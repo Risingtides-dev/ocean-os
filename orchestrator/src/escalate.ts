@@ -28,12 +28,15 @@ export type Task = {
 };
 
 export async function detectAndEscalate(pool: Pool, log: (msg: string) => void): Promise<void> {
-  // Find tasks that meet a stall condition but haven't been escalated yet.
+  // Find agent-tasks (human_owner IS NOT NULL) that meet a stall condition but
+  // haven't been escalated yet. Dispatch tasks (human_owner IS NULL) are ignored —
+  // they have no human to DM and a different status vocabulary (pending/claimed/done).
   const { rows } = await pool.query<Task>(`
     SELECT id, human_owner, twin_id, description, status,
            stall_reason, rounds, max_rounds, consecutive_failures, escalated_at
     FROM orchestrator.tasks
-    WHERE escalated_at IS NULL
+    WHERE human_owner IS NOT NULL
+      AND escalated_at IS NULL
       AND status != 'completed'
       AND (
         rounds >= max_rounds
