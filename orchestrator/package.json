@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Ocean-OS orchestrator. Accepts inbound webhook events, creates task rows, and lets twin bridges claim work.",
+  "description": "Ocean-OS orchestrator. Dispatches inbound webhook events to twins and tracks long-running agent tasks, escalating stalled ones to human owners over Slack DM.",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
