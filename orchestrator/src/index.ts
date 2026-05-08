@@ -8,7 +8,7 @@
  * Env:
  *   PORT                  — default 8082
  *   OCEAN_DATABASE_URL    — Postgres connection string (write role for orchestrator schema)
- *   ORCHESTRATOR_SECRET   — Bearer token required on POST /events (optional for local dev)
+ *   ORCHESTRATOR_SECRET   — Bearer token required on all endpoints (optional for local dev)
  */
 
 import Fastify from "fastify";
@@ -65,14 +65,19 @@ app.post("/events", async (req, reply) => {
 
   const { source, event_type, source_ref, payload } = parsed.data;
 
-  const result = await pool.query<{ id: string }>(
-    `INSERT INTO orchestrator.tasks (source, event_type, source_ref, payload)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id`,
-    [source, event_type, source_ref ?? null, payload]
-  );
-
-  const taskId = result.rows[0].id;
+  let taskId: string;
+  try {
+    const result = await pool.query<{ id: string }>(
+      `INSERT INTO orchestrator.tasks (source, event_type, source_ref, payload)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [source, event_type, source_ref ?? null, payload]
+    );
+    taskId = result.rows[0].id;
+  } catch (err) {
+    req.log.error({ err }, "ingestion failed");
+    return reply.code(500).send({ error: "ingestion failed" });
+  }
 
   // Stub: log the task instead of routing it anywhere.
   req.log.info({ taskId, source, event_type }, "task created — dispatch stubbed");
@@ -90,6 +95,11 @@ app.post<{ Params: { id: string } }>("/tasks/:id/claim", async (req, reply) => {
   }
 
   const { id } = req.params;
+
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID_RE.test(id)) {
+    return reply.code(400).send({ error: "invalid task id" });
+  }
 
   const parsed = ClaimBodySchema.safeParse(req.body);
   if (!parsed.success) {
@@ -144,6 +154,9 @@ app.post<{ Params: { id: string } }>("/tasks/:id/claim", async (req, reply) => {
     });
   } catch (err) {
     await client.query("ROLLBACK");
+    if ((err as { code?: string }).code === "23505") {
+      return reply.code(409).send({ error: "task already claimed" });
+    }
     req.log.error({ err }, "claim failed");
     return reply.code(500).send({ error: "claim failed" });
   } finally {

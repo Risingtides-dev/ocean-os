@@ -2,7 +2,7 @@
 -- !! NOT YET EXECUTED — run manually against the target database after review !!
 --
 -- Depends on: 000_init.sql (pgcrypto extension, gen_random_uuid())
--- Apply with: psql $DATABASE_URL -f schema/002_orchestrator.sql
+-- Apply with: psql $OCEAN_DATABASE_URL -f schema/002_orchestrator.sql
 
 CREATE SCHEMA IF NOT EXISTS orchestrator;
 
@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS orchestrator.dispatches (
   resolved_at timestamptz
 );
 
--- Only one successful claim per task.
+-- One active or successfully completed dispatch per task.
+-- A failed dispatch (outcome = 'failed') is excluded so the task can be retried.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_orchestrator_dispatches_task
   ON orchestrator.dispatches (task_id)
   WHERE outcome IS NULL OR outcome = 'done';
