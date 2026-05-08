@@ -103,7 +103,7 @@ is safe (duplicate events are dropped via `ON CONFLICT DO NOTHING`).
 Before deploying the worker, apply the schema migration:
 
 ```bash
-psql "$OCEAN_DATABASE_URL" -f ../../schema/300_content_lab.sql
+psql "$OCEAN_DATABASE_URL" -f ../../schema/004_content_lab.sql
 ```
 
 This adds `lab_job_id` and `lab_distribution_id` columns (with unique constraints)
