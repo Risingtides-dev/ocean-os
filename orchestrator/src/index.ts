@@ -42,7 +42,7 @@ const ClaimBodySchema = z.object({
 // Auth helper — skipped if no secret is configured (local dev)
 // ---------------------------------------------------------------------------
 
-function checkBearer(req: Parameters<typeof app.get>[1] extends undefined ? never : Parameters<typeof app.addHook>[1] extends never ? never : import("fastify").FastifyRequest, secret: string): boolean {
+function checkBearer(req: { headers: { authorization?: string } }, secret: string): boolean {
   if (!secret) return true;
   const auth = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -98,33 +98,41 @@ app.post<{ Params: { id: string } }>("/tasks/:id/claim", async (req, reply) => {
 
   const { twin_id } = parsed.data;
 
-  // Verify the task exists and is still claimable.
-  const taskResult = await pool.query<{ id: string; status: string; payload: unknown }>(
-    `SELECT id, status, payload FROM orchestrator.tasks WHERE id = $1`,
-    [id]
-  );
-
-  if (taskResult.rowCount === 0) {
-    return reply.code(404).send({ error: "task not found" });
-  }
-
-  const task = taskResult.rows[0];
-  if (task.status !== "pending") {
-    return reply.code(409).send({ error: "task already claimed", status: task.status });
-  }
-
-  // Claim atomically: update task status, insert dispatch row.
-  await pool.query("BEGIN");
+  // Claim atomically on a dedicated connection so BEGIN/COMMIT stay on one socket.
+  // The UPDATE ... WHERE status = 'pending' eliminates the check-then-act race.
+  const client = await pool.connect();
   try {
-    await pool.query(
-      `UPDATE orchestrator.tasks SET status = 'claimed', updated_at = now() WHERE id = $1`,
+    await client.query("BEGIN");
+
+    const claimResult = await client.query<{ id: string; payload: unknown }>(
+      `UPDATE orchestrator.tasks
+       SET status = 'claimed', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING id, payload`,
       [id]
     );
-    const dispatchResult = await pool.query<{ id: string }>(
+
+    if ((claimResult.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
+      // Distinguish not-found from already-claimed.
+      const exists = await client.query<{ status: string }>(
+        `SELECT status FROM orchestrator.tasks WHERE id = $1`,
+        [id]
+      );
+      if ((exists.rowCount ?? 0) === 0) {
+        return reply.code(404).send({ error: "task not found" });
+      }
+      return reply.code(409).send({ error: "task already claimed", status: exists.rows[0].status });
+    }
+
+    const task = claimResult.rows[0];
+
+    const dispatchResult = await client.query<{ id: string }>(
       `INSERT INTO orchestrator.dispatches (task_id, twin_id) VALUES ($1, $2) RETURNING id`,
       [id, twin_id]
     );
-    await pool.query("COMMIT");
+
+    await client.query("COMMIT");
 
     const dispatchId = dispatchResult.rows[0].id;
     req.log.info({ taskId: id, dispatchId, twin_id }, "task claimed");
@@ -135,9 +143,11 @@ app.post<{ Params: { id: string } }>("/tasks/:id/claim", async (req, reply) => {
       task: { id: task.id, payload: task.payload },
     });
   } catch (err) {
-    await pool.query("ROLLBACK");
+    await client.query("ROLLBACK");
     req.log.error({ err }, "claim failed");
     return reply.code(500).send({ error: "claim failed" });
+  } finally {
+    client.release();
   }
 });
 
