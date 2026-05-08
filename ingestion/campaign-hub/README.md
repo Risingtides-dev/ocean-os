@@ -114,10 +114,10 @@ GET /api/payments?updated_since=<ISO8601>&per_page=100[&cursor=<token>]
 
 ## Schema migration
 
-Before deploying, run `schema/002_campaigns_hub.sql` against the Ocean-OS database. This adds `hub_id` to `campaigns.bookings`, creates `campaigns.payments`, and creates `campaigns.poll_cursor`.
+Before deploying, run `schema/003_campaigns_hub.sql` against the Ocean-OS database. This adds `hub_id` to `campaigns.bookings`, creates `campaigns.payments`, and creates `campaigns.poll_cursor`.
 
 ```bash
-psql "$OCEAN_DATABASE_URL" -f schema/002_campaigns_hub.sql
+psql "$OCEAN_DATABASE_URL" -f schema/003_campaigns_hub.sql
 ```
 
 **Do not run against production without review — see PR notes.**
