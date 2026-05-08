@@ -1,0 +1,22 @@
+{
+  "name": "@ocean-os/ingest-github",
+  "version": "0.0.1",
+  "description": "GitHub webhook ingestion worker for Ocean-OS.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p .",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "fastify": "^5.0.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
