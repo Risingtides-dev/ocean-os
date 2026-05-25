@@ -39,6 +39,9 @@ ocean-tools
 ocean-store
   SQLite session/event store.
 
+See `docs/OCEAN_NATIVE_INTERNALS_MAP.md` for the current Pi-borrowed
+`ocean-agent` surfaces and the extraction order that preserves smoke behavior.
+
 ocean-tui
   ratatui client.
 
