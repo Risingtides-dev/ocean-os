@@ -32,6 +32,20 @@ use ratatui::{
 use serde::Deserialize;
 use serde_json::Value;
 
+const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4780";
+const DEFAULT_MESH_REFRESH_MS: u64 = 1000;
+const DEFAULT_DAEMON_REFRESH: Duration = Duration::from_secs(5);
+const ACTION_POLL: Duration = Duration::from_millis(100);
+const REDRAW_MAX_IDLE: Duration = Duration::from_millis(250);
+const ACTIVITY_CAP: usize = 36;
+const TRANSCRIPT_CAP: usize = 120;
+const REQUEST_CAP: usize = 64;
+const SESSION_CAP: usize = 64;
+const FEED_CAP: usize = 300;
+const INBOX_CAP: usize = 120;
+const ACTIVE_AGENT_MS: i64 = 2 * 60 * 1000;
+const AWAY_AGENT_MS: i64 = 15 * 60 * 1000;
+
 #[derive(Debug, Parser)]
 #[command(name = "ocean-tui", about = "Ocean daemon steering + TIDES-MESH TUI")]
 struct Cli {
@@ -41,7 +55,7 @@ struct Cli {
     #[arg(
         long,
         env = "OCEAN_DAEMON_URL",
-        default_value = "http://127.0.0.1:4780"
+        default_value = DEFAULT_DAEMON_URL
     )]
     url: String,
 }
@@ -52,7 +66,7 @@ enum Command {
     Mesh(MeshCli),
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 struct MeshCli {
     #[arg(long, default_value = ".")]
     root: PathBuf,
@@ -63,7 +77,7 @@ struct MeshCli {
     #[arg(long, env = "PIMESH_TAB", value_enum, default_value_t = MeshTab::Board)]
     tab: MeshTab,
 
-    #[arg(long, env = "PIMESH_REFRESH_MS", default_value_t = 1000)]
+    #[arg(long, env = "PIMESH_REFRESH_MS", default_value_t = DEFAULT_MESH_REFRESH_MS)]
     refresh_ms: u64,
 }
 
@@ -126,12 +140,32 @@ struct SessionsResponse {
 }
 
 #[derive(Debug)]
-enum StreamMessage {
-    Status(String),
-    Event(EventEnvelope),
+enum Action {
+    Quit,
+    Tick,
+    RefreshAll,
+    RefreshSessions,
+    SendPrompt,
+    CancelActive,
+    InputChar(char),
+    Backspace,
+    ClearInput,
+    StreamStatus(String),
+    StreamEvent(EventEnvelope),
+    MeshRefresh,
+    MeshTogglePause,
+    MeshNextTab,
+    MeshSelectTab(MeshTab),
 }
 
-struct App {
+#[derive(Debug)]
+enum UiMode {
+    Daemon(DaemonApp),
+    Mesh(MeshApp, MeshState),
+}
+
+#[derive(Debug)]
+struct DaemonApp {
     url: String,
     health: HealthState,
     sessions: Vec<SessionSummary>,
@@ -146,7 +180,7 @@ struct App {
     refresh_every: Duration,
 }
 
-impl App {
+impl DaemonApp {
     fn new(url: String) -> Self {
         Self {
             url,
@@ -164,7 +198,7 @@ impl App {
             status: "starting".to_string(),
             stream_status: "connecting".to_string(),
             last_checked: None,
-            refresh_every: Duration::from_secs(5),
+            refresh_every: DEFAULT_DAEMON_REFRESH,
         }
     }
 
@@ -191,26 +225,23 @@ impl App {
     }
 
     fn checked_text(&self) -> String {
-        match self.last_checked {
-            Some(last_checked) => {
-                let elapsed = last_checked.elapsed();
-                if elapsed < Duration::from_secs(1) {
-                    "just now".to_string()
-                } else {
-                    format!("{}s ago", elapsed.as_secs())
-                }
-            }
-            None => "never".to_string(),
-        }
+        checked_text(self.last_checked)
     }
 
     fn push_activity(&mut self, line: String) {
-        self.activity.push(line);
-        const ACTIVITY_CAP: usize = 36;
-        if self.activity.len() > ACTIVITY_CAP {
-            let drain = self.activity.len() - ACTIVITY_CAP;
-            self.activity.drain(0..drain);
-        }
+        push_bounded(&mut self.activity, line, ACTIVITY_CAP);
+    }
+
+    fn push_transcript(&mut self, line: String) {
+        push_bounded(&mut self.transcript, line, TRANSCRIPT_CAP);
+    }
+
+    fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        self.sessions = sessions.into_iter().take(SESSION_CAP).collect();
+    }
+
+    fn set_requests(&mut self, requests: Vec<RequestStatus>) {
+        self.requests = requests.into_iter().take(REQUEST_CAP).collect();
     }
 
     fn activity_lines(&self) -> Vec<Line<'static>> {
@@ -288,6 +319,7 @@ impl App {
     }
 }
 
+#[derive(Debug)]
 struct MeshApp {
     root: PathBuf,
     agent: String,
@@ -300,10 +332,9 @@ struct MeshApp {
 
 impl MeshApp {
     fn new(cli: MeshCli) -> Self {
-        let agent = cli.agent.unwrap_or_else(default_mesh_agent);
         Self {
             root: cli.root,
-            agent,
+            agent: cli.agent.unwrap_or_else(default_mesh_agent),
             active_tab: cli.tab,
             paused: false,
             refresh_every: Duration::from_millis(cli.refresh_ms.max(100)),
@@ -313,17 +344,115 @@ impl MeshApp {
     }
 
     fn checked_text(&self) -> String {
-        match self.last_refresh {
-            Some(last) => {
-                let elapsed = last.elapsed();
-                if elapsed < Duration::from_secs(1) {
-                    "just now".to_string()
-                } else {
-                    format!("{}s ago", elapsed.as_secs())
-                }
-            }
-            None => "never".to_string(),
+        checked_text(self.last_refresh)
+    }
+}
+
+#[derive(Debug)]
+struct AppState {
+    mode: UiMode,
+    last_draw: Instant,
+    dirty: bool,
+}
+
+impl AppState {
+    fn new(mode: UiMode) -> Self {
+        Self {
+            mode,
+            last_draw: Instant::now() - REDRAW_MAX_IDLE,
+            dirty: true,
         }
+    }
+
+    fn draw_due(&self) -> bool {
+        self.dirty || self.last_draw.elapsed() >= REDRAW_MAX_IDLE
+    }
+
+    fn mark_drawn(&mut self) {
+        self.last_draw = Instant::now();
+        self.dirty = false;
+    }
+}
+
+struct DaemonClient {
+    http: reqwest::blocking::Client,
+}
+
+impl DaemonClient {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            http: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .context("build daemon client")?,
+        })
+    }
+
+    fn health(&self, base_url: &str) -> Result<HealthResponse, String> {
+        let url = format!("{}/health", base_url.trim_end_matches('/'));
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<HealthResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn sessions(&self, base_url: &str) -> Result<SessionsResponse, String> {
+        let url = format!("{}/v1/sessions", base_url.trim_end_matches('/'));
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<SessionsResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn requests(&self, base_url: &str) -> Result<RequestsResponse, String> {
+        let url = format!("{}/v1/requests", base_url.trim_end_matches('/'));
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<RequestsResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn create_request(
+        &self,
+        base_url: &str,
+        request: &PromptRequest,
+    ) -> Result<RequestCreateResponse, String> {
+        let url = format!("{}/v1/requests", base_url.trim_end_matches('/'));
+        self.http
+            .post(url)
+            .json(request)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<RequestCreateResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn cancel_request(
+        &self,
+        base_url: &str,
+        request_id: RequestId,
+    ) -> Result<RequestControlResponse, String> {
+        let url = format!(
+            "{}/v1/requests/{request_id}/cancel",
+            base_url.trim_end_matches('/')
+        );
+        self.http
+            .post(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<RequestControlResponse>()
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -471,20 +600,20 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Mesh(mesh)) => run_mesh(mesh),
-        None => run_daemon(App::new(cli.url)),
+        None => run_daemon(cli.url),
     }
 }
 
-fn run_daemon(mut app: App) -> anyhow::Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .context("build daemon client")?;
+fn run_daemon(url: String) -> anyhow::Result<()> {
+    let client = DaemonClient::new()?;
+    let mut state = AppState::new(UiMode::Daemon(DaemonApp::new(url)));
+    let (stream_tx, action_rx) = mpsc::channel();
 
-    let (stream_tx, stream_rx) = mpsc::channel();
-    spawn_event_stream(app.url.clone(), stream_tx);
+    if let UiMode::Daemon(app) = &state.mode {
+        spawn_event_stream(app.url.clone(), stream_tx);
+    }
+
     let mut stdout = io::stdout();
-
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
     let _guard = TerminalGuard;
@@ -493,63 +622,30 @@ fn run_daemon(mut app: App) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear().context("clear terminal")?;
 
-    refresh_health(&client, &mut app);
-    refresh_sessions(&client, &mut app);
-    refresh_requests(&client, &mut app);
-    let mut next_refresh = Instant::now() + app.refresh_every;
+    daemon_refresh_all(&client, &mut state);
 
     loop {
-        pump_stream(&stream_rx, &mut app);
-        terminal.draw(|frame| draw_daemon_ui(frame, &app))?;
-
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => break,
-                Event::Key(key) if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) => {
-                    refresh_health(&client, &mut app);
-                    refresh_sessions(&client, &mut app);
-                    refresh_requests(&client, &mut app);
-                    next_refresh = Instant::now() + app.refresh_every;
-                }
-                Event::Key(key) if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) => {
-                    refresh_sessions(&client, &mut app);
-                }
-                Event::Key(key)
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    cancel_active_request(&client, &mut app);
-                    refresh_requests(&client, &mut app);
-                }
-                Event::Key(key) if key.code == KeyCode::Enter => {
-                    send_prompt(&client, &mut app);
-                    refresh_sessions(&client, &mut app);
-                    refresh_requests(&client, &mut app);
-                }
-                Event::Key(key) if key.code == KeyCode::Backspace => {
-                    app.input.pop();
-                }
-                Event::Key(key)
-                    if key.code == KeyCode::Char('u')
-                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    app.input.clear();
-                }
-                Event::Key(key) => {
-                    if let KeyCode::Char(ch) = key.code {
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                            app.input.push(ch);
-                        }
-                    }
-                }
-                _ => {}
+        while let Ok(action) = action_rx.try_recv() {
+            if !handle_daemon_action(&client, &mut state, action) {
+                return Ok(());
             }
         }
 
-        if Instant::now() >= next_refresh {
-            refresh_health(&client, &mut app);
-            refresh_requests(&client, &mut app);
-            next_refresh = Instant::now() + app.refresh_every;
+        if state.draw_due() {
+            terminal.draw(|frame| draw_state(frame, &state))?;
+            state.mark_drawn();
+        }
+
+        if event::poll(ACTION_POLL)? {
+            if let Some(action) = daemon_key_action(event::read()?) {
+                if !handle_daemon_action(&client, &mut state, action) {
+                    break;
+                }
+            }
+        }
+
+        if daemon_tick_due(&state) && !handle_daemon_action(&client, &mut state, Action::Tick) {
+            break;
         }
     }
 
@@ -557,9 +653,25 @@ fn run_daemon(mut app: App) -> anyhow::Result<()> {
 }
 
 fn run_mesh(cli: MeshCli) -> anyhow::Result<()> {
-    let mut app = MeshApp::new(cli);
-    let mut stdout = io::stdout();
+    let app = MeshApp::new(cli.clone());
+    let mesh_state = load_mesh_state(&app.root, &app.agent).unwrap_or_else(|_| empty_mesh_state());
+    let mut state = AppState::new(UiMode::Mesh(app, mesh_state));
 
+    if let UiMode::Mesh(app, mesh) = &mut state.mode {
+        match load_mesh_state(&app.root, &app.agent) {
+            Ok(next) => {
+                *mesh = next;
+                app.status = "loaded".to_string();
+                app.last_refresh = Some(Instant::now());
+            }
+            Err(err) => {
+                app.status = format!("load error: {err}");
+                app.last_refresh = Some(Instant::now());
+            }
+        }
+    }
+
+    let mut stdout = io::stdout();
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
     let _guard = TerminalGuard;
@@ -568,166 +680,232 @@ fn run_mesh(cli: MeshCli) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear().context("clear terminal")?;
 
-    let mut state = load_mesh_state(&app.root, &app.agent).unwrap_or_else(|err| {
-        app.status = format!("load error: {err}");
-        empty_mesh_state()
-    });
-    app.last_refresh = Some(Instant::now());
-    let mut next_refresh = Instant::now() + app.refresh_every;
-
     loop {
-        terminal.draw(|frame| draw_mesh_ui(frame, &app, &state))?;
+        if state.draw_due() {
+            terminal.draw(|frame| draw_state(frame, &state))?;
+            state.mark_drawn();
+        }
 
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => break,
-                Event::Key(key) if key.code == KeyCode::Tab => {
-                    app.active_tab = app.active_tab.next();
+        if event::poll(ACTION_POLL)? {
+            if let Some(action) = mesh_key_action(event::read()?) {
+                if !handle_mesh_action(&mut state, action) {
+                    break;
                 }
-                Event::Key(key) if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) => {
-                    match load_mesh_state(&app.root, &app.agent) {
-                        Ok(next) => {
-                            state = next;
-                            app.status = "refreshed".to_string();
-                            app.last_refresh = Some(Instant::now());
-                            next_refresh = Instant::now() + app.refresh_every;
-                        }
-                        Err(err) => app.status = format!("refresh error: {err}"),
-                    }
-                }
-                Event::Key(key) if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) => {
-                    app.paused = !app.paused;
-                    app.status = if app.paused {
-                        "paused".to_string()
-                    } else {
-                        "resumed".to_string()
-                    };
-                }
-                Event::Key(key) => {
-                    if let KeyCode::Char(ch) = key.code {
-                        if let Some(tab) = MeshTab::from_digit(ch) {
-                            app.active_tab = tab;
-                        }
-                    }
-                }
-                _ => {}
             }
         }
 
-        if !app.paused && Instant::now() >= next_refresh {
-            match load_mesh_state(&app.root, &app.agent) {
-                Ok(next) => {
-                    state = next;
-                    app.status = "auto-refresh".to_string();
-                    app.last_refresh = Some(Instant::now());
-                }
-                Err(err) => app.status = format!("auto-refresh error: {err}"),
-            }
-            next_refresh = Instant::now() + app.refresh_every;
+        if mesh_tick_due(&state) && !handle_mesh_action(&mut state, Action::Tick) {
+            break;
         }
     }
 
     Ok(())
 }
 
-fn refresh_health(client: &reqwest::blocking::Client, app: &mut App) {
-    let url = format!("{}/health", app.url.trim_end_matches('/'));
-    match client.get(url).send() {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => match response.json::<HealthResponse>() {
-                Ok(health) => {
-                    app.health = HealthState::Ready(health);
-                    app.status = "health refreshed".to_string();
-                }
-                Err(err) => app.health = HealthState::Error(err.to_string()),
-            },
-            Err(err) => app.health = HealthState::Error(err.to_string()),
-        },
-        Err(err) => app.health = HealthState::Error(err.to_string()),
+fn draw_state(frame: &mut ratatui::Frame<'_>, state: &AppState) {
+    match &state.mode {
+        UiMode::Daemon(app) => draw_daemon_ui(frame, app),
+        UiMode::Mesh(app, mesh) => draw_mesh_ui(frame, app, mesh),
     }
+}
 
+fn daemon_tick_due(state: &AppState) -> bool {
+    matches!(&state.mode, UiMode::Daemon(app) if app.last_checked.unwrap_or_else(Instant::now).elapsed() >= app.refresh_every)
+}
+
+fn mesh_tick_due(state: &AppState) -> bool {
+    matches!(&state.mode, UiMode::Mesh(app, _) if !app.paused && app.last_refresh.unwrap_or_else(Instant::now).elapsed() >= app.refresh_every)
+}
+
+fn daemon_key_action(event: Event) -> Option<Action> {
+    match event {
+        Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => {
+            Some(Action::Quit)
+        }
+        Event::Key(key) if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) => {
+            Some(Action::RefreshAll)
+        }
+        Event::Key(key) if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) => {
+            Some(Action::RefreshSessions)
+        }
+        Event::Key(key)
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::CancelActive)
+        }
+        Event::Key(key) if key.code == KeyCode::Enter => Some(Action::SendPrompt),
+        Event::Key(key) if key.code == KeyCode::Backspace => Some(Action::Backspace),
+        Event::Key(key)
+            if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::ClearInput)
+        }
+        Event::Key(key) => match key.code {
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Action::InputChar(ch))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn mesh_key_action(event: Event) -> Option<Action> {
+    match event {
+        Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => {
+            Some(Action::Quit)
+        }
+        Event::Key(key) if key.code == KeyCode::Tab => Some(Action::MeshNextTab),
+        Event::Key(key) if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) => {
+            Some(Action::MeshRefresh)
+        }
+        Event::Key(key) if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) => {
+            Some(Action::MeshTogglePause)
+        }
+        Event::Key(key) => match key.code {
+            KeyCode::Char(ch) => MeshTab::from_digit(ch).map(Action::MeshSelectTab),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Action) -> bool {
+    let UiMode::Daemon(app) = &mut state.mode else {
+        return true;
+    };
+
+    match action {
+        Action::Quit => return false,
+        Action::Tick | Action::RefreshAll => daemon_refresh_all(client, state),
+        Action::RefreshSessions => daemon_refresh_sessions(client, app),
+        Action::SendPrompt => daemon_send_prompt(client, app),
+        Action::CancelActive => daemon_cancel_active(client, app),
+        Action::InputChar(ch) => app.input.push(ch),
+        Action::Backspace => {
+            app.input.pop();
+        }
+        Action::ClearInput => app.input.clear(),
+        Action::StreamStatus(status) => app.stream_status = status,
+        Action::StreamEvent(envelope) => app.push_activity(summarize_event(&envelope)),
+        _ => {}
+    }
+    state.dirty = true;
+    true
+}
+
+fn handle_mesh_action(state: &mut AppState, action: Action) -> bool {
+    let UiMode::Mesh(app, mesh) = &mut state.mode else {
+        return true;
+    };
+
+    match action {
+        Action::Quit => return false,
+        Action::Tick | Action::MeshRefresh => match load_mesh_state(&app.root, &app.agent) {
+            Ok(next) => {
+                *mesh = next;
+                app.status = if matches!(action, Action::Tick) {
+                    "auto-refresh".to_string()
+                } else {
+                    "refreshed".to_string()
+                };
+                app.last_refresh = Some(Instant::now());
+            }
+            Err(err) => {
+                app.status = format!("refresh error: {err}");
+                app.last_refresh = Some(Instant::now());
+            }
+        },
+        Action::MeshTogglePause => {
+            app.paused = !app.paused;
+            app.status = if app.paused {
+                "paused".to_string()
+            } else {
+                "resumed".to_string()
+            };
+        }
+        Action::MeshNextTab => {
+            app.active_tab = app.active_tab.next();
+        }
+        Action::MeshSelectTab(tab) => {
+            app.active_tab = tab;
+        }
+        _ => {}
+    }
+    state.dirty = true;
+    true
+}
+
+fn daemon_refresh_all(client: &DaemonClient, state: &mut AppState) {
+    let UiMode::Daemon(app) = &mut state.mode else {
+        return;
+    };
+    daemon_refresh_health(client, app);
+    daemon_refresh_sessions(client, app);
+    daemon_refresh_requests(client, app);
+}
+
+fn daemon_refresh_health(client: &DaemonClient, app: &mut DaemonApp) {
+    match client.health(&app.url) {
+        Ok(health) => {
+            app.health = HealthState::Ready(health);
+            app.status = "health refreshed".to_string();
+        }
+        Err(err) => app.health = HealthState::Error(err),
+    }
     app.last_checked = Some(Instant::now());
 }
 
-fn refresh_sessions(client: &reqwest::blocking::Client, app: &mut App) {
-    let url = format!("{}/v1/sessions", app.url.trim_end_matches('/'));
-    match client
-        .get(url)
-        .send()
-        .and_then(|res| res.error_for_status())
-    {
-        Ok(response) => match response.json::<SessionsResponse>() {
-            Ok(res) if res.ok => {
-                app.sessions = res.sessions;
-                app.status = format!("sessions refreshed: {}", app.sessions.len());
-            }
-            Ok(res) => app.status = format!("sessions error: {}", res.error.unwrap_or_default()),
-            Err(err) => app.status = format!("sessions parse error: {err}"),
-        },
+fn daemon_refresh_sessions(client: &DaemonClient, app: &mut DaemonApp) {
+    match client.sessions(&app.url) {
+        Ok(res) if res.ok => {
+            app.set_sessions(res.sessions);
+            app.status = format!("sessions refreshed: {}", app.sessions.len());
+        }
+        Ok(res) => app.status = format!("sessions error: {}", res.error.unwrap_or_default()),
         Err(err) => app.status = format!("sessions request error: {err}"),
     }
 }
 
-fn refresh_requests(client: &reqwest::blocking::Client, app: &mut App) {
-    let url = format!("{}/v1/requests", app.url.trim_end_matches('/'));
-    match client
-        .get(url)
-        .send()
-        .and_then(|res| res.error_for_status())
-    {
-        Ok(response) => match response.json::<RequestsResponse>() {
-            Ok(res) if res.ok => {
-                app.requests = res.requests;
-                app.status = format!("requests refreshed: {}", app.requests.len());
-            }
-            Ok(res) => app.status = format!("requests error: {}", res.error.unwrap_or_default()),
-            Err(err) => app.status = format!("requests parse error: {err}"),
-        },
+fn daemon_refresh_requests(client: &DaemonClient, app: &mut DaemonApp) {
+    match client.requests(&app.url) {
+        Ok(res) if res.ok => {
+            app.set_requests(res.requests);
+            app.status = format!("requests refreshed: {}", app.requests.len());
+        }
+        Ok(res) => app.status = format!("requests error: {}", res.error.unwrap_or_default()),
         Err(err) => app.status = format!("requests request error: {err}"),
     }
 }
 
-fn cancel_active_request(client: &reqwest::blocking::Client, app: &mut App) {
+fn daemon_cancel_active(client: &DaemonClient, app: &mut DaemonApp) {
     let Some(request_id) = app.cancellable_request_id() else {
         app.status = "no cancellable request".to_string();
         return;
     };
-
-    let url = format!(
-        "{}/v1/requests/{request_id}/cancel",
-        app.url.trim_end_matches('/')
-    );
-    match client
-        .post(url)
-        .send()
-        .and_then(|res| res.error_for_status())
-    {
-        Ok(response) => match response.json::<RequestControlResponse>() {
-            Ok(res) => {
-                app.status = format!(
-                    "cancel requested ok={} request={} {}: {}",
-                    res.ok,
-                    short_id(res.request_id),
-                    state_label(res.state),
-                    compact_text(&res.message, 56)
-                );
-            }
-            Err(err) => app.status = format!("cancel parse error: {err}"),
-        },
+    match client.cancel_request(&app.url, request_id) {
+        Ok(res) => {
+            app.status = format!(
+                "cancel requested ok={} request={} {}: {}",
+                res.ok,
+                short_id(res.request_id),
+                state_label(res.state),
+                compact_text(&res.message, 56)
+            );
+        }
         Err(err) => app.status = format!("cancel request error: {err}"),
     }
 }
 
-fn send_prompt(client: &reqwest::blocking::Client, app: &mut App) {
+fn daemon_send_prompt(client: &DaemonClient, app: &mut DaemonApp) {
     let prompt = app.input.trim().to_string();
     if prompt.is_empty() {
         return;
     }
     app.input.clear();
-    app.transcript.push(format!("> {prompt}"));
+    app.push_transcript(format!("> {prompt}"));
     app.status = "creating async request...".to_string();
 
-    let url = format!("{}/v1/requests", app.url.trim_end_matches('/'));
     let request = PromptRequest {
         prompt,
         request_id: None,
@@ -736,47 +914,39 @@ fn send_prompt(client: &reqwest::blocking::Client, app: &mut App) {
         yolo: false,
     };
 
-    match client
-        .post(url)
-        .json(&request)
-        .send()
-        .and_then(|res| res.error_for_status())
-    {
-        Ok(response) => match response.json::<RequestCreateResponse>() {
-            Ok(res) if res.ok => {
-                app.active_request_id = Some(res.request_id);
-                app.status = format!(
-                    "request accepted {} {}: {}",
-                    short_id(res.request_id),
-                    state_label(res.state),
-                    compact_text(&res.message, 56)
-                );
-                app.push_activity(format!(
-                    "request_created [{}] {}",
-                    short_id(res.request_id),
-                    state_label(res.state)
-                ));
-            }
-            Ok(res) => {
-                app.status = format!(
-                    "request rejected {} {}: {}",
-                    short_id(res.request_id),
-                    state_label(res.state),
-                    compact_text(&res.message, 56)
-                );
-            }
-            Err(err) => app.status = format!("request parse error: {err}"),
-        },
+    match client.create_request(&app.url, &request) {
+        Ok(res) if res.ok => {
+            app.active_request_id = Some(res.request_id);
+            app.status = format!(
+                "request accepted {} {}: {}",
+                short_id(res.request_id),
+                state_label(res.state),
+                compact_text(&res.message, 56)
+            );
+            app.push_activity(format!(
+                "request_created [{}] {}",
+                short_id(res.request_id),
+                state_label(res.state)
+            ));
+        }
+        Ok(res) => {
+            app.status = format!(
+                "request rejected {} {}: {}",
+                short_id(res.request_id),
+                state_label(res.state),
+                compact_text(&res.message, 56)
+            );
+        }
         Err(err) => app.status = format!("request create error: {err}"),
     }
 }
 
-fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
+fn spawn_event_stream(url: String, tx: mpsc::Sender<Action>) {
     thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder().build() {
             Ok(client) => client,
             Err(err) => {
-                let _ = tx.send(StreamMessage::Status(format!(
+                let _ = tx.send(Action::StreamStatus(format!(
                     "stream client error: {}",
                     compact_text(&err.to_string(), 72)
                 )));
@@ -788,7 +958,7 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
 
         loop {
             if tx
-                .send(StreamMessage::Status("connecting".to_string()))
+                .send(Action::StreamStatus("connecting".to_string()))
                 .is_err()
             {
                 break;
@@ -803,7 +973,7 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
                 Ok(response) => response,
                 Err(err) => {
                     if tx
-                        .send(StreamMessage::Status(format!(
+                        .send(Action::StreamStatus(format!(
                             "reconnecting: {}",
                             compact_text(&err.to_string(), 72)
                         )))
@@ -817,7 +987,7 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
             };
 
             if tx
-                .send(StreamMessage::Status("connected".to_string()))
+                .send(Action::StreamStatus("connected".to_string()))
                 .is_err()
             {
                 break;
@@ -839,7 +1009,7 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
                                 let payload = data_lines.join("\n");
                                 match serde_json::from_str::<EventEnvelope>(&payload) {
                                     Ok(envelope) => {
-                                        if tx.send(StreamMessage::Event(envelope)).is_err() {
+                                        if tx.send(Action::StreamEvent(envelope)).is_err() {
                                             return;
                                         }
                                     }
@@ -850,7 +1020,7 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
                                             format!("event parse error ({event_name})")
                                         };
                                         if tx
-                                            .send(StreamMessage::Status(format!(
+                                            .send(Action::StreamStatus(format!(
                                                 "{label}: {}",
                                                 compact_text(&err.to_string(), 72)
                                             )))
@@ -881,7 +1051,7 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
                     }
                     Err(err) => {
                         if tx
-                            .send(StreamMessage::Status(format!(
+                            .send(Action::StreamStatus(format!(
                                 "stream read error: {}",
                                 compact_text(&err.to_string(), 72)
                             )))
@@ -895,7 +1065,7 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
             }
 
             if tx
-                .send(StreamMessage::Status("reconnecting".to_string()))
+                .send(Action::StreamStatus("reconnecting".to_string()))
                 .is_err()
             {
                 break;
@@ -903,15 +1073,6 @@ fn spawn_event_stream(url: String, tx: mpsc::Sender<StreamMessage>) {
             thread::sleep(Duration::from_secs(2));
         }
     });
-}
-
-fn pump_stream(rx: &mpsc::Receiver<StreamMessage>, app: &mut App) {
-    while let Ok(message) = rx.try_recv() {
-        match message {
-            StreamMessage::Status(status) => app.stream_status = status,
-            StreamMessage::Event(envelope) => app.push_activity(summarize_event(&envelope)),
-        }
-    }
 }
 
 fn summarize_event(envelope: &EventEnvelope) -> String {
@@ -1130,9 +1291,7 @@ fn read_external_tasks(root: &Path) -> anyhow::Result<Vec<MeshTask>> {
 fn read_feed(root: &Path) -> anyhow::Result<Vec<FeedEvent>> {
     let path = root.join(".pi/messenger/feed.jsonl");
     let mut items = read_jsonl::<FeedEvent>(&path)?;
-    if items.len() > 300 {
-        items = items.split_off(items.len() - 300);
-    }
+    trim_front(&mut items, FEED_CAP);
     items.reverse();
     Ok(items)
 }
@@ -1140,9 +1299,7 @@ fn read_feed(root: &Path) -> anyhow::Result<Vec<FeedEvent>> {
 fn read_inbox(root: &Path, agent: &str) -> anyhow::Result<Vec<InboxMessage>> {
     let path = root.join(format!(".pi/messenger/mailboxes/by-agent/{agent}.jsonl"));
     let mut items = read_jsonl::<InboxMessage>(&path)?;
-    if items.len() > 120 {
-        items = items.split_off(items.len() - 120);
-    }
+    trim_front(&mut items, INBOX_CAP);
     items.reverse();
     Ok(items)
 }
@@ -1183,12 +1340,12 @@ fn classify_agent(record: AgentRecord) -> AgentView {
     } else if pid_state.zombie {
         reasons.push("zombie pid".to_string());
     }
-    if age_ms > 15 * 60 * 1000 {
+    if age_ms > AWAY_AGENT_MS {
         reasons.push("old heartbeat".to_string());
     }
-    let presence = if reasons.is_empty() && age_ms <= 2 * 60 * 1000 {
+    let presence = if reasons.is_empty() && age_ms <= ACTIVE_AGENT_MS {
         AgentPresence::Active
-    } else if reasons.is_empty() && age_ms <= 15 * 60 * 1000 {
+    } else if reasons.is_empty() && age_ms <= AWAY_AGENT_MS {
         AgentPresence::Away
     } else {
         AgentPresence::Stale
@@ -1273,7 +1430,7 @@ fn count_agents(agents: &[AgentView]) -> AgentCounts {
     counts
 }
 
-fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
+fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -1733,10 +1890,36 @@ fn compact_text(text: &str, limit: usize) -> String {
     result
 }
 
+fn checked_text(last: Option<Instant>) -> String {
+    match last {
+        Some(last_checked) => {
+            let elapsed = last_checked.elapsed();
+            if elapsed < Duration::from_secs(1) {
+                "just now".to_string()
+            } else {
+                format!("{}s ago", elapsed.as_secs())
+            }
+        }
+        None => "never".to_string(),
+    }
+}
+
 fn default_mesh_agent() -> String {
     env::var("TIDES_MESH_AGENT")
         .or_else(|_| env::var("PI_AGENT_NAME"))
         .unwrap_or_else(|_| "Orchestrator".to_string())
+}
+
+fn push_bounded<T>(items: &mut Vec<T>, value: T, cap: usize) {
+    items.push(value);
+    trim_front(items, cap);
+}
+
+fn trim_front<T>(items: &mut Vec<T>, cap: usize) {
+    if items.len() > cap {
+        let drain = items.len() - cap;
+        items.drain(0..drain);
+    }
 }
 
 fn read_dir_safe(path: &Path) -> anyhow::Result<Vec<fs::DirEntry>> {
