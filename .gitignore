@@ -1,0 +1,20 @@
+/target/
+**/target/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+
+# Pi/local orchestration state
+.pi/messenger/
+.pi/extensions/
+.pi/extensions.disabled/
+.pi/pi-messenger.json
+subagent-*.md
+gateway-nudges-*.md
+
+# Editor/local temp
+.vscode/
+.idea/
+*.swp
