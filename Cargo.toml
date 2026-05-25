@@ -1,0 +1,36 @@
+[workspace]
+members = [
+  "crates/ocean-core",
+  "crates/ocean-agent",
+  "crates/ocean-daemon",
+  "crates/ocean-cli",
+  "crates/ocean-tui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Ocean OS"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+crossterm = "0.29"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+ocean-core = { path = "crates/ocean-core" }
+ocean-agent = { path = "crates/ocean-agent" }
+pi-agent = "1.0.0"
+pi-ai = "1.0.0"
