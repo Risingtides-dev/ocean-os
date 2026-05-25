@@ -202,6 +202,13 @@ fn model_from_env() -> Model {
             64_000,
             8_192,
         ),
+        "deepseek-v4-flash" => Model::openai_compat(
+            "deepseek",
+            "deepseek-v4-flash",
+            "https://api.deepseek.com/v1",
+            64_000,
+            8_192,
+        ),
         "gpt-4o" => Model::openai_gpt_4o(),
         "gpt-4o-mini" => Model::openai_gpt_4o_mini(),
         "claude-sonnet-4-6" | "claude-sonnet" | "sonnet" => Model::anthropic_claude_sonnet_4_6(),
