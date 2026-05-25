@@ -40,6 +40,27 @@ pub enum RequestState {
     Errored,
 }
 
+impl RequestState {
+    /// Returns true when no later request-control action should mutate this state.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RequestState::Cancelled | RequestState::Completed | RequestState::Errored
+        )
+    }
+
+    /// Returns true when a client cancellation request can be accepted.
+    pub fn is_cancellable(self) -> bool {
+        matches!(
+            self,
+            RequestState::Queued
+                | RequestState::Running
+                | RequestState::WaitingForPermission
+                | RequestState::Cancelling
+        )
+    }
+}
+
 /// Payload for `POST /v1/prompt`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptRequest {
@@ -79,6 +100,17 @@ pub struct SessionSummary {
     pub title: String,
 }
 
+/// Response payload for `POST /v1/requests`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestCreateResponse {
+    pub ok: bool,
+    pub request_id: RequestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    pub state: RequestState,
+    pub message: String,
+}
+
 /// Current status snapshot for a request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestStatus {
@@ -98,6 +130,16 @@ pub struct RequestStatus {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// Response payload for `GET /v1/requests`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestsResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub requests: Vec<RequestStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// A client decision for a permission request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -109,7 +151,7 @@ pub enum PermissionDecision {
     },
 }
 
-/// Body for `POST /v1/permissions/:id/decision`.
+/// Body for `POST /v1/permissions/{id}/decision`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionDecisionRequest {
     pub permission_id: PermissionId,
@@ -117,7 +159,7 @@ pub struct PermissionDecisionRequest {
     pub decision: PermissionDecision,
 }
 
-/// Body for `POST /v1/requests/:id/cancel`.
+/// Body for `POST /v1/requests/{id}/cancel`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelRequest {
     pub request_id: RequestId,
@@ -273,5 +315,20 @@ mod tests {
 
         let roundtrip: PermissionDecisionRequest = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, decision);
+    }
+
+    #[test]
+    fn request_state_helpers_mark_control_boundaries() {
+        assert!(RequestState::Queued.is_cancellable());
+        assert!(RequestState::Running.is_cancellable());
+        assert!(RequestState::WaitingForPermission.is_cancellable());
+        assert!(RequestState::Cancelling.is_cancellable());
+
+        assert!(RequestState::Cancelled.is_terminal());
+        assert!(RequestState::Completed.is_terminal());
+        assert!(RequestState::Errored.is_terminal());
+
+        assert!(!RequestState::Completed.is_cancellable());
+        assert!(!RequestState::Running.is_terminal());
     }
 }
