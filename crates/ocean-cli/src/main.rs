@@ -64,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
                 session_id: None,
                 max_turns,
                 yolo,
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
             };
             let res: PromptResponse = client
                 .post(format!("{}/v1/prompt", cli.url))

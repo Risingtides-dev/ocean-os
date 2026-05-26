@@ -2,6 +2,7 @@
 members = [
   "crates/ocean-core",
   "crates/ocean-agent",
+  "crates/ocean-agent-sdk",
   "crates/ocean-providers",
   "crates/ocean-daemon",
   "crates/ocean-cli",
@@ -34,6 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ocean-core = { path = "crates/ocean-core" }
+ocean-agent-sdk = { path = "crates/ocean-agent-sdk" }
 ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }
 pi-agent = "1.0.0"

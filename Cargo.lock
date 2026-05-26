@@ -1260,6 +1260,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "ocean-cli"
 version = "0.1.0"
 dependencies = [
@@ -1290,6 +1303,7 @@ dependencies = [
  "axum",
  "chrono",
  "ocean-agent",
+ "ocean-agent-sdk",
  "ocean-core",
  "pi-agent",
  "serde",
@@ -1320,6 +1334,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.29.0",
+ "ocean-agent-sdk",
  "ocean-core",
  "ratatui",
  "reqwest",

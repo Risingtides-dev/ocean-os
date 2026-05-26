@@ -73,6 +73,8 @@ pub struct PromptRequest {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub yolo: bool,
+    #[serde(default)]
+    pub cwd: String,
 }
 
 /// Response payload for `POST /v1/prompt`.
@@ -85,9 +87,11 @@ pub struct PromptResponse {
     pub session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<i32>,
-    pub wall_ms: u128,
+    pub wall_ms: u64,
     pub stdout: String,
     pub stderr: String,
+    #[serde(default)]
+    pub cwd: String,
 }
 
 /// Summary item returned by `GET /v1/sessions`.
@@ -320,7 +324,7 @@ pub enum OceanEvent {
     },
     TurnFinished {
         ok: bool,
-        wall_ms: u128,
+        wall_ms: u64,
     },
     Cancelled {
         reason: Option<String>,

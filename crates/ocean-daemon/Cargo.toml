@@ -16,6 +16,7 @@ async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 ocean-agent.workspace = true
+ocean-agent-sdk.workspace = true
 ocean-core.workspace = true
 pi-agent.workspace = true
 serde.workspace = true

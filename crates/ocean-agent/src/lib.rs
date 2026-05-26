@@ -75,15 +75,20 @@ impl AgentRuntime {
         req.request_id = Some(request_id);
 
         let start = Instant::now();
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
         if let Some(stderr) = self.provider_preflight_error() {
             return PromptResponse {
                 request_id: Some(request_id),
                 ok: false,
                 session_id: req.session_id,
                 code: None,
-                wall_ms: start.elapsed().as_millis(),
+                wall_ms: start.elapsed().as_millis() as u64,
                 stdout: String::new(),
                 stderr,
+                cwd,
             };
         }
 
@@ -99,18 +104,20 @@ impl AgentRuntime {
                 ok: true,
                 session_id: Some(session_id),
                 code: Some(0),
-                wall_ms: start.elapsed().as_millis(),
+                wall_ms: start.elapsed().as_millis() as u64,
                 stdout,
                 stderr,
+                cwd,
             },
             Err(e) => PromptResponse {
                 request_id: Some(request_id),
                 ok: false,
                 session_id: req.session_id,
                 code: None,
-                wall_ms: start.elapsed().as_millis(),
+                wall_ms: start.elapsed().as_millis() as u64,
                 stdout: String::new(),
                 stderr: e.to_string(),
+                cwd,
             },
         }
     }
@@ -189,10 +196,13 @@ impl AgentRuntime {
         history.push(Message::user_text(req.prompt));
 
         let PromptControl { permission, cancel } = control;
-        let mut cfg = AgentConfig::new(self.model.clone(), system_prompt::build_system_prompt())
-            .with_tools(default_tools())
-            .with_max_turns(req.max_turns.unwrap_or(32))
-            .with_permission(permission);
+        let mut cfg = AgentConfig::new(
+            self.model.clone(),
+            system_prompt::build_system_prompt(Some(&req.cwd)),
+        )
+        .with_tools(default_tools())
+        .with_max_turns(req.max_turns.unwrap_or(32))
+        .with_permission(permission);
         cfg.stream_options.api_key = self.api_key.clone();
         cfg.stream_options.base_url = Some(self.provider_config.selection.base_url.clone());
         cfg.stream_options.cancel = cancel;
@@ -655,6 +665,7 @@ mod tests {
                     session_id: None,
                     max_turns: None,
                     yolo: false,
+                    cwd: ".".into(),
                 },
                 PromptControl::yolo(false),
             )
@@ -690,6 +701,7 @@ mod tests {
                     session_id: None,
                     max_turns: None,
                     yolo: false,
+                    cwd: ".".into(),
                 },
                 PromptControl::yolo(false),
             )
@@ -797,13 +809,25 @@ Guidelines:
 You operate inside the daemon's working directory unless a future client request supplies a project directory.
 "#;
 
-    pub fn build_system_prompt() -> String {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let project = load_project_prompt(&cwd);
+    /// Build the system prompt, optionally scoped to `cwd`.
+    pub fn build_system_prompt(cwd: Option<&str>) -> String {
+        let cwd = cwd
+            .and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(s))
+                }
+            })
+            .or_else(|| std::env::current_dir().ok());
+        let project = cwd
+            .as_ref()
+            .map(|p| load_project_prompt(p))
+            .unwrap_or_default();
         if project.is_empty() {
             BASE_SYSTEM_PROMPT.to_string()
         } else {
-            format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----{project}")
+            format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----\n{project}")
         }
     }
 

@@ -1,5 +1,7 @@
 use std::{collections::HashMap, convert::Infallible, env, net::SocketAddr, sync::Arc};
 
+use uuid::Uuid;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use axum::{
@@ -11,6 +13,11 @@ use axum::{
 };
 use chrono::Utc;
 use ocean_agent::{AgentRuntime, PromptControl};
+use ocean_agent_sdk::{
+    AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse,
+    AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus, ToolCall,
+    ToolCallId, ToolResult,
+};
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
@@ -112,6 +119,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(root))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/v1/agent/turns", post(agent_turn))
+        .route("/v1/agent/events", get(agent_events))
+        .route("/v1/agent/sessions", get(agent_sessions))
+        .route("/v1/agent/sessions/{id}", get(agent_session))
         .route("/v1/events", get(events))
         .route("/v1/prompt", post(prompt))
         .route("/v1/requests", get(requests).post(create_request))
@@ -840,6 +851,320 @@ async fn update_request_finished(
     status.finished_at = Some(Utc::now());
     let _ = control.handle.take();
     Some(desired_state)
+}
+
+// ---------------------------------------------------------------------------
+// /v1/agent/* handlers — product-shaped agent-turn API
+// ---------------------------------------------------------------------------
+
+async fn agent_turn(
+    State(state): State<AppState>,
+    Json(req): Json<AgentTurnRequest>,
+) -> (StatusCode, Json<AgentTurnResponse>) {
+    let session_id = req.session_id.unwrap_or_else(AgentSessionId::new_v4);
+    let turn_id = AgentTurnId::new_v4();
+    let event_prefix = turn_id.0.to_string()[..8].to_string();
+
+    // If new session, emit session_created first
+    if req.session_id.is_none() {
+        emit_agent(
+            &state.events,
+            session_id,
+            AgentTurnEvent::SessionCreated {
+                session_id,
+                title: req.prompt.chars().take(60).collect(),
+                cwd: req.cwd.clone(),
+            },
+        );
+    }
+
+    // Emit turn_started
+    emit_agent(
+        &state.events,
+        session_id,
+        AgentTurnEvent::TurnStarted {
+            turn_id,
+            session_id,
+        },
+    );
+
+    // Map to PromptRequest; yolo=true for V0 foreground-allow
+    let prompt_req = PromptRequest {
+        prompt: req.prompt,
+        request_id: None,
+        session_id: Some(core_sid(session_id)),
+        max_turns: None,
+        yolo: true,
+        cwd: req.cwd.clone(),
+    };
+
+    let control = PromptControl::yolo(true);
+    let res = state.runtime.prompt(prompt_req, control).await;
+
+    if res.ok {
+        if !res.stdout.trim().is_empty() {
+            emit_agent(
+                &state.events,
+                session_id,
+                AgentTurnEvent::AssistantTextDelta {
+                    turn_id,
+                    delta: res.stdout.clone(),
+                },
+            );
+        }
+        emit_agent(
+            &state.events,
+            session_id,
+            AgentTurnEvent::TurnFinished {
+                turn_id,
+                status: AgentTurnStatus::Completed,
+                error: None,
+            },
+        );
+    } else {
+        emit_agent(
+            &state.events,
+            session_id,
+            AgentTurnEvent::TurnFinished {
+                turn_id,
+                status: AgentTurnStatus::Failed,
+                error: Some(res.stderr.clone()),
+            },
+        );
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(AgentTurnResponse {
+            ok: true,
+            turn_id,
+            session_id,
+            status: if res.ok {
+                AgentTurnStatus::Completed
+            } else {
+                AgentTurnStatus::Failed
+            },
+            event_id_prefix: event_prefix,
+            error: if res.ok { None } else { Some(res.stderr) },
+        }),
+    )
+}
+
+async fn agent_events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|event| match event {
+        Ok(envelope) => {
+            if let Some(agent_event) = ocean_to_agent_event(envelope.event) {
+                let id = envelope.id.to_string();
+                let event_type = agent_event_type_name(&agent_event);
+                let data = serde_json::to_string(&agent_event).unwrap_or_else(|_| {
+                    r#"{"type":"error","message":"serialize failed"}"#.to_string()
+                });
+                Some(Ok(Event::default().id(id).event(event_type).data(data)))
+            } else {
+                None
+            }
+        }
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            let data = json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
+                .to_string();
+            Some(Ok(Event::default().event("error").data(data)))
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn agent_sessions(State(state): State<AppState>) -> Json<AgentSessionsResponse> {
+    let core_sessions = state.runtime.list_sessions().unwrap_or_default();
+    let summaries: Vec<AgentSessionSummary> = core_sessions
+        .into_iter()
+        .map(|s| AgentSessionSummary {
+            id: sdk_sid(s.id),
+            title: s.title,
+            cwd: String::new(),
+            updated_at: chrono::Utc::now(),
+            active_turn: None,
+            turn_count: s.turns,
+        })
+        .collect();
+    Json(AgentSessionsResponse {
+        ok: true,
+        sessions: summaries,
+        error: None,
+    })
+}
+
+async fn agent_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<AgentSessionId>,
+) -> (StatusCode, Json<AgentSessionResponse>) {
+    let core_id = core_sid(session_id);
+    match state.runtime.session_detail(core_id) {
+        Ok(session) => (
+            StatusCode::OK,
+            Json(AgentSessionResponse {
+                ok: true,
+                session: Some(ocean_agent_sdk::AgentSession {
+                    id: session_id,
+                    title: session.title.clone(),
+                    cwd: String::new(),
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    active_turn: None,
+                }),
+                turns: vec![],
+                error: None,
+            }),
+        ),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(AgentSessionResponse {
+                ok: false,
+                session: None,
+                turns: vec![],
+                error: Some("session not found".into()),
+            }),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversion helpers — bridge between core SessionId/Uuid and SDK wrappers
+// ---------------------------------------------------------------------------
+
+/// Wrap a raw Uuid in a SessionId type alias.
+fn core_sid(sdk_id: AgentSessionId) -> SessionId {
+    sdk_id.inner()
+}
+
+/// Wrap a raw Uuid in an AgentSessionId wrapper.
+fn sdk_sid(core_id: SessionId) -> AgentSessionId {
+    AgentSessionId(core_id)
+}
+
+fn emit_agent(events: &EventBus, session_id: AgentSessionId, event: AgentTurnEvent) {
+    if let Some(inner) = agent_to_ocean_event(event) {
+        let mut env = EventEnvelope::new(inner);
+        env.session_id = Some(core_sid(session_id));
+        events.emit(env);
+    }
+}
+
+fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
+    match event {
+        AgentTurnEvent::TurnStarted {
+            turn_id: _,
+            session_id: _,
+        } => None,
+        AgentTurnEvent::AssistantTextDelta { turn_id: _, delta } => {
+            Some(OceanEvent::AssistantDelta { text: delta })
+        }
+        AgentTurnEvent::ToolCallStarted { turn_id: _, call } => Some(OceanEvent::ToolStarted {
+            tool: call.name,
+            args: call.args_json,
+        }),
+        AgentTurnEvent::ToolCallFinished {
+            turn_id: _,
+            call_id: _,
+            result,
+        } => Some(OceanEvent::ToolEnded {
+            tool: "tool".into(),
+            is_error: !result.ok,
+        }),
+        AgentTurnEvent::TurnFinished {
+            turn_id: _,
+            status,
+            error: _,
+        } => Some(OceanEvent::TurnFinished {
+            ok: matches!(status, AgentTurnStatus::Completed),
+            wall_ms: 0,
+        }),
+        AgentTurnEvent::ToolCallChunk {
+            turn_id: _,
+            call_id: _,
+            chunk,
+        } => Some(OceanEvent::ToolOutput {
+            tool: "tool".into(),
+            text: chunk,
+            is_error: false,
+        }),
+        AgentTurnEvent::SessionCreated {
+            session_id: _,
+            title: _,
+            cwd: _,
+        } => Some(OceanEvent::SessionCreated),
+        AgentTurnEvent::Extension {
+            extension: _,
+            payload: _,
+        } => None,
+    }
+}
+
+fn ocean_to_agent_event(event: OceanEvent) -> Option<AgentTurnEvent> {
+    match event {
+        OceanEvent::AssistantDelta { text } => Some(AgentTurnEvent::AssistantTextDelta {
+            turn_id: AgentTurnId(Uuid::new_v4()),
+            delta: text,
+        }),
+        OceanEvent::ToolStarted { tool, args } => Some(AgentTurnEvent::ToolCallStarted {
+            turn_id: AgentTurnId(Uuid::new_v4()),
+            call: ToolCall {
+                id: ToolCallId(Uuid::new_v4()),
+                name: tool,
+                args_json: args,
+            },
+        }),
+        OceanEvent::ToolOutput {
+            tool: _,
+            text,
+            is_error,
+        } => Some(AgentTurnEvent::ToolCallFinished {
+            turn_id: AgentTurnId(Uuid::new_v4()),
+            call_id: ToolCallId(Uuid::new_v4()),
+            result: ToolResult {
+                ok: !is_error,
+                output: text,
+                metadata_json: None,
+            },
+        }),
+        OceanEvent::TurnFinished { ok, wall_ms: _, .. } => Some(AgentTurnEvent::TurnFinished {
+            turn_id: AgentTurnId(Uuid::new_v4()),
+            status: if ok {
+                AgentTurnStatus::Completed
+            } else {
+                AgentTurnStatus::Failed
+            },
+            error: None,
+        }),
+        OceanEvent::Cancelled { reason } => Some(AgentTurnEvent::TurnFinished {
+            turn_id: AgentTurnId(Uuid::new_v4()),
+            status: AgentTurnStatus::Cancelled,
+            error: reason,
+        }),
+        OceanEvent::Error { message } => Some(AgentTurnEvent::TurnFinished {
+            turn_id: AgentTurnId(Uuid::new_v4()),
+            status: AgentTurnStatus::Failed,
+            error: Some(message),
+        }),
+        _ => None,
+    }
+}
+
+fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
+    match event {
+        AgentTurnEvent::TurnStarted { .. } => "turn_started",
+        AgentTurnEvent::AssistantTextDelta { .. } => "assistant_text_delta",
+        AgentTurnEvent::ToolCallStarted { .. } => "tool_call_started",
+        AgentTurnEvent::ToolCallChunk { .. } => "tool_call_chunk",
+        AgentTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
+        AgentTurnEvent::TurnFinished { .. } => "turn_finished",
+        AgentTurnEvent::SessionCreated { .. } => "session_created",
+        AgentTurnEvent::Extension {
+            extension: _,
+            payload: _,
+        } => "extension",
+    }
 }
 
 fn emit(
