@@ -900,6 +900,21 @@ async fn agent_turn(
 
     let control = PromptControl::yolo(true);
     let res = state.runtime.prompt(prompt_req, control).await;
+    let output_tokens = estimate_visible_tokens(&res.stdout);
+    let tokens_per_second = if res.wall_ms > 0 {
+        Some((output_tokens as f64) / (res.wall_ms as f64 / 1000.0))
+    } else {
+        None
+    };
+    tracing::info!(
+        turn_id = %turn_id,
+        session_id = %session_id,
+        ok = res.ok,
+        wall_ms = res.wall_ms,
+        output_tokens,
+        tokens_per_second,
+        "agent turn finished"
+    );
 
     if res.ok {
         if !res.stdout.trim().is_empty() {
@@ -919,6 +934,9 @@ async fn agent_turn(
                 turn_id,
                 status: AgentTurnStatus::Completed,
                 error: None,
+                wall_ms: Some(res.wall_ms),
+                output_tokens: Some(output_tokens),
+                tokens_per_second,
             },
         );
     } else {
@@ -929,6 +947,9 @@ async fn agent_turn(
                 turn_id,
                 status: AgentTurnStatus::Failed,
                 error: Some(res.stderr.clone()),
+                wall_ms: Some(res.wall_ms),
+                output_tokens: Some(output_tokens),
+                tokens_per_second,
             },
         );
     }
@@ -1043,6 +1064,10 @@ fn sdk_sid(core_id: SessionId) -> AgentSessionId {
     AgentSessionId(core_id)
 }
 
+fn estimate_visible_tokens(text: &str) -> u64 {
+    text.split_whitespace().count() as u64
+}
+
 fn emit_agent(events: &EventBus, session_id: AgentSessionId, event: AgentTurnEvent) {
     if let Some(inner) = agent_to_ocean_event(event) {
         let mut env = EventEnvelope::new(inner);
@@ -1076,9 +1101,12 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             turn_id: _,
             status,
             error: _,
+            wall_ms,
+            output_tokens: _,
+            tokens_per_second: _,
         } => Some(OceanEvent::TurnFinished {
             ok: matches!(status, AgentTurnStatus::Completed),
-            wall_ms: 0,
+            wall_ms: wall_ms.unwrap_or(0),
         }),
         AgentTurnEvent::ToolCallChunk {
             turn_id: _,
@@ -1128,7 +1156,7 @@ fn ocean_to_agent_event(event: OceanEvent) -> Option<AgentTurnEvent> {
                 metadata_json: None,
             },
         }),
-        OceanEvent::TurnFinished { ok, wall_ms: _, .. } => Some(AgentTurnEvent::TurnFinished {
+        OceanEvent::TurnFinished { ok, wall_ms, .. } => Some(AgentTurnEvent::TurnFinished {
             turn_id: AgentTurnId(Uuid::new_v4()),
             status: if ok {
                 AgentTurnStatus::Completed
@@ -1136,16 +1164,25 @@ fn ocean_to_agent_event(event: OceanEvent) -> Option<AgentTurnEvent> {
                 AgentTurnStatus::Failed
             },
             error: None,
+            wall_ms: Some(wall_ms),
+            output_tokens: None,
+            tokens_per_second: None,
         }),
         OceanEvent::Cancelled { reason } => Some(AgentTurnEvent::TurnFinished {
             turn_id: AgentTurnId(Uuid::new_v4()),
             status: AgentTurnStatus::Cancelled,
             error: reason,
+            wall_ms: None,
+            output_tokens: None,
+            tokens_per_second: None,
         }),
         OceanEvent::Error { message } => Some(AgentTurnEvent::TurnFinished {
             turn_id: AgentTurnId(Uuid::new_v4()),
             status: AgentTurnStatus::Failed,
             error: Some(message),
+            wall_ms: None,
+            output_tokens: None,
+            tokens_per_second: None,
         }),
         _ => None,
     }

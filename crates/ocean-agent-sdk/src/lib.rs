@@ -299,6 +299,15 @@ pub enum AgentTurnEvent {
         status: AgentTurnStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Wall-clock duration for the turn, when known by the daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wall_ms: Option<u64>,
+        /// Approximate visible output token count, when provider usage is not exposed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u64>,
+        /// Approximate visible output tokens per second.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_per_second: Option<f64>,
     },
     /// A session was created as a side-effect of submitting a turn with
     /// `session_id: null`.

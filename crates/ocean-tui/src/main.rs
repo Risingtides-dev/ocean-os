@@ -2234,12 +2234,16 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             turn_id,
             status,
             error,
+            wall_ms,
+            output_tokens,
+            tokens_per_second,
         } => {
             if app.active_agent_turn_id == Some(turn_id) {
                 app.active_agent_turn_id = None;
             }
             app.streaming_agent_turn_id = None;
-            app.status = format!("agent turn {:?}: {}", status, short_id(turn_id));
+            let perf = format_agent_turn_perf(wall_ms, output_tokens, tokens_per_second);
+            app.status = format!("agent turn {:?}: {}{}", status, short_id(turn_id), perf);
             match error {
                 Some(error) if !error.trim().is_empty() => app.push_transcript(format!(
                     "✗ agent turn [{}] {:?}: {}",
@@ -2248,9 +2252,10 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                     compact_text(&error, 72)
                 )),
                 _ => app.push_transcript(format!(
-                    "✓ agent turn [{}] {:?}",
+                    "✓ agent turn [{}] {:?}{}",
                     short_id(turn_id),
-                    status
+                    status,
+                    perf
                 )),
             }
         }
@@ -2261,6 +2266,21 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 compact_text(&payload.to_string(), 72)
             ));
         }
+    }
+}
+
+fn format_agent_turn_perf(
+    wall_ms: Option<u64>,
+    output_tokens: Option<u64>,
+    tokens_per_second: Option<f64>,
+) -> String {
+    match (wall_ms, output_tokens, tokens_per_second) {
+        (Some(ms), Some(tokens), Some(tps)) => {
+            format!(" · {ms}ms · {tokens} tok · {tps:.1} tok/s")
+        }
+        (Some(ms), Some(tokens), None) => format!(" · {ms}ms · {tokens} tok"),
+        (Some(ms), None, _) => format!(" · {ms}ms"),
+        _ => String::new(),
     }
 }
 
@@ -2637,6 +2657,9 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             turn_id,
             status,
             error,
+            wall_ms,
+            output_tokens,
+            tokens_per_second,
         } => match error.as_deref() {
             Some(error) if !error.trim().is_empty() => format!(
                 "agent turn_finished [{}] {:?}: {}",
@@ -2644,7 +2667,12 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
                 status,
                 compact_text(error, 60)
             ),
-            _ => format!("agent turn_finished [{}] {:?}", short_id(turn_id), status),
+            _ => format!(
+                "agent turn_finished [{}] {:?}{}",
+                short_id(turn_id),
+                status,
+                format_agent_turn_perf(*wall_ms, *output_tokens, *tokens_per_second)
+            ),
         },
         AgentTurnEvent::Extension { extension, payload } => format!(
             "agent extension {} {}",
