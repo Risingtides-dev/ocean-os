@@ -31,7 +31,10 @@ fn draw_room_pm(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
         frame,
         area,
         "PM",
-        app.transcript_lines(area.height.saturating_sub(2) as usize),
+        app.transcript_lines(
+            area.width.saturating_sub(2) as usize,
+            area.height.saturating_sub(2) as usize,
+        ),
     );
 }
 

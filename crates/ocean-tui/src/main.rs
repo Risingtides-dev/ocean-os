@@ -465,30 +465,36 @@ impl DaemonApp {
             .collect()
     }
 
-    fn transcript_lines(&self, height: usize) -> Vec<Line<'static>> {
+    fn transcript_lines(&self, width: usize, height: usize) -> Vec<Line<'static>> {
         let visible = height.max(1);
         if self.transcript.is_empty() {
             return vec![Line::from("Type a PM instruction below, then press Enter.")];
         }
-        let end = self.transcript.len().saturating_sub(
+
+        let wrap_width = width.max(8);
+        let visual_lines: Vec<String> = self
+            .transcript
+            .iter()
+            .flat_map(|line| wrap_transcript_line(line, wrap_width))
+            .collect();
+        let end = visual_lines.len().saturating_sub(
             self.transcript_scroll
-                .min(self.transcript.len().saturating_sub(1)),
+                .min(visual_lines.len().saturating_sub(1)),
         );
         let start = end.saturating_sub(visible);
-        self.transcript[start..end]
+        visual_lines[start..end]
             .iter()
             .map(|line| styled_transcript_line(line))
             .collect()
     }
 
     fn scroll_transcript(&mut self, delta: isize) {
-        let max_scroll = self.transcript.len().saturating_sub(1);
         self.transcript_scroll = if delta.is_negative() {
             self.transcript_scroll.saturating_sub(delta.unsigned_abs())
         } else {
             self.transcript_scroll
                 .saturating_add(delta as usize)
-                .min(max_scroll)
+                .min(10_000)
         };
         self.status = if self.transcript_scroll == 0 {
             "chat: live bottom".to_string()
@@ -3140,7 +3146,11 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(app.transcript_lines(layout[0].height as usize)).wrap(Wrap { trim: false }),
+        Paragraph::new(app.transcript_lines(
+            layout[0].width.saturating_sub(2) as usize,
+            layout[0].height as usize,
+        ))
+        .wrap(Wrap { trim: false }),
         layout[0],
     );
 
@@ -4042,6 +4052,66 @@ fn compact_text(text: &str, limit: usize) -> String {
     let mut result: String = compact.chars().take(limit.saturating_sub(1)).collect();
     result.push('…');
     result
+}
+
+fn wrap_transcript_line(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current_len == 0 {
+            if word_len <= width {
+                current.push_str(word);
+                current_len = word_len;
+            } else {
+                split_long_word(word, width, &mut lines);
+            }
+        } else if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current_len = 0;
+            if word_len <= width {
+                current.push_str(word);
+                current_len = word_len;
+            } else {
+                split_long_word(word, width, &mut lines);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn split_long_word(word: &str, width: usize, lines: &mut Vec<String>) {
+    let width = width.max(1);
+    let mut chunk = String::new();
+    let mut len = 0usize;
+    for ch in word.chars() {
+        if len >= width {
+            lines.push(std::mem::take(&mut chunk));
+            len = 0;
+        }
+        chunk.push(ch);
+        len += 1;
+    }
+    if !chunk.is_empty() {
+        lines.push(chunk);
+    }
 }
 
 fn styled_transcript_line(text: &str) -> Line<'static> {
