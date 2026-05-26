@@ -193,7 +193,9 @@ impl AgentRuntime {
         };
 
         let mut history = session.messages.clone();
-        if self.provider_config.selection.provider == ProviderId::DeepSeek {
+        if self.provider_config.selection.provider == ProviderId::DeepSeek
+            && self.provider_config.selection.model == "deepseek-reasoner"
+        {
             strip_assistant_thinking_content(&mut history);
         }
         history.push(Message::user_text(req.prompt));
@@ -663,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_assistant_thinking_before_deepseek_history_replay() {
+    fn strips_assistant_thinking_for_deepseek_reasoner_history_replay() {
         let mut messages = vec![Message::Assistant(AssistantMessage {
             content: vec![
                 Content::Thinking {
