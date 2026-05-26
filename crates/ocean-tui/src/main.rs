@@ -14,7 +14,10 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -1542,7 +1545,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -1569,7 +1572,7 @@ fn run_daemon(url: String) -> anyhow::Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
@@ -1630,7 +1633,7 @@ fn run_mesh(cli: MeshCli) -> anyhow::Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
@@ -1677,6 +1680,11 @@ fn mesh_tick_due(state: &AppState) -> bool {
 fn daemon_key_action(app: &DaemonApp, event: Event) -> Option<Action> {
     match event {
         Event::Paste(text) if !app.show_help => Some(Action::Paste(text)),
+        Event::Mouse(mouse) if !app.show_help => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(Action::FocusPrev),
+            MouseEventKind::ScrollDown => Some(Action::FocusNext),
+            _ => None,
+        },
         Event::Key(key) if !key_is_press_or_repeat(&key) => None,
         Event::Key(key) if key.code == KeyCode::F(10) => Some(Action::ToggleHelp),
         Event::Key(key) if app.show_help => match key.code {
