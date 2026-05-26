@@ -1,6 +1,6 @@
 # ocean-rs architecture
 
-Ocean-rs is a Rust-native agent runtime for Ocean OS.
+Ocean-rs is a Rust-native Pi-style coding-agent harness/runtime for Ocean OS. The daemon owns runtime authority; `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that harness.
 
 ## Crates
 
@@ -43,7 +43,11 @@ See `docs/OCEAN_NATIVE_INTERNALS_MAP.md` for the current Pi-borrowed
 `ocean-agent` surfaces and the extraction order that preserves smoke behavior.
 
 ocean-tui
-  ratatui client.
+  Active ratatui steering cockpit and Rust-native Tides Mesh MeshFloor. It renders floor state, prompts, sessions, requests, events, approvals, and mesh panels while leaving provider calls, tools, sessions, and agent loops under daemon authority.
+
+  Main layout/parity references:
+  - docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md
+  - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
 
 ocean-plugin
   WASM/subprocess plugin runtime.
@@ -51,7 +55,7 @@ ocean-plugin
 
 ## API model
 
-Clients do not directly run agents. They connect to the daemon.
+Clients do not directly run agents. They connect to the daemon. `ocean-tui` is still an active operator cockpit: it steers requests, approvals, cancellation, and MeshFloor visibility through protocol calls instead of becoming a second runtime.
 
 ```text
 OceanTUI ─┐

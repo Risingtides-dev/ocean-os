@@ -1,6 +1,7 @@
 use std::{collections::HashMap, convert::Infallible, env, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
+use async_trait::async_trait;
 use axum::{
     extract::{Path, State},
     http::Method,
@@ -9,18 +10,24 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use ocean_agent::AgentRuntime;
+use ocean_agent::{AgentRuntime, PromptControl};
 use ocean_core::{
-    EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse, PermissionDecision,
-    PermissionDecisionRequest, PermissionId, PromptRequest, RequestControlResponse,
-    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, SessionId,
+    EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
+    PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
+    PromptRequest, RequestControlResponse, RequestCreateResponse, RequestId, RequestState,
+    RequestStatus, RequestsResponse, SessionId,
 };
-use serde_json::json;
-use tokio::sync::{broadcast, RwLock};
+use pi_agent::{PermissionDecision as AgentPermissionDecision, PermissionPolicy};
+use serde_json::{json, Value};
+use tokio::{
+    sync::{broadcast, oneshot, RwLock},
+    task::JoinHandle,
+};
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
     Stream, StreamExt,
 };
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -31,9 +38,32 @@ struct AppState {
     runtime: Arc<AgentRuntime>,
     events: EventBus,
     requests: RequestRegistry,
+    permissions: PermissionRegistry,
 }
 
-type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestStatus>>>;
+type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
+type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
+
+struct RequestControl {
+    status: RequestStatus,
+    cancel: CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct PermissionWaiter {
+    request_id: RequestId,
+    sender: Option<oneshot::Sender<AgentPermissionDecision>>,
+}
+
+struct DaemonPermissionPolicy {
+    allow_mutating: bool,
+    request_id: RequestId,
+    session_id: Option<SessionId>,
+    events: EventBus,
+    permissions: PermissionRegistry,
+    requests: RequestRegistry,
+    cancel: CancellationToken,
+}
 
 #[derive(Clone)]
 struct EventBus {
@@ -69,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         runtime: Arc::new(AgentRuntime::from_env()?),
         events: EventBus::new(1024),
         requests: Arc::new(RwLock::new(HashMap::new())),
+        permissions: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let cors = CorsLayer::new()
@@ -79,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/v1/events", get(events))
         .route("/v1/prompt", post(prompt))
         .route("/v1/requests", get(requests).post(create_request))
@@ -102,6 +134,7 @@ async fn root() -> Json<serde_json::Value> {
         "service": "ocean-daemon",
         "routes": [
             "GET /health",
+            "GET /ready",
             "GET /v1/events",
             "POST /v1/prompt",
             "GET /v1/requests",
@@ -120,6 +153,20 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").into(),
         backend: state.runtime.backend_name().to_string(),
     })
+}
+
+async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(state.runtime.provider_readiness()).unwrap_or_else(|err| {
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "READINESS_SERIALIZE_ERROR",
+                    "message": err.to_string()
+                }
+            })
+        }),
+    )
 }
 
 async fn events(
@@ -157,10 +204,12 @@ async fn prompt(
     State(state): State<AppState>,
     Json(mut req): Json<PromptRequest>,
 ) -> Json<ocean_core::PromptResponse> {
-    let request_id = register_running_request(&state, &mut req, "prompt running").await;
+    let (request_id, cancel) =
+        register_running_request(&state, &mut req, "prompt running", RequestState::Running).await;
     emit_user_message(&state.events, &req, request_id);
 
-    let res = state.runtime.prompt(req).await;
+    let control = build_prompt_control(&state, request_id, req.session_id, req.yolo, cancel);
+    let res = state.runtime.prompt(req, control).await;
     record_prompt_result(&state, request_id, &res).await;
 
     Json(res)
@@ -170,16 +219,23 @@ async fn create_request(
     State(state): State<AppState>,
     Json(mut req): Json<PromptRequest>,
 ) -> Json<RequestCreateResponse> {
-    let request_id =
-        register_running_request(&state, &mut req, "request accepted; prompt running").await;
+    let (request_id, cancel) = register_running_request(
+        &state,
+        &mut req,
+        "request accepted; prompt running",
+        RequestState::Running,
+    )
+    .await;
     let session_id = req.session_id;
     emit_user_message(&state.events, &req, request_id);
 
+    let control = build_prompt_control(&state, request_id, session_id, req.yolo, cancel);
     let task_state = state.clone();
-    tokio::spawn(async move {
-        let res = task_state.runtime.prompt(req).await;
+    let handle = tokio::spawn(async move {
+        let res = task_state.runtime.prompt(req, control).await;
         record_prompt_result(&task_state, request_id, &res).await;
     });
+    attach_request_handle(&state, request_id, handle).await;
 
     Json(RequestCreateResponse {
         ok: true,
@@ -195,7 +251,7 @@ async fn cancel_request(
     Path(request_id): Path<RequestId>,
 ) -> Json<RequestControlResponse> {
     let mut requests = state.requests.write().await;
-    let Some(status) = requests.get_mut(&request_id) else {
+    let Some(control) = requests.get_mut(&request_id) else {
         return Json(RequestControlResponse {
             ok: false,
             request_id,
@@ -204,24 +260,29 @@ async fn cancel_request(
         });
     };
 
-    if !status.state.is_cancellable() {
+    if !control.status.state.is_cancellable() {
         return Json(RequestControlResponse {
             ok: false,
             request_id,
-            state: status.state,
+            state: control.status.state,
             message: format!(
                 "request is already terminal ({:?}); cancel ignored",
-                status.state
+                control.status.state
             ),
         });
     }
 
-    status.state = RequestState::Cancelling;
-    status.message =
-        Some("cancel requested; cooperative runtime cancellation token is not wired yet".into());
-    status.updated_at = Some(Utc::now());
-    let session_id = status.session_id;
+    control.status.state = RequestState::Cancelling;
+    control.status.message = Some("cancel requested; cancellation token sent".into());
+    control.status.updated_at = Some(Utc::now());
+    let session_id = control.status.session_id;
+    let permission_id = control.status.permission_id;
+    control.cancel.cancel();
     drop(requests);
+
+    if let Some(permission_id) = permission_id {
+        cancel_permission_waiter(&state.permissions, permission_id, request_id).await;
+    }
 
     emit(
         &state.events,
@@ -229,9 +290,7 @@ async fn cancel_request(
         Some(request_id),
         None,
         OceanEvent::Cancelled {
-            reason: Some(
-                "cancel requested; runtime will mark cancelled when current turn returns".into(),
-            ),
+            reason: Some("cancel requested; runtime cancellation token signalled".into()),
         },
     );
 
@@ -239,7 +298,7 @@ async fn cancel_request(
         ok: true,
         request_id,
         state: RequestState::Cancelling,
-        message: "cancel requested; cooperative runtime cancellation token is next".into(),
+        message: "cancel requested; runtime cancellation token signalled".into(),
     })
 }
 
@@ -248,28 +307,174 @@ async fn permission_decision(
     Path(permission_id): Path<PermissionId>,
     Json(decision): Json<PermissionDecisionRequest>,
 ) -> Json<PermissionControlResponse> {
-    let (allowed, reason) = match decision.decision {
-        PermissionDecision::Allow => (true, None),
-        PermissionDecision::Deny { reason } => (false, reason),
+    if decision.permission_id != permission_id {
+        return Json(PermissionControlResponse {
+            ok: false,
+            permission_id,
+            message: "permission id mismatch between path and body".into(),
+        });
+    }
+
+    let waiter = {
+        let mut permissions = state.permissions.write().await;
+        permissions.remove(&permission_id)
     };
+
+    let Some(mut waiter) = waiter else {
+        return Json(PermissionControlResponse {
+            ok: false,
+            permission_id,
+            message: "permission request not found or already handled".into(),
+        });
+    };
+
+    let agent_decision = match decision.decision {
+        PermissionDecisionBody::Allow => AgentPermissionDecision::Allow,
+        PermissionDecisionBody::Deny { reason } => AgentPermissionDecision::Deny {
+            reason: reason.unwrap_or_else(|| "permission denied by operator".into()),
+        },
+    };
+
+    if let Some(sender) = waiter.sender.take() {
+        let _ = sender.send(agent_decision.clone());
+    }
+
+    update_request_permission_result(
+        &state.requests,
+        waiter.request_id,
+        permission_id,
+        agent_decision.clone(),
+    )
+    .await;
 
     emit(
         &state.events,
         None,
-        None,
+        Some(waiter.request_id),
         Some(permission_id),
-        OceanEvent::PermissionDecision { allowed, reason },
+        OceanEvent::PermissionDecision {
+            allowed: matches!(agent_decision, AgentPermissionDecision::Allow),
+            reason: match &agent_decision {
+                AgentPermissionDecision::Allow => None,
+                AgentPermissionDecision::AllowSession => Some("allow_session".into()),
+                AgentPermissionDecision::Deny { reason } => Some(reason.clone()),
+            },
+        },
     );
 
     Json(PermissionControlResponse {
-        ok: decision.permission_id == permission_id,
+        ok: true,
         permission_id,
-        message: if decision.permission_id == permission_id {
-            "permission decision recorded; runtime permission wait hook is next".into()
-        } else {
-            "permission id mismatch between path and body".into()
-        },
+        message: "permission decision recorded and waiter released".into(),
     })
+}
+
+fn build_prompt_control(
+    state: &AppState,
+    request_id: RequestId,
+    session_id: Option<SessionId>,
+    allow_mutating: bool,
+    cancel: CancellationToken,
+) -> PromptControl {
+    let control: Arc<dyn PermissionPolicy> = if allow_mutating {
+        Arc::new(DaemonPermissionPolicy {
+            allow_mutating: true,
+            request_id,
+            session_id,
+            events: state.events.clone(),
+            permissions: state.permissions.clone(),
+            requests: state.requests.clone(),
+            cancel: cancel.clone(),
+        })
+    } else {
+        Arc::new(DaemonPermissionPolicy {
+            allow_mutating: false,
+            request_id,
+            session_id,
+            events: state.events.clone(),
+            permissions: state.permissions.clone(),
+            requests: state.requests.clone(),
+            cancel: cancel.clone(),
+        })
+    };
+
+    PromptControl::new(control).with_cancel(cancel)
+}
+
+#[async_trait]
+impl PermissionPolicy for DaemonPermissionPolicy {
+    async fn check(&self, tool_name: &str, args: &Value) -> AgentPermissionDecision {
+        if self.allow_mutating {
+            return AgentPermissionDecision::Allow;
+        }
+
+        let permission_id = PermissionId::new_v4();
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut requests = self.requests.write().await;
+            if let Some(control) = requests.get_mut(&self.request_id) {
+                control.status.state = RequestState::WaitingForPermission;
+                control.status.permission_id = Some(permission_id);
+                control.status.message = Some(format!("waiting on permission for {tool_name}"));
+                control.status.updated_at = Some(Utc::now());
+            }
+        }
+
+        {
+            let mut permissions = self.permissions.write().await;
+            permissions.insert(
+                permission_id,
+                PermissionWaiter {
+                    request_id: self.request_id,
+                    sender: Some(tx),
+                },
+            );
+        }
+
+        emit(
+            &self.events,
+            self.session_id,
+            Some(self.request_id),
+            Some(permission_id),
+            OceanEvent::PermissionRequest {
+                tool: tool_name.to_string(),
+                reason: format!("permission required for {tool_name}"),
+                args: args.clone(),
+            },
+        );
+
+        let decision = tokio::select! {
+            decision = rx => match decision {
+                Ok(decision) => decision,
+                Err(_) => AgentPermissionDecision::Deny {
+                    reason: "permission decision channel closed".into(),
+                },
+            },
+            _ = self.cancel.cancelled() => AgentPermissionDecision::Deny {
+                reason: "request cancelled while waiting for permission".into(),
+            },
+        };
+
+        {
+            let mut permissions = self.permissions.write().await;
+            permissions.remove(&permission_id);
+        }
+
+        if matches!(decision, AgentPermissionDecision::Deny { .. }) && self.cancel.is_cancelled() {
+            let mut requests = self.requests.write().await;
+            if let Some(control) = requests.get_mut(&self.request_id) {
+                if !control.status.state.is_terminal() {
+                    control.status.state = RequestState::Cancelling;
+                    control.status.message =
+                        Some("cancel requested while waiting for permission".into());
+                    control.status.updated_at = Some(Utc::now());
+                }
+            }
+        }
+
+        decision
+    }
 }
 
 async fn sessions(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -285,7 +490,7 @@ async fn requests(State(state): State<AppState>) -> Json<RequestsResponse> {
         .read()
         .await
         .values()
-        .cloned()
+        .map(|control| control.status.clone())
         .collect::<Vec<_>>();
     requests.sort_by_key(|status| status.started_at);
     requests.reverse();
@@ -300,26 +505,92 @@ async fn register_running_request(
     state: &AppState,
     req: &mut PromptRequest,
     message: impl Into<String>,
-) -> RequestId {
+    state_value: RequestState,
+) -> (RequestId, CancellationToken) {
     let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
     req.request_id = Some(request_id);
+    let cancel = CancellationToken::new();
     let now = Utc::now();
 
     state.requests.write().await.insert(
         request_id,
-        RequestStatus {
-            request_id,
-            session_id: req.session_id,
-            state: RequestState::Running,
-            permission_id: None,
-            message: Some(message.into()),
-            started_at: Some(now),
-            updated_at: Some(now),
-            finished_at: None,
+        RequestControl {
+            status: RequestStatus {
+                request_id,
+                session_id: req.session_id,
+                state: state_value,
+                permission_id: None,
+                message: Some(message.into()),
+                started_at: Some(now),
+                updated_at: Some(now),
+                finished_at: None,
+            },
+            cancel: cancel.clone(),
+            handle: None,
         },
     );
 
-    request_id
+    (request_id, cancel)
+}
+
+async fn attach_request_handle(state: &AppState, request_id: RequestId, handle: JoinHandle<()>) {
+    let mut requests = state.requests.write().await;
+    if let Some(control) = requests.get_mut(&request_id) {
+        control.handle = Some(handle);
+    }
+}
+
+async fn cancel_permission_waiter(
+    permissions: &PermissionRegistry,
+    permission_id: PermissionId,
+    request_id: RequestId,
+) {
+    let waiter = {
+        let mut permissions = permissions.write().await;
+        permissions.remove(&permission_id)
+    };
+
+    if let Some(mut waiter) = waiter {
+        if waiter.request_id != request_id {
+            return;
+        }
+        if let Some(sender) = waiter.sender.take() {
+            let _ = sender.send(AgentPermissionDecision::Deny {
+                reason: "request cancelled while waiting for permission".into(),
+            });
+        }
+    }
+}
+
+async fn update_request_permission_result(
+    requests: &RequestRegistry,
+    request_id: RequestId,
+    permission_id: PermissionId,
+    decision: AgentPermissionDecision,
+) {
+    let mut requests = requests.write().await;
+    let Some(control) = requests.get_mut(&request_id) else {
+        return;
+    };
+
+    if control.status.state.is_terminal()
+        || matches!(control.status.state, RequestState::Cancelling)
+    {
+        return;
+    }
+
+    control.status.state = RequestState::Running;
+    control.status.permission_id = None;
+    control.status.message = Some(match decision {
+        AgentPermissionDecision::Allow => format!("permission {permission_id} allowed"),
+        AgentPermissionDecision::AllowSession => {
+            format!("permission {permission_id} allowed for session")
+        }
+        AgentPermissionDecision::Deny { ref reason } => {
+            format!("permission {permission_id} denied: {reason}")
+        }
+    });
+    control.status.updated_at = Some(Utc::now());
 }
 
 fn emit_user_message(events: &EventBus, req: &PromptRequest, request_id: RequestId) {
@@ -417,7 +688,8 @@ async fn update_request_finished(
     message: String,
 ) -> Option<RequestState> {
     let mut requests = requests.write().await;
-    let status = requests.get_mut(&request_id)?;
+    let control = requests.get_mut(&request_id)?;
+    let status = &mut control.status;
 
     if matches!(
         status.state,
@@ -431,10 +703,12 @@ async fn update_request_finished(
         );
         status.updated_at = Some(Utc::now());
         status.finished_at = Some(Utc::now());
+        let _ = control.handle.take();
         return Some(RequestState::Cancelled);
     }
 
     if status.state.is_terminal() {
+        let _ = control.handle.take();
         return Some(status.state);
     }
 
@@ -443,6 +717,7 @@ async fn update_request_finished(
     status.message = Some(message);
     status.updated_at = Some(Utc::now());
     status.finished_at = Some(Utc::now());
+    let _ = control.handle.take();
     Some(desired_state)
 }
 
@@ -480,16 +755,20 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 mod tests {
     use super::*;
 
-    fn status(request_id: RequestId, state: RequestState) -> RequestStatus {
-        RequestStatus {
-            request_id,
-            session_id: None,
-            state,
-            permission_id: None,
-            message: None,
-            started_at: Some(Utc::now()),
-            updated_at: Some(Utc::now()),
-            finished_at: None,
+    fn status(request_id: RequestId, state: RequestState) -> RequestControl {
+        RequestControl {
+            status: RequestStatus {
+                request_id,
+                session_id: None,
+                state,
+                permission_id: None,
+                message: None,
+                started_at: Some(Utc::now()),
+                updated_at: Some(Utc::now()),
+                finished_at: None,
+            },
+            cancel: CancellationToken::new(),
+            handle: None,
         }
     }
 
@@ -513,8 +792,8 @@ mod tests {
         assert_eq!(state, Some(RequestState::Completed));
         let requests = requests.read().await;
         let status = requests.get(&request_id).unwrap();
-        assert_eq!(status.state, RequestState::Completed);
-        assert_eq!(status.message, None);
+        assert_eq!(status.status.state, RequestState::Completed);
+        assert_eq!(status.status.message, None);
     }
 
     #[tokio::test]
@@ -537,12 +816,54 @@ mod tests {
         assert_eq!(state, Some(RequestState::Cancelled));
         let requests = requests.read().await;
         let status = requests.get(&request_id).unwrap();
-        assert_eq!(status.state, RequestState::Cancelled);
-        assert!(status.finished_at.is_some());
+        assert_eq!(status.status.state, RequestState::Cancelled);
+        assert!(status.status.finished_at.is_some());
         assert!(status
+            .status
             .message
             .as_deref()
             .unwrap_or_default()
             .contains("cancel requested"));
+    }
+    #[tokio::test]
+    async fn permission_result_does_not_resume_cancelling_request() {
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let mut control = status(request_id, RequestState::Cancelling);
+        control.status.permission_id = Some(permission_id);
+        let requests = Arc::new(RwLock::new(HashMap::from([(request_id, control)])));
+
+        update_request_permission_result(
+            &requests,
+            request_id,
+            permission_id,
+            AgentPermissionDecision::Allow,
+        )
+        .await;
+
+        let requests = requests.read().await;
+        let status = requests.get(&request_id).unwrap();
+        assert_eq!(status.status.state, RequestState::Cancelling);
+        assert_eq!(status.status.permission_id, Some(permission_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_permission_waiter_releases_waiter_with_deny() {
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let (tx, rx) = oneshot::channel();
+        let permissions = Arc::new(RwLock::new(HashMap::from([(
+            permission_id,
+            PermissionWaiter {
+                request_id,
+                sender: Some(tx),
+            },
+        )])));
+
+        cancel_permission_waiter(&permissions, permission_id, request_id).await;
+
+        let decision = rx.await.unwrap();
+        assert!(matches!(decision, AgentPermissionDecision::Deny { .. }));
+        assert!(permissions.read().await.get(&permission_id).is_none());
     }
 }

@@ -245,13 +245,17 @@ impl DaemonApp {
     }
 
     fn activity_lines(&self) -> Vec<Line<'static>> {
+        self.event_lines(24)
+    }
+
+    fn event_lines(&self, limit: usize) -> Vec<Line<'static>> {
         if self.activity.is_empty() {
-            return vec![Line::from("Waiting for daemon events...")];
+            return vec![Line::from("Waiting for live events...")];
         }
         self.activity
             .iter()
             .rev()
-            .take(24)
+            .take(limit)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -533,7 +537,10 @@ struct InboxMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 struct AgentRecord {
-    agent: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     pid: Option<i32>,
     #[serde(default, rename = "updatedAt")]
@@ -550,6 +557,18 @@ struct AgentRecord {
     last_event: Option<String>,
     #[serde(default)]
     lifecycle: Option<String>,
+    #[serde(default)]
+    status_message: Option<String>,
+    #[serde(default)]
+    activity: Option<AgentActivity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentActivity {
+    #[serde(default, rename = "lastActivityAt")]
+    last_activity_at: Option<String>,
+    #[serde(default, rename = "lastToolCall")]
+    last_tool_call: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1305,15 +1324,18 @@ fn read_inbox(root: &Path, agent: &str) -> anyhow::Result<Vec<InboxMessage>> {
 }
 
 fn read_agents(root: &Path) -> anyhow::Result<Vec<AgentView>> {
-    let dir = root.join(".pi/messenger/live/agents");
     let mut records = Vec::new();
-    for entry in read_dir_safe(&dir)? {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
+    for dir in agent_source_dirs(root) {
+        for entry in read_dir_safe(&dir)? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let record: AgentRecord = read_json_file(&path)?;
+            if let Some(agent) = classify_agent(record) {
+                records.push(agent);
+            }
         }
-        let record: AgentRecord = read_json_file(&path)?;
-        records.push(classify_agent(record));
     }
     apply_agent_record_hygiene(&mut records);
     records.sort_by(|a, b| {
@@ -1324,11 +1346,25 @@ fn read_agents(root: &Path) -> anyhow::Result<Vec<AgentView>> {
     Ok(records)
 }
 
-fn classify_agent(record: AgentRecord) -> AgentView {
+fn classify_agent(record: AgentRecord) -> Option<AgentView> {
+    let agent_name = record.agent.or(record.name)?;
+    let updated_at = record.updated_at.or_else(|| {
+        record
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.last_activity_at.clone())
+    });
+    let last_event = record.last_event.or_else(|| {
+        record
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.last_tool_call.clone())
+    });
+    let preview = record.preview.or(record.status_message.clone());
     let pid_state = pid_state(record.pid);
-    let age_ms = age_ms(record.updated_at.as_deref());
+    let age_ms = age_ms(updated_at.as_deref());
     let mut reasons = Vec::new();
-    if record.updated_at.is_none() {
+    if updated_at.is_none() {
         reasons.push("no heartbeat".to_string());
     }
     if !pid_state.exists {
@@ -1350,21 +1386,21 @@ fn classify_agent(record: AgentRecord) -> AgentView {
     } else {
         AgentPresence::Stale
     };
-    AgentView {
-        agent: record.agent,
+    Some(AgentView {
+        agent: agent_name,
         pid: record.pid,
-        updated_at: record.updated_at,
+        updated_at,
         model: record.model,
         provider: record.provider,
-        preview: record.preview,
+        preview,
         cwd: record.cwd,
-        last_event: record.last_event,
+        last_event,
         lifecycle: record.lifecycle,
         presence,
         presence_reasons: reasons,
         pid_exists: pid_state.exists,
         zombie: pid_state.zombie,
-    }
+    })
 }
 
 fn apply_agent_record_hygiene(agents: &mut [AgentView]) {
@@ -1437,8 +1473,9 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         .constraints([
             Constraint::Length(5),
             Constraint::Length(8),
+            Constraint::Length(8),
             Constraint::Length(6),
-            Constraint::Min(7),
+            Constraint::Min(6),
             Constraint::Length(8),
             Constraint::Length(4),
             Constraint::Length(2),
@@ -1449,13 +1486,20 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                "Ocean TUI",
+                "◉",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(health_label, Style::default().fg(health_color)),
+            Span::raw("  "),
+            Span::styled(
+                "Ocean TUI",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(format!("daemon URL: {}", app.url)),
         Line::from(app.health_summary()),
@@ -1464,30 +1508,39 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     .wrap(Wrap { trim: true });
     frame.render_widget(header, chunks[0]);
 
-    let activity = Paragraph::new(app.activity_lines())
-        .block(Block::default().title("Activity").borders(Borders::ALL))
+    let event_stream = Paragraph::new(app.event_lines(24))
+        .block(Block::default().title("Event Stream").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
-    frame.render_widget(activity, chunks[1]);
+    frame.render_widget(event_stream, chunks[1]);
+
+    let activity = Paragraph::new(app.activity_lines())
+        .block(
+            Block::default()
+                .title("Activity Summary")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(activity, chunks[2]);
 
     let requests = Paragraph::new(app.request_lines())
         .block(Block::default().title("Requests").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
-    frame.render_widget(requests, chunks[2]);
+    frame.render_widget(requests, chunks[3]);
 
     let transcript = Paragraph::new(app.transcript_lines())
         .block(Block::default().title("Transcript").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
-    frame.render_widget(transcript, chunks[3]);
+    frame.render_widget(transcript, chunks[4]);
 
     let sessions = Paragraph::new(app.session_lines())
         .block(Block::default().title("Sessions").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
-    frame.render_widget(sessions, chunks[4]);
+    frame.render_widget(sessions, chunks[5]);
 
     let composer = Paragraph::new(format!("> {}", app.input))
         .block(Block::default().title("Composer").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
-    frame.render_widget(composer, chunks[5]);
+    frame.render_widget(composer, chunks[6]);
 
     let footer = Paragraph::new(format!(
         "Enter send | Ctrl-C cancel | s sessions | r refresh | q quit | stream {} | checked {} | {}",
@@ -1497,7 +1550,7 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     ))
     .alignment(Alignment::Center)
     .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, chunks[6]);
+    frame.render_widget(footer, chunks[7]);
 }
 
 fn draw_mesh_ui(frame: &mut ratatui::Frame<'_>, app: &MeshApp, state: &MeshState) {
@@ -1540,7 +1593,10 @@ fn draw_mesh_ui(frame: &mut ratatui::Frame<'_>, app: &MeshApp, state: &MeshState
             state.agent_counts.away,
             state.agent_counts.stale
         )),
-        Line::from(mesh_tabs_line(app.active_tab, app.paused)),
+        Line::from(mesh_tabs_line(
+            active_center_tab(app.active_tab),
+            app.paused,
+        )),
     ])
     .block(
         Block::default()
@@ -1550,11 +1606,15 @@ fn draw_mesh_ui(frame: &mut ratatui::Frame<'_>, app: &MeshApp, state: &MeshState
     .wrap(Wrap { trim: true });
     frame.render_widget(header, layout[0]);
 
-    match app.active_tab {
-        MeshTab::Board => draw_mesh_board(frame, layout[1], state),
-        MeshTab::Events => draw_mesh_events(frame, layout[1], state),
-        MeshTab::Inbox => draw_mesh_inbox(frame, layout[1], state, &app.agent),
-        MeshTab::Agents => draw_mesh_agents(frame, layout[1], state),
+    if area.width >= 160 && area.height >= 28 {
+        draw_mesh_floor(frame, layout[1], app, state);
+    } else {
+        match app.active_tab {
+            MeshTab::Board => draw_mesh_board(frame, layout[1], state),
+            MeshTab::Events => draw_mesh_events(frame, layout[1], state),
+            MeshTab::Inbox => draw_mesh_inbox(frame, layout[1], state, &app.agent),
+            MeshTab::Agents => draw_mesh_agents(frame, layout[1], state),
+        }
     }
 
     let footer = Paragraph::new(format!(
@@ -1565,6 +1625,179 @@ fn draw_mesh_ui(frame: &mut ratatui::Frame<'_>, app: &MeshApp, state: &MeshState
     .alignment(Alignment::Center)
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, layout[2]);
+}
+
+fn draw_mesh_floor(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &MeshApp,
+    state: &MeshState,
+) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(31),
+            Constraint::Percentage(49),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(14),
+            Constraint::Min(18),
+            Constraint::Min(12),
+        ])
+        .split(cols[0]);
+    let center = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Min(20)])
+        .split(cols[1]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(49), Constraint::Min(20)])
+        .split(cols[2]);
+
+    draw_mesh_glyph(frame, left[0], state);
+    draw_mesh_knox(frame, left[1], state);
+    draw_mesh_charlotte(frame, left[2], state);
+    draw_mesh_center(frame, center[0], app, state);
+    draw_mesh_orchestrator(frame, center[1], app, state);
+    draw_mesh_brick(frame, right[0], state);
+    draw_mesh_pixel(frame, right[1], state);
+}
+
+fn draw_mesh_glyph(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, state: &MeshState) {
+    let lines = vec![
+        Line::from("◉ Glyph / ledger"),
+        Line::from(format!("tasks: {} total", state.tasks.len())),
+        Line::from(format!("events: {} live", state.feed.len())),
+        Line::from(format!(
+            "agents: {} active / {} away / {} stale",
+            state.agent_counts.active, state.agent_counts.away, state.agent_counts.stale
+        )),
+    ];
+    let panel = Paragraph::new(lines)
+        .block(Block::default().title("Glyph").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+fn draw_mesh_knox(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, state: &MeshState) {
+    draw_mesh_agent_status_panel(frame, area, state, "KNOX", "review gate");
+}
+
+fn draw_mesh_charlotte(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &MeshState,
+) {
+    draw_mesh_agent_status_panel(frame, area, state, "Charlotte", "research");
+}
+
+fn draw_mesh_brick(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, state: &MeshState) {
+    draw_mesh_agent_status_panel(frame, area, state, "BRICK", "backend/runtime");
+}
+
+fn draw_mesh_pixel(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, state: &MeshState) {
+    draw_mesh_agent_status_panel(frame, area, state, "PIXEL", "frontend/tui");
+}
+
+fn draw_mesh_center(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &MeshApp,
+    state: &MeshState,
+) {
+    match app.active_tab {
+        MeshTab::Events => draw_mesh_events(frame, area, state),
+        MeshTab::Inbox => draw_mesh_inbox(frame, area, state, &app.agent),
+        _ => draw_mesh_board(frame, area, state),
+    }
+}
+
+fn draw_mesh_orchestrator(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &MeshApp,
+    state: &MeshState,
+) {
+    let lines = vec![
+        Line::from("Orchestrator control"),
+        Line::from(format!("agent: {}", app.agent)),
+        Line::from(format!("checked: {}", app.checked_text())),
+        Line::from(format!("status: {}", app.status)),
+        Line::from(format!(
+            "done: {}  active: {}",
+            state.counts.done, state.counts.in_progress
+        )),
+    ];
+    let panel = Paragraph::new(lines)
+        .block(Block::default().title("Orchestrator").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+fn draw_mesh_agent_status_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &MeshState,
+    agent_name: &str,
+    role: &str,
+) {
+    let agent = state
+        .agents
+        .iter()
+        .find(|agent| agent.agent.eq_ignore_ascii_case(agent_name));
+    let (presence, last, preview) = if let Some(agent) = agent {
+        (
+            match agent.presence {
+                AgentPresence::Active => "active",
+                AgentPresence::Away => "away",
+                AgentPresence::Stale => "stale",
+            },
+            time_ago(agent.updated_at.as_deref()),
+            agent
+                .preview
+                .as_deref()
+                .or(agent.last_event.as_deref())
+                .unwrap_or("no preview"),
+        )
+    } else {
+        ("offline", "—".into(), "no live agent record")
+    };
+
+    let lines = vec![
+        Line::from(format!("role: {role}")),
+        Line::from(format!("presence: {presence}")),
+        Line::from(format!("last: {last}")),
+        Line::from(compact_text(preview, area.width.saturating_sub(4) as usize)),
+    ];
+    let panel = Paragraph::new(lines)
+        .block(Block::default().title(agent_name).borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+fn active_center_tab(tab: MeshTab) -> MeshTab {
+    match tab {
+        MeshTab::Agents => MeshTab::Board,
+        other => other,
+    }
+}
+
+fn agent_source_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        root.join(".pi/messenger/live/agents"),
+        root.join(".pi/messenger/registry"),
+    ];
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".pi/agent/messenger/registry"));
+        dirs.push(home.join(".pi/messenger/registry"));
+    }
+    dirs
 }
 
 fn draw_mesh_board(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, state: &MeshState) {
@@ -2029,8 +2262,15 @@ fn pid_state(pid: Option<i32>) -> PidState {
             invalid: true,
         };
     }
+    pid_state_from_reader(pid, |path| fs::read_to_string(path).ok())
+}
+
+fn pid_state_from_reader<F>(pid: i32, read_stat: F) -> PidState
+where
+    F: FnOnce(&Path) -> Option<String>,
+{
     let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
-    let Ok(stat) = fs::read_to_string(&stat_path) else {
+    let Some(stat) = read_stat(&stat_path) else {
         return PidState {
             exists: false,
             zombie: false,
@@ -2042,5 +2282,135 @@ fn pid_state(pid: Option<i32>) -> PidState {
         exists: true,
         zombie,
         invalid: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ocean_core::EventEnvelope;
+    use serde_json::json;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn summarize_event_includes_request_prefix() {
+        let request_id = RequestId::nil();
+        let mut envelope = EventEnvelope::new(OceanEvent::AssistantDelta {
+            text: "hello from stream".to_string(),
+        });
+        envelope.request_id = Some(request_id);
+
+        let summary = summarize_event(&envelope);
+
+        assert!(summary.contains("assistant_delta: hello from stream"));
+        assert!(summary.contains(&short_id(request_id)));
+    }
+
+    #[test]
+    fn mesh_tabs_line_marks_active_and_paused_state() {
+        let line = mesh_tabs_line(MeshTab::Events, true);
+        assert!(line.contains("[2:EVENTS]"));
+        assert!(line.contains("PAUSED"));
+    }
+
+    #[test]
+    fn active_center_tab_preserves_agents_board_mapping() {
+        assert_eq!(active_center_tab(MeshTab::Agents), MeshTab::Board);
+        assert_eq!(active_center_tab(MeshTab::Inbox), MeshTab::Inbox);
+    }
+
+    #[test]
+    fn agent_source_dirs_preserve_project_then_home_precedence() {
+        let root = Path::new("/tmp/ocean-test-root");
+        let dirs = agent_source_dirs(root);
+
+        assert_eq!(dirs[0], root.join(".pi/messenger/live/agents"));
+        assert_eq!(dirs[1], root.join(".pi/messenger/registry"));
+        assert!(dirs
+            .iter()
+            .any(|dir| dir.ends_with(".pi/agent/messenger/registry")));
+        assert!(dirs
+            .iter()
+            .any(|dir| dir.ends_with(".pi/messenger/registry")));
+    }
+
+    #[test]
+    fn classify_agent_uses_fallback_fields_from_registry_schema() {
+        let record = AgentRecord {
+            agent: None,
+            name: Some("BRICK".to_string()),
+            pid: Some(123),
+            updated_at: None,
+            model: Some("gpt-5.5".to_string()),
+            provider: Some("openai".to_string()),
+            preview: None,
+            cwd: Some("/repo".to_string()),
+            last_event: None,
+            lifecycle: None,
+            status_message: Some("ready".to_string()),
+            activity: Some(AgentActivity {
+                last_activity_at: Some("2026-05-25T13:13:49.262Z".to_string()),
+                last_tool_call: Some("test: passed".to_string()),
+            }),
+        };
+
+        let agent = classify_agent(record).expect("agent should classify");
+
+        assert_eq!(agent.agent, "BRICK");
+        assert_eq!(agent.preview.as_deref(), Some("ready"));
+        assert_eq!(agent.last_event.as_deref(), Some("test: passed"));
+    }
+
+    #[test]
+    fn pid_state_reader_detects_zombie_process() {
+        let state = pid_state_from_reader(42, |_| Some("42 (pi) Z 1 2 3 4".to_string()));
+        assert!(state.exists);
+        assert!(state.zombie);
+        assert!(!state.invalid);
+    }
+
+    #[test]
+    fn read_agents_falls_back_to_home_registry_when_project_live_agents_missing() {
+        let unique = format!(
+            "ocean-tui-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let temp = env::temp_dir().join(unique);
+        let root = temp.join("repo");
+        let home = temp.join("home");
+        fs::create_dir_all(root.join(".pi/messenger/registry")).expect("root registry");
+        fs::create_dir_all(root.join(".pi/messenger/live/agents")).expect("root live agents");
+        fs::create_dir_all(home.join(".pi/agent/messenger/registry")).expect("home registry");
+
+        fs::write(
+            home.join(".pi/agent/messenger/registry/PIXEL.json"),
+            json!({
+                "name": "PIXEL",
+                "pid": 999,
+                "cwd": "/repo",
+                "statusMessage": "active",
+                "activity": {"lastActivityAt": "2026-05-25T13:17:52.861Z", "lastToolCall": "test: passed"}
+            })
+            .to_string(),
+        )
+        .expect("write registry");
+
+        let original_home = env::var_os("HOME");
+        unsafe { env::set_var("HOME", &home) };
+        let agents = read_agents(&root).expect("read agents");
+        match original_home {
+            Some(value) => unsafe { env::set_var("HOME", value) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+        fs::remove_dir_all(&temp).ok();
+
+        assert!(agents.iter().any(|agent| agent.agent == "PIXEL"));
     }
 }

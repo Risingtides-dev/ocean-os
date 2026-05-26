@@ -7,6 +7,9 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{PromptRequest, PromptResponse, RequestId, SessionId, SessionSummary};
+use ocean_providers::{
+    resolve_provider_config_from_env, ProviderConfig, ProviderId, ProviderReadiness,
+};
 use pi_agent::{
     run_agent_with_history, tools::default_tools, AgentConfig, AgentEvent, PermissionDecision,
     PermissionPolicy,
@@ -15,6 +18,7 @@ use pi_ai::{Content, Message, Model};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const APP_NAME: &str = "ocean-rs";
 
@@ -30,18 +34,27 @@ pub struct AgentRuntime {
     model: Model,
     api_key: Option<String>,
     backend_name: String,
+    provider_config: ProviderConfig,
 }
 
 impl AgentRuntime {
     pub fn from_env() -> anyhow::Result<Self> {
-        let model = model_from_env();
-        let api_key = api_key_for_model(&model)?;
-        let backend_name = format!("ocean-native-{}", model.provider);
+        let provider_config = resolve_provider_config_from_env()?;
+        let model = model_from_provider_config(&provider_config)?;
+        let api_key = provider_config
+            .credential
+            .as_ref()
+            .map(|credential| credential.secret.expose().to_string());
+        let backend_name = format!(
+            "ocean-native-{}",
+            provider_config.selection.provider.as_str()
+        );
         Ok(Self {
             config_dir: config_dir_from_env(),
             model,
             api_key,
             backend_name,
+            provider_config,
         })
     }
 
@@ -49,13 +62,17 @@ impl AgentRuntime {
         &self.backend_name
     }
 
-    pub async fn prompt(&self, req: PromptRequest) -> PromptResponse {
+    pub fn provider_readiness(&self) -> ProviderReadiness {
+        self.provider_config.readiness()
+    }
+
+    pub async fn prompt(&self, req: PromptRequest, control: PromptControl) -> PromptResponse {
         let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
         let mut req = req;
         req.request_id = Some(request_id);
 
         let start = Instant::now();
-        match self.run_prompt(req.clone()).await {
+        match self.run_prompt(req.clone(), control).await {
             Ok((session_id, stdout, stderr)) => PromptResponse {
                 request_id: Some(request_id),
                 ok: true,
@@ -81,7 +98,11 @@ impl AgentRuntime {
         session::list(&self.config_dir)
     }
 
-    async fn run_prompt(&self, req: PromptRequest) -> anyhow::Result<(SessionId, String, String)> {
+    async fn run_prompt(
+        &self,
+        req: PromptRequest,
+        control: PromptControl,
+    ) -> anyhow::Result<(SessionId, String, String)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let mut session = match req.session_id {
@@ -93,11 +114,13 @@ impl AgentRuntime {
         let mut history = session.messages.clone();
         history.push(Message::user_text(req.prompt));
 
+        let PromptControl { permission, cancel } = control;
         let mut cfg = AgentConfig::new(self.model.clone(), system_prompt::build_system_prompt())
             .with_tools(default_tools())
             .with_max_turns(req.max_turns.unwrap_or(32))
-            .with_permission(Arc::new(DaemonPermission::new(req.yolo)));
+            .with_permission(permission);
         cfg.stream_options.api_key = self.api_key.clone();
+        cfg.stream_options.cancel = cancel;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cfg_cloned = cfg.clone();
@@ -160,18 +183,36 @@ impl AgentRuntime {
     }
 }
 
-struct DaemonPermission {
-    allow_mutating: bool,
+#[derive(Clone)]
+pub struct PromptControl {
+    pub permission: Arc<dyn PermissionPolicy>,
+    pub cancel: Option<CancellationToken>,
 }
 
-impl DaemonPermission {
-    fn new(allow_mutating: bool) -> Self {
-        Self { allow_mutating }
+impl PromptControl {
+    pub fn new(permission: Arc<dyn PermissionPolicy>) -> Self {
+        Self {
+            permission,
+            cancel: None,
+        }
+    }
+
+    pub fn yolo(allow_mutating: bool) -> Self {
+        Self::new(Arc::new(StaticPermissionPolicy { allow_mutating }))
+    }
+
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 }
 
+struct StaticPermissionPolicy {
+    allow_mutating: bool,
+}
+
 #[async_trait]
-impl PermissionPolicy for DaemonPermission {
+impl PermissionPolicy for StaticPermissionPolicy {
     async fn check(&self, _tool_name: &str, _args: &Value) -> PermissionDecision {
         if self.allow_mutating {
             PermissionDecision::Allow
@@ -183,67 +224,40 @@ impl PermissionPolicy for DaemonPermission {
     }
 }
 
-fn model_from_env() -> Model {
-    let id = std::env::var("OCEAN_MODEL")
-        .or_else(|_| std::env::var("PI_MODEL"))
-        .unwrap_or_else(|_| "deepseek-chat".to_string());
-    match id.as_str() {
-        "deepseek" | "deepseek-chat" => Model::openai_compat(
-            "deepseek",
-            "deepseek-chat",
-            "https://api.deepseek.com/v1",
-            64_000,
-            8_192,
-        ),
-        "deepseek-reasoner" | "deepseek-r1" => Model::openai_compat(
-            "deepseek",
-            "deepseek-reasoner",
-            "https://api.deepseek.com/v1",
-            64_000,
-            8_192,
-        ),
-        "deepseek-v4-flash" => Model::openai_compat(
-            "deepseek",
-            "deepseek-v4-flash",
-            "https://api.deepseek.com/v1",
-            64_000,
-            8_192,
-        ),
-        "gpt-4o" => Model::openai_gpt_4o(),
-        "gpt-4o-mini" => Model::openai_gpt_4o_mini(),
-        "claude-sonnet-4-6" | "claude-sonnet" | "sonnet" => Model::anthropic_claude_sonnet_4_6(),
-        "claude-opus-4-7" | "claude-opus" | "opus" => Model::anthropic_claude_opus_4_7(),
-        other => Model::openai_compat(
-            "openai-compatible",
-            other,
-            std::env::var("OCEAN_OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            128_000,
-            16_384,
-        ),
+fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> {
+    let selection = &config.selection;
+    match selection.provider {
+        ProviderId::DeepSeek | ProviderId::OpenAiCompatible | ProviderId::Fake => {
+            Ok(Model::openai_compat(
+                selection.provider.as_str(),
+                selection.model.clone(),
+                selection.base_url.clone(),
+                selection.context_window,
+                selection.max_output_tokens,
+            ))
+        }
+        ProviderId::OpenAi => Ok(match selection.model.as_str() {
+            "gpt-4o" => Model::openai_gpt_4o(),
+            "gpt-4o-mini" => Model::openai_gpt_4o_mini(),
+            _ => Model::openai_compat(
+                selection.provider.as_str(),
+                selection.model.clone(),
+                selection.base_url.clone(),
+                selection.context_window,
+                selection.max_output_tokens,
+            ),
+        }),
+        ProviderId::Anthropic => Ok(match selection.model.as_str() {
+            "claude-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
+            "claude-opus-4-7" => Model::anthropic_claude_opus_4_7(),
+            _ => {
+                anyhow::bail!(
+                    "unsupported anthropic model '{}' in temporary pi-ai adapter",
+                    selection.model
+                );
+            }
+        }),
     }
-}
-
-fn api_key_for_model(model: &Model) -> anyhow::Result<Option<String>> {
-    match model.provider.as_str() {
-        "deepseek" => Ok(std::env::var("DEEPSEEK_API_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(read_deepseek_key_from_pi_auth)),
-        _ => Ok(None),
-    }
-}
-
-fn read_deepseek_key_from_pi_auth() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home).join(".pi/agent/auth.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&text).ok()?;
-    json.pointer("/deepseek/key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn config_dir_from_env() -> PathBuf {

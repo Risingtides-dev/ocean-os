@@ -1,8 +1,8 @@
 # Ocean Runtime + TUI Framing
 
-Ocean TUI is the first steering client for the canonical `ocean-rs` daemon.
+Ocean is a Rust-native Pi-style coding-agent harness/runtime. `ocean-tui` is the active steering cockpit for that harness and the Rust-native Tides Mesh **MeshFloor**. It is not a passive daemon dashboard that merely asks for updates.
 
-The goal is not to build a second terminal runtime. The goal is to force the daemon protocol to become complete, streamable, inspectable, and useful before GUI polish.
+The goal is not to build a second terminal runtime. The goal is to make the cockpit strong enough to steer the daemon honestly: route work, show floor state, compose prompts, inspect sessions, watch events, request/cancel work, and approve/deny permissions while the daemon remains the runtime authority.
 
 ## Boundary
 
@@ -10,7 +10,7 @@ The goal is not to build a second terminal runtime. The goal is to force the dae
 ocean-tui ── client protocol ── ocean-daemon ── ocean-agent / tools / providers
 ```
 
-The TUI may render state, gather input, send requests, display events, and ask for approvals. It must not own the agent loop, provider calls, session storage authority, or tool execution authority.
+The TUI actively renders and controls the operator surface: it gathers input, sends requests, displays events, shows floor state, drives cancel/retry/approval actions, and exposes the Tides Mesh MeshFloor. It must not own the agent loop, provider calls, session storage authority, or tool execution authority.
 
 ## Runtime responsibilities
 
@@ -32,6 +32,8 @@ The TUI may render state, gather input, send requests, display events, and ask f
 `ocean-tui` owns:
 
 - terminal layout
+- MeshFloor / Tides Mesh cockpit view
+- board, events, inbox, and agents panels
 - composer/input editing
 - event/transcript rendering
 - session picker
@@ -39,6 +41,7 @@ The TUI may render state, gather input, send requests, display events, and ask f
 - request status display
 - approval UI for daemon permission requests
 - cancel/retry controls
+- floor visibility for Glyph, KNOX, Charlotte, Orchestrator, BRICK, PIXEL, Henry, and Rev workspaces
 
 ## Initial daemon protocol target
 
@@ -73,14 +76,28 @@ SSE is preferred first because the daemon can keep request/approval commands as 
 
 Shared event names are snake_case on the wire (`tool_started`, `permission_request`, `request_cancelled`, etc.) even when the docs show a dotted conceptual model.
 
-## First TUI layout
+## Current cockpit / MeshFloor layout
+
+The main TUI context should promote the live Tides Mesh floor, not bury it in side notes. The current Rust-native MeshFloor target is documented in:
+
+- [`docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](OCEAN_TUI_TMUX_LAYOUT_MAP.md) — live tmux floor blueprint and pane geometry.
+- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md) — no-feature-drop parity contract.
+
+MeshFloor summary:
+
+```text
+┌ Glyph / audit ─┬ KNOX review ─┬ Charlotte research ─┐
+├ Orchestrator / board-events-inbox-agents cockpit ───┤
+├ PIXEL UI / TUI lane ───────┬ BRICK runtime lane ────┤
+└ adjacent context: WritersRoom/Henry, Rev review, ops ┘
+```
+
+The daemon-steering cockpit remains part of this same surface:
 
 ```text
 ┌ Ocean TUI ─ status: daemon ok / model / session / request ┐
-│ Transcript                                                 │
-│                                                           │
-├ Events / tools / permissions ─────────────────────────────┤
-│                                                           │
+│ Transcript / MeshFloor / Sessions / Requests              │
+├ Events / tools / permissions / Tides Mesh activity ───────┤
 ├ Composer ─────────────────────────────────────────────────┤
 │ >                                                         │
 └ shortcuts: enter send | ctrl-c cancel | ctrl-s sessions ──┘

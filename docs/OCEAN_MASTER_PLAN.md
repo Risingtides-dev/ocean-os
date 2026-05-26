@@ -6,16 +6,16 @@
 
 ## Executive Decision
 
-Ocean is a local-first Rust-native agentic distro, but it must grow from one canonical runtime:
+Ocean is a local-first Rust-native agentic distro, but it must grow from one canonical Rust-native Pi-style coding-agent harness/runtime:
 
 ```text
 ocean-rs daemon/runtime node
-  ├─ Ocean TUI steering client
+  ├─ Ocean TUI active steering cockpit + Tides Mesh MeshFloor
   ├─ Ocean OS native GUI client
   └─ distro/service integration layer
 ```
 
-Do not create a second agent runtime in Ocean TUI, Ocean OS GUI, or any service-layer crate. All clients steer `ocean-rs` through stable protocol types from `ocean-core`.
+Do not create a second agent runtime in Ocean TUI, Ocean OS GUI, or any service-layer crate. All clients steer `ocean-rs` through stable protocol types from `ocean-core`. `ocean-tui` is not a passive daemon dashboard; it is the primary operator control surface for prompts, requests, sessions, events, approvals, cancellation, and the Rust-native Tides Mesh floor.
 
 ## Current Verified State
 
@@ -33,7 +33,7 @@ crates/ocean-core      shared protocol types
 crates/ocean-agent     in-process agent runtime facade
 crates/ocean-daemon    canonical local daemon
 crates/ocean-cli       thin CLI client
-crates/ocean-tui       TUI steering client scaffold
+crates/ocean-tui       active TUI steering cockpit + MeshFloor scaffold
 ```
 
 Current Crew task state:
@@ -47,6 +47,15 @@ next: task-2 daemon event broadcaster + SSE
 next: task-4 TUI prompt composer + sessions
 next: task-9 first GUI daemon-client slice
 ```
+
+## Current MeshFloor context
+
+The Tides Mesh floor is part of the main Ocean TUI product context, not an auxiliary side document. Current layout and parity references:
+
+- [`docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](OCEAN_TUI_TMUX_LAYOUT_MAP.md) — live tmux floor blueprint, including Glyph upper-left audit, KNOX, Charlotte, Orchestrator, BRICK, PIXEL, WritersRoom/Henry, Rev, and ops context.
+- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md) — no-feature-drop contract for replacing the existing Tides Mesh operator floor with Rust-native Ocean TUI panels.
+
+The product target is a single cockpit where daemon steering and Tides Mesh floor visibility reinforce each other while daemon/harness authority remains clear.
 
 ## Team Domains
 

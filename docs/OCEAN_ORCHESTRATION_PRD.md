@@ -2,12 +2,13 @@
 
 ## Mission
 
-Use Pi as the orchestration layer to build Ocean into a local-first Rust-native agentic distro. The canonical runtime is `ocean-rs`; the first serious client is Ocean TUI; Ocean OS GUI follows as a thin native client; distro integration comes after the runtime/client protocol is stable.
+Use Pi as the orchestration layer to build Ocean into a local-first Rust-native agentic distro. The canonical runtime is `ocean-rs`: a Rust-native Pi-style coding-agent harness/runtime. The first serious product surface is Ocean TUI: an active steering cockpit and Rust-native Tides Mesh MeshFloor over that harness. Ocean OS GUI follows as a thin native client; distro integration comes after the runtime/client protocol is stable.
 
 ## Non-goals
 
 - Do not create another runtime in `/home/ocean-os`.
 - Do not make Ocean TUI own provider calls, tools, sessions, or agent loops.
+- Do not frame Ocean TUI as a passive daemon dashboard; it is the active operator cockpit over daemon-owned authority.
 - Do not build on Electron, Tauri, or browser-first product assumptions.
 - Do not hide daemon state behind GUI-only behavior.
 
@@ -44,9 +45,9 @@ backend=ocean-native-deepseek
 
 ## Product direction
 
-### Phase 1: Runtime + TUI steering
+### Phase 1: Runtime + TUI steering cockpit
 
-Create a TUI client that steers `ocean-rs` and exposes the daemon honestly.
+Create a TUI cockpit that steers `ocean-rs`, exposes the daemon honestly, and brings the Tides Mesh MeshFloor into the main product surface.
 
 Deliverables:
 
@@ -59,6 +60,13 @@ Deliverables:
 - request/session indicators
 - cancel affordance
 - permission prompt surface once daemon supports it
+- MeshFloor panels for board/events/inbox/agents
+- live floor context for Glyph audit, KNOX review, Charlotte research, Orchestrator routing, BRICK runtime, PIXEL UI, WritersRoom/Henry, and Rev review
+
+MeshFloor references that belong to the main TUI/current-context docs:
+
+- [`docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](OCEAN_TUI_TMUX_LAYOUT_MAP.md)
+- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md)
 
 ### Phase 2: Streaming daemon protocol
 
@@ -110,6 +118,16 @@ Only after the runtime protocol is stable:
 - sandbox profiles
 - theme/client protocol
 - plugin model
+
+## Future Telegram bridge controls
+
+Product requirement for the Telegram/Ocean bridge:
+
+- `/reload` reloads runtime extensions/config only.
+- `/reconnect` reconnects Telegram/bridge/session transports only.
+- Both commands require explicit operator approval boundaries.
+- Reload/reconnect must not reveal secrets or broaden auth scope.
+- Do not implement these commands until a routed task authorizes the bridge work.
 
 ## Crew task seed
 

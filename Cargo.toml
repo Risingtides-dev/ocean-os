@@ -2,6 +2,7 @@
 members = [
   "crates/ocean-core",
   "crates/ocean-agent",
+  "crates/ocean-providers",
   "crates/ocean-daemon",
   "crates/ocean-cli",
   "crates/ocean-tui",
@@ -26,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -33,5 +35,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ocean-core = { path = "crates/ocean-core" }
 ocean-agent = { path = "crates/ocean-agent" }
+ocean-providers = { path = "crates/ocean-providers" }
 pi-agent = "1.0.0"
 pi-ai = "1.0.0"

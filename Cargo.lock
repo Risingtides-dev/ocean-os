@@ -1249,11 +1249,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "ocean-core",
+ "ocean-providers",
  "pi-agent",
  "pi-ai",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -1284,14 +1286,17 @@ name = "ocean-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "ocean-agent",
  "ocean-core",
+ "pi-agent",
  "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -1299,10 +1304,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ocean-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "crossterm 0.29.0",
  "ocean-core",
