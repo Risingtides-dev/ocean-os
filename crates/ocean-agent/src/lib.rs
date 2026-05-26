@@ -14,7 +14,7 @@ use pi_agent::{
     run_agent_with_history, tools::default_tools, AgentConfig, AgentEvent, PermissionDecision,
     PermissionPolicy,
 };
-use pi_ai::{Content, Message, Model};
+use pi_ai::{AssistantMessage, Content, Message, Model, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -72,7 +72,25 @@ impl AgentRuntime {
         req.request_id = Some(request_id);
 
         let start = Instant::now();
-        match self.run_prompt(req.clone(), control).await {
+        if let Some(stderr) = self.provider_preflight_error() {
+            return PromptResponse {
+                request_id: Some(request_id),
+                ok: false,
+                session_id: req.session_id,
+                code: None,
+                wall_ms: start.elapsed().as_millis(),
+                stdout: String::new(),
+                stderr,
+            };
+        }
+
+        let result = if self.provider_config.selection.provider == ProviderId::Fake {
+            self.run_fake_prompt(req.clone()).await
+        } else {
+            self.run_prompt(req.clone(), control).await
+        };
+
+        match result {
             Ok((session_id, stdout, stderr)) => PromptResponse {
                 request_id: Some(request_id),
                 ok: true,
@@ -98,6 +116,55 @@ impl AgentRuntime {
         session::list(&self.config_dir)
     }
 
+    fn provider_preflight_error(&self) -> Option<String> {
+        let readiness = self.provider_readiness();
+        if readiness.ok {
+            return None;
+        }
+
+        let detail = readiness
+            .error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "provider is not ready".to_string());
+        Some(format!(
+            "provider readiness failed for provider {} model {}: {detail}",
+            readiness.provider.as_str(),
+            readiness.model
+        ))
+    }
+
+    async fn run_fake_prompt(
+        &self,
+        req: PromptRequest,
+    ) -> anyhow::Result<(SessionId, String, String)> {
+        anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
+
+        let mut session = match req.session_id {
+            Some(id) => session::load(&self.config_dir, id)
+                .unwrap_or_else(|_| session::Session::new_with_id(id, &self.model)),
+            None => session::Session::new(&self.model),
+        };
+
+        let stdout = "OCEAN_FAKE_OK\n".to_string();
+        let mut messages = session.messages.clone();
+        messages.push(Message::user_text(req.prompt));
+        messages.push(Message::Assistant(AssistantMessage {
+            content: vec![Content::text(stdout.trim_end())],
+            api: self.model.api.clone(),
+            provider: self.model.provider.clone(),
+            model: self.model.id.clone(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: pi_ai::now_ms(),
+        }));
+        session.replace_messages(messages);
+        session::save(&self.config_dir, &session)?;
+
+        Ok((session.id, stdout, String::new()))
+    }
+
     async fn run_prompt(
         &self,
         req: PromptRequest,
@@ -120,6 +187,7 @@ impl AgentRuntime {
             .with_max_turns(req.max_turns.unwrap_or(32))
             .with_permission(permission);
         cfg.stream_options.api_key = self.api_key.clone();
+        cfg.stream_options.base_url = Some(self.provider_config.selection.base_url.clone());
         cfg.stream_options.cancel = cancel;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -395,6 +463,115 @@ mod session {
         } else {
             format!("{}…", squashed.chars().take(70).collect::<String>())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ocean-agent-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    fn provider_config(provider: ProviderId, model: &str, credential: bool) -> ProviderConfig {
+        ProviderConfig {
+            selection: ocean_providers::ModelSelection {
+                provider,
+                model: model.to_string(),
+                base_url: "fake://local".to_string(),
+                context_window: 1_000,
+                max_output_tokens: 1_000,
+            },
+            credential: credential.then(|| ocean_providers::ResolvedCredential {
+                secret: ocean_providers::SecretString::new("test-secret").unwrap(),
+                source: ocean_providers::CredentialSource::Env {
+                    name: "OCEAN_TEST_API_KEY".into(),
+                },
+            }),
+        }
+    }
+
+    fn runtime(config_dir: PathBuf, provider_config: ProviderConfig) -> AgentRuntime {
+        let model = model_from_provider_config(&provider_config).unwrap();
+        let api_key = provider_config
+            .credential
+            .as_ref()
+            .map(|credential| credential.secret.expose().to_string());
+        let backend_name = format!(
+            "ocean-native-{}",
+            provider_config.selection.provider.as_str()
+        );
+        AgentRuntime {
+            config_dir,
+            model,
+            api_key,
+            backend_name,
+            provider_config,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_credential_preflight_names_ocean_provider_and_model() {
+        let config_dir = temp_config_dir("missing-credential");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::DeepSeek, "deepseek-v4-flash", false),
+        );
+
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "hello".into(),
+                    request_id: None,
+                    session_id: None,
+                    max_turns: None,
+                    yolo: false,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+
+        assert!(!res.ok);
+        assert!(res.stderr.contains("provider deepseek"));
+        assert!(res.stderr.contains("deepseek-v4-flash"));
+        assert!(!res.stderr.contains("provider openai"));
+        assert!(runtime.list_sessions().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn fake_provider_bypasses_remote_streaming_without_api_key() {
+        let config_dir = temp_config_dir("fake-provider");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "Reply exactly: OCEAN_OK".into(),
+                    request_id: None,
+                    session_id: None,
+                    max_turns: None,
+                    yolo: false,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+
+        assert!(res.ok);
+        assert_eq!(res.stdout, "OCEAN_FAKE_OK\n");
+        assert!(res.stderr.is_empty());
+        assert_eq!(runtime.list_sessions().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(config_dir);
     }
 }
 
