@@ -39,9 +39,9 @@ OceanTUI should model the real tmux floor before inventing new layout. The Tides
 | `tidemesh` | 3 | `Writers Room` | `213x56` | NoteDash + Henry + shell |
 | `tidemesh` | 4 | `Tides-mesh Orchestrator` | `213x56` | primary mesh floor |
 | `tidemesh` | 5 | `Rev Review` | `213x56` | review/PR room |
-| `tidemesh` | 6 | `TideDash` | `213x56` | dashboard |
+| `tidemesh` | 6 | `TideDash` | `213x56` | board |
 | `tidemesh` | 7 | `WorkOps` | `213x56` | ops split |
-| `tidemesh` | 8 | `WorldMap` | `213x56` | map/dashboard |
+| `tidemesh` | 8 | `WorldMap` | `213x56` | map board |
 | `tidemesh` | 9 | `test window` | `213x56` | scratch/test |
 
 ## Primary blueprint: `tidemesh:4` Tides-mesh Orchestrator
@@ -175,7 +175,7 @@ OceanTUI lesson: writer/research views can be a 50/50 split with right-side stac
 | Pane | Role | Title | Cmd | Active | x | y | w | h |
 | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | 0 | Rev reviewer | `Tides Mesh · Rev` | `pi` | 1 | 0 | 0 | 100 | 56 |
-| 1 | review dashboard | `tide-net` | `python` | 0 | 101 | 0 | 112 | 20 |
+| 1 | review board | `tide-net` | `python` | 0 | 101 | 0 | 112 | 20 |
 | 2 | git UI | `tide-net` | `lazygit` | 0 | 101 | 21 | 56 | 35 |
 | 3 | review context | `tide-net` | `python` | 0 | 158 | 21 | 55 | 35 |
 
@@ -183,7 +183,7 @@ Plot:
 
 ```text
 ┌────────────────────────────┬────────────────────────────────┐
-│ Rev 100x56                 │ Review dashboard 112x20        │
+│ Rev 100x56                 │ Review board 112x20            │
 │                            ├───────────────┬────────────────┤
 │                            │ lazygit 56x35 │ context 55x35  │
 └────────────────────────────┴───────────────┴────────────────┘
@@ -195,18 +195,18 @@ OceanTUI lesson: review mode needs one dominant reviewer pane plus a top status 
 
 | Pane | Role | Title | Cmd | Active | x | y | w | h |
 | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 0 | ops dashboard | `tide-net` | `python` | 0 | 0 | 0 | 106 | 56 |
+| 0 | ops board | `tide-net` | `python` | 0 | 0 | 0 | 106 | 56 |
 | 1 | ops shell | `tide-net` | `bash` | 1 | 107 | 0 | 106 | 56 |
 
 Plot:
 
 ```text
 ┌──────────────────────────────┬──────────────────────────────┐
-│ ops dashboard 106x56         │ ops shell 106x56             │
+│ ops board 106x56             │ ops shell 106x56             │
 └──────────────────────────────┴──────────────────────────────┘
 ```
 
-OceanTUI lesson: operational mode can be a symmetric dashboard/shell split.
+OceanTUI lesson: operational mode can be a symmetric board/shell split.
 
 ### Single-pane windows
 
@@ -215,8 +215,8 @@ OceanTUI lesson: operational mode can be a symmetric dashboard/shell split.
 | `0:1 pi` | Pi shell | `240x66` |
 | `0:2 pi` | Pi shell | `240x66` |
 | `tidemesh:2 pi` | Pi shell | `213x56` |
-| `tidemesh:6 TideDash` | dashboard | `213x56` |
-| `tidemesh:8 WorldMap` | map/dashboard | `213x56` |
+| `tidemesh:6 TideDash` | board | `213x56` |
+| `tidemesh:8 WorldMap` | map board | `213x56` |
 | `tidemesh:9 test window` | scratch | `213x56` |
 
 ## OceanTUI implementation targets
@@ -251,7 +251,7 @@ Use other windows as secondary blueprints:
 - Writers Room mode from `tidemesh:3`.
 - Review mode from `tidemesh:5`.
 - WorkOps mode from `tidemesh:7`.
-- Single-pane dashboards from `tidemesh:6` and `tidemesh:8`.
+- Single-pane boards from `tidemesh:6` and `tidemesh:8`.
 
 ### 3. Measurement-driven tests
 

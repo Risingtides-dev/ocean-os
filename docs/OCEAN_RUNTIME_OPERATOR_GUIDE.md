@@ -164,11 +164,64 @@ curl http://127.0.0.1:4780/v1/sessions
 
 ### TUI steering client
 
-Default daemon steering client:
+Default coding-agent workspace:
 
 ```bash
 cargo run -p ocean-tui
 ```
+
+Default launch now opens the Ocean coding-agent workspace first, with daemon health and system state surfaced as supporting primitives rather than as a standalone monitor view. The primary shell keeps the agent transcript/composer/tool/approval/session surfaces visible while TIDES-MESH rooms are exposed as top-level tabs. Daemon health stays visible but no longer owns the surface.
+
+Workspace operator keys:
+
+- `Tab` — cycle TIDES-MESH rooms
+- `F1`..`F7` — jump to `Orchestrator`, `Writers`, `Rev`, `TideDash`, `WorkOps`, `WorldMap`, `PM`
+- `Up` / `Down` — change the session target (`new session` or a saved session ID)
+- `Enter` — send composer prompt
+- `Ctrl-J` — insert newline into the multiline composer
+- `Ctrl-U` — clear the composer
+- `Ctrl-C` — cancel the latest active request
+- `Shift-Y` — allow the newest pending permission request
+- `Shift-N` — deny the newest pending permission request
+- `F10` or `?` — toggle the inline help surface
+- `s` — refresh sessions
+- `r` — refresh health/requests/sessions/support state
+- `q` / `Esc` — quit
+
+Current honest placeholders in the workspace shell:
+
+- full session transcript inspection still needs `GET /v1/sessions/:id`
+- some non-Orchestrator room widgets still render cache/task placeholders instead of embedded native panes
+- diff/edit capture is opportunistic from SSE tool output and assistant text, not yet a structured daemon diff feed
+
+### Product direction: permanent multi-room command center
+
+The operator correction after task-26 is explicit:
+
+- Ocean TUI is a permanent Rust-native Ratatui command center, not a daemon monitor with chat attached.
+- The default workspace shell stays first-class.
+- Daemon monitoring is only one primitive and should eventually live inside an Ops/Systems-style room rather than define the whole product.
+
+Next-phase room model to preserve in docs/planning:
+
+- `PM` — operator communication / PM terminal space
+- `Writers Room` — NoteDash-style notes, sources, actions, plus Henry terminal/context lane
+- `Tides Mesh` — main mesh command center with Glyph anchor, board/events/inbox/agents primitives, orchestrator control, and live roster/info panel
+- `Review Room` — Rev chat plus WorkDash-style PR / Linear / git / diff review primitives
+- `TideDash`, `WorkOps/OpsDash`, `WorldMap`, and file-tree contexts as dedicated rooms or panes
+
+Primitive-source rule for future implementation work:
+
+- read `rising-tuis/opsdash.py` for service/ports/cloud health primitives
+- read `rising-tuis/workdash.py` for review/git/Linear primitives
+- read `rising-tuis/notedash.py` and `rising-tuis/notedash_api.py` for Writers Room notes/source/action primitives
+- read `rising-tuis/tidedash.py`, `rising-tuis/world_time_map.py`, and `rising-tuis/file_tree_tui.py` for campaign/world/files primitives
+- reimplement the useful primitives natively in Rust/Ratatui rather than treating the Python TUIs as the target surface
+
+Current task-26/task-27 constraint:
+
+- these docs record the roadmap, but they do not authorize new UI/code expansion by themselves
+- further implementation should wait for explicit routing/review approval
 
 TIDES-MESH MeshFloor/parity view:
 

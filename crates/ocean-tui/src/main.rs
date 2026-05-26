@@ -17,9 +17,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ocean_core::{
-    EventEnvelope, HealthResponse, OceanEvent, PromptRequest, RequestControlResponse,
-    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse,
-    SessionSummary,
+    EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
+    PermissionDecision as CorePermissionDecision, PermissionDecisionRequest, PermissionId,
+    PermissionStatus, PermissionsResponse, PromptRequest, RequestControlResponse,
+    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, SessionDetail,
+    SessionId, SessionResponse, SessionRunState, SessionSummary,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -147,6 +149,14 @@ enum Action {
     RefreshSessions,
     SendPrompt,
     CancelActive,
+    ApproveLatestPermission,
+    DenyLatestPermission,
+    ComposerNewline,
+    ToggleHelp,
+    NextRoom,
+    SelectRoom(WorkspaceRoom),
+    SessionPrev,
+    SessionNext,
     InputChar(char),
     Backspace,
     ClearInput,
@@ -160,20 +170,31 @@ enum Action {
 
 #[derive(Debug)]
 enum UiMode {
-    Daemon(DaemonApp),
-    Mesh(MeshApp, MeshState),
+    Daemon(Box<DaemonApp>),
+    Mesh(MeshApp, Box<MeshState>),
 }
 
 #[derive(Debug)]
 struct DaemonApp {
     url: String,
+    root: PathBuf,
+    mesh_agent: String,
+    active_room: WorkspaceRoom,
+    show_help: bool,
     health: HealthState,
     sessions: Vec<SessionSummary>,
+    selected_session_index: usize,
+    selected_session_detail: Option<SessionDetail>,
     requests: Vec<RequestStatus>,
+    pending_permissions: Vec<PendingPermission>,
     active_request_id: Option<RequestId>,
+    streaming_request_id: Option<RequestId>,
     input: String,
     activity: Vec<String>,
     transcript: Vec<String>,
+    tool_timeline: Vec<ToolTimelineEntry>,
+    diff_snippets: Vec<String>,
+    support: WorkspaceSupportState,
     status: String,
     stream_status: String,
     last_checked: Option<Instant>,
@@ -181,21 +202,34 @@ struct DaemonApp {
 }
 
 impl DaemonApp {
-    fn new(url: String) -> Self {
+    fn new(url: String, root: PathBuf) -> Self {
         Self {
             url,
+            root,
+            mesh_agent: default_mesh_agent(),
+            active_room: WorkspaceRoom::Orchestrator,
+            show_help: false,
             health: HealthState::Loading,
             sessions: Vec::new(),
+            selected_session_index: 0,
+            selected_session_detail: None,
             requests: Vec::new(),
+            pending_permissions: Vec::new(),
             active_request_id: None,
+            streaming_request_id: None,
             input: String::new(),
             activity: Vec::new(),
             transcript: vec![
-                "Ocean TUI thin client".to_string(),
-                "Type a prompt and press Enter. Press s to refresh sessions.".to_string(),
-                "Press Ctrl-C to cancel the latest active request.".to_string(),
+                "Ocean TUI coding-agent workspace".to_string(),
+                "Tab cycles TIDES-MESH rooms; F1-F7 jumps directly to a room.".to_string(),
+                "Enter sends. Ctrl-J inserts a newline in the composer.".to_string(),
+                "Shift-Y / Shift-N handle tool approvals; Up/Down picks the session to inspect or resume."
+                    .to_string(),
             ],
-            status: "starting".to_string(),
+            tool_timeline: Vec::new(),
+            diff_snippets: Vec::new(),
+            support: WorkspaceSupportState::default(),
+            status: "starting workspace shell".to_string(),
             stream_status: "connecting".to_string(),
             last_checked: None,
             refresh_every: DEFAULT_DAEMON_REFRESH,
@@ -228,6 +262,44 @@ impl DaemonApp {
         checked_text(self.last_checked)
     }
 
+    fn selected_session_slot(&self) -> usize {
+        self.selected_session_index.min(self.sessions.len())
+    }
+
+    fn selected_session(&self) -> Option<&SessionSummary> {
+        self.selected_session_slot()
+            .checked_sub(1)
+            .and_then(|idx| self.sessions.get(idx))
+    }
+
+    fn selected_session_id(&self) -> Option<SessionId> {
+        self.selected_session().map(|session| session.id)
+    }
+
+    fn selected_session_label(&self) -> String {
+        match self.selected_session() {
+            Some(session) => format!(
+                "resume {} · {} turns · {}",
+                short_id(session.id),
+                session.turns,
+                compact_text(&session.title, 20)
+            ),
+            None => "new session".to_string(),
+        }
+    }
+
+    fn cycle_session(&mut self, delta: isize) {
+        let slots = self.sessions.len() + 1;
+        if slots == 0 {
+            self.selected_session_index = 0;
+            return;
+        }
+        let current = self.selected_session_slot() as isize;
+        let next = (current + delta).clamp(0, self.sessions.len() as isize);
+        self.selected_session_index = next as usize;
+        self.status = format!("session target: {}", self.selected_session_label());
+    }
+
     fn push_activity(&mut self, line: String) {
         push_bounded(&mut self.activity, line, ACTIVITY_CAP);
     }
@@ -236,16 +308,47 @@ impl DaemonApp {
         push_bounded(&mut self.transcript, line, TRANSCRIPT_CAP);
     }
 
+    fn push_transcript_if_new(&mut self, line: String) {
+        if self.transcript.last() != Some(&line) {
+            self.push_transcript(line);
+        }
+    }
+
+    fn append_assistant_delta(&mut self, request_id: Option<RequestId>, text: &str) {
+        let chunk = text.replace(['\r', '\n'], " ");
+        if chunk.trim().is_empty() {
+            return;
+        }
+        let prefix = match request_id {
+            Some(request_id) => format!("← [{}] ", short_id(request_id)),
+            None => "← ".to_string(),
+        };
+        if self.streaming_request_id == request_id {
+            if let Some(last) = self.transcript.last_mut() {
+                if last.starts_with(&prefix) {
+                    last.push_str(&chunk);
+                    return;
+                }
+            }
+        }
+        self.streaming_request_id = request_id;
+        self.push_transcript(format!("{prefix}{chunk}"));
+    }
+
     fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
         self.sessions = sessions.into_iter().take(SESSION_CAP).collect();
+        self.selected_session_index = self.selected_session_index.min(self.sessions.len());
+        self.selected_session_detail = None;
     }
 
     fn set_requests(&mut self, requests: Vec<RequestStatus>) {
         self.requests = requests.into_iter().take(REQUEST_CAP).collect();
-    }
-
-    fn activity_lines(&self) -> Vec<Line<'static>> {
-        self.event_lines(24)
+        self.active_request_id = self
+            .requests
+            .iter()
+            .find(|request| !request.state.is_terminal())
+            .map(|request| request.request_id);
+        self.reconcile_pending_permissions();
     }
 
     fn event_lines(&self, limit: usize) -> Vec<Line<'static>> {
@@ -276,19 +379,100 @@ impl DaemonApp {
     }
 
     fn session_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(format!(
+            "{} new session",
+            if self.selected_session_slot() == 0 {
+                ">"
+            } else {
+                " "
+            }
+        ))];
         if self.sessions.is_empty() {
-            return vec![Line::from("No sessions yet. Press s to refresh.")];
+            lines.push(Line::from("  no saved sessions yet"));
+            lines.push(Line::from(
+                "  Up/Down selects a session; detail stays in sync below",
+            ));
+            return lines;
         }
-        self.sessions
+        lines.extend(
+            self.sessions
+                .iter()
+                .take(10)
+                .enumerate()
+                .map(|(idx, session)| {
+                    Line::from(format!(
+                        "{} [{}] {} turns {}",
+                        if self.selected_session_slot() == idx + 1 {
+                            ">"
+                        } else {
+                            " "
+                        },
+                        short_id(session.id),
+                        session.turns,
+                        compact_text(&session.title, 34)
+                    ))
+                }),
+        );
+        if let Some(detail) = self.selected_session_detail.as_ref() {
+            lines.push(Line::from(""));
+            lines.extend(
+                Self::session_detail_lines(detail)
+                    .into_iter()
+                    .map(Line::from),
+            );
+        } else if self.selected_session_slot() > 0 {
+            lines.push(Line::from("  session detail loading..."));
+        } else {
+            lines.push(Line::from(
+                "  select a session with Up/Down to inspect detail",
+            ));
+        }
+        lines
+    }
+
+    fn session_detail_lines(detail: &SessionDetail) -> Vec<String> {
+        let mut lines = vec![
+            format!(
+                "  selected [{}] {}",
+                short_id(detail.id),
+                compact_text(&detail.title, 38)
+            ),
+            format!(
+                "  {} · {} turns · {} · resumable {}",
+                compact_text(&format!("{}/{}", detail.provider, detail.model), 24),
+                detail.turns,
+                session_run_state_label(detail.state),
+                if detail.resumable { "yes" } else { "no" }
+            ),
+            format!(
+                "  transcript {} · messages {} · tools {} · active {} · pending {}",
+                detail.transcript.len(),
+                detail.messages.len(),
+                detail.tool_context.len(),
+                detail.active_requests.len(),
+                detail.pending_permissions.len()
+            ),
+        ];
+        if let Some(entry) = detail
+            .transcript
             .iter()
-            .take(12)
-            .map(|session| {
-                Line::from(format!(
-                    "{}  {} turns  {}",
-                    session.id, session.turns, session.title
-                ))
-            })
-            .collect()
+            .rev()
+            .find(|entry| !entry.text.trim().is_empty() || entry.tool_name.is_some())
+        {
+            let preview = if !entry.text.trim().is_empty() {
+                compact_text(&entry.text, 52)
+            } else if let Some(tool_name) = entry.tool_name.as_deref() {
+                compact_text(tool_name, 52)
+            } else {
+                compact_text(&entry.role, 52)
+            };
+            lines.push(format!(
+                "  recent {}: {}",
+                compact_text(&entry.role, 10),
+                preview
+            ));
+        }
+        lines
     }
 
     fn request_lines(&self) -> Vec<Line<'static>> {
@@ -304,15 +488,294 @@ impl DaemonApp {
                 } else {
                     " "
                 };
+                let permission = request
+                    .permission_id
+                    .map(|id| format!(" perm:{}", short_id(id)))
+                    .unwrap_or_default();
                 let message = request.message.as_deref().unwrap_or("");
                 Line::from(format!(
-                    "{marker} {}  {}  {}",
+                    "{marker} {}  {}{}  {}",
                     short_id(request.request_id),
                     state_label(request.state),
-                    compact_text(message, 48)
+                    permission,
+                    compact_text(message, 42)
                 ))
             })
             .collect()
+    }
+
+    fn tool_timeline_lines(&self, limit: usize) -> Vec<Line<'static>> {
+        if self.tool_timeline.is_empty() {
+            return vec![Line::from(
+                "No tool calls yet. Waiting for SSE tool events.",
+            )];
+        }
+        self.tool_timeline
+            .iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|entry| {
+                let left = format!(
+                    "{:>4} [{}] {} {}",
+                    time_ago(Some(&entry.at.to_rfc3339())),
+                    entry
+                        .request_id
+                        .map(short_id)
+                        .unwrap_or_else(|| "stream".to_string()),
+                    compact_text(&entry.tool, 12),
+                    compact_text(&entry.phase, 10)
+                );
+                Line::from(format!("{} {}", left, compact_text(&entry.message, 54)))
+            })
+            .collect()
+    }
+
+    fn diff_lines(&self, limit: usize) -> Vec<Line<'static>> {
+        if self.diff_snippets.is_empty() {
+            return vec![
+                Line::from("No diff/edit payloads captured yet."),
+                Line::from(
+                    "Waiting for tool output that looks like git diff, patch, or exact file edits.",
+                ),
+            ];
+        }
+        self.diff_snippets
+            .iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|line| Line::from(line.clone()))
+            .collect()
+    }
+
+    fn composer_lines(&self) -> Vec<Line<'static>> {
+        let prompt = if self.input.is_empty() {
+            "".to_string()
+        } else {
+            self.input.clone()
+        };
+        let mut lines = Vec::new();
+        for (idx, line) in prompt.split('\n').enumerate() {
+            lines.push(Line::from(format!(
+                "{} {}",
+                if idx == 0 { ">" } else { "·" },
+                line
+            )));
+        }
+        if lines.is_empty() {
+            lines.push(Line::from("> "));
+        }
+        lines.push(Line::from(format!(
+            "session target: {}",
+            self.selected_session_label()
+        )));
+        lines
+    }
+
+    fn room_lines(&self, width: usize) -> Vec<Line<'static>> {
+        render_workspace_room_lines(self, width)
+    }
+
+    fn support_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(format!(
+            "daemon {} · stream {} · checked {}",
+            self.status_label().0,
+            self.stream_status,
+            self.checked_text()
+        ))];
+        if let Some(generated) = self.support.unified.generated_at.as_deref() {
+            lines.push(Line::from(format!(
+                "unified cache {}",
+                time_ago(Some(generated))
+            )));
+        } else {
+            lines.push(Line::from("unified cache unavailable"));
+        }
+        lines.push(Line::from(format!(
+            "mesh tasks {} · feed {} · agents {}",
+            self.support.mesh.tasks.len(),
+            self.support.mesh.feed.len(),
+            self.support.mesh.agents.len()
+        )));
+        if let Some(source_count) = self
+            .support
+            .unified
+            .sources
+            .as_object()
+            .map(|map| map.len())
+        {
+            lines.push(Line::from(format!("sidecar sources {}", source_count)));
+        }
+        lines
+    }
+
+    fn pending_permission_lines(&self) -> Vec<Line<'static>> {
+        if self.pending_permissions.is_empty() {
+            return vec![
+                Line::from("No approvals waiting."),
+                Line::from("Shift-Y approve / Shift-N deny when a request appears."),
+            ];
+        }
+        let mut lines = vec![Line::from("Latest (*) uses Shift-Y approve · Shift-N deny")];
+        lines.extend(
+            self.pending_permissions
+                .iter()
+                .take(2)
+                .enumerate()
+                .flat_map(|(idx, pending)| {
+                    let marker = if idx == 0 { "*" } else { " " };
+                    let age = pending
+                        .updated_at
+                        .as_ref()
+                        .map(|ts| {
+                            let stamp = ts.to_rfc3339();
+                            time_ago(Some(&stamp))
+                        })
+                        .unwrap_or_else(|| "—".to_string());
+                    let request = pending
+                        .request_id
+                        .map(|id| format!(" req:{}", short_id(id)))
+                        .unwrap_or_default();
+                    [
+                        Line::from(format!(
+                            "{marker} {} [{}]{} {}",
+                            compact_text(&pending.tool, 14),
+                            short_id(pending.permission_id),
+                            request,
+                            age
+                        )),
+                        Line::from(format!("  {}", compact_text(&pending.reason, 56))),
+                        Line::from(format!(
+                            "  args {}",
+                            compact_text(&pending.args_preview, 52)
+                        )),
+                    ]
+                }),
+        );
+        lines
+    }
+
+    fn latest_pending_permission(&self) -> Option<&PendingPermission> {
+        self.pending_permissions.first()
+    }
+
+    fn set_permissions(&mut self, permissions: Vec<PermissionStatus>) {
+        self.pending_permissions = permissions
+            .into_iter()
+            .map(PendingPermission::from_status)
+            .collect();
+        self.sort_pending_permissions();
+    }
+
+    fn upsert_pending_permission(&mut self, pending: PendingPermission) {
+        if let Some(existing) = self
+            .pending_permissions
+            .iter_mut()
+            .find(|item| item.permission_id == pending.permission_id)
+        {
+            *existing = pending;
+        } else {
+            self.pending_permissions.push(pending);
+        }
+        self.sort_pending_permissions();
+    }
+
+    fn remove_pending_permission(&mut self, permission_id: PermissionId) {
+        self.pending_permissions
+            .retain(|pending| pending.permission_id != permission_id);
+    }
+
+    fn reconcile_pending_permissions(&mut self) {
+        let waiting: Vec<&RequestStatus> = self
+            .requests
+            .iter()
+            .filter(|request| request.state == RequestState::WaitingForPermission)
+            .collect();
+        self.pending_permissions.retain(|pending| {
+            waiting
+                .iter()
+                .any(|request| request.permission_id == Some(pending.permission_id))
+        });
+        for request in waiting {
+            let Some(permission_id) = request.permission_id else {
+                continue;
+            };
+            if let Some(existing) = self
+                .pending_permissions
+                .iter_mut()
+                .find(|pending| pending.permission_id == permission_id)
+            {
+                existing.request_id = Some(request.request_id);
+                existing.updated_at = request.updated_at;
+                if existing.reason.is_empty() {
+                    existing.reason = request
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "waiting for operator decision".to_string());
+                }
+                if existing.args_preview.is_empty() {
+                    existing.args_preview = request.message.clone().unwrap_or_default();
+                }
+            } else {
+                self.pending_permissions.push(PendingPermission {
+                    permission_id,
+                    request_id: Some(request.request_id),
+                    tool: "permission request".to_string(),
+                    reason: request
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "waiting for operator decision".to_string()),
+                    args_preview: request.message.clone().unwrap_or_default(),
+                    updated_at: request.updated_at,
+                });
+            }
+        }
+        self.sort_pending_permissions();
+    }
+
+    fn sort_pending_permissions(&mut self) {
+        self.pending_permissions.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then(b.permission_id.cmp(&a.permission_id))
+        });
+    }
+
+    fn push_tool_timeline(
+        &mut self,
+        request_id: Option<RequestId>,
+        tool: &str,
+        phase: &str,
+        message: String,
+        at: DateTime<Utc>,
+    ) {
+        push_bounded(
+            &mut self.tool_timeline,
+            ToolTimelineEntry {
+                at,
+                request_id,
+                tool: tool.to_string(),
+                phase: phase.to_string(),
+                message,
+            },
+            FEED_CAP,
+        );
+    }
+
+    fn capture_diff_excerpt(&mut self, text: &str) {
+        if let Some(snippet) = extract_diff_excerpt(text) {
+            push_bounded(&mut self.diff_snippets, snippet, ACTIVITY_CAP);
+        }
+    }
+
+    fn refresh_support_state(&mut self) {
+        self.support = load_workspace_support_state(&self.root, &self.mesh_agent)
+            .unwrap_or_else(|_| WorkspaceSupportState::default());
     }
 
     fn cancellable_request_id(&self) -> Option<RequestId> {
@@ -321,6 +784,153 @@ impl DaemonApp {
             .find(|request| request.state.is_cancellable())
             .map(|request| request.request_id)
     }
+}
+
+#[derive(Debug, Clone)]
+struct PendingPermission {
+    permission_id: PermissionId,
+    request_id: Option<RequestId>,
+    tool: String,
+    reason: String,
+    args_preview: String,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+impl PendingPermission {
+    fn from_status(status: PermissionStatus) -> Self {
+        Self {
+            permission_id: status.permission_id,
+            request_id: Some(status.request_id),
+            tool: status.tool,
+            reason: status.reason,
+            args_preview: serde_json::to_string(&status.args)
+                .map(|json| compact_text(&json, 56))
+                .unwrap_or_else(|_| "{}".to_string()),
+            updated_at: Some(status.created_at),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceRoom {
+    Orchestrator,
+    Writers,
+    Rev,
+    TideDash,
+    WorkOps,
+    WorldMap,
+    PM,
+}
+
+impl WorkspaceRoom {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Orchestrator => "Orchestrator",
+            Self::Writers => "Writers",
+            Self::Rev => "Rev",
+            Self::TideDash => "TideDash",
+            Self::WorkOps => "WorkOps",
+            Self::WorldMap => "WorldMap",
+            Self::PM => "PM",
+        }
+    }
+
+    fn all() -> [Self; 7] {
+        [
+            Self::Orchestrator,
+            Self::Writers,
+            Self::Rev,
+            Self::TideDash,
+            Self::WorkOps,
+            Self::WorldMap,
+            Self::PM,
+        ]
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Orchestrator => Self::Writers,
+            Self::Writers => Self::Rev,
+            Self::Rev => Self::TideDash,
+            Self::TideDash => Self::WorkOps,
+            Self::WorkOps => Self::WorldMap,
+            Self::WorldMap => Self::PM,
+            Self::PM => Self::Orchestrator,
+        }
+    }
+
+    fn from_function_key(code: KeyCode) -> Option<Self> {
+        match code {
+            KeyCode::F(1) => Some(Self::Orchestrator),
+            KeyCode::F(2) => Some(Self::Writers),
+            KeyCode::F(3) => Some(Self::Rev),
+            KeyCode::F(4) => Some(Self::TideDash),
+            KeyCode::F(5) => Some(Self::WorkOps),
+            KeyCode::F(6) => Some(Self::WorldMap),
+            KeyCode::F(7) => Some(Self::PM),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ToolTimelineEntry {
+    at: DateTime<Utc>,
+    request_id: Option<RequestId>,
+    tool: String,
+    phase: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceSupportState {
+    mesh: MeshState,
+    unified: UnifiedSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct UnifiedSnapshot {
+    generated_at: Option<String>,
+    summary: Value,
+    sources: Value,
+    events: Vec<UnifiedEvent>,
+}
+
+impl Default for UnifiedSnapshot {
+    fn default() -> Self {
+        Self {
+            generated_at: None,
+            summary: Value::Null,
+            sources: Value::Null,
+            events: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UnifiedStateFile {
+    #[serde(default)]
+    generated_at: Option<String>,
+    #[serde(default)]
+    summary: Value,
+    #[serde(default)]
+    sources: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UnifiedEvent {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    ts: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    summary: Option<Value>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Debug)]
@@ -414,6 +1024,24 @@ impl DaemonClient {
             .map_err(|err| err.to_string())
     }
 
+    fn session_detail(
+        &self,
+        base_url: &str,
+        session_id: SessionId,
+    ) -> Result<SessionResponse, String> {
+        let url = format!(
+            "{}/v1/sessions/{session_id}",
+            base_url.trim_end_matches('/')
+        );
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<SessionResponse>()
+            .map_err(|err| err.to_string())
+    }
+
     fn requests(&self, base_url: &str) -> Result<RequestsResponse, String> {
         let url = format!("{}/v1/requests", base_url.trim_end_matches('/'));
         self.http
@@ -422,6 +1050,17 @@ impl DaemonClient {
             .and_then(|res| res.error_for_status())
             .map_err(|err| err.to_string())?
             .json::<RequestsResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn permissions(&self, base_url: &str) -> Result<PermissionsResponse, String> {
+        let url = format!("{}/v1/permissions", base_url.trim_end_matches('/'));
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<PermissionsResponse>()
             .map_err(|err| err.to_string())
     }
 
@@ -456,6 +1095,30 @@ impl DaemonClient {
             .and_then(|res| res.error_for_status())
             .map_err(|err| err.to_string())?
             .json::<RequestControlResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn permission_decision(
+        &self,
+        base_url: &str,
+        permission_id: PermissionId,
+        decision: CorePermissionDecision,
+    ) -> Result<PermissionControlResponse, String> {
+        let url = format!(
+            "{}/v1/permissions/{permission_id}/decision",
+            base_url.trim_end_matches('/')
+        );
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision,
+        };
+        self.http
+            .post(url)
+            .json(&body)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<PermissionControlResponse>()
             .map_err(|err| err.to_string())
     }
 }
@@ -595,7 +1258,7 @@ enum AgentPresence {
     Stale,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct MeshState {
     tasks: Vec<MeshTask>,
     feed: Vec<FeedEvent>,
@@ -625,7 +1288,8 @@ fn main() -> anyhow::Result<()> {
 
 fn run_daemon(url: String) -> anyhow::Result<()> {
     let client = DaemonClient::new()?;
-    let mut state = AppState::new(UiMode::Daemon(DaemonApp::new(url)));
+    let root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut state = AppState::new(UiMode::Daemon(Box::new(DaemonApp::new(url, root))));
     let (stream_tx, action_rx) = mpsc::channel();
 
     if let UiMode::Daemon(app) = &state.mode {
@@ -674,12 +1338,12 @@ fn run_daemon(url: String) -> anyhow::Result<()> {
 fn run_mesh(cli: MeshCli) -> anyhow::Result<()> {
     let app = MeshApp::new(cli.clone());
     let mesh_state = load_mesh_state(&app.root, &app.agent).unwrap_or_else(|_| empty_mesh_state());
-    let mut state = AppState::new(UiMode::Mesh(app, mesh_state));
+    let mut state = AppState::new(UiMode::Mesh(app, Box::new(mesh_state)));
 
     if let UiMode::Mesh(app, mesh) = &mut state.mode {
         match load_mesh_state(&app.root, &app.agent) {
             Ok(next) => {
-                *mesh = next;
+                **mesh = next;
                 app.status = "loaded".to_string();
                 app.last_refresh = Some(Instant::now());
             }
@@ -741,6 +1405,10 @@ fn daemon_key_action(event: Event) -> Option<Action> {
         Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => {
             Some(Action::Quit)
         }
+        Event::Key(key) if key.code == KeyCode::Tab => Some(Action::NextRoom),
+        Event::Key(key) if key.code == KeyCode::Up => Some(Action::SessionPrev),
+        Event::Key(key) if key.code == KeyCode::Down => Some(Action::SessionNext),
+        Event::Key(key) if key.code == KeyCode::F(10) => Some(Action::ToggleHelp),
         Event::Key(key) if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) => {
             Some(Action::RefreshAll)
         }
@@ -752,6 +1420,13 @@ fn daemon_key_action(event: Event) -> Option<Action> {
         {
             Some(Action::CancelActive)
         }
+        Event::Key(key)
+            if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::ComposerNewline)
+        }
+        Event::Key(key) if key.code == KeyCode::Char('Y') => Some(Action::ApproveLatestPermission),
+        Event::Key(key) if key.code == KeyCode::Char('N') => Some(Action::DenyLatestPermission),
         Event::Key(key) if key.code == KeyCode::Enter => Some(Action::SendPrompt),
         Event::Key(key) if key.code == KeyCode::Backspace => Some(Action::Backspace),
         Event::Key(key)
@@ -759,12 +1434,18 @@ fn daemon_key_action(event: Event) -> Option<Action> {
         {
             Some(Action::ClearInput)
         }
-        Event::Key(key) => match key.code {
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Some(Action::InputChar(ch))
+        Event::Key(key) => {
+            if let Some(room) = WorkspaceRoom::from_function_key(key.code) {
+                return Some(Action::SelectRoom(room));
             }
-            _ => None,
-        },
+            match key.code {
+                KeyCode::Char('?') => Some(Action::ToggleHelp),
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(Action::InputChar(ch))
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -800,13 +1481,27 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
         Action::RefreshSessions => daemon_refresh_sessions(client, app),
         Action::SendPrompt => daemon_send_prompt(client, app),
         Action::CancelActive => daemon_cancel_active(client, app),
+        Action::ApproveLatestPermission => daemon_decide_latest_permission(client, app, true),
+        Action::DenyLatestPermission => daemon_decide_latest_permission(client, app, false),
+        Action::ComposerNewline => app.input.push('\n'),
+        Action::ToggleHelp => app.show_help = !app.show_help,
+        Action::NextRoom => app.active_room = app.active_room.next(),
+        Action::SelectRoom(room) => app.active_room = room,
+        Action::SessionPrev => {
+            app.cycle_session(-1);
+            daemon_refresh_selected_session_detail(client, app);
+        }
+        Action::SessionNext => {
+            app.cycle_session(1);
+            daemon_refresh_selected_session_detail(client, app);
+        }
         Action::InputChar(ch) => app.input.push(ch),
         Action::Backspace => {
             app.input.pop();
         }
         Action::ClearInput => app.input.clear(),
         Action::StreamStatus(status) => app.stream_status = status,
-        Action::StreamEvent(envelope) => app.push_activity(summarize_event(&envelope)),
+        Action::StreamEvent(envelope) => daemon_apply_stream_event(app, envelope),
         _ => {}
     }
     state.dirty = true;
@@ -822,7 +1517,7 @@ fn handle_mesh_action(state: &mut AppState, action: Action) -> bool {
         Action::Quit => return false,
         Action::Tick | Action::MeshRefresh => match load_mesh_state(&app.root, &app.agent) {
             Ok(next) => {
-                *mesh = next;
+                **mesh = next;
                 app.status = if matches!(action, Action::Tick) {
                     "auto-refresh".to_string()
                 } else {
@@ -862,6 +1557,8 @@ fn daemon_refresh_all(client: &DaemonClient, state: &mut AppState) {
     daemon_refresh_health(client, app);
     daemon_refresh_sessions(client, app);
     daemon_refresh_requests(client, app);
+    daemon_refresh_permissions(client, app);
+    app.refresh_support_state();
 }
 
 fn daemon_refresh_health(client: &DaemonClient, app: &mut DaemonApp) {
@@ -879,10 +1576,48 @@ fn daemon_refresh_sessions(client: &DaemonClient, app: &mut DaemonApp) {
     match client.sessions(&app.url) {
         Ok(res) if res.ok => {
             app.set_sessions(res.sessions);
-            app.status = format!("sessions refreshed: {}", app.sessions.len());
+            app.status = format!(
+                "sessions refreshed: {} ({})",
+                app.sessions.len(),
+                app.selected_session_label()
+            );
+            daemon_refresh_selected_session_detail(client, app);
         }
         Ok(res) => app.status = format!("sessions error: {}", res.error.unwrap_or_default()),
         Err(err) => app.status = format!("sessions request error: {err}"),
+    }
+}
+
+fn daemon_refresh_selected_session_detail(client: &DaemonClient, app: &mut DaemonApp) {
+    let Some(session_id) = app.selected_session_id() else {
+        app.selected_session_detail = None;
+        return;
+    };
+
+    match client.session_detail(&app.url, session_id) {
+        Ok(res) if res.ok => {
+            if let Some(session) = res.session {
+                app.status = format!(
+                    "session detail: {} {} · {} turns · {} messages",
+                    short_id(session.id),
+                    compact_text(&session.title, 36),
+                    session.turns,
+                    session.messages.len()
+                );
+                app.selected_session_detail = Some(session);
+            } else {
+                app.selected_session_detail = None;
+                app.status = format!("session detail missing for {}", short_id(session_id));
+            }
+        }
+        Ok(res) => {
+            app.selected_session_detail = None;
+            app.status = format!("session detail error: {}", res.error.unwrap_or_default());
+        }
+        Err(err) => {
+            app.selected_session_detail = None;
+            app.status = format!("session detail request error: {err}");
+        }
     }
 }
 
@@ -894,6 +1629,17 @@ fn daemon_refresh_requests(client: &DaemonClient, app: &mut DaemonApp) {
         }
         Ok(res) => app.status = format!("requests error: {}", res.error.unwrap_or_default()),
         Err(err) => app.status = format!("requests request error: {err}"),
+    }
+}
+
+fn daemon_refresh_permissions(client: &DaemonClient, app: &mut DaemonApp) {
+    match client.permissions(&app.url) {
+        Ok(res) if res.ok => {
+            app.set_permissions(res.permissions);
+            app.status = format!("permissions refreshed: {}", app.pending_permissions.len());
+        }
+        Ok(res) => app.status = format!("permissions error: {}", res.error.unwrap_or_default()),
+        Err(err) => app.status = format!("permissions request error: {err}"),
     }
 }
 
@@ -922,13 +1668,14 @@ fn daemon_send_prompt(client: &DaemonClient, app: &mut DaemonApp) {
         return;
     }
     app.input.clear();
+    app.streaming_request_id = None;
     app.push_transcript(format!("> {prompt}"));
     app.status = "creating async request...".to_string();
 
     let request = PromptRequest {
         prompt,
         request_id: None,
-        session_id: None,
+        session_id: app.selected_session_id(),
         max_turns: None,
         yolo: false,
     };
@@ -957,6 +1704,179 @@ fn daemon_send_prompt(client: &DaemonClient, app: &mut DaemonApp) {
             );
         }
         Err(err) => app.status = format!("request create error: {err}"),
+    }
+}
+
+fn daemon_decide_latest_permission(client: &DaemonClient, app: &mut DaemonApp, allow: bool) {
+    let Some(pending) = app.latest_pending_permission().cloned() else {
+        app.status = "no pending permission request".to_string();
+        return;
+    };
+    let decision = if allow {
+        CorePermissionDecision::Allow
+    } else {
+        CorePermissionDecision::Deny {
+            reason: Some("operator denied from ocean-tui".to_string()),
+        }
+    };
+    match client.permission_decision(&app.url, pending.permission_id, decision) {
+        Ok(res) if res.ok => {
+            app.remove_pending_permission(res.permission_id);
+            app.status = format!(
+                "permission {} {}",
+                short_id(res.permission_id),
+                compact_text(&res.message, 56)
+            );
+            app.push_transcript(format!(
+                "{} permission [{}] {}",
+                if allow { "✓ allowed" } else { "✗ denied" },
+                short_id(res.permission_id),
+                compact_text(&pending.reason, 52)
+            ));
+            daemon_refresh_requests(client, app);
+            daemon_refresh_permissions(client, app);
+        }
+        Ok(res) => {
+            app.status = format!(
+                "permission {} rejected: {}",
+                short_id(res.permission_id),
+                compact_text(&res.message, 56)
+            );
+        }
+        Err(err) => app.status = format!("permission decision error: {err}"),
+    }
+}
+
+fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
+    let request_id = envelope.request_id;
+    let permission_id = envelope.permission_id;
+    app.push_activity(summarize_event(&envelope));
+
+    match &envelope.event {
+        OceanEvent::SessionCreated => {
+            app.status = "session created".to_string();
+        }
+        OceanEvent::UserMessage { text } => {
+            app.push_transcript_if_new(format!("> {text}"));
+        }
+        OceanEvent::AssistantDelta { text } => {
+            app.append_assistant_delta(request_id, text);
+            app.capture_diff_excerpt(text);
+        }
+        OceanEvent::ToolStarted { tool, args } => {
+            let args_text = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+            app.push_tool_timeline(
+                request_id,
+                tool,
+                "started",
+                compact_text(&args_text, 72),
+                envelope.at,
+            );
+            app.capture_diff_excerpt(&args_text);
+        }
+        OceanEvent::ToolOutput {
+            tool,
+            text,
+            is_error,
+        } => {
+            app.push_tool_timeline(
+                request_id,
+                tool,
+                if *is_error { "stderr" } else { "output" },
+                compact_text(text, 72),
+                envelope.at,
+            );
+            app.capture_diff_excerpt(text);
+        }
+        OceanEvent::ToolEnded { tool, is_error } => {
+            app.push_tool_timeline(
+                request_id,
+                tool,
+                "ended",
+                if *is_error {
+                    "tool exited with error".to_string()
+                } else {
+                    "tool completed".to_string()
+                },
+                envelope.at,
+            );
+        }
+        OceanEvent::PermissionRequest { tool, reason, args } => {
+            app.streaming_request_id = None;
+            if let Some(permission_id) = permission_id {
+                app.upsert_pending_permission(PendingPermission {
+                    permission_id,
+                    request_id,
+                    tool: tool.clone(),
+                    reason: reason.clone(),
+                    args_preview: serde_json::to_string(args)
+                        .map(|json| compact_text(&json, 56))
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    updated_at: Some(envelope.at),
+                });
+            }
+            app.push_tool_timeline(
+                request_id,
+                tool,
+                "approval",
+                compact_text(reason, 72),
+                envelope.at,
+            );
+            app.push_transcript(format!(
+                "⚠ approval needed: {} {}",
+                tool,
+                compact_text(reason, 56)
+            ));
+            if let Some(request_id) = request_id {
+                app.active_request_id = Some(request_id);
+            }
+            app.status = format!("approval waiting for {}", tool);
+        }
+        OceanEvent::PermissionDecision { allowed, reason } => {
+            app.streaming_request_id = None;
+            if let Some(permission_id) = permission_id {
+                app.remove_pending_permission(permission_id);
+                app.push_transcript(format!(
+                    "{} permission [{}] {}",
+                    if *allowed {
+                        "✓ allowed"
+                    } else {
+                        "✗ denied"
+                    },
+                    short_id(permission_id),
+                    compact_text(reason.as_deref().unwrap_or("decision recorded"), 56)
+                ));
+            }
+        }
+        OceanEvent::TurnFinished { ok, wall_ms } => {
+            app.streaming_request_id = None;
+            if app.active_request_id == request_id {
+                app.active_request_id = None;
+            }
+            app.push_transcript(format!(
+                "{} request {} finished in {}ms",
+                if *ok { "✓" } else { "✗" },
+                request_id
+                    .map(short_id)
+                    .unwrap_or_else(|| "stream".to_string()),
+                wall_ms
+            ));
+        }
+        OceanEvent::Cancelled { reason } => {
+            app.streaming_request_id = None;
+            if app.active_request_id == request_id {
+                app.active_request_id = None;
+            }
+            app.push_transcript(format!(
+                "✗ cancelled {}",
+                compact_text(reason.as_deref().unwrap_or("request cancelled"), 56)
+            ));
+        }
+        OceanEvent::Error { message } => {
+            app.streaming_request_id = None;
+            app.push_transcript(format!("✗ error {}", compact_text(message, 60)));
+            app.status = compact_text(message, 72);
+        }
     }
 }
 
@@ -1154,6 +2074,142 @@ fn summarize_event(envelope: &EventEnvelope) -> String {
             format!("{request}error: {}", compact_text(message, 72))
         }
     }
+}
+
+fn load_workspace_support_state(root: &Path, agent: &str) -> anyhow::Result<WorkspaceSupportState> {
+    Ok(WorkspaceSupportState {
+        mesh: load_mesh_state(root, agent).unwrap_or_else(|_| empty_mesh_state()),
+        unified: load_unified_snapshot(root).unwrap_or_default(),
+    })
+}
+
+fn load_unified_snapshot(root: &Path) -> anyhow::Result<UnifiedSnapshot> {
+    let state_path = root.join(".pi/unified/state.json");
+    let events_path = root.join(".pi/unified/events.jsonl");
+    let state: UnifiedStateFile = if state_path.exists() {
+        read_json_file(&state_path)?
+    } else {
+        UnifiedStateFile {
+            generated_at: None,
+            summary: Value::Null,
+            sources: Value::Null,
+        }
+    };
+    let mut events = read_jsonl::<UnifiedEvent>(&events_path)?;
+    trim_front(&mut events, FEED_CAP);
+    events.reverse();
+    Ok(UnifiedSnapshot {
+        generated_at: state.generated_at,
+        summary: state.summary,
+        sources: state.sources,
+        events,
+    })
+}
+
+fn render_workspace_room_lines(app: &DaemonApp, width: usize) -> Vec<Line<'static>> {
+    let mesh = &app.support.mesh;
+    let unified = &app.support.unified;
+    let mut lines = match app.active_room {
+        WorkspaceRoom::Orchestrator => vec![
+            Line::from("Orchestrator shell"),
+            Line::from(format!(
+                "tasks {} done / {} active / {} blocked",
+                mesh.counts.done,
+                mesh.counts.in_progress,
+                mesh.counts.blocked + mesh.counts.review
+            )),
+            Line::from(format!(
+                "inbox {} · feed {} · agents {}",
+                mesh.inbox.len(),
+                mesh.feed.len(),
+                mesh.agent_counts.active
+            )),
+            Line::from(compact_text(
+                mesh.feed
+                    .first()
+                    .map(|event| render_feed_event(event, width.saturating_sub(4)))
+                    .as_deref()
+                    .unwrap_or("No mesh event yet."),
+                width.saturating_sub(4),
+            )),
+        ],
+        WorkspaceRoom::Writers => vec![
+            Line::from("WritersRoom lane"),
+            Line::from(format!(
+                "Henry {} · Charlotte {}",
+                agent_presence(mesh, "Henry"),
+                agent_presence(mesh, "Charlotte")
+            )),
+            Line::from(format!(
+                "writing/research tasks {}",
+                room_task_count(mesh, &["henry", "writer", "writers", "charlotte"])
+            )),
+            Line::from("placeholder: NoteDash/filetree internals are not yet embedded; room tab shows mesh/task visibility only."),
+        ],
+        WorkspaceRoom::Rev => vec![
+            Line::from("Rev review lane"),
+            Line::from(format!(
+                "KNOX/Rev {} · review queue {}",
+                agent_presence(mesh, "KNOX"),
+                mesh.tasks
+                    .iter()
+                    .filter(|task| matches!(task.status.as_str(), "review" | "blocked" | "milestone"))
+                    .count()
+            )),
+            Line::from("placeholder: PR/file diff review detail remains local-TUI only until a richer review surface is wired."),
+        ],
+        WorkspaceRoom::TideDash => vec![
+            Line::from("TideDash room"),
+            Line::from(value_summary_line(
+                &unified.summary,
+                "tidedash_statuses",
+                "status snapshots",
+            )),
+            Line::from(value_summary_line(
+                &unified.summary,
+                "tidedash_errors",
+                "error snapshots",
+            )),
+            Line::from("placeholder: full TideDash panes remain separate until unified cache slices are promoted into native widgets."),
+        ],
+        WorkspaceRoom::WorkOps => vec![
+            Line::from("WorkOps room"),
+            Line::from(value_summary_line(&unified.summary, "ops_attention", "ops attention")),
+            Line::from(value_summary_line(&unified.summary, "workdash", "workdash summary")),
+            Line::from("placeholder: workdash/opsdash split is represented as cache summaries, not embedded tables yet."),
+        ],
+        WorkspaceRoom::WorldMap => vec![
+            Line::from("WorldMap room"),
+            Line::from(format!(
+                "active {} · away {} · stale {}",
+                mesh.agent_counts.active, mesh.agent_counts.away, mesh.agent_counts.stale
+            )),
+            Line::from("placeholder: geospatial clock/map widget is not embedded yet; using live agent-presence as the room heartbeat."),
+        ],
+        WorkspaceRoom::PM => vec![
+            Line::from("PM room"),
+            Line::from(format!(
+                "product-facing tasks {}",
+                room_task_count(mesh, &["pm", "product", "charlotte", "pixel", "owl"])
+            )),
+            Line::from(value_summary_line(
+                &unified.summary,
+                "integrations",
+                "integration readiness",
+            )),
+            Line::from("placeholder: PM routing/brief layer is not embedded; this room currently exposes task + integration context only."),
+        ],
+    };
+
+    let tail = unified
+        .events
+        .first()
+        .map(|event| render_unified_event(event, width.saturating_sub(4)))
+        .unwrap_or_else(|| "No unified sidecar event yet.".to_string());
+    lines.push(Line::from(""));
+    lines.push(Line::from("Latest sidecar:"));
+    lines.push(Line::from(compact_text(&tail, width.saturating_sub(4))));
+    lines
 }
 
 fn load_mesh_state(root: &Path, agent: &str) -> anyhow::Result<MeshState> {
@@ -1467,22 +2523,211 @@ fn count_agents(agents: &[AgentView]) -> AgentCounts {
 }
 
 fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
+    if frame.area().width < 118 || frame.area().height < 32 {
+        draw_daemon_ui_compact(frame, app);
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(16),
+            Constraint::Length(6),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(52),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+        ])
+        .split(layout[1]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(12), Constraint::Length(8)])
+        .split(body[0]);
+    let center = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(body[1]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(11),
+            Constraint::Length(8),
+            Constraint::Min(8),
+        ])
+        .split(body[2]);
+
+    draw_daemon_header(frame, layout[0], app);
+    frame.render_widget(
+        Paragraph::new(app.transcript_lines())
+            .block(
+                Block::default()
+                    .title("Agent Session Transcript")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        left[0],
+    );
+    frame.render_widget(
+        Paragraph::new(app.event_lines(12))
+            .block(Block::default().title("Event Rail").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+        left[1],
+    );
+    frame.render_widget(
+        Paragraph::new(app.tool_timeline_lines(center[0].height.saturating_sub(2) as usize))
+            .block(
+                Block::default()
+                    .title("Tool Timeline")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        center[0],
+    );
+    frame.render_widget(
+        Paragraph::new(app.diff_lines(center[1].height.saturating_sub(2) as usize))
+            .block(
+                Block::default()
+                    .title("Diffs / Edits")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        center[1],
+    );
+    frame.render_widget(
+        Paragraph::new(app.room_lines(right[0].width.saturating_sub(4) as usize))
+            .block(
+                Block::default()
+                    .title(format!("{} Room", app.active_room.label()))
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        right[0],
+    );
+    frame.render_widget(
+        Paragraph::new(app.pending_permission_lines())
+            .block(
+                Block::default()
+                    .title(format!("Approvals ({})", app.pending_permissions.len()))
+                    .borders(Borders::ALL)
+                    .border_style(if app.pending_permissions.is_empty() {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    }),
+            )
+            .wrap(Wrap { trim: true }),
+        right[1],
+    );
+    frame.render_widget(
+        Paragraph::new(workspace_status_lines(
+            app,
+            right[2].height.saturating_sub(2) as usize,
+        ))
+        .block(
+            Block::default()
+                .title("Sessions / Support / Help")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: true }),
+        right[2],
+    );
+    frame.render_widget(
+        Paragraph::new(app.composer_lines())
+            .block(Block::default().title("Composer").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        layout[2],
+    );
+    frame.render_widget(daemon_footer(app), layout[3]);
+}
+
+fn draw_daemon_ui_compact(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(5),
-            Constraint::Length(8),
-            Constraint::Length(8),
             Constraint::Length(6),
-            Constraint::Min(6),
             Constraint::Length(8),
-            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Min(8),
+            Constraint::Length(6),
             Constraint::Length(2),
         ])
         .split(frame.area());
 
+    draw_daemon_header(frame, chunks[0], app);
+    frame.render_widget(
+        Paragraph::new(app.room_lines(chunks[1].width.saturating_sub(4) as usize))
+            .block(
+                Block::default()
+                    .title(format!("{} Room", app.active_room.label()))
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(app.tool_timeline_lines(chunks[2].height.saturating_sub(2) as usize))
+            .block(
+                Block::default()
+                    .title("Tool Timeline")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
+    frame.render_widget(
+        Paragraph::new(app.pending_permission_lines())
+            .block(
+                Block::default()
+                    .title(format!("Approvals ({})", app.pending_permissions.len()))
+                    .borders(Borders::ALL)
+                    .border_style(if app.pending_permissions.is_empty() {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    }),
+            )
+            .wrap(Wrap { trim: true }),
+        chunks[3],
+    );
+    frame.render_widget(
+        Paragraph::new(app.transcript_lines())
+            .block(
+                Block::default()
+                    .title("Transcript / Diff / Sessions")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[4],
+    );
+    frame.render_widget(
+        Paragraph::new(app.composer_lines())
+            .block(Block::default().title("Composer").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        chunks[5],
+    );
+    frame.render_widget(daemon_footer(app), chunks[6]);
+}
+
+fn draw_daemon_header(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &DaemonApp,
+) {
     let (health_label, health_color) = app.status_label();
+    let root_label = app
+        .root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| app.root.display().to_string());
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -1495,62 +2740,77 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
             Span::styled(health_label, Style::default().fg(health_color)),
             Span::raw("  "),
             Span::styled(
-                "Ocean TUI",
+                "Ocean TUI Coding Workspace",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(format!("daemon URL: {}", app.url)),
-        Line::from(app.health_summary()),
+        Line::from(format!(
+            "root {} · room {} · session {}",
+            root_label,
+            app.active_room.label(),
+            app.selected_session_label()
+        )),
+        Line::from(workspace_room_tabs_line(app.active_room)),
+        Line::from(format!(
+            "daemon {} · stream {} · approvals {} · active request {}",
+            app.health_summary(),
+            app.stream_status,
+            app.pending_permissions.len(),
+            app.active_request_id
+                .map(short_id)
+                .unwrap_or_else(|| "none".to_string())
+        )),
     ])
     .block(Block::default().title("Ocean").borders(Borders::ALL))
     .wrap(Wrap { trim: true });
-    frame.render_widget(header, chunks[0]);
+    frame.render_widget(header, area);
+}
 
-    let event_stream = Paragraph::new(app.event_lines(24))
-        .block(Block::default().title("Event Stream").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(event_stream, chunks[1]);
+fn workspace_room_tabs_line(active: WorkspaceRoom) -> String {
+    WorkspaceRoom::all()
+        .iter()
+        .enumerate()
+        .map(|(idx, room)| {
+            if *room == active {
+                format!("[F{} {}]", idx + 1, room.label())
+            } else {
+                format!("F{} {}", idx + 1, room.label())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
 
-    let activity = Paragraph::new(app.activity_lines())
-        .block(
-            Block::default()
-                .title("Activity Summary")
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: true });
-    frame.render_widget(activity, chunks[2]);
+fn workspace_status_lines(app: &DaemonApp, limit: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.extend(app.request_lines());
+    lines.push(Line::from(""));
+    lines.extend(app.session_lines());
+    lines.push(Line::from(""));
+    lines.extend(app.support_lines());
+    if app.show_help {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Help"));
+        lines.push(Line::from("Tab/F1-F7 rooms · Up/Down session picker"));
+        lines.push(Line::from("Enter send · Ctrl-J newline · Ctrl-U clear"));
+        lines.push(Line::from("Ctrl-C cancel · Shift-Y/N approval · r refresh"));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from("F10 or ? for help"));
+    }
+    lines.into_iter().take(limit.max(1)).collect()
+}
 
-    let requests = Paragraph::new(app.request_lines())
-        .block(Block::default().title("Requests").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(requests, chunks[3]);
-
-    let transcript = Paragraph::new(app.transcript_lines())
-        .block(Block::default().title("Transcript").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(transcript, chunks[4]);
-
-    let sessions = Paragraph::new(app.session_lines())
-        .block(Block::default().title("Sessions").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(sessions, chunks[5]);
-
-    let composer = Paragraph::new(format!("> {}", app.input))
-        .block(Block::default().title("Composer").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(composer, chunks[6]);
-
-    let footer = Paragraph::new(format!(
-        "Enter send | Ctrl-C cancel | s sessions | r refresh | q quit | stream {} | checked {} | {}",
-        app.stream_status,
+fn daemon_footer(app: &DaemonApp) -> Paragraph<'static> {
+    Paragraph::new(format!(
+        "workspace first | Tab cycle rooms | F1-F7 jump | Up/Down session picker | Enter send | Ctrl-J newline | Ctrl-C cancel | Shift-Y/Shift-N approvals | F10/? help | checked {} | {}",
         app.checked_text(),
         app.status
     ))
     .alignment(Alignment::Center)
-    .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, chunks[7]);
+    .style(Style::default().fg(Color::DarkGray))
 }
 
 fn draw_mesh_ui(frame: &mut ratatui::Frame<'_>, app: &MeshApp, state: &MeshState) {
@@ -2093,6 +3353,105 @@ fn render_agent_line(agent: &AgentView, width: usize) -> String {
     )
 }
 
+fn agent_presence(state: &MeshState, agent_name: &str) -> &'static str {
+    state
+        .agents
+        .iter()
+        .find(|agent| agent.agent.eq_ignore_ascii_case(agent_name))
+        .map(|agent| match agent.presence {
+            AgentPresence::Active => "active",
+            AgentPresence::Away => "away",
+            AgentPresence::Stale => "stale",
+        })
+        .unwrap_or("offline")
+}
+
+fn room_task_count(state: &MeshState, owners: &[&str]) -> usize {
+    state
+        .tasks
+        .iter()
+        .filter(|task| {
+            let haystack = [
+                task.assigned_to.as_deref().unwrap_or(""),
+                task.owner.as_deref().unwrap_or(""),
+                task.title.as_str(),
+            ]
+            .join(" ")
+            .to_ascii_lowercase();
+            owners
+                .iter()
+                .any(|needle| haystack.contains(&needle.to_ascii_lowercase()))
+        })
+        .count()
+}
+
+fn value_summary_line(summary: &Value, key: &str, label: &str) -> String {
+    match summary.get(key) {
+        Some(Value::Array(items)) => format!("{} {}", label, items.len()),
+        Some(Value::Object(map)) => format!("{} {} keys", label, map.len()),
+        Some(Value::String(text)) => format!("{} {}", label, compact_text(text, 32)),
+        Some(other) => format!("{} {}", label, compact_text(&other.to_string(), 32)),
+        None => format!("{} unavailable", label),
+    }
+}
+
+fn render_unified_event(event: &UnifiedEvent, width: usize) -> String {
+    let stamp = time_ago(event.ts.as_deref());
+    let source = event.source.as_deref().unwrap_or("unified");
+    let kind = event.r#type.as_deref().unwrap_or("event");
+    let ident = event
+        .id
+        .as_deref()
+        .map(|id| compact_text(id, 6))
+        .unwrap_or_default();
+    let summary = event
+        .message
+        .as_deref()
+        .map(ToOwned::to_owned)
+        .or_else(|| event.summary.as_ref().map(Value::to_string))
+        .unwrap_or_default();
+    let left = format!(
+        "{:>4} {} {} {}",
+        stamp,
+        compact_text(source, 12),
+        compact_text(kind, 18),
+        ident
+    );
+    format!(
+        "{} {}",
+        left,
+        compact_text(&summary, width.saturating_sub(left.len() + 1))
+    )
+}
+
+fn extract_diff_excerpt(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let looks_like_diff = trimmed.contains("diff --git")
+        || trimmed.contains("@@")
+        || trimmed.contains("+++ ")
+        || trimmed.contains("--- ")
+        || trimmed.contains("Successfully replaced")
+        || trimmed.contains("apply_patch")
+        || trimmed.contains("cargo fmt")
+        || trimmed.lines().any(|line| {
+            let line = line.trim_start();
+            (line.starts_with('+') || line.starts_with('-')) && line.len() > 4
+        });
+    if !looks_like_diff {
+        return None;
+    }
+    let excerpt = trimmed
+        .lines()
+        .take(4)
+        .map(|line| compact_text(line, 70))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(excerpt)
+}
+
 fn state_label(state: RequestState) -> &'static str {
     match state {
         RequestState::Queued => "queued",
@@ -2102,6 +3461,18 @@ fn state_label(state: RequestState) -> &'static str {
         RequestState::Cancelled => "cancelled",
         RequestState::Completed => "completed",
         RequestState::Errored => "errored",
+    }
+}
+
+fn session_run_state_label(state: SessionRunState) -> &'static str {
+    match state {
+        SessionRunState::Stored => "stored",
+        SessionRunState::Running => "running",
+        SessionRunState::WaitingForPermission => "waiting_permission",
+        SessionRunState::Cancelling => "cancel_requested",
+        SessionRunState::Cancelled => "cancelled",
+        SessionRunState::Completed => "completed",
+        SessionRunState::Errored => "errored",
     }
 }
 
@@ -2307,6 +3678,170 @@ mod tests {
 
         assert!(summary.contains("assistant_delta: hello from stream"));
         assert!(summary.contains(&short_id(request_id)));
+    }
+
+    #[test]
+    fn daemon_tracks_pending_permissions_from_request_snapshots() {
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+
+        app.set_requests(vec![RequestStatus {
+            request_id,
+            session_id: None,
+            state: RequestState::WaitingForPermission,
+            permission_id: Some(permission_id),
+            message: Some("waiting on permission for bash".to_string()),
+            started_at: None,
+            updated_at: Some(Utc::now()),
+            finished_at: None,
+        }]);
+
+        assert_eq!(app.pending_permissions.len(), 1);
+        assert_eq!(app.pending_permissions[0].permission_id, permission_id);
+        assert_eq!(app.pending_permissions[0].request_id, Some(request_id));
+    }
+
+    #[test]
+    fn daemon_sets_pending_permissions_from_permissions_endpoint_payload() {
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+
+        app.set_permissions(vec![PermissionStatus {
+            permission_id,
+            request_id,
+            session_id: Some(SessionId::new_v4()),
+            tool: "bash".to_string(),
+            reason: "permission required for bash".to_string(),
+            args: json!({"command": "touch /tmp/ocean-demo"}),
+            created_at: Utc::now(),
+        }]);
+
+        assert_eq!(app.pending_permissions.len(), 1);
+        assert_eq!(app.pending_permissions[0].permission_id, permission_id);
+        assert_eq!(app.pending_permissions[0].request_id, Some(request_id));
+        assert_eq!(app.pending_permissions[0].tool, "bash");
+        assert!(app.pending_permissions[0]
+            .args_preview
+            .contains("/tmp/ocean-demo"));
+        let rendered = app
+            .pending_permission_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Shift-Y approve"));
+        assert!(rendered.contains("Shift-N deny"));
+
+        app.set_permissions(Vec::new());
+        assert!(app.pending_permissions.is_empty());
+    }
+
+    #[test]
+    fn daemon_approval_keys_map_to_permission_actions() {
+        let approve = daemon_key_action(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )));
+        let deny = daemon_key_action(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('N'),
+            KeyModifiers::SHIFT,
+        )));
+
+        assert!(matches!(approve, Some(Action::ApproveLatestPermission)));
+        assert!(matches!(deny, Some(Action::DenyLatestPermission)));
+    }
+
+    #[test]
+    fn daemon_stream_event_updates_permission_queue_and_transcript() {
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let mut request = EventEnvelope::new(OceanEvent::PermissionRequest {
+            tool: "bash".to_string(),
+            reason: "permission required for bash".to_string(),
+            args: json!({"command": "rm -rf /tmp/demo"}),
+        });
+        request.request_id = Some(request_id);
+        request.permission_id = Some(permission_id);
+
+        daemon_apply_stream_event(&mut app, request);
+        assert_eq!(app.pending_permissions.len(), 1);
+        assert!(app
+            .transcript
+            .iter()
+            .any(|line| line.contains("approval needed")));
+
+        let mut decision = EventEnvelope::new(OceanEvent::PermissionDecision {
+            allowed: false,
+            reason: Some("operator denied".to_string()),
+        });
+        decision.request_id = Some(request_id);
+        decision.permission_id = Some(permission_id);
+
+        daemon_apply_stream_event(&mut app, decision);
+        assert!(app.pending_permissions.is_empty());
+        assert!(app.transcript.iter().any(|line| line.contains("denied")));
+    }
+
+    #[test]
+    fn workspace_room_tabs_mark_active_room() {
+        let line = workspace_room_tabs_line(WorkspaceRoom::Rev);
+        assert!(line.contains("[F3 Rev]"));
+        assert!(line.contains("F1 Orchestrator"));
+    }
+
+    #[test]
+    fn daemon_session_cycle_keeps_new_session_slot() {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let session_id = SessionId::new_v4();
+        app.set_sessions(vec![SessionSummary {
+            id: session_id,
+            model: "test-model".to_string(),
+            turns: 3,
+            title: "Existing session".to_string(),
+        }]);
+
+        assert_eq!(app.selected_session_id(), None);
+        app.cycle_session(1);
+        assert_eq!(app.selected_session_id(), Some(session_id));
+        app.cycle_session(-1);
+        assert_eq!(app.selected_session_id(), None);
+    }
+
+    #[test]
+    fn session_detail_lines_render_summary() {
+        let session_id = SessionId::new_v4();
+        let detail = SessionDetail {
+            id: session_id,
+            created_ms: 1,
+            updated_ms: 2,
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            turns: 7,
+            title: "Selected session title".to_string(),
+            state: SessionRunState::Running,
+            resumable: true,
+            active_requests: vec![RequestId::new_v4()],
+            pending_permissions: vec![],
+            transcript: vec![ocean_core::SessionTranscriptEntry {
+                role: "assistant".to_string(),
+                timestamp_ms: None,
+                text: "assistant summary line".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+            }],
+            tool_context: vec![],
+            messages: vec![Value::String("raw message".to_string())],
+        };
+
+        let lines = DaemonApp::session_detail_lines(&detail).join("\n");
+        assert!(lines.contains("Selected session title"));
+        assert!(lines.contains("7 turns"));
+        assert!(lines.contains("messages 1"));
+        assert!(lines.contains("assistant summary line"));
     }
 
     #[test]

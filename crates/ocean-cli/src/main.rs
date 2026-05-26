@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use ocean_core::{HealthResponse, PromptRequest, PromptResponse};
+use ocean_core::{HealthResponse, PromptRequest, PromptResponse, SessionId, SessionResponse};
 
 #[derive(Debug, Parser)]
 #[command(name = "ocean-rs", about = "Ocean OS agent runtime client")]
@@ -26,6 +26,9 @@ enum Cmd {
         max_turns: Option<u32>,
     },
     Sessions,
+    Session {
+        id: SessionId,
+    },
 }
 
 #[tokio::main]
@@ -89,6 +92,21 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("read sessions response")?;
             println!("{text}");
+        }
+        Cmd::Session { id } => {
+            let response = client
+                .get(format!("{}/v1/sessions/{id}", cli.url))
+                .send()
+                .await?;
+            let status = response.status();
+            let body: SessionResponse = response.json().await.context("read session response")?;
+            anyhow::ensure!(
+                status.is_success() && body.ok,
+                "{}",
+                body.error
+                    .unwrap_or_else(|| format!("session request failed: {status}"))
+            );
+            println!("{}", serde_json::to_string_pretty(&body)?);
         }
     }
     Ok(())

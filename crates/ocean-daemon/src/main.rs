@@ -4,7 +4,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use axum::{
     extract::{Path, State},
-    http::Method,
+    http::{Method, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
@@ -14,8 +14,9 @@ use ocean_agent::{AgentRuntime, PromptControl};
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
-    PromptRequest, RequestControlResponse, RequestCreateResponse, RequestId, RequestState,
-    RequestStatus, RequestsResponse, SessionId,
+    PermissionStatus, PermissionsResponse, PromptRequest, RequestControlResponse,
+    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, SessionDetail,
+    SessionId, SessionResponse, SessionRunState,
 };
 use pi_agent::{PermissionDecision as AgentPermissionDecision, PermissionPolicy};
 use serde_json::{json, Value};
@@ -51,7 +52,7 @@ struct RequestControl {
 }
 
 struct PermissionWaiter {
-    request_id: RequestId,
+    status: PermissionStatus,
     sender: Option<oneshot::Sender<AgentPermissionDecision>>,
 }
 
@@ -115,8 +116,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/prompt", post(prompt))
         .route("/v1/requests", get(requests).post(create_request))
         .route("/v1/requests/{id}/cancel", post(cancel_request))
+        .route("/v1/permissions", get(permissions))
         .route("/v1/permissions/{id}/decision", post(permission_decision))
         .route("/v1/sessions", get(sessions))
+        .route("/v1/sessions/{id}", get(session))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -140,8 +143,10 @@ async fn root() -> Json<serde_json::Value> {
             "GET /v1/requests",
             "POST /v1/requests",
             "POST /v1/requests/{id}/cancel",
+            "GET /v1/permissions",
             "POST /v1/permissions/{id}/decision",
-            "GET /v1/sessions"
+            "GET /v1/sessions",
+            "GET /v1/sessions/{id}"
         ]
     }))
 }
@@ -341,7 +346,7 @@ async fn permission_decision(
 
     update_request_permission_result(
         &state.requests,
-        waiter.request_id,
+        waiter.status.request_id,
         permission_id,
         agent_decision.clone(),
     )
@@ -349,8 +354,8 @@ async fn permission_decision(
 
     emit(
         &state.events,
-        None,
-        Some(waiter.request_id),
+        waiter.status.session_id,
+        Some(waiter.status.request_id),
         Some(permission_id),
         OceanEvent::PermissionDecision {
             allowed: matches!(agent_decision, AgentPermissionDecision::Allow),
@@ -409,6 +414,16 @@ impl PermissionPolicy for DaemonPermissionPolicy {
         }
 
         let permission_id = PermissionId::new_v4();
+        let reason = format!("permission required for {tool_name}");
+        let status = PermissionStatus {
+            permission_id,
+            request_id: self.request_id,
+            session_id: self.session_id,
+            tool: tool_name.to_string(),
+            reason: reason.clone(),
+            args: args.clone(),
+            created_at: Utc::now(),
+        };
         let (tx, rx) = oneshot::channel();
 
         {
@@ -426,7 +441,7 @@ impl PermissionPolicy for DaemonPermissionPolicy {
             permissions.insert(
                 permission_id,
                 PermissionWaiter {
-                    request_id: self.request_id,
+                    status: status.clone(),
                     sender: Some(tx),
                 },
             );
@@ -438,9 +453,9 @@ impl PermissionPolicy for DaemonPermissionPolicy {
             Some(self.request_id),
             Some(permission_id),
             OceanEvent::PermissionRequest {
-                tool: tool_name.to_string(),
-                reason: format!("permission required for {tool_name}"),
-                args: args.clone(),
+                tool: status.tool.clone(),
+                reason,
+                args: status.args.clone(),
             },
         );
 
@@ -484,6 +499,100 @@ async fn sessions(State(state): State<AppState>) -> Json<serde_json::Value> {
     }
 }
 
+async fn session(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> (StatusCode, Json<SessionResponse>) {
+    match state.runtime.session_detail(session_id) {
+        Ok(mut session) => {
+            enrich_session_detail(&state, &mut session).await;
+            (
+                StatusCode::OK,
+                Json(SessionResponse {
+                    ok: true,
+                    session: Some(session),
+                    error: None,
+                }),
+            )
+        }
+        Err(error) if is_not_found(&error) => (
+            StatusCode::NOT_FOUND,
+            Json(SessionResponse {
+                ok: false,
+                session: None,
+                error: Some("session not found".into()),
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(%session_id, error = %error, "failed to read session detail");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SessionResponse {
+                    ok: false,
+                    session: None,
+                    error: Some("session could not be read".into()),
+                }),
+            )
+        }
+    }
+}
+
+async fn enrich_session_detail(state: &AppState, session: &mut SessionDetail) {
+    let requests = state.requests.read().await;
+    let mut matching = requests
+        .values()
+        .filter(|control| control.status.session_id == Some(session.id))
+        .map(|control| control.status.clone())
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|status| status.updated_at.or(status.started_at));
+    matching.reverse();
+
+    session.active_requests = matching
+        .iter()
+        .filter(|status| !status.state.is_terminal())
+        .map(|status| status.request_id)
+        .collect();
+    session.pending_permissions = matching
+        .iter()
+        .filter_map(|status| status.permission_id)
+        .collect();
+
+    if let Some(active) = matching.iter().find(|status| !status.state.is_terminal()) {
+        session.state = session_run_state(active.state);
+        session.resumable = false;
+    } else if let Some(latest) = matching.first() {
+        session.state = session_run_state(latest.state);
+        session.resumable = true;
+    }
+}
+
+fn session_run_state(state: RequestState) -> SessionRunState {
+    match state {
+        RequestState::Queued | RequestState::Running => SessionRunState::Running,
+        RequestState::WaitingForPermission => SessionRunState::WaitingForPermission,
+        RequestState::Cancelling => SessionRunState::Cancelling,
+        RequestState::Cancelled => SessionRunState::Cancelled,
+        RequestState::Completed => SessionRunState::Completed,
+        RequestState::Errored => SessionRunState::Errored,
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+async fn permissions(State(state): State<AppState>) -> Json<PermissionsResponse> {
+    Json(PermissionsResponse {
+        ok: true,
+        permissions: pending_permissions_snapshot(&state.permissions).await,
+        error: None,
+    })
+}
+
 async fn requests(State(state): State<AppState>) -> Json<RequestsResponse> {
     let mut requests = state
         .requests
@@ -499,6 +608,18 @@ async fn requests(State(state): State<AppState>) -> Json<RequestsResponse> {
         requests,
         error: None,
     })
+}
+
+async fn pending_permissions_snapshot(permissions: &PermissionRegistry) -> Vec<PermissionStatus> {
+    let mut pending = permissions
+        .read()
+        .await
+        .values()
+        .map(|waiter| waiter.status.clone())
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|status| status.created_at);
+    pending.reverse();
+    pending
 }
 
 async fn register_running_request(
@@ -551,7 +672,7 @@ async fn cancel_permission_waiter(
     };
 
     if let Some(mut waiter) = waiter {
-        if waiter.request_id != request_id {
+        if waiter.status.request_id != request_id {
             return;
         }
         if let Some(sender) = waiter.sender.take() {
@@ -772,6 +893,18 @@ mod tests {
         }
     }
 
+    fn permission_status(permission_id: PermissionId, request_id: RequestId) -> PermissionStatus {
+        PermissionStatus {
+            permission_id,
+            request_id,
+            session_id: None,
+            tool: "write".into(),
+            reason: "permission required for write".into(),
+            args: json!({"path": "src/lib.rs"}),
+            created_at: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn finish_does_not_overwrite_terminal_state() {
         let request_id = RequestId::new_v4();
@@ -826,6 +959,103 @@ mod tests {
             .contains("cancel requested"));
     }
     #[tokio::test]
+    async fn permission_result_records_decision_on_waiting_request() {
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let mut control = status(request_id, RequestState::WaitingForPermission);
+        control.status.permission_id = Some(permission_id);
+        let requests = Arc::new(RwLock::new(HashMap::from([(request_id, control)])));
+
+        update_request_permission_result(
+            &requests,
+            request_id,
+            permission_id,
+            AgentPermissionDecision::Deny {
+                reason: "operator denied".into(),
+            },
+        )
+        .await;
+
+        let requests = requests.read().await;
+        let status = requests.get(&request_id).unwrap();
+        assert_eq!(status.status.state, RequestState::Running);
+        assert_eq!(status.status.permission_id, None);
+        assert!(status
+            .status
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("operator denied"));
+    }
+
+    #[tokio::test]
+    async fn pending_permissions_snapshot_exposes_request_context() {
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let permissions = Arc::new(RwLock::new(HashMap::from([(
+            permission_id,
+            PermissionWaiter {
+                status: permission_status(permission_id, request_id),
+                sender: None,
+            },
+        )])));
+
+        let pending = pending_permissions_snapshot(&permissions).await;
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].permission_id, permission_id);
+        assert_eq!(pending[0].request_id, request_id);
+        assert_eq!(pending[0].tool, "write");
+        assert_eq!(pending[0].args, json!({"path": "src/lib.rs"}));
+    }
+
+    #[tokio::test]
+    async fn permission_events_are_observable_with_ids() {
+        let events = EventBus::new(8);
+        let mut rx = events.subscribe();
+        let request_id = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+
+        emit(
+            &events,
+            None,
+            Some(request_id),
+            Some(permission_id),
+            OceanEvent::PermissionRequest {
+                tool: "write".into(),
+                reason: "permission required for write".into(),
+                args: json!({"path": "src/lib.rs"}),
+            },
+        );
+        emit(
+            &events,
+            None,
+            Some(request_id),
+            Some(permission_id),
+            OceanEvent::PermissionDecision {
+                allowed: false,
+                reason: Some("operator denied".into()),
+            },
+        );
+
+        let request_event = rx.recv().await.unwrap();
+        assert_eq!(request_event.request_id, Some(request_id));
+        assert_eq!(request_event.permission_id, Some(permission_id));
+        assert!(matches!(
+            request_event.event,
+            OceanEvent::PermissionRequest { .. }
+        ));
+
+        let decision_event = rx.recv().await.unwrap();
+        assert_eq!(decision_event.request_id, Some(request_id));
+        assert_eq!(decision_event.permission_id, Some(permission_id));
+        assert!(matches!(
+            decision_event.event,
+            OceanEvent::PermissionDecision { allowed: false, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn permission_result_does_not_resume_cancelling_request() {
         let request_id = RequestId::new_v4();
         let permission_id = PermissionId::new_v4();
@@ -855,7 +1085,7 @@ mod tests {
         let permissions = Arc::new(RwLock::new(HashMap::from([(
             permission_id,
             PermissionWaiter {
-                request_id,
+                status: permission_status(permission_id, request_id),
                 sender: Some(tx),
             },
         )])));

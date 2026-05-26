@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
-use ocean_core::{PromptRequest, PromptResponse, RequestId, SessionId, SessionSummary};
+use ocean_core::{
+    PromptRequest, PromptResponse, RequestId, SessionDetail, SessionId, SessionRunState,
+    SessionSummary, SessionToolContext, SessionTranscriptEntry,
+};
 use ocean_providers::{
     resolve_provider_config_from_env, ProviderConfig, ProviderId, ProviderReadiness,
 };
@@ -114,6 +117,10 @@ impl AgentRuntime {
 
     pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         session::list(&self.config_dir)
+    }
+
+    pub fn session_detail(&self, id: SessionId) -> anyhow::Result<SessionDetail> {
+        session::detail(&self.config_dir, id)
     }
 
     fn provider_preflight_error(&self) -> Option<String> {
@@ -416,6 +423,11 @@ mod session {
         Ok(session)
     }
 
+    pub fn detail(config_dir: &Path, id: SessionId) -> anyhow::Result<SessionDetail> {
+        let session = load(config_dir, id)?;
+        Ok(session_detail(session))
+    }
+
     pub fn list(config_dir: &Path) -> anyhow::Result<Vec<SessionSummary>> {
         let dir = sessions_dir(config_dir);
         if !dir.exists() {
@@ -454,6 +466,116 @@ mod session {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    fn session_detail(session: Session) -> SessionDetail {
+        let title = first_user_text(&session.messages);
+        let transcript = session
+            .messages
+            .iter()
+            .map(transcript_entry)
+            .collect::<Vec<_>>();
+        let tool_context = session
+            .messages
+            .iter()
+            .flat_map(tool_context_entries)
+            .collect::<Vec<_>>();
+        let messages = session
+            .messages
+            .iter()
+            .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
+            .collect::<Vec<_>>();
+
+        SessionDetail {
+            id: session.id,
+            created_ms: session.created_ms,
+            updated_ms: session.updated_ms,
+            model: session.model,
+            provider: session.provider,
+            turns: session.messages.len() as u32,
+            title,
+            state: SessionRunState::Stored,
+            resumable: true,
+            active_requests: Vec::new(),
+            pending_permissions: Vec::new(),
+            transcript,
+            tool_context,
+            messages,
+        }
+    }
+
+    fn transcript_entry(message: &Message) -> SessionTranscriptEntry {
+        match message {
+            Message::User { content, timestamp } => SessionTranscriptEntry {
+                role: "user".into(),
+                timestamp_ms: Some(*timestamp),
+                text: text_from_content(content),
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+            },
+            Message::Assistant(assistant) => SessionTranscriptEntry {
+                role: "assistant".into(),
+                timestamp_ms: Some(assistant.timestamp),
+                text: text_from_content(&assistant.content),
+                tool_call_id: None,
+                tool_name: None,
+                is_error: assistant.error_message.as_ref().map(|_| true),
+            },
+            Message::ToolResult(tool) => SessionTranscriptEntry {
+                role: "tool".into(),
+                timestamp_ms: Some(tool.timestamp),
+                text: text_from_content(&tool.content),
+                tool_call_id: Some(tool.tool_call_id.clone()),
+                tool_name: Some(tool.tool_name.clone()),
+                is_error: Some(tool.is_error),
+            },
+        }
+    }
+
+    fn tool_context_entries(message: &Message) -> Vec<SessionToolContext> {
+        match message {
+            Message::Assistant(assistant) => assistant
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => Some(SessionToolContext {
+                        kind: "call".into(),
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        arguments: Some(arguments.clone()),
+                        is_error: None,
+                        text: String::new(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            Message::ToolResult(tool) => vec![SessionToolContext {
+                kind: "result".into(),
+                tool_call_id: tool.tool_call_id.clone(),
+                tool_name: tool.tool_name.clone(),
+                arguments: None,
+                is_error: Some(tool.is_error),
+                text: text_from_content(&tool.content),
+            }],
+            Message::User { .. } => Vec::new(),
+        }
+    }
+
+    fn text_from_content(content: &[Content]) -> String {
+        content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(text.as_str()),
+                Content::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     fn truncate_title(text: &str) -> String {
@@ -543,6 +665,12 @@ mod tests {
         assert!(res.stderr.contains("deepseek-v4-flash"));
         assert!(!res.stderr.contains("provider openai"));
         assert!(runtime.list_sessions().unwrap().is_empty());
+        let missing = runtime.session_detail(SessionId::new_v4()).unwrap_err();
+        assert!(missing.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        }));
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
@@ -571,6 +699,83 @@ mod tests {
         assert_eq!(res.stdout, "OCEAN_FAKE_OK\n");
         assert!(res.stderr.is_empty());
         assert_eq!(runtime.list_sessions().unwrap().len(), 1);
+
+        let detail = runtime.session_detail(res.session_id.unwrap()).unwrap();
+        assert_eq!(detail.state, SessionRunState::Stored);
+        assert!(detail.resumable);
+        assert_eq!(detail.turns, 2);
+        assert_eq!(detail.transcript[0].role, "user");
+        assert!(detail.transcript[0].text.contains("OCEAN_OK"));
+        assert_eq!(detail.transcript[1].role, "assistant");
+        assert_eq!(detail.transcript[1].text, "OCEAN_FAKE_OK");
+        assert_eq!(detail.messages.len(), 2);
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn session_detail_reports_corrupt_session_file() {
+        let config_dir = temp_config_dir("corrupt-session");
+        let id = SessionId::new_v4();
+        let dir = session::sessions_dir(&config_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.json")), "{not-json").unwrap();
+
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let error = runtime.session_detail(id).unwrap_err();
+        assert!(error
+            .chain()
+            .all(|cause| cause.downcast_ref::<std::io::Error>().is_none()));
+        assert!(error.to_string().contains("expected") || error.to_string().contains("key"));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn session_detail_includes_tool_context_when_persisted() {
+        let config_dir = temp_config_dir("tool-context");
+        let model =
+            model_from_provider_config(&provider_config(ProviderId::Fake, "fake-ok", false))
+                .unwrap();
+        let mut session = session::Session::new(&model);
+        let tool_call_id = "call-1".to_string();
+        session.replace_messages(vec![
+            Message::user_text("inspect workspace"),
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall {
+                    id: tool_call_id.clone(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                }],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: pi_ai::now_ms(),
+            }),
+            Message::ToolResult(pi_ai::ToolResultMessage {
+                tool_call_id,
+                tool_name: "read".into(),
+                content: vec![Content::text("contents")],
+                is_error: false,
+                timestamp: pi_ai::now_ms(),
+            }),
+        ]);
+        session::save(&config_dir, &session).unwrap();
+
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let detail = runtime.session_detail(session.id).unwrap();
+        assert_eq!(detail.tool_context.len(), 2);
+        assert_eq!(detail.tool_context[0].kind, "call");
+        assert_eq!(detail.tool_context[0].tool_name, "read");
+        assert_eq!(detail.tool_context[1].kind, "result");
+        assert_eq!(detail.tool_context[1].text, "contents");
         let _ = std::fs::remove_dir_all(config_dir);
     }
 }

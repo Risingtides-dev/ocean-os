@@ -100,6 +100,85 @@ pub struct SessionSummary {
     pub title: String,
 }
 
+/// Runtime state exposed by `GET /v1/sessions/{id}` for command-center clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRunState {
+    Stored,
+    Running,
+    WaitingForPermission,
+    Cancelling,
+    Cancelled,
+    Completed,
+    Errored,
+}
+
+/// One display-ready transcript entry derived from a persisted session message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTranscriptEntry {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+}
+
+/// Tool-call or tool-result context derived from persisted transcript messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionToolContext {
+    pub kind: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// Detailed session transcript returned by `GET /v1/sessions/{id}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDetail {
+    #[serde(alias = "session_id")]
+    pub id: SessionId,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+    pub model: String,
+    pub provider: String,
+    pub turns: u32,
+    pub title: String,
+    pub state: SessionRunState,
+    pub resumable: bool,
+    #[serde(default)]
+    pub active_requests: Vec<RequestId>,
+    #[serde(default)]
+    pub pending_permissions: Vec<PermissionId>,
+    #[serde(default)]
+    pub transcript: Vec<SessionTranscriptEntry>,
+    #[serde(default)]
+    pub tool_context: Vec<SessionToolContext>,
+    /// Raw persisted messages for clients that need provider-specific detail.
+    #[serde(default)]
+    pub messages: Vec<Value>,
+}
+
+/// Response payload for `GET /v1/sessions/{id}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Response payload for `POST /v1/requests`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestCreateResponse {
@@ -136,6 +215,29 @@ pub struct RequestsResponse {
     pub ok: bool,
     #[serde(default)]
     pub requests: Vec<RequestStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Pending permission request observable by daemon clients.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionStatus {
+    pub permission_id: PermissionId,
+    pub request_id: RequestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    pub tool: String,
+    pub reason: String,
+    pub args: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Response payload for `GET /v1/permissions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionsResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub permissions: Vec<PermissionStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
