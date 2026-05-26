@@ -1,9 +1,12 @@
 /target/
 **/target/
+node_modules/
+dist/
 .DS_Store
 *.log
 .env
 .env.*
+.env.local
 !.env.example
 
 # Pi/local orchestration state
