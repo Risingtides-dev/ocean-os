@@ -193,6 +193,9 @@ impl AgentRuntime {
         };
 
         let mut history = session.messages.clone();
+        if self.provider_config.selection.provider == ProviderId::DeepSeek {
+            strip_assistant_thinking_content(&mut history);
+        }
         history.push(Message::user_text(req.prompt));
 
         let PromptControl { permission, cancel } = control;
@@ -356,6 +359,16 @@ fn config_dir_from_env() -> PathBuf {
         return PathBuf::from(home).join(".config").join(APP_NAME);
     }
     PathBuf::from(".ocean-rs")
+}
+
+fn strip_assistant_thinking_content(messages: &mut [Message]) {
+    for message in messages {
+        if let Message::Assistant(assistant) = message {
+            assistant
+                .content
+                .retain(|content| !matches!(content, Content::Thinking { .. }));
+        }
+    }
 }
 
 fn last_assistant_text(messages: &[Message]) -> Option<String> {
@@ -649,12 +662,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn strips_assistant_thinking_before_deepseek_history_replay() {
+        let mut messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "private chain of thought".into(),
+                    thinking_signature: None,
+                },
+                Content::text("visible answer"),
+            ],
+            api: "chat".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-reasoner".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 1,
+        })];
+
+        strip_assistant_thinking_content(&mut messages);
+
+        let Message::Assistant(assistant) = &messages[0] else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(assistant.content, vec![Content::text("visible answer")]);
+    }
+
     #[tokio::test]
     async fn missing_credential_preflight_names_ocean_provider_and_model() {
         let config_dir = temp_config_dir("missing-credential");
         let runtime = runtime(
             config_dir.clone(),
-            provider_config(ProviderId::DeepSeek, "deepseek-v4-flash", false),
+            provider_config(ProviderId::DeepSeek, "deepseek-v4-pro", false),
         );
 
         let res = runtime
@@ -673,7 +713,7 @@ mod tests {
 
         assert!(!res.ok);
         assert!(res.stderr.contains("provider deepseek"));
-        assert!(res.stderr.contains("deepseek-v4-flash"));
+        assert!(res.stderr.contains("deepseek-v4-pro"));
         assert!(!res.stderr.contains("provider openai"));
         assert!(runtime.list_sessions().unwrap().is_empty());
         let missing = runtime.session_detail(SessionId::new_v4()).unwrap_err();
