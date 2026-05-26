@@ -27,85 +27,11 @@ pub fn draw_daemon_room_body(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp)
 }
 
 fn draw_room_pm(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
-    let mesh = &app.support.mesh;
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(45),
-            Constraint::Percentage(25),
-        ])
-        .split(area);
-    let center = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(cols[1]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(14), Constraint::Min(10)])
-        .split(cols[2]);
-
     draw_lines_pane(
         frame,
-        cols[0],
-        "PM Inbox",
-        vec![
-            Line::from("PM window: real agent-turn benchmark lane"),
-            Line::from(""),
-            Line::from("Operator workflow"),
-            Line::from("  • F1 stays on PM"),
-            Line::from("  • type normal text into the input box"),
-            Line::from("  • Enter submits /v1/agent/turns"),
-            Line::from("  • / jumps back to input from panes"),
-            Line::from(""),
-            Line::from(format!(
-                "Mesh status: {} tasks · {} feed events · {} agents",
-                mesh.tasks.len(),
-                mesh.feed.len(),
-                mesh.agents.len()
-            )),
-            Line::from(format!(
-                "Approvals waiting: {} · backend support: {}",
-                app.pending_permissions.len(),
-                app.status_label().0
-            )),
-            Line::from(""),
-            Line::from("Mail is pull-only when operator asks."),
-        ],
-    );
-
-    draw_lines_pane(frame, center[0], "Agent Turn Stream", {
-        let mut lines = app.transcript_lines();
-        if !app.activity.is_empty() {
-            lines.push(Line::from(""));
-            lines.extend(app.event_lines(12));
-        }
-        if lines.is_empty() {
-            lines.push(Line::from("Waiting for turn submission..."));
-        }
-        lines
-    });
-
-    draw_lines_pane(
-        frame,
-        center[1],
-        "Tool Timeline",
-        app.tool_timeline_lines(12),
-    );
-
-    draw_lines_pane(frame, right[0], "Sessions", app.session_lines());
-    draw_lines_pane(
-        frame,
-        right[1],
-        "Status",
-        vec![
-            Line::from(format!("daemon: {}", app.status_label().0)),
-            Line::from(format!("agent stream: {}", app.stream_status)),
-            Line::from(format!("checked: {}", app.checked_text())),
-            Line::from(""),
-            Line::from("Only PM is live for this benchmark."),
-            Line::from("Other rooms remain shell/fake for now."),
-        ],
+        area,
+        "PM",
+        app.transcript_lines(area.height.saturating_sub(2) as usize),
     );
 }
 

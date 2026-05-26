@@ -255,6 +255,8 @@ struct DaemonApp {
     sessions: Vec<SessionSummary>,
     selected_session_index: usize,
     selected_session_detail: Option<SessionDetail>,
+    transcript_scroll: usize,
+    model_config: ModelConfig,
     requests: Vec<RequestStatus>,
     pending_permissions: Vec<PendingPermission>,
     active_request_id: Option<RequestId>,
@@ -280,13 +282,15 @@ impl DaemonApp {
             url,
             root,
             mesh_agent: default_mesh_agent(),
-            active_room: WorkspaceRoom::Orchestrator,
+            active_room: WorkspaceRoom::PM,
             focus: FocusPane::Composer,
             show_help: false,
             health: HealthState::Loading,
             sessions: Vec::new(),
             selected_session_index: 0,
             selected_session_detail: None,
+            transcript_scroll: 0,
+            model_config: ModelConfig::unknown(),
             requests: Vec::new(),
             pending_permissions: Vec::new(),
             active_request_id: None,
@@ -296,13 +300,7 @@ impl DaemonApp {
             streaming_agent_turn_id: None,
             input: String::new(),
             activity: Vec::new(),
-            transcript: vec![
-                "Ocean Agent command center".to_string(),
-                "Tab cycles panes; F1-F7 jump rooms; / or i jumps to the input box.".to_string(),
-                "Enter applies the command or instruction to the current room/workflow.".to_string(),
-                "Shift-Y / Shift-N handle tool approvals; Up/Down changes room or support selection."
-                    .to_string(),
-            ],
+            transcript: Vec::new(),
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
             support: WorkspaceSupportState::default(),
@@ -388,6 +386,7 @@ impl DaemonApp {
 
     fn push_transcript(&mut self, line: String) {
         push_bounded(&mut self.transcript, line, TRANSCRIPT_CAP);
+        self.transcript_scroll = 0;
     }
 
     fn push_transcript_if_new(&mut self, line: String) {
@@ -402,8 +401,8 @@ impl DaemonApp {
             return;
         }
         let prefix = match request_id {
-            Some(request_id) => format!("← [{}] ", short_id(request_id)),
-            None => "← ".to_string(),
+            Some(request_id) => format!("Ocean [{}]: ", short_id(request_id)),
+            None => "Ocean: ".to_string(),
         };
         if self.streaming_request_id == request_id {
             if let Some(last) = self.transcript.last_mut() {
@@ -422,7 +421,7 @@ impl DaemonApp {
         if chunk.trim().is_empty() {
             return;
         }
-        let prefix = format!("← agent [{}] ", short_id(turn_id));
+        let prefix = format!("Ocean [{}]: ", short_id(turn_id));
         if self.streaming_agent_turn_id == Some(turn_id) {
             if let Some(last) = self.transcript.last_mut() {
                 if last.starts_with(&prefix) {
@@ -466,16 +465,36 @@ impl DaemonApp {
             .collect()
     }
 
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
-        self.transcript
+    fn transcript_lines(&self, height: usize) -> Vec<Line<'static>> {
+        let visible = height.max(1);
+        if self.transcript.is_empty() {
+            return vec![Line::from("Type a PM instruction below, then press Enter.")];
+        }
+        let end = self.transcript.len().saturating_sub(
+            self.transcript_scroll
+                .min(self.transcript.len().saturating_sub(1)),
+        );
+        let start = end.saturating_sub(visible);
+        self.transcript[start..end]
             .iter()
-            .rev()
-            .take(80)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|line| Line::from(line.clone()))
+            .map(|line| styled_transcript_line(line))
             .collect()
+    }
+
+    fn scroll_transcript(&mut self, delta: isize) {
+        let max_scroll = self.transcript.len().saturating_sub(1);
+        self.transcript_scroll = if delta.is_negative() {
+            self.transcript_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.transcript_scroll
+                .saturating_add(delta as usize)
+                .min(max_scroll)
+        };
+        self.status = if self.transcript_scroll == 0 {
+            "chat: live bottom".to_string()
+        } else {
+            format!("chat: {} lines back", self.transcript_scroll)
+        };
     }
 
     fn session_lines(&self) -> Vec<Line<'static>> {
@@ -725,10 +744,10 @@ impl DaemonApp {
         if self.pending_permissions.is_empty() {
             return vec![
                 Line::from("No approvals waiting."),
-                Line::from("Shift-Y approve / Shift-N deny when a request appears."),
+                Line::from("Ctrl-Y approve / Ctrl-N deny when a request appears."),
             ];
         }
-        let mut lines = vec![Line::from("Latest (*) uses Shift-Y approve · Shift-N deny")];
+        let mut lines = vec![Line::from("Latest (*) uses Ctrl-Y approve · Ctrl-N deny")];
         lines.extend(
             self.pending_permissions
                 .iter()
@@ -1022,6 +1041,79 @@ struct ToolTimelineEntry {
     message: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderReadinessView {
+    ok: bool,
+    provider: String,
+    model: String,
+    base_url_host: String,
+    credential_present: bool,
+    #[serde(default)]
+    credential_source: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelConfig {
+    provider: String,
+    model: String,
+    credential: String,
+    source: String,
+}
+
+impl ModelConfig {
+    fn unknown() -> Self {
+        Self {
+            provider: "daemon".to_string(),
+            model: "not loaded".to_string(),
+            credential: "unknown".to_string(),
+            source: "waiting for /ready".to_string(),
+        }
+    }
+
+    fn from_readiness(readiness: ProviderReadinessView) -> Self {
+        let credential = if readiness.credential_present {
+            "present".to_string()
+        } else if readiness.provider == "fake" {
+            "not required".to_string()
+        } else {
+            "missing".to_string()
+        };
+        let source = readiness
+            .credential_source
+            .as_ref()
+            .map(|source| compact_text(&source.to_string(), 56))
+            .or_else(|| {
+                readiness
+                    .error
+                    .as_ref()
+                    .map(|error| compact_text(&error.to_string(), 56))
+            })
+            .unwrap_or_else(|| format!("daemon /ready · {}", readiness.base_url_host));
+        let provider = if readiness.ok {
+            readiness.provider
+        } else {
+            format!("{} (not ready)", readiness.provider)
+        };
+        Self {
+            provider,
+            model: readiness.model,
+            credential,
+            source,
+        }
+    }
+
+    fn lines(&self) -> Vec<Line<'static>> {
+        vec![
+            Line::from(format!("provider: {}", self.provider)),
+            Line::from(format!("model: {}", self.model)),
+            Line::from(format!("api key: {}", self.credential)),
+            Line::from(format!("source: {}", compact_text(&self.source, 56))),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WorkspaceSupportState {
     mesh: MeshState,
@@ -1153,6 +1245,17 @@ impl DaemonClient {
             .and_then(|res| res.error_for_status())
             .map_err(|err| err.to_string())?
             .json::<HealthResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn ready(&self, base_url: &str) -> Result<ProviderReadinessView, String> {
+        let url = format!("{}/ready", base_url.trim_end_matches('/'));
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<ProviderReadinessView>()
             .map_err(|err| err.to_string())
     }
 
@@ -1567,14 +1670,11 @@ fn mesh_tick_due(state: &AppState) -> bool {
 
 fn daemon_key_action(app: &DaemonApp, event: Event) -> Option<Action> {
     match event {
-        Event::Paste(text) if app.focus == FocusPane::Composer && !app.show_help => {
-            Some(Action::Paste(text))
-        }
+        Event::Paste(text) if !app.show_help => Some(Action::Paste(text)),
         Event::Key(key) if !key_is_press_or_repeat(&key) => None,
         Event::Key(key) if key.code == KeyCode::F(10) => Some(Action::ToggleHelp),
         Event::Key(key) if app.show_help => match key.code {
-            KeyCode::Esc => Some(Action::ToggleHelp),
-            KeyCode::Char('?') if app.focus != FocusPane::Composer => Some(Action::ToggleHelp),
+            KeyCode::Esc | KeyCode::F(10) => Some(Action::ToggleHelp),
             _ => None,
         },
         Event::Key(key) => {
@@ -1596,24 +1696,19 @@ fn daemon_key_action(app: &DaemonApp, event: Event) -> Option<Action> {
             if let Some(room) = WorkspaceRoom::from_function_key(key.code) {
                 return Some(Action::SelectRoom(room));
             }
-            if key.code == KeyCode::F(8) {
-                return Some(Action::FocusSupport);
-            }
-            if key.code == KeyCode::Char('/') && app.focus != FocusPane::Composer {
-                return Some(Action::FocusComposer);
-            }
 
             match key.code {
-                KeyCode::Tab => Some(Action::FocusNext),
-                KeyCode::BackTab => Some(Action::FocusPrev),
-                KeyCode::Left if app.focus != FocusPane::Composer => Some(Action::PrevRoom),
-                KeyCode::Right if app.focus != FocusPane::Composer => Some(Action::NextRoom),
-                KeyCode::Up if app.focus != FocusPane::Composer => Some(Action::SessionPrev),
-                KeyCode::Down if app.focus != FocusPane::Composer => Some(Action::SessionNext),
+                KeyCode::Tab => Some(Action::NextRoom),
+                KeyCode::BackTab => Some(Action::PrevRoom),
+                KeyCode::Left => Some(Action::PrevRoom),
+                KeyCode::Right => Some(Action::NextRoom),
+                KeyCode::PageUp => Some(Action::SessionPrev),
+                KeyCode::PageDown => Some(Action::SessionNext),
+                KeyCode::Up => Some(Action::FocusPrev),
+                KeyCode::Down => Some(Action::FocusNext),
                 KeyCode::Enter => Some(Action::SubmitComposer),
                 KeyCode::Backspace => Some(Action::Backspace),
-                KeyCode::Esc if app.focus == FocusPane::Composer => Some(Action::FocusRooms),
-                KeyCode::Char('?') if app.focus != FocusPane::Composer => Some(Action::ToggleHelp),
+                KeyCode::Esc => None,
                 _ if key_is_text_input(&key) => match key.code {
                     KeyCode::Char(ch) => Some(Action::InputChar(ch)),
                     _ => None,
@@ -1660,14 +1755,8 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
         Action::ApproveLatestPermission => daemon_decide_latest_permission(client, app, true),
         Action::DenyLatestPermission => daemon_decide_latest_permission(client, app, false),
         Action::ToggleHelp => app.show_help = !app.show_help,
-        Action::FocusNext => {
-            app.focus = app.focus.next();
-            app.status = format!("pane: {}", app.focus.label());
-        }
-        Action::FocusPrev => {
-            app.focus = app.focus.prev();
-            app.status = format!("pane: {}", app.focus.label());
-        }
+        Action::FocusNext => app.scroll_transcript(-1),
+        Action::FocusPrev => app.scroll_transcript(1),
         Action::FocusComposer => {
             app.focus = FocusPane::Composer;
             app.status = format!("pane: {}", app.focus.label());
@@ -1682,14 +1771,17 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
         }
         Action::NextRoom => {
             app.active_room = app.active_room.next();
-            app.focus = FocusPane::Rooms;
+            app.focus = FocusPane::Composer;
+            app.status = format!("room: {}", app.active_room.label());
         }
         Action::PrevRoom => {
             app.active_room = app.active_room.prev();
-            app.focus = FocusPane::Rooms;
+            app.focus = FocusPane::Composer;
+            app.status = format!("room: {}", app.active_room.label());
         }
         Action::SelectRoom(room) => {
             app.active_room = room;
+            app.focus = FocusPane::Composer;
             app.status = format!("room: {}", app.active_room.label());
         }
         Action::SessionPrev => {
@@ -1780,7 +1872,15 @@ fn daemon_refresh_health(client: &DaemonClient, app: &mut DaemonApp) {
     match client.health(&app.url) {
         Ok(health) => {
             app.health = HealthState::Ready(health);
-            app.status = "health refreshed".to_string();
+            match client.ready(&app.url) {
+                Ok(readiness) => {
+                    app.model_config = ModelConfig::from_readiness(readiness);
+                    app.status = format!("health refreshed · model {}", app.model_config.model);
+                }
+                Err(err) => {
+                    app.status = format!("health refreshed · readiness error: {err}");
+                }
+            }
         }
         Err(err) => app.health = HealthState::Error(err),
     }
@@ -1889,7 +1989,12 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
 
     app.input.clear();
     app.streaming_request_id = None;
-    app.push_transcript(format!("YOU → {}: {instruction}", app.active_room.label()));
+
+    if handle_slash_command(app, &instruction) {
+        return;
+    }
+
+    app.push_transcript(format!("You: {instruction}"));
 
     if app.active_room == WorkspaceRoom::PM {
         let action_tx = state.action_tx.clone();
@@ -1937,6 +2042,29 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             app.active_room.label(),
             compact_text(&instruction, 56)
         );
+    }
+}
+
+fn handle_slash_command(app: &mut DaemonApp, instruction: &str) -> bool {
+    match instruction.trim() {
+        "/model" | "/model status" => {
+            app.push_transcript("You: /model".to_string());
+            app.push_transcript(format!(
+                "Ocean: model provider={} model={} api_key={} source={}",
+                app.model_config.provider,
+                app.model_config.model,
+                app.model_config.credential,
+                compact_text(&app.model_config.source, 72)
+            ));
+            app.status = "model config displayed".to_string();
+            true
+        }
+        "/help" => {
+            app.show_help = true;
+            app.status = "help open".to_string();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1990,21 +2118,22 @@ fn daemon_apply_agent_turn_response(app: &mut DaemonApp, response: AgentTurnResp
         short_id(response.session_id),
         response.status
     ));
-    if response.ok {
+    if response.ok && response.status == ocean_agent_sdk::AgentTurnStatus::Completed {
         app.status = format!(
             "PM agent turn {:?}: {}",
             response.status,
             short_id(response.turn_id)
         );
     } else {
-        app.status = format!(
-            "PM agent turn rejected: {}",
-            compact_text(response.error.as_deref().unwrap_or("unknown error"), 72)
-        );
+        let error = response
+            .error
+            .as_deref()
+            .unwrap_or("agent turn failed without an error message");
+        app.status = format!("PM agent turn failed: {}", compact_text(error, 72));
         app.push_transcript(format!(
-            "✗ agent turn {} {}",
+            "Ocean error [{}]: {}",
             short_id(response.turn_id),
-            compact_text(response.error.as_deref().unwrap_or("request rejected"), 72)
+            compact_text(error, 140)
         ));
     }
 }
@@ -2055,6 +2184,11 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 "started",
                 compact_text(&args_text, 72),
             );
+            app.push_transcript(format!(
+                "Tool: {} started {}",
+                call.name,
+                compact_text(&args_text, 96)
+            ));
             app.capture_diff_excerpt(&args_text);
         }
         AgentTurnEvent::ToolCallChunk {
@@ -2065,10 +2199,15 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             app.active_agent_turn_id = Some(turn_id);
             app.push_agent_tool_timeline(
                 turn_id,
-                &format!("tool {}", short_id(call_id)),
+                &format!("tool {}", short_id(&call_id)),
                 "chunk",
                 compact_text(&chunk, 72),
             );
+            app.push_transcript(format!(
+                "Tool: {} output {}",
+                short_id(&call_id),
+                compact_text(&chunk, 120)
+            ));
             app.capture_diff_excerpt(&chunk);
         }
         AgentTurnEvent::ToolCallFinished {
@@ -2079,10 +2218,16 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             app.active_agent_turn_id = Some(turn_id);
             app.push_agent_tool_timeline(
                 turn_id,
-                &format!("tool {}", short_id(call_id)),
+                &format!("tool {}", short_id(&call_id)),
                 if result.ok { "finished" } else { "failed" },
                 compact_text(&result.output, 72),
             );
+            app.push_transcript(format!(
+                "Tool: {} {} {}",
+                short_id(&call_id),
+                if result.ok { "done" } else { "failed" },
+                compact_text(&result.output, 120)
+            ));
             app.capture_diff_excerpt(&result.output);
         }
         AgentTurnEvent::TurnFinished {
@@ -2144,6 +2289,11 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
                 compact_text(&args_text, 72),
                 envelope.at,
             );
+            app.push_transcript(format!(
+                "Tool: {} started {}",
+                tool,
+                compact_text(&args_text, 96)
+            ));
             app.capture_diff_excerpt(&args_text);
         }
         OceanEvent::ToolOutput {
@@ -2158,20 +2308,26 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
                 compact_text(text, 72),
                 envelope.at,
             );
+            app.push_transcript(format!(
+                "Tool: {} {} {}",
+                tool,
+                if *is_error { "stderr" } else { "output" },
+                compact_text(text, 120)
+            ));
             app.capture_diff_excerpt(text);
         }
         OceanEvent::ToolEnded { tool, is_error } => {
-            app.push_tool_timeline(
-                request_id,
+            let message = if *is_error {
+                "tool exited with error".to_string()
+            } else {
+                "tool completed".to_string()
+            };
+            app.push_tool_timeline(request_id, tool, "ended", message.clone(), envelope.at);
+            app.push_transcript(format!(
+                "Tool: {} {}",
                 tool,
-                "ended",
-                if *is_error {
-                    "tool exited with error".to_string()
-                } else {
-                    "tool completed".to_string()
-                },
-                envelope.at,
-            );
+                if *is_error { "failed" } else { "done" }
+            ));
         }
         OceanEvent::PermissionRequest { tool, reason, args } => {
             app.streaming_request_id = None;
@@ -2931,7 +3087,87 @@ fn count_agents(agents: &[AgentView]) -> AgentCounts {
     counts
 }
 
+fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
+    let area = frame.area();
+    let outer = Block::default()
+        .title("F1 PM")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let input_height = if inner.height > 14 { 7 } else { 4 };
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(input_height),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(app.transcript_lines(layout[0].height as usize)).wrap(Wrap { trim: false }),
+        layout[0],
+    );
+
+    let separator = "─".repeat(layout[1].width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            separator,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        layout[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(pm_agent_input_lines(app, input_height as usize)).wrap(Wrap { trim: false }),
+        layout[2],
+    );
+}
+
+fn pm_agent_input_lines(app: &DaemonApp, height: usize) -> Vec<Line<'static>> {
+    let max_text_lines = height.saturating_sub(2).max(1);
+    let text = if app.input.is_empty() {
+        "message Ocean…".to_string()
+    } else {
+        app.input.clone()
+    };
+    let mut lines: Vec<Line<'static>> = text
+        .split('\n')
+        .take(max_text_lines)
+        .enumerate()
+        .map(|(idx, line)| {
+            let prefix = if idx == 0 { "> " } else { "  " };
+            let cursor = if idx + 1 == text.lines().count().max(1) {
+                " ▏"
+            } else {
+                ""
+            };
+            Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{line}{cursor}"), Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(Span::styled(
+        "Enter send · ↑/↓ scroll · Ctrl-Q quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
 fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
+    if app.active_room == WorkspaceRoom::PM {
+        draw_pm_agent_ui(frame, app);
+        return;
+    }
+
     if frame.area().width < 118 || frame.area().height < 28 {
         draw_daemon_ui_compact(frame, app);
         return;
@@ -2965,6 +3201,11 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
 }
 
 fn draw_daemon_ui_compact(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
+    if app.active_room == WorkspaceRoom::PM {
+        draw_pm_agent_ui(frame, app);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -3065,27 +3306,29 @@ fn workspace_status_lines(app: &DaemonApp, limit: usize) -> Vec<Line<'static>> {
     if app.show_help {
         lines.push(Line::from(""));
         lines.push(Line::from("Help"));
-        lines.push(Line::from("Tab/Shift-Tab pane focus · arrows room/session"));
+        lines.push(Line::from(
+            "F1-F7 jump rooms directly · no compose/navigation mode",
+        ));
         lines.push(Line::from("F1 PM · F2 Writers · F3 ORCH+MESH · F4 Review"));
         lines.push(Line::from(
             "F5 TideDash · F6 WorkOps · F7 WorldMap · Enter submit",
         ));
         lines.push(Line::from(
-            "plain letters always type · / jumps to input · Ctrl-J newline · Ctrl-U clear",
+            "plain letters always type · Tab/Shift-Tab cycle rooms · Ctrl-J newline",
         ));
         lines.push(Line::from(
-            "Ctrl-Q quit · Ctrl-R refresh · Ctrl-Y/N approvals",
+            "Ctrl-Q quit · Ctrl-R refresh · Ctrl-U clear · Ctrl-Y/N approvals",
         ));
     } else {
         lines.push(Line::from(""));
-        lines.push(Line::from("F10 or ? for help"));
+        lines.push(Line::from("F10 for help"));
     }
     lines.into_iter().take(limit.max(1)).collect()
 }
 
 fn daemon_footer(app: &DaemonApp) -> Paragraph<'static> {
     Paragraph::new(format!(
-        "F1 PM · F2 Writers Room · F3 ORCH + MESH · F4 Review Room · F5 TideDash · F6 WorkOps · F7 WorldMap | Tab panes | / input | Ctrl-Q quit | Ctrl-R refresh | {}",
+        "F1 PM · F2 Writers Room · F3 ORCH + MESH · F4 Review Room · F5 TideDash · F6 WorkOps · F7 WorldMap | Tab/Shift-Tab rooms | type anywhere | Ctrl-Q quit | Ctrl-R refresh | {}",
         app.status
     ))
     .alignment(Alignment::Center)
@@ -3773,6 +4016,29 @@ fn compact_text(text: &str, limit: usize) -> String {
     result
 }
 
+fn styled_transcript_line(text: &str) -> Line<'static> {
+    let style = if text.starts_with("You:") || text.starts_with("> ") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if text.starts_with("Ocean:") || text.starts_with("Ocean [") {
+        Style::default().fg(Color::Green)
+    } else if text.starts_with("Tool:") {
+        Style::default().fg(Color::Yellow)
+    } else if text.starts_with("Ocean error") || text.starts_with('✗') {
+        Style::default().fg(Color::Red)
+    } else if text.starts_with('✓') {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if text.starts_with('…') {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Line::from(Span::styled(text.to_string(), style))
+}
+
 fn checked_text(last: Option<Instant>) -> String {
     match last {
         Some(last_checked) => {
@@ -4010,24 +4276,24 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Shift-Y approve"));
-        assert!(rendered.contains("Shift-N deny"));
+        assert!(rendered.contains("Ctrl-Y approve"));
+        assert!(rendered.contains("Ctrl-N deny"));
 
         app.set_permissions(Vec::new());
         assert!(app.pending_permissions.is_empty());
     }
 
     #[test]
-    fn daemon_composer_focus_treats_uppercase_as_input() {
+    fn daemon_shift_y_n_are_text_input_not_permission_shortcuts() {
         let app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
-        let approve = daemon_key_action(
+        let y = daemon_key_action(
             &app,
             Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Char('Y'),
                 KeyModifiers::SHIFT,
             )),
         );
-        let deny = daemon_key_action(
+        let n = daemon_key_action(
             &app,
             Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Char('N'),
@@ -4035,8 +4301,8 @@ mod tests {
             )),
         );
 
-        assert!(matches!(approve, Some(Action::InputChar('Y'))));
-        assert!(matches!(deny, Some(Action::InputChar('N'))));
+        assert!(matches!(y, Some(Action::InputChar('Y'))));
+        assert!(matches!(n, Some(Action::InputChar('N'))));
     }
 
     #[test]
@@ -4113,7 +4379,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_escape_leaves_input_but_does_not_toggle_back() {
+    fn daemon_escape_does_not_create_a_navigation_mode() {
         let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
         app.focus = FocusPane::Composer;
 
@@ -4124,7 +4390,7 @@ mod tests {
                 KeyModifiers::NONE,
             )),
         );
-        assert!(matches!(esc, Some(Action::FocusRooms)));
+        assert!(esc.is_none());
 
         app.focus = FocusPane::Rooms;
         let esc_again = daemon_key_action(
@@ -4138,11 +4404,11 @@ mod tests {
     }
 
     #[test]
-    fn daemon_slash_jumps_to_input_from_rooms() {
+    fn daemon_slash_is_plain_input_not_a_mode_switch() {
         let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
         app.focus = FocusPane::Rooms;
 
-        let jump = daemon_key_action(
+        let slash = daemon_key_action(
             &app,
             Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Char('/'),
@@ -4150,7 +4416,7 @@ mod tests {
             )),
         );
 
-        assert!(matches!(jump, Some(Action::FocusComposer)));
+        assert!(matches!(slash, Some(Action::InputChar('/'))));
     }
 
     #[test]
@@ -4270,6 +4536,44 @@ mod tests {
         assert!(line.contains("[F4 Review Room]"));
         assert!(line.contains("F1 PM"));
         assert!(line.contains("F3 ORCH + MESH"));
+    }
+
+    #[test]
+    fn daemon_starts_on_pm_and_function_keys_jump_rooms() {
+        let app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        assert_eq!(app.active_room, WorkspaceRoom::PM);
+
+        let f3 = daemon_key_action(
+            &app,
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::F(3),
+                KeyModifiers::NONE,
+            )),
+        );
+        assert!(matches!(
+            f3,
+            Some(Action::SelectRoom(WorkspaceRoom::Orchestrator))
+        ));
+    }
+
+    #[test]
+    fn daemon_tab_cycles_rooms_without_leaving_input() {
+        let client = DaemonClient::new().expect("client");
+        let (action_tx, _action_rx) = mpsc::channel();
+        let mut state = AppState::new(
+            UiMode::Daemon(Box::new(DaemonApp::new(
+                "http://127.0.0.1:4780".to_string(),
+                PathBuf::from("."),
+            ))),
+            action_tx,
+        );
+
+        assert!(handle_daemon_action(&client, &mut state, Action::NextRoom));
+        let UiMode::Daemon(app) = &state.mode else {
+            panic!("expected daemon mode");
+        };
+        assert_eq!(app.active_room, WorkspaceRoom::Writers);
+        assert_eq!(app.focus, FocusPane::Composer);
     }
 
     #[test]
