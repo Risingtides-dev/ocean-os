@@ -55,7 +55,7 @@ This order keeps the current `ocean-rs prompt "Reply exactly: OCEAN_OK"` smoke p
 - `ocean-rs prompt` smoke with an existing session ID
 
 ### Before `ocean-providers`
-- model selection matrix test (`OCEAN_MODEL`, `PI_MODEL`, default)
+- model selection matrix test (`OCEAN_MODEL`, default, DeepSeek V4 Pro/Flash aliases)
 - DeepSeek key fallback test from `~/.pi/agent/auth.json`
 - health/backend string regression check
 

@@ -63,22 +63,22 @@ cargo run -p ocean-cli -- --url http://127.0.0.1:4781 health
 `ocean-agent` reads model config in this order:
 
 1. `OCEAN_MODEL`
-2. `PI_MODEL`
-3. default `deepseek-chat`
+2. default `deepseek-chat`
 
 Currently mapped model IDs include:
 
 - `deepseek` / `deepseek-chat`
 - `deepseek-v4-flash`
+- `deepseek-v4-pro` (`deepseek-v4`, `deepseek-pro`, and `DeepSeek V4 Pro` normalize here)
 - `deepseek-reasoner` / `deepseek-r1`
 - `gpt-4o`
 - `gpt-4o-mini`
 - `claude-sonnet-4-6` / `claude-sonnet` / `sonnet`
 - `claude-opus-4-7` / `claude-opus` / `opus`
 
-Any other model ID falls through to an OpenAI-compatible provider using `OCEAN_OPENAI_BASE_URL` or `https://api.openai.com/v1`.
+Any other model ID uses the OpenAI-compatible provider only when `OCEAN_OPENAI_BASE_URL` is set; otherwise it is rejected as unknown.
 
-Historical note: earlier audits found `deepseek-v4-flash` falling through to the generic OpenAI-compatible path. The Rev-gated task-1 hotfix maps `deepseek-v4-flash` explicitly. If a prompt reports a missing OpenAI key while you expected DeepSeek, re-check the deployed binary/service environment and confirm it includes that hotfix.
+Historical note: earlier audits found `deepseek-v4-flash` falling through to the generic OpenAI-compatible path, and stale Pi-era model environment could shadow the operator's intended model. Ocean now keys off `OCEAN_MODEL` only, and maps `deepseek-v4-pro` explicitly so V4 Pro does not silently become Flash.
 
 ### API keys
 

@@ -218,18 +218,14 @@ pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, Prov
 
 /// Resolve model selection without reading credential values.
 pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, ProviderConfigError> {
-    let model = env
-        .get("OCEAN_MODEL")
-        .or_else(|| env.get("PI_MODEL"))
-        .unwrap_or("deepseek-chat")
-        .trim();
+    let model = normalize_model_id(env.get("OCEAN_MODEL").unwrap_or("deepseek-chat"));
     let provider_override = env.get("OCEAN_PROVIDER").map(str::trim);
 
     if let Some(provider) = provider_override {
-        return model_for_explicit_provider(provider, model, env);
+        return model_for_explicit_provider(provider, model.as_str(), env);
     }
 
-    match model {
+    match model.as_str() {
         "deepseek" | "deepseek-chat" => Ok(model_selection(
             ProviderId::DeepSeek,
             "deepseek-chat",
@@ -247,6 +243,13 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         "deepseek-v4-flash" => Ok(model_selection(
             ProviderId::DeepSeek,
             "deepseek-v4-flash",
+            DEEPSEEK_BASE_URL,
+            64_000,
+            8_192,
+        )),
+        "deepseek-v4-pro" | "deepseek-v4" | "deepseek-pro" | "v4-pro" => Ok(model_selection(
+            ProviderId::DeepSeek,
+            "deepseek-v4-pro",
             DEEPSEEK_BASE_URL,
             64_000,
             8_192,
@@ -297,6 +300,15 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             model: other.to_string(),
         }),
     }
+}
+
+fn normalize_model_id(model: &str) -> String {
+    model
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch == ' ' || ch == '_' { '-' } else { ch })
+        .collect()
 }
 
 fn model_for_explicit_provider(
@@ -467,6 +479,23 @@ mod tests {
         assert_eq!(selection.provider, ProviderId::DeepSeek);
         assert_eq!(selection.model, "deepseek-v4-flash");
         assert_eq!(selection.base_url, DEEPSEEK_BASE_URL);
+    }
+
+    #[test]
+    fn maps_deepseek_v4_pro_to_official_deepseek_model() {
+        let selection =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "deepseek-v4-pro")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::DeepSeek);
+        assert_eq!(selection.model, "deepseek-v4-pro");
+        assert_eq!(selection.base_url, DEEPSEEK_BASE_URL);
+    }
+
+    #[test]
+    fn normalizes_spaced_deepseek_v4_pro_alias_to_pro_not_flash() {
+        let selection =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "DeepSeek V4 Pro")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::DeepSeek);
+        assert_eq!(selection.model, "deepseek-v4-pro");
     }
 
     #[test]

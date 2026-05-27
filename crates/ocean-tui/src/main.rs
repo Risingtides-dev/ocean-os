@@ -2060,9 +2060,58 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
 }
 
 fn handle_slash_command(app: &mut DaemonApp, instruction: &str) -> bool {
-    match instruction.trim() {
-        "/model" | "/model status" => {
-            app.push_transcript("You: /model".to_string());
+    let trimmed = instruction.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+
+    // Split "/resume 3" -> ("/resume", "3")
+    let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
+        Some((c, a)) => (c, Some(a.trim())),
+        None => (trimmed, None),
+    };
+
+    // Try each registered command
+    for command in SLASH_COMMANDS {
+        if command.names.contains(&cmd) {
+            app.push_transcript(format!("You: {instruction}"));
+            (command.execute)(app, args);
+            return true;
+        }
+    }
+
+    // Unknown command — show available ones
+    app.push_transcript(format!("You: {instruction}"));
+    let available = SLASH_COMMANDS
+        .iter()
+        .flat_map(|c| c.names.first())
+        .map(|n| format!("  {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_transcript(format!("Ocean: unknown command. Available:\n{available}"));
+    app.status = format!("unknown command {cmd}");
+    true
+}
+
+struct SlashCommandDef {
+    names: &'static [&'static str],
+    help: &'static str,
+    execute: fn(app: &mut DaemonApp, args: Option<&str>),
+}
+
+const SLASH_COMMANDS: &[SlashCommandDef] = &[
+    SlashCommandDef {
+        names: &["/help", "/?"],
+        help: "Show this help screen",
+        execute: |app, _args| {
+            app.show_help = true;
+            app.status = "help open".to_string();
+        },
+    },
+    SlashCommandDef {
+        names: &["/model"],
+        help: "Show current model provider, model, and credential status",
+        execute: |app, _args| {
             app.push_transcript(format!(
                 "Ocean: model provider={} model={} api_key={} source={}",
                 app.model_config.provider,
@@ -2071,16 +2120,120 @@ fn handle_slash_command(app: &mut DaemonApp, instruction: &str) -> bool {
                 compact_text(&app.model_config.source, 72)
             ));
             app.status = "model config displayed".to_string();
-            true
-        }
-        "/help" => {
-            app.show_help = true;
-            app.status = "help open".to_string();
-            true
-        }
-        _ => false,
-    }
-}
+        },
+    },
+    SlashCommandDef {
+        names: &["/clear", "/cls"],
+        help: "Clear the transcript and activity panels",
+        execute: |app, _args| {
+            app.transcript.clear();
+            app.activity.clear();
+            app.diff_snippets.clear();
+            app.tool_timeline.clear();
+            app.status = "panels cleared".to_string();
+        },
+    },
+    SlashCommandDef {
+        names: &["/sessions", "/ls"],
+        help: "List recent sessions from the daemon",
+        execute: |app, _args| {
+            let count = app.sessions.len();
+            if count == 0 {
+                app.push_transcript("Ocean: no saved sessions yet.".to_string());
+            } else {
+                let lines: Vec<String> = app
+                    .sessions
+                    .iter()
+                    .take(10)
+                    .map(|session| {
+                        format!(
+                            "  [{}] {} · {} turns · {}",
+                            short_id(session.id),
+                            compact_text(&session.title, 30),
+                            session.turns,
+                            session.model,
+                        )
+                    })
+                    .collect();
+                app.push_transcript(format!("Ocean: {count} session(s):"));
+                for line in lines {
+                    app.push_transcript(line);
+                }
+                if count > 10 {
+                    app.push_transcript(format!("  … and {} more", count - 10));
+                }
+            }
+            app.status = format!("listed {count} sessions").to_string();
+        },
+    },
+    SlashCommandDef {
+        names: &["/resume"],
+        help: "Resume the selected session. Usage: /resume or /resume <N> to select by index",
+        execute: |app, args| {
+            if let Some(index_str) = args {
+                if let Ok(index) = index_str.parse::<usize>() {
+                    let slot = index.min(app.sessions.len());
+                    if slot > 0 {
+                        let label = {
+                            app.selected_session_index = slot;
+                            app.selected_session_label()
+                        };
+                        app.status = format!("session target: {label}");
+                        app.push_transcript(format!("Ocean: switched to session {label}"));
+                        return;
+                    }
+                }
+                app.push_transcript(
+                    "Ocean: invalid session index. Use /sessions to list them.".to_string(),
+                );
+                app.status = "invalid session index".to_string();
+            } else {
+                let (label, has_session) = {
+                    let session = app.selected_session();
+                    let label = app.selected_session_label();
+                    (label, session.is_some())
+                };
+                if has_session {
+                    app.push_transcript(format!("Ocean: selected {label}",));
+                    app.status = format!(
+                        "ready to resume [{}]",
+                        short_id(app.selected_session_id().unwrap_or_default())
+                    );
+                } else {
+                    app.push_transcript(
+                        "Ocean: no session selected. Use /sessions then Up/Down to pick one."
+                            .to_string(),
+                    );
+                    app.status = "no session selected".to_string();
+                }
+            }
+        },
+    },
+    SlashCommandDef {
+        names: &["/refresh", "/r"],
+        help: "Trigger a full daemon refresh (health, sessions, requests, permissions)",
+        execute: |app, _args| {
+            app.last_checked = None; // force tick to refresh
+            app.status = "refresh triggered on next tick".to_string();
+        },
+    },
+    SlashCommandDef {
+        names: &["/status"],
+        help: "Show daemon status summary",
+        execute: |app, _args| {
+            let (health_label, _) = app.status_label();
+            app.push_transcript(format!(
+                "Ocean: status {}  stream {}  approvals {}  model {}  sessions {}",
+                health_label,
+                app.stream_status,
+                app.pending_permissions.len(),
+                app.model_config.model,
+                app.sessions.len(),
+            ));
+            app.status = "status displayed".to_string();
+        },
+    },
+];
 
 fn daemon_decide_latest_permission(client: &DaemonClient, app: &mut DaemonApp, allow: bool) {
     let Some(pending) = app.latest_pending_permission().cloned() else {
@@ -3351,20 +3504,27 @@ fn workspace_status_lines(app: &DaemonApp, limit: usize) -> Vec<Line<'static>> {
     lines.extend(app.support_lines());
     if app.show_help {
         lines.push(Line::from(""));
-        lines.push(Line::from("Help"));
+        lines.push(Line::from("Keys"));
         lines.push(Line::from(
-            "F1-F7 jump rooms directly · no compose/navigation mode",
-        ));
-        lines.push(Line::from("F1 PM · F2 Writers · F3 ORCH+MESH · F4 Review"));
-        lines.push(Line::from(
-            "F5 TideDash · F6 WorkOps · F7 WorldMap · Enter submit",
+            "F1-F7 jump rooms directly · plain letters always type",
         ));
         lines.push(Line::from(
-            "plain letters always type · Tab/Shift-Tab cycle rooms · Ctrl-J newline",
+            "Tab/Shift-Tab cycle rooms · Ctrl-J newline · Esc no-op",
         ));
         lines.push(Line::from(
-            "Ctrl-Q quit · Ctrl-R refresh · Ctrl-U clear · Ctrl-Y/N approvals",
+            "Ctrl-Q quit · Ctrl-R refresh · Ctrl-U clear input",
         ));
+        lines.push(Line::from(
+            "Ctrl-Y approve · Ctrl-N deny · PageUp/Down sessions",
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "Slash commands (type in composer and press Enter)",
+        ));
+        for cmd in SLASH_COMMANDS {
+            let names = cmd.names.join(", ");
+            lines.push(Line::from(format!("  {names:28} {h}", h = cmd.help)));
+        }
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from("F10 for help"));
@@ -4523,6 +4683,31 @@ mod tests {
         );
 
         assert!(matches!(slash, Some(Action::InputChar('/'))));
+    }
+
+    #[test]
+    fn daemon_slash_commands_list_sessions_and_resume_selection() {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let session_id = SessionId::new_v4();
+        app.set_sessions(vec![SessionSummary {
+            id: session_id,
+            model: "test-model".to_string(),
+            turns: 3,
+            title: "Existing session".to_string(),
+        }]);
+
+        assert!(handle_slash_command(&mut app, "/sessions"));
+        assert!(app
+            .transcript
+            .iter()
+            .any(|line| line.contains("Ocean: 1 session(s):")));
+
+        assert!(handle_slash_command(&mut app, "/resume 1"));
+        assert_eq!(app.selected_session_id(), Some(session_id));
+        assert!(app.status.contains("session target"));
+
+        assert!(handle_slash_command(&mut app, "/help"));
+        assert!(app.show_help);
     }
 
     #[test]
