@@ -1,161 +1,75 @@
-# Ocean-OS
+# Ocean OS
 
-> Agentic knowledge layer for Rising Tides, plus the Rust-native Ocean runtime in this repo.
+> Rust-native coding-agent runtime, daemon, and TUI cockpit.
 
-This repository now contains two related tracks:
+Ocean OS is a local-first agent runtime written in Rust. A long-running daemon owns the agent loop, tool execution, provider calls, sessions, and permissions. Clients (CLI, TUI, future GUI / web / voice) are thin shells that steer the daemon over a stable protocol.
 
-- **Ocean-OS**: deployed central data + tool layer for Rising Tides agents.
-- **ocean-rs**: Rust-native local coding-agent harness/runtime and TUI.
+## What's in this repo
 
-## ocean-rs runtime
+| Crate | Role |
+|---|---|
+| `ocean-core` | Shared protocol types: requests, responses, events, sessions |
+| `ocean-protocol` | Unified multi-provider LLM wire protocol (Anthropic, OpenAI, Google Gemini, OpenAI-compatible). SSE streaming, retry, cancellation |
+| `ocean-runtime` | Agent loop with permission-gated tool execution. Built-in tools: read, write, edit, bash, ls, grep, glob, web_fetch, todo |
+| `ocean-providers` | Ocean-owned provider registry: model routing, credential resolution, readiness checks |
+| `ocean-agent` | Ocean session/history layer wrapping `ocean-runtime` |
+| `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
+| `ocean-daemon` | Long-running HTTP service on `:4780`. Owns runtime authority |
+| `ocean-cli` (`ocean-rs` binary) | CLI client: health, prompt, sessions |
+| `ocean-tui` (`ocean` binary) | Terminal steering cockpit with TIDES-MESH parity views |
 
-`ocean-rs` is the canonical Rust-native coding-agent harness/runtime for Ocean.
-It is **not** a Pi fork. We are using Pi concepts as reference material, then building a lower-level Rust runtime and operator floor in Rust.
-
-Current product framing:
-
-- `ocean-rs` is the canonical Rust-native coding-agent harness/runtime.
-- `ocean-daemon` owns runtime authority: provider calls, agent loops, tools, sessions, permissions, and events.
-- `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that harness, not a passive daemon dashboard.
-- F1 PM is the minimal Rust-backed agent-turn chat lane.
-- Ocean GUI and service layers remain thin clients until the daemon protocol is stable.
-
-Run the daemon:
+## Quick start
 
 ```bash
-cargo run -p ocean-daemon
-```
+# Build
+cargo build --workspace --release
 
-Health:
+# Configure provider credentials (any one of these is enough)
+export OCEAN_DEEPSEEK_API_KEY=...   # DeepSeek (default)
+export OCEAN_ANTHROPIC_API_KEY=...  # Anthropic
+export OCEAN_OPENAI_API_KEY=...     # OpenAI
 
-```bash
+# Run the daemon
+./target/release/ocean-daemon
+
+# In another shell:
 curl http://127.0.0.1:4780/health
+./target/release/ocean-rs prompt "Reply with: pong"
+
+# Launch the TUI cockpit
+./target/release/ocean-tui   # or: ocean   (if symlinked into ~/.local/bin)
 ```
 
-Prompt:
+## Provider configuration
 
-```bash
-cargo run -p ocean-cli -- prompt "Reply OK"
-```
+Model selection via `OCEAN_MODEL` (default: `deepseek-chat`). Supported model strings include:
 
-TUI:
+- `deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash`, `deepseek-v4-pro`
+- `gpt-4o`, `gpt-4o-mini`
+- `claude-sonnet-4-6`, `claude-opus-4-7`
+- `fake` (no creds — for testing)
+- any OpenAI-compatible base via `OCEAN_PROVIDER=openai-compatible` + `OCEAN_BASE_URL`
 
-```bash
-cargo run -p ocean-tui
-```
-
-## Ocean-OS knowledge layer
-
-Ocean-OS is a deployed central data + tool layer that ingests from every system Rising Tides runs on, normalizes it, vectorizes it, and exposes it to all our agents through a single MCP. It is **not** a replacement for any production database — it is a read-replica + event log + vector index + knowledge graph that agents can hammer without risk to live data.
-
-## Why this exists
-
-Right now every Claude in the workspace is flying solo. Each agent greps its operator's filesystem, hits GitHub independently, scrapes Notion, and stitches an answer for every Slack mention. None of them share a grounded view of reality, half the answers are partly hallucinated, and there is no shared memory across the squad.
-
-Ocean-OS is the layer that fixes this. One source of truth that every agent reads from, one tool surface every agent acts through, one feedback log every agent writes back into.
+Provider env-var lookup order is documented in [`crates/ocean-providers/src/lib.rs`](crates/ocean-providers/src/lib.rs).
 
 ## Architecture
 
-```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Production sources                           │
-│  Slack  GitHub  Cobrand  Campaign Hub  Content Lab  Telegram        │
-│  Railway  Cloudflare  Notion CRM  Cloudflare Email                  │
-└────────────────────────────────┬────────────────────────────────────┘
-                                 │ webhooks + polling
-                ┌────────────────▼────────────────┐
-                │    Ingestion workers (per src)  │
-                │  Independent services. Fail     │
-                │  independently. Own one source. │
-                └────────────────┬────────────────┘
-                                 │
-                ┌────────────────▼────────────────┐
-                │       Postgres core             │
-                │  Append-only event log per src  │
-                │  Materialized current state     │
-                │  views per source schema        │
-                │                                 │
-                │  + pgvector embeddings          │
-                │  + relationship graph           │
-                └────────────────┬────────────────┘
-                                 │
-                ┌────────────────▼────────────────┐
-                │       Ocean MCP server          │
-                │  Single MCP every Slack bot     │
-                │  loads. Hides source-specific   │
-                │  complexity behind clean tools. │
-                └────────────────┬────────────────┘
-                                 │
-        ┌──────────────────┬─────┴──────┬─────────────────┐
-        │                  │            │                 │
-   smaths-bot         Jake's Claude  Eric's Claude   future agents
-```
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the daemon ↔ client model, and [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md) for runtime ops.
 
-## Components
+TUI design: [`docs/OCEAN_TUI_MOCKUPS.md`](docs/OCEAN_TUI_MOCKUPS.md), [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](docs/OCEAN_TUI_TIDES_MESH_PARITY.md), [`docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md).
 
-### 1. Ingestion workers
+Internals: [`docs/OCEAN_NATIVE_INTERNALS_MAP.md`](docs/OCEAN_NATIVE_INTERNALS_MAP.md).
 
-Independent services per source. Each owns one source, fails independently, writes to its own schema.
+## Roadmap
 
-| Source | What it ingests |
-|---|---|
-| `slack` | Messages, threads, reactions, channel events |
-| `github` | Commits, PRs, issues, deploys, branch events |
-| `cobrand` | Campaign performance, post submissions, view counts |
-| `campaign-hub` | Bookings, creators, payments, budgets |
-| `content-lab` | Generation jobs, render outputs, distribution events |
-| `telegram` | Distribution events, folder uploads, poster activity |
-| `railway` | Deploy state, service logs, env metadata |
-| `cloudflare` | DNS state, Workers state, R2 buckets, email routing |
-| `notion` | CRM entries, campaign briefs, client data |
+Active runtime roadmap: [`ROADMAP.md`](ROADMAP.md).
 
-### 2. Postgres core
+Longer-horizon vision — Ocean OS as a shared agentic knowledge layer (PRDs, market research, ingestion architecture, MCP service design) — lives on the [`roadmap/ocean-os-v2`](https://github.com/Risingtides-dev/ocean-os/tree/roadmap/ocean-os-v2) branch. That branch preserves the v2 product work and the TypeScript ingestion/orchestrator/MCP scaffolding; cherry-pick from it as those pieces graduate into the runtime.
 
-Append-only event log + materialized views for current state queries. Schemas namespaced by source: `github.*`, `slack.*`, `campaigns.*`, `content.*`, `deploys.*`. See [`schema/000_init.sql`](schema/000_init.sql).
+## Provenance
 
-### 3. Embedding + knowledge graph
-
-`pgvector` over text-heavy data. Relationship graph layer linking entities — campaign → creators → posts → performance → client.
-
-### 4. Ocean MCP
-
-Single MCP server every Slack bot loads. Tools like:
-
-- `ocean.query_campaign(slug)`
-- `ocean.search_threads(query)`
-- `ocean.deployments_for_repo(name)`
-- `ocean.creator_history(handle)`
-- `ocean.post_content_to_telegram(folder, brief)`
-- `ocean.diagnose_deploy(repo)`
-
-See [`mcp/`](mcp/) for the skeleton.
-
-### 5. Feedback loop
-
-Every agent action posts back into Ocean. Bot suggested X, user accepted/rejected, outcome was Y.
-
-### 6. Skills/prompts/MCP registry
-
-Versioned shared store of the team's reusable prompts, skills, and MCP configurations.
-
-## Repo layout
-
-```text
-ocean-os/
-├── crates/                       ocean-rs Rust runtime crates
-│   ├── ocean-agent/
-│   ├── ocean-cli/
-│   ├── ocean-core/
-│   ├── ocean-daemon/
-│   ├── ocean-providers/
-│   └── ocean-tui/
-├── docs/
-├── schema/
-├── mcp/
-├── ingestion/
-└── .github/
-```
+`ocean-runtime` and `ocean-protocol` were vendored from [`pi-agent`](https://crates.io/crates/pi-agent) and [`pi-ai`](https://crates.io/crates/pi-ai) v1.0.0 (MIT, © Pi Rust Port Contributors). Ocean owns and evolves them in-tree. See each crate's `README.md`.
 
 ## Contributing
 
-See [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md).
+See [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md). For repo routing and Linear team rules, see [`CLAUDE.md`](CLAUDE.md) and [`AGENTS.md`](AGENTS.md).
