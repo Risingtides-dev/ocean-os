@@ -266,6 +266,8 @@ enum Action {
     PmScrollUp(usize),
     PmScrollDown(usize),
     PmScrollHome,
+    SetModel(String),
+    PmSystemMessage(String),
 }
 
 #[derive(Debug)]
@@ -345,6 +347,7 @@ struct DaemonApp {
     pm_scroll: usize,
     pm_focused_block: Option<(usize, usize)>,
     show_all_sessions: bool,
+    pending_model_swap: Option<String>,
     tool_timeline: Vec<ToolTimelineEntry>,
     diff_snippets: Vec<String>,
     support: WorkspaceSupportState,
@@ -383,6 +386,7 @@ impl DaemonApp {
             pm_scroll: 0,
             pm_focused_block: None,
             show_all_sessions: false,
+            pending_model_swap: None,
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
             support: WorkspaceSupportState::default(),
@@ -1556,6 +1560,38 @@ impl DaemonClient {
             .map_err(|err| err.to_string())
     }
 
+    fn set_model(&self, base_url: &str, model: &str) -> Result<(String, String), String> {
+        let url = format!("{}/v1/model", base_url.trim_end_matches('/'));
+        let body = serde_json::json!({ "model": model });
+        let resp: serde_json::Value = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json()
+            .map_err(|err| err.to_string())?;
+        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("set_model failed")
+                .to_string());
+        }
+        let provider = resp
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let model = resp
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok((provider, model))
+    }
+
     fn requests(&self, base_url: &str) -> Result<RequestsResponse, String> {
         let url = format!("{}/v1/requests", base_url.trim_end_matches('/'));
         self.http
@@ -2132,6 +2168,40 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
         Action::PmScrollHome => {
             app.pm_scroll = 0;
         }
+        Action::SetModel(spec) => {
+            let url = app.url.clone();
+            let client = client.clone();
+            let action_tx = state.action_tx.clone();
+            thread::spawn(move || match client.set_model(&url, &spec) {
+                Ok((provider, model)) => {
+                    let line = format!("model swapped → {provider}/{model}");
+                    let _ = action_tx.send(Action::StreamStatus(line.clone()));
+                    let _ = action_tx.send(Action::PmSystemMessage(format!(
+                        "Model is now **{provider}/{model}**."
+                    )));
+                    let _ = action_tx.send(Action::RefreshAll);
+                }
+                Err(err) => {
+                    let line = format!("model swap failed: {}", compact_text(&err, 72));
+                    let _ = action_tx.send(Action::StreamStatus(line.clone()));
+                    let _ = action_tx.send(Action::PmSystemMessage(format!(
+                        "Model swap failed: {err}"
+                    )));
+                }
+            });
+        }
+        Action::PmSystemMessage(text) => {
+            app.pm_turns.push(PmTurn {
+                turn_id: None,
+                role: PmRole::Assistant,
+                blocks: vec![PmBlock::Text(text)],
+            });
+            if app.pm_turns.len() > PM_TURN_CAP {
+                let drop = app.pm_turns.len() - PM_TURN_CAP;
+                app.pm_turns.drain(0..drop);
+            }
+            app.pm_scroll = 0;
+        }
         _ => {}
     }
     state.dirty = true;
@@ -2318,6 +2388,9 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
     app.streaming_request_id = None;
 
     if handle_slash_command(app, &instruction) {
+        if let Some(spec) = app.pending_model_swap.take() {
+            let _ = state.action_tx.send(Action::SetModel(spec));
+        }
         return;
     }
 
@@ -2474,16 +2547,22 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
     },
     SlashCommandDef {
         names: &["/model"],
-        help: "Show current model provider, model, and credential status",
-        execute: |app, _args| {
-            app.push_transcript(format!(
-                "Ocean: model provider={} model={} api_key={} source={}",
-                app.model_config.provider,
-                app.model_config.model,
-                app.model_config.credential,
-                compact_text(&app.model_config.source, 72)
-            ));
-            app.status = "model config displayed".to_string();
+        help: "Show current model (no args) or swap models live: /model <name>",
+        execute: |app, args| {
+            if let Some(spec) = args.map(str::trim).filter(|s| !s.is_empty()) {
+                app.pending_model_swap = Some(spec.to_string());
+                app.push_transcript(format!("Ocean: swapping model → {spec}…"));
+                app.status = format!("model swap requested: {spec}");
+            } else {
+                app.push_transcript(format!(
+                    "Ocean: model provider={} model={} api_key={} source={}",
+                    app.model_config.provider,
+                    app.model_config.model,
+                    app.model_config.credential,
+                    compact_text(&app.model_config.source, 72)
+                ));
+                app.status = "model config displayed".to_string();
+            }
         },
     },
     SlashCommandDef {

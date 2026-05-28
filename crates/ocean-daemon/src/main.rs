@@ -168,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/permissions/{id}/decision", post(permission_decision))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
+        .route("/v1/model", get(model_get).post(model_set))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -581,6 +582,29 @@ async fn sessions(
     let scope = q.workspace_filter(&state.runtime);
     match state.runtime.list_sessions(scope.as_deref()) {
         Ok(sessions) => Json(json!({"ok": true, "sessions": sessions, "workspace": scope})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ModelSetRequest {
+    model: String,
+}
+
+async fn model_get(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let (provider, model) = state.runtime.current_model();
+    Json(json!({"ok": true, "provider": provider, "model": model}))
+}
+
+async fn model_set(
+    State(state): State<AppState>,
+    Json(req): Json<ModelSetRequest>,
+) -> Json<serde_json::Value> {
+    match state.runtime.set_model(&req.model) {
+        Ok((provider, model)) => {
+            tracing::info!(provider, model, "model swapped");
+            Json(json!({"ok": true, "provider": provider, "model": model}))
+        }
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
 }

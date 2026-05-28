@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
@@ -12,7 +12,8 @@ use ocean_core::{
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
 use ocean_providers::{
-    resolve_provider_config_from_env, ProviderConfig, ProviderId, ProviderReadiness,
+    resolve_provider_config, resolve_provider_config_from_env, ProviderConfig, ProviderEnv,
+    ProviderId, ProviderReadiness,
 };
 use ocean_runtime::{
     run_agent_with_history, tools::default_tools, AgentConfig, AgentEvent, PermissionDecision,
@@ -25,6 +26,17 @@ use tokio_util::sync::CancellationToken;
 
 const APP_NAME: &str = "ocean-rs";
 
+/// Inner runtime state that's swappable at runtime (model, provider, key).
+/// Kept behind an `Arc<RwLock<_>>` so a single AgentRuntime instance can
+/// re-bind to a different model without restarting the daemon process.
+#[derive(Debug, Clone)]
+struct RuntimeState {
+    model: Model,
+    api_key: Option<String>,
+    backend_name: String,
+    provider_config: ProviderConfig,
+}
+
 /// Native Ocean agent runtime.
 ///
 /// Daemon-owned wrapper around `ocean-runtime` that adds Ocean's session,
@@ -32,41 +44,65 @@ const APP_NAME: &str = "ocean-rs";
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     config_dir: PathBuf,
-    model: Model,
-    api_key: Option<String>,
-    backend_name: String,
-    provider_config: ProviderConfig,
+    state: Arc<RwLock<RuntimeState>>,
 }
 
 impl AgentRuntime {
     pub fn from_env() -> anyhow::Result<Self> {
-        let provider_config = resolve_provider_config_from_env()?;
-        let model = model_from_provider_config(&provider_config)?;
-        let api_key = provider_config
-            .credential
-            .as_ref()
-            .map(|credential| credential.secret.expose().to_string());
-        let backend_name = format!(
-            "ocean-native-{}",
-            provider_config.selection.provider.as_str()
-        );
+        let state = build_state_from_env()?;
         let runtime = Self {
             config_dir: config_dir_from_env(),
-            model,
-            api_key,
-            backend_name,
-            provider_config,
+            state: Arc::new(RwLock::new(state)),
         };
         runtime.migrate_legacy_sessions();
         Ok(runtime)
     }
 
-    pub fn backend_name(&self) -> &str {
-        &self.backend_name
+    fn snapshot(&self) -> RuntimeState {
+        self.state.read().expect("runtime state poisoned").clone()
+    }
+
+    pub fn backend_name(&self) -> String {
+        self.snapshot().backend_name
     }
 
     pub fn provider_readiness(&self) -> ProviderReadiness {
-        self.provider_config.readiness()
+        self.snapshot().provider_config.readiness()
+    }
+
+    /// Currently-bound model and provider id, for `/model` read paths.
+    pub fn current_model(&self) -> (String, String) {
+        let s = self.snapshot();
+        (
+            s.provider_config.selection.provider.as_str().to_string(),
+            s.provider_config.selection.model.clone(),
+        )
+    }
+
+    /// Swap the active model. Resolves a fresh provider config from the
+    /// process environment with `OCEAN_MODEL` overridden, then atomically
+    /// replaces the runtime state. Fails (without mutating anything) if
+    /// the new selection doesn't resolve or has no credential.
+    pub fn set_model(&self, model_spec: &str) -> anyhow::Result<(String, String)> {
+        let mut env = ProviderEnv::from_process();
+        env.vars
+            .insert("OCEAN_MODEL".to_string(), model_spec.to_string());
+        // If model spec doesn't have a known provider, the env-driven
+        // OCEAN_PROVIDER override carries through; we don't force-clear it.
+        let provider_config = resolve_provider_config(&env)
+            .map_err(|e| anyhow::anyhow!("failed to resolve model `{model_spec}`: {e}"))?;
+        let state = state_from_provider_config(provider_config)?;
+        let label = (
+            state
+                .provider_config
+                .selection
+                .provider
+                .as_str()
+                .to_string(),
+            state.provider_config.selection.model.clone(),
+        );
+        *self.state.write().expect("runtime state poisoned") = state;
+        Ok(label)
     }
 
     pub async fn prompt(&self, req: PromptRequest, control: PromptControl) -> PromptResponse {
@@ -92,10 +128,11 @@ impl AgentRuntime {
             };
         }
 
-        let result = if self.provider_config.selection.provider == ProviderId::Fake {
-            self.run_fake_prompt(req.clone()).await
+        let snapshot = self.snapshot();
+        let result = if snapshot.provider_config.selection.provider == ProviderId::Fake {
+            self.run_fake_prompt(req.clone(), &snapshot).await
         } else {
-            self.run_prompt(req.clone(), control).await
+            self.run_prompt(req.clone(), control, &snapshot).await
         };
 
         match result {
@@ -166,13 +203,14 @@ impl AgentRuntime {
     async fn run_fake_prompt(
         &self,
         req: PromptRequest,
+        snapshot: &RuntimeState,
     ) -> anyhow::Result<(SessionId, String, String)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let mut session = match req.session_id {
             Some(id) => session::load(&self.config_dir, id)
-                .unwrap_or_else(|_| session::Session::new_with_id(id, &self.model)),
-            None => session::Session::new(&self.model),
+                .unwrap_or_else(|_| session::Session::new_with_id(id, &snapshot.model)),
+            None => session::Session::new(&snapshot.model),
         };
         session.bind_workspace(Path::new(&req.cwd));
 
@@ -181,9 +219,9 @@ impl AgentRuntime {
         messages.push(Message::user_text(req.prompt));
         messages.push(Message::Assistant(AssistantMessage {
             content: vec![Content::text(stdout.trim_end())],
-            api: self.model.api.clone(),
-            provider: self.model.provider.clone(),
-            model: self.model.id.clone(),
+            api: snapshot.model.api.clone(),
+            provider: snapshot.model.provider.clone(),
+            model: snapshot.model.id.clone(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -199,19 +237,20 @@ impl AgentRuntime {
         &self,
         req: PromptRequest,
         control: PromptControl,
+        snapshot: &RuntimeState,
     ) -> anyhow::Result<(SessionId, String, String)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let mut session = match req.session_id {
             Some(id) => session::load(&self.config_dir, id)
-                .unwrap_or_else(|_| session::Session::new_with_id(id, &self.model)),
-            None => session::Session::new(&self.model),
+                .unwrap_or_else(|_| session::Session::new_with_id(id, &snapshot.model)),
+            None => session::Session::new(&snapshot.model),
         };
         session.bind_workspace(Path::new(&req.cwd));
 
         let mut history = session.messages.clone();
-        if self.provider_config.selection.provider == ProviderId::DeepSeek
-            && self.provider_config.selection.model == "deepseek-reasoner"
+        if snapshot.provider_config.selection.provider == ProviderId::DeepSeek
+            && snapshot.provider_config.selection.model == "deepseek-reasoner"
         {
             strip_assistant_thinking_content(&mut history);
         }
@@ -223,14 +262,14 @@ impl AgentRuntime {
             event_sink,
         } = control;
         let mut cfg = AgentConfig::new(
-            self.model.clone(),
+            snapshot.model.clone(),
             system_prompt::build_system_prompt(Some(&req.cwd)),
         )
         .with_tools(default_tools())
         .with_max_turns(req.max_turns.unwrap_or(32))
         .with_permission(permission);
-        cfg.stream_options.api_key = self.api_key.clone();
-        cfg.stream_options.base_url = Some(self.provider_config.selection.base_url.clone());
+        cfg.stream_options.api_key = snapshot.api_key.clone();
+        cfg.stream_options.base_url = Some(snapshot.provider_config.selection.base_url.clone());
         cfg.stream_options.cancel = cancel;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -346,6 +385,31 @@ impl PermissionPolicy for StaticPermissionPolicy {
             }
         }
     }
+}
+
+/// Resolve a fresh runtime state from the current process env.
+fn build_state_from_env() -> anyhow::Result<RuntimeState> {
+    let provider_config = resolve_provider_config_from_env()?;
+    state_from_provider_config(provider_config)
+}
+
+/// Build a runtime state from an already-resolved provider config.
+fn state_from_provider_config(provider_config: ProviderConfig) -> anyhow::Result<RuntimeState> {
+    let model = model_from_provider_config(&provider_config)?;
+    let api_key = provider_config
+        .credential
+        .as_ref()
+        .map(|credential| credential.secret.expose().to_string());
+    let backend_name = format!(
+        "ocean-native-{}",
+        provider_config.selection.provider.as_str()
+    );
+    Ok(RuntimeState {
+        model,
+        api_key,
+        backend_name,
+        provider_config,
+    })
 }
 
 fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> {
@@ -888,21 +952,10 @@ mod tests {
     }
 
     fn runtime(config_dir: PathBuf, provider_config: ProviderConfig) -> AgentRuntime {
-        let model = model_from_provider_config(&provider_config).unwrap();
-        let api_key = provider_config
-            .credential
-            .as_ref()
-            .map(|credential| credential.secret.expose().to_string());
-        let backend_name = format!(
-            "ocean-native-{}",
-            provider_config.selection.provider.as_str()
-        );
+        let state = state_from_provider_config(provider_config).unwrap();
         AgentRuntime {
             config_dir,
-            model,
-            api_key,
-            backend_name,
-            provider_config,
+            state: std::sync::Arc::new(std::sync::RwLock::new(state)),
         }
     }
 
