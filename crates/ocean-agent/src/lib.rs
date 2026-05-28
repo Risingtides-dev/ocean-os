@@ -200,7 +200,11 @@ impl AgentRuntime {
         }
         history.push(Message::user_text(req.prompt));
 
-        let PromptControl { permission, cancel } = control;
+        let PromptControl {
+            permission,
+            cancel,
+            event_sink,
+        } = control;
         let mut cfg = AgentConfig::new(
             self.model.clone(),
             system_prompt::build_system_prompt(Some(&req.cwd)),
@@ -222,6 +226,9 @@ impl AgentRuntime {
         let mut stdout = String::new();
         let mut stderr = String::new();
         while let Some(ev) = rx.recv().await {
+            if let Some(sink) = event_sink.as_ref() {
+                let _ = sink.send(ev.clone());
+            }
             match ev {
                 AgentEvent::TextDelta { delta } => stdout.push_str(&delta),
                 AgentEvent::ThinkingDelta { delta } => {
@@ -277,6 +284,10 @@ impl AgentRuntime {
 pub struct PromptControl {
     pub permission: Arc<dyn PermissionPolicy>,
     pub cancel: Option<CancellationToken>,
+    /// Optional sink that receives raw `AgentEvent`s as the run progresses.
+    /// The daemon uses this to push real-time deltas onto its broadcast bus
+    /// so SSE consumers (TUI/CLI) can render text as it streams.
+    pub event_sink: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
 impl PromptControl {
@@ -284,6 +295,7 @@ impl PromptControl {
         Self {
             permission,
             cancel: None,
+            event_sink: None,
         }
     }
 
@@ -293,6 +305,11 @@ impl PromptControl {
 
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    pub fn with_event_sink(mut self, sink: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 }

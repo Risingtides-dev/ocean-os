@@ -43,18 +43,20 @@ use serde::Deserialize;
 use serde_json::Value;
 
 mod rooms;
+mod splash;
 
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4780";
 const DEFAULT_MESH_REFRESH_MS: u64 = 1000;
 const DEFAULT_DAEMON_REFRESH: Duration = Duration::from_secs(5);
-const ACTION_POLL: Duration = Duration::from_millis(100);
-const REDRAW_MAX_IDLE: Duration = Duration::from_millis(250);
+const ACTION_POLL: Duration = Duration::from_millis(30);
+const REDRAW_MAX_IDLE: Duration = Duration::from_millis(80);
 const ACTIVITY_CAP: usize = 36;
 const TRANSCRIPT_CAP: usize = 120;
 const REQUEST_CAP: usize = 64;
 const SESSION_CAP: usize = 64;
 const FEED_CAP: usize = 300;
 const INBOX_CAP: usize = 120;
+const PM_TURN_CAP: usize = 50;
 const ACTIVE_AGENT_MS: i64 = 2 * 60 * 1000;
 const AWAY_AGENT_MS: i64 = 15 * 60 * 1000;
 
@@ -238,12 +240,62 @@ enum Action {
     MeshTogglePause,
     MeshNextTab,
     MeshSelectTab(MeshTab),
+    PmFocusNextBlock,
+    PmFocusPrevBlock,
+    PmToggleBlock,
+    PmClearFocus,
+    PmScrollUp(usize),
+    PmScrollDown(usize),
+    PmScrollHome,
 }
 
 #[derive(Debug)]
 enum UiMode {
     Daemon(Box<DaemonApp>),
     Mesh(MeshApp, Box<MeshState>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PmRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolStatus {
+    Running,
+    Ok,
+    Err,
+}
+
+#[derive(Debug, Clone)]
+enum PmBlock {
+    /// Plain assistant text. Streams char-by-char.
+    Text(String),
+    /// Hidden reasoning. Collapsed by default; expand with Space/Enter
+    /// when focused.
+    Thinking {
+        content: String,
+        expanded: bool,
+    },
+    /// One tool call dispatched by the assistant. `args_preview` is a
+    /// short one-liner shown in the collapsed header; `output` streams
+    /// in from ToolCallChunk and finalises on ToolCallFinished.
+    ToolCall {
+        call_id: String,
+        name: String,
+        args_preview: String,
+        output: String,
+        status: ToolStatus,
+        expanded: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PmTurn {
+    turn_id: Option<AgentTurnId>,
+    role: PmRole,
+    blocks: Vec<PmBlock>,
 }
 
 #[derive(Debug)]
@@ -270,6 +322,9 @@ struct DaemonApp {
     input: String,
     activity: Vec<String>,
     transcript: Vec<String>,
+    pm_turns: Vec<PmTurn>,
+    pm_scroll: usize,
+    pm_focused_block: Option<(usize, usize)>,
     tool_timeline: Vec<ToolTimelineEntry>,
     diff_snippets: Vec<String>,
     support: WorkspaceSupportState,
@@ -304,6 +359,9 @@ impl DaemonApp {
             input: String::new(),
             activity: Vec::new(),
             transcript: Vec::new(),
+            pm_turns: Vec::new(),
+            pm_scroll: 0,
+            pm_focused_block: None,
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
             support: WorkspaceSupportState::default(),
@@ -395,6 +453,171 @@ impl DaemonApp {
     fn push_transcript_if_new(&mut self, line: String) {
         if self.transcript.last() != Some(&line) {
             self.push_transcript(line);
+        }
+    }
+
+    fn pm_push_user_prompt(&mut self, text: String) {
+        self.pm_turns.push(PmTurn {
+            turn_id: None,
+            role: PmRole::User,
+            blocks: vec![PmBlock::Text(text)],
+        });
+        if self.pm_turns.len() > PM_TURN_CAP {
+            let drop = self.pm_turns.len() - PM_TURN_CAP;
+            self.pm_turns.drain(0..drop);
+        }
+        self.pm_scroll = 0;
+        self.pm_focused_block = None;
+    }
+
+    fn pm_assistant_turn_mut(&mut self, turn_id: AgentTurnId) -> &mut PmTurn {
+        if let Some(last) = self.pm_turns.last() {
+            if last.role == PmRole::Assistant && last.turn_id == Some(turn_id) {
+                return self.pm_turns.last_mut().unwrap();
+            }
+        }
+        self.pm_turns.push(PmTurn {
+            turn_id: Some(turn_id),
+            role: PmRole::Assistant,
+            blocks: Vec::new(),
+        });
+        if self.pm_turns.len() > PM_TURN_CAP {
+            let drop = self.pm_turns.len() - PM_TURN_CAP;
+            self.pm_turns.drain(0..drop);
+        }
+        self.pm_turns.last_mut().unwrap()
+    }
+
+    fn pm_append_assistant_text(&mut self, turn_id: AgentTurnId, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let turn = self.pm_assistant_turn_mut(turn_id);
+        if let Some(PmBlock::Text(buf)) = turn.blocks.last_mut() {
+            buf.push_str(delta);
+        } else {
+            turn.blocks.push(PmBlock::Text(delta.to_string()));
+        }
+    }
+
+    fn pm_append_thinking(&mut self, turn_id: AgentTurnId, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let turn = self.pm_assistant_turn_mut(turn_id);
+        if let Some(PmBlock::Thinking { content, .. }) = turn.blocks.last_mut() {
+            content.push_str(delta);
+        } else {
+            turn.blocks.push(PmBlock::Thinking {
+                content: delta.to_string(),
+                expanded: false,
+            });
+        }
+    }
+
+    fn pm_push_tool_started(
+        &mut self,
+        turn_id: AgentTurnId,
+        call_id: String,
+        name: String,
+        args_preview: String,
+    ) {
+        let turn = self.pm_assistant_turn_mut(turn_id);
+        turn.blocks.push(PmBlock::ToolCall {
+            call_id,
+            name,
+            args_preview,
+            output: String::new(),
+            status: ToolStatus::Running,
+            expanded: false,
+        });
+    }
+
+    fn pm_append_tool_chunk(&mut self, turn_id: AgentTurnId, call_id: &str, chunk: &str) {
+        let turn = self.pm_assistant_turn_mut(turn_id);
+        for block in turn.blocks.iter_mut().rev() {
+            if let PmBlock::ToolCall {
+                call_id: id,
+                output,
+                ..
+            } = block
+            {
+                if id == call_id {
+                    output.push_str(chunk);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn pm_finish_tool(&mut self, turn_id: AgentTurnId, call_id: &str, ok: bool, final_output: &str) {
+        let turn = self.pm_assistant_turn_mut(turn_id);
+        for block in turn.blocks.iter_mut().rev() {
+            if let PmBlock::ToolCall {
+                call_id: id,
+                output,
+                status,
+                ..
+            } = block
+            {
+                if id == call_id {
+                    if output.is_empty() && !final_output.is_empty() {
+                        output.push_str(final_output);
+                    }
+                    *status = if ok { ToolStatus::Ok } else { ToolStatus::Err };
+                    return;
+                }
+            }
+        }
+    }
+
+    fn pm_collapsible_blocks(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (ti, turn) in self.pm_turns.iter().enumerate() {
+            for (bi, block) in turn.blocks.iter().enumerate() {
+                if matches!(block, PmBlock::Thinking { .. } | PmBlock::ToolCall { .. }) {
+                    out.push((ti, bi));
+                }
+            }
+        }
+        out
+    }
+
+    fn pm_focus_next(&mut self, delta: isize) {
+        let blocks = self.pm_collapsible_blocks();
+        if blocks.is_empty() {
+            self.pm_focused_block = None;
+            return;
+        }
+        let idx = match self.pm_focused_block {
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    blocks.len() - 1
+                }
+            }
+            Some(cur) => {
+                let pos = blocks.iter().position(|b| *b == cur).unwrap_or(0) as isize;
+                let next = (pos + delta).rem_euclid(blocks.len() as isize);
+                next as usize
+            }
+        };
+        self.pm_focused_block = Some(blocks[idx]);
+    }
+
+    fn pm_toggle_focused(&mut self) {
+        let Some((ti, bi)) = self.pm_focused_block else {
+            return;
+        };
+        if let Some(turn) = self.pm_turns.get_mut(ti) {
+            if let Some(block) = turn.blocks.get_mut(bi) {
+                match block {
+                    PmBlock::Thinking { expanded, .. } => *expanded = !*expanded,
+                    PmBlock::ToolCall { expanded, .. } => *expanded = !*expanded,
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1567,7 +1790,8 @@ fn run_daemon(url: String) -> anyhow::Result<()> {
     );
 
     if let UiMode::Daemon(app) = &state.mode {
-        spawn_daemon_event_stream(app.url.clone(), action_tx);
+        spawn_daemon_event_stream(app.url.clone(), action_tx.clone());
+        spawn_daemon_agent_event_stream(app.url.clone(), action_tx);
     }
 
     let mut stdout = io::stdout();
@@ -1577,6 +1801,9 @@ fn run_daemon(url: String) -> anyhow::Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
+    terminal.clear().context("clear terminal")?;
+
+    splash::play(&mut terminal).ok();
     terminal.clear().context("clear terminal")?;
 
     daemon_refresh_all(&client, &mut state);
@@ -1599,6 +1826,11 @@ fn run_daemon(url: String) -> anyhow::Result<()> {
                     if !handle_daemon_action(&client, &mut state, action) {
                         break;
                     }
+                    // Force a redraw after every user-driven action so
+                    // input, scroll, and submit feel instant — no waiting
+                    // on the next poll cycle.
+                    terminal.draw(|frame| draw_state(frame, &state))?;
+                    state.mark_drawn();
                 }
             }
         }
@@ -1640,6 +1872,9 @@ fn run_mesh(cli: MeshCli) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear().context("clear terminal")?;
 
+    splash::play(&mut terminal).ok();
+    terminal.clear().context("clear terminal")?;
+
     loop {
         if state.draw_due() {
             terminal.draw(|frame| draw_state(frame, &state))?;
@@ -1678,9 +1913,12 @@ fn mesh_tick_due(state: &AppState) -> bool {
 }
 
 fn daemon_key_action(app: &DaemonApp, event: Event) -> Option<Action> {
+    let pm = app.active_room == WorkspaceRoom::PM;
     match event {
         Event::Paste(text) if !app.show_help => Some(Action::Paste(text)),
         Event::Mouse(mouse) if !app.show_help => match mouse.kind {
+            MouseEventKind::ScrollUp if pm => Some(Action::PmScrollUp(3)),
+            MouseEventKind::ScrollDown if pm => Some(Action::PmScrollDown(3)),
             MouseEventKind::ScrollUp => Some(Action::FocusPrev),
             MouseEventKind::ScrollDown => Some(Action::FocusNext),
             _ => None,
@@ -1707,19 +1945,41 @@ fn daemon_key_action(app: &DaemonApp, event: Event) -> Option<Action> {
                     _ => None,
                 };
             }
+
+            // Alt+arrow → block focus / toggle (PM-only); doesn't fight typing.
+            if pm && key.modifiers.contains(KeyModifiers::ALT) {
+                match key.code {
+                    KeyCode::Up => return Some(Action::PmFocusPrevBlock),
+                    KeyCode::Down => return Some(Action::PmFocusNextBlock),
+                    KeyCode::Char(' ') | KeyCode::Enter => return Some(Action::PmToggleBlock),
+                    _ => {}
+                }
+            }
+
             if let Some(room) = WorkspaceRoom::from_function_key(key.code) {
                 return Some(Action::SelectRoom(room));
             }
+
+            let has_focus = app.pm_focused_block.is_some();
 
             match key.code {
                 KeyCode::Tab => Some(Action::NextRoom),
                 KeyCode::BackTab => Some(Action::PrevRoom),
                 KeyCode::Left => Some(Action::PrevRoom),
                 KeyCode::Right => Some(Action::NextRoom),
+                KeyCode::PageUp if pm => Some(Action::PmScrollUp(10)),
+                KeyCode::PageDown if pm => Some(Action::PmScrollDown(10)),
                 KeyCode::PageUp => Some(Action::SessionPrev),
                 KeyCode::PageDown => Some(Action::SessionNext),
+                KeyCode::Up if pm => Some(Action::PmScrollUp(1)),
+                KeyCode::Down if pm => Some(Action::PmScrollDown(1)),
                 KeyCode::Up => Some(Action::FocusPrev),
                 KeyCode::Down => Some(Action::FocusNext),
+                KeyCode::Esc if pm && has_focus => Some(Action::PmClearFocus),
+                KeyCode::Esc if pm && app.pm_scroll > 0 => Some(Action::PmScrollHome),
+                KeyCode::Char(' ') if pm && has_focus && app.input.is_empty() => {
+                    Some(Action::PmToggleBlock)
+                }
                 KeyCode::Enter => Some(Action::SubmitComposer),
                 KeyCode::Backspace => Some(Action::Backspace),
                 KeyCode::Esc => None,
@@ -1823,6 +2083,19 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
         Action::StreamEvent(envelope) => daemon_apply_stream_event(app, envelope),
         Action::AgentTurnResponse(response) => daemon_apply_agent_turn_response(app, response),
         Action::AgentStreamEvent(event) => daemon_apply_agent_stream_event(app, event),
+        Action::PmFocusNextBlock => app.pm_focus_next(1),
+        Action::PmFocusPrevBlock => app.pm_focus_next(-1),
+        Action::PmToggleBlock => app.pm_toggle_focused(),
+        Action::PmClearFocus => app.pm_focused_block = None,
+        Action::PmScrollUp(n) => {
+            app.pm_scroll = app.pm_scroll.saturating_add(n);
+        }
+        Action::PmScrollDown(n) => {
+            app.pm_scroll = app.pm_scroll.saturating_sub(n);
+        }
+        Action::PmScrollHome => {
+            app.pm_scroll = 0;
+        }
         _ => {}
     }
     state.dirty = true;
@@ -2011,6 +2284,7 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
     app.push_transcript(format!("You: {instruction}"));
 
     if app.active_room == WorkspaceRoom::PM {
+        app.pm_push_user_prompt(instruction.clone());
         let action_tx = state.action_tx.clone();
         let url = app.url.clone();
         let request = AgentTurnRequest {
@@ -2339,7 +2613,12 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
         AgentTurnEvent::AssistantTextDelta { turn_id, delta } => {
             app.active_agent_turn_id = Some(turn_id);
             app.append_agent_assistant_delta(turn_id, &delta);
+            app.pm_append_assistant_text(turn_id, &delta);
             app.capture_diff_excerpt(&delta);
+        }
+        AgentTurnEvent::ThinkingDelta { turn_id, delta } => {
+            app.active_agent_turn_id = Some(turn_id);
+            app.pm_append_thinking(turn_id, &delta);
         }
         AgentTurnEvent::ToolCallStarted { turn_id, call } => {
             app.active_agent_turn_id = Some(turn_id);
@@ -2356,6 +2635,12 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 call.name,
                 compact_text(&args_text, 96)
             ));
+            app.pm_push_tool_started(
+                turn_id,
+                call.id.0.to_string(),
+                call.name.clone(),
+                compact_text(&args_text, 60),
+            );
             app.capture_diff_excerpt(&args_text);
         }
         AgentTurnEvent::ToolCallChunk {
@@ -2375,6 +2660,7 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 short_id(&call_id),
                 compact_text(&chunk, 120)
             ));
+            app.pm_append_tool_chunk(turn_id, &call_id.0.to_string(), &chunk);
             app.capture_diff_excerpt(&chunk);
         }
         AgentTurnEvent::ToolCallFinished {
@@ -2395,6 +2681,7 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 if result.ok { "done" } else { "failed" },
                 compact_text(&result.output, 120)
             ));
+            app.pm_finish_tool(turn_id, &call_id.0.to_string(), result.ok, &result.output);
             app.capture_diff_excerpt(&result.output);
         }
         AgentTurnEvent::TurnFinished {
@@ -2732,6 +3019,113 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
     });
 }
 
+/// Subscribe to the daemon's full-fidelity `/v1/agent/events` SSE stream
+/// (assistant text deltas, thinking deltas, tool call started/chunk/finished)
+/// and ship each event to the action channel for real-time PM rendering.
+fn spawn_daemon_agent_event_stream(url: String, tx: mpsc::Sender<Action>) {
+    thread::spawn(move || {
+        let client = match reqwest::blocking::Client::builder().build() {
+            Ok(client) => client,
+            Err(err) => {
+                let _ = tx.send(Action::StreamStatus(format!(
+                    "agent stream client error: {}",
+                    compact_text(&err.to_string(), 72)
+                )));
+                return;
+            }
+        };
+
+        let events_url = format!("{}/v1/agent/events", url.trim_end_matches('/'));
+
+        loop {
+            let response = match client
+                .get(&events_url)
+                .header("Accept", "text/event-stream")
+                .send()
+                .and_then(|res| res.error_for_status())
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    if tx
+                        .send(Action::StreamStatus(format!(
+                            "agent stream reconnecting: {}",
+                            compact_text(&err.to_string(), 72)
+                        )))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            let mut reader = BufReader::new(response);
+            let mut line = String::new();
+            let mut event_name = String::new();
+            let mut data_lines: Vec<String> = Vec::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        if trimmed.is_empty() {
+                            if !data_lines.is_empty() {
+                                let payload = data_lines.join("\n");
+                                match parse_agent_turn_event(&payload) {
+                                    Ok(Some(event)) => {
+                                        if tx.send(Action::AgentStreamEvent(event)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        let label = if event_name.is_empty() {
+                                            "agent stream parse error".to_string()
+                                        } else {
+                                            format!("agent stream parse error ({event_name})")
+                                        };
+                                        if tx
+                                            .send(Action::StreamStatus(format!(
+                                                "{label}: {}",
+                                                compact_text(&err, 72)
+                                            )))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                data_lines.clear();
+                                event_name.clear();
+                            }
+                            continue;
+                        }
+
+                        if trimmed.starts_with(':') {
+                            continue;
+                        }
+
+                        if let Some(rest) = trimmed.strip_prefix("event:") {
+                            event_name = rest.trim().to_string();
+                            continue;
+                        }
+
+                        if let Some(rest) = trimmed.strip_prefix("data:") {
+                            data_lines.push(rest.trim_start().to_string());
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
 fn parse_event_envelope(payload: &str) -> Result<Option<EventEnvelope>, String> {
     match serde_json::from_str::<EventEnvelope>(payload) {
         Ok(event) => Ok(Some(event)),
@@ -2790,6 +3184,11 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
         ),
         AgentTurnEvent::AssistantTextDelta { turn_id, delta } => format!(
             "agent assistant_delta [{}]: {}",
+            short_id(turn_id),
+            compact_text(delta, 72)
+        ),
+        AgentTurnEvent::ThinkingDelta { turn_id, delta } => format!(
+            "agent thinking_delta [{}]: {}",
             short_id(turn_id),
             compact_text(delta, 72)
         ),
@@ -3306,13 +3705,43 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         ])
         .split(inner);
 
+    let transcript_area = layout[0];
+    // Inset 2 cols on each side for breathing room.
+    let inset = ratatui::layout::Rect {
+        x: transcript_area.x + 2,
+        y: transcript_area.y,
+        width: transcript_area.width.saturating_sub(4),
+        height: transcript_area.height,
+    };
+    let lines = pm_block_lines(app);
+    let visible_height = inset.height as usize;
+    let wrap_width = inset.width.max(1) as usize;
+    // Count how many rendered rows each Line takes given current wrap width.
+    let row_counts: Vec<usize> = lines
+        .iter()
+        .map(|l| line_visual_rows(l, wrap_width))
+        .collect();
+    let total_rows: usize = row_counts.iter().sum();
+    // Rows we want to skip from the top to keep the latest content visible,
+    // honouring pm_scroll (rows from the bottom).
+    let target_skip_rows = total_rows
+        .saturating_sub(visible_height)
+        .saturating_sub(app.pm_scroll);
+    let mut skip_lines = 0usize;
+    let mut acc = 0usize;
+    for (i, rows) in row_counts.iter().enumerate() {
+        if acc + rows > target_skip_rows {
+            skip_lines = i;
+            break;
+        }
+        acc += rows;
+        skip_lines = i + 1;
+    }
+    let rendered: Vec<Line<'static>> = lines.into_iter().skip(skip_lines).collect();
+
     frame.render_widget(
-        Paragraph::new(app.transcript_lines(
-            layout[0].width.saturating_sub(2) as usize,
-            layout[0].height as usize,
-        ))
-        .wrap(Wrap { trim: false }),
-        layout[0],
+        Paragraph::new(rendered).wrap(Wrap { trim: false }),
+        inset,
     );
 
     let separator = "─".repeat(layout[1].width as usize);
@@ -3328,6 +3757,390 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         Paragraph::new(pm_agent_input_lines(app, input_height as usize)).wrap(Wrap { trim: false }),
         layout[2],
     );
+}
+
+/// Render an assistant text block as styled `Line`s using a small markdown
+/// parser. Supports bold, italic, inline code, headings, bullet/numbered
+/// lists, blockquotes, and fenced code blocks. Falls back gracefully on
+/// partial / in-progress streams (incomplete tokens render as raw text).
+fn render_markdown_lines(src: &str, indent: &'static str) -> Vec<Line<'static>> {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::White)];
+    let mut list_stack: Vec<Option<u64>> = Vec::new(); // None = bullet, Some(n) = ordered
+    let mut in_code_block = false;
+    let mut list_item_pending_marker = false;
+
+    let push_line = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
+        if current.is_empty() {
+            lines.push(Line::from(indent));
+        } else {
+            let mut spans = vec![Span::raw(indent)];
+            spans.append(current);
+            lines.push(Line::from(spans));
+        }
+    };
+
+    let cur_style = |stack: &Vec<Style>| *stack.last().unwrap_or(&Style::default());
+
+    let parser = Parser::new_ext(src, Options::ENABLE_STRIKETHROUGH);
+    for ev in parser {
+        match ev {
+            Event::Start(Tag::Strong) => {
+                let mut s = cur_style(&style_stack);
+                s = s.add_modifier(Modifier::BOLD);
+                style_stack.push(s);
+            }
+            Event::End(TagEnd::Strong) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+            }
+            Event::Start(Tag::Emphasis) => {
+                let mut s = cur_style(&style_stack);
+                s = s.add_modifier(Modifier::ITALIC);
+                style_stack.push(s);
+            }
+            Event::End(TagEnd::Emphasis) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+            }
+            Event::Start(Tag::Strikethrough) => {
+                let mut s = cur_style(&style_stack);
+                s = s.add_modifier(Modifier::CROSSED_OUT);
+                style_stack.push(s);
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+            }
+            Event::Start(Tag::Heading { level, .. }) => {
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+                let prefix = match level {
+                    HeadingLevel::H1 => "█ ",
+                    HeadingLevel::H2 => "▌ ",
+                    _ => "› ",
+                };
+                current.push(Span::styled(
+                    prefix,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+                let mut s = Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD);
+                if matches!(level, HeadingLevel::H1) {
+                    s = s.add_modifier(Modifier::UNDERLINED);
+                }
+                style_stack.push(s);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+                push_line(&mut lines, &mut current);
+            }
+            Event::Start(Tag::Paragraph) => {
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                push_line(&mut lines, &mut current);
+            }
+            Event::Start(Tag::List(start)) => {
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+                list_stack.push(start);
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_stack.pop();
+            }
+            Event::Start(Tag::Item) => {
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+                list_item_pending_marker = true;
+                let depth = list_stack.len().saturating_sub(1);
+                let depth_pad = "  ".repeat(depth);
+                if let Some(Some(n)) = list_stack.last_mut() {
+                    current.push(Span::raw(depth_pad));
+                    current.push(Span::styled(
+                        format!("{n}. "),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                    *n += 1;
+                } else {
+                    current.push(Span::raw(depth_pad));
+                    current.push(Span::styled("• ", Style::default().fg(Color::Cyan)));
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                push_line(&mut lines, &mut current);
+                list_item_pending_marker = false;
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+                current.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+                let mut s = cur_style(&style_stack);
+                s = s.add_modifier(Modifier::ITALIC);
+                style_stack.push(s);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+                push_line(&mut lines, &mut current);
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+                in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+            }
+            Event::Code(text) => {
+                current.push(Span::styled(
+                    text.into_string(),
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .bg(Color::Reset)
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+            Event::Text(text) => {
+                if in_code_block {
+                    for raw in text.lines() {
+                        let mut spans = vec![
+                            Span::raw(indent),
+                            Span::styled(
+                                "  ".to_string(),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                raw.to_string(),
+                                Style::default().fg(Color::LightYellow),
+                            ),
+                        ];
+                        if !current.is_empty() {
+                            current.append(&mut Vec::new());
+                        }
+                        lines.push(Line::from(std::mem::take(&mut spans)));
+                    }
+                    if text.ends_with('\n') {
+                        // no-op, already line-broken
+                    }
+                    let _ = list_item_pending_marker;
+                } else {
+                    let style = cur_style(&style_stack);
+                    current.push(Span::styled(text.into_string(), style));
+                }
+            }
+            Event::SoftBreak => {
+                current.push(Span::raw(" "));
+            }
+            Event::HardBreak => {
+                push_line(&mut lines, &mut current);
+            }
+            Event::Rule => {
+                if !current.is_empty() {
+                    push_line(&mut lines, &mut current);
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", indent, "─".repeat(40)),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            _ => {}
+        }
+    }
+    if !current.is_empty() {
+        push_line(&mut lines, &mut current);
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(indent));
+    }
+    lines
+}
+
+/// Estimate how many on-screen rows a `Line` occupies when wrapped to
+/// `width` columns. This is a unicode-width-aware best-effort that matches
+/// how ratatui's `Paragraph` with `Wrap { trim: false }` will lay it out
+/// for typical chat content (no tabs, no zero-width glyphs).
+fn line_visual_rows(line: &Line<'_>, width: usize) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    if width == 0 {
+        return 1;
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let cells = UnicodeWidthStr::width(text.as_str());
+    if cells == 0 {
+        1
+    } else {
+        cells.div_ceil(width)
+    }
+}
+
+fn pm_block_lines(app: &DaemonApp) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.pm_turns.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "message Ocean to begin — answers stream in real time",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    }
+
+    for (ti, turn) in app.pm_turns.iter().enumerate() {
+        match turn.role {
+            PmRole::User => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "you ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("▸", Style::default().fg(Color::DarkGray)),
+                ]));
+                for block in &turn.blocks {
+                    if let PmBlock::Text(text) = block {
+                        for line in text.lines() {
+                            lines.push(Line::from(vec![
+                                Span::raw("  "),
+                                Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                            ]));
+                        }
+                    }
+                }
+                lines.push(Line::from(""));
+            }
+            PmRole::Assistant => {
+                for (bi, block) in turn.blocks.iter().enumerate() {
+                    let focused = app.pm_focused_block == Some((ti, bi));
+                    render_pm_block(&mut lines, block, focused);
+                }
+                lines.push(Line::from(""));
+            }
+        }
+    }
+
+    lines
+}
+
+fn render_pm_block(lines: &mut Vec<Line<'static>>, block: &PmBlock, focused: bool) {
+    let focus_style = |base: Style| {
+        if focused {
+            base.add_modifier(Modifier::REVERSED)
+        } else {
+            base
+        }
+    };
+
+    match block {
+        PmBlock::Text(text) => {
+            // Header row.
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "ocean ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▸", Style::default().fg(Color::DarkGray)),
+            ]));
+            if text.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("▏", Style::default().fg(Color::DarkGray)),
+                ]));
+            } else {
+                let md_lines = render_markdown_lines(text, "  ");
+                lines.extend(md_lines);
+            }
+        }
+        PmBlock::Thinking { content, expanded } => {
+            let arrow = if *expanded { "▾" } else { "▸" };
+            let header = format!(
+                "  {} thinking… ({} chars)",
+                arrow,
+                content.chars().count()
+            );
+            lines.push(Line::from(Span::styled(
+                header,
+                focus_style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            )));
+            if *expanded {
+                for line in content.lines() {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                }
+            }
+        }
+        PmBlock::ToolCall {
+            name,
+            args_preview,
+            output,
+            status,
+            expanded,
+            ..
+        } => {
+            let arrow = if *expanded { "▾" } else { "▸" };
+            let (status_label, status_color) = match status {
+                ToolStatus::Running => ("running", Color::Yellow),
+                ToolStatus::Ok => ("done", Color::Green),
+                ToolStatus::Err => ("error", Color::Red),
+            };
+            let header_text = format!(
+                "  {} tool · {}({}) · {}",
+                arrow, name, args_preview, status_label
+            );
+            lines.push(Line::from(Span::styled(
+                header_text,
+                focus_style(Style::default().fg(status_color)),
+            )));
+            if *expanded {
+                if output.trim().is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "    (no output yet)".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    for line in output.lines().take(40) {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                    let extra = output.lines().count().saturating_sub(40);
+                    if extra > 0 {
+                        lines.push(Line::from(Span::styled(
+                            format!("    … {} more lines", extra),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn pm_agent_input_lines(app: &DaemonApp, height: usize) -> Vec<Line<'static>> {
@@ -3354,8 +4167,12 @@ fn pm_agent_input_lines(app: &DaemonApp, height: usize) -> Vec<Line<'static>> {
             ])
         })
         .collect();
+    let next_room = app.active_room.next().label();
     lines.push(Line::from(Span::styled(
-        "Enter send · ↑/↓ scroll · Ctrl-Q quit",
+        format!(
+            "Enter send · ↑/↓/wheel scroll · Alt+↑/↓ focus block · Space expand · Tab → {} · Ctrl-Q quit",
+            next_room
+        ),
         Style::default().fg(Color::DarkGray),
     )));
     lines
@@ -4476,6 +5293,36 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn md_render_probe_bold_and_lists() {
+        let src = "Hello **bold world** and *italic*.\n\n1. first **item**\n2. second\n\n### Heading\n\nplain";
+        let out = render_markdown_lines(src, "  ");
+        let dump: Vec<String> = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| {
+                        let bold = s.style.add_modifier.contains(Modifier::BOLD);
+                        if bold {
+                            format!("[B:{}]", s.content)
+                        } else {
+                            s.content.to_string()
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        eprintln!("MD_RENDER_OUT:\n{}", dump.join("\n"));
+        // Make sure bold is detected
+        let any_bold = out.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        });
+        assert!(any_bold, "no bold spans emitted from markdown");
+    }
 
     #[test]
     fn summarize_event_includes_request_prefix() {

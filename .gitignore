@@ -21,3 +21,6 @@ gateway-nudges-*.md
 .vscode/
 .idea/
 *.swp
+
+# Local Claude Code session state (per-developer)
+.claude/

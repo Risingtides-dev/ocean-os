@@ -276,6 +276,10 @@ pub enum AgentTurnEvent {
     },
     /// Incremental assistant text delta.  Clients append to their output buffer.
     AssistantTextDelta { turn_id: AgentTurnId, delta: String },
+    /// Incremental assistant thinking delta (extended-thinking models only).
+    /// Clients should display this in a separate, collapsed surface from the
+    /// main assistant text — it is not part of the public turn output.
+    ThinkingDelta { turn_id: AgentTurnId, delta: String },
     /// A tool call has been dispatched.
     ToolCallStarted {
         turn_id: AgentTurnId,

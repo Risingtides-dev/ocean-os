@@ -25,7 +25,9 @@ use ocean_core::{
     RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, SessionDetail,
     SessionId, SessionResponse, SessionRunState,
 };
-use ocean_runtime::{PermissionDecision as AgentPermissionDecision, PermissionPolicy};
+use ocean_runtime::{
+    AgentEvent, PermissionDecision as AgentPermissionDecision, PermissionPolicy,
+};
 use serde_json::{json, Value};
 use tokio::{
     sync::{broadcast, oneshot, RwLock},
@@ -45,6 +47,7 @@ use tower_http::{
 struct AppState {
     runtime: Arc<AgentRuntime>,
     events: EventBus,
+    agent_events: AgentEventBus,
     requests: RequestRegistry,
     permissions: PermissionRegistry,
 }
@@ -93,6 +96,39 @@ impl EventBus {
     }
 }
 
+/// Parallel broadcast bus that carries `AgentTurnEvent`s with full fidelity
+/// (turn_id, call_id, thinking deltas, tool chunks). The legacy `OceanEvent`
+/// bus still ships, but `/v1/agent/events` subscribes here so the TUI can
+/// render real-time streaming output without the lossy round-trip.
+#[derive(Clone)]
+struct AgentEventBus {
+    tx: broadcast::Sender<AgentEventEnvelope>,
+}
+
+#[derive(Clone)]
+struct AgentEventEnvelope {
+    id: Uuid,
+    event: AgentTurnEvent,
+}
+
+impl AgentEventBus {
+    fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<AgentEventEnvelope> {
+        self.tx.subscribe()
+    }
+
+    fn emit(&self, event: AgentTurnEvent) {
+        let _ = self.tx.send(AgentEventEnvelope {
+            id: Uuid::new_v4(),
+            event,
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -106,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         runtime: Arc::new(AgentRuntime::from_env()?),
         events: EventBus::new(1024),
+        agent_events: AgentEventBus::new(1024),
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
     };
@@ -869,6 +906,7 @@ async fn agent_turn(
     if req.session_id.is_none() {
         emit_agent(
             &state.events,
+            &state.agent_events,
             session_id,
             AgentTurnEvent::SessionCreated {
                 session_id,
@@ -881,6 +919,7 @@ async fn agent_turn(
     // Emit turn_started
     emit_agent(
         &state.events,
+        &state.agent_events,
         session_id,
         AgentTurnEvent::TurnStarted {
             turn_id,
@@ -898,8 +937,91 @@ async fn agent_turn(
         cwd: req.cwd.clone(),
     };
 
-    let control = PromptControl::yolo(true);
+    // Wire up the runtime → bus streaming bridge. Every TextDelta /
+    // ThinkingDelta / ToolExecution* event the agent emits gets forwarded
+    // onto the AgentEventBus in real time so SSE clients render as it streams.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let bridge_bus = state.agent_events.clone();
+    let bridge_turn_id = turn_id;
+    let bridge = tokio::spawn(async move {
+        let mut tool_call_ids: HashMap<String, ToolCallId> = HashMap::new();
+        while let Some(ev) = event_rx.recv().await {
+            match ev {
+                AgentEvent::TextDelta { delta } => {
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    bridge_bus.emit(AgentTurnEvent::AssistantTextDelta {
+                        turn_id: bridge_turn_id,
+                        delta,
+                    });
+                }
+                AgentEvent::ThinkingDelta { delta } => {
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    bridge_bus.emit(AgentTurnEvent::ThinkingDelta {
+                        turn_id: bridge_turn_id,
+                        delta,
+                    });
+                }
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id,
+                    tool_name,
+                    args,
+                } => {
+                    let call_id = ToolCallId(Uuid::new_v4());
+                    tool_call_ids.insert(tool_call_id, call_id.clone());
+                    bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
+                        turn_id: bridge_turn_id,
+                        call: ToolCall {
+                            id: call_id,
+                            name: tool_name,
+                            args_json: args,
+                        },
+                    });
+                }
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id,
+                    tool_name: _,
+                    is_error,
+                    content,
+                } => {
+                    let call_id = tool_call_ids
+                        .remove(&tool_call_id)
+                        .unwrap_or_else(|| ToolCallId(Uuid::new_v4()));
+                    let output = render_tool_output(&content);
+                    bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
+                        turn_id: bridge_turn_id,
+                        call_id,
+                        result: ToolResult {
+                            ok: !is_error,
+                            output,
+                            metadata_json: None,
+                        },
+                    });
+                }
+                AgentEvent::PermissionDenied { tool_name, reason } => {
+                    let call_id = ToolCallId(Uuid::new_v4());
+                    bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
+                        turn_id: bridge_turn_id,
+                        call_id,
+                        result: ToolResult {
+                            ok: false,
+                            output: format!("permission denied for {tool_name}: {reason}"),
+                            metadata_json: None,
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let control = PromptControl::yolo(true).with_event_sink(event_tx);
     let res = state.runtime.prompt(prompt_req, control).await;
+    // Wait for the bridge to drain (the sender has been dropped by now).
+    let _ = bridge.await;
     let output_tokens = estimate_visible_tokens(&res.stdout);
     let tokens_per_second = if res.wall_ms > 0 {
         Some((output_tokens as f64) / (res.wall_ms as f64 / 1000.0))
@@ -916,19 +1038,12 @@ async fn agent_turn(
         "agent turn finished"
     );
 
+    // NOTE: assistant text already streamed delta-by-delta through the bridge,
+    // so we do NOT re-emit res.stdout here. Just close out the turn.
     if res.ok {
-        if !res.stdout.trim().is_empty() {
-            emit_agent(
-                &state.events,
-                session_id,
-                AgentTurnEvent::AssistantTextDelta {
-                    turn_id,
-                    delta: res.stdout.clone(),
-                },
-            );
-        }
         emit_agent(
             &state.events,
+            &state.agent_events,
             session_id,
             AgentTurnEvent::TurnFinished {
                 turn_id,
@@ -942,6 +1057,7 @@ async fn agent_turn(
     } else {
         emit_agent(
             &state.events,
+            &state.agent_events,
             session_id,
             AgentTurnEvent::TurnFinished {
                 turn_id,
@@ -974,25 +1090,23 @@ async fn agent_turn(
 async fn agent_events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|event| match event {
-        Ok(envelope) => {
-            if let Some(agent_event) = ocean_to_agent_event(envelope.event) {
+    let stream =
+        BroadcastStream::new(state.agent_events.subscribe()).filter_map(|event| match event {
+            Ok(envelope) => {
                 let id = envelope.id.to_string();
-                let event_type = agent_event_type_name(&agent_event);
-                let data = serde_json::to_string(&agent_event).unwrap_or_else(|_| {
+                let event_type = agent_event_type_name(&envelope.event);
+                let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
                     r#"{"type":"error","message":"serialize failed"}"#.to_string()
                 });
                 Some(Ok(Event::default().id(id).event(event_type).data(data)))
-            } else {
-                None
             }
-        }
-        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-            let data = json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
-                .to_string();
-            Some(Ok(Event::default().event("error").data(data)))
-        }
-    });
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                let data =
+                    json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
+                        .to_string();
+                Some(Ok(Event::default().event("error").data(data)))
+            }
+        });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -1068,7 +1182,15 @@ fn estimate_visible_tokens(text: &str) -> u64 {
     text.split_whitespace().count() as u64
 }
 
-fn emit_agent(events: &EventBus, session_id: AgentSessionId, event: AgentTurnEvent) {
+fn emit_agent(
+    events: &EventBus,
+    agent_events: &AgentEventBus,
+    session_id: AgentSessionId,
+    event: AgentTurnEvent,
+) {
+    // Always publish on the AgentEventBus (full fidelity for SSE consumers).
+    agent_events.emit(event.clone());
+    // Legacy OceanEvent bus mirror for any subscriber still on it.
     if let Some(inner) = agent_to_ocean_event(event) {
         let mut env = EventEnvelope::new(inner);
         env.session_id = Some(core_sid(session_id));
@@ -1085,6 +1207,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
         AgentTurnEvent::AssistantTextDelta { turn_id: _, delta } => {
             Some(OceanEvent::AssistantDelta { text: delta })
         }
+        AgentTurnEvent::ThinkingDelta { .. } => None,
         AgentTurnEvent::ToolCallStarted { turn_id: _, call } => Some(OceanEvent::ToolStarted {
             tool: call.name,
             args: call.args_json,
@@ -1192,6 +1315,7 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
     match event {
         AgentTurnEvent::TurnStarted { .. } => "turn_started",
         AgentTurnEvent::AssistantTextDelta { .. } => "assistant_text_delta",
+        AgentTurnEvent::ThinkingDelta { .. } => "thinking_delta",
         AgentTurnEvent::ToolCallStarted { .. } => "tool_call_started",
         AgentTurnEvent::ToolCallChunk { .. } => "tool_call_chunk",
         AgentTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
@@ -1202,6 +1326,35 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
             payload: _,
         } => "extension",
     }
+}
+
+fn render_tool_output(content: &[ocean_protocol::Content]) -> String {
+    use ocean_protocol::Content;
+    let mut out = String::new();
+    for c in content {
+        match c {
+            Content::Text { text } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            Content::Thinking { thinking, .. } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(thinking);
+            }
+            Content::Image { .. } => {}
+            Content::ToolCall { name, arguments, .. } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("→ {name}({arguments})"));
+            }
+        }
+    }
+    out
 }
 
 fn emit(
