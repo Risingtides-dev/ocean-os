@@ -36,7 +36,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Terminal,
 };
 use serde::Deserialize;
@@ -348,6 +348,10 @@ struct DaemonApp {
     pm_focused_block: Option<(usize, usize)>,
     show_all_sessions: bool,
     pending_model_swap: Option<String>,
+    /// When true, new thinking blocks render fully expanded as they stream.
+    /// When false (default), they show the one-line "▸ thinking… (N chars)"
+    /// pill and can be expanded manually via Alt+arrow + Space.
+    pm_thinking_default_expanded: bool,
     tool_timeline: Vec<ToolTimelineEntry>,
     diff_snippets: Vec<String>,
     support: WorkspaceSupportState,
@@ -387,6 +391,7 @@ impl DaemonApp {
             pm_focused_block: None,
             show_all_sessions: false,
             pending_model_swap: None,
+            pm_thinking_default_expanded: false,
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
             support: WorkspaceSupportState::default(),
@@ -529,13 +534,14 @@ impl DaemonApp {
         if delta.is_empty() {
             return;
         }
+        let default_expanded = self.pm_thinking_default_expanded;
         let turn = self.pm_assistant_turn_mut(turn_id);
         if let Some(PmBlock::Thinking { content, .. }) = turn.blocks.last_mut() {
             content.push_str(delta);
         } else {
             turn.blocks.push(PmBlock::Thinking {
                 content: delta.to_string(),
-                expanded: false,
+                expanded: default_expanded,
             });
         }
     }
@@ -2676,6 +2682,29 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
         },
     },
     SlashCommandDef {
+        names: &["/thinking"],
+        help: "Toggle full-thinking render. /thinking on|off, or no arg to toggle.",
+        execute: |app, args| {
+            let next = match args.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+                Some("on" | "1" | "true" | "expand" | "expanded") => true,
+                Some("off" | "0" | "false" | "collapse" | "collapsed") => false,
+                _ => !app.pm_thinking_default_expanded,
+            };
+            app.pm_thinking_default_expanded = next;
+            // Apply to already-rendered thinking blocks so the toggle feels live.
+            for turn in app.pm_turns.iter_mut() {
+                for block in turn.blocks.iter_mut() {
+                    if let PmBlock::Thinking { expanded, .. } = block {
+                        *expanded = next;
+                    }
+                }
+            }
+            let label = if next { "on (full stream)" } else { "off (collapsed pill)" };
+            app.push_transcript(format!("Ocean: thinking render → {label}"));
+            app.status = format!("thinking render: {label}");
+        },
+    },
+    SlashCommandDef {
         names: &["/refresh", "/r"],
         help: "Trigger a full daemon refresh (health, sessions, requests, permissions)",
         execute: |app, _args| {
@@ -3931,6 +3960,10 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     }
     let rendered: Vec<Line<'static>> = lines.into_iter().skip(skip_lines).collect();
 
+    // Wipe the transcript region before drawing so cells from a previous
+    // (taller) frame — e.g. an expanded tool block that just collapsed —
+    // don't leave residue on screen.
+    frame.render_widget(Clear, transcript_area);
     frame.render_widget(
         Paragraph::new(rendered).wrap(Wrap { trim: false }),
         inset,
