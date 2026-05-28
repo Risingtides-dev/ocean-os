@@ -2385,16 +2385,26 @@ fn handle_slash_command(app: &mut DaemonApp, instruction: &str) -> bool {
         None => (trimmed, None),
     };
 
+    let in_pm = app.active_room == WorkspaceRoom::PM;
+    let before = app.transcript.len();
+
     // Try each registered command
     for command in SLASH_COMMANDS {
         if command.names.contains(&cmd) {
+            if in_pm {
+                app.pm_push_user_prompt(instruction.to_string());
+            }
             app.push_transcript(format!("You: {instruction}"));
             (command.execute)(app, args);
+            mirror_slash_output_to_pm(app, in_pm, before);
             return true;
         }
     }
 
     // Unknown command — show available ones
+    if in_pm {
+        app.pm_push_user_prompt(instruction.to_string());
+    }
     app.push_transcript(format!("You: {instruction}"));
     let available = SLASH_COMMANDS
         .iter()
@@ -2403,8 +2413,48 @@ fn handle_slash_command(app: &mut DaemonApp, instruction: &str) -> bool {
         .collect::<Vec<_>>()
         .join("\n");
     app.push_transcript(format!("Ocean: unknown command. Available:\n{available}"));
+    mirror_slash_output_to_pm(app, in_pm, before);
     app.status = format!("unknown command {cmd}");
     true
+}
+
+/// After a slash command runs, mirror anything it pushed onto the legacy
+/// transcript into pm_turns so F1 PM actually shows it. Strips the leading
+/// `You: …` echo (we already added the user prompt via pm_push_user_prompt).
+fn mirror_slash_output_to_pm(app: &mut DaemonApp, in_pm: bool, before: usize) {
+    if !in_pm {
+        return;
+    }
+    if app.transcript.len() <= before {
+        return;
+    }
+    let new_lines: Vec<String> = app
+        .transcript
+        .iter()
+        .skip(before)
+        .filter(|line| !line.starts_with("You: "))
+        .cloned()
+        .collect();
+    if new_lines.is_empty() {
+        return;
+    }
+    // Strip the "Ocean: " prefix so the rendered "ocean ▸" header isn't
+    // doubled up, and join multi-line output into one assistant text block.
+    let body: String = new_lines
+        .iter()
+        .map(|l| l.strip_prefix("Ocean: ").unwrap_or(l.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.pm_turns.push(PmTurn {
+        turn_id: None,
+        role: PmRole::Assistant,
+        blocks: vec![PmBlock::Text(body)],
+    });
+    if app.pm_turns.len() > PM_TURN_CAP {
+        let drop = app.pm_turns.len() - PM_TURN_CAP;
+        app.pm_turns.drain(0..drop);
+    }
+    app.pm_scroll = 0;
 }
 
 struct SlashCommandDef {

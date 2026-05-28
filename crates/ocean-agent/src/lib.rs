@@ -27,10 +27,8 @@ const APP_NAME: &str = "ocean-rs";
 
 /// Native Ocean agent runtime.
 ///
-/// This is the first extraction of the old `pi-rs-deepseek` bootstrap path into
-/// daemon-owned Rust code. It intentionally uses the small `pi-agent`/`pi-ai`
-/// crates as reference/runtime components for now, while Ocean owns config,
-/// sessions, permissions, protocol mapping, and the long-running daemon shape.
+/// Daemon-owned wrapper around `ocean-runtime` that adds Ocean's session,
+/// history, config, and permission layers on top of the underlying agent loop.
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     config_dir: PathBuf,
@@ -378,7 +376,7 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
             "claude-opus-4-7" => Model::anthropic_claude_opus_4_7(),
             _ => {
                 anyhow::bail!(
-                    "unsupported anthropic model '{}' in temporary pi-ai adapter",
+                    "unsupported anthropic model '{}'",
                     selection.model
                 );
             }
@@ -521,10 +519,9 @@ mod session {
         }
     }
 
-    /// Encode a workspace path as a filesystem-safe slug. Mirrors the
-    /// Claude Code / pi-agent convention: leading slash dropped, remaining
-    /// slashes turned into dashes, then prefixed with a leading dash so
-    /// directory listings sort intuitively.
+    /// Encode a workspace path as a filesystem-safe slug. Leading slash
+    /// dropped, remaining slashes turned into dashes, then prefixed with a
+    /// leading dash so directory listings sort intuitively.
     pub fn workspace_slug(root: &Path) -> String {
         let s = root.to_string_lossy();
         let trimmed = s.trim_start_matches('/');
