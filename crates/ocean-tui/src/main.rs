@@ -4029,6 +4029,23 @@ fn pm_block_lines(app: &DaemonApp) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
             }
             PmRole::Assistant => {
+                // One "ocean ▸" header per turn, even when the agent
+                // interleaves text → tool → text inside a single turn.
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "ocean ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("▸", Style::default().fg(Color::DarkGray)),
+                ]));
+                if turn.blocks.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("▏", Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
                 for (bi, block) in turn.blocks.iter().enumerate() {
                     let focused = app.pm_focused_block == Some((ti, bi));
                     render_pm_block(&mut lines, block, focused);
@@ -4052,22 +4069,7 @@ fn render_pm_block(lines: &mut Vec<Line<'static>>, block: &PmBlock, focused: boo
 
     match block {
         PmBlock::Text(text) => {
-            // Header row.
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "ocean ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("▸", Style::default().fg(Color::DarkGray)),
-            ]));
-            if text.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("▏", Style::default().fg(Color::DarkGray)),
-                ]));
-            } else {
+            if !text.is_empty() {
                 let md_lines = render_markdown_lines(text, "  ");
                 lines.extend(md_lines);
             }
