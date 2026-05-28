@@ -425,6 +425,30 @@ impl Provider for OpenAiProvider {
                 });
             }
 
+            // Fallback: some reasoning-capable OAI-compat models (notably
+            // DeepSeek v4-pro) stream their entire conversational reply
+            // through `reasoning_content` and never populate `content`.
+            // If we got reasoning but no text, surface the reasoning as the
+            // assistant's text so the user actually sees an answer. The
+            // ThinkingDelta events still fired in real time for harnesses
+            // that want to display the trace separately — this only adds
+            // a text path so the reply isn't silently swallowed.
+            if text_buf.is_empty() && !thinking_buf.is_empty() {
+                let promoted_index = next_block_index;
+                next_block_index += 1;
+                text_index = Some(promoted_index);
+                yield Ok(AssistantMessageEvent::TextStart { content_index: promoted_index });
+                yield Ok(AssistantMessageEvent::TextDelta {
+                    content_index: promoted_index,
+                    delta: thinking_buf.clone(),
+                });
+                yield Ok(AssistantMessageEvent::TextEnd {
+                    content_index: promoted_index,
+                    content: thinking_buf.clone(),
+                });
+                text_buf = thinking_buf.clone();
+            }
+
             let mut out_content: Vec<Content> = Vec::new();
             if !thinking_buf.is_empty() {
                 out_content.push(Content::Thinking {
