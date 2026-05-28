@@ -1,0 +1,29 @@
+# --- secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.token
+*token*.txt
+auth.json
+settings.json
+models.json
+
+# --- runtime state & generated artifacts ---
+state/
+sessions/
+turns/
+logs/
+status-audio/
+voices/
+media/
+*.wav
+*.lock
+
+# --- node / python ---
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*-venv/

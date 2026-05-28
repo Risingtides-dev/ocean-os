@@ -1,0 +1,21 @@
+{
+  "name": "ocean-voice",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Voice surface for the Ocean runtime — a thin steering client (web PWA + desktop daemon) over ocean-daemon.",
+  "bin": {
+    "ocean-voice": "src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node src/web-server.mjs",
+    "web": "node src/web-server.mjs",
+    "daemon": "node src/daemon.mjs",
+    "cli": "node src/cli.mjs",
+    "check": "node --check src/ocean-client.mjs && node --check src/daemon.mjs && node --check src/web-server.mjs && node --check src/cli.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}

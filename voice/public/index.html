@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#07131f" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Ocean Voice" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>Ocean Voice</title>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Ocean OS</p>
+          <h1>Ocean Voice</h1>
+          <p class="subhead">Light web connector for the voice agent on this computer.</p>
+        </div>
+        <div class="status-card" aria-live="polite">
+          <span id="status-dot" class="dot idle"></span>
+          <span id="status-text">Checking…</span>
+        </div>
+      </header>
+
+      <section id="auth-panel" class="panel hidden">
+        <h2>Connector token</h2>
+        <p>This connector is protected. Paste the local token for this device.</p>
+        <div class="row">
+          <input id="token-input" type="password" autocomplete="off" placeholder="VOICE_WEB_TOKEN" />
+          <button id="save-token">Save</button>
+        </div>
+      </section>
+
+      <section class="panel composer">
+        <div class="mic-wrap">
+          <button id="mic-button" class="orb" type="button" aria-pressed="false">
+            <span id="mic-label">Tap to talk</span>
+          </button>
+          <p id="mic-hint">Records here, transcribes locally through the connector, then sends text to the Ocean runtime.</p>
+        </div>
+
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="5" placeholder="Type here, or tap the mic and speak…"></textarea>
+
+        <div class="actions">
+          <button id="send" class="primary" type="button">Send to Ocean</button>
+          <button id="clear" type="button">Clear</button>
+        </div>
+
+        <div class="options">
+          <label><input id="auto-send" type="checkbox" checked /> Auto-send after transcription</label>
+          <label><input id="speak-here" type="checkbox" checked /> Speak response on this device</label>
+        </div>
+      </section>
+
+      <section class="panel response-panel">
+        <div class="panel-head">
+          <h2>Response</h2>
+          <button id="stop-speech" type="button">Stop speech</button>
+        </div>
+        <pre id="response" aria-live="polite">Ready.</pre>
+      </section>
+
+      <section class="panel small">
+        <h2>Connection</h2>
+        <pre id="debug">Loading connector config…</pre>
+      </section>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
