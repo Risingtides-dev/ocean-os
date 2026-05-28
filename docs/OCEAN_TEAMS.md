@@ -81,17 +81,19 @@ Mission:
 Scope:
 
 ```text
-future crates/ocean-providers
-future crates/ocean-tools
+crates/ocean-protocol
+crates/ocean-runtime
+crates/ocean-providers
 crates/ocean-agent internals
+future crates/ocean-tools
 ```
 
 Mission:
 
-- replace remaining Pi Rust component dependencies
-- build Ocean-owned provider abstraction
-- build Ocean-owned tools
-- preserve CLI smoke behavior during extraction
+- own and evolve the in-tree ocean-runtime + ocean-protocol crates
+- extend the Ocean-owned provider abstraction
+- factor tools into a standalone ocean-tools crate when plugin runtime lands
+- preserve CLI smoke behavior across changes
 
 ### 5. Distro Integration Team
 

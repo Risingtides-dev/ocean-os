@@ -98,14 +98,13 @@ Deliverables:
 
 ### Phase 4: Native Ocean internals
 
-Replace remaining Pi Rust component dependencies with Ocean-owned crates.
+The runtime and protocol stacks are now in-tree as `ocean-runtime` and `ocean-protocol`.
 
-Deliverables:
+Remaining native-ownership deliverables:
 
-- `ocean-providers`
-- `ocean-tools`
-- native agent loop ownership in `ocean-agent`
-- `ocean-store` for session/event persistence
+- `ocean-providers` extension (more providers, smarter routing)
+- `ocean-tools` as a standalone crate (carved out of `ocean-runtime::tools`)
+- `ocean-store` for SQLite-backed session/event persistence
 
 ### Phase 5: Distro shape
 

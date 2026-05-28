@@ -1,4 +1,4 @@
-//! Agent loop — Rust port of `packages/agent/src/agent-loop.ts`.
+//! Agent loop.
 //!
 //! Streams assistant deltas, executes tool calls, and surfaces permission
 //! decisions. Cancellation is honored via `StreamOptions::cancel`.

@@ -30,10 +30,6 @@ println!("{} messages", run.messages.len());
 # });
 ```
 
-## Provenance
-
-Vendored from [`pi-agent`](https://crates.io/crates/pi-agent) v1.0.0 (MIT, © Pi Rust Port Contributors), itself a Rust port of [`@earendil-works/pi-agent-core`](https://github.com/earendil-works/pi). Renamed and adopted into the Ocean tree so we own and evolve the agent loop directly.
-
 ## License
 
-MIT
+MIT. See [`/NOTICE.md`](../../NOTICE.md) for third-party attributions.

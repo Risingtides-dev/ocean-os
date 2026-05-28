@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Ocean OS unified multi-provider LLM protocol. Streams from Anthropic, OpenAI, Google Gemini, and any OpenAI-compatible endpoint. Vendored and Oceanized from pi-ai 1.0.0 (MIT)."
+description = "Ocean OS unified multi-provider LLM protocol. Streams from Anthropic, OpenAI, Google Gemini, and any OpenAI-compatible endpoint."
 
 [lib]
 name = "ocean_protocol"

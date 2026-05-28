@@ -48,10 +48,6 @@ let m = Model::openai_compat(
 
 Set `OPENAI_API_KEY` to the provider's key, or pass `api_key` directly.
 
-## Provenance
-
-Vendored from [`pi-ai`](https://crates.io/crates/pi-ai) v1.0.0 (MIT, © Pi Rust Port Contributors), itself a Rust port of [`@earendil-works/pi-ai`](https://github.com/earendil-works/pi). Renamed and adopted into the Ocean tree so we own and evolve the wire protocol directly.
-
 ## License
 
-MIT
+MIT. See [`/NOTICE.md`](../../NOTICE.md) for third-party attributions.

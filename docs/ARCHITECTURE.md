@@ -1,6 +1,6 @@
-# ocean-rs architecture
+# Ocean OS architecture
 
-Ocean-rs is a Rust-native Pi-style coding-agent harness/runtime for Ocean OS. The daemon owns runtime authority; `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that harness.
+Ocean OS is a Rust-native coding-agent runtime and daemon. The daemon owns runtime authority; `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that runtime.
 
 ## Crates
 
@@ -8,46 +8,47 @@ Ocean-rs is a Rust-native Pi-style coding-agent harness/runtime for Ocean OS. Th
 ocean-core
   Shared protocol types: requests, responses, events, sessions.
 
+ocean-protocol
+  Unified multi-provider LLM wire protocol (Anthropic, OpenAI, Google,
+  OpenAI-compatible). SSE streaming, retry, cancellation.
+
+ocean-runtime
+  Agent loop with permission-gated tool execution. Built-in tools:
+  read, write, edit, bash, ls, grep, glob, web_fetch, todo.
+
+ocean-providers
+  Ocean-owned provider registry: model routing, credential resolution,
+  readiness checks.
+
+ocean-agent
+  Native Ocean agent facade. Owns model selection, credential discovery,
+  session persistence, daemon-safe permissions, project prompt loading, and
+  protocol/event mapping. Wraps ocean-runtime + ocean-protocol in-process.
+
 ocean-daemon
   Long-running OS service. Owns API surface for OceanTUI/Ocean GUI and
   calls the native runtime in-process. It must not shell out to a second agent
   runtime.
 
-ocean-agent
-  Native Ocean agent facade. Owns model selection, DeepSeek key discovery,
-  session persistence, daemon-safe permissions, project prompt loading, and
-  protocol/event mapping. It currently uses the small pi-agent/pi-ai Rust crates
-  as replaceable components, not as an external process.
-
 ocean-cli
   Thin terminal client for daemon control and one-shot prompts.
+
+ocean-tui
+  Active ratatui steering cockpit and Rust-native Tides Mesh MeshFloor. It
+  renders floor state, prompts, sessions, requests, events, approvals, and
+  mesh panels while leaving provider calls, tools, sessions, and agent loops
+  under daemon authority.
+
+  Main layout/parity references:
+  - docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md
+  - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
 ```
 
 Planned crates:
 
 ```text
-ocean-agent internals
-  Replace remaining pi-agent/pi-ai components with Ocean-owned agent loop,
-  provider clients, and tools.
-
-ocean-providers
-  DeepSeek/OpenAI-compatible, Anthropic, Gemini, xAI.
-
-ocean-tools
-  read/write/edit/bash/grep/find/ls plus Rust-specific tools.
-
 ocean-store
   SQLite session/event store.
-
-See `docs/OCEAN_NATIVE_INTERNALS_MAP.md` for the current Pi-borrowed
-`ocean-agent` surfaces and the extraction order that preserves smoke behavior.
-
-ocean-tui
-  Active ratatui steering cockpit and Rust-native Tides Mesh MeshFloor. It renders floor state, prompts, sessions, requests, events, approvals, and mesh panels while leaving provider calls, tools, sessions, and agent loops under daemon authority.
-
-  Main layout/parity references:
-  - docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md
-  - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
 
 ocean-plugin
   WASM/subprocess plugin runtime.

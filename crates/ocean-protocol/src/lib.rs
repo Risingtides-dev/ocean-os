@@ -1,10 +1,9 @@
 //! `ocean-protocol` — Unified multi-provider LLM API.
 //!
-//! Rust port of the TypeScript package `@earendil-works/ocean-protocol`. The original
-//! project supports many providers; this port focuses on the two most common
-//! agent backends: Anthropic Messages and OpenAI Chat Completions. Both share
-//! the same `Message`/`Tool`/`AssistantMessageEvent` types so the agent loop
-//! is provider-agnostic.
+//! Supports Anthropic Messages, OpenAI Chat Completions, Google Gemini, and
+//! any OpenAI-compatible endpoint. All providers share the same
+//! `Message`/`Tool`/`AssistantMessageEvent` types so the agent loop is
+//! provider-agnostic.
 
 pub mod error;
 pub mod providers;

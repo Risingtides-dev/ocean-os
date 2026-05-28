@@ -66,9 +66,9 @@ Active runtime roadmap: [`ROADMAP.md`](ROADMAP.md).
 
 Longer-horizon vision — Ocean OS as a shared agentic knowledge layer (PRDs, market research, ingestion architecture, MCP service design) — lives on the [`roadmap/ocean-os-v2`](https://github.com/Risingtides-dev/ocean-os/tree/roadmap/ocean-os-v2) branch. That branch preserves the v2 product work and the TypeScript ingestion/orchestrator/MCP scaffolding; cherry-pick from it as those pieces graduate into the runtime.
 
-## Provenance
+## Third-party attributions
 
-`ocean-runtime` and `ocean-protocol` were vendored from [`pi-agent`](https://crates.io/crates/pi-agent) and [`pi-ai`](https://crates.io/crates/pi-ai) v1.0.0 (MIT, © Pi Rust Port Contributors). Ocean owns and evolves them in-tree. See each crate's `README.md`.
+See [`NOTICE.md`](NOTICE.md).
 
 ## Contributing
 
