@@ -428,12 +428,19 @@ impl Provider for OpenAiProvider {
             // Fallback: some reasoning-capable OAI-compat models (notably
             // DeepSeek v4-pro) stream their entire conversational reply
             // through `reasoning_content` and never populate `content`.
-            // If we got reasoning but no text, surface the reasoning as the
-            // assistant's text so the user actually sees an answer. The
-            // ThinkingDelta events still fired in real time for harnesses
-            // that want to display the trace separately — this only adds
-            // a text path so the reply isn't silently swallowed.
-            if text_buf.is_empty() && !thinking_buf.is_empty() {
+            // If we got reasoning but no text AND no tool calls, surface
+            // the reasoning as the assistant's text so the user actually
+            // sees an answer.
+            //
+            // We deliberately skip the promotion when tool calls are
+            // present: in that case the reasoning is the model's plan for
+            // the tool call, not a user-facing reply, and the real text
+            // answer will come on the next agent-loop turn after the tool
+            // results are appended. Promoting prematurely would dump the
+            // private plan into the user's transcript and then duplicate
+            // it again when the real answer arrives.
+            let has_tool_calls = !tool_calls.is_empty();
+            if text_buf.is_empty() && !thinking_buf.is_empty() && !has_tool_calls {
                 let promoted_index = next_block_index;
                 next_block_index += 1;
                 yield Ok(AssistantMessageEvent::TextStart { content_index: promoted_index });
