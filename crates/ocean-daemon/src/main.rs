@@ -25,7 +25,7 @@ use ocean_core::{
     RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, SessionDetail,
     SessionId, SessionResponse, SessionRunState,
 };
-use pi_agent::{PermissionDecision as AgentPermissionDecision, PermissionPolicy};
+use ocean_runtime::{PermissionDecision as AgentPermissionDecision, PermissionPolicy};
 use serde_json::{json, Value};
 use tokio::{
     sync::{broadcast, oneshot, RwLock},

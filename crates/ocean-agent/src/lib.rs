@@ -10,14 +10,14 @@ use ocean_core::{
     PromptRequest, PromptResponse, RequestId, SessionDetail, SessionId, SessionRunState,
     SessionSummary, SessionToolContext, SessionTranscriptEntry,
 };
+use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
 use ocean_providers::{
     resolve_provider_config_from_env, ProviderConfig, ProviderId, ProviderReadiness,
 };
-use pi_agent::{
+use ocean_runtime::{
     run_agent_with_history, tools::default_tools, AgentConfig, AgentEvent, PermissionDecision,
     PermissionPolicy,
 };
-use pi_ai::{AssistantMessage, Content, Message, Model, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -171,7 +171,7 @@ impl AgentRuntime {
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
-            timestamp: pi_ai::now_ms(),
+            timestamp: ocean_protocol::now_ms(),
         }));
         session.replace_messages(messages);
         session::save(&self.config_dir, &session)?;
@@ -410,7 +410,7 @@ mod session {
         }
 
         pub fn new_with_id(id: SessionId, model: &Model) -> Self {
-            let now = pi_ai::now_ms();
+            let now = ocean_protocol::now_ms();
             Self {
                 id,
                 created_ms: now,
@@ -423,7 +423,7 @@ mod session {
 
         pub fn replace_messages(&mut self, messages: Vec<Message>) {
             self.messages = messages;
-            self.updated_ms = pi_ai::now_ms();
+            self.updated_ms = ocean_protocol::now_ms();
         }
     }
 
@@ -808,14 +808,14 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
                 error_message: None,
-                timestamp: pi_ai::now_ms(),
+                timestamp: ocean_protocol::now_ms(),
             }),
-            Message::ToolResult(pi_ai::ToolResultMessage {
+            Message::ToolResult(ocean_protocol::ToolResultMessage {
                 tool_call_id,
                 tool_name: "read".into(),
                 content: vec![Content::text("contents")],
                 is_error: false,
-                timestamp: pi_ai::now_ms(),
+                timestamp: ocean_protocol::now_ms(),
             }),
         ]);
         session::save(&config_dir, &session).unwrap();

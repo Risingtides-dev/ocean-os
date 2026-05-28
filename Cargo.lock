@@ -1249,9 +1249,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "ocean-core",
+ "ocean-protocol",
  "ocean-providers",
- "pi-agent",
- "pi-ai",
+ "ocean-runtime",
  "serde",
  "serde_json",
  "tokio",
@@ -1305,7 +1305,7 @@ dependencies = [
  "ocean-agent",
  "ocean-agent-sdk",
  "ocean-core",
- "pi-agent",
+ "ocean-runtime",
  "serde",
  "serde_json",
  "tokio",
@@ -1318,12 +1318,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-protocol"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "ocean-providers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ocean-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "glob",
+ "ignore",
+ "ocean-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1388,54 +1432,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "pi-agent"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cb24a36a5cc678ed65a9d487c4fc720183c01a3b2f18fa88165c175ad4e678e"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "chrono",
- "futures",
- "glob",
- "ignore",
- "pi-ai",
- "reqwest",
- "serde",
- "serde_json",
- "shell-words",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pi-ai"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f176aea74f87af1f6cab6cb3d90e1fc76d4630874b1ccf997f675989fff7cbe7"
-dependencies = [
- "async-stream",
- "async-trait",
- "bytes",
- "chrono",
- "eventsource-stream",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
 
 [[package]]
 name = "pin-project-lite"
