@@ -249,9 +249,14 @@ impl AgentRuntime {
         session.bind_workspace(Path::new(&req.cwd));
 
         let mut history = session.messages.clone();
-        if snapshot.provider_config.selection.provider == ProviderId::DeepSeek
-            && snapshot.provider_config.selection.model == "deepseek-reasoner"
-        {
+        // OpenAI-compatible providers (DeepSeek, OpenAI o-series, xAI, etc.)
+        // do not accept assistant `thinking` blocks as input on the next turn —
+        // reasoning is output-only. Strip them on replay. Anthropic stores
+        // thinking with a signature and is happy to receive it back.
+        if matches!(
+            snapshot.provider_config.selection.provider,
+            ProviderId::DeepSeek | ProviderId::OpenAi | ProviderId::OpenAiCompatible
+        ) {
             strip_assistant_thinking_content(&mut history);
         }
         history.push(Message::user_text(req.prompt));

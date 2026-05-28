@@ -45,6 +45,12 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek extended-reasoning models (deepseek-reasoner, deepseek-v4-pro)
+    /// stream their chain-of-thought through `reasoning_content` alongside the
+    /// final `content`. OpenAI-compatible "reasoning" models (o1, o3-style)
+    /// alias the same channel as `reasoning`. We accept both spellings.
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCallDelta>,
 }
@@ -281,11 +287,16 @@ impl Provider for OpenAiProvider {
 
             let mut sse = resp.bytes_stream().eventsource();
 
+            // Block layout: thinking → text → tool calls (in upstream tc.index order).
+            // We assign content_indexes in arrival order via `next_block_index` and
+            // remember the index for each open block so deltas can re-use it.
+            let mut next_block_index: usize = 0;
+            let mut thinking_buf = String::new();
+            let mut thinking_index: Option<usize> = None;
             let mut text_buf = String::new();
-            let mut text_started = false;
-            let mut text_index: usize = 0;
+            let mut text_index: Option<usize> = None;
             let mut tool_calls: std::collections::BTreeMap<usize, PartialToolCall> = Default::default();
-            let mut tool_started: std::collections::BTreeSet<usize> = Default::default();
+            let mut tool_block_indexes: std::collections::BTreeMap<usize, usize> = Default::default();
             let mut stop = StopReason::Stop;
             let mut usage = Usage::default();
             let mut response_model: Option<String> = None;
@@ -329,15 +340,42 @@ impl Provider for OpenAiProvider {
                         };
                     }
                     if let Some(delta) = choice.delta {
+                        // Reasoning / chain-of-thought (DeepSeek reasoner & v4-pro,
+                        // OpenAI o-series). Streams as its own block ahead of text.
+                        if let Some(r) = delta.reasoning_content {
+                            if !r.is_empty() {
+                                let idx = match thinking_index {
+                                    Some(i) => i,
+                                    None => {
+                                        let i = next_block_index;
+                                        next_block_index += 1;
+                                        thinking_index = Some(i);
+                                        yield Ok(AssistantMessageEvent::ThinkingStart { content_index: i });
+                                        i
+                                    }
+                                };
+                                thinking_buf.push_str(&r);
+                                yield Ok(AssistantMessageEvent::ThinkingDelta {
+                                    content_index: idx,
+                                    delta: r,
+                                });
+                            }
+                        }
                         if let Some(c) = delta.content {
                             if !c.is_empty() {
-                                if !text_started {
-                                    text_started = true;
-                                    yield Ok(AssistantMessageEvent::TextStart { content_index: text_index });
-                                }
+                                let idx = match text_index {
+                                    Some(i) => i,
+                                    None => {
+                                        let i = next_block_index;
+                                        next_block_index += 1;
+                                        text_index = Some(i);
+                                        yield Ok(AssistantMessageEvent::TextStart { content_index: i });
+                                        i
+                                    }
+                                };
                                 text_buf.push_str(&c);
                                 yield Ok(AssistantMessageEvent::TextDelta {
-                                    content_index: text_index,
+                                    content_index: idx,
                                     delta: c,
                                 });
                             }
@@ -349,21 +387,20 @@ impl Provider for OpenAiProvider {
                                 if let Some(n) = f.name { entry.name = n; }
                                 if let Some(a) = f.arguments {
                                     entry.args.push_str(&a);
-                                    if !tool_started.contains(&tc.index) {
-                                        tool_started.insert(tc.index);
-                                        let block_index = text_index
-                                            + if text_started { 1 } else { 0 }
-                                            + tool_started.len()
-                                            - 1;
-                                        yield Ok(AssistantMessageEvent::ToolCallStart {
-                                            content_index: block_index,
-                                            id: entry.id.clone(),
-                                            name: entry.name.clone(),
-                                        });
-                                    }
-                                    let block_index = text_index
-                                        + if text_started { 1 } else { 0 }
-                                        + tc.index;
+                                    let block_index = match tool_block_indexes.get(&tc.index) {
+                                        Some(i) => *i,
+                                        None => {
+                                            let i = next_block_index;
+                                            next_block_index += 1;
+                                            tool_block_indexes.insert(tc.index, i);
+                                            yield Ok(AssistantMessageEvent::ToolCallStart {
+                                                content_index: i,
+                                                id: entry.id.clone(),
+                                                name: entry.name.clone(),
+                                            });
+                                            i
+                                        }
+                                    };
                                     yield Ok(AssistantMessageEvent::ToolCallDelta {
                                         content_index: block_index,
                                         delta: a,
@@ -375,16 +412,27 @@ impl Provider for OpenAiProvider {
                 }
             }
 
-            if text_started {
+            if let Some(i) = thinking_index {
+                yield Ok(AssistantMessageEvent::ThinkingEnd {
+                    content_index: i,
+                    content: thinking_buf.clone(),
+                });
+            }
+            if let Some(i) = text_index {
                 yield Ok(AssistantMessageEvent::TextEnd {
-                    content_index: text_index,
+                    content_index: i,
                     content: text_buf.clone(),
                 });
-                text_index += 1;
             }
 
             let mut out_content: Vec<Content> = Vec::new();
-            if text_started {
+            if !thinking_buf.is_empty() {
+                out_content.push(Content::Thinking {
+                    thinking: thinking_buf.clone(),
+                    thinking_signature: None,
+                });
+            }
+            if !text_buf.is_empty() {
                 out_content.push(Content::Text { text: text_buf.clone() });
             }
             for (i, tc) in tool_calls {
@@ -393,7 +441,10 @@ impl Provider for OpenAiProvider {
                 } else {
                     serde_json::from_str(&tc.args).unwrap_or(Value::Object(Default::default()))
                 };
-                let block_index = text_index + i;
+                let block_index = tool_block_indexes
+                    .get(&i)
+                    .copied()
+                    .unwrap_or(next_block_index);
                 yield Ok(AssistantMessageEvent::ToolCallEnd {
                     content_index: block_index,
                     id: tc.id.clone(),
