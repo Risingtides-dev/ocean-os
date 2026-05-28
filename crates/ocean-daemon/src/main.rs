@@ -1321,65 +1321,6 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
     }
 }
 
-fn ocean_to_agent_event(event: OceanEvent) -> Option<AgentTurnEvent> {
-    match event {
-        OceanEvent::AssistantDelta { text } => Some(AgentTurnEvent::AssistantTextDelta {
-            turn_id: AgentTurnId(Uuid::new_v4()),
-            delta: text,
-        }),
-        OceanEvent::ToolStarted { tool, args } => Some(AgentTurnEvent::ToolCallStarted {
-            turn_id: AgentTurnId(Uuid::new_v4()),
-            call: ToolCall {
-                id: ToolCallId(Uuid::new_v4()),
-                name: tool,
-                args_json: args,
-            },
-        }),
-        OceanEvent::ToolOutput {
-            tool: _,
-            text,
-            is_error,
-        } => Some(AgentTurnEvent::ToolCallFinished {
-            turn_id: AgentTurnId(Uuid::new_v4()),
-            call_id: ToolCallId(Uuid::new_v4()),
-            result: ToolResult {
-                ok: !is_error,
-                output: text,
-                metadata_json: None,
-            },
-        }),
-        OceanEvent::TurnFinished { ok, wall_ms, .. } => Some(AgentTurnEvent::TurnFinished {
-            turn_id: AgentTurnId(Uuid::new_v4()),
-            status: if ok {
-                AgentTurnStatus::Completed
-            } else {
-                AgentTurnStatus::Failed
-            },
-            error: None,
-            wall_ms: Some(wall_ms),
-            output_tokens: None,
-            tokens_per_second: None,
-        }),
-        OceanEvent::Cancelled { reason } => Some(AgentTurnEvent::TurnFinished {
-            turn_id: AgentTurnId(Uuid::new_v4()),
-            status: AgentTurnStatus::Cancelled,
-            error: reason,
-            wall_ms: None,
-            output_tokens: None,
-            tokens_per_second: None,
-        }),
-        OceanEvent::Error { message } => Some(AgentTurnEvent::TurnFinished {
-            turn_id: AgentTurnId(Uuid::new_v4()),
-            status: AgentTurnStatus::Failed,
-            error: Some(message),
-            wall_ms: None,
-            output_tokens: None,
-            tokens_per_second: None,
-        }),
-        _ => None,
-    }
-}
-
 fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
     match event {
         AgentTurnEvent::TurnStarted { .. } => "turn_started",

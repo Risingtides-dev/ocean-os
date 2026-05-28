@@ -436,7 +436,6 @@ impl Provider for OpenAiProvider {
             if text_buf.is_empty() && !thinking_buf.is_empty() {
                 let promoted_index = next_block_index;
                 next_block_index += 1;
-                text_index = Some(promoted_index);
                 yield Ok(AssistantMessageEvent::TextStart { content_index: promoted_index });
                 yield Ok(AssistantMessageEvent::TextDelta {
                     content_index: promoted_index,
