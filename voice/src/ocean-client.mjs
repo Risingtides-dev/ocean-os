@@ -99,64 +99,69 @@ export async function runOceanTurn({
     }
   })();
 
-  // Small head start so the subscription is live before the turn emits events.
-  await delay(120);
-
-  const turnAc = new AbortController();
-  const timer = setTimeout(() => turnAc.abort(), timeoutMs);
-  let response;
+  // The SSE subscription must be torn down on every exit path — including a
+  // failed/timed-out turn POST — or the daemon connection and its callback leak.
   try {
-    const body = {
-      prompt,
-      cwd,
-      ...(sessionId ? { session_id: sessionId } : {}),
-      ...(guidance ? { guidance } : {}),
+    // Small head start so the subscription is live before the turn emits events.
+    await delay(120);
+
+    const turnAc = new AbortController();
+    const timer = setTimeout(() => turnAc.abort(), timeoutMs);
+    let response;
+    try {
+      const body = {
+        prompt,
+        cwd,
+        ...(sessionId ? { session_id: sessionId } : {}),
+        ...(guidance ? { guidance } : {}),
+      };
+      const r = await fetch(`${url}/v1/agent/turns`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: turnAc.signal,
+      });
+      const raw = await r.text();
+      try { response = raw ? JSON.parse(raw) : {}; } catch { response = {}; }
+      if (!r.ok) throw new Error(`ocean-daemon ${r.status}: ${response?.error || raw}`);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const turnId = response.turn_id || liveTurnId;
+    const finalSessionId = response.session_id || liveSessionId;
+
+    // NOTE: the daemon's /v1/agent/events stream regenerates a fresh turn_id on
+    // every event, so it can't be matched against the response's turn_id. We run
+    // turns single-flight with a fresh subscription per call, so every event in
+    // this window belongs to this turn — accumulate them all rather than filter.
+
+    // The turn POST may return just before the SSE flushes the final delta;
+    // wait briefly for turn_finished before closing the stream.
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+      if (events.some((e) => e.type === 'turn_finished')) break;
+      await delay(50);
+    }
+
+    const text = events
+      .filter((e) => e.type === 'assistant_text_delta')
+      .map((e) => e.delta)
+      .join('')
+      .trim();
+
+    const status = response.status || 'completed';
+    const ok = response.ok !== false && status !== 'failed';
+    return {
+      ok,
+      text,
+      error: response.error || null,
+      sessionId: finalSessionId,
+      turnId,
+      status,
     };
-    const r = await fetch(`${url}/v1/agent/turns`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: turnAc.signal,
-    });
-    const raw = await r.text();
-    try { response = raw ? JSON.parse(raw) : {}; } catch { response = {}; }
-    if (!r.ok) throw new Error(`ocean-daemon ${r.status}: ${response?.error || raw}`);
   } finally {
-    clearTimeout(timer);
+    eventsAc.abort();
+    await sseDone.catch(() => {});
   }
-
-  const turnId = response.turn_id || liveTurnId;
-  const finalSessionId = response.session_id || liveSessionId;
-
-  // NOTE: the daemon's /v1/agent/events stream regenerates a fresh turn_id on
-  // every event, so it can't be matched against the response's turn_id. We run
-  // turns single-flight with a fresh subscription per call, so every event in
-  // this window belongs to this turn — accumulate them all rather than filter.
-
-  // The turn POST may return just before the SSE flushes the final delta;
-  // wait briefly for turn_finished before closing the stream.
-  const deadline = Date.now() + 1500;
-  while (Date.now() < deadline) {
-    if (events.some((e) => e.type === 'turn_finished')) break;
-    await delay(50);
-  }
-  eventsAc.abort();
-  await sseDone.catch(() => {});
-
-  const text = events
-    .filter((e) => e.type === 'assistant_text_delta')
-    .map((e) => e.delta)
-    .join('')
-    .trim();
-
-  const status = response.status || 'completed';
-  const ok = response.ok !== false && status !== 'failed';
-  return {
-    ok,
-    text,
-    error: response.error || null,
-    sessionId: finalSessionId,
-    turnId,
-    status,
-  };
 }

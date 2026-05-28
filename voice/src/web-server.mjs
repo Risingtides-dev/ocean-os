@@ -34,6 +34,8 @@ const OCEAN_VOICE_CWD = process.env.OCEAN_VOICE_CWD || HOME;
 
 // Session continuity for this connector instance (the Rust runtime owns the session).
 let webSessionId = null;
+// Single-flight guard: one Ocean turn at a time through this connector.
+let webBusy = false;
 
 const LOCAL_BINDS = new Set(['127.0.0.1', 'localhost', '::1']);
 if (!LOCAL_BINDS.has(HOST) && !AUTH_ENABLED) {
@@ -279,6 +281,13 @@ async function handleApi(req, res, requestUrl) {
       webSessionId = null;
       return json(res, 200, { ok: true, text: 'Started a fresh Ocean voice session.', sessionId: null });
     }
+    // Single-flight: runOceanTurn attributes every event in its window to the one
+    // in-flight turn, and webSessionId must not be raced. Reject overlap (the
+    // daemon surface has the same guard) rather than cross-contaminate replies.
+    if (webBusy) {
+      return json(res, 409, { ok: false, error: 'voice agent is busy' });
+    }
+    webBusy = true;
     try {
       const result = await runOceanTurn({
         prompt,
@@ -296,6 +305,8 @@ async function handleApi(req, res, requestUrl) {
       });
     } catch (error) {
       return json(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      webBusy = false;
     }
   }
 
