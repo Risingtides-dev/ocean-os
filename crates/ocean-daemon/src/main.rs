@@ -5,7 +5,7 @@ use uuid::Uuid;
 use anyhow::Context;
 use async_trait::async_trait;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{Method, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
@@ -540,9 +540,47 @@ impl PermissionPolicy for DaemonPermissionPolicy {
     }
 }
 
-async fn sessions(State(state): State<AppState>) -> Json<serde_json::Value> {
-    match state.runtime.list_sessions() {
-        Ok(sessions) => Json(json!({"ok": true, "sessions": sessions})),
+#[derive(Debug, serde::Deserialize, Default)]
+struct SessionListQuery {
+    /// Optional workspace path filter. When provided, returns only sessions
+    /// bound to that exact workspace_root. When `?cwd=` is provided instead,
+    /// the daemon resolves it to a workspace root (git toplevel) first.
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    /// `?all=1` short-circuits the filter and returns every bucket.
+    #[serde(default)]
+    all: Option<String>,
+}
+
+impl SessionListQuery {
+    fn workspace_filter(&self, runtime: &AgentRuntime) -> Option<String> {
+        if self.all.as_deref().is_some_and(|v| v == "1" || v == "true") {
+            return None;
+        }
+        if let Some(ws) = self.workspace.as_deref() {
+            return Some(ws.to_string());
+        }
+        if let Some(cwd) = self.cwd.as_deref() {
+            return Some(
+                runtime
+                    .workspace_root_for(std::path::Path::new(cwd))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        None
+    }
+}
+
+async fn sessions(
+    State(state): State<AppState>,
+    Query(q): Query<SessionListQuery>,
+) -> Json<serde_json::Value> {
+    let scope = q.workspace_filter(&state.runtime);
+    match state.runtime.list_sessions(scope.as_deref()) {
+        Ok(sessions) => Json(json!({"ok": true, "sessions": sessions, "workspace": scope})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
 }
@@ -1110,14 +1148,21 @@ async fn agent_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn agent_sessions(State(state): State<AppState>) -> Json<AgentSessionsResponse> {
-    let core_sessions = state.runtime.list_sessions().unwrap_or_default();
+async fn agent_sessions(
+    State(state): State<AppState>,
+    Query(q): Query<SessionListQuery>,
+) -> Json<AgentSessionsResponse> {
+    let scope = q.workspace_filter(&state.runtime);
+    let core_sessions = state
+        .runtime
+        .list_sessions(scope.as_deref())
+        .unwrap_or_default();
     let summaries: Vec<AgentSessionSummary> = core_sessions
         .into_iter()
         .map(|s| AgentSessionSummary {
             id: sdk_sid(s.id),
             title: s.title,
-            cwd: String::new(),
+            cwd: s.workspace_root.clone().unwrap_or_default(),
             updated_at: chrono::Utc::now(),
             active_turn: None,
             turn_count: s.turns,

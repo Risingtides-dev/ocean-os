@@ -57,6 +57,25 @@ const SESSION_CAP: usize = 64;
 const FEED_CAP: usize = 300;
 const INBOX_CAP: usize = 120;
 const PM_TURN_CAP: usize = 50;
+
+/// Tiny percent-encoder for query-string values. Encodes everything outside
+/// the unreserved set so paths with spaces, slashes, etc. survive intact.
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        let safe = byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~';
+        if safe {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
 const ACTIVE_AGENT_MS: i64 = 2 * 60 * 1000;
 const AWAY_AGENT_MS: i64 = 15 * 60 * 1000;
 
@@ -325,6 +344,7 @@ struct DaemonApp {
     pm_turns: Vec<PmTurn>,
     pm_scroll: usize,
     pm_focused_block: Option<(usize, usize)>,
+    show_all_sessions: bool,
     tool_timeline: Vec<ToolTimelineEntry>,
     diff_snippets: Vec<String>,
     support: WorkspaceSupportState,
@@ -362,6 +382,7 @@ impl DaemonApp {
             pm_turns: Vec::new(),
             pm_scroll: 0,
             pm_focused_block: None,
+            show_all_sessions: false,
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
             support: WorkspaceSupportState::default(),
@@ -1491,8 +1512,23 @@ impl DaemonClient {
             .map_err(|err| err.to_string())
     }
 
-    fn sessions(&self, base_url: &str) -> Result<SessionsResponse, String> {
-        let url = format!("{}/v1/sessions", base_url.trim_end_matches('/'));
+    fn sessions(
+        &self,
+        base_url: &str,
+        cwd: Option<&str>,
+        all: bool,
+    ) -> Result<SessionsResponse, String> {
+        let mut url = format!("{}/v1/sessions", base_url.trim_end_matches('/'));
+        let mut qs: Vec<String> = Vec::new();
+        if all {
+            qs.push("all=1".to_string());
+        } else if let Some(c) = cwd {
+            qs.push(format!("cwd={}", urlencoding(c)));
+        }
+        if !qs.is_empty() {
+            url.push('?');
+            url.push_str(&qs.join("&"));
+        }
         self.http
             .get(url)
             .send()
@@ -2175,13 +2211,17 @@ fn daemon_refresh_health(client: &DaemonClient, app: &mut DaemonApp) {
 }
 
 fn daemon_refresh_sessions(client: &DaemonClient, app: &mut DaemonApp) {
-    match client.sessions(&app.url) {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    match client.sessions(&app.url, cwd.as_deref(), app.show_all_sessions) {
         Ok(res) if res.ok => {
             app.set_sessions(res.sessions);
             app.status = format!(
-                "sessions refreshed: {} ({})",
+                "sessions refreshed: {} ({}) {}",
                 app.sessions.len(),
-                app.selected_session_label()
+                app.selected_session_label(),
+                if app.show_all_sessions { "[all workspaces]" } else { "[this workspace]" },
             );
             daemon_refresh_selected_session_detail(client, app);
         }
@@ -2409,27 +2449,50 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
     },
     SlashCommandDef {
         names: &["/sessions", "/ls"],
-        help: "List recent sessions from the daemon",
-        execute: |app, _args| {
+        help: "List sessions for this workspace. `/sessions all` for everything.",
+        execute: |app, args| {
+            let want_all = args.map(|s| s.trim()).is_some_and(|s| {
+                matches!(s, "all" | "-a" | "--all" | "every")
+            });
+            app.show_all_sessions = want_all;
+            // Schedule a refresh on next tick; meanwhile render whatever is cached.
+            app.last_checked = None;
             let count = app.sessions.len();
+            let scope = if want_all {
+                "all workspaces"
+            } else {
+                "this workspace"
+            };
             if count == 0 {
-                app.push_transcript("Ocean: no saved sessions yet.".to_string());
+                app.push_transcript(format!(
+                    "Ocean: no sessions in {scope} yet (refresh queued)."
+                ));
             } else {
                 let lines: Vec<String> = app
                     .sessions
                     .iter()
                     .take(10)
                     .map(|session| {
+                        let ws = session
+                            .workspace_root
+                            .as_deref()
+                            .map(|p| std::path::Path::new(p)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.to_string()))
+                            .unwrap_or_else(|| "—".to_string());
+                        let branch = session.git_branch.as_deref().unwrap_or("·");
                         format!(
-                            "  [{}] {} · {} turns · {}",
+                            "  [{}] {}@{} · {} turns · {}",
                             short_id(session.id),
-                            compact_text(&session.title, 30),
+                            ws,
+                            branch,
                             session.turns,
-                            session.model,
+                            compact_text(&session.title, 30),
                         )
                     })
                     .collect();
-                app.push_transcript(format!("Ocean: {count} session(s):"));
+                app.push_transcript(format!("Ocean: {count} session(s) in {scope}:"));
                 for line in lines {
                     app.push_transcript(line);
                 }
@@ -2437,7 +2500,7 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
                     app.push_transcript(format!("  … and {} more", count - 10));
                 }
             }
-            app.status = format!("listed {count} sessions").to_string();
+            app.status = format!("listed {count} sessions ({scope})");
         },
     },
     SlashCommandDef {
@@ -5543,13 +5606,16 @@ mod tests {
             model: "test-model".to_string(),
             turns: 3,
             title: "Existing session".to_string(),
+            workspace_root: Some("/tmp/ws".into()),
+            git_branch: Some("main".into()),
+            updated_ms: Some(0),
         }]);
 
         assert!(handle_slash_command(&mut app, "/sessions"));
         assert!(app
             .transcript
             .iter()
-            .any(|line| line.contains("Ocean: 1 session(s):")));
+            .any(|line| line.contains("1 session(s) in this workspace:")));
 
         assert!(handle_slash_command(&mut app, "/resume 1"));
         assert_eq!(app.selected_session_id(), Some(session_id));
@@ -5725,6 +5791,9 @@ mod tests {
             model: "test-model".to_string(),
             turns: 3,
             title: "Existing session".to_string(),
+            workspace_root: None,
+            git_branch: None,
+            updated_ms: None,
         }]);
 
         assert_eq!(app.selected_session_id(), None);
@@ -5759,6 +5828,10 @@ mod tests {
             }],
             tool_context: vec![],
             messages: vec![Value::String("raw message".to_string())],
+            workspace_root: None,
+            cwd: None,
+            git_branch: None,
+            git_commit: None,
         };
 
         let lines = DaemonApp::session_detail_lines(&detail).join("\n");

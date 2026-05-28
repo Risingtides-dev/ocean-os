@@ -102,6 +102,18 @@ pub struct SessionSummary {
     pub model: String,
     pub turns: u32,
     pub title: String,
+    /// Absolute path of the workspace root this session was started from
+    /// (git toplevel when available, else the cwd the prompt was issued
+    /// from). `None` for legacy pre-binding sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    /// Git branch at the moment the session was created, if cwd was in
+    /// a repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Updated-at epoch ms — used by clients to render relative time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_ms: Option<i64>,
 }
 
 /// Runtime state exposed by `GET /v1/sessions/{id}` for command-center clients.
@@ -171,6 +183,14 @@ pub struct SessionDetail {
     /// Raw persisted messages for clients that need provider-specific detail.
     #[serde(default)]
     pub messages: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
 }
 
 /// Response payload for `GET /v1/sessions/{id}`.

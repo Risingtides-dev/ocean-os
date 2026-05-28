@@ -52,13 +52,15 @@ impl AgentRuntime {
             "ocean-native-{}",
             provider_config.selection.provider.as_str()
         );
-        Ok(Self {
+        let runtime = Self {
             config_dir: config_dir_from_env(),
             model,
             api_key,
             backend_name,
             provider_config,
-        })
+        };
+        runtime.migrate_legacy_sessions();
+        Ok(runtime)
     }
 
     pub fn backend_name(&self) -> &str {
@@ -122,8 +124,23 @@ impl AgentRuntime {
         }
     }
 
-    pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
-        session::list(&self.config_dir)
+    pub fn list_sessions(
+        &self,
+        workspace_root: Option<&str>,
+    ) -> anyhow::Result<Vec<SessionSummary>> {
+        session::list(&self.config_dir, workspace_root)
+    }
+
+    /// Resolve the workspace root for an arbitrary cwd. Exposed so callers
+    /// (daemon, TUI) can ask "what workspace would my current cwd map to?"
+    /// without depending on the private session module.
+    pub fn workspace_root_for(&self, cwd: &Path) -> PathBuf {
+        session::workspace_root(cwd)
+    }
+
+    /// One-shot legacy migration — safe to call repeatedly.
+    pub fn migrate_legacy_sessions(&self) {
+        session::migrate_legacy_sessions(&self.config_dir);
     }
 
     pub fn session_detail(&self, id: SessionId) -> anyhow::Result<SessionDetail> {
@@ -159,6 +176,7 @@ impl AgentRuntime {
                 .unwrap_or_else(|_| session::Session::new_with_id(id, &self.model)),
             None => session::Session::new(&self.model),
         };
+        session.bind_workspace(Path::new(&req.cwd));
 
         let stdout = "OCEAN_FAKE_OK\n".to_string();
         let mut messages = session.messages.clone();
@@ -191,6 +209,7 @@ impl AgentRuntime {
                 .unwrap_or_else(|_| session::Session::new_with_id(id, &self.model)),
             None => session::Session::new(&self.model),
         };
+        session.bind_workspace(Path::new(&req.cwd));
 
         let mut history = session.messages.clone();
         if self.provider_config.selection.provider == ProviderId::DeepSeek
@@ -419,6 +438,20 @@ mod session {
         pub model: String,
         pub provider: String,
         pub messages: Vec<Message>,
+        /// Workspace anchor — git toplevel if the cwd is inside a repo,
+        /// else the cwd itself. Used to bucket sessions per project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_root: Option<String>,
+        /// The cwd this session was started in. May differ from
+        /// `workspace_root` if cwd was inside a subdirectory of a repo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cwd: Option<String>,
+        /// Git branch captured at session creation, when in a repo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub git_branch: Option<String>,
+        /// Git short-commit captured at session creation, when in a repo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub git_commit: Option<String>,
     }
 
     impl Session {
@@ -435,6 +468,28 @@ mod session {
                 model: model.id.clone(),
                 provider: model.provider.clone(),
                 messages: Vec::new(),
+                workspace_root: None,
+                cwd: None,
+                git_branch: None,
+                git_commit: None,
+            }
+        }
+
+        /// Tag this session with workspace metadata derived from the
+        /// caller's cwd. Idempotent — pre-existing values win so that
+        /// resuming a session in a different cwd doesn't rewrite its
+        /// original workspace.
+        pub fn bind_workspace(&mut self, cwd: &Path) {
+            if self.cwd.is_none() {
+                self.cwd = Some(cwd.to_string_lossy().into_owned());
+            }
+            if self.workspace_root.is_none() {
+                self.workspace_root = Some(workspace_root(cwd).to_string_lossy().into_owned());
+            }
+            if self.git_branch.is_none() && self.git_commit.is_none() {
+                let (branch, commit) = probe_git(cwd);
+                self.git_branch = branch;
+                self.git_commit = commit;
             }
         }
 
@@ -444,12 +499,134 @@ mod session {
         }
     }
 
+    /// Resolve the workspace root for `cwd`. Tries `git rev-parse --show-toplevel`
+    /// first; falls back to the cwd itself when not in a repo or git is absent.
+    pub fn workspace_root(cwd: &Path) -> PathBuf {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    PathBuf::from(s)
+                } else {
+                    cwd.to_path_buf()
+                }
+            }
+            _ => cwd.to_path_buf(),
+        }
+    }
+
+    /// Encode a workspace path as a filesystem-safe slug. Mirrors the
+    /// Claude Code / pi-agent convention: leading slash dropped, remaining
+    /// slashes turned into dashes, then prefixed with a leading dash so
+    /// directory listings sort intuitively.
+    pub fn workspace_slug(root: &Path) -> String {
+        let s = root.to_string_lossy();
+        let trimmed = s.trim_start_matches('/');
+        let slug: String = trimmed
+            .chars()
+            .map(|c| match c {
+                '/' => '-',
+                '\\' => '-',
+                ':' => '-',
+                ' ' => '-',
+                c => c,
+            })
+            .collect();
+        format!("-{slug}")
+    }
+
+    fn probe_git(cwd: &Path) -> (Option<String>, Option<String>) {
+        let branch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("rev-parse")
+            .arg("--abbrev-ref")
+            .arg("HEAD")
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() || s == "HEAD" {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                } else {
+                    None
+                }
+            });
+        let commit = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("rev-parse")
+            .arg("--short")
+            .arg("HEAD")
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                } else {
+                    None
+                }
+            });
+        (branch, commit)
+    }
+
     pub fn sessions_dir(config_dir: &Path) -> PathBuf {
         config_dir.join("sessions")
     }
 
-    pub fn save(config_dir: &Path, session: &Session) -> anyhow::Result<PathBuf> {
+    /// Per-workspace bucket: `<config>/sessions/<workspace-slug>/`.
+    fn workspace_dir(config_dir: &Path, workspace_root: &str) -> PathBuf {
+        sessions_dir(config_dir).join(workspace_slug(Path::new(workspace_root)))
+    }
+
+    /// Migrate any loose `sessions/<uuid>.json` files into
+    /// `sessions/legacy/<uuid>.json`. Idempotent — running twice is a
+    /// no-op once the loose files are gone. Failures here are best-effort;
+    /// we don't crash the daemon over a stuck migration.
+    pub fn migrate_legacy_sessions(config_dir: &Path) {
         let dir = sessions_dir(config_dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let legacy = dir.join("legacy");
+        let mut made_dir = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if !made_dir {
+                if std::fs::create_dir_all(&legacy).is_err() {
+                    return;
+                }
+                made_dir = true;
+            }
+            if let Some(name) = path.file_name() {
+                let _ = std::fs::rename(&path, legacy.join(name));
+            }
+        }
+    }
+
+    pub fn save(config_dir: &Path, session: &Session) -> anyhow::Result<PathBuf> {
+        let dir = match session.workspace_root.as_deref() {
+            Some(root) => workspace_dir(config_dir, root),
+            None => sessions_dir(config_dir).join("legacy"),
+        };
         std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         let path = dir.join(format!("{}.json", session.id));
         let json = serde_json::to_string_pretty(session)?;
@@ -458,11 +635,33 @@ mod session {
     }
 
     pub fn load(config_dir: &Path, id: SessionId) -> anyhow::Result<Session> {
-        let path = sessions_dir(config_dir).join(format!("{id}.json"));
-        let text =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let session = serde_json::from_str(&text)?;
-        Ok(session)
+        let target = format!("{id}.json");
+        // Search all workspace buckets + legacy/ + top-level (for forward-compat).
+        for candidate in candidate_session_paths(config_dir, &target) {
+            if candidate.exists() {
+                let text = std::fs::read_to_string(&candidate)
+                    .with_context(|| format!("read {}", candidate.display()))?;
+                let session = serde_json::from_str(&text)?;
+                return Ok(session);
+            }
+        }
+        anyhow::bail!("session {id} not found")
+    }
+
+    fn candidate_session_paths(config_dir: &Path, filename: &str) -> Vec<PathBuf> {
+        let root = sessions_dir(config_dir);
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    out.push(p.join(filename));
+                }
+            }
+        }
+        // Final fallback: a loose file in the legacy layout we haven't migrated yet.
+        out.push(root.join(filename));
+        out
     }
 
     pub fn detail(config_dir: &Path, id: SessionId) -> anyhow::Result<SessionDetail> {
@@ -470,31 +669,56 @@ mod session {
         Ok(session_detail(session))
     }
 
-    pub fn list(config_dir: &Path) -> anyhow::Result<Vec<SessionSummary>> {
+    /// List sessions, optionally scoped to a single workspace root.
+    /// `workspace_root = None` returns every session across every bucket.
+    pub fn list(
+        config_dir: &Path,
+        workspace_root: Option<&str>,
+    ) -> anyhow::Result<Vec<SessionSummary>> {
         let dir = sessions_dir(config_dir);
         if !dir.exists() {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        for bucket in std::fs::read_dir(&dir)?.flatten() {
+            let bucket_path = bucket.path();
+            if !bucket_path.is_dir() {
                 continue;
             }
-            let text = std::fs::read_to_string(&path)?;
-            let session: Session = match serde_json::from_str(&text) {
-                Ok(session) => session,
-                Err(_) => continue,
-            };
-            out.push(SessionSummary {
-                id: session.id,
-                model: session.model,
-                turns: session.messages.len() as u32,
-                title: first_user_text(&session.messages),
-            });
+            for entry in std::fs::read_dir(&bucket_path)?.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(session) = serde_json::from_str::<Session>(&text) else {
+                    continue;
+                };
+                if let Some(filter) = workspace_root {
+                    if session.workspace_root.as_deref() != Some(filter) {
+                        continue;
+                    }
+                }
+                out.push(SessionSummary {
+                    id: session.id,
+                    model: session.model,
+                    turns: session.messages.len() as u32,
+                    title: first_user_text(&session.messages),
+                    workspace_root: session.workspace_root,
+                    git_branch: session.git_branch,
+                    updated_ms: Some(session.updated_ms),
+                });
+            }
         }
-        out.sort_by_key(|session| std::cmp::Reverse(session.id));
+        // Newest first by updated_ms; fall back to id ordering when missing.
+        out.sort_by(|a, b| {
+            b.updated_ms
+                .unwrap_or(0)
+                .cmp(&a.updated_ms.unwrap_or(0))
+                .then_with(|| b.id.cmp(&a.id))
+        });
         Ok(out)
     }
 
@@ -543,6 +767,10 @@ mod session {
             transcript,
             tool_context,
             messages,
+            workspace_root: session.workspace_root,
+            cwd: session.cwd,
+            git_branch: session.git_branch,
+            git_commit: session.git_commit,
         }
     }
 
@@ -734,13 +962,9 @@ mod tests {
         assert!(res.stderr.contains("provider deepseek"));
         assert!(res.stderr.contains("deepseek-v4-pro"));
         assert!(!res.stderr.contains("provider openai"));
-        assert!(runtime.list_sessions().unwrap().is_empty());
+        assert!(runtime.list_sessions(None).unwrap().is_empty());
         let missing = runtime.session_detail(SessionId::new_v4()).unwrap_err();
-        assert!(missing.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-        }));
+        assert!(missing.to_string().contains("not found"));
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
@@ -769,7 +993,7 @@ mod tests {
         assert!(res.ok);
         assert_eq!(res.stdout, "OCEAN_FAKE_OK\n");
         assert!(res.stderr.is_empty());
-        assert_eq!(runtime.list_sessions().unwrap().len(), 1);
+        assert_eq!(runtime.list_sessions(None).unwrap().len(), 1);
 
         let detail = runtime.session_detail(res.session_id.unwrap()).unwrap();
         assert_eq!(detail.state, SessionRunState::Stored);
