@@ -14,8 +14,22 @@ dist/
 .pi/extensions/
 .pi/extensions.disabled/
 .pi/pi-messenger.json
+.pi/ledger/
+.pi/pm-heartbeat.md
+.pi/pm-mailbox/
+.pi/tidemesh/
+.pi/unified/
+.pi/watchdog/
 subagent-*.md
 gateway-nudges-*.md
+
+# Local runtime/cache artifacts
+*.pid
+__pycache__/
+*.py[cod]
+*.tar.gz
+*.tgz
+*.zip
 
 # Editor/local temp
 .vscode/

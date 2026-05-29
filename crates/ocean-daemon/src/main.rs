@@ -1,6 +1,10 @@
-use std::{collections::HashMap, convert::Infallible, env, net::SocketAddr, sync::Arc};
-
-use uuid::Uuid;
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
+    env,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -12,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use ocean_agent::{AgentRuntime, PromptControl};
+use ocean_agent::{room_guidance, AgentRuntime, PromptControl};
 use ocean_agent_sdk::{
     AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse,
     AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus, ToolCall,
@@ -22,12 +26,11 @@ use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, PromptRequest, RequestControlResponse,
-    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, SessionDetail,
-    SessionId, SessionResponse, SessionRunState,
+    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, RoomId,
+    RoomPanelSnapshot, RoomSnapshot, RoomsResponse, SessionDetail, SessionId, SessionResponse,
+    SessionRunState, SessionSummary,
 };
-use ocean_runtime::{
-    AgentEvent, PermissionDecision as AgentPermissionDecision, PermissionPolicy,
-};
+use ocean_runtime::{AgentEvent, PermissionDecision as AgentPermissionDecision, PermissionPolicy};
 use serde_json::{json, Value};
 use tokio::{
     sync::{broadcast, oneshot, RwLock},
@@ -42,6 +45,7 @@ use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
@@ -79,19 +83,44 @@ struct DaemonPermissionPolicy {
 #[derive(Clone)]
 struct EventBus {
     tx: broadcast::Sender<EventEnvelope>,
+    history: Arc<Mutex<VecDeque<EventEnvelope>>>,
+    history_limit: usize,
 }
 
 impl EventBus {
     fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            tx,
+            history: Arc::new(Mutex::new(VecDeque::with_capacity(capacity.min(128)))),
+            history_limit: capacity.clamp(1, 256),
+        }
     }
 
     fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.tx.subscribe()
     }
 
+    fn recent(&self, limit: usize) -> Vec<EventEnvelope> {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        history.iter().rev().take(limit).cloned().collect()
+    }
+
     fn emit(&self, event: EventEnvelope) {
+        {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            history.push_back(event.clone());
+            while history.len() > self.history_limit {
+                history.pop_front();
+            }
+        }
+
         let _ = self.tx.send(event);
     }
 }
@@ -166,6 +195,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/requests/{id}/cancel", post(cancel_request))
         .route("/v1/permissions", get(permissions))
         .route("/v1/permissions/{id}/decision", post(permission_decision))
+        .route("/v1/rooms", get(rooms))
+        .route("/v1/rooms/{room_id}", get(room))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
         .route("/v1/model", get(model_get).post(model_set))
@@ -647,6 +678,439 @@ async fn session(
     }
 }
 
+async fn rooms(State(state): State<AppState>) -> Json<RoomsResponse> {
+    let input = room_projection_input(&state).await;
+    Json(RoomsResponse {
+        ok: true,
+        rooms: build_room_snapshots(&input),
+        error: None,
+    })
+}
+
+async fn room(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+) -> (StatusCode, Json<RoomsResponse>) {
+    let room_id = match parse_room_id(&room_id) {
+        Ok(room_id) => room_id,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(RoomsResponse {
+                    ok: false,
+                    rooms: vec![],
+                    error: Some(error),
+                }),
+            );
+        }
+    };
+
+    let input = room_projection_input(&state).await;
+    let room = build_room_snapshot(&input, room_id);
+    (
+        StatusCode::OK,
+        Json(RoomsResponse {
+            ok: true,
+            rooms: vec![room],
+            error: None,
+        }),
+    )
+}
+
+fn parse_room_id(room_id: &str) -> Result<RoomId, String> {
+    RoomId::parse(room_id).ok_or_else(|| {
+        format!("invalid room id '{room_id}'; expected pm, writers, orch_mesh, or review")
+    })
+}
+
+struct RoomProjectionInput {
+    runtime_status: String,
+    sessions: Vec<SessionSummary>,
+    requests: Vec<RequestStatus>,
+    permissions: Vec<PermissionStatus>,
+    events: Vec<EventEnvelope>,
+}
+
+async fn room_projection_input(state: &AppState) -> RoomProjectionInput {
+    let sessions = state.runtime.list_sessions(None).unwrap_or_default();
+    let requests = state
+        .requests
+        .read()
+        .await
+        .values()
+        .map(|control| control.status.clone())
+        .collect::<Vec<_>>();
+    let permissions = pending_permissions_snapshot(&state.permissions).await;
+    let events = state.events.recent(32);
+
+    RoomProjectionInput {
+        runtime_status: runtime_status_line(state.runtime.as_ref()),
+        sessions,
+        requests,
+        permissions,
+        events,
+    }
+}
+
+fn build_room_snapshots(input: &RoomProjectionInput) -> Vec<RoomSnapshot> {
+    [
+        RoomId::Pm,
+        RoomId::Writers,
+        RoomId::OrchMesh,
+        RoomId::Review,
+    ]
+    .into_iter()
+    .map(|room_id| build_room_snapshot(input, room_id))
+    .collect()
+}
+
+fn build_room_snapshot(input: &RoomProjectionInput, room_id: RoomId) -> RoomSnapshot {
+    let updated_ms = input
+        .events
+        .first()
+        .map(|event| event.at.timestamp_millis())
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+
+    let panels = match room_id {
+        RoomId::Pm => vec![
+            panel(
+                "Prompt rail",
+                "event feed",
+                if input.events.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_events(&input.events, 4),
+            ),
+            panel(
+                "Sessions",
+                "session list",
+                if input.sessions.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_sessions(&input.sessions, 4),
+            ),
+            panel(
+                "Runtime",
+                "daemon state",
+                "status",
+                vec![
+                    input.runtime_status.clone(),
+                    format!("requests: {}", input.requests.len()),
+                ],
+            ),
+        ],
+        RoomId::Writers => vec![
+            panel(
+                "Drafts",
+                "session list",
+                if input.sessions.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_sessions(&input.sessions, 5),
+            ),
+            panel(
+                "Transcript cues",
+                "event feed",
+                if input.events.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_events(&input.events, 5),
+            ),
+            panel(
+                "Runtime",
+                "daemon state",
+                "status",
+                vec![
+                    input.runtime_status.clone(),
+                    format!("sessions: {}", input.sessions.len()),
+                ],
+            ),
+        ],
+        RoomId::OrchMesh => vec![
+            panel(
+                "Board",
+                "request rail",
+                if input.requests.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_requests(&input.requests, 5),
+            ),
+            panel(
+                "Permissions",
+                "approval rail",
+                if input.permissions.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_permissions(&input.permissions, 5),
+            ),
+            panel(
+                "Events",
+                "control feed",
+                if input.events.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_events(&input.events, 6),
+            ),
+        ],
+        RoomId::Review => vec![
+            panel(
+                "Review queue",
+                "request rail",
+                if input.requests.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_requests(&input.requests, 4),
+            ),
+            panel(
+                "Evidence",
+                "event rail",
+                if input.events.is_empty() {
+                    "empty"
+                } else {
+                    "active"
+                },
+                summarize_events(&input.events, 4),
+            ),
+            panel(
+                "Gate",
+                "release status",
+                "status",
+                vec![
+                    input.runtime_status.clone(),
+                    format!("pending permissions: {}", input.permissions.len()),
+                ],
+            ),
+        ],
+    };
+
+    RoomSnapshot {
+        room_id,
+        title: room_id.title().into(),
+        summary: room_id.summary().into(),
+        status: input.runtime_status.clone(),
+        updated_ms,
+        panels,
+    }
+}
+
+fn panel(title: &str, kind: &str, status: &str, mut lines: Vec<String>) -> RoomPanelSnapshot {
+    if lines.is_empty() {
+        lines.push("no live data yet".into());
+    }
+
+    RoomPanelSnapshot {
+        title: title.into(),
+        kind: kind.into(),
+        status: status.into(),
+        lines,
+    }
+}
+
+fn runtime_status_line(runtime: &AgentRuntime) -> String {
+    let readiness = runtime.provider_readiness();
+    let mut status = format!(
+        "{} · {} · {} · {}",
+        runtime.backend_name(),
+        readiness.provider.as_str(),
+        readiness.model,
+        if readiness.ok { "ready" } else { "degraded" }
+    );
+
+    if let Some(error) = readiness.error.as_ref() {
+        status.push_str(" · ");
+        status.push_str(&error.to_string());
+    }
+
+    status
+}
+
+fn summarize_sessions(sessions: &[SessionSummary], limit: usize) -> Vec<String> {
+    let mut lines = sessions
+        .iter()
+        .take(limit)
+        .map(|session| {
+            format!(
+                "{} · {} turns · {}",
+                short_id(session.id),
+                session.turns,
+                session.title
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        lines.push("no sessions yet".into());
+    }
+
+    lines
+}
+
+fn summarize_requests(requests: &[RequestStatus], limit: usize) -> Vec<String> {
+    let mut lines = requests
+        .iter()
+        .take(limit)
+        .map(|status| {
+            let mut line = format!(
+                "{} · {}",
+                short_id(status.request_id),
+                request_state_label(status.state)
+            );
+            if let Some(message) = status.message.as_deref() {
+                line.push_str(" · ");
+                line.push_str(message);
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        lines.push("no requests yet".into());
+    }
+
+    lines
+}
+
+fn summarize_permissions(permissions: &[PermissionStatus], limit: usize) -> Vec<String> {
+    let mut lines = permissions
+        .iter()
+        .take(limit)
+        .map(|permission| {
+            format!(
+                "{} · {} · {}",
+                short_id(permission.request_id),
+                permission.tool,
+                permission.reason
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        lines.push("no pending permissions".into());
+    }
+
+    lines
+}
+
+fn summarize_events(events: &[EventEnvelope], limit: usize) -> Vec<String> {
+    let mut lines = events
+        .iter()
+        .take(limit)
+        .map(event_summary)
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        lines.push("no recent events".into());
+    }
+
+    lines
+}
+
+fn event_summary(event: &EventEnvelope) -> String {
+    let actor = event
+        .request_id
+        .map(short_id)
+        .or_else(|| event.session_id.map(short_id))
+        .unwrap_or_else(|| short_id(event.id));
+
+    match &event.event {
+        OceanEvent::SessionCreated => format!("{actor} · session created"),
+        OceanEvent::UserMessage { text } => format!("{actor} · user: {}", trim_line(text, 48)),
+        OceanEvent::AssistantDelta { text } => {
+            format!("{actor} · assistant: {}", trim_line(text, 48))
+        }
+        OceanEvent::ToolStarted { tool, .. } => format!("{actor} · tool start: {tool}"),
+        OceanEvent::ToolOutput {
+            tool,
+            text,
+            is_error,
+        } => format!(
+            "{actor} · tool {}: {}",
+            tool,
+            if *is_error {
+                trim_line(text, 42)
+            } else {
+                trim_line(text, 48)
+            }
+        ),
+        OceanEvent::ToolEnded { tool, is_error } => format!(
+            "{actor} · tool end: {tool}{}",
+            if *is_error { " (error)" } else { "" }
+        ),
+        OceanEvent::PermissionRequest { tool, reason, .. } => {
+            format!("{actor} · perm: {tool} · {reason}")
+        }
+        OceanEvent::PermissionDecision { allowed, reason } => format!(
+            "{actor} · permission {}{}",
+            if *allowed { "allowed" } else { "denied" },
+            reason
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default()
+        ),
+        OceanEvent::TurnFinished { ok, wall_ms } => {
+            format!(
+                "{actor} · turn {} · {wall_ms}ms",
+                if *ok { "ok" } else { "failed" }
+            )
+        }
+        OceanEvent::Cancelled { reason } => format!(
+            "{actor} · cancelled{}",
+            reason
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default()
+        ),
+        OceanEvent::Error { message } => format!("{actor} · error: {}", trim_line(message, 48)),
+    }
+}
+
+fn request_state_label(state: RequestState) -> &'static str {
+    match state {
+        RequestState::Queued => "queued",
+        RequestState::Running => "running",
+        RequestState::WaitingForPermission => "waiting-permission",
+        RequestState::Cancelling => "cancelling",
+        RequestState::Cancelled => "cancelled",
+        RequestState::Completed => "completed",
+        RequestState::Errored => "errored",
+    }
+}
+
+fn short_id(id: uuid::Uuid) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+fn trim_line(text: &str, max_chars: usize) -> String {
+    let trimmed = text.lines().next().unwrap_or_default().trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let mut clipped = trimmed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    clipped.push('…');
+    clipped
+}
+
 async fn enrich_session_detail(state: &AppState, session: &mut SessionDetail) {
     let requests = state.requests.read().await;
     let mut matching = requests
@@ -960,23 +1424,50 @@ async fn agent_turn(
     State(state): State<AppState>,
     Json(req): Json<AgentTurnRequest>,
 ) -> (StatusCode, Json<AgentTurnResponse>) {
-    let session_id = req.session_id.unwrap_or_else(AgentSessionId::new_v4);
-    let turn_id = AgentTurnId::new_v4();
-    let event_prefix = turn_id.0.to_string()[..8].to_string();
+    let AgentTurnRequest {
+        session_id,
+        prompt,
+        cwd,
+        guidance: _,
+        room_id,
+    } = req;
 
-    // If new session, emit session_created first
-    if req.session_id.is_none() {
+    let is_new_session = session_id.is_none();
+    let session_id = session_id.unwrap_or_else(AgentSessionId::new_v4);
+    let turn_id = AgentTurnId::new_v4();
+    let request_id = turn_id.0;
+    let event_prefix = request_id.to_string()[..8].to_string();
+
+    if is_new_session {
         emit_agent(
             &state.events,
             &state.agent_events,
             session_id,
             AgentTurnEvent::SessionCreated {
                 session_id,
-                title: req.prompt.chars().take(60).collect(),
-                cwd: req.cwd.clone(),
+                title: prompt.chars().take(60).collect(),
+                cwd: cwd.clone(),
             },
         );
     }
+
+    // Parse room_id for F1-F4 guidance injection (new in Track-0 room migration).
+    let room_id = match parse_agent_turn_room(room_id.as_deref()) {
+        Ok(room_id) => room_id,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentTurnResponse {
+                    ok: false,
+                    turn_id,
+                    session_id,
+                    status: AgentTurnStatus::Failed,
+                    event_id_prefix: event_prefix,
+                    error: Some(error),
+                }),
+            );
+        }
+    };
 
     // Emit turn_started
     emit_agent(
@@ -989,14 +1480,14 @@ async fn agent_turn(
         },
     );
 
-    // Map to PromptRequest; yolo=true for V0 foreground-allow
+    let guided_prompt = apply_room_guidance(room_id, &prompt);
     let prompt_req = PromptRequest {
-        prompt: req.prompt,
-        request_id: None,
+        prompt: guided_prompt,
+        request_id: Some(request_id),
         session_id: Some(core_sid(session_id)),
         max_turns: None,
         yolo: true,
-        cwd: req.cwd.clone(),
+        cwd,
     };
 
     // Wire up the runtime → bus streaming bridge. Every TextDelta /
@@ -1090,8 +1581,11 @@ async fn agent_turn(
     } else {
         None
     };
+    record_prompt_result(&state, request_id, &res).await;
+
     tracing::info!(
         turn_id = %turn_id,
+        request_id = %request_id,
         session_id = %session_id,
         ok = res.ok,
         wall_ms = res.wall_ms,
@@ -1131,7 +1625,6 @@ async fn agent_turn(
             },
         );
     }
-
     (
         StatusCode::ACCEPTED,
         Json(AgentTurnResponse {
@@ -1147,6 +1640,23 @@ async fn agent_turn(
             error: if res.ok { None } else { Some(res.stderr) },
         }),
     )
+}
+
+fn parse_agent_turn_room(room_id: Option<&str>) -> Result<Option<RoomId>, String> {
+    let Some(room_id) = room_id.map(str::trim).filter(|room_id| !room_id.is_empty()) else {
+        return Ok(None);
+    };
+
+    RoomId::parse(room_id).map(Some).ok_or_else(|| {
+        format!("unsupported room_id '{room_id}'; supported rooms: pm, writers, orch_mesh, review")
+    })
+}
+
+fn apply_room_guidance(room_id: Option<RoomId>, prompt: &str) -> String {
+    match room_id {
+        Some(room_id) => format!("{}\n\n{}", room_guidance(room_id), prompt),
+        None => prompt.to_string(),
+    }
 }
 
 async fn agent_events(
@@ -1281,14 +1791,6 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             tool: call.name,
             args: call.args_json,
         }),
-        AgentTurnEvent::ToolCallFinished {
-            turn_id: _,
-            call_id: _,
-            result,
-        } => Some(OceanEvent::ToolEnded {
-            tool: "tool".into(),
-            is_error: !result.ok,
-        }),
         AgentTurnEvent::TurnFinished {
             turn_id: _,
             status,
@@ -1308,6 +1810,14 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             tool: "tool".into(),
             text: chunk,
             is_error: false,
+        }),
+        AgentTurnEvent::ToolCallFinished {
+            turn_id: _,
+            call_id: _,
+            result,
+        } => Some(OceanEvent::ToolEnded {
+            tool: "tool".into(),
+            is_error: !result.ok,
         }),
         AgentTurnEvent::SessionCreated {
             session_id: _,
@@ -1356,7 +1866,9 @@ fn render_tool_output(content: &[ocean_protocol::Content]) -> String {
                 out.push_str(thinking);
             }
             Content::Image { .. } => {}
-            Content::ToolCall { name, arguments, .. } => {
+            Content::ToolCall {
+                name, arguments, ..
+            } => {
                 if !out.is_empty() {
                     out.push('\n');
                 }
@@ -1620,5 +2132,87 @@ mod tests {
         let decision = rx.await.unwrap();
         assert!(matches!(decision, AgentPermissionDecision::Deny { .. }));
         assert!(permissions.read().await.get(&permission_id).is_none());
+    }
+
+    #[test]
+    fn parse_room_id_rejects_unknown_ids() {
+        let error = parse_agent_turn_room(Some("bogus")).unwrap_err();
+        assert!(error.contains("unsupported room_id 'bogus'"));
+        assert!(error.contains("pm, writers, orch_mesh, review"));
+    }
+
+    #[test]
+    fn room_guidance_is_optional_for_legacy_requests() {
+        assert_eq!(parse_agent_turn_room(None).unwrap(), None);
+        let guided = apply_room_guidance(None, "build the thing");
+        assert_eq!(guided, "build the thing");
+    }
+
+    #[test]
+    fn room_guidance_is_prepended_for_canonical_rooms() {
+        for (wire, room_name) in [
+            ("pm", "PM room"),
+            ("writers", "Writers Room"),
+            ("orch_mesh", "ORCH + MESH"),
+            ("review", "Review Room"),
+        ] {
+            let room = parse_agent_turn_room(Some(wire)).unwrap().unwrap();
+            let guided = apply_room_guidance(Some(room), "verify the diff");
+            assert!(guided.contains(room_name));
+            assert!(guided.ends_with("verify the diff"));
+        }
+    }
+
+    #[test]
+    fn room_projection_renders_empty_panels() {
+        let input = RoomProjectionInput {
+            runtime_status: "ocean-native-fake · fake · model · ready".into(),
+            sessions: vec![],
+            requests: vec![],
+            permissions: vec![],
+            events: vec![],
+        };
+
+        let room = build_room_snapshot(&input, RoomId::Pm);
+        let rooms = build_room_snapshots(&input);
+
+        assert_eq!(room.room_id, RoomId::Pm);
+        assert_eq!(room.panels.len(), 3);
+        assert_eq!(room.panels[0].lines, vec!["no recent events".to_string()]);
+        assert!(room.status.contains("ocean-native-fake"));
+        assert_eq!(rooms.len(), 4);
+        assert_eq!(rooms[0].room_id, RoomId::Pm);
+        assert_eq!(rooms[3].room_id, RoomId::Review);
+    }
+
+    #[tokio::test]
+    async fn event_bus_records_recent_history() {
+        let events = EventBus::new(4);
+        let request_id = RequestId::new_v4();
+        let session_id = SessionId::new_v4();
+
+        emit(
+            &events,
+            Some(session_id),
+            Some(request_id),
+            None,
+            OceanEvent::UserMessage {
+                text: "hello".into(),
+            },
+        );
+        emit(
+            &events,
+            Some(session_id),
+            Some(request_id),
+            None,
+            OceanEvent::AssistantDelta {
+                text: "world".into(),
+            },
+        );
+
+        let recent = events.recent(2);
+        assert_eq!(recent.len(), 2);
+        assert!(matches!(recent[0].event, OceanEvent::AssistantDelta { .. }));
+        assert!(matches!(recent[1].event, OceanEvent::UserMessage { .. }));
     }
 }

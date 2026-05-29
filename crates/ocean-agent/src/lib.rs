@@ -7,7 +7,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
-    PromptRequest, PromptResponse, RequestId, SessionDetail, SessionId, SessionRunState,
+    PromptRequest, PromptResponse, RequestId, RoomId, SessionDetail, SessionId, SessionRunState,
     SessionSummary, SessionToolContext, SessionTranscriptEntry,
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
@@ -25,6 +25,24 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const APP_NAME: &str = "ocean-rs";
+
+/// Room-specific operator guidance injected by the daemon before runtime turns.
+pub fn room_guidance(room_id: RoomId) -> &'static str {
+    match room_id {
+        RoomId::Pm => {
+            "PM room: operator proxy and foreground agent turns. Keep focus on the current instruction, streamed output, and command status."
+        }
+        RoomId::Writers => {
+            "Writers Room: drafts, sources, and handoff context. Keep output oriented to writing, doc edits, and source references."
+        }
+        RoomId::OrchMesh => {
+            "ORCH + MESH: route requests, permissions, and event state. Keep changes operational, concise, and traceable."
+        }
+        RoomId::Review => {
+            "Review Room: review notes, validation evidence, and release proof. Focus on risks, diffs, and test results."
+        }
+    }
+}
 
 /// Inner runtime state that's swappable at runtime (model, provider, key).
 /// Kept behind an `Arc<RwLock<_>>` so a single AgentRuntime instance can
@@ -444,10 +462,7 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
             "claude-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
             "claude-opus-4-7" => Model::anthropic_claude_opus_4_7(),
             _ => {
-                anyhow::bail!(
-                    "unsupported anthropic model '{}'",
-                    selection.model
-                );
+                anyhow::bail!("unsupported anthropic model '{}'", selection.model);
             }
         }),
     }
@@ -989,6 +1004,14 @@ mod tests {
             panic!("expected assistant message");
         };
         assert_eq!(assistant.content, vec![Content::text("visible answer")]);
+    }
+
+    #[test]
+    fn room_guidance_matches_track0_rooms() {
+        assert!(room_guidance(RoomId::Pm).contains("PM room"));
+        assert!(room_guidance(RoomId::Writers).contains("Writers Room"));
+        assert!(room_guidance(RoomId::OrchMesh).contains("ORCH + MESH"));
+        assert!(room_guidance(RoomId::Review).contains("Review Room"));
     }
 
     #[tokio::test]

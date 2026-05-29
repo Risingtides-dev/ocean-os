@@ -4,8 +4,8 @@ This is the no-feature-drop contract for migrating the current Tides Mesh/operat
 
 ## Rules
 
-- Keep the existing tmux/operator layout working until Rust parity is proven.
-- Read the same file-backed sources first; do not change runtime authority.
+- Keep the existing tmux/operator layout working as a temporary visual reference until Rust parity is proven.
+- Read the same file-backed sources first; the tmux floor is not runtime authority.
 - Preserve the four core views: board, events, inbox, agents.
 - Preserve operator shortcuts, narrow-pane behavior, and visible failure/reconnect states.
 - Coordinate through live `pi_messenger` feed/mailbox; do not hide team state.
@@ -108,6 +108,7 @@ Rust Ocean TUI may replace `scripts/pimesh-tui.mjs` only after it matches:
 - the same board/task grouping
 - the same visible error/reconnect behavior
 - no change to runtime authority
+- decommission gate: F1-F4 must render, submit, stream, and cancel through Ocean runtime before tmux can be retired as the primary visual floor
 
 ## Acceptance checks
 

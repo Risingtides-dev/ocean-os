@@ -203,6 +203,81 @@ pub struct SessionResponse {
     pub error: Option<String>,
 }
 
+/// Canonical Track-0 room identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomId {
+    Pm,
+    Writers,
+    OrchMesh,
+    Review,
+}
+
+impl RoomId {
+    /// Parse a room id from the public route segment.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pm" => Some(Self::Pm),
+            "writers" => Some(Self::Writers),
+            "orch_mesh" => Some(Self::OrchMesh),
+            "review" => Some(Self::Review),
+            _ => None,
+        }
+    }
+
+    /// Human-readable room name for titles and logs.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Pm => "PM",
+            Self::Writers => "Writers Room",
+            Self::OrchMesh => "ORCH + MESH",
+            Self::Review => "Review Room",
+        }
+    }
+
+    /// Short summary used by room projections when no room-specific data exists.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Pm => "operator proxy and foreground agent turns",
+            Self::Writers => "drafts, sources, and handoff context",
+            Self::OrchMesh => "request, permission, and event rail",
+            Self::Review => "review, validation, and release proof",
+        }
+    }
+}
+
+/// One panel in a projected room snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomPanelSnapshot {
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+/// One Track-0 room projection derived from daemon/runtime state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomSnapshot {
+    pub room_id: RoomId,
+    pub title: String,
+    pub summary: String,
+    pub status: String,
+    pub updated_ms: i64,
+    #[serde(default)]
+    pub panels: Vec<RoomPanelSnapshot>,
+}
+
+/// Response payload for room projection endpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomsResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub rooms: Vec<RoomSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Response payload for `POST /v1/requests`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestCreateResponse {
@@ -456,5 +531,33 @@ mod tests {
 
         assert!(!RequestState::Completed.is_cancellable());
         assert!(!RequestState::Running.is_terminal());
+    }
+
+    #[test]
+    fn room_projection_roundtrips_through_serde() {
+        let response = RoomsResponse {
+            ok: true,
+            rooms: vec![RoomSnapshot {
+                room_id: RoomId::OrchMesh,
+                title: RoomId::OrchMesh.title().into(),
+                summary: RoomId::OrchMesh.summary().into(),
+                status: "ready".into(),
+                updated_ms: 123,
+                panels: vec![RoomPanelSnapshot {
+                    title: "Board".into(),
+                    kind: "list".into(),
+                    status: "empty".into(),
+                    lines: vec!["no requests yet".into()],
+                }],
+            }],
+            error: None,
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["rooms"][0]["room_id"], "orch_mesh");
+        assert_eq!(json["rooms"][0]["title"], "ORCH + MESH");
+
+        let roundtrip: RoomsResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, response);
     }
 }
