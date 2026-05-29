@@ -28,8 +28,8 @@ use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as CorePermissionDecision, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, PromptRequest, RequestControlResponse, RequestId,
-    RequestState, RequestStatus, RequestsResponse, SessionDetail, SessionId, SessionResponse,
-    SessionRunState, SessionSummary,
+    RequestState, RequestStatus, RequestsResponse, RoomId, RoomSnapshot, RoomsResponse,
+    SessionDetail, SessionId, SessionResponse, SessionRunState, SessionSummary,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -295,10 +295,7 @@ enum PmBlock {
     Text(String),
     /// Hidden reasoning. Collapsed by default; expand with Space/Enter
     /// when focused.
-    Thinking {
-        content: String,
-        expanded: bool,
-    },
+    Thinking { content: String, expanded: bool },
     /// One tool call dispatched by the assistant. `args_preview` is a
     /// short one-liner shown in the collapsed header; `output` streams
     /// in from ToolCallChunk and finalises on ToolCallFinished.
@@ -354,6 +351,7 @@ struct DaemonApp {
     pm_thinking_default_expanded: bool,
     tool_timeline: Vec<ToolTimelineEntry>,
     diff_snippets: Vec<String>,
+    room_snapshots: Vec<RoomSnapshot>,
     support: WorkspaceSupportState,
     status: String,
     stream_status: String,
@@ -394,6 +392,7 @@ impl DaemonApp {
             pm_thinking_default_expanded: false,
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
+            room_snapshots: Vec::new(),
             support: WorkspaceSupportState::default(),
             status: "starting workspace shell".to_string(),
             stream_status: "connecting".to_string(),
@@ -581,7 +580,13 @@ impl DaemonApp {
         }
     }
 
-    fn pm_finish_tool(&mut self, turn_id: AgentTurnId, call_id: &str, ok: bool, final_output: &str) {
+    fn pm_finish_tool(
+        &mut self,
+        turn_id: AgentTurnId,
+        call_id: &str,
+        ok: bool,
+        final_output: &str,
+    ) {
         let turn = self.pm_assistant_turn_mut(turn_id);
         for block in turn.blocks.iter_mut().rev() {
             if let PmBlock::ToolCall {
@@ -953,10 +958,10 @@ impl DaemonApp {
         if lines.is_empty() {
             lines.push(Line::from("> ▏"));
         }
-        let submit_hint = if self.active_room == WorkspaceRoom::PM {
+        let submit_hint = if self.active_room.runtime_submit_room_id().is_some() {
             "Enter submits /v1/agent/turns"
         } else {
-            "Enter queues local operator instruction"
+            "Enter is provisional (no runtime submit)"
         };
         lines.push(Line::from(format!(
             "target: {} · {}",
@@ -967,7 +972,43 @@ impl DaemonApp {
     }
 
     fn room_lines(&self, width: usize) -> Vec<Line<'static>> {
-        render_workspace_room_lines(self, width)
+        if self.active_room.runtime_room_id().is_none() {
+            return vec![
+                Line::from(format!("{} placeholder", self.active_room.label())),
+                Line::from("runtime projection available for F1-F4 only"),
+            ];
+        }
+
+        if let Some(snapshot) = self.active_room_snapshot() {
+            let mut lines = vec![
+                Line::from(format!(
+                    "{} — {}",
+                    snapshot.title,
+                    compact_text(&snapshot.summary, width.saturating_sub(10))
+                )),
+                Line::from(format!(
+                    "status: {} · {} panel(s)",
+                    compact_text(&snapshot.status, 64),
+                    snapshot.panels.len()
+                )),
+            ];
+            if let Some(panel) = snapshot.panels.first() {
+                lines.push(Line::from(format!(
+                    "{} [{}] {}",
+                    panel.title, panel.kind, panel.status
+                )));
+                lines.extend(
+                    panel
+                        .lines
+                        .iter()
+                        .take(4)
+                        .map(|line| Line::from(compact_text(line, width.saturating_sub(2)))),
+                );
+            }
+            return lines;
+        }
+
+        self.render_active_room_empty_state()
     }
 
     fn support_lines(&self) -> Vec<Line<'static>> {
@@ -1001,6 +1042,43 @@ impl DaemonApp {
             lines.push(Line::from(format!("sidecar sources {}", source_count)));
         }
         lines
+    }
+
+    fn active_room_snapshot(&self) -> Option<&RoomSnapshot> {
+        self.active_room.runtime_room_id().and_then(|room_id| {
+            self.room_snapshots
+                .iter()
+                .find(|snapshot| snapshot.room_id == room_id)
+        })
+    }
+
+    fn render_active_room_empty_state(&self) -> Vec<Line<'static>> {
+        if self.room_snapshots.is_empty() {
+            return vec![
+                Line::from("room runtime snapshots unavailable"),
+                Line::from("start daemon + /v1/rooms for live room views"),
+                Line::from("fallback data: check mesh files is legacy only"),
+            ];
+        }
+
+        match self.active_room {
+            WorkspaceRoom::PM
+            | WorkspaceRoom::Writers
+            | WorkspaceRoom::Orchestrator
+            | WorkspaceRoom::Rev => {
+                vec![Line::from(format!(
+                    "room {} has no runtime snapshot",
+                    self.active_room.label()
+                ))]
+            }
+            WorkspaceRoom::TideDash | WorkspaceRoom::WorkOps | WorkspaceRoom::WorldMap => vec![
+                Line::from(format!(
+                    "{} intentionally read-only placeholder",
+                    self.active_room.label()
+                )),
+                Line::from("runtime projection defined only for F1-F4"),
+            ],
+        }
     }
 
     fn pending_permission_lines(&self) -> Vec<Line<'static>> {
@@ -1243,6 +1321,25 @@ impl WorkspaceRoom {
             Self::WorkOps => "WorkOps",
             Self::WorldMap => "WorldMap",
         }
+    }
+
+    fn runtime_room_id(self) -> Option<RoomId> {
+        match self {
+            Self::PM => Some(RoomId::Pm),
+            Self::Writers => Some(RoomId::Writers),
+            Self::Orchestrator => Some(RoomId::OrchMesh),
+            Self::Rev => Some(RoomId::Review),
+            Self::TideDash | Self::WorkOps | Self::WorldMap => None,
+        }
+    }
+
+    fn runtime_submit_room_id(self) -> Option<&'static str> {
+        Some(match self.runtime_room_id()? {
+            RoomId::Pm => "pm",
+            RoomId::Writers => "writers",
+            RoomId::OrchMesh => "orch_mesh",
+            RoomId::Review => "review",
+        })
     }
 
     fn all() -> [Self; 7] {
@@ -1545,6 +1642,34 @@ impl DaemonClient {
             .and_then(|res| res.error_for_status())
             .map_err(|err| err.to_string())?
             .json::<SessionsResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn room_snapshots(&self, base_url: &str) -> Result<RoomsResponse, String> {
+        let url = format!("{}/v1/rooms", base_url.trim_end_matches('/'));
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<RoomsResponse>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn room_snapshot(&self, base_url: &str, room_id: RoomId) -> Result<RoomsResponse, String> {
+        let room_id = match room_id {
+            RoomId::Pm => "pm",
+            RoomId::Writers => "writers",
+            RoomId::OrchMesh => "orch_mesh",
+            RoomId::Review => "review",
+        };
+        let url = format!("{}/v1/rooms/{room_id}", base_url.trim_end_matches('/'));
+        self.http
+            .get(url)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<RoomsResponse>()
             .map_err(|err| err.to_string())
     }
 
@@ -2190,9 +2315,8 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
                 Err(err) => {
                     let line = format!("model swap failed: {}", compact_text(&err, 72));
                     let _ = action_tx.send(Action::StreamStatus(line.clone()));
-                    let _ = action_tx.send(Action::PmSystemMessage(format!(
-                        "Model swap failed: {err}"
-                    )));
+                    let _ = action_tx
+                        .send(Action::PmSystemMessage(format!("Model swap failed: {err}")));
                 }
             });
         }
@@ -2264,6 +2388,7 @@ fn daemon_refresh_all(client: &DaemonClient, state: &mut AppState) {
     daemon_refresh_sessions(client, app);
     daemon_refresh_requests(client, app);
     daemon_refresh_permissions(client, app);
+    daemon_refresh_room_snapshots(client, app);
     app.refresh_support_state();
 }
 
@@ -2297,7 +2422,11 @@ fn daemon_refresh_sessions(client: &DaemonClient, app: &mut DaemonApp) {
                 "sessions refreshed: {} ({}) {}",
                 app.sessions.len(),
                 app.selected_session_label(),
-                if app.show_all_sessions { "[all workspaces]" } else { "[this workspace]" },
+                if app.show_all_sessions {
+                    "[all workspaces]"
+                } else {
+                    "[this workspace]"
+                },
             );
             daemon_refresh_selected_session_detail(client, app);
         }
@@ -2361,6 +2490,30 @@ fn daemon_refresh_permissions(client: &DaemonClient, app: &mut DaemonApp) {
     }
 }
 
+fn daemon_refresh_room_snapshots(client: &DaemonClient, app: &mut DaemonApp) {
+    match client.room_snapshots(&app.url) {
+        Ok(res) if res.ok => {
+            app.room_snapshots = res.rooms;
+            if app.room_snapshots.is_empty() {
+                app.status = "rooms refreshed: empty".to_string();
+            } else {
+                app.status = format!("rooms refreshed: {}", app.room_snapshots.len());
+            }
+            if app.active_room.runtime_room_id().is_some() && app.active_room_snapshot().is_none() {
+                app.status.push_str(" · fallback for active room");
+            }
+        }
+        Ok(res) => {
+            app.room_snapshots.clear();
+            app.status = format!("rooms error: {}", res.error.unwrap_or_default());
+        }
+        Err(err) => {
+            app.room_snapshots.clear();
+            app.status = format!("rooms request error: {err}");
+        }
+    }
+}
+
 fn daemon_cancel_active(client: &DaemonClient, app: &mut DaemonApp) {
     let Some(request_id) = app.cancellable_request_id() else {
         app.status = "no cancellable request".to_string();
@@ -2402,7 +2555,7 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
 
     app.push_transcript(format!("You: {instruction}"));
 
-    if app.active_room == WorkspaceRoom::PM {
+    if let Some(room_id) = app.active_room.runtime_submit_room_id() {
         app.pm_push_user_prompt(instruction.clone());
         let action_tx = state.action_tx.clone();
         let url = app.url.clone();
@@ -2414,14 +2567,17 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
                 .to_string_lossy()
                 .into_owned(),
             guidance: None,
+            room_id: Some(room_id.to_string()),
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(
-            "pm_agent_turn_submit endpoint=/v1/agent/turns text={}",
+            "agent_turn_submit room={} endpoint=/v1/agent/turns text={}",
+            room_id,
             compact_text(&instruction, 72)
         ));
         app.status = format!(
-            "PM agent turn submitted: {}",
+            "{} agent turn submitted: {}",
+            app.active_room.label(),
             compact_text(&instruction, 56)
         );
         let client = client.clone();
@@ -2432,7 +2588,7 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             }
             Err(err) => {
                 let _ = action_tx.send(Action::StreamStatus(format!(
-                    "PM agent turn submit error: {}",
+                    "agent turn submit error ({room_id}): {}",
                     compact_text(&err, 72)
                 )));
                 let _ = action_tx.send(Action::RefreshAll);
@@ -2440,15 +2596,10 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
         });
     } else {
         app.push_activity(format!(
-            "operator_instruction room={} text={}",
-            app.active_room.label(),
-            compact_text(&instruction, 72)
+            "composer for {} is provisional and unsupported in runtime submit path",
+            app.active_room.label()
         ));
-        app.status = format!(
-            "queued local instruction for {}: {}",
-            app.active_room.label(),
-            compact_text(&instruction, 56)
-        );
+        app.status = format!("provisional room unsupported: {}", app.active_room.label());
     }
 }
 
@@ -2586,9 +2737,9 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
         names: &["/sessions", "/ls"],
         help: "List sessions for this workspace. `/sessions all` for everything.",
         execute: |app, args| {
-            let want_all = args.map(|s| s.trim()).is_some_and(|s| {
-                matches!(s, "all" | "-a" | "--all" | "every")
-            });
+            let want_all = args
+                .map(|s| s.trim())
+                .is_some_and(|s| matches!(s, "all" | "-a" | "--all" | "every"));
             app.show_all_sessions = want_all;
             // Schedule a refresh on next tick; meanwhile render whatever is cached.
             app.last_checked = None;
@@ -2611,10 +2762,12 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
                         let ws = session
                             .workspace_root
                             .as_deref()
-                            .map(|p| std::path::Path::new(p)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| p.to_string()))
+                            .map(|p| {
+                                std::path::Path::new(p)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| p.to_string())
+                            })
                             .unwrap_or_else(|| "—".to_string());
                         let branch = session.git_branch.as_deref().unwrap_or("·");
                         format!(
@@ -2699,7 +2852,11 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
                     }
                 }
             }
-            let label = if next { "on (full stream)" } else { "off (collapsed pill)" };
+            let label = if next {
+                "on (full stream)"
+            } else {
+                "off (collapsed pill)"
+            };
             app.push_transcript(format!("Ocean: thinking render → {label}"));
             app.status = format!("thinking render: {label}");
         },
@@ -3562,32 +3719,45 @@ fn load_unified_snapshot(root: &Path) -> anyhow::Result<UnifiedSnapshot> {
 }
 
 fn render_workspace_room_lines(app: &DaemonApp, width: usize) -> Vec<Line<'static>> {
-    let mesh = &app.support.mesh;
-    let mut lines = vec![
-        Line::from(format!("{} shell", app.active_room.label())),
-        Line::from(format!(
-            "tasks todo {} · active {} · review/block {} · done {}",
-            mesh.counts.todo,
-            mesh.counts.in_progress,
-            mesh.counts.review + mesh.counts.blocked,
-            mesh.counts.done
-        )),
-        Line::from(format!(
-            "feed {} · inbox {} · agents {}",
-            mesh.feed.len(),
-            mesh.inbox.len(),
-            mesh.agents.len()
-        )),
-    ];
-    if let Some(event) = mesh.feed.first() {
-        lines.push(Line::from(compact_text(
-            &render_feed_event(event, width.saturating_sub(4)),
-            width.saturating_sub(4),
+    if let Some(snapshot) = app.active_room_snapshot() {
+        let mut lines = vec![
+            Line::from(compact_text(&snapshot.title, width.saturating_sub(4)).to_string()),
+            Line::from(format!(
+                "{} · {}",
+                compact_text(&snapshot.summary, width.saturating_sub(20)),
+                compact_text(&snapshot.status, 24)
+            )),
+        ];
+        if let Some(panel) = snapshot.panels.first() {
+            lines.push(Line::from(format!(
+                "{} [{}] {}",
+                compact_text(&panel.title, 14),
+                compact_text(&panel.kind, 12),
+                compact_text(&panel.status, 12)
+            )));
+            lines.extend(
+                panel
+                    .lines
+                    .iter()
+                    .take(4)
+                    .map(|line| Line::from(compact_text(line, width.saturating_sub(2)))),
+            );
+        } else {
+            lines.push(Line::from("(no runtime panels)"));
+        }
+        return lines;
+    }
+
+    let mut lines = vec![Line::from(format!("{} shell", app.active_room.label()))];
+    if app.active_room.runtime_room_id().is_none() {
+        lines.push(Line::from(format!(
+            "{} room is placeholder",
+            app.active_room.label()
         )));
+        lines.push(Line::from("Runtime projection available for F1-F4 only."));
     } else {
-        lines.push(Line::from(
-            "fixture: room body uses tmux-shaped panes in rooms.rs",
-        ));
+        lines.push(Line::from("room snapshots unavailable"));
+        lines.push(Line::from("daemon unreachable or rooms not yet loaded"));
     }
     lines
 }
@@ -3964,10 +4134,7 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     // (taller) frame — e.g. an expanded tool block that just collapsed —
     // don't leave residue on screen.
     frame.render_widget(Clear, transcript_area);
-    frame.render_widget(
-        Paragraph::new(rendered).wrap(Wrap { trim: false }),
-        inset,
-    );
+    frame.render_widget(Paragraph::new(rendered).wrap(Wrap { trim: false }), inset);
 
     let separator = "─".repeat(layout[1].width as usize);
     frame.render_widget(
@@ -4018,35 +4185,27 @@ fn render_markdown_lines(src: &str, indent: &'static str) -> Vec<Line<'static>> 
                 s = s.add_modifier(Modifier::BOLD);
                 style_stack.push(s);
             }
-            Event::End(TagEnd::Strong) => {
-                if style_stack.len() > 1 {
-                    style_stack.pop();
-                }
+            Event::End(TagEnd::Strong) if style_stack.len() > 1 => {
+                style_stack.pop();
             }
             Event::Start(Tag::Emphasis) => {
                 let mut s = cur_style(&style_stack);
                 s = s.add_modifier(Modifier::ITALIC);
                 style_stack.push(s);
             }
-            Event::End(TagEnd::Emphasis) => {
-                if style_stack.len() > 1 {
-                    style_stack.pop();
-                }
+            Event::End(TagEnd::Emphasis) if style_stack.len() > 1 => {
+                style_stack.pop();
             }
             Event::Start(Tag::Strikethrough) => {
                 let mut s = cur_style(&style_stack);
                 s = s.add_modifier(Modifier::CROSSED_OUT);
                 style_stack.push(s);
             }
-            Event::End(TagEnd::Strikethrough) => {
-                if style_stack.len() > 1 {
-                    style_stack.pop();
-                }
+            Event::End(TagEnd::Strikethrough) if style_stack.len() > 1 => {
+                style_stack.pop();
             }
-            Event::Start(Tag::Heading { level, .. }) => {
-                if !current.is_empty() {
-                    push_line(&mut lines, &mut current);
-                }
+            Event::Start(Tag::Heading { level, .. }) if !current.is_empty() => {
+                push_line(&mut lines, &mut current);
                 let prefix = match level {
                     HeadingLevel::H1 => "█ ",
                     HeadingLevel::H2 => "▌ ",
@@ -4054,7 +4213,9 @@ fn render_markdown_lines(src: &str, indent: &'static str) -> Vec<Line<'static>> 
                 };
                 current.push(Span::styled(
                     prefix,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 let mut s = Style::default()
                     .fg(Color::White)
@@ -4070,10 +4231,8 @@ fn render_markdown_lines(src: &str, indent: &'static str) -> Vec<Line<'static>> 
                 }
                 push_line(&mut lines, &mut current);
             }
-            Event::Start(Tag::Paragraph) => {
-                if !current.is_empty() {
-                    push_line(&mut lines, &mut current);
-                }
+            Event::Start(Tag::Paragraph) if !current.is_empty() => {
+                push_line(&mut lines, &mut current);
             }
             Event::End(TagEnd::Paragraph) => {
                 push_line(&mut lines, &mut current);
@@ -4151,14 +4310,8 @@ fn render_markdown_lines(src: &str, indent: &'static str) -> Vec<Line<'static>> 
                     for raw in text.lines() {
                         let mut spans = vec![
                             Span::raw(indent),
-                            Span::styled(
-                                "  ".to_string(),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::styled(
-                                raw.to_string(),
-                                Style::default().fg(Color::LightYellow),
-                            ),
+                            Span::styled("  ".to_string(), Style::default().fg(Color::DarkGray)),
+                            Span::styled(raw.to_string(), Style::default().fg(Color::LightYellow)),
                         ];
                         if !current.is_empty() {
                             current.append(&mut Vec::new());
@@ -4301,14 +4454,14 @@ fn render_pm_block(lines: &mut Vec<Line<'static>>, block: &PmBlock, focused: boo
         }
         PmBlock::Thinking { content, expanded } => {
             let arrow = if *expanded { "▾" } else { "▸" };
-            let header = format!(
-                "  {} thinking… ({} chars)",
-                arrow,
-                content.chars().count()
-            );
+            let header = format!("  {} thinking… ({} chars)", arrow, content.chars().count());
             lines.push(Line::from(Span::styled(
                 header,
-                focus_style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                focus_style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
             )));
             if *expanded {
                 for line in content.lines() {
@@ -4316,7 +4469,9 @@ fn render_pm_block(lines: &mut Vec<Line<'static>>, block: &PmBlock, focused: boo
                         Span::raw("    "),
                         Span::styled(
                             line.to_string(),
-                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
                         ),
                     ]));
                 }
@@ -5922,6 +6077,71 @@ mod tests {
             f3,
             Some(Action::SelectRoom(WorkspaceRoom::Orchestrator))
         ));
+    }
+
+    #[test]
+    fn daemon_room_snapshots_active_room_helper() {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        assert!(app.active_room_snapshot().is_none());
+
+        app.room_snapshots = vec![RoomSnapshot {
+            room_id: RoomId::Pm,
+            title: "PM".to_string(),
+            summary: "operator proxy and turns".to_string(),
+            status: "active".to_string(),
+            updated_ms: 1,
+            panels: vec![],
+        }];
+
+        assert!(app.active_room_snapshot().is_some());
+        app.active_room = WorkspaceRoom::Orchestrator;
+        assert!(app.active_room_snapshot().is_none());
+    }
+
+    #[test]
+    fn daemon_room_submit_ids_map_for_f1_f4_rooms() {
+        assert_eq!(WorkspaceRoom::PM.runtime_submit_room_id(), Some("pm"));
+        assert_eq!(
+            WorkspaceRoom::Writers.runtime_submit_room_id(),
+            Some("writers")
+        );
+        assert_eq!(
+            WorkspaceRoom::Orchestrator.runtime_submit_room_id(),
+            Some("orch_mesh")
+        );
+        assert_eq!(WorkspaceRoom::Rev.runtime_submit_room_id(), Some("review"));
+        assert_eq!(WorkspaceRoom::TideDash.runtime_submit_room_id(), None);
+        assert_eq!(WorkspaceRoom::WorkOps.runtime_submit_room_id(), None);
+        assert_eq!(WorkspaceRoom::WorldMap.runtime_submit_room_id(), None);
+    }
+
+    #[test]
+    fn daemon_submit_on_provisional_room_is_noop_status() {
+        let client = DaemonClient::new().expect("client");
+        let (action_tx, _action_rx) = mpsc::channel();
+        let mut state = AppState::new(
+            UiMode::Daemon(Box::new(DaemonApp::new(
+                "http://127.0.0.1:4780".to_string(),
+                PathBuf::from("."),
+            ))),
+            action_tx,
+        );
+
+        let UiMode::Daemon(app) = &mut state.mode else {
+            panic!("expected daemon mode");
+        };
+        app.active_room = WorkspaceRoom::WorkOps;
+        app.input = "manual note".to_string();
+        app.status = "starting".to_string();
+
+        let result = handle_daemon_action(&client, &mut state, Action::SubmitComposer);
+        let UiMode::Daemon(app) = &state.mode else {
+            panic!("expected daemon mode");
+        };
+
+        assert!(result);
+        assert_eq!(app.input, "");
+        assert!(app.status.contains("provisional room unsupported"));
     }
 
     #[test]

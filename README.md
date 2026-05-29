@@ -20,6 +20,21 @@ Ocean OS is a local-first agent runtime written in Rust. A long-running daemon o
 
 ## Quick start
 
+## Product framing
+
+`ocean-rs` is the canonical Rust-native coding-agent harness/runtime for Ocean.
+It is **not** a Pi fork. We are using Pi concepts as reference material, then building a lower-level Rust runtime and operator floor in Rust.
+
+- `ocean-rs` is the canonical Rust-native coding-agent harness/runtime.
+- `ocean-daemon` owns runtime authority: provider calls, agent loops, tools, sessions, permissions, and events.
+- `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that harness, not a passive daemon dashboard.
+- F1 PM is the minimal Rust-backed agent-turn chat lane.
+- F2-F4 are the rest of the active runtime-backed Track-0 rooms; F5-F7 remain provisional.
+- The existing Pi/tmux floor is only a temporary visual reference until F1-F4 can render, submit, stream, and cancel through Ocean runtime.
+- Ocean GUI and service layers remain thin clients until the daemon protocol is stable.
+
+Run the daemon:
+
 ```bash
 # Build
 cargo build --workspace --release

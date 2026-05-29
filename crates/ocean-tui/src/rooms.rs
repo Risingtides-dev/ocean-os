@@ -11,6 +11,8 @@ use ratatui::{
     Frame,
 };
 
+use ocean_core::RoomPanelSnapshot;
+
 use crate::{DaemonApp, WorkspaceRoom};
 
 /// Render the selected Track-0 room body into the provided area.
@@ -27,231 +29,65 @@ pub fn draw_daemon_room_body(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp)
 }
 
 fn draw_room_pm(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
-    draw_lines_pane(
-        frame,
-        area,
-        "PM",
-        app.transcript_lines(
-            area.width.saturating_sub(2) as usize,
-            area.height.saturating_sub(2) as usize,
-        ),
-    );
+    if app.active_room == crate::WorkspaceRoom::PM {
+        draw_runtime_room_panes(frame, area, app);
+    } else {
+        draw_lines_pane(
+            frame,
+            area,
+            "PM",
+            vec![Line::from(
+                "PM room is provisional until runtime room selected",
+            )],
+        );
+    }
 }
 
 fn draw_room_writers(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
-    let mesh = &app.support.mesh;
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(cols[1]);
+    if app.active_room == crate::WorkspaceRoom::Writers {
+        draw_runtime_room_panes(frame, area, app);
+        return;
+    }
 
     draw_lines_pane(
         frame,
-        cols[0],
-        "NoteDash",
-        vec![
-            Line::from("# Notes / source queue"),
-            Line::from("- Track-0 shell mirrors tmux layout"),
-            Line::from("- Use fake data until live adapters are ready"),
-            Line::from("- Keep room names exact"),
-            Line::from(""),
-            Line::from("# Drafts"),
-            Line::from("- Operator proof checklist"),
-            Line::from("- Ratatui room shell handoff"),
-        ],
-    );
-
-    draw_lines_pane(
-        frame,
-        right[0],
-        "π writer",
-        vec![
-            Line::from(format!("Henry: {}", crate::agent_presence(mesh, "Henry"))),
-            Line::from("Role: writing / docs lane"),
-            Line::from("Prompt: summarize room-shell proof after validation"),
-            Line::from("Last: standing by for UI proof"),
-        ],
-    );
-
-    draw_lines_pane(
-        frame,
-        right[1],
-        "lynx / browser",
-        vec![
-            Line::from("Browser/context pane"),
-            Line::from("  docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md"),
-            Line::from("  ratatui layout primitives"),
-            Line::from("  tmux window snapshot"),
-        ],
+        area,
+        "Writers Room",
+        vec![Line::from(
+            "writers room is provisional without runtime room selection",
+        )],
     );
 }
 
 fn draw_room_orch_mesh(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
-    let mesh = &app.support.mesh;
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(31),
-            Constraint::Percentage(49),
-            Constraint::Percentage(20),
-        ])
-        .split(area);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(14),
-            Constraint::Min(18),
-            Constraint::Min(12),
-        ])
-        .split(cols[0]);
-    let center = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Min(20)])
-        .split(cols[1]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(49), Constraint::Min(20)])
-        .split(cols[2]);
-
-    draw_lines_pane(
-        frame,
-        left[0],
-        "Glyph",
-        vec![
-            Line::from("Glyph ledger / heartbeat"),
-            Line::from(format!("tasks: {} total", mesh.tasks.len())),
-            Line::from(format!("events: {} live", mesh.feed.len())),
-            Line::from(format!(
-                "agents: {} active / {} away / {} stale",
-                mesh.agent_counts.active, mesh.agent_counts.away, mesh.agent_counts.stale
-            )),
-        ],
-    );
-    draw_agent_pane(frame, left[1], mesh, "KNOX", "review gate");
-    draw_agent_pane(frame, left[2], mesh, "Charlotte", "research");
-
-    let mut board_lines = vec![
-        Line::from("TIDES-MESH Kanban / task / issues board"),
-        Line::from(format!(
-            "todo {} · active {} · review/block {} · done {}",
-            mesh.counts.todo,
-            mesh.counts.in_progress,
-            mesh.counts.review + mesh.counts.blocked,
-            mesh.counts.done
-        )),
-        Line::from(""),
-    ];
-    if mesh.feed.is_empty() {
-        board_lines.extend([
-            Line::from("fixture: BRICK patch running"),
-            Line::from("fixture: KNOX review queued"),
-            Line::from("fixture: PIXEL proving Ratatui shell"),
-        ]);
-    } else {
-        board_lines.extend(
-            mesh.feed
-                .iter()
-                .take(center[0].height.saturating_sub(5) as usize)
-                .map(|event| Line::from(crate::render_feed_event(event, center[0].width as usize))),
-        );
+    if app.active_room == crate::WorkspaceRoom::Orchestrator {
+        draw_runtime_room_panes(frame, area, app);
+        return;
     }
-    draw_lines_pane(frame, center[0], "Kanban / Tasks / Issues", board_lines);
 
     draw_lines_pane(
         frame,
-        center[1],
-        "Orchestrator pane %85",
-        vec![
-            Line::from("Restored Orchestrator control pane"),
-            Line::from(format!("mesh agent: {}", app.mesh_agent)),
-            Line::from(format!("checked: {}", app.checked_text())),
-            Line::from(format!("room: {}", app.active_room.label())),
-            Line::from(format!("status: {}", app.status)),
-            Line::from("Input routes operator instruction here by default."),
-        ],
+        area,
+        "ORCH + MESH",
+        vec![Line::from(
+            "orchestrator room is provisional without runtime room selection",
+        )],
     );
-
-    draw_agent_pane(frame, right[0], mesh, "BRICK", "backend/runtime");
-    draw_agent_pane(frame, right[1], mesh, "PIXEL", "frontend/tui");
 }
 
 fn draw_room_review(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
-    let mesh = &app.support.mesh;
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(47), Constraint::Percentage(53)])
-        .split(area);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(8)])
-        .split(cols[1]);
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(right[1]);
+    if app.active_room == crate::WorkspaceRoom::Rev {
+        draw_runtime_room_panes(frame, area, app);
+        return;
+    }
 
     draw_lines_pane(
         frame,
-        cols[0],
-        "Rev Review",
-        vec![
-            Line::from(format!("Rev/KNOX: {}", crate::agent_presence(mesh, "KNOX"))),
-            Line::from("Review workflow dominant pane"),
-            Line::from("Current: Track-0 Ratatui shell"),
-            Line::from("Expected: exact room names + pane proportions"),
-            Line::from("No backend/protocol changes."),
-        ],
-    );
-
-    let review_lines: Vec<Line<'static>> = mesh
-        .tasks
-        .iter()
-        .filter(|task| matches!(task.status.as_str(), "review" | "blocked" | "milestone"))
-        .take(right[0].height.saturating_sub(2) as usize)
-        .map(|task| {
-            Line::from(format!(
-                "{} {} · {}",
-                task.id,
-                crate::compact_text(&task.title, 32),
-                task.status
-            ))
-        })
-        .collect();
-    draw_lines_pane(
-        frame,
-        right[0],
-        "WorkDash",
-        if review_lines.is_empty() {
-            vec![Line::from("fixture: review board waiting for KNOX gate")]
-        } else {
-            review_lines
-        },
-    );
-    draw_lines_pane(
-        frame,
-        bottom[0],
-        "lazygit",
-        vec![
-            Line::from("rev/ocean-runtime-tui-async"),
-            Line::from(" M crates/ocean-tui/src/main.rs"),
-            Line::from("?? crates/ocean-tui/src/rooms.rs"),
-            Line::from("?? crates/ocean-tui/examples/rooms_demo.rs"),
-        ],
-    );
-    draw_lines_pane(
-        frame,
-        bottom[1],
-        "bash / context",
-        vec![
-            Line::from("$ cargo fmt --all"),
-            Line::from("$ cargo clippy --all-targets --all-features"),
-            Line::from("$ cargo test"),
-            Line::from("manual: F1-F7 + typing smoke"),
-        ],
+        area,
+        "Review Room",
+        vec![Line::from(
+            "review room is provisional without runtime room selection",
+        )],
     );
 }
 
@@ -262,7 +98,7 @@ fn draw_room_tidedash(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
         area,
         "TideDash",
         vec![
-            Line::from("TideDash python dashboard pane"),
+            Line::from("TideDash python dashboard (provisional)"),
             Line::from("Campaigns        3 active"),
             Line::from("Deals            2 in progress"),
             Line::from("Pipeline         $48K"),
@@ -292,14 +128,14 @@ fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
         cols[0],
         "python / ops board",
         vec![
-            Line::from("WorkOps board"),
+            Line::from("WorkOps board (provisional)"),
             Line::from(crate::value_summary_line(
                 &unified.summary,
                 "ops_attention",
                 "ops attention",
             )),
             Line::from("Fixtures: services, jobs, queue health, operator alerts"),
-            Line::from("Runtime health stays in the header support strip."),
+            Line::from("WorkOps remains provisional / out-of-scope."),
         ],
     );
     draw_lines_pane(
@@ -311,6 +147,7 @@ fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
             Line::from("fixture: tailing workops.log"),
             Line::from("fixture: all watched jobs idle"),
             Line::from(format!("operator status: {}", app.status)),
+            Line::from("WorkOps room is provisional."),
         ],
     );
 }
@@ -318,7 +155,7 @@ fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
 fn draw_room_worldmap(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
     let mesh = &app.support.mesh;
     let mut lines = vec![
-        Line::from("WorldMap python pane"),
+        Line::from("WorldMap python pane (provisional)"),
         Line::from(""),
         Line::from("UTC  14:32  ● Orchestrator  ● KNOX  ● BRICK"),
         Line::from("PST  06:32  ○ Charlotte     ○ Henry"),
@@ -400,4 +237,212 @@ fn draw_agent_pane(
             )),
         ],
     );
+}
+
+fn draw_runtime_room_panes(frame: &mut Frame<'_>, area: Rect, app: &crate::DaemonApp) {
+    let Some(snapshot) = app.active_room_snapshot() else {
+        draw_lines_pane(
+            frame,
+            area,
+            "runtime snapshot",
+            vec![
+                Line::from("No room snapshot data yet."),
+                Line::from("Retry refresh to load /v1/rooms."),
+            ],
+        );
+        return;
+    };
+
+    match app.active_room {
+        crate::WorkspaceRoom::PM => draw_room_pm_runtime(frame, area, snapshot),
+        crate::WorkspaceRoom::Writers => draw_room_writers_runtime(frame, area, snapshot),
+        crate::WorkspaceRoom::Orchestrator => draw_room_orch_mesh_runtime(frame, area, snapshot),
+        crate::WorkspaceRoom::Rev => draw_room_review_runtime(frame, area, snapshot),
+        _ => draw_lines_pane(
+            frame,
+            area,
+            "runtime room",
+            vec![
+                Line::from("room has no runtime renderer"),
+                Line::from(snapshot.title.clone()),
+            ],
+        ),
+    }
+}
+
+fn draw_room_pm_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::RoomSnapshot) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(cols[0]);
+
+    draw_panel_pane(
+        frame,
+        left_rows[0],
+        snapshot.panels.first().map(|panel| panel.title.as_str()),
+        snapshot.panels.first(),
+    );
+    draw_panel_pane(
+        frame,
+        left_rows[1],
+        snapshot.panels.get(1).map(|panel| panel.title.as_str()),
+        snapshot.panels.get(1),
+    );
+
+    draw_panel_pane(
+        frame,
+        cols[1],
+        snapshot.panels.get(2).map(|panel| panel.title.as_str()),
+        snapshot.panels.get(2),
+    );
+}
+
+fn draw_room_writers_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::RoomSnapshot) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    draw_panel_pane(
+        frame,
+        cols[0],
+        Some("Writers / Drafts"),
+        snapshot.panels.first(),
+    );
+
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(cols[1]);
+
+    draw_panel_pane(
+        frame,
+        right_rows[0],
+        snapshot.panels.get(1).map(|panel| panel.title.as_str()),
+        snapshot.panels.get(1),
+    );
+    draw_panel_pane(
+        frame,
+        right_rows[1],
+        snapshot.panels.get(2).map(|panel| panel.title.as_str()),
+        snapshot.panels.get(2),
+    );
+}
+
+fn draw_room_orch_mesh_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::RoomSnapshot) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(31),
+            Constraint::Percentage(49),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(cols[0]);
+
+    draw_panel_pane(
+        frame,
+        left_rows[0],
+        snapshot.panels.first().map(|panel| panel.title.as_str()),
+        snapshot.panels.first(),
+    );
+    draw_panel_pane(
+        frame,
+        left_rows[1],
+        snapshot.panels.get(1).map(|panel| panel.title.as_str()),
+        snapshot.panels.get(1),
+    );
+    draw_panel_pane(
+        frame,
+        left_rows[2],
+        snapshot.panels.get(2).map(|panel| panel.title.as_str()),
+        snapshot.panels.get(2),
+    );
+
+    if snapshot.panels.len() > 3 {
+        draw_panel_pane(
+            frame,
+            cols[1],
+            snapshot.panels.get(3).map(|panel| panel.title.as_str()),
+            snapshot.panels.get(3),
+        );
+    } else {
+        draw_panel_pane(frame, cols[1], Some("Runtime control rail"), None);
+    }
+
+    draw_panel_pane(
+        frame,
+        cols[2],
+        Some("Orch + Mesh live state"),
+        snapshot.panels.first(),
+    );
+}
+
+fn draw_room_review_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::RoomSnapshot) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(cols[1]);
+
+    draw_panel_pane(
+        frame,
+        cols[0],
+        Some("Review queue"),
+        snapshot.panels.first(),
+    );
+    draw_panel_pane(
+        frame,
+        right_rows[0],
+        Some("Evidence"),
+        snapshot.panels.get(1),
+    );
+    draw_panel_pane(
+        frame,
+        right_rows[1],
+        Some("Release gate"),
+        snapshot.panels.get(2),
+    );
+}
+
+fn draw_panel_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: Option<&str>,
+    panel: Option<&RoomPanelSnapshot>,
+) {
+    let mut lines = Vec::new();
+    if let Some(panel) = panel {
+        lines.push(Line::from(format!(
+            "{} [{}] {}",
+            panel.title, panel.kind, panel.status
+        )));
+        lines.extend(panel.lines.iter().map(|line| {
+            Line::from(crate::compact_text(
+                line,
+                area.width.saturating_sub(2) as usize,
+            ))
+        }));
+    } else {
+        lines.push(Line::from("No panel data"));
+    }
+
+    draw_lines_pane(frame, area, title.unwrap_or("Room panel"), lines);
 }
