@@ -31,6 +31,15 @@ const VALID_KINDS: &[&str] = &[
     "progress",
     "markdown",
     "dashboard",
+    "chart",
+    "timeline",
+    "stat",
+    "file_tree",
+    "diff",
+    "code",
+    "callout",
+    "gallery",
+    "confirm",
 ];
 
 // ---------------------------------------------------------------------------
@@ -51,23 +60,38 @@ impl AgentTool for ComponentRenderTool {
 
     fn description(&self) -> &str {
         "Mount or update a rich, interactive UI component in the client surface. \
-         PREFER this over hand-typing markdown tables/lists when the data is structured: \
-         tabular data MUST use kind 'table' (never markdown pipe tables), task boards use \
-         'kanban', input collection uses 'form', progress uses 'progress'. \
-         `id` is an agent-chosen opaque string scoped to the session; reuse the same id with \
-         replace:true to update a component in place (e.g. advance a progress bar). \
+         On the web surface these render as live HTML — USE THEM LIBERALLY instead of \
+         hand-typing markdown for anything structured. `id` is an agent-chosen opaque \
+         string scoped to the session; reuse the same id with replace:true to update a \
+         component in place (e.g. advance a progress bar, flip a timeline step to done).\n\
+         \
+         WHEN TO REACH FOR WHICH KIND:\n\
+         • Rows/columns of data → 'table' (NEVER markdown pipe tables).\n\
+         • Task/status board → 'kanban'. Collecting input → 'form' (then component_wait).\n\
+         • A running task → 'progress'. A multi-step plan → 'timeline'.\n\
+         • KPIs / metrics (views, plays, saves) → 'stat'. Numeric series to visualize → 'chart'.\n\
+         • Project structure / file list → 'file_tree'. Showing code edits → 'diff'.\n\
+         • A code snippet to copy → 'code'. An important note/warning → 'callout'.\n\
+         • Images / screenshots / generated art → 'gallery'. A yes/no before something \
+         destructive → 'confirm' (then component_wait for the answer).\n\
+         • Several of the above at once → 'dashboard'. Long prose → 'markdown' (or plain text).\n\
          \
          PROPS SCHEMA BY KIND (props must match exactly):\n\
-         • table — { columns: [\"Name\",\"Status\"], rows: [[\"Fix login\",\"open\"],[\"Add tests\",\"done\"]] }. \
-         Rows are arrays of cells aligned to columns. Emits row_clicked { row_index }.\n\
-         • kanban — { columns: [{id,title}], cards: [{id, column, title, description?}] }. \
-         card.column references a column id. Emits card_clicked / card_moved.\n\
-         • form — { title, fields: [{name, label, type, required?, options?}], submit_label? }. \
-         field.type is text|textarea|select|number; select needs options:[..]. Emits form_submit { <name>: value, .. }.\n\
-         • progress — { label, value, max, indeterminate? }. value/max are numbers (e.g. 0.6/1.0). Display only.\n\
-         • markdown — { content: \"## md string\" }. For rich prose blocks; supports tables, bold, lists.\n\
-         • dashboard — { children: [{ id, width, kind?, props? }] }. Grid layout; width is fr units. \
-         A child with inline kind+props renders that component in its cell.\n\
+         • table — { columns: [\"Name\",\"Status\"], rows: [[\"Fix login\",\"open\"],[\"Add tests\",\"done\"]] }. Emits row_clicked { row_index }.\n\
+         • kanban — { columns: [{id,title}], cards: [{id, column, title, description?}] }. Emits card_clicked.\n\
+         • form — { title, fields: [{name, label, type, required?, options?}], submit_label? }. type is text|textarea|select|number. Emits form_submit { <name>: value }.\n\
+         • progress — { label, value, max, indeterminate? }. value/max numbers (0.6/1.0). Display only.\n\
+         • markdown — { content: \"## md\" }. Rich prose; supports tables, bold, lists.\n\
+         • dashboard — { children: [{ id, width, kind?, props? }] }. Grid; width is fr units; inline kind+props renders that component in the cell.\n\
+         • chart — { title?, type: \"bar\"|\"line\", series: [{label, value}] }. value is numeric. Display only.\n\
+         • timeline — { steps: [{label, status: \"done\"|\"active\"|\"pending\"|\"error\", detail?}] }. Re-render with replace:true to advance.\n\
+         • stat — { stats: [{label, value, delta?, trend: \"up\"|\"down\"|\"flat\"}] }. value is string or number.\n\
+         • file_tree — { root?, entries: [{name, type: \"file\"|\"dir\", path?, children?}] }. Dirs nest via children. Files emit file_clicked { path }.\n\
+         • diff — { filename?, lines: [{kind: \"add\"|\"del\"|\"ctx\", text}] }  OR  { filename?, unified: \"+new\\n-old\" }.\n\
+         • code — { language?, filename?, code }. Renders a copy-able code block.\n\
+         • callout — { variant: \"info\"|\"success\"|\"warn\"|\"error\", title?, body? }. body supports markdown.\n\
+         • gallery — { images: [{src, caption?}] }. src is a URL or data: URI.\n\
+         • confirm — { title, body?, confirm_label?, cancel_label?, variant? }. Emits confirm_response { confirmed: bool }.\n\
          \
          Set replace:true to overwrite an existing component with the same id. \
          Full reference: docs/AGENT_RENDER_PROTOCOL.md."
@@ -83,7 +107,11 @@ impl AgentTool for ComponentRenderTool {
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["kanban", "form", "table", "progress", "markdown", "dashboard"],
+                    "enum": [
+                        "kanban", "form", "table", "progress", "markdown", "dashboard",
+                        "chart", "timeline", "stat", "file_tree", "diff", "code",
+                        "callout", "gallery", "confirm"
+                    ],
                     "description": "Component type. Defines the shape of `props`."
                 },
                 "props": {
@@ -92,7 +120,13 @@ impl AgentTool for ComponentRenderTool {
                         table: {columns:[str], rows:[[cell,..]]}. kanban: {columns:[{id,title}], cards:[{id,column,title,description?}]}. \
                         form: {title, fields:[{name,label,type,required?,options?}], submit_label?}. \
                         progress: {label, value, max, indeterminate?}. markdown: {content}. \
-                        dashboard: {children:[{id,width,kind?,props?}]}."
+                        dashboard: {children:[{id,width,kind?,props?}]}. \
+                        chart: {title?, type:'bar'|'line', series:[{label,value}]}. \
+                        timeline: {steps:[{label,status,detail?}]}. stat: {stats:[{label,value,delta?,trend?}]}. \
+                        file_tree: {root?, entries:[{name,type,path?,children?}]}. \
+                        diff: {filename?, lines:[{kind,text}]} or {filename?, unified:str}. \
+                        code: {language?, filename?, code}. callout: {variant,title?,body?}. \
+                        gallery: {images:[{src,caption?}]}. confirm: {title,body?,confirm_label?,cancel_label?,variant?}."
                 },
                 "replace": {
                     "type": "boolean",
