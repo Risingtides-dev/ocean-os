@@ -522,7 +522,16 @@ impl DaemonApp {
             return;
         }
         let turn = self.pm_assistant_turn_mut(turn_id);
-        if let Some(PmBlock::Text(buf)) = turn.blocks.last_mut() {
+        // Reasoning models (DeepSeek reasoner/v4-pro, Kimi, MiniMax) interleave
+        // `reasoning_content` and `content` token-by-token, so a thinking delta
+        // can land between two words of the visible answer. If we only appended
+        // to the *last* block, every such interleave would open a fresh Text
+        // block and the reply would shatter into one-word-per-line spatter.
+        // Instead, fold this delta into the most-recent Text block as long as
+        // only Thinking blocks sit between it and the end — Thinking is a
+        // side-channel that must not fragment the answer. A ToolCall/Component
+        // is a real structural boundary, so those still start a new Text run.
+        if let Some(buf) = pm_coalescable_text(&mut turn.blocks) {
             buf.push_str(delta);
         } else {
             turn.blocks.push(PmBlock::Text(delta.to_string()));
@@ -2568,6 +2577,7 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
                 .into_owned(),
             guidance: None,
             room_id: Some(room_id.to_string()),
+            client_type: Some("tui".into()),
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(

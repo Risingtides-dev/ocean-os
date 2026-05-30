@@ -10,7 +10,14 @@ use serde::{Deserialize, Serialize};
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+// OpenAI-compatible chat-completions endpoints. Both expose `/chat/completions`
+// under these bases and stream reasoning separately (MiniMax via `<think>`
+// tags / `reasoning_split`, Kimi via a thinking channel), so they ride the
+// same streaming path as DeepSeek's reasoner models.
+const MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/v1";
+const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
 /// Stable provider identifier used by Ocean runtime components.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +25,13 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 pub enum ProviderId {
     DeepSeek,
     OpenAi,
+    /// OpenAI Codex over a ChatGPT subscription OAuth token (Responses API).
+    OpenAiCodex,
     Anthropic,
+    /// MiniMax (OpenAI-compatible chat-completions; M2 family).
+    MiniMax,
+    /// Moonshot AI / Kimi (OpenAI-compatible chat-completions; K2 family).
+    Kimi,
     OpenAiCompatible,
     Fake,
 }
@@ -28,7 +41,10 @@ impl ProviderId {
         match self {
             Self::DeepSeek => "deepseek",
             Self::OpenAi => "openai",
+            Self::OpenAiCodex => "openai-codex",
             Self::Anthropic => "anthropic",
+            Self::MiniMax => "minimax",
+            Self::Kimi => "kimi",
             Self::OpenAiCompatible => "openai-compatible",
             Self::Fake => "fake",
         }
@@ -38,7 +54,11 @@ impl ProviderId {
         match self {
             Self::DeepSeek => &["OCEAN_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
             Self::OpenAi | Self::OpenAiCompatible => &["OCEAN_OPENAI_API_KEY", "OPENAI_API_KEY"],
+            // Codex uses the OAuth token from auth.json, not an env API key.
+            Self::OpenAiCodex => &[],
             Self::Anthropic => &["OCEAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+            Self::MiniMax => &["OCEAN_MINIMAX_API_KEY", "MINIMAX_API_KEY"],
+            Self::Kimi => &["OCEAN_MOONSHOT_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"],
             Self::Fake => &[],
         }
     }
@@ -115,6 +135,9 @@ pub struct ModelSelection {
 pub struct ProviderConfig {
     pub selection: ModelSelection,
     pub credential: Option<ResolvedCredential>,
+    /// ChatGPT account id, present only for the Codex OAuth provider. Sent as
+    /// the `chatgpt-account-id` request header. Non-secret.
+    pub account_id: Option<String>,
 }
 
 impl ProviderConfig {
@@ -210,10 +233,28 @@ pub fn resolve_provider_config_from_env() -> Result<ProviderConfig, ProviderConf
 pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, ProviderConfigError> {
     let selection = resolve_model_selection(env)?;
     let credential = resolve_credential(env, &selection.provider)?;
+    let account_id = if matches!(selection.provider, ProviderId::OpenAiCodex) {
+        resolve_codex_account_id(env)
+    } else {
+        None
+    };
     Ok(ProviderConfig {
         selection,
         credential,
+        account_id,
     })
+}
+
+/// Read the ChatGPT account id from the `openai-codex` auth.json block.
+fn resolve_codex_account_id(env: &ProviderEnv) -> Option<String> {
+    let path = env.auth_file.as_ref()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.pointer("/openai-codex/accountId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// Resolve model selection without reading credential values.
@@ -268,6 +309,34 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             128_000,
             16_384,
         )),
+        "gpt-5.5" | "gpt-5-5" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            "gpt-5.5",
+            CODEX_BASE_URL,
+            400_000,
+            128_000,
+        )),
+        "gpt-5.4" | "gpt-5-4" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            "gpt-5.4",
+            CODEX_BASE_URL,
+            400_000,
+            128_000,
+        )),
+        "gpt-5.4-mini" | "gpt-5-4-mini" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            "gpt-5.4-mini",
+            CODEX_BASE_URL,
+            400_000,
+            128_000,
+        )),
+        "gpt-5.3-codex-spark" | "gpt-5-3-codex-spark" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            "gpt-5.3-codex-spark",
+            CODEX_BASE_URL,
+            400_000,
+            128_000,
+        )),
         "claude-sonnet-4-6" | "claude-sonnet" | "sonnet" => Ok(model_selection(
             ProviderId::Anthropic,
             "claude-sonnet-4-6",
@@ -281,6 +350,39 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
+        )),
+        // MiniMax M2 family. `normalize_model_id` lowercases the lookup key, but
+        // MiniMax's API expects the original `MiniMax-…` casing, so the value we
+        // pass through preserves it.
+        "minimax" | "minimax-m2" => Ok(model_selection(
+            ProviderId::MiniMax,
+            "MiniMax-M2",
+            MINIMAX_BASE_URL,
+            200_000,
+            8_192,
+        )),
+        "minimax-m2.7" | "minimax-m2-7" => Ok(model_selection(
+            ProviderId::MiniMax,
+            "MiniMax-M2.7",
+            MINIMAX_BASE_URL,
+            200_000,
+            8_192,
+        )),
+        // Moonshot AI / Kimi K2 family. Official OpenAI-compatible base; model
+        // ids are lowercase so casing survives normalization as-is.
+        "kimi" | "kimi-k2.6" | "kimi-k2-6" => Ok(model_selection(
+            ProviderId::Kimi,
+            "kimi-k2.6",
+            MOONSHOT_BASE_URL,
+            256_000,
+            8_192,
+        )),
+        "kimi-k2" | "moonshot-v1" => Ok(model_selection(
+            ProviderId::Kimi,
+            "kimi-k2",
+            MOONSHOT_BASE_URL,
+            128_000,
+            8_192,
         )),
         "fake" | "fake-ok" => Ok(model_selection(
             ProviderId::Fake,
@@ -331,12 +433,33 @@ fn model_for_explicit_provider(
             128_000,
             16_384,
         )),
+        "openai-codex" | "codex" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            model,
+            CODEX_BASE_URL,
+            400_000,
+            128_000,
+        )),
         "anthropic" => Ok(model_selection(
             ProviderId::Anthropic,
             model,
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
+        )),
+        "minimax" => Ok(model_selection(
+            ProviderId::MiniMax,
+            model,
+            MINIMAX_BASE_URL,
+            200_000,
+            8_192,
+        )),
+        "kimi" | "moonshot" => Ok(model_selection(
+            ProviderId::Kimi,
+            model,
+            MOONSHOT_BASE_URL,
+            256_000,
+            8_192,
         )),
         "openai-compatible" => {
             let base = env.get("OCEAN_OPENAI_BASE_URL").ok_or_else(|| {
@@ -418,19 +541,39 @@ fn resolve_credential(
             message: err.to_string(),
         })?;
 
-    let key = auth_file_key(&json, provider.as_str()).and_then(SecretString::new);
-    Ok(key.map(|secret| ResolvedCredential {
-        secret,
-        source: CredentialSource::OceanAuthFile {
-            path: path.display().to_string(),
-        },
-    }))
+    let source = CredentialSource::OceanAuthFile {
+        path: path.display().to_string(),
+    };
+
+    // The Codex provider authenticates with the OAuth access token from the
+    // "openai-codex" block; everyone else uses a plain api_key.
+    let secret = if matches!(provider, ProviderId::OpenAiCodex) {
+        oauth_access_token(&json, "openai-codex").and_then(SecretString::new)
+    } else {
+        auth_file_key(&json, provider.as_str()).and_then(SecretString::new)
+    };
+    Ok(secret.map(|secret| ResolvedCredential { secret, source }))
 }
 
 fn auth_file_key<'a>(json: &'a serde_json::Value, provider: &str) -> Option<&'a str> {
     json.pointer(&format!("/providers/{provider}/api_key"))
         .or_else(|| json.pointer(&format!("/{provider}/api_key")))
         .or_else(|| json.pointer(&format!("/{provider}/key")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Pull an OAuth access token from an auth.json block of `type: "oauth"`.
+/// Used so the OpenAI provider can authenticate with the Codex OAuth login
+/// (bearer token) when no plain api_key is configured.
+fn oauth_access_token<'a>(json: &'a serde_json::Value, block: &str) -> Option<&'a str> {
+    let entry = json.pointer(&format!("/{block}"))?;
+    if entry.pointer("/type").and_then(serde_json::Value::as_str) != Some("oauth") {
+        return None;
+    }
+    entry
+        .pointer("/access")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -569,6 +712,32 @@ mod tests {
                 path: path.display().to_string()
             }
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gpt5_routes_to_codex_with_oauth_token_and_account_id() {
+        let dir = std::env::temp_dir().join(format!("ocean-oauth-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(
+            &path,
+            r#"{"openai-codex":{"type":"oauth","access":"oauth-bearer-token","refresh":"rt_x","expires":9999999999999,"accountId":"acct-123"}}"#,
+        )
+        .unwrap();
+
+        let config = resolve_provider_config(&ProviderEnv {
+            vars: BTreeMap::from([("OCEAN_MODEL".into(), "gpt-5.5".into())]),
+            auth_file: Some(path.clone()),
+        })
+        .unwrap();
+        let credential = config.credential.expect("oauth token should resolve");
+        assert_eq!(credential.secret.expose(), "oauth-bearer-token");
+        assert_eq!(config.selection.provider, ProviderId::OpenAiCodex);
+        assert_eq!(config.selection.model, "gpt-5.5");
+        assert_eq!(config.selection.base_url, CODEX_BASE_URL);
+        assert_eq!(config.account_id.as_deref(), Some("acct-123"));
         let _ = fs::remove_dir_all(&dir);
     }
 

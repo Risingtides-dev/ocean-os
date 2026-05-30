@@ -277,7 +277,12 @@ impl AgentRuntime {
         // thinking with a signature and is happy to receive it back.
         if matches!(
             snapshot.provider_config.selection.provider,
-            ProviderId::DeepSeek | ProviderId::OpenAi | ProviderId::OpenAiCompatible
+            ProviderId::DeepSeek
+                | ProviderId::OpenAi
+                | ProviderId::OpenAiCodex
+                | ProviderId::OpenAiCompatible
+                | ProviderId::MiniMax
+                | ProviderId::Kimi
         ) {
             strip_assistant_thinking_content(&mut history);
         }
@@ -290,7 +295,7 @@ impl AgentRuntime {
         } = control;
         let mut cfg = AgentConfig::new(
             snapshot.model.clone(),
-            system_prompt::build_system_prompt(Some(&req.cwd)),
+            system_prompt::build_system_prompt(Some(&req.cwd), req.client_type.as_deref()),
         )
         .with_tools(default_tools())
         .with_max_turns(req.max_turns.unwrap_or(32))
@@ -298,6 +303,11 @@ impl AgentRuntime {
         cfg.stream_options.api_key = snapshot.api_key.clone();
         cfg.stream_options.base_url = Some(snapshot.provider_config.selection.base_url.clone());
         cfg.stream_options.cancel = cancel;
+        if let Some(account_id) = &snapshot.provider_config.account_id {
+            cfg.stream_options
+                .headers
+                .insert("chatgpt-account-id".into(), account_id.clone());
+        }
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cfg_cloned = cfg.clone();
@@ -346,7 +356,11 @@ impl AgentRuntime {
         }
 
         let run = handle.await.context("agent task join failed")??;
-        session.replace_messages(run.messages.clone());
+        // Cap what we persist. The agent loop already trims per-send to the
+        // context window, but the *stored* transcript would otherwise grow
+        // forever and be reloaded in full on every future turn (the dominant
+        // source of runaway input-token cost). Keep the most recent messages.
+        session.replace_messages(cap_session_history(run.messages.clone()));
         session::save(&self.config_dir, &session)?;
 
         if stdout.trim().is_empty() {
@@ -442,15 +456,17 @@ fn state_from_provider_config(provider_config: ProviderConfig) -> anyhow::Result
 fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> {
     let selection = &config.selection;
     match selection.provider {
-        ProviderId::DeepSeek | ProviderId::OpenAiCompatible | ProviderId::Fake => {
-            Ok(Model::openai_compat(
-                selection.provider.as_str(),
-                selection.model.clone(),
-                selection.base_url.clone(),
-                selection.context_window,
-                selection.max_output_tokens,
-            ))
-        }
+        ProviderId::DeepSeek
+        | ProviderId::OpenAiCompatible
+        | ProviderId::MiniMax
+        | ProviderId::Kimi
+        | ProviderId::Fake => Ok(Model::openai_compat(
+            selection.provider.as_str(),
+            selection.model.clone(),
+            selection.base_url.clone(),
+            selection.context_window,
+            selection.max_output_tokens,
+        )),
         ProviderId::OpenAi => Ok(match selection.model.as_str() {
             "gpt-4o" => Model::openai_gpt_4o(),
             "gpt-4o-mini" => Model::openai_gpt_4o_mini(),
@@ -462,6 +478,11 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
                 selection.max_output_tokens,
             ),
         }),
+        ProviderId::OpenAiCodex => Ok(Model::codex(
+            selection.model.clone(),
+            selection.context_window,
+            selection.max_output_tokens,
+        )),
         ProviderId::Anthropic => Ok(match selection.model.as_str() {
             "claude-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
             "claude-opus-4-7" => Model::anthropic_claude_opus_4_7(),
@@ -493,6 +514,29 @@ fn strip_assistant_thinking_content(messages: &mut [Message]) {
                 .retain(|content| !matches!(content, Content::Thinking { .. }));
         }
     }
+}
+
+/// Max messages we persist per session. The agent loop trims per-send to the
+/// model's context window, but the stored transcript is reloaded in full at the
+/// start of every future turn — so without a stored cap a long-lived session
+/// reloads an ever-growing history and re-pays for it on every turn. Keep the
+/// most recent messages; this is a hard bound on session file size and reload
+/// cost, well above what any single coherent task needs.
+const MAX_SESSION_MESSAGES: usize = 200;
+
+fn cap_session_history(mut messages: Vec<Message>) -> Vec<Message> {
+    if messages.len() <= MAX_SESSION_MESSAGES {
+        return messages;
+    }
+    let drop = messages.len() - MAX_SESSION_MESSAGES;
+    messages.drain(0..drop);
+    // Don't let the kept history begin with an orphan tool-result whose
+    // originating assistant ToolCall was just dropped — a provider would reject
+    // it on the next turn's replay.
+    while matches!(messages.first(), Some(Message::ToolResult(_))) {
+        messages.remove(0);
+    }
+    messages
 }
 
 fn last_assistant_text(messages: &[Message]) -> Option<String> {
@@ -974,6 +1018,49 @@ mod tests {
         path
     }
 
+    #[test]
+    fn cap_session_history_is_noop_under_limit() {
+        let msgs: Vec<Message> = (0..10).map(|i| Message::user_text(format!("m{i}"))).collect();
+        assert_eq!(cap_session_history(msgs).len(), 10);
+    }
+
+    #[test]
+    fn cap_session_history_keeps_most_recent_within_limit() {
+        let msgs: Vec<Message> = (0..MAX_SESSION_MESSAGES + 50)
+            .map(|i| Message::user_text(format!("m{i}")))
+            .collect();
+        let capped = cap_session_history(msgs);
+        assert!(capped.len() <= MAX_SESSION_MESSAGES);
+        // Oldest dropped, newest retained.
+        assert!(matches!(capped.last(), Some(Message::Assistant(_)) | Some(Message::User { .. })));
+        if let Some(Message::User { content, .. }) = capped.last() {
+            let want = format!("m{}", MAX_SESSION_MESSAGES + 50 - 1);
+            assert!(content.iter().any(|c| c.as_text() == Some(want.as_str())));
+        }
+    }
+
+    #[test]
+    fn cap_session_history_drops_leading_orphan_tool_results() {
+        use ocean_protocol::ToolResultMessage;
+        // Build an over-limit history where the trim boundary lands on a
+        // tool-result; the kept slice must not begin with one.
+        let mut msgs: Vec<Message> = Vec::new();
+        for _ in 0..MAX_SESSION_MESSAGES + 5 {
+            msgs.push(Message::user_text("u"));
+        }
+        // Force the message right after the drop boundary to be a tool result.
+        let boundary = msgs.len() - MAX_SESSION_MESSAGES;
+        msgs[boundary] = Message::ToolResult(ToolResultMessage {
+            tool_call_id: "c".into(),
+            tool_name: "bash".into(),
+            content: vec![Content::text("orphan")],
+            is_error: false,
+            timestamp: 0,
+        });
+        let capped = cap_session_history(msgs);
+        assert!(!matches!(capped.first(), Some(Message::ToolResult(_))));
+    }
+
     fn provider_config(provider: ProviderId, model: &str, credential: bool) -> ProviderConfig {
         ProviderConfig {
             selection: ocean_providers::ModelSelection {
@@ -989,6 +1076,7 @@ mod tests {
                     name: "OCEAN_TEST_API_KEY".into(),
                 },
             }),
+            account_id: None,
         }
     }
 
@@ -1092,6 +1180,7 @@ mod tests {
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
+                    client_type: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -1124,6 +1213,7 @@ mod tests {
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
+                    client_type: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -1225,17 +1315,18 @@ mod tests {
 mod system_prompt {
     use super::*;
 
-    const BASE_SYSTEM_PROMPT: &str = r#"You are Ocean — a local-first, Rust-native coding agent. You are the brain that lives inside ocean-daemon, a small HTTP+SSE service the user runs on their own machine. Thin clients (the F1 PM TUI, a planned voice surface called Leo, a planned web/native surface called Ocean Surface) all talk to you over the same product API: POST /v1/agent/turns + GET /v1/agent/events.
+    const BASE_SYSTEM_PROMPT: &str = r#"You are Ocean — a local-first, Rust-native coding agent. You are the brain that lives inside ocean-daemon, a small HTTP+SSE service the user runs on their own machine. Several clients (TUI, web, native, CLI, voice) all talk to you over the same product API: POST /v1/agent/turns + GET /v1/agent/events.
 
 ## What ocean-os is
 
 A Rust monorepo at github.com/Risingtides-dev/ocean-os. Crates:
+- ocean-core — shared daemon/client wire types: requests, responses, events, sessions, rooms
 - ocean-daemon  — the HTTP service that runs you
 - ocean-runtime — the agent loop, tool execution, streaming
 - ocean-protocol — provider implementations (OpenAI-compatible, Anthropic, Google)
 - ocean-providers — credential + model resolution
 - ocean-agent — session storage, system prompt (you're reading from here), permission policy
-- ocean-agent-sdk — wire types shared across clients
+- ocean-agent-sdk — embedding/SDK surface for Rust clients
 - ocean-tui — the F1 PM cockpit + workspace rooms
 - ocean-cli — one-shot CLI
 
@@ -1246,8 +1337,8 @@ Companion repo (separate, non-Rust): github.com/Risingtides-dev/ocean-surface, t
 - You run as a long-lived daemon, not a per-invocation CLI. Multiple clients share one brain and one session store. Switch from TUI to phone mid-conversation, you're still you.
 - Sessions are workspace-bound (git toplevel or cwd). `/sessions` shows just the current project unless asked for all.
 - You speak any OpenAI-compatible provider (DeepSeek, OpenAI, xAI, OpenAI-compat endpoints) plus Anthropic and Google natively. Model is hot-swappable at runtime via `/model <name>` — no daemon restart.
-- Reasoning models (DeepSeek reasoner + v4-pro, OpenAI o-series) surface their chain-of-thought as collapsible "thinking" blocks in the TUI, not buried in logs.
-- The TUI streams in real time delta-by-delta with markdown rendering, inline tool chips, and collapsible thinking pills. No "wall of text on completion."
+- Reasoning models (DeepSeek reasoner + v4-pro, OpenAI o-series) surface their chain-of-thought as collapsible "thinking" blocks, not buried in logs.
+- Clients stream in real time delta-by-delta with markdown rendering, inline components, collapsible thinking pills. The web surface renders rich HTML; the TUI renders markdown in the terminal.
 - Local-first. Your sessions, your keys, your machine. No cloud relay.
 
 ## Tools available
@@ -1272,19 +1363,24 @@ read, write, edit (files); ls, glob (filesystem nav); grep (content search); bas
 
 ## Rich surface — render components, don't fake them
 
-Clients render live, interactive UI components, not just text. When data is structured, render the real component via `component_render` instead of hand-typing markdown:
+Clients render live, interactive UI components, not just text. On the web/native surface these are real HTML — lean on them. When data is structured, render the real component via `component_render` instead of hand-typing markdown. The full kit:
 
-- Tabular data → kind `table` ({columns, rows}). NEVER hand-build a markdown pipe table when a `table` component fits.
-- Task/status boards → `kanban`. Collecting input → `form` (then `component_wait` for the submit). Live progress → `progress` (reuse the id with replace:true to advance it). Multi-component layouts → `dashboard`.
-- Prose, explanations, code → plain markdown text is correct; don't over-componentize.
+- Tabular data → `table` ({columns, rows}). NEVER hand-build a markdown pipe table when `table` fits.
+- Task/status boards → `kanban`. Collecting input → `form` (then `component_wait` for the submit).
+- Live task → `progress` (reuse the id with replace:true to advance). Multi-step plan → `timeline` (flip steps done/active/pending; re-render to advance).
+- KPIs / metrics (views, plays, saves) → `stat`. Numeric series to chart → `chart` (bar or line).
+- Project structure / file listing → `file_tree`. Showing code edits → `diff`. A copy-able snippet → `code`.
+- An important note or warning → `callout`. Images / screenshots / art → `gallery`.
+- Yes/no before something destructive → `confirm` (then `component_wait` for the answer).
+- Several at once → `dashboard`. Long prose / explanation → plain markdown text; don't over-componentize.
 
 The `component_render` tool description carries the exact props schema for each kind. Use it; don't guess the shape. After rendering, still give a short text reply — the component complements your words, it doesn't replace them.
 
 You operate from the user's project directory (passed per turn). Look for AGENTS.md, CLAUDE.md, or .pi/instructions.md in the project tree — those are project-specific instructions that override or extend the above.
 "#;
 
-    /// Build the system prompt, optionally scoped to `cwd`.
-    pub fn build_system_prompt(cwd: Option<&str>) -> String {
+    /// Build the system prompt, optionally scoped to `cwd` and `client_type`.
+    pub fn build_system_prompt(cwd: Option<&str>, client_type: Option<&str>) -> String {
         let cwd = cwd
             .and_then(|s| {
                 if s.is_empty() {
@@ -1299,9 +1395,22 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
             .map(|p| load_project_prompt(p))
             .unwrap_or_default();
         if project.is_empty() {
-            BASE_SYSTEM_PROMPT.to_string()
+            append_client_type(BASE_SYSTEM_PROMPT, client_type)
         } else {
-            format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----\n{project}")
+            let prompt = format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----\n{project}");
+            append_client_type(&prompt, client_type)
+        }
+    }
+
+    fn append_client_type(prompt: &str, client_type: Option<&str>) -> String {
+        match client_type {
+            Some("tui") => format!("{prompt}\n\n## Current client\n\nYou are speaking through the **Ocean TUI**. The user sees a terminal interface with basic markdown rendering. Keep responses concise — no rich interactive components.\n"),
+            Some("surface-web") => format!("{prompt}\n\n## Current client\n\nYou are speaking through **Ocean Surface (web)**. Responses render as HTML with rich interactive components, inline images, and live UI. The user is in a browser PWA.\n"),
+            Some("surface-native") => format!("{prompt}\n\n## Current client\n\nYou are speaking through **Ocean Surface (native)** — a macOS/iOS app built with Tauri. Same rendering as the web surface but running natively.\n"),
+            Some("cli") => format!("{prompt}\n\n## Current client\n\nYou are speaking through the **Ocean CLI** — a one-shot terminal tool. No interactivity, just text output.\n"),
+            Some("leo-voice") => format!("{prompt}\n\n## Current client\n\nYou are speaking through **Leo (voice)** — a voice-only interface. Responses should be concise and spoken aloud.\n"),
+            Some(other) => format!("{prompt}\n\n## Current client\n\nYou are speaking through an unknown client: `{other}`.\n"),
+            None => prompt.to_string(),
         }
     }
 
