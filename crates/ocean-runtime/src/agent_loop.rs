@@ -20,6 +20,9 @@ use crate::types::{AgentConfig, AgentEvent, AgentTool, AgentToolResult, Permissi
 pub struct AgentRun {
     pub messages: Vec<Message>,
     pub stopped_at_turn_limit: bool,
+    /// Real provider token usage, summed across every round of the turn.
+    /// `Usage::default()` (all zero) when the provider reported none.
+    pub usage: ocean_protocol::Usage,
 }
 
 #[instrument(skip(config, initial_prompt, events), fields(model = %config.model.id))]
@@ -56,6 +59,7 @@ pub async fn run_agent_with_history(
     let mut session_allowed: HashSet<String> = HashSet::new();
     let mut turn: u32 = 0;
     let mut stopped_at_turn_limit = false;
+    let mut total_usage = ocean_protocol::Usage::default();
 
     'outer: while turn < config.max_turns {
         turn += 1;
@@ -89,6 +93,12 @@ pub async fn run_agent_with_history(
             match ev {
                 AssistantMessageEvent::Done { reason, message } => {
                     stop = reason;
+                    // Accumulate this round's real provider usage.
+                    total_usage.input += message.usage.input;
+                    total_usage.output += message.usage.output;
+                    total_usage.cache_read += message.usage.cache_read;
+                    total_usage.cache_write += message.usage.cache_write;
+                    total_usage.total_tokens += message.usage.total_tokens;
                     final_message = Some(message);
                     break;
                 }
@@ -276,6 +286,7 @@ pub async fn run_agent_with_history(
     Ok(AgentRun {
         messages,
         stopped_at_turn_limit,
+        usage: total_usage,
     })
 }
 

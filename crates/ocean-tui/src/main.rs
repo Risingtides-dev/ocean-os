@@ -3105,6 +3105,7 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             wall_ms,
             output_tokens,
             tokens_per_second,
+            ..
         } => {
             if app.active_agent_turn_id == Some(turn_id) {
                 app.active_agent_turn_id = None;
@@ -3658,6 +3659,7 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             wall_ms,
             output_tokens,
             tokens_per_second,
+            ..
         } => match error.as_deref() {
             Some(error) if !error.trim().is_empty() => format!(
                 "agent turn_finished [{}] {:?}: {}",

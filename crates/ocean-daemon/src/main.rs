@@ -1602,7 +1602,15 @@ async fn agent_turn(
     let res = state.runtime.prompt(prompt_req, control).await;
     // Wait for the bridge to drain (the sender has been dropped by now).
     let _ = bridge.await;
-    let output_tokens = estimate_visible_tokens(&res.stdout);
+    // Prefer real provider usage; fall back to a visible-text estimate only
+    // when the provider reported no output tokens.
+    let output_tokens = if res.usage.output > 0 {
+        res.usage.output
+    } else {
+        estimate_visible_tokens(&res.stdout)
+    };
+    let input_tokens = (res.usage.input > 0).then_some(res.usage.input);
+    let cache_read_tokens = (res.usage.cache_read > 0).then_some(res.usage.cache_read);
     let tokens_per_second = if res.wall_ms > 0 {
         Some((output_tokens as f64) / (res.wall_ms as f64 / 1000.0))
     } else {
@@ -1616,7 +1624,10 @@ async fn agent_turn(
         session_id = %session_id,
         ok = res.ok,
         wall_ms = res.wall_ms,
+        input_tokens = res.usage.input,
         output_tokens,
+        cache_read = res.usage.cache_read,
+        total_tokens = res.usage.total_tokens,
         tokens_per_second,
         "agent turn finished"
     );
@@ -1634,6 +1645,8 @@ async fn agent_turn(
                 error: None,
                 wall_ms: Some(res.wall_ms),
                 output_tokens: Some(output_tokens),
+                input_tokens,
+                cache_read_tokens,
                 tokens_per_second,
             },
         );
@@ -1648,6 +1661,8 @@ async fn agent_turn(
                 error: Some(res.stderr.clone()),
                 wall_ms: Some(res.wall_ms),
                 output_tokens: Some(output_tokens),
+                input_tokens,
+                cache_read_tokens,
                 tokens_per_second,
             },
         );
@@ -1898,6 +1913,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             wall_ms,
             output_tokens: _,
             tokens_per_second: _,
+            ..
         } => Some(OceanEvent::TurnFinished {
             ok: matches!(status, AgentTurnStatus::Completed),
             wall_ms: wall_ms.unwrap_or(0),

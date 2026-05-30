@@ -96,6 +96,26 @@ pub struct PromptResponse {
     pub stderr: String,
     #[serde(default)]
     pub cwd: String,
+    /// Real provider token usage for the turn (input/output/cache/total),
+    /// summed across rounds. Zero when the provider reported none.
+    #[serde(default)]
+    pub usage: TokenUsage,
+}
+
+/// Token usage for a turn, mirrored from `ocean_protocol::Usage` so `ocean-core`
+/// stays free of a protocol dependency. All counts sum across the turn's rounds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
 }
 
 /// Summary item returned by `GET /v1/sessions`.

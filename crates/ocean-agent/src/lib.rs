@@ -8,6 +8,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
     PromptRequest, PromptResponse, RequestId, RoomId, SessionDetail, SessionId, SessionRunState,
+    TokenUsage,
     SessionSummary, SessionToolContext, SessionTranscriptEntry,
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
@@ -143,6 +144,7 @@ impl AgentRuntime {
                 stdout: String::new(),
                 stderr,
                 cwd,
+                usage: TokenUsage::default(),
             };
         }
 
@@ -154,7 +156,7 @@ impl AgentRuntime {
         };
 
         match result {
-            Ok((session_id, stdout, stderr)) => PromptResponse {
+            Ok((session_id, stdout, stderr, usage)) => PromptResponse {
                 request_id: Some(request_id),
                 ok: true,
                 session_id: Some(session_id),
@@ -163,6 +165,7 @@ impl AgentRuntime {
                 stdout,
                 stderr,
                 cwd,
+                usage,
             },
             Err(e) => PromptResponse {
                 request_id: Some(request_id),
@@ -173,6 +176,7 @@ impl AgentRuntime {
                 stdout: String::new(),
                 stderr: e.to_string(),
                 cwd,
+                usage: TokenUsage::default(),
             },
         }
     }
@@ -222,7 +226,7 @@ impl AgentRuntime {
         &self,
         req: PromptRequest,
         snapshot: &RuntimeState,
-    ) -> anyhow::Result<(SessionId, String, String)> {
+    ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let mut session = match req.session_id {
@@ -250,7 +254,8 @@ impl AgentRuntime {
         session.replace_messages(messages);
         session::save(&self.config_dir, &session)?;
 
-        Ok((session.id, stdout, String::new()))
+        // The fake provider does no real inference; report zero usage.
+        Ok((session.id, stdout, String::new(), TokenUsage::default()))
     }
 
     async fn run_prompt(
@@ -258,7 +263,7 @@ impl AgentRuntime {
         req: PromptRequest,
         control: PromptControl,
         snapshot: &RuntimeState,
-    ) -> anyhow::Result<(SessionId, String, String)> {
+    ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let mut session = match req.session_id {
@@ -373,7 +378,14 @@ impl AgentRuntime {
             stderr.push_str("stopped at max turns\n");
         }
 
-        Ok((session.id, stdout, stderr))
+        let usage = TokenUsage {
+            input: run.usage.input,
+            output: run.usage.output,
+            cache_read: run.usage.cache_read,
+            cache_write: run.usage.cache_write,
+            total_tokens: run.usage.total_tokens,
+        };
+        Ok((session.id, stdout, stderr, usage))
     }
 }
 

@@ -313,10 +313,18 @@ pub enum AgentTurnEvent {
         /// Wall-clock duration for the turn, when known by the daemon.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wall_ms: Option<u64>,
-        /// Approximate visible output token count, when provider usage is not exposed.
+        /// Output token count for the turn. Real provider usage when available,
+        /// else an estimate from visible text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_tokens: Option<u64>,
-        /// Approximate visible output tokens per second.
+        /// Input (prompt) token count for the turn, summed across rounds, from
+        /// real provider usage. `None`/0 when the provider reported none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        /// Cache-read (prompt-cache hit) tokens for the turn, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_tokens: Option<u64>,
+        /// Output tokens per second (output_tokens / wall time).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_per_second: Option<f64>,
     },
