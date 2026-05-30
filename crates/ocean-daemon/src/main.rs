@@ -1512,6 +1512,7 @@ async fn agent_turn(
                         continue;
                     }
                     bridge_bus.emit(AgentTurnEvent::AssistantTextDelta {
+                        session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
                         delta,
                     });
@@ -1521,6 +1522,7 @@ async fn agent_turn(
                         continue;
                     }
                     bridge_bus.emit(AgentTurnEvent::ThinkingDelta {
+                        session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
                         delta,
                     });
@@ -1533,6 +1535,7 @@ async fn agent_turn(
                     let call_id = ToolCallId(Uuid::new_v4());
                     tool_call_ids.insert(tool_call_id, call_id.clone());
                     bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
+                        session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
                         call: ToolCall {
                             id: call_id,
@@ -1552,6 +1555,7 @@ async fn agent_turn(
                         .unwrap_or_else(|| ToolCallId(Uuid::new_v4()));
                     let output = render_tool_output(&content);
                     bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
+                        session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
                         call_id,
                         result: ToolResult {
@@ -1564,6 +1568,7 @@ async fn agent_turn(
                 AgentEvent::PermissionDenied { tool_name, reason } => {
                     let call_id = ToolCallId(Uuid::new_v4());
                     bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
+                        session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
                         call_id,
                         result: ToolResult {
@@ -1640,6 +1645,7 @@ async fn agent_turn(
             &state.agent_events,
             session_id,
             AgentTurnEvent::TurnFinished {
+                session_id,
                 turn_id,
                 status: AgentTurnStatus::Completed,
                 error: None,
@@ -1656,6 +1662,7 @@ async fn agent_turn(
             &state.agent_events,
             session_id,
             AgentTurnEvent::TurnFinished {
+                session_id,
                 turn_id,
                 status: AgentTurnStatus::Failed,
                 error: Some(res.stderr.clone()),
@@ -1898,11 +1905,11 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             turn_id: _,
             session_id: _,
         } => None,
-        AgentTurnEvent::AssistantTextDelta { turn_id: _, delta } => {
+        AgentTurnEvent::AssistantTextDelta { turn_id: _, delta, .. } => {
             Some(OceanEvent::AssistantDelta { text: delta })
         }
         AgentTurnEvent::ThinkingDelta { .. } => None,
-        AgentTurnEvent::ToolCallStarted { turn_id: _, call } => Some(OceanEvent::ToolStarted {
+        AgentTurnEvent::ToolCallStarted { turn_id: _, call, .. } => Some(OceanEvent::ToolStarted {
             tool: call.name,
             args: call.args_json,
         }),
@@ -1922,6 +1929,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             turn_id: _,
             call_id: _,
             chunk,
+            ..
         } => Some(OceanEvent::ToolOutput {
             tool: "tool".into(),
             text: chunk,
@@ -1931,6 +1939,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             turn_id: _,
             call_id: _,
             result,
+            ..
         } => Some(OceanEvent::ToolEnded {
             tool: "tool".into(),
             is_error: !result.ok,

@@ -282,30 +282,42 @@ pub enum AgentTurnEvent {
         session_id: AgentSessionId,
     },
     /// Incremental assistant text delta.  Clients append to their output buffer.
-    AssistantTextDelta { turn_id: AgentTurnId, delta: String },
+    AssistantTextDelta {
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+        delta: String,
+    },
     /// Incremental assistant thinking delta (extended-thinking models only).
     /// Clients should display this in a separate, collapsed surface from the
     /// main assistant text — it is not part of the public turn output.
-    ThinkingDelta { turn_id: AgentTurnId, delta: String },
+    ThinkingDelta {
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+        delta: String,
+    },
     /// A tool call has been dispatched.
     ToolCallStarted {
+        session_id: AgentSessionId,
         turn_id: AgentTurnId,
         call: ToolCall,
     },
     /// Incremental output from a running tool call.
     ToolCallChunk {
+        session_id: AgentSessionId,
         turn_id: AgentTurnId,
         call_id: ToolCallId,
         chunk: String,
     },
     /// A tool call has completed.
     ToolCallFinished {
+        session_id: AgentSessionId,
         turn_id: AgentTurnId,
         call_id: ToolCallId,
         result: ToolResult,
     },
     /// The turn has ended.
     TurnFinished {
+        session_id: AgentSessionId,
         turn_id: AgentTurnId,
         status: AgentTurnStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +410,7 @@ mod tests {
     #[test]
     fn agent_turn_event_deserializes_round_trip() {
         let event = AgentTurnEvent::ToolCallFinished {
+            session_id: AgentSessionId::new_v4(),
             turn_id: AgentTurnId::new_v4(),
             call_id: ToolCallId::new_v4(),
             result: ToolResult {

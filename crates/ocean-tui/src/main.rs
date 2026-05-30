@@ -3024,17 +3024,32 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             app.status = format!("agent turn running: {}", short_id(turn_id));
             app.push_transcript_if_new(format!("… agent turn [{}] started", short_id(turn_id)));
         }
-        AgentTurnEvent::AssistantTextDelta { turn_id, delta } => {
+        AgentTurnEvent::AssistantTextDelta {
+            turn_id,
+            delta,
+            session_id,
+        } => {
+            app.active_agent_session_id = Some(session_id);
             app.active_agent_turn_id = Some(turn_id);
             app.append_agent_assistant_delta(turn_id, &delta);
             app.pm_append_assistant_text(turn_id, &delta);
             app.capture_diff_excerpt(&delta);
         }
-        AgentTurnEvent::ThinkingDelta { turn_id, delta } => {
+        AgentTurnEvent::ThinkingDelta {
+            turn_id,
+            delta,
+            session_id,
+        } => {
+            app.active_agent_session_id = Some(session_id);
             app.active_agent_turn_id = Some(turn_id);
             app.pm_append_thinking(turn_id, &delta);
         }
-        AgentTurnEvent::ToolCallStarted { turn_id, call } => {
+        AgentTurnEvent::ToolCallStarted {
+            turn_id,
+            call,
+            session_id,
+        } => {
+            app.active_agent_session_id = Some(session_id);
             app.active_agent_turn_id = Some(turn_id);
             let args_text =
                 serde_json::to_string(&call.args_json).unwrap_or_else(|_| "{}".to_string());
@@ -3061,7 +3076,9 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             turn_id,
             call_id,
             chunk,
+            session_id,
         } => {
+            app.active_agent_session_id = Some(session_id);
             app.active_agent_turn_id = Some(turn_id);
             app.push_agent_tool_timeline(
                 turn_id,
@@ -3081,7 +3098,9 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             turn_id,
             call_id,
             result,
+            session_id,
         } => {
+            app.active_agent_session_id = Some(session_id);
             app.active_agent_turn_id = Some(turn_id);
             app.push_agent_tool_timeline(
                 turn_id,
@@ -3615,17 +3634,23 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             short_id(turn_id),
             short_id(session_id)
         ),
-        AgentTurnEvent::AssistantTextDelta { turn_id, delta } => format!(
+        AgentTurnEvent::AssistantTextDelta {
+            turn_id, delta, ..
+        } => format!(
             "agent assistant_delta [{}]: {}",
             short_id(turn_id),
             compact_text(delta, 72)
         ),
-        AgentTurnEvent::ThinkingDelta { turn_id, delta } => format!(
+        AgentTurnEvent::ThinkingDelta {
+            turn_id, delta, ..
+        } => format!(
             "agent thinking_delta [{}]: {}",
             short_id(turn_id),
             compact_text(delta, 72)
         ),
-        AgentTurnEvent::ToolCallStarted { turn_id, call } => format!(
+        AgentTurnEvent::ToolCallStarted {
+            turn_id, call, ..
+        } => format!(
             "agent tool_started [{}] {} args={}",
             short_id(turn_id),
             compact_text(&call.name, 20),
@@ -3635,6 +3660,7 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             turn_id,
             call_id,
             chunk,
+            ..
         } => format!(
             "agent tool_chunk [{}] {} {}",
             short_id(turn_id),
@@ -3645,6 +3671,7 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             turn_id,
             call_id,
             result,
+            ..
         } => format!(
             "agent tool_finished [{}] {} ok={} {}",
             short_id(turn_id),
@@ -6015,7 +6042,9 @@ mod tests {
     #[test]
     fn agent_turn_event_parser_accepts_product_stream_event() {
         let turn_id = AgentTurnId::new_v4();
+        let session_id = AgentSessionId::new_v4();
         let payload = serde_json::to_string(&AgentTurnEvent::AssistantTextDelta {
+            session_id,
             turn_id,
             delta: "hello from agent stream".to_string(),
         })
@@ -6058,12 +6087,14 @@ mod tests {
     #[test]
     fn daemon_agent_stream_event_updates_pm_transcript_and_tool_timeline() {
         let turn_id = AgentTurnId::new_v4();
+        let session_id = AgentSessionId::new_v4();
         let call_id = ocean_agent_sdk::ToolCallId::new_v4();
         let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
 
         daemon_apply_agent_stream_event(
             &mut app,
             AgentTurnEvent::AssistantTextDelta {
+                session_id,
                 turn_id,
                 delta: "streamed assistant text".to_string(),
             },
@@ -6071,6 +6102,7 @@ mod tests {
         daemon_apply_agent_stream_event(
             &mut app,
             AgentTurnEvent::ToolCallFinished {
+                session_id,
                 turn_id,
                 call_id,
                 result: ocean_agent_sdk::ToolResult {
