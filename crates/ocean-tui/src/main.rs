@@ -3017,6 +3017,7 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
         AgentTurnEvent::TurnStarted {
             turn_id,
             session_id,
+            ..
         } => {
             app.active_agent_session_id = Some(session_id);
             app.active_agent_turn_id = Some(turn_id);
@@ -3629,6 +3630,7 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
         AgentTurnEvent::TurnStarted {
             turn_id,
             session_id,
+            ..
         } => format!(
             "agent turn_started [{}] session={}",
             short_id(turn_id),

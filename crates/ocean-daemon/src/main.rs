@@ -203,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
         .route("/v1/model", get(model_get).post(model_set))
+        .route("/v1/models", get(models_list))
         .route("/v1/component/event", post(component_event))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -629,6 +630,17 @@ struct ModelSetRequest {
 async fn model_get(State(state): State<AppState>) -> Json<serde_json::Value> {
     let (provider, model) = state.runtime.current_model();
     Json(json!({"ok": true, "provider": provider, "model": model}))
+}
+
+/// List the models the daemon can route to, plus the currently selected one,
+/// for a client model picker.
+async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let (provider, model) = state.runtime.current_model();
+    Json(json!({
+        "ok": true,
+        "current": { "provider": provider, "model": model },
+        "models": ocean_agent::known_models(),
+    }))
 }
 
 async fn model_set(
@@ -1474,7 +1486,9 @@ async fn agent_turn(
         }
     };
 
-    // Emit turn_started
+    // Emit turn_started, tagged with the model driving this turn so clients
+    // can show it live and reflect a mid-session swap.
+    let (_provider, current_model) = state.runtime.current_model();
     emit_agent(
         &state.events,
         &state.agent_events,
@@ -1482,11 +1496,12 @@ async fn agent_turn(
         AgentTurnEvent::TurnStarted {
             turn_id,
             session_id,
+            model: Some(current_model),
         },
     );
 
     let guided_prompt = apply_room_guidance(room_id, &prompt);
-    let prompt_req = PromptRequest {
+    let mut prompt_req = PromptRequest {
         prompt: guided_prompt,
         request_id: Some(request_id),
         session_id: Some(core_sid(session_id)),
@@ -1495,6 +1510,14 @@ async fn agent_turn(
         cwd,
         client_type,
     };
+
+    // Register the turn in the request map so it's cancellable via
+    // POST /v1/requests/{turn_id}/cancel (the turn_id IS the request_id). The
+    // returned token is threaded into PromptControl below; the agent loop polls
+    // it, so a halt from the client actually stops the turn mid-flight.
+    let (_request_id, cancel) =
+        register_running_request(&state, &mut prompt_req, "agent turn running", RequestState::Running)
+            .await;
 
     // Wire up the runtime → bus streaming bridge. Every TextDelta /
     // ThinkingDelta / ToolExecution* event the agent emits gets forwarded
@@ -1603,7 +1626,8 @@ async fn agent_turn(
         }
     });
 
-    let control = PromptControl::yolo(true).with_event_sink(event_tx);
+    let control = build_prompt_control(&state, request_id, Some(core_sid(session_id)), true, cancel)
+        .with_event_sink(event_tx);
     let res = state.runtime.prompt(prompt_req, control).await;
     // Wait for the bridge to drain (the sender has been dropped by now).
     let _ = bridge.await;
@@ -1904,6 +1928,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
         AgentTurnEvent::TurnStarted {
             turn_id: _,
             session_id: _,
+            ..
         } => None,
         AgentTurnEvent::AssistantTextDelta { turn_id: _, delta, .. } => {
             Some(OceanEvent::AssistantDelta { text: delta })

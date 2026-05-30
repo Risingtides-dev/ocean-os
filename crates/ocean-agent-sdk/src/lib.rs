@@ -280,6 +280,10 @@ pub enum AgentTurnEvent {
     TurnStarted {
         turn_id: AgentTurnId,
         session_id: AgentSessionId,
+        /// Model id driving this turn (e.g. "deepseek-v4-pro"). Lets clients
+        /// show the live model and reflect a mid-session model swap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// Incremental assistant text delta.  Clients append to their output buffer.
     AssistantTextDelta {
@@ -400,6 +404,7 @@ mod tests {
         let event = AgentTurnEvent::TurnStarted {
             turn_id: AgentTurnId::new_v4(),
             session_id: AgentSessionId::new_v4(),
+            model: Some("deepseek-v4-pro".into()),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.starts_with(r#"{"type":"turn_started","#));

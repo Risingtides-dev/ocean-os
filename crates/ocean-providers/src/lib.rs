@@ -257,6 +257,43 @@ fn resolve_codex_account_id(env: &ProviderEnv) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A user-selectable model: the canonical id to pass to `OCEAN_MODEL` /
+/// `POST /v1/model`, its provider, and a short human label for a picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownModel {
+    /// Canonical model id (also a valid alias for selection).
+    pub id: String,
+    /// Provider this model routes to (e.g. "deepseek", "openai-codex").
+    pub provider: String,
+    /// Short human-facing label for a dropdown.
+    pub label: String,
+}
+
+/// The catalogue of models the daemon knows how to route, for clients that
+/// render a model picker. Kept in sync with the alias arms in
+/// `resolve_model_selection`. (Availability still depends on the relevant
+/// provider credential being present; this is the menu, not a guarantee.)
+pub fn known_models() -> Vec<KnownModel> {
+    let m = |id: &str, provider: &str, label: &str| KnownModel {
+        id: id.to_string(),
+        provider: provider.to_string(),
+        label: label.to_string(),
+    };
+    vec![
+        m("deepseek-v4-pro", "deepseek", "DeepSeek V4 Pro"),
+        m("deepseek-v4-flash", "deepseek", "DeepSeek V4 Flash"),
+        m("deepseek-reasoner", "deepseek", "DeepSeek Reasoner"),
+        m("deepseek-chat", "deepseek", "DeepSeek Chat"),
+        m("gpt-5.5", "openai-codex", "GPT-5.5 (Codex)"),
+        m("gpt-5.4", "openai-codex", "GPT-5.4 (Codex)"),
+        m("gpt-5.4-mini", "openai-codex", "GPT-5.4 Mini (Codex)"),
+        m("claude-opus-4-7", "anthropic", "Claude Opus 4.7"),
+        m("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6"),
+        m("minimax-m2", "minimax", "MiniMax M2"),
+        m("kimi-k2.6", "kimi", "Kimi K2.6"),
+    ]
+}
+
 /// Resolve model selection without reading credential values.
 pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, ProviderConfigError> {
     let model = normalize_model_id(env.get("OCEAN_MODEL").unwrap_or("deepseek-chat"));
