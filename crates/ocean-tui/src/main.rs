@@ -3098,6 +3098,24 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 compact_text(&payload.to_string(), 72)
             ));
         }
+        AgentTurnEvent::ComponentRender {
+            session_id: _,
+            component_id,
+            kind,
+            props: _,
+            replace,
+        } => {
+            app.push_transcript(format!(
+                "component {op} **{kind}** `{component_id}`",
+                op = if replace { "replaced" } else { "rendered" }
+            ));
+        }
+        AgentTurnEvent::ComponentUnmount {
+            session_id: _,
+            component_id,
+        } => {
+            app.push_transcript(format!("component unmounted `{component_id}`"));
+        }
     }
 }
 
@@ -3623,6 +3641,20 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             extension,
             compact_text(&payload.to_string(), 72)
         ),
+        AgentTurnEvent::ComponentRender {
+            session_id: _,
+            component_id,
+            kind,
+            props: _,
+            replace,
+        } => format!(
+            "component {op} {kind} {component_id}",
+            op = if *replace { "replaced" } else { "rendered" }
+        ),
+        AgentTurnEvent::ComponentUnmount {
+            session_id: _,
+            component_id,
+        } => format!("component unmounted {component_id}"),
     }
 }
 

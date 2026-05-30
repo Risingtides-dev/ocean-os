@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crate::error::{AgentError, Result};
-use crate::types::{AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision};
+use crate::types::{AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, ToolSideEffect};
 
 pub struct AgentRun {
     pub messages: Vec<Message>,
@@ -180,19 +180,26 @@ pub async fn run_agent_with_history(
                     args: args.clone(),
                 },
             );
-            let (content, is_error, terminate) = match tool_obj {
+            let (content, is_error, terminate, side_effects) = match tool_obj {
                 Some(tool) => match tool.execute(&id, args).await {
                     Ok(AgentToolResult {
                         content,
                         details: _,
                         terminate,
-                    }) => (content, false, terminate),
-                    Err(e) => (vec![Content::text(format!("tool error: {e}"))], true, false),
+                        side_effects,
+                    }) => (content, false, terminate, side_effects),
+                    Err(e) => (
+                        vec![Content::text(format!("tool error: {e}"))],
+                        true,
+                        false,
+                        Vec::new(),
+                    ),
                 },
                 None => (
                     vec![Content::text(format!("unknown tool: {name}"))],
                     true,
                     false,
+                    Vec::new(),
                 ),
             };
             if !terminate {
@@ -207,6 +214,30 @@ pub async fn run_agent_with_history(
                     content: content.clone(),
                 },
             );
+            // Emit any side-effect events the tool requested (render, unmount, etc.)
+            for effect in &side_effects {
+                match effect {
+                    ToolSideEffect::Render {
+                        id,
+                        kind,
+                        props,
+                        replace,
+                    } => {
+                        emit(
+                            &events,
+                            AgentEvent::Render {
+                                id: id.clone(),
+                                kind: kind.clone(),
+                                props: props.clone(),
+                                replace: *replace,
+                            },
+                        );
+                    }
+                    ToolSideEffect::Unmount { id } => {
+                        emit(&events, AgentEvent::Unmount { id: id.clone() });
+                    }
+                }
+            }
             let tr = ToolResultMessage {
                 tool_call_id: id,
                 tool_name: name,

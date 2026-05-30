@@ -30,7 +30,10 @@ use ocean_core::{
     RoomPanelSnapshot, RoomSnapshot, RoomsResponse, SessionDetail, SessionId, SessionResponse,
     SessionRunState, SessionSummary,
 };
-use ocean_runtime::{AgentEvent, PermissionDecision as AgentPermissionDecision, PermissionPolicy};
+use ocean_runtime::{
+    tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
+    PermissionDecision as AgentPermissionDecision, PermissionPolicy,
+};
 use serde_json::{json, Value};
 use tokio::{
     sync::{broadcast, oneshot, RwLock},
@@ -200,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
         .route("/v1/model", get(model_get).post(model_set))
+        .route("/v1/component/event", post(component_event))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -1496,6 +1500,7 @@ async fn agent_turn(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let bridge_bus = state.agent_events.clone();
     let bridge_turn_id = turn_id;
+    let bridge_session_id = session_id;
     let bridge = tokio::spawn(async move {
         let mut tool_call_ids: HashMap<String, ToolCallId> = HashMap::new();
         while let Some(ev) = event_rx.recv().await {
@@ -1564,6 +1569,26 @@ async fn agent_turn(
                             output: format!("permission denied for {tool_name}: {reason}"),
                             metadata_json: None,
                         },
+                    });
+                }
+                AgentEvent::Render {
+                    id,
+                    kind,
+                    props,
+                    replace,
+                } => {
+                    bridge_bus.emit(AgentTurnEvent::ComponentRender {
+                        session_id: bridge_session_id,
+                        component_id: id,
+                        kind,
+                        props,
+                        replace,
+                    });
+                }
+                AgentEvent::Unmount { id } => {
+                    bridge_bus.emit(AgentTurnEvent::ComponentUnmount {
+                        session_id: bridge_session_id,
+                        component_id: id,
                     });
                 }
                 _ => {}
@@ -1642,6 +1667,7 @@ async fn agent_turn(
     )
 }
 
+
 fn parse_agent_turn_room(room_id: Option<&str>) -> Result<Option<RoomId>, String> {
     let Some(room_id) = room_id.map(str::trim).filter(|room_id| !room_id.is_empty()) else {
         return Ok(None);
@@ -1656,6 +1682,78 @@ fn apply_room_guidance(room_id: Option<RoomId>, prompt: &str) -> String {
     match room_id {
         Some(room_id) => format!("{}\n\n{}", room_guidance(room_id), prompt),
         None => prompt.to_string(),
+    }
+}
+
+/// Receive a user interaction event for a rendered component and deliver it
+/// to the waiting `component_wait` tool call.
+///
+/// Request body:
+/// ```json
+/// {
+///   "session_id": "uuid-of-session",
+///   "component_id": "agent-chosen-id",
+///   "event": { "type": "submit", "data": { ... } }
+/// }
+/// ```
+///
+/// Returns 200 if the event was delivered, 404 if nobody is waiting on that
+/// component, 400 on missing fields.
+async fn component_event(
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let session_id = match body.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'session_id'" })),
+            );
+        }
+    };
+    let component_id = match body.get("component_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'component_id'" })),
+            );
+        }
+    };
+    let event = body.get("event").cloned().unwrap_or(json!({}));
+
+    let sender = {
+        let mut pending = match COMPONENT_WAIT_REGISTRY.pending.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("registry lock: {e}") })),
+                );
+            }
+        };
+        pending.remove(&(session_id.clone(), component_id.clone()))
+    };
+
+    match sender {
+        Some(tx) => {
+            if tx.send(event).is_err() {
+                // Receiver dropped (timeout or cancellation) — not an error for the caller.
+                (
+                    StatusCode::GONE,
+                    Json(json!({ "status": "nobody waiting" })),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "status": "delivered" })),
+                )
+            }
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no pending wait for component", "session_id": session_id, "component_id": component_id })),
+        ),
     }
 }
 
@@ -1828,6 +1926,8 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             extension: _,
             payload: _,
         } => None,
+        AgentTurnEvent::ComponentRender { .. } => None,
+        AgentTurnEvent::ComponentUnmount { .. } => None,
     }
 }
 
@@ -1845,6 +1945,8 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
             extension: _,
             payload: _,
         } => "extension",
+        AgentTurnEvent::ComponentRender { .. } => "component_render",
+        AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
     }
 }
 

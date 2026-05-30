@@ -323,6 +323,27 @@ pub enum AgentTurnEvent {
         title: String,
         cwd: String,
     },
+    /// The agent wants the client to mount or update an interactive component.
+    /// Clients maintain a component registry per session and render these
+    /// as live UI elements (kanban, forms, tables, etc.).
+    ComponentRender {
+        session_id: AgentSessionId,
+        /// Opaque component id chosen by the agent.
+        component_id: String,
+        /// Component kind: "kanban", "form", "table", "progress", "markdown", etc.
+        kind: String,
+        /// Component-specific JSON props. Schema defined per-kind in
+        /// docs/AGENT_RENDER_PROTOCOL.md.
+        props: Value,
+        /// If true, overwrite any existing component with this component_id.
+        replace: bool,
+    },
+    /// The agent wants the client to unmount (remove) a previously rendered
+    /// component.
+    ComponentUnmount {
+        session_id: AgentSessionId,
+        component_id: String,
+    },
     /// Catch-all for unexpected or extension events.  Includes the raw payload.
     Extension { extension: String, payload: Value },
 }

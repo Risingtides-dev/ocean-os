@@ -4,12 +4,32 @@ use async_trait::async_trait;
 use ocean_protocol::{Content, Message, Model, StreamOptions, ThinkingLevel, Tool};
 use serde_json::Value;
 
+/// Side-effect events a tool may emit during execution. The agent loop forwards
+/// these onto the event bus after the tool returns. This avoids threading a
+/// mutable event sender through every tool's `execute` signature.
+#[derive(Debug, Clone)]
+pub enum ToolSideEffect {
+    Render {
+        id: String,
+        kind: String,
+        props: Value,
+        replace: bool,
+    },
+    Unmount {
+        id: String,
+    },
+}
+
 /// A live result returned from a tool execution.
 #[derive(Debug, Clone, Default)]
 pub struct AgentToolResult {
     pub content: Vec<Content>,
     pub details: Value,
     pub terminate: bool,
+    /// Optional side-effect events the tool wants emitted after its result.
+    /// The agent loop emits these onto the event bus during
+    /// `ToolExecutionEnd` handling.
+    pub side_effects: Vec<ToolSideEffect>,
 }
 
 impl AgentToolResult {
@@ -18,6 +38,7 @@ impl AgentToolResult {
             content: vec![Content::text(s)],
             details: Value::Null,
             terminate: false,
+            side_effects: Vec::new(),
         }
     }
 }
@@ -161,5 +182,17 @@ pub enum AgentEvent {
     PermissionDenied {
         tool_name: String,
         reason: String,
+    },
+    /// The agent wants the client to mount or update an interactive component.
+    /// Clients maintain a component registry per session.
+    Render {
+        id: String,
+        kind: String,
+        props: Value,
+        replace: bool,
+    },
+    /// The agent wants the client to remove a previously rendered component.
+    Unmount {
+        id: String,
     },
 }
