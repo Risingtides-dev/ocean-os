@@ -189,6 +189,10 @@ pub struct AgentTurnRequest {
     /// Optional room identifier for Track-0 room-scoped turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_id: Option<String>,
+    /// Identifies the client surface so the agent can tailor responses.
+    /// Known values: "tui", "surface-web", "surface-native", "cli", "leo-voice"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
 }
 
 /// Response payload for `POST /v1/agent/turns`.
@@ -407,6 +411,7 @@ mod tests {
             cwd: "/home/user/project".into(),
             guidance: Some(vec!["be concise".into()]),
             room_id: Some("pm".into()),
+            client_type: Some("surface-web".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));

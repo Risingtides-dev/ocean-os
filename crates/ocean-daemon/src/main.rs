@@ -1434,6 +1434,7 @@ async fn agent_turn(
         cwd,
         guidance: _,
         room_id,
+        client_type,
     } = req;
 
     let is_new_session = session_id.is_none();
@@ -1492,6 +1493,7 @@ async fn agent_turn(
         max_turns: None,
         yolo: true,
         cwd,
+        client_type,
     };
 
     // Wire up the runtime → bus streaming bridge. Every TextDelta /
