@@ -309,6 +309,32 @@ enum PmBlock {
     },
 }
 
+/// Return the most-recent `Text` block to append a streaming delta into, but
+/// only if every block after it is a `Thinking` block. Reasoning models
+/// (DeepSeek reasoner/v4-pro, Kimi, MiniMax) interleave reasoning and content
+/// token-by-token, so a thinking delta can land between two words of the
+/// visible answer; folding the next content delta back into the prior `Text`
+/// block keeps the reply from shattering into one-word-per-line spatter. A
+/// `ToolCall` (or any non-Thinking block) is a real structural boundary and
+/// stops the search, so post-tool text correctly starts a fresh block.
+fn pm_coalescable_text(blocks: &mut [PmBlock]) -> Option<&mut String> {
+    let mut idx = None;
+    for (i, block) in blocks.iter().enumerate().rev() {
+        match block {
+            PmBlock::Text(_) => {
+                idx = Some(i);
+                break;
+            }
+            PmBlock::Thinking { .. } => continue,
+            _ => return None, // structural boundary (tool call, etc.)
+        }
+    }
+    match blocks.get_mut(idx?) {
+        Some(PmBlock::Text(buf)) => Some(buf),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PmTurn {
     turn_id: Option<AgentTurnId>,
