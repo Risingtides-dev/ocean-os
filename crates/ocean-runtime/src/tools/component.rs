@@ -50,11 +50,27 @@ impl AgentTool for ComponentRenderTool {
     }
 
     fn description(&self) -> &str {
-        "Mount or update an interactive UI component in the client. \
-         Supported kinds: kanban, form, table, progress, markdown, dashboard. \
-         The `id` is an agent-chosen opaque string scoped to the session. \
-         Set `replace: true` to overwrite an existing component with the same id. \
-         Component specs are in docs/AGENT_RENDER_PROTOCOL.md."
+        "Mount or update a rich, interactive UI component in the client surface. \
+         PREFER this over hand-typing markdown tables/lists when the data is structured: \
+         tabular data MUST use kind 'table' (never markdown pipe tables), task boards use \
+         'kanban', input collection uses 'form', progress uses 'progress'. \
+         `id` is an agent-chosen opaque string scoped to the session; reuse the same id with \
+         replace:true to update a component in place (e.g. advance a progress bar). \
+         \
+         PROPS SCHEMA BY KIND (props must match exactly):\n\
+         • table — { columns: [\"Name\",\"Status\"], rows: [[\"Fix login\",\"open\"],[\"Add tests\",\"done\"]] }. \
+         Rows are arrays of cells aligned to columns. Emits row_clicked { row_index }.\n\
+         • kanban — { columns: [{id,title}], cards: [{id, column, title, description?}] }. \
+         card.column references a column id. Emits card_clicked / card_moved.\n\
+         • form — { title, fields: [{name, label, type, required?, options?}], submit_label? }. \
+         field.type is text|textarea|select|number; select needs options:[..]. Emits form_submit { <name>: value, .. }.\n\
+         • progress — { label, value, max, indeterminate? }. value/max are numbers (e.g. 0.6/1.0). Display only.\n\
+         • markdown — { content: \"## md string\" }. For rich prose blocks; supports tables, bold, lists.\n\
+         • dashboard — { children: [{ id, width, kind?, props? }] }. Grid layout; width is fr units. \
+         A child with inline kind+props renders that component in its cell.\n\
+         \
+         Set replace:true to overwrite an existing component with the same id. \
+         Full reference: docs/AGENT_RENDER_PROTOCOL.md."
     }
 
     fn parameters(&self) -> Value {
@@ -72,7 +88,11 @@ impl AgentTool for ComponentRenderTool {
                 },
                 "props": {
                     "type": "object",
-                    "description": "Component-specific JSON props. Schema depends on `kind`."
+                    "description": "Component-specific JSON props; shape MUST match the chosen kind. \
+                        table: {columns:[str], rows:[[cell,..]]}. kanban: {columns:[{id,title}], cards:[{id,column,title,description?}]}. \
+                        form: {title, fields:[{name,label,type,required?,options?}], submit_label?}. \
+                        progress: {label, value, max, indeterminate?}. markdown: {content}. \
+                        dashboard: {children:[{id,width,kind?,props?}]}."
                 },
                 "replace": {
                     "type": "boolean",

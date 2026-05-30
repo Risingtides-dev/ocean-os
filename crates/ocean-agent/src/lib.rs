@@ -226,8 +226,10 @@ impl AgentRuntime {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let mut session = match req.session_id {
-            Some(id) => session::load(&self.config_dir, id)
-                .unwrap_or_else(|_| session::Session::new_with_id(id, &snapshot.model)),
+            Some(id) => match session::load_resumable(&self.config_dir, id)? {
+                Some(existing) => existing,
+                None => session::Session::new_with_id(id, &snapshot.model),
+            },
             None => session::Session::new(&snapshot.model),
         };
         session.bind_workspace(Path::new(&req.cwd));
@@ -260,8 +262,10 @@ impl AgentRuntime {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let mut session = match req.session_id {
-            Some(id) => session::load(&self.config_dir, id)
-                .unwrap_or_else(|_| session::Session::new_with_id(id, &snapshot.model)),
+            Some(id) => match session::load_resumable(&self.config_dir, id)? {
+                Some(existing) => existing,
+                None => session::Session::new_with_id(id, &snapshot.model),
+            },
             None => session::Session::new(&snapshot.model),
         };
         session.bind_workspace(Path::new(&req.cwd));
@@ -711,22 +715,39 @@ mod session {
         std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         let path = dir.join(format!("{}.json", session.id));
         let json = serde_json::to_string_pretty(session)?;
-        std::fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
+        // Atomic write: a crash mid-write must never corrupt an existing good
+        // transcript. Write to a temp sibling, then rename over the target.
+        let tmp = dir.join(format!(".{}.json.tmp", session.id));
+        std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(path)
     }
 
     pub fn load(config_dir: &Path, id: SessionId) -> anyhow::Result<Session> {
+        match load_resumable(config_dir, id)? {
+            Some(session) => Ok(session),
+            None => anyhow::bail!("session {id} not found"),
+        }
+    }
+
+    /// Load a session for resumption, distinguishing "no session file exists"
+    /// (Ok(None) — safe to start fresh) from "a session file exists but could
+    /// not be read or parsed" (Err — must NOT be treated as a fresh session,
+    /// or the entire prior transcript is silently discarded mid-chat).
+    pub fn load_resumable(config_dir: &Path, id: SessionId) -> anyhow::Result<Option<Session>> {
         let target = format!("{id}.json");
         // Search all workspace buckets + legacy/ + top-level (for forward-compat).
         for candidate in candidate_session_paths(config_dir, &target) {
             if candidate.exists() {
                 let text = std::fs::read_to_string(&candidate)
                     .with_context(|| format!("read {}", candidate.display()))?;
-                let session = serde_json::from_str(&text)?;
-                return Ok(session);
+                let session = serde_json::from_str(&text)
+                    .with_context(|| format!("parse {}", candidate.display()))?;
+                return Ok(Some(session));
             }
         }
-        anyhow::bail!("session {id} not found")
+        Ok(None)
     }
 
     fn candidate_session_paths(config_dir: &Path, filename: &str) -> Vec<PathBuf> {
@@ -1014,6 +1035,46 @@ mod tests {
         assert!(room_guidance(RoomId::Review).contains("Review Room"));
     }
 
+    #[test]
+    fn load_resumable_returns_none_for_unknown_session() {
+        let config_dir = temp_config_dir("resumable-none");
+        let result = session::load_resumable(&config_dir, SessionId::new_v4()).unwrap();
+        assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn load_resumable_errors_on_corrupt_session_instead_of_wiping_it() {
+        let config_dir = temp_config_dir("resumable-corrupt");
+        let id = SessionId::new_v4();
+        let bucket = session::sessions_dir(&config_dir).join("legacy");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Simulate a partial/corrupt write of an existing transcript.
+        std::fs::write(bucket.join(format!("{id}.json")), b"{ not valid json").unwrap();
+
+        let result = session::load_resumable(&config_dir, id);
+        assert!(
+            result.is_err(),
+            "corrupt session must error, not silently resolve to an empty session"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn save_then_load_resumable_roundtrips_messages() {
+        let config_dir = temp_config_dir("resumable-roundtrip");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let mut s = session::Session::new(&model);
+        s.bind_workspace(Path::new("."));
+        s.replace_messages(vec![Message::user_text("remember me")]);
+        let id = s.id;
+        session::save(&config_dir, &s).unwrap();
+
+        let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
     #[tokio::test]
     async fn missing_credential_preflight_names_ocean_provider_and_model() {
         let config_dir = temp_config_dir("missing-credential");
@@ -1101,7 +1162,15 @@ mod tests {
         assert!(error
             .chain()
             .all(|cause| cause.downcast_ref::<std::io::Error>().is_none()));
-        assert!(error.to_string().contains("expected") || error.to_string().contains("key"));
+        let chain = error
+            .chain()
+            .map(|cause| cause.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            chain.contains("expected") || chain.contains("key"),
+            "corrupt session error should surface a parse failure, got: {chain}"
+        );
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
@@ -1200,6 +1269,16 @@ read, write, edit (files); ls, glob (filesystem nav); grep (content search); bas
 - Use markdown — the TUI renders it. Bold for emphasis, code spans for filenames/symbols, numbered lists for steps.
 - Show, don't editorialize. Cite file paths with line numbers when useful (e.g. `crates/ocean-tui/src/main.rs:3905`).
 - Don't apologize for taking actions you were asked to take.
+
+## Rich surface — render components, don't fake them
+
+Clients render live, interactive UI components, not just text. When data is structured, render the real component via `component_render` instead of hand-typing markdown:
+
+- Tabular data → kind `table` ({columns, rows}). NEVER hand-build a markdown pipe table when a `table` component fits.
+- Task/status boards → `kanban`. Collecting input → `form` (then `component_wait` for the submit). Live progress → `progress` (reuse the id with replace:true to advance it). Multi-component layouts → `dashboard`.
+- Prose, explanations, code → plain markdown text is correct; don't over-componentize.
+
+The `component_render` tool description carries the exact props schema for each kind. Use it; don't guess the shape. After rendering, still give a short text reply — the component complements your words, it doesn't replace them.
 
 You operate from the user's project directory (passed per turn). Look for AGENTS.md, CLAUDE.md, or .pi/instructions.md in the project tree — those are project-specific instructions that override or extend the above.
 "#;
