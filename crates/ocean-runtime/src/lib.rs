@@ -7,11 +7,16 @@
 //! - Builtin tools under [`tools`]
 
 pub mod agent_loop;
+pub mod capability;
 pub mod error;
 pub mod tools;
 pub mod types;
 
 pub use agent_loop::{run_agent, run_agent_with_history, AgentRun};
+pub use capability::{
+    BuiltinProvider, CapabilityProvider, CapabilityRegistry, ProviderHealth, SessionContext,
+    SharedTool,
+};
 pub use error::{AgentError, Result};
 pub use types::{
     tool_def, AgentConfig, AgentEvent, AgentTool, AgentToolResult, AllowAllPolicy,
