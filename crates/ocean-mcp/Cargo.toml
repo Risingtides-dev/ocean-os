@@ -1,0 +1,35 @@
+[package]
+name = "ocean-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The capability seam we implement. ocean-mcp depends UP into ocean-runtime;
+# ocean-runtime must never depend back on ocean-mcp.
+ocean-runtime = { path = "../ocean-runtime" }
+
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# A tiny in-repo stdio MCP server lives at src/bin/fake_server.rs (auto-
+# discovered). Cargo builds it for tests and sets CARGO_BIN_EXE_fake_server, the
+# path the e2e test spawns as the MCP child. It uses serde_json (a normal dep).
+[[bin]]
+name = "fake_server"
+test = false
+doc = false
+
+[dev-dependencies]
+# Parses the [[mcp.server]] section in the config test; the daemon's real
+# loader (ocean-agent) carries the non-dev toml dependency.
+toml.workspace = true
+# The e2e test inspects tool-result Content (transitive via ocean-runtime, but
+# named explicitly so the test crate can `use` it).
+ocean-protocol = { path = "../ocean-protocol" }

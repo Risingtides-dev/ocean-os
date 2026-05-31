@@ -3,6 +3,7 @@ members = [
   "crates/ocean-core",
   "crates/ocean-protocol",
   "crates/ocean-runtime",
+  "crates/ocean-mcp",
   "crates/ocean-agent",
   "crates/ocean-agent-sdk",
   "crates/ocean-providers",
@@ -39,6 +40,8 @@ chrono = { version = "0.4", features = ["serde"] }
 ocean-core = { path = "crates/ocean-core" }
 ocean-protocol = { path = "crates/ocean-protocol" }
 ocean-runtime = { path = "crates/ocean-runtime" }
+ocean-mcp = { path = "crates/ocean-mcp" }
+toml = "0.8"
 ocean-agent-sdk = { path = "crates/ocean-agent-sdk" }
 ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }
