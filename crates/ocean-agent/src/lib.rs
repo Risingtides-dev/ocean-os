@@ -21,15 +21,23 @@ use ocean_providers::{
 // a direct ocean-providers dependency.
 pub use ocean_providers::{known_models, KnownModel};
 use ocean_runtime::{
-    run_agent_with_history, tools::default_tools, AgentConfig, AgentEvent, PermissionDecision,
-    PermissionPolicy,
+    run_agent_with_history, AgentConfig, AgentEvent, BuiltinProvider, CapabilityProvider,
+    CapabilityRegistry, PermissionDecision, PermissionPolicy, SessionContext,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod config;
+pub use config::{DaemonConfig, McpSection};
+
 const APP_NAME: &str = "ocean-rs";
+
+/// How long to wait for a single MCP server to connect + list its tools at
+/// startup. A server that exceeds this contributes no tools (non-fatal) rather
+/// than wedging daemon startup.
+const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Room-specific operator guidance injected by the daemon before runtime turns.
 pub fn room_guidance(room_id: RoomId) -> &'static str {
@@ -68,6 +76,11 @@ struct RuntimeState {
 pub struct AgentRuntime {
     config_dir: PathBuf,
     state: Arc<RwLock<RuntimeState>>,
+    /// Source of tools for every turn. Built-ins plus any MCP/skill providers,
+    /// flattened per turn through `tools_for_session`. The agent loop never
+    /// builds tools directly — this is the one seam that replaced the old
+    /// hardcoded `default_tools()` call. Assembled once at startup.
+    capabilities: Arc<CapabilityRegistry>,
     /// Per-session turn serialization. A turn against a session must hold this
     /// session's lock across load → run → save, so two concurrent turns on the
     /// same session can't both load the same history and clobber each other's
@@ -78,15 +91,38 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Build the runtime from the environment with **built-in tools only**.
+    ///
+    /// MCP/extension providers are connected separately via
+    /// [`with_extensions`](Self::with_extensions), which is async (it spawns and
+    /// handshakes child processes). Keeping `from_env` sync and built-ins-only
+    /// preserves every existing caller and test; the daemon upgrades the
+    /// registry with `.with_extensions().await` right after construction.
     pub fn from_env() -> anyhow::Result<Self> {
         let state = build_state_from_env()?;
         let runtime = Self {
             config_dir: config_dir_from_env(),
             state: Arc::new(RwLock::new(state)),
+            capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         runtime.migrate_legacy_sessions();
         Ok(runtime)
+    }
+
+    /// Connect configured MCP servers and fold their tools into the capability
+    /// registry, on top of the built-ins. Reads `<config_dir>/ocean.toml`;
+    /// absent/empty config leaves the registry built-ins-only. Each server is
+    /// connected with a timeout and non-fatally — a server that fails to start
+    /// logs a warning and contributes no tools, never blocking startup.
+    ///
+    /// Consuming builder so the daemon can do
+    /// `AgentRuntime::from_env()?.with_extensions().await` before sharing the
+    /// runtime behind an `Arc`.
+    pub async fn with_extensions(mut self) -> Self {
+        let registry = build_capability_registry(&self.config_dir).await;
+        self.capabilities = Arc::new(registry);
+        self
     }
 
     /// Get (or create) the per-session turn lock for `id`.
@@ -343,11 +379,20 @@ impl AgentRuntime {
             cancel,
             event_sink,
         } = control;
+        // Resolve the toolset for this turn through the capability registry —
+        // built-ins plus any connected MCP/skill providers, deduped first-wins.
+        // This is the seam that replaced the old hardcoded `default_tools()`.
+        let tool_ctx = SessionContext {
+            cwd: PathBuf::from(&req.cwd),
+            session_id: Some(session_id.to_string()),
+        };
+        let tools = self.capabilities.tools_for_session(&tool_ctx).await;
+
         let mut cfg = AgentConfig::new(
             snapshot.model.clone(),
             system_prompt::build_system_prompt(Some(&req.cwd), req.client_type.as_deref()),
         )
-        .with_tools(default_tools())
+        .with_tools(tools)
         .with_max_turns(req.max_turns.unwrap_or(32))
         .with_permission(permission);
         cfg.stream_options.api_key = snapshot.api_key.clone();
@@ -483,6 +528,96 @@ impl PermissionPolicy for StaticPermissionPolicy {
             }
         }
     }
+}
+
+/// Assemble the capability registry: built-ins first, then one provider per
+/// configured MCP server. Built-ins-first ordering means an MCP server can never
+/// shadow a built-in tool name (the registry dedups first-wins).
+///
+/// Secrets are resolved by env-var name from the daemon's process environment
+/// (`std::env::var`), which is loaded from `tools.env`. Names only ever leave
+/// this layer; values are injected straight into the child by `ocean-mcp` and
+/// are never logged.
+async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
+    let mut providers: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
+
+    let cfg = match config::DaemonConfig::load(config_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            // A malformed config shouldn't take the agent down — run with
+            // built-ins and make the misconfiguration loud.
+            tracing::error!(error = %e, "failed to load ocean.toml; running with built-in tools only");
+            return CapabilityRegistry::new(providers);
+        }
+    };
+
+    // Load tools.env once. Process env takes precedence (an explicitly exported
+    // var overrides the file), so the closure falls back to the file only when
+    // the var isn't already set. We log only how many keys were loaded — never
+    // names or values.
+    let file_env = load_tools_env(config_dir);
+
+    for server in &cfg.mcp.server {
+        let lookup = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .or_else(|| file_env.get(name).cloned())
+        };
+        match ocean_mcp::McpProvider::connect(server, lookup, MCP_CONNECT_TIMEOUT).await {
+            Ok(provider) => providers.push(Arc::new(provider)),
+            Err(e) => {
+                // Connect only errors for an unusable *config* (e.g. stdio with
+                // no command); server-side failures are already folded into an
+                // empty provider inside connect().
+                tracing::error!(server = %server.name, error = %e, "skipping misconfigured MCP server");
+            }
+        }
+    }
+
+    CapabilityRegistry::new(providers)
+}
+
+/// Parse `<config_dir>/tools.env` into a name→value map. Best-effort: a missing
+/// file is normal (returns empty). Supports `KEY=VALUE` lines, `#` comments,
+/// blank lines, an optional `export ` prefix, and surrounding quotes on the
+/// value. Values are never logged — only the count of keys loaded.
+fn load_tools_env(config_dir: &Path) -> HashMap<String, String> {
+    let path = config_dir.join("tools.env");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not read tools.env");
+            return HashMap::new();
+        }
+    };
+    let mut map = HashMap::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        // Strip matching surrounding quotes from the value.
+        let val = val.trim();
+        let val = val
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(val);
+        map.insert(key.to_string(), val.to_string());
+    }
+    if !map.is_empty() {
+        tracing::info!(path = %path.display(), keys = map.len(), "loaded tools.env");
+    }
+    map
 }
 
 /// Resolve a fresh runtime state from the current process env.
@@ -642,6 +777,10 @@ mod session {
     }
 
     impl Session {
+        /// Mint a session with a fresh random id. Only used by tests today
+        /// (production always mints the id at the daemon layer and calls
+        /// `new_with_id`), hence `cfg(test)` to keep the non-test build clean.
+        #[cfg(test)]
         pub fn new(model: &Model) -> Self {
             Self::new_with_id(SessionId::new_v4(), model)
         }
@@ -1142,6 +1281,7 @@ mod tests {
         AgentRuntime {
             config_dir,
             state: std::sync::Arc::new(std::sync::RwLock::new(state)),
+            capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -1577,11 +1717,50 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
         }
     }
 
+    const SURFACE_COMPONENT_PROMPT: &str = r#"
+## Ocean Surface component UX
+
+You are speaking through Ocean Surface, which renders live Leptos components from `component_render` events. Treat components as task UI, not chat decoration.
+
+Use components aggressively when they fit:
+
+- **Running work** → `progress`. Reuse the same id with `replace:true` as work advances; finish with a short summary and often a `callout`.
+- **Multi-step plan/status** → `timeline`. Flip steps from `pending` → `active` → `done`/`error` with `replace:true`.
+- **Structured rows/columns** → `table`. Do not fake tables with markdown when `table` fits.
+- **Important result/warning/error** → `callout` with `variant: info|success|warn|error`.
+- **Code edits** → `diff`; copyable commands/config/source → `code`.
+- **Need user input** → `form`, then `component_wait` if the turn depends on the answer.
+- **Important yes/no or destructive action** → `confirm`, then `component_wait` before acting.
+- **Locations/POIs/routes/search areas** → `map` with `markers` and usually `fit_markers:true`.
+- **KPIs/numbers** → `stat` or `chart`.
+- **Multiple panels at once** → `dashboard`.
+
+Common patterns:
+
+- Long-running dev task: `progress(start)` → `progress(update)` → `diff/table/callout` → concise text summary.
+- Code edit: `timeline(plan)` → `progress(while editing/testing)` → `diff(show change)` → `callout(result)`.
+- User decision: `callout(context)` → `confirm` → `component_wait` → act on result.
+- Data-heavy answer: render `table`/`stat`/`chart`/`map` first, then explain briefly.
+
+Never end a turn with only a component. Always include short text so non-rich clients retain context.
+
+Reference docs in this repo:
+- `docs/AGENT_RENDER_PROTOCOL.md`
+- `docs/OCEAN_SURFACE_COMPONENT_PROMPT_GUIDE.md`
+- `docs/PAGE_LEVEL_AGENT_SURFACE_UI_NOTE.md`
+"#;
+
+    fn surface_prompt(prompt: &str, client_label: &str) -> String {
+        format!(
+            "{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**. Responses render as HTML with rich interactive components, inline images, and live UI.\n\n{SURFACE_COMPONENT_PROMPT}\n"
+        )
+    }
+
     fn append_client_type(prompt: &str, client_type: Option<&str>) -> String {
         match client_type {
             Some("tui") => format!("{prompt}\n\n## Current client\n\nYou are speaking through the **Ocean TUI**. The user sees a terminal interface with basic markdown rendering. Keep responses concise — no rich interactive components.\n"),
-            Some("surface-web") => format!("{prompt}\n\n## Current client\n\nYou are speaking through **Ocean Surface (web)**. Responses render as HTML with rich interactive components, inline images, and live UI. The user is in a browser PWA.\n"),
-            Some("surface-native") => format!("{prompt}\n\n## Current client\n\nYou are speaking through **Ocean Surface (native)** — a macOS/iOS app built with Tauri. Same rendering as the web surface but running natively.\n"),
+            Some("surface-web") => surface_prompt(prompt, "Ocean Surface (web) — a browser PWA"),
+            Some("surface-native") => surface_prompt(prompt, "Ocean Surface (native) — a macOS/iOS app built with Tauri"),
             Some("cli") => format!("{prompt}\n\n## Current client\n\nYou are speaking through the **Ocean CLI** — a one-shot terminal tool. No interactivity, just text output.\n"),
             Some("leo-voice") => format!("{prompt}\n\n## Current client\n\nYou are speaking through **Leo (voice)** — a voice-only interface. Responses should be concise and spoken aloud.\n"),
             Some(other) => format!("{prompt}\n\n## Current client\n\nYou are speaking through an unknown client: `{other}`.\n"),

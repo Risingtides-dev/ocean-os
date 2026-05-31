@@ -1,0 +1,43 @@
+# Ocean daemon config — copy to <config_dir>/ocean.toml to activate.
+#   config_dir = $OCEAN_CONFIG_DIR, else $XDG_CONFIG_HOME/ocean-rs, else ~/.config/ocean-rs
+#
+# This file is OPTIONAL. With no ocean.toml the daemon runs with built-in tools
+# only (read/write/edit/bash/ls/grep/glob/web_fetch/todo/component_*).
+#
+# The [[mcp.server]] entries below register external Model Context Protocol
+# servers; their tools appear to the agent namespaced as  mcp__<name>__<tool>
+# and flow through the same capability registry as the built-ins.
+#
+# SECRETS: list the NAMES of the env vars each server needs under `env`. The
+# values are read from the daemon's process environment (which you load from
+# ~/.config/ocean-rs/tools.env) and injected into the child at spawn. Never put
+# secret *values* in this file.
+#
+# Servers connect once at startup, with a timeout, non-fatally: a server that
+# fails to start logs a warning and simply contributes no tools.
+
+[[mcp.server]]
+name = "brave"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-brave-search"]
+env = ["BRAVE_API_KEY"]
+
+[[mcp.server]]
+name = "linear"
+command = "npx"
+args = ["-y", "@tacticlaunch/mcp-linear"]
+env = ["LINEAR_API_KEY"]
+
+[[mcp.server]]
+name = "slack"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-slack"]
+env = ["SLACK_BOT_TOKEN", "SLACK_TEAM_ID", "SLACK_CHANNEL_IDS"]
+
+# Disabled example — kept in the file but not launched.
+[[mcp.server]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = ["GITHUB_TOKEN"]
+enabled = false

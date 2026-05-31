@@ -171,8 +171,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let bind = env::var("OCEAN_BIND").unwrap_or_else(|_| "127.0.0.1:4780".to_string());
+    // Built-ins first, then connect any configured MCP servers (non-fatally)
+    // and fold their tools into the capability registry before sharing it.
+    let runtime = Arc::new(AgentRuntime::from_env()?.with_extensions().await);
     let state = AppState {
-        runtime: Arc::new(AgentRuntime::from_env()?),
+        runtime,
         events: EventBus::new(1024),
         agent_events: AgentEventBus::new(1024),
         requests: Arc::new(RwLock::new(HashMap::new())),
