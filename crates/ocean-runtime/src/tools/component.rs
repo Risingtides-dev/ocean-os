@@ -40,6 +40,8 @@ const VALID_KINDS: &[&str] = &[
     "callout",
     "gallery",
     "confirm",
+    "map",
+    "video",
 ];
 
 // ---------------------------------------------------------------------------
@@ -74,6 +76,10 @@ impl AgentTool for ComponentRenderTool {
          • A code snippet to copy → 'code'. An important note/warning → 'callout'.\n\
          • Images / screenshots / generated art → 'gallery'. A yes/no before something \
          destructive → 'confirm' (then component_wait for the answer).\n\
+         • Anything geographic — locations, routes, where creators/streams/markets are → \
+         'map' (a live, pannable Google Map). Far better than describing coordinates in text.\n\
+         • A video to watch inline — a TikTok/Reel/YouTube link, or a direct video file → \
+         'video' (embeds and plays in the chat). Use for campaign clips, sound previews, references.\n\
          • Several of the above at once → 'dashboard'. Long prose → 'markdown' (or plain text).\n\
          \
          PROPS SCHEMA BY KIND (props must match exactly):\n\
@@ -92,6 +98,12 @@ impl AgentTool for ComponentRenderTool {
          • callout — { variant: \"info\"|\"success\"|\"warn\"|\"error\", title?, body? }. body supports markdown.\n\
          • gallery — { images: [{src, caption?}] }. src is a URL or data: URI.\n\
          • confirm — { title, body?, confirm_label?, cancel_label?, variant? }. Emits confirm_response { confirmed: bool }.\n\
+         • map — { center: {lat, lng}, zoom?, markers?: [{lat, lng, title?, label?}], fit_markers? }. \
+         Live Google Map. `zoom` 1–20 (default ~10); `fit_markers:true` auto-frames all markers. \
+         Emits marker_clicked { index, title }.\n\
+         • video — { url, title?, autoplay?, start? }. `url` is a TikTok / Instagram Reel / \
+         YouTube / Vimeo link OR a direct .mp4/.webm/.m3u8 URL — the surface picks the right \
+         embed automatically. `start` is seconds offset (YouTube/file). Display only.\n\
          \
          Set replace:true to overwrite an existing component with the same id. \
          Full reference: docs/AGENT_RENDER_PROTOCOL.md."
@@ -110,7 +122,7 @@ impl AgentTool for ComponentRenderTool {
                     "enum": [
                         "kanban", "form", "table", "progress", "markdown", "dashboard",
                         "chart", "timeline", "stat", "file_tree", "diff", "code",
-                        "callout", "gallery", "confirm"
+                        "callout", "gallery", "confirm", "map", "video"
                     ],
                     "description": "Component type. Defines the shape of `props`."
                 },
