@@ -34,7 +34,9 @@ pub struct RenderEvent {
     /// Opaque component id, scoped to the session. The agent picks it,
     /// the client echoes it back on interactions.
     pub id: String,
-    /// Component kind: "kanban", "form", "table", "chart", "progress", etc.
+    /// Component kind — one of the 17 built-in kinds (see "Built-in component
+    /// kinds" below): kanban, form, table, progress, markdown, dashboard, chart,
+    /// timeline, stat, file_tree, diff, code, callout, gallery, confirm, map, video.
     pub kind: String,
     /// Component props — a JSON object whose schema is defined per kind.
     pub props: serde_json::Value,
@@ -178,6 +180,127 @@ No interactions — display only.
 This is the default renderer for assistant text anyway, but explicit `markdown`
 components let the agent place rendered blocks anywhere in a dashboard layout.
 
+#### `chart`
+
+```json
+{ "id": "c1", "kind": "chart",
+  "props": { "title": "Plays", "type": "bar",
+             "series": [ { "label": "Mon", "value": 12 }, { "label": "Tue", "value": 30 } ] } }
+```
+
+`type` is `"bar" | "line"`; `value` is numeric. Display only.
+
+#### `timeline`
+
+```json
+{ "id": "t1", "kind": "timeline",
+  "props": { "steps": [ { "label": "Plan", "status": "done", "detail": "..." },
+                        { "label": "Build", "status": "active" },
+                        { "label": "Ship", "status": "pending" } ] } }
+```
+
+`status` is `"done" | "active" | "pending" | "error"`. Re-render with `replace:true`
+to advance a step. Display only.
+
+#### `stat`
+
+```json
+{ "id": "s1", "kind": "stat",
+  "props": { "stats": [ { "label": "Views", "value": "1.2M", "delta": "+8%", "trend": "up" },
+                        { "label": "Saves", "value": 4210, "trend": "flat" } ] } }
+```
+
+KPI cards. `trend` is `"up" | "down" | "flat"`; `value` is string or number. Display only.
+
+#### `file_tree`
+
+```json
+{ "id": "ft1", "kind": "file_tree",
+  "props": { "root": "src", "entries": [
+      { "name": "main.rs", "type": "file", "path": "src/main.rs" },
+      { "name": "lib", "type": "dir", "children": [ { "name": "mod.rs", "type": "file", "path": "src/lib/mod.rs" } ] } ] } }
+```
+
+Dirs nest via `children`. Files emit `file_clicked` with `{ "path": "..." }`.
+
+#### `diff`
+
+```json
+{ "id": "d1", "kind": "diff",
+  "props": { "filename": "main.rs",
+             "lines": [ { "kind": "ctx", "text": "fn main() {" },
+                        { "kind": "del", "text": "    old();" },
+                        { "kind": "add", "text": "    new();" } ] } }
+```
+
+Line `kind` is `"add" | "del" | "ctx"`. Alternatively pass `{ "unified": "+new\n-old" }`.
+Display only.
+
+#### `code`
+
+```json
+{ "id": "code1", "kind": "code",
+  "props": { "language": "rust", "filename": "main.rs", "code": "fn main() {}" } }
+```
+
+A copy-able code block. Display only.
+
+#### `callout`
+
+```json
+{ "id": "cl1", "kind": "callout",
+  "props": { "variant": "warn", "title": "Heads up", "body": "Body supports **markdown**." } }
+```
+
+`variant` is `"info" | "success" | "warn" | "error"`. Display only.
+
+#### `gallery`
+
+```json
+{ "id": "g1", "kind": "gallery",
+  "props": { "images": [ { "src": "https://...", "caption": "Cover" },
+                         { "src": "data:image/png;base64,...", "caption": "Frame" } ] } }
+```
+
+`src` is a URL or `data:` URI. Display only.
+
+#### `confirm`
+
+```json
+{ "id": "cf1", "kind": "confirm",
+  "props": { "title": "Delete campaign?", "body": "This can't be undone.",
+             "confirm_label": "Delete", "cancel_label": "Keep", "variant": "error" } }
+```
+
+Emits `confirm_response` with `{ "confirmed": true|false }`. Pair with `component_wait`
+for a yes/no before a destructive action.
+
+#### `map`
+
+```json
+{ "id": "m1", "kind": "map",
+  "props": { "center": { "lat": 34.05, "lng": -118.24 }, "zoom": 9,
+             "markers": [ { "lat": 34.05, "lng": -118.24, "title": "LA" } ],
+             "fit_markers": true } }
+```
+
+A live Google Map (Places UI Kit). Modes: plain `markers`; a `place_id` →
+place-details card; a `query` or `nearby` → place search list. `zoom` 1–20;
+`fit_markers:true` auto-frames the markers. Emits `marker_clicked` / `place_selected`.
+Requires the proxy to serve a Maps key via `/api/config` (`GOOGLE_MAPS_API_KEY`,
+optional `GOOGLE_MAPS_MAP_ID` for custom styling).
+
+#### `video`
+
+```json
+{ "id": "v1", "kind": "video",
+  "props": { "url": "https://www.tiktok.com/@user/video/123", "title": "Clip", "autoplay": false } }
+```
+
+`url` is a TikTok / Instagram Reel / YouTube / Vimeo link, or a direct
+`.mp4/.webm/.m3u8` file — the surface auto-selects the embed. `start` is a seconds
+offset (YouTube/file). Display only.
+
 ## Agent interface
 
 Exposed to the agent as a new tool:
@@ -186,9 +309,11 @@ Exposed to the agent as a new tool:
 tool: component_render
   args:
     id: string       # component id, agent-chosen
-    kind: string     # "kanban" | "form" | "table" | "progress" | "markdown"
-    props: object    # component-specific props
-    replace: bool    # default false
+    kind: string     # kanban | form | table | progress | markdown | dashboard
+                     # | chart | timeline | stat | file_tree | diff | code
+                     # | callout | gallery | confirm | map | video
+    props: object    # component-specific props (see "Built-in component kinds")
+    replace: bool    # default false (true overwrites a component with the same id)
 
 tool: component_unmount
   args:
