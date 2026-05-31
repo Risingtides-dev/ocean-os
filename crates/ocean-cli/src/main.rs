@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
                 request_id: None,
                 prompt,
                 session_id: None,
+                create_if_missing: true,
                 max_turns,
                 yolo,
                 cwd: std::env::current_dir()

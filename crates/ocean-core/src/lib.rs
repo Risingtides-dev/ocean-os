@@ -69,6 +69,12 @@ pub struct PromptRequest {
     pub request_id: Option<RequestId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
+    /// Resume/create policy when `session_id` is supplied but no such session
+    /// exists. `false` (default) = strict: error rather than silently starting
+    /// a fresh transcript under that id (which masks stale-client-id bugs).
+    /// `true` = create a new session with that id (explicit "reserve this id").
+    #[serde(default)]
+    pub create_if_missing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     #[serde(default)]

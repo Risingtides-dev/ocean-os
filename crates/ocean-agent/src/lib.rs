@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Instant,
@@ -67,6 +68,13 @@ struct RuntimeState {
 pub struct AgentRuntime {
     config_dir: PathBuf,
     state: Arc<RwLock<RuntimeState>>,
+    /// Per-session turn serialization. A turn against a session must hold this
+    /// session's lock across load → run → save, so two concurrent turns on the
+    /// same session can't both load the same history and clobber each other's
+    /// transcript (lost-update corruption). Keyed by SessionId; entries are
+    /// created on demand and kept for the process lifetime (one cheap Arc<Mutex>
+    /// per session ever touched — negligible).
+    session_locks: Arc<std::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AgentRuntime {
@@ -75,9 +83,20 @@ impl AgentRuntime {
         let runtime = Self {
             config_dir: config_dir_from_env(),
             state: Arc::new(RwLock::new(state)),
+            session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         runtime.migrate_legacy_sessions();
         Ok(runtime)
+    }
+
+    /// Get (or create) the per-session turn lock for `id`.
+    fn session_lock(&self, id: SessionId) -> Arc<tokio::sync::Mutex<()>> {
+        self.session_locks
+            .lock()
+            .expect("session_locks poisoned")
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     fn snapshot(&self) -> RuntimeState {
@@ -232,12 +251,17 @@ impl AgentRuntime {
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
-        let mut session = match req.session_id {
-            Some(id) => match session::load_resumable(&self.config_dir, id)? {
-                Some(existing) => existing,
-                None => session::Session::new_with_id(id, &snapshot.model),
-            },
-            None => session::Session::new(&snapshot.model),
+        let session_id = req.session_id.unwrap_or_else(SessionId::new_v4);
+        let lock = self.session_lock(session_id);
+        let _turn_guard = lock.lock().await;
+
+        let supplied = req.session_id.is_some();
+        let mut session = match session::load_resumable(&self.config_dir, session_id)? {
+            Some(existing) => existing,
+            None if !supplied || req.create_if_missing => {
+                session::Session::new_with_id(session_id, &snapshot.model)
+            }
+            None => anyhow::bail!("session not found: {session_id}"),
         };
         session.bind_workspace(Path::new(&req.cwd));
 
@@ -269,12 +293,30 @@ impl AgentRuntime {
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
-        let mut session = match req.session_id {
-            Some(id) => match session::load_resumable(&self.config_dir, id)? {
-                Some(existing) => existing,
-                None => session::Session::new_with_id(id, &snapshot.model),
-            },
-            None => session::Session::new(&snapshot.model),
+        // Resolve the effective session id up front so we can serialize on it.
+        // None means "new session" — mint the id now so the lock still covers
+        // the load/run/save window.
+        let session_id = req.session_id.unwrap_or_else(SessionId::new_v4);
+
+        // Hold the per-session lock across load → run → save. Without it, two
+        // turns on the same session both load the same history and the last to
+        // save wins, silently dropping the other's messages.
+        let lock = self.session_lock(session_id);
+        let _turn_guard = lock.lock().await;
+
+        // Strict resume-vs-create. A supplied-but-unknown session id is an error
+        // by default (so a stale client id surfaces instead of silently forking
+        // a fresh transcript). Creating with a specific id requires opt-in.
+        let supplied = req.session_id.is_some();
+        let mut session = match session::load_resumable(&self.config_dir, session_id)? {
+            Some(existing) => existing,
+            None if !supplied || req.create_if_missing => {
+                session::Session::new_with_id(session_id, &snapshot.model)
+            }
+            None => anyhow::bail!(
+                "session not found: {session_id} (resume requires an existing session; \
+                 pass create_if_missing to start a new one with this id)"
+            ),
         };
         session.bind_workspace(Path::new(&req.cwd));
 
@@ -1100,6 +1142,7 @@ mod tests {
         AgentRuntime {
             config_dir,
             state: std::sync::Arc::new(std::sync::RwLock::new(state)),
+            session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1192,6 +1235,7 @@ mod tests {
                     prompt: "hello".into(),
                     request_id: None,
                     session_id: None,
+                    create_if_missing: true,
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
@@ -1225,6 +1269,7 @@ mod tests {
                     prompt: "Reply exactly: OCEAN_OK".into(),
                     request_id: None,
                     session_id: None,
+                    create_if_missing: true,
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
@@ -1248,6 +1293,121 @@ mod tests {
         assert_eq!(detail.transcript[1].role, "assistant");
         assert_eq!(detail.transcript[1].text, "OCEAN_FAKE_OK");
         assert_eq!(detail.messages.len(), 2);
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn unknown_session_id_errors_instead_of_silently_creating() {
+        // Strict resume: a supplied-but-unknown session id with create_if_missing
+        // = false must fail, and must NOT leave a fresh transcript behind under
+        // that id. This is the daemon-side fix for stale-client-id bugs.
+        let config_dir = temp_config_dir("strict-resume");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let ghost = SessionId::new_v4();
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "resume a session that doesn't exist".into(),
+                    request_id: None,
+                    session_id: Some(ghost),
+                    create_if_missing: false,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    client_type: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+        assert!(!res.ok, "strict resume of unknown session must fail");
+        assert!(res.stderr.contains("session not found"), "stderr: {}", res.stderr);
+        // And no session was created under the ghost id.
+        assert!(runtime.session_detail(ghost).is_err());
+        assert!(runtime.list_sessions(None).unwrap().is_empty());
+
+        // But with create_if_missing: true, the same id is accepted.
+        let ok = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "now create it".into(),
+                    request_id: None,
+                    session_id: Some(ghost),
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    client_type: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+        assert!(ok.ok, "create_if_missing should accept a new id: {}", ok.stderr);
+        assert_eq!(ok.session_id, Some(ghost));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_on_same_session_serialize_without_lost_updates() {
+        // Two turns fired at the same session concurrently must not clobber
+        // each other: both user prompts (and both assistant replies) must
+        // survive in the final transcript. Without the per-session lock, the
+        // last save wins and one turn's messages vanish.
+        let config_dir = temp_config_dir("concurrent-turns");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        // First turn creates the session; capture its id.
+        let first = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "first".into(),
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    client_type: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+        assert!(first.ok);
+        let sid = first.session_id.unwrap();
+
+        // Now fire two more turns at that same session at once.
+        let mk = |p: &str| PromptRequest {
+            prompt: p.into(),
+            request_id: None,
+            session_id: Some(sid),
+            create_if_missing: false,
+            max_turns: None,
+            yolo: false,
+            cwd: ".".into(),
+            client_type: None,
+        };
+        let (a, b) = tokio::join!(
+            runtime.prompt(mk("alpha"), PromptControl::yolo(false)),
+            runtime.prompt(mk("bravo"), PromptControl::yolo(false)),
+        );
+        assert!(a.ok && b.ok);
+
+        // Final transcript must contain all three user prompts.
+        let detail = runtime.session_detail(sid).unwrap();
+        let user_texts: Vec<String> = detail
+            .transcript
+            .iter()
+            .filter(|t| t.role == "user")
+            .map(|t| t.text.clone())
+            .collect();
+        assert!(user_texts.iter().any(|t| t.contains("first")), "lost 'first': {user_texts:?}");
+        assert!(user_texts.iter().any(|t| t.contains("alpha")), "lost 'alpha': {user_texts:?}");
+        assert!(user_texts.iter().any(|t| t.contains("bravo")), "lost 'bravo': {user_texts:?}");
         let _ = std::fs::remove_dir_all(config_dir);
     }
 

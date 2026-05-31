@@ -1505,6 +1505,10 @@ async fn agent_turn(
         prompt: guided_prompt,
         request_id: Some(request_id),
         session_id: Some(core_sid(session_id)),
+        // New session → allow creating under the freshly-minted id. Resume
+        // (client supplied the id) → strict: error if that session is gone,
+        // rather than silently forking a fresh transcript under the same id.
+        create_if_missing: is_new_session,
         max_turns: None,
         yolo: true,
         cwd,
