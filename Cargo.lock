@@ -1308,6 +1308,7 @@ dependencies = [
  "ocean-agent",
  "ocean-agent-sdk",
  "ocean-core",
+ "ocean-longhouse",
  "ocean-protocol",
  "ocean-runtime",
  "serde",
@@ -1318,6 +1319,22 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ocean-longhouse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "ocean-agent-sdk",
+ "ocean-protocol",
+ "ocean-providers",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

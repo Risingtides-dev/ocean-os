@@ -7,6 +7,7 @@ members = [
   "crates/ocean-agent",
   "crates/ocean-agent-sdk",
   "crates/ocean-providers",
+  "crates/ocean-longhouse",
   "crates/ocean-daemon",
   "crates/ocean-cli",
   "crates/ocean-tui",
@@ -45,3 +46,4 @@ toml = "0.8"
 ocean-agent-sdk = { path = "crates/ocean-agent-sdk" }
 ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }
+ocean-longhouse = { path = "crates/ocean-longhouse" }
