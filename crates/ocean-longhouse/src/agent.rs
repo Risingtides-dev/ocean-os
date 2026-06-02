@@ -59,7 +59,8 @@ impl ModelHandle {
         let mut env = ProviderEnv::from_process();
         // Pin the model selection to the requested alias. We intentionally drop
         // any inherited OCEAN_MODEL/OCEAN_PROVIDER so the alias decides routing.
-        env.vars.insert("OCEAN_MODEL".to_string(), alias.to_string());
+        env.vars
+            .insert("OCEAN_MODEL".to_string(), alias.to_string());
         env.vars.remove("OCEAN_PROVIDER");
 
         let config = ocean_providers::resolve_provider_config(&env)
@@ -140,11 +141,7 @@ impl ModelHandle {
 }
 
 /// Drive `stream_simple` to completion and collect the assistant text.
-async fn run_once(
-    model: &Model,
-    ctx: Context,
-    options: StreamOptions,
-) -> anyhow::Result<String> {
+async fn run_once(model: &Model, ctx: Context, options: StreamOptions) -> anyhow::Result<String> {
     let mut stream = stream_simple(model, &ctx, &options)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

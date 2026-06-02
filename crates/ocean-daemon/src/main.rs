@@ -689,10 +689,30 @@ async fn longhouse_demo(State(state): State<AppState>) -> Json<serde_json::Value
         emit(LonghouseEvent::Convened {
             topic_id,
             members: vec![
-                member(opus, AgentRole::Courier, "claude-opus-4-7", "Sales Courier · Opus"),
-                member(kimi, AgentRole::Courier, "kimi-k2.6", "Sales Courier · Kimi"),
-                member(deepseek, AgentRole::Courier, "deepseek-v4-pro", "Sales Courier · DeepSeek"),
-                member(steward, AgentRole::Steward, "claude-opus-4-7", "Sales Steward"),
+                member(
+                    opus,
+                    AgentRole::Courier,
+                    "claude-opus-4-7",
+                    "Sales Courier · Opus",
+                ),
+                member(
+                    kimi,
+                    AgentRole::Courier,
+                    "kimi-k2.6",
+                    "Sales Courier · Kimi",
+                ),
+                member(
+                    deepseek,
+                    AgentRole::Courier,
+                    "deepseek-v4-pro",
+                    "Sales Courier · DeepSeek",
+                ),
+                member(
+                    steward,
+                    AgentRole::Steward,
+                    "claude-opus-4-7",
+                    "Sales Steward",
+                ),
             ],
         });
         sleep(Duration::from_millis(700)).await;
@@ -732,7 +752,8 @@ async fn longhouse_demo(State(state): State<AppState>) -> Json<serde_json::Value
                 author: deepseek,
                 kind: MarkKind::Evidence,
                 target: Some(prop_a),
-                summary: "Campaign Hub: Plan A creators avg 2.3x save-rate on prior Warner sounds".into(),
+                summary: "Campaign Hub: Plan A creators avg 2.3x save-rate on prior Warner sounds"
+                    .into(),
             },
         });
         sleep(Duration::from_millis(500)).await;
@@ -750,8 +771,14 @@ async fn longhouse_demo(State(state): State<AppState>) -> Json<serde_json::Value
             emit(LonghouseEvent::QuorumUpdated {
                 topic_id,
                 tallies: vec![
-                    ProposalTally { proposal: prop_a, net_weight: 1.0 },
-                    ProposalTally { proposal: prop_b, net_weight: 0.4 },
+                    ProposalTally {
+                        proposal: prop_a,
+                        net_weight: 1.0,
+                    },
+                    ProposalTally {
+                        proposal: prop_b,
+                        net_weight: 0.4,
+                    },
                 ],
                 leader: Some(prop_a),
                 distance_to_quorum: 0.5,
@@ -779,8 +806,14 @@ async fn longhouse_demo(State(state): State<AppState>) -> Json<serde_json::Value
         emit(LonghouseEvent::QuorumUpdated {
             topic_id,
             tallies: vec![
-                ProposalTally { proposal: prop_a, net_weight: 2.6 },
-                ProposalTally { proposal: prop_b, net_weight: 0.4 },
+                ProposalTally {
+                    proposal: prop_a,
+                    net_weight: 2.6,
+                },
+                ProposalTally {
+                    proposal: prop_b,
+                    net_weight: 0.4,
+                },
             ],
             leader: Some(prop_a),
             distance_to_quorum: 1.0,
@@ -1757,9 +1790,13 @@ async fn agent_turn(
     // POST /v1/requests/{turn_id}/cancel (the turn_id IS the request_id). The
     // returned token is threaded into PromptControl below; the agent loop polls
     // it, so a halt from the client actually stops the turn mid-flight.
-    let (_request_id, cancel) =
-        register_running_request(&state, &mut prompt_req, "agent turn running", RequestState::Running)
-            .await;
+    let (_request_id, cancel) = register_running_request(
+        &state,
+        &mut prompt_req,
+        "agent turn running",
+        RequestState::Running,
+    )
+    .await;
 
     // Wire up the runtime → bus streaming bridge. Every TextDelta /
     // ThinkingDelta / ToolExecution* event the agent emits gets forwarded
@@ -1868,8 +1905,9 @@ async fn agent_turn(
         }
     });
 
-    let control = build_prompt_control(&state, request_id, Some(core_sid(session_id)), true, cancel)
-        .with_event_sink(event_tx);
+    let control =
+        build_prompt_control(&state, request_id, Some(core_sid(session_id)), true, cancel)
+            .with_event_sink(event_tx);
     let res = state.runtime.prompt(prompt_req, control).await;
     // Wait for the bridge to drain (the sender has been dropped by now).
     let _ = bridge.await;
@@ -1957,7 +1995,6 @@ async fn agent_turn(
     )
 }
 
-
 fn parse_agent_turn_room(room_id: Option<&str>) -> Result<Option<RoomId>, String> {
     let Some(room_id) = room_id.map(str::trim).filter(|room_id| !room_id.is_empty()) else {
         return Ok(None);
@@ -1989,9 +2026,7 @@ fn apply_room_guidance(room_id: Option<RoomId>, prompt: &str) -> String {
 ///
 /// Returns 200 if the event was delivered, 404 if nobody is waiting on that
 /// component, 400 on missing fields.
-async fn component_event(
-    Json(body): Json<Value>,
-) -> (StatusCode, Json<Value>) {
+async fn component_event(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     let session_id = match body.get("session_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -2034,15 +2069,14 @@ async fn component_event(
                     Json(json!({ "status": "nobody waiting" })),
                 )
             } else {
-                (
-                    StatusCode::OK,
-                    Json(json!({ "status": "delivered" })),
-                )
+                (StatusCode::OK, Json(json!({ "status": "delivered" })))
             }
         }
         None => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "no pending wait for component", "session_id": session_id, "component_id": component_id })),
+            Json(
+                json!({ "error": "no pending wait for component", "session_id": session_id, "component_id": component_id }),
+            ),
         ),
     }
 }
@@ -2172,11 +2206,13 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             session_id: _,
             ..
         } => None,
-        AgentTurnEvent::AssistantTextDelta { turn_id: _, delta, .. } => {
-            Some(OceanEvent::AssistantDelta { text: delta })
-        }
+        AgentTurnEvent::AssistantTextDelta {
+            turn_id: _, delta, ..
+        } => Some(OceanEvent::AssistantDelta { text: delta }),
         AgentTurnEvent::ThinkingDelta { .. } => None,
-        AgentTurnEvent::ToolCallStarted { turn_id: _, call, .. } => Some(OceanEvent::ToolStarted {
+        AgentTurnEvent::ToolCallStarted {
+            turn_id: _, call, ..
+        } => Some(OceanEvent::ToolStarted {
             tool: call.name,
             args: call.args_json,
         }),

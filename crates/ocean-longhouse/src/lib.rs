@@ -33,12 +33,16 @@
 //! without any model in the loop (see the unit tests in [`quorum`]).
 
 pub mod agent;
+pub mod config;
 pub mod convene;
 pub mod quorum;
+pub mod replay;
 
 pub use agent::ModelHandle;
+pub use config::{LonghouseConfig, LonghouseMode};
 pub use convene::{convene, Clock, ConveneOutcome, ConveneRequest, SystemClock};
 pub use quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
+pub use replay::{replay, sweep, RecordedMark, RecordedMarkKind, Recording, ReplayResult};
 
 // Re-export the SDK event vocabulary so daemon callers can `use
 // ocean_longhouse::{LonghouseEvent, Federation, ...}` from one place.

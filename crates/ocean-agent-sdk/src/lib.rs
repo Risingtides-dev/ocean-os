@@ -685,7 +685,11 @@ mod tests {
         // The deck extracts it back; unrelated events return None.
         let back = LonghouseEvent::from_turn_event(&wrapped).expect("should extract");
         match back {
-            LonghouseEvent::TopicConvened { federation, trigger, .. } => {
+            LonghouseEvent::TopicConvened {
+                federation,
+                trigger,
+                ..
+            } => {
                 assert_eq!(federation, Federation::Sales);
                 assert_eq!(trigger, ConveneTrigger::UserRequest);
             }

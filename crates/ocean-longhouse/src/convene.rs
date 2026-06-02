@@ -7,8 +7,9 @@
 //!
 //! 1. **Round 1 — propose.** Each worker gets the question and posts one
 //!    `proposal` mark (a candidate answer).
-//! 2. **Round 2 — endorse / inhibit.** Each worker sees the *other* proposals
-//!    (a bounded projection) and posts an `endorse` or `inhibit` mark.
+//! 2. **Rounds 2..N — endorse / inhibit re-assertion.** Each worker sees the
+//!    current bounded proposal projection and posts an `endorse` or `inhibit`
+//!    mark. The loop stops on quorum, `max_rounds`, or deadline.
 //!
 //! After **every** mark the daemon-side [`QuorumEngine`] re-tallies, and we emit
 //! a `QuorumUpdated`. When the engine reports convergence (or we hit the
@@ -28,6 +29,7 @@ use uuid::Uuid;
 
 use crate::agent::ModelHandle;
 use crate::quorum::{QuorumConfig, QuorumEngine, QuorumOutcome};
+use crate::replay::{RecordedMark, RecordedMarkKind, Recording};
 
 /// A request to convene a council on a question.
 #[derive(Debug, Clone)]
@@ -47,6 +49,10 @@ pub struct ConveneRequest {
     /// Hard deadline budget in ms from convening. On expiry the engine force-
     /// resolves (clear leader → converge; tie → seeded tie-break).
     pub deadline_ms_from_now: i64,
+    /// Maximum deliberation rounds, including the proposal round. Round 1 proposes;
+    /// rounds 2..N are endorse/inhibit re-assertion rounds. This bounds open-ended
+    /// deliberation until token-budget accounting lands.
+    pub max_rounds: usize,
 }
 
 impl ConveneRequest {
@@ -64,6 +70,7 @@ impl ConveneRequest {
             ],
             quorum: QuorumConfig::default(),
             deadline_ms_from_now: 120_000,
+            max_rounds: 4,
         }
     }
 }
@@ -79,6 +86,11 @@ pub struct ConveneOutcome {
     pub tallies: Vec<ProposalTally>,
     /// The proposal text for each proposal id (so callers can show the answer).
     pub proposals: HashMap<Uuid, String>,
+    /// The full ordered mark-stream this council fed the engine, captured so the
+    /// run can be **replayed** through different [`QuorumConfig`]s offline (see
+    /// [`crate::replay`]). Timestamps are relative to the council start, so the
+    /// recording is portable. Serialize this to disk to build a tuning corpus.
+    pub recording: Recording,
 }
 
 /// A clock so the convening flow is testable without the wall clock.
@@ -107,11 +119,7 @@ struct Worker {
 /// (`bus.emit(ev.into_turn_event())`), so the deck animates a live council.
 ///
 /// `clock` is injected for deterministic testing of the timing/quorum path.
-pub async fn convene<F>(
-    req: ConveneRequest,
-    clock: &dyn Clock,
-    mut emit: F,
-) -> ConveneOutcome
+pub async fn convene<F>(req: ConveneRequest, clock: &dyn Clock, mut emit: F) -> ConveneOutcome
 where
     F: FnMut(LonghouseEvent),
 {
@@ -168,6 +176,9 @@ where
     let mut proposals: HashMap<Uuid, String> = HashMap::new();
     // proposal_id -> author agent_id, so endorse/inhibit can target by proposal.
     let mut proposal_by_author: HashMap<Uuid, Uuid> = HashMap::new();
+    // Capture every mark fed to the engine (timestamps relative to `started`)
+    // so the whole run is replayable offline under different configs.
+    let mut recorded: Vec<RecordedMark> = Vec::new();
 
     if workers.is_empty() {
         // Nothing resolved — abort cleanly rather than hang.
@@ -182,6 +193,10 @@ where
             decision: None,
             tallies: vec![],
             proposals,
+            recording: Recording {
+                question: req.question.clone(),
+                marks: recorded.clone(),
+            },
         };
     }
 
@@ -201,6 +216,13 @@ where
         let proposal_id = Uuid::new_v4();
         let now = clock.now_ms();
         engine.propose(proposal_id, w.agent_id, now);
+        recorded.push(RecordedMark {
+            at_ms: now - started,
+            author: w.agent_id,
+            kind: RecordedMarkKind::Propose {
+                proposal: proposal_id,
+            },
+        });
         proposals.insert(proposal_id, answer.clone());
         proposal_by_author.insert(w.agent_id, proposal_id);
 
@@ -235,11 +257,20 @@ where
             decision: None,
             tallies: engine.tallies(clock.now_ms()),
             proposals,
+            recording: Recording {
+                question: req.question.clone(),
+                marks: recorded.clone(),
+            },
         };
     }
 
-    // ---- Round 2: endorse / inhibit ----------------------------------------
-    if !engine.is_converged() {
+    // ---- Rounds 2..N: endorse / inhibit re-assertion --------------------------
+    let max_rounds = req.max_rounds.max(1);
+    for round in 2..=max_rounds {
+        if engine.is_converged() || clock.now_ms() >= deadline_ms {
+            break;
+        }
+
         // Build a bounded projection of the proposals for the voters to see.
         let projection = projection_text(&proposals);
         let proposal_ids: Vec<Uuid> = proposals.keys().copied().collect();
@@ -249,23 +280,43 @@ where
             .enumerate()
             .map(|(idx, w)| {
                 let own = proposal_by_author.get(&w.agent_id).copied();
-                (idx, round2_user(&req.question, &projection, &proposal_ids, own))
+                (
+                    idx,
+                    round2_user(&req.question, &projection, &proposal_ids, own, round),
+                )
             })
             .collect();
 
         let vote_results = run_round(&workers, vote_prompts, ROUND2_SYSTEM).await;
+        let mut contributed = false;
 
         for (idx, answer) in vote_results {
+            if engine.is_converged() || clock.now_ms() >= deadline_ms {
+                break;
+            }
             let Some(answer) = answer else { continue };
             let w = &workers[idx];
             let now = clock.now_ms();
             let Some(vote) = parse_vote(&answer, &proposal_ids) else {
                 continue;
             };
+            contributed = true;
             match vote.kind {
                 VoteKind::Endorse => engine.endorse(vote.target, w.agent_id, None, now),
                 VoteKind::Inhibit => engine.inhibit(vote.target, w.agent_id, None, now),
             }
+            recorded.push(RecordedMark {
+                at_ms: now - started,
+                author: w.agent_id,
+                kind: match vote.kind {
+                    VoteKind::Endorse => RecordedMarkKind::Endorse {
+                        proposal: vote.target,
+                    },
+                    VoteKind::Inhibit => RecordedMarkKind::Inhibit {
+                        proposal: vote.target,
+                    },
+                },
+            });
             emit(LonghouseEvent::MarkPosted {
                 topic_id,
                 mark: Mark {
@@ -280,9 +331,12 @@ where
                 },
             });
             emit_quorum(&mut engine, topic_id, clock.now_ms(), &mut emit);
-            if engine.is_converged() {
-                break;
-            }
+        }
+
+        // If a whole re-assertion round produced no usable marks, another identical
+        // prompt cycle is unlikely to help; terminate and let force_resolve decide.
+        if !contributed {
+            break;
         }
     }
 
@@ -342,6 +396,10 @@ where
         decision,
         tallies: engine.tallies(now),
         proposals,
+        recording: Recording {
+            question: req.question.clone(),
+            marks: recorded,
+        },
     }
 }
 
@@ -408,9 +466,12 @@ fn round2_user(
     projection: &str,
     _ids: &[Uuid],
     _own: Option<Uuid>,
+    round: usize,
 ) -> String {
     format!(
-        "Question:\n{question}\n\nProposals on the blackboard:\n{projection}\n\n\
+        "Question:\n{question}\n\nDeliberation round: {round}\n\nProposals on the blackboard:\n{projection}\n\n\
+         Re-assert your current stance. If the field already has a strong answer, ENDORSE it; \
+         if one proposal is actively harmful or weaker than a rival, INHIBIT it.\n\n\
          Your vote (ENDORSE <n>: reason  OR  INHIBIT <n>: reason):"
     )
 }

@@ -1,5 +1,7 @@
 # Ocean OS — read this first
 
+**Longhouse note:** Ocean Longhouse is the hive — the local-first agentic operations hub where agents go before they act. It centralizes SOPs, routines/workflows, tools/MCP discovery, skills, memory/knowledge, subagent specs, and quorum/council workflows. `ocean-daemon` remains the local runtime/body and execution authority; Longhouse coordinates/recommends and must not bypass daemon permission gates. Canonical doc: `docs/LONGHOUSE.md`.
+
 **This repo is one half of a two-repo system. The other half is `ocean-surface`.**
 
 | Repo | What it is | Where |

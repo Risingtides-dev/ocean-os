@@ -204,11 +204,14 @@ impl QuorumEngine {
     pub fn propose(&mut self, proposal: Uuid, author: Uuid, now_ms: i64) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let entry = self.proposals.entry(proposal).or_insert_with(|| ProposalState {
-            proposer: author,
-            seq,
-            ..Default::default()
-        });
+        let entry = self
+            .proposals
+            .entry(proposal)
+            .or_insert_with(|| ProposalState {
+                proposer: author,
+                seq,
+                ..Default::default()
+            });
         // The proposer counts as one endorsing credential.
         entry.stances.insert(
             author,
@@ -238,11 +241,14 @@ impl QuorumEngine {
         let seq = self.next_seq;
         // A stance can arrive for a proposal we haven't seen a `propose` for yet
         // (out-of-order marks). Create a placeholder so the signal still counts.
-        let entry = self.proposals.entry(proposal).or_insert_with(|| ProposalState {
-            proposer: author,
-            seq,
-            ..Default::default()
-        });
+        let entry = self
+            .proposals
+            .entry(proposal)
+            .or_insert_with(|| ProposalState {
+                proposer: author,
+                seq,
+                ..Default::default()
+            });
         if entry.seq == seq {
             self.next_seq += 1;
         }
@@ -512,10 +518,7 @@ mod tests {
         eng.endorse(p, b, None, t0);
         eng.endorse(p, c, None, t0);
         // Fresh: net = 3.0 >= cutoff 2.5 -> converged.
-        assert!(matches!(
-            eng.evaluate(t0),
-            QuorumOutcome::Converged { .. }
-        ));
+        assert!(matches!(eng.evaluate(t0), QuorumOutcome::Converged { .. }));
 
         // But evaluate a *fresh* engine at a later time to see decay (the first
         // engine latched converged, which is correct — once decided, decided).
@@ -576,8 +579,12 @@ mod tests {
         // Deadline, with tie-break -> deterministic winner, repeatable.
         let mut eng_tb1 = eng.clone();
         let mut eng_tb2 = eng.clone();
-        let w1 = eng_tb1.force_resolve(0, AbortReason::Timeout, true).unwrap();
-        let w2 = eng_tb2.force_resolve(0, AbortReason::Timeout, true).unwrap();
+        let w1 = eng_tb1
+            .force_resolve(0, AbortReason::Timeout, true)
+            .unwrap();
+        let w2 = eng_tb2
+            .force_resolve(0, AbortReason::Timeout, true)
+            .unwrap();
         assert_eq!(w1, w2, "seeded tie-break must be deterministic");
         assert!(w1 == pa || w1 == pb);
     }
