@@ -357,6 +357,13 @@ The result includes the interaction event. This lets the agent do:
 - `component_wait` pauses the agent loop and enters a "component interaction mode"
   in the TUI event loop.
 
+### ocean-gui (GPUI native)
+
+- GPUI is a native desktop surface, not a Leptos/WebView renderer.
+- Do not assume Leptos components, HTML, maps, dashboards, or web widgets render inside chat.
+- Until GPUI has native component implementations for a kind, agents should prefer concise markdown, file paths, command/status summaries, and native surface-state descriptions.
+- GPUI clients identify turns with `client_type: "surface-gpui"` so the daemon can inject GPUI-safe guidance instead of the web component playbook.
+
 ### CLI
 
 - Skip render events silently.

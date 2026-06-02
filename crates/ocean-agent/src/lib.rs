@@ -1676,9 +1676,9 @@ read, write, edit (files); ls, glob (filesystem nav); grep (content search); bas
 - Show, don't editorialize. Cite file paths with line numbers when useful (e.g. `crates/ocean-tui/src/main.rs:3905`).
 - Don't apologize for taking actions you were asked to take.
 
-## Rich surface — render components, don't fake them
+## Rich web surface — render components when the client supports them
 
-Clients render live, interactive UI components, not just text. On the web/native surface these are real HTML — lean on them. When data is structured, render the real component via `component_render` instead of hand-typing markdown. The full kit:
+Some Ocean clients render live, interactive UI components, not just text. When the current client explicitly says it supports the web/Leptos component surface, lean on `component_render`. When the current client is GPUI, TUI, CLI, or voice, prefer medium-appropriate text and do not assume web components render. The full web kit:
 
 - Tabular data → `table` ({columns, rows}). NEVER hand-build a markdown pipe table when `table` fits.
 - Task/status boards → `kanban`. Collecting input → `form` (then `component_wait` for the submit).
@@ -1717,8 +1717,8 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
         }
     }
 
-    const SURFACE_COMPONENT_PROMPT: &str = r#"
-## Ocean Surface component UX
+    const WEB_SURFACE_COMPONENT_PROMPT: &str = r#"
+## Ocean web surface component UX
 
 You are speaking through Ocean Surface, which renders live Leptos components from `component_render` events. Treat components as task UI, not chat decoration.
 
@@ -1750,21 +1750,104 @@ Reference docs in this repo:
 - `docs/PAGE_LEVEL_AGENT_SURFACE_UI_NOTE.md`
 "#;
 
-    fn surface_prompt(prompt: &str, client_label: &str) -> String {
+    const GPUI_SURFACE_PROMPT: &str = r#"
+## Ocean GPUI surface UX
+
+You are speaking through Ocean GUI, a native GPUI desktop surface. It is not a browser/WebView surface and it does not render Leptos components or arbitrary HTML inside chat.
+
+Use compact markdown, clear step summaries, file paths, commands, and short status text. Do not use `component_render`, `component_wait`, web widgets, Leptos component assumptions, maps, dashboards, forms, or HTML-oriented UI unless the user explicitly asks for a protocol test. If work has structured output, present it as concise markdown or describe the native surface/state that should be updated.
+"#;
+
+    const TUI_SURFACE_PROMPT: &str = r#"
+## Ocean TUI surface UX
+
+You are speaking through the Ocean TUI. The user sees a terminal interface with basic markdown rendering. Keep responses concise and terminal-native.
+
+Do not use `component_render`, `component_wait`, web widgets, Leptos component assumptions, maps, dashboards, forms, or HTML-oriented UI unless the user explicitly asks for a protocol test. Prefer short markdown, file paths, command output summaries, and state updates that fit a terminal transcript.
+"#;
+
+    fn web_surface_prompt(prompt: &str, client_label: &str) -> String {
         format!(
-            "{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**. Responses render as HTML with rich interactive components, inline images, and live UI.\n\n{SURFACE_COMPONENT_PROMPT}\n"
+            "{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**. Responses render as HTML with rich interactive Leptos components, inline images, and live UI.\n\n{WEB_SURFACE_COMPONENT_PROMPT}\n"
+        )
+    }
+
+    fn gpui_surface_prompt(prompt: &str, client_label: &str) -> String {
+        format!(
+            "{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**.\n\n{GPUI_SURFACE_PROMPT}\n"
+        )
+    }
+
+    fn tui_surface_prompt(prompt: &str) -> String {
+        format!("{prompt}\n\n## Current client\n\n{TUI_SURFACE_PROMPT}\n")
+    }
+
+    fn cli_surface_prompt(prompt: &str) -> String {
+        format!(
+            "{prompt}\n\n## Current client\n\nYou are speaking through the **Ocean CLI** — a one-shot terminal tool. No interactivity, just text output.\n"
+        )
+    }
+
+    fn voice_surface_prompt(prompt: &str) -> String {
+        format!(
+            "{prompt}\n\n## Current client\n\nYou are speaking through **Leo (voice)** — a voice-only interface. Responses should be concise and spoken aloud. Do not use visual components.\n"
         )
     }
 
     fn append_client_type(prompt: &str, client_type: Option<&str>) -> String {
         match client_type {
-            Some("tui") => format!("{prompt}\n\n## Current client\n\nYou are speaking through the **Ocean TUI**. The user sees a terminal interface with basic markdown rendering. Keep responses concise — no rich interactive components.\n"),
-            Some("surface-web") => surface_prompt(prompt, "Ocean Surface (web) — a browser PWA"),
-            Some("surface-native") => surface_prompt(prompt, "Ocean Surface (native) — a macOS/iOS app built with Tauri"),
-            Some("cli") => format!("{prompt}\n\n## Current client\n\nYou are speaking through the **Ocean CLI** — a one-shot terminal tool. No interactivity, just text output.\n"),
-            Some("leo-voice") => format!("{prompt}\n\n## Current client\n\nYou are speaking through **Leo (voice)** — a voice-only interface. Responses should be concise and spoken aloud.\n"),
+            Some("tui") => tui_surface_prompt(prompt),
+            Some("surface-web") => web_surface_prompt(prompt, "Ocean Surface (web) — a browser PWA"),
+            Some("surface-gpui") => gpui_surface_prompt(prompt, "Ocean GUI (GPUI native desktop)"),
+            Some("surface-native") => gpui_surface_prompt(prompt, "Ocean native surface"),
+            Some("cli") => cli_surface_prompt(prompt),
+            Some("leo-voice") => voice_surface_prompt(prompt),
             Some(other) => format!("{prompt}\n\n## Current client\n\nYou are speaking through an unknown client: `{other}`.\n"),
             None => prompt.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::build_system_prompt;
+
+        #[test]
+        fn web_surface_gets_leptos_component_guidance() {
+            let prompt = build_system_prompt(None, Some("surface-web"));
+
+            assert!(prompt.contains("Leptos components"));
+            assert!(prompt.contains("component_render"));
+            assert!(prompt.contains("Responses render as HTML"));
+        }
+
+        #[test]
+        fn gpui_surface_avoids_web_component_guidance() {
+            let prompt = build_system_prompt(None, Some("surface-gpui"));
+
+            assert!(prompt.contains("Ocean GUI"));
+            assert!(prompt.contains("GPUI"));
+            assert!(prompt.contains("does not render Leptos components"));
+            assert!(prompt.contains("Do not use `component_render`"));
+            assert!(!prompt.contains("Responses render as HTML"));
+        }
+
+        #[test]
+        fn legacy_native_surface_is_not_treated_as_webview() {
+            let prompt = build_system_prompt(None, Some("surface-native"));
+
+            assert!(prompt.contains("Ocean native surface"));
+            assert!(prompt.contains("Do not use `component_render`"));
+            assert!(!prompt.contains("Responses render as HTML"));
+        }
+
+        #[test]
+        fn tui_surface_avoids_web_component_guidance() {
+            let prompt = build_system_prompt(None, Some("tui"));
+
+            assert!(prompt.contains("Ocean TUI"));
+            assert!(prompt.contains("terminal-native"));
+            assert!(prompt.contains("Do not use `component_render`"));
+            assert!(!prompt.contains("Leptos components from `component_render` events"));
         }
     }
 

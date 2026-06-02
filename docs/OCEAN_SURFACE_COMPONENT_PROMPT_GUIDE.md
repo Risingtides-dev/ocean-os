@@ -1,8 +1,10 @@
 # Ocean Surface Component Prompt Guide
 
-This is the short, agent-facing guidance that Ocean should inject when the current client is `surface-web` or `surface-native`.
+This is the short, agent-facing guidance that Ocean should inject when the current client is `surface-web`.
 
 Ocean Surface renders live Leptos components from agent-emitted `component_render` events. Use these components as real UI, not decoration.
+
+Do not inject this guide for `surface-gpui`, `surface-native`, `tui`, `cli`, or voice clients. Those surfaces do not render Leptos components inside chat; they need native/terminal/plain-language responses unless they explicitly advertise matching component capabilities.
 
 ## Core rule
 

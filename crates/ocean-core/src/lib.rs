@@ -82,7 +82,7 @@ pub struct PromptRequest {
     #[serde(default)]
     pub cwd: String,
     /// Identifies the client surface so the agent can tailor responses.
-    /// Known values: "tui", "surface-web", "surface-native", "cli", "leo-voice"
+    /// Known values: "tui", "surface-web", "surface-gpui", "surface-native", "cli", "leo-voice"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
 }
