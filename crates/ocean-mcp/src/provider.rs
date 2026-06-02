@@ -67,7 +67,10 @@ impl McpProvider {
 
         let command = match &cfg.command {
             Some(c) => c.clone(),
-            None => anyhow::bail!("MCP server `{}` has stdio transport but no command", cfg.name),
+            None => anyhow::bail!(
+                "MCP server `{}` has stdio transport but no command",
+                cfg.name
+            ),
         };
 
         // Resolve declared secrets by name. Missing ones are a warning; we log
@@ -142,9 +145,7 @@ impl McpProvider {
                 let tool: SharedTool = Arc::new(McpTool {
                     namespaced_name: format!("mcp{NS}{server_name}{NS}{}", def.name),
                     remote_name: def.name,
-                    description: def
-                        .description
-                        .unwrap_or_else(|| "MCP tool".to_string()),
+                    description: def.description.unwrap_or_else(|| "MCP tool".to_string()),
                     parameters: normalize_schema(def.input_schema),
                     client: client.clone(),
                 });

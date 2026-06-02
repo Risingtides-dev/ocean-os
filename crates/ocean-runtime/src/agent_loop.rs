@@ -15,7 +15,9 @@ use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crate::error::{AgentError, Result};
-use crate::types::{AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, ToolSideEffect};
+use crate::types::{
+    AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, ToolSideEffect,
+};
 
 pub struct AgentRun {
     pub messages: Vec<Message>,

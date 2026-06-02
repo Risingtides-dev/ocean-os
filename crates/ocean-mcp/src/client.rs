@@ -185,7 +185,9 @@ impl McpClient {
                 .await
                 .map_err(|_| anyhow!("MCP request `{method}` timed out"))??;
             let Some(raw) = next else {
-                return Err(anyhow!("MCP server closed the connection during `{method}`"));
+                return Err(anyhow!(
+                    "MCP server closed the connection during `{method}`"
+                ));
             };
             let msg: Incoming = match serde_json::from_str(&raw) {
                 Ok(m) => m,

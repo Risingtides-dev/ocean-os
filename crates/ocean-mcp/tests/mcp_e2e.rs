@@ -45,7 +45,10 @@ async fn connects_lists_and_namespaces_tools() {
     assert!(names.contains(&"mcp__fake__boom"));
 
     // The namespaced tool keeps the server's description and schema.
-    let echo = tools.iter().find(|t| t.name() == "mcp__fake__echo").unwrap();
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "mcp__fake__echo")
+        .unwrap();
     assert_eq!(echo.description(), "Echo the message argument back");
     assert_eq!(echo.parameters()["type"], "object");
     // MCP tools require permission by default.
@@ -58,7 +61,10 @@ async fn calls_a_tool_and_gets_result() {
         .await
         .unwrap();
     let tools = provider.tools(&SessionContext::default()).await;
-    let echo = tools.iter().find(|t| t.name() == "mcp__fake__echo").unwrap();
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "mcp__fake__echo")
+        .unwrap();
 
     let out = echo
         .execute("call-1", json!({ "message": "hi there" }))
@@ -74,7 +80,10 @@ async fn tool_execution_error_surfaces_as_err() {
         .await
         .unwrap();
     let tools = provider.tools(&SessionContext::default()).await;
-    let boom = tools.iter().find(|t| t.name() == "mcp__fake__boom").unwrap();
+    let boom = tools
+        .iter()
+        .find(|t| t.name() == "mcp__fake__boom")
+        .unwrap();
 
     let err = boom.execute("call-2", json!({})).await.unwrap_err();
     assert!(err.contains("kaboom"), "isError result becomes Err: {err}");
@@ -100,8 +109,7 @@ async fn registry_merges_builtins_with_live_mcp_server() {
     let mcp = McpProvider::connect(&server_cfg(), |_| None, Duration::from_secs(10))
         .await
         .unwrap();
-    let registry =
-        CapabilityRegistry::new(vec![Arc::new(BuiltinProvider::new()), Arc::new(mcp)]);
+    let registry = CapabilityRegistry::new(vec![Arc::new(BuiltinProvider::new()), Arc::new(mcp)]);
 
     let tools = registry.tools_for_session(&SessionContext::default()).await;
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

@@ -237,11 +237,7 @@ impl Model {
 
     /// Codex (Responses API) over a ChatGPT/Codex OAuth subscription token.
     /// Used for `gpt-5.x` driven without an API key.
-    pub fn codex(
-        id: impl Into<String>,
-        context_window: u32,
-        max_tokens: u32,
-    ) -> Self {
+    pub fn codex(id: impl Into<String>, context_window: u32, max_tokens: u32) -> Self {
         let id = id.into();
         Self {
             name: id.clone(),

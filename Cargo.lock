@@ -1327,6 +1327,8 @@ name = "ocean-longhouse"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "clap",
  "futures",
  "ocean-agent-sdk",
  "ocean-protocol",
@@ -1335,6 +1337,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

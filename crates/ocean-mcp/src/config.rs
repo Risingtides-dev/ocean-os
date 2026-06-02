@@ -125,7 +125,11 @@ mod tests {
             transport: McpTransportKind::Stdio,
             command: Some("npx".into()),
             args: vec![],
-            env: vec!["PRESENT_KEY".into(), "MISSING_KEY".into(), "EMPTY_KEY".into()],
+            env: vec![
+                "PRESENT_KEY".into(),
+                "MISSING_KEY".into(),
+                "EMPTY_KEY".into(),
+            ],
             enabled: true,
         };
         let (resolved, missing) = cfg.resolve_env(|name| match name {
@@ -133,7 +137,10 @@ mod tests {
             "EMPTY_KEY" => Some(String::new()),
             _ => None,
         });
-        assert_eq!(resolved, vec![("PRESENT_KEY".into(), "secret-value".into())]);
+        assert_eq!(
+            resolved,
+            vec![("PRESENT_KEY".into(), "secret-value".into())]
+        );
         // Empty value is treated as missing (a blank secret is not a secret).
         assert!(missing.contains(&"MISSING_KEY".to_string()));
         assert!(missing.contains(&"EMPTY_KEY".to_string()));
