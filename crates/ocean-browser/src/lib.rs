@@ -37,15 +37,46 @@ impl BrowserHandle {
     /// Get (or create) the active page.
     async fn active_page(&self) -> Result<Page> {
         let mut guard = self.page.lock().await;
+        // Reuse our cached page only if it's still alive (the tab wasn't closed).
         if let Some(p) = guard.as_ref() {
-            return Ok(p.clone());
+            if p.url().await.is_ok() {
+                return Ok(p.clone());
+            }
         }
         let chrome = self.inner.lock().await;
-        let page = chrome
-            .browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+        // Prefer an EXISTING real tab — the window the user is actually looking
+        // at — over spawning a fresh blank one. This is what stops the agent
+        // from opening a brand-new window every turn: when you chat from the
+        // side panel, you're already in a browser, so drive that browser's tab.
+        // We skip the extension's own pages (chrome-extension://) and devtools.
+        let existing = match chrome.browser.pages().await {
+            Ok(pages) => {
+                let mut chosen = None;
+                for p in pages {
+                    let url = p.url().await.ok().flatten().unwrap_or_default();
+                    // Skip the extension's own pages, devtools, and chrome:// UI.
+                    // Anything else (a real site, or even about:blank/newtab the
+                    // user has open) is a usable tab to drive.
+                    if url.starts_with("chrome-extension://")
+                        || url.starts_with("devtools://")
+                        || url.starts_with("chrome://")
+                    {
+                        continue;
+                    }
+                    chosen = Some(p);
+                }
+                chosen
+            }
+            Err(_) => None,
+        };
+        let page = match existing {
+            Some(p) => p,
+            None => chrome
+                .browser
+                .new_page("about:blank")
+                .await
+                .map_err(|e| BrowserError::Cdp(e.to_string()))?,
+        };
         *guard = Some(page.clone());
         Ok(page)
     }
