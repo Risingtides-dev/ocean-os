@@ -18,10 +18,45 @@ use tokio::sync::Mutex;
 use crate::capability::{CapabilityProvider, ProviderHealth, SessionContext, SharedTool};
 use crate::types::{AgentTool, AgentToolResult, ToolSideEffect};
 
-/// Shared dependency injected into every browser tool.
+/// A lazily-launched, shared Chrome handle. Tools hold this and call
+/// `.get().await` only when they actually run — so merely LISTING the browser
+/// tools (which happens on every turn) never launches Chrome. Chrome boots on
+/// the first real browser action, and is reused after.
+#[derive(Clone)]
+pub struct LazyBrowser {
+    cfg: Arc<LaunchConfig>,
+    handle: Arc<Mutex<Option<Arc<BrowserHandle>>>>,
+}
+
+impl LazyBrowser {
+    pub fn new(cfg: LaunchConfig) -> Self {
+        Self {
+            cfg: Arc::new(cfg),
+            handle: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Get-or-launch the shared browser. Called from inside a tool's execute().
+    pub async fn get(&self) -> Result<Arc<BrowserHandle>, String> {
+        let mut guard = self.handle.lock().await;
+        if let Some(h) = guard.as_ref() {
+            return Ok(h.clone());
+        }
+        let h = Arc::new(
+            BrowserHandle::launch((*self.cfg).clone())
+                .await
+                .map_err(|e| format!("could not start browser: {e}"))?,
+        );
+        *guard = Some(h.clone());
+        Ok(h)
+    }
+}
+
+/// Shared dependency injected into every browser tool. Holds a LAZY browser —
+/// listing tools never launches Chrome; the first tool that runs does.
 #[derive(Clone)]
 pub struct BrowserToolCtx {
-    pub handle: Arc<BrowserHandle>,
+    pub lazy: LazyBrowser,
 }
 
 /// Build a text result that also flags browser activity for the handoff.
@@ -48,23 +83,20 @@ pub fn browser_tools(ctx: BrowserToolCtx) -> Vec<Arc<dyn AgentTool>> {
     ]
 }
 
-/// Capability provider that lazily launches Chrome the first time a turn asks
-/// for tools, then serves the browser tool suite. The first `tools()` call
-/// pays the launch cost (a few hundred ms); subsequent turns reuse the handle.
-///
-/// If Chrome fails to launch the provider serves **no** tools and logs a
-/// warning — the agent simply won't have browser tools that session, rather
-/// than the daemon failing to start or the turn erroring.
+/// Capability provider that advertises the browser tools WITHOUT launching
+/// Chrome. The tools share one [`LazyBrowser`]; Chrome boots on the first
+/// actual browser action and is reused afterward. Listing tools (which happens
+/// on every single turn) is therefore free — a "what's 2+2" turn never starts
+/// a browser.
 pub struct BrowserProvider {
-    cfg: LaunchConfig,
-    handle: Mutex<Option<Arc<BrowserHandle>>>,
+    lazy: LazyBrowser,
 }
 
 impl BrowserProvider {
-    /// Build a provider. `profile_dir` is Chrome's user-data dir (point at the
-    /// real Chrome data dir to inherit the user's logins); `profile_directory`
-    /// is the sub-profile (e.g. "Default"); `extension_dir` (if it exists)
-    /// preloads the Ocean cockpit extension.
+    /// Build a provider. `profile_dir` is Chrome's user-data dir;
+    /// `profile_directory` is the sub-profile (e.g. "Default"); `extension_dir`
+    /// (if it exists) preloads the Ocean cockpit extension; `chrome_executable`
+    /// should point at Chrome for Testing so the extension auto-loads.
     pub fn new(
         profile_dir: PathBuf,
         profile_directory: Option<String>,
@@ -72,34 +104,14 @@ impl BrowserProvider {
         chrome_executable: Option<PathBuf>,
     ) -> Self {
         Self {
-            cfg: LaunchConfig {
+            lazy: LazyBrowser::new(LaunchConfig {
                 profile_dir,
                 profile_directory,
                 extension_dir,
                 chrome_executable,
                 headless: false,
                 port: 0,
-            },
-            handle: Mutex::new(None),
-        }
-    }
-
-    /// Get-or-launch the shared handle.
-    async fn ensure(&self) -> Option<Arc<BrowserHandle>> {
-        let mut guard = self.handle.lock().await;
-        if let Some(h) = guard.as_ref() {
-            return Some(h.clone());
-        }
-        match BrowserHandle::launch(self.cfg.clone()).await {
-            Ok(h) => {
-                let h = Arc::new(h);
-                *guard = Some(h.clone());
-                Some(h)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "browser launch failed; browser tools unavailable");
-                None
-            }
+            }),
         }
     }
 }
@@ -111,10 +123,10 @@ impl CapabilityProvider for BrowserProvider {
     }
 
     async fn tools(&self, _ctx: &SessionContext) -> Vec<SharedTool> {
-        match self.ensure().await {
-            Some(handle) => browser_tools(BrowserToolCtx { handle }),
-            None => Vec::new(),
-        }
+        // No launch here — just hand the tools a clone of the lazy browser.
+        browser_tools(BrowserToolCtx {
+            lazy: self.lazy.clone(),
+        })
     }
 
     async fn health(&self) -> ProviderHealth {

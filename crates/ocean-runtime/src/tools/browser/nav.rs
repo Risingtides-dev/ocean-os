@@ -31,10 +31,7 @@ impl AgentTool for BrowserNavigateTool {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or("missing 'url'")?;
-        let title = self
-            .ctx
-            .handle
-            .navigate(url)
+        let title = self.ctx.lazy.get().await?.navigate(url)
             .await
             .map_err(|e| e.to_string())?;
         Ok(active_result(format!("navigated to {url} — title: {title}")))

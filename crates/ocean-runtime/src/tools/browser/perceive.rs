@@ -21,7 +21,7 @@ impl AgentTool for BrowserReadPageTool {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let read = self.ctx.handle.read_page().await.map_err(|e| e.to_string())?;
+        let read = self.ctx.lazy.get().await?.read_page().await.map_err(|e| e.to_string())?;
         let body = serde_json::to_string_pretty(&read).map_err(|e| e.to_string())?;
         Ok(active_result(body))
     }
@@ -50,10 +50,7 @@ impl AgentTool for BrowserScreenshotTool {
             .get("full_page")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let b64 = self
-            .ctx
-            .handle
-            .screenshot(full)
+        let b64 = self.ctx.lazy.get().await?.screenshot(full)
             .await
             .map_err(|e| e.to_string())?;
         Ok(AgentToolResult {
