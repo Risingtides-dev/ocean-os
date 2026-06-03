@@ -49,19 +49,23 @@ pub struct LaunchedChrome {
 /// Launch Chrome via chromiumoxide using our flag set. Spawns the required
 /// CDP event-handler task internally.
 pub async fn launch(cfg: &LaunchConfig) -> Result<LaunchedChrome, BrowserError> {
+    // NOTE: chromiumoxide's `.arg()` parses a bare flag (no leading `--`); it
+    // adds the dashes itself. And it injects `--disable-extensions` UNLESS you
+    // register extensions via `.extension()`, which also emits `--load-extension`.
     let mut builder = BrowserConfig::builder()
         .user_data_dir(&cfg.profile_dir)
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check");
+        .arg("no-first-run")
+        .arg("no-default-browser-check");
     if cfg.headless {
-        builder = builder.arg("--headless=new");
+        builder = builder.arg("headless=new");
     } else {
         builder = builder.with_head();
     }
     if let Some(ext) = &cfg.extension_dir {
-        builder = builder
-            .arg(format!("--load-extension={}", ext.display()))
-            .arg(format!("--disable-extensions-except={}", ext.display()));
+        builder = builder.extension(ext.display().to_string());
+        // Recent Chrome (127+) ignores --load-extension unless this feature
+        // kill-switch is set. Without it the extension silently never loads.
+        builder = builder.arg("disable-features=DisableLoadExtensionCommandLineSwitch");
     }
     let config = builder
         .build()
