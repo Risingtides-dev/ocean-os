@@ -4,12 +4,14 @@ members = [
   "crates/ocean-protocol",
   "crates/ocean-runtime",
   "crates/ocean-mcp",
+  "crates/ocean-acp",
   "crates/ocean-agent",
   "crates/ocean-agent-sdk",
   "crates/ocean-providers",
   "crates/ocean-daemon",
   "crates/ocean-cli",
   "crates/ocean-tui",
+  "crates/ocean-browser",
 ]
 resolver = "2"
 
@@ -45,3 +47,9 @@ toml = "0.8"
 ocean-agent-sdk = { path = "crates/ocean-agent-sdk" }
 ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }
+ocean-browser = { path = "crates/ocean-browser" }
+# Default features only ("bytes"). The `fetcher`/`rustls`/`native-tls` features
+# pull in chromiumoxide_fetcher (auto-downloads Chromium) which has a broken zip
+# gate in 0.9.1 — and we drive the system Chrome, so we never want the fetcher.
+chromiumoxide = { version = "0.9" }
+base64 = "0.22"
