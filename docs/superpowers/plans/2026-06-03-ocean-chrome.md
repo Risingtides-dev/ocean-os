@@ -12,6 +12,40 @@
 
 ---
 
+## STATUS: ✅ COMPLETE (2026-06-03)
+
+All 14 tasks implemented and committed across `ocean-os` and `ocean-surface`.
+Workspace builds release-clean; real-Chrome smoke tests pass headless.
+
+**Deviations from the original plan (all improvements found during build):**
+
+1. **chromiumoxide features:** `tokio-runtime` doesn't exist in 0.9; any TLS
+   feature (`rustls`/`native-tls`) drags in the broken `chromiumoxide_fetcher`
+   (zip-gate compile error). Fixed by using **default features only** — we
+   drive the system Chrome, never the fetcher.
+2. **type/key dispatch:** `Page::type_str`/`press_key` aren't on the public
+   `Page` in 0.9 (only on `Element` / the internal handler). Replicated the
+   handler's exact CDP `DispatchKeyEvent` dispatch via a `dispatch_key` free fn
+   using the public `keys::get_key_definition`.
+3. **Daemon integration:** instead of stashing a lazy handle in `AppState` and
+   appending tools per-turn, implemented a **`BrowserProvider`
+   (CapabilityProvider)** registered in `build_capability_registry`. This fits
+   the existing tool seam exactly — lazy launch lives in the provider's cached
+   `tools()`, and the agent runtime needed no per-turn changes.
+4. **Event path:** `browser-active/idle` flows as a first-class
+   `AgentEvent::BrowserActivity` → `AgentTurnEvent::BrowserActivity` wire event
+   (not a hand-rolled JSON publish), so it rides the existing SSE serializer.
+   Required adding exhaustive match arms in the TUI (2 sites) — done.
+5. **build-extension.sh:** `cp dist/*.js` also matched `sw.js`; fixed to copy
+   exact filenames. `--filehash false` confirmed working in Trunk 0.21.
+
+**Not verifiable in this environment:** a full agent turn driving the browser
+needs an LLM provider/API key configured (none present). The CDP layer itself
+is proven by the passing real-Chrome smoke tests; the agent wiring compiles and
+registers the tools.
+
+---
+
 ## File Structure
 
 **New crate `crates/ocean-browser/`** — owns the Chrome process + CDP session. One responsibility: be a typed, async handle to a running Chrome.
