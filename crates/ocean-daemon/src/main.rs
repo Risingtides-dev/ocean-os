@@ -18,14 +18,16 @@ use axum::{
 use chrono::Utc;
 use ocean_agent::{room_guidance, AgentRuntime, PromptControl};
 use ocean_agent_sdk::{
-    AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse,
-    AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus, ToolCall,
-    ToolCallId, ToolResult,
+    AgentRole, AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse,
+    AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
+    ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
+    ToolCall, ToolCallId, ToolResult,
 };
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
-    PermissionStatus, PermissionsResponse, PromptRequest, RequestControlResponse,
+    PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectResponse,
+    ProjectsResponse, PromptRequest, RequestControlResponse,
     RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, RoomId,
     RoomPanelSnapshot, RoomSnapshot, RoomsResponse, SessionDetail, SessionId, SessionResponse,
     SessionRunState, SessionSummary,
@@ -205,9 +207,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/rooms/{room_id}", get(room))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
+        .route("/v1/projects", get(projects_list).post(project_create))
+        .route(
+            "/v1/projects/{id}",
+            get(project_get).patch(project_patch).delete(project_delete),
+        )
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
         .route("/v1/component/event", post(component_event))
+        .route("/v1/longhouse/demo", post(longhouse_demo))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -646,6 +654,165 @@ async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// Emit a scripted-but-real Longhouse deliberation onto the agent event bus so
+/// the Living Deck (the underwater-building UI) can render an actual council
+/// flow before the full convening engine exists. Returns immediately; the flow
+/// streams over `/v1/agent/events` as `Extension { extension: "longhouse" }`
+/// events. This is a development harness, not the production convening path.
+async fn longhouse_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let bus = state.agent_events.clone();
+    let topic_id = Uuid::new_v4();
+    let board_id = Uuid::new_v4();
+
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        let emit = |ev: LonghouseEvent| bus.emit(ev.into_turn_event());
+
+        // 1. A user asks the Sales room a question → the room lights up.
+        emit(LonghouseEvent::TopicConvened {
+            topic_id,
+            board_id,
+            federation: Federation::Sales,
+            trigger: ConveneTrigger::UserRequest,
+            title: "Which 5 creators should we pitch for the Warner Q3 push?".into(),
+            deadline_ms: 1_700_000_000_000,
+        });
+        sleep(Duration::from_millis(600)).await;
+
+        // 2. Four members swim in — mixed models, mostly couriers + a steward.
+        let opus = Uuid::new_v4();
+        let kimi = Uuid::new_v4();
+        let deepseek = Uuid::new_v4();
+        let steward = Uuid::new_v4();
+        let member = |id: Uuid, role: AgentRole, model: &str, label: &str| LonghouseMember {
+            agent_id: id,
+            federation: Federation::Sales,
+            role,
+            model: model.into(),
+            label: Some(label.into()),
+        };
+        emit(LonghouseEvent::Convened {
+            topic_id,
+            members: vec![
+                member(opus, AgentRole::Courier, "claude-opus-4-7", "Sales Courier · Opus"),
+                member(kimi, AgentRole::Courier, "kimi-k2.6", "Sales Courier · Kimi"),
+                member(deepseek, AgentRole::Courier, "deepseek-v4-pro", "Sales Courier · DeepSeek"),
+                member(steward, AgentRole::Steward, "claude-opus-4-7", "Sales Steward"),
+            ],
+        });
+        sleep(Duration::from_millis(700)).await;
+
+        // 3. Two proposals land on the blackboard.
+        let prop_a = Uuid::new_v4();
+        let prop_b = Uuid::new_v4();
+        emit(LonghouseEvent::MarkPosted {
+            topic_id,
+            mark: Mark {
+                mark_id: Uuid::new_v4(),
+                author: opus,
+                kind: MarkKind::Proposal,
+                target: None,
+                summary: "Plan A: 5 mid-tier dance creators w/ proven Warner sound lift".into(),
+            },
+        });
+        // give prop_a its identity by re-using mark_id as proposal id in tallies
+        sleep(Duration::from_millis(500)).await;
+        emit(LonghouseEvent::MarkPosted {
+            topic_id,
+            mark: Mark {
+                mark_id: Uuid::new_v4(),
+                author: kimi,
+                kind: MarkKind::Proposal,
+                target: None,
+                summary: "Plan B: 3 macro creators + 2 emerging, higher reach, higher risk".into(),
+            },
+        });
+        sleep(Duration::from_millis(600)).await;
+
+        // 4. Evidence + endorsements + an inhibit — the deliberation moves.
+        emit(LonghouseEvent::MarkPosted {
+            topic_id,
+            mark: Mark {
+                mark_id: Uuid::new_v4(),
+                author: deepseek,
+                kind: MarkKind::Evidence,
+                target: Some(prop_a),
+                summary: "Campaign Hub: Plan A creators avg 2.3x save-rate on prior Warner sounds".into(),
+            },
+        });
+        sleep(Duration::from_millis(500)).await;
+        for (author, target) in [(opus, prop_a), (deepseek, prop_a), (steward, prop_a)] {
+            emit(LonghouseEvent::MarkPosted {
+                topic_id,
+                mark: Mark {
+                    mark_id: Uuid::new_v4(),
+                    author,
+                    kind: MarkKind::Endorse,
+                    target: Some(target),
+                    summary: "endorses Plan A".into(),
+                },
+            });
+            emit(LonghouseEvent::QuorumUpdated {
+                topic_id,
+                tallies: vec![
+                    ProposalTally { proposal: prop_a, net_weight: 1.0 },
+                    ProposalTally { proposal: prop_b, net_weight: 0.4 },
+                ],
+                leader: Some(prop_a),
+                distance_to_quorum: 0.5,
+            });
+            sleep(Duration::from_millis(450)).await;
+        }
+        emit(LonghouseEvent::MarkPosted {
+            topic_id,
+            mark: Mark {
+                mark_id: Uuid::new_v4(),
+                author: kimi,
+                kind: MarkKind::Inhibit,
+                target: Some(prop_a),
+                summary: "flags Plan A reach ceiling — but concedes save-rate".into(),
+            },
+        });
+        sleep(Duration::from_millis(500)).await;
+
+        // 5. A firekeeper title is granted; quorum crosses.
+        emit(LonghouseEvent::RoleGranted {
+            topic_id,
+            agent_id: steward,
+            role: AgentRole::Firekeeper,
+        });
+        emit(LonghouseEvent::QuorumUpdated {
+            topic_id,
+            tallies: vec![
+                ProposalTally { proposal: prop_a, net_weight: 2.6 },
+                ProposalTally { proposal: prop_b, net_weight: 0.4 },
+            ],
+            leader: Some(prop_a),
+            distance_to_quorum: 1.0,
+        });
+        sleep(Duration::from_millis(600)).await;
+
+        // 6. The firekeeper ratifies — the room floods with light.
+        emit(LonghouseEvent::Converged {
+            topic_id,
+            decision: prop_a,
+            by: steward,
+        });
+        sleep(Duration::from_millis(400)).await;
+        emit(LonghouseEvent::TopicClosed { topic_id });
+
+        // 7. A steward heartbeat about the Sales automations (deck shows health).
+        emit(LonghouseEvent::RunHealth {
+            federation: Federation::Sales,
+            runs_total: 7,
+            runs_healthy: 7,
+            note: Some("nightly outreach sync green".into()),
+        });
+    });
+
+    Json(json!({ "ok": true, "topic_id": topic_id, "streaming_on": "/v1/agent/events" }))
+}
+
 async fn model_set(
     State(state): State<AppState>,
     Json(req): Json<ModelSetRequest>,
@@ -656,6 +823,152 @@ async fn model_set(
             Json(json!({"ok": true, "provider": provider, "model": model}))
         }
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+// ---- Projects --------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct CreateProjectRequest {
+    name: String,
+    workspace_root: String,
+    #[serde(default)]
+    config: ProjectConfig,
+}
+
+#[derive(serde::Deserialize)]
+struct PatchProjectRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    config: Option<ProjectConfig>,
+}
+
+/// `GET /v1/projects` — list all registered projects.
+async fn projects_list(State(state): State<AppState>) -> Json<ProjectsResponse> {
+    match state.runtime.list_projects() {
+        Ok(projects) => Json(ProjectsResponse { ok: true, projects, error: None }),
+        Err(e) => Json(ProjectsResponse {
+            ok: false,
+            projects: vec![],
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+/// `POST /v1/projects` — create a project bound to a directory.
+async fn project_create(
+    State(state): State<AppState>,
+    Json(req): Json<CreateProjectRequest>,
+) -> (StatusCode, Json<ProjectResponse>) {
+    let now = Utc::now().timestamp_millis();
+    let project = Project {
+        id: uuid::Uuid::new_v4(),
+        name: req.name,
+        workspace_root: req.workspace_root,
+        config: req.config,
+        created_ms: now,
+        updated_ms: now,
+    };
+    match state.runtime.upsert_project(project, now) {
+        Ok(project) => (
+            StatusCode::CREATED,
+            Json(ProjectResponse { ok: true, project: Some(project), error: None }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ProjectResponse { ok: false, project: None, error: Some(e.to_string()) }),
+        ),
+    }
+}
+
+/// `GET /v1/projects/{id}` — one project plus its sessions (the sessions in the
+/// project's `workspace_root` bucket).
+async fn project_get(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.runtime.find_project(id) {
+        Ok(Some(project)) => {
+            let sessions = state
+                .runtime
+                .list_sessions(Some(&project.workspace_root))
+                .unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "project": project, "sessions": sessions })),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("unknown project {id}") })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `PATCH /v1/projects/{id}` — update name and/or config (partial).
+async fn project_patch(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+    Json(req): Json<PatchProjectRequest>,
+) -> (StatusCode, Json<ProjectResponse>) {
+    let now = Utc::now().timestamp_millis();
+    let existing = match state.runtime.find_project(id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ProjectResponse {
+                    ok: false,
+                    project: None,
+                    error: Some(format!("unknown project {id}")),
+                }),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProjectResponse { ok: false, project: None, error: Some(e.to_string()) }),
+            )
+        }
+    };
+    let updated = Project {
+        name: req.name.unwrap_or(existing.name),
+        config: req.config.unwrap_or(existing.config),
+        ..existing
+    };
+    match state.runtime.upsert_project(updated, now) {
+        Ok(project) => (
+            StatusCode::OK,
+            Json(ProjectResponse { ok: true, project: Some(project), error: None }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ProjectResponse { ok: false, project: None, error: Some(e.to_string()) }),
+        ),
+    }
+}
+
+/// `DELETE /v1/projects/{id}` — remove a project. Its sessions are NOT deleted;
+/// they keep their workspace bucket and simply become project-less.
+async fn project_delete(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.runtime.delete_project(id) {
+        Ok(true) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("unknown project {id}") })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1449,8 +1762,29 @@ async fn agent_turn(
         cwd,
         guidance: _,
         room_id,
+        project_id,
         client_type,
     } = req;
+
+    // Resolve the working directory: a non-empty cwd wins; else the project's
+    // workspace_root; else an explicit error — never the daemon's own launch
+    // dir. This is the fix for "every session reverts to ocean-os".
+    let cwd = match state.runtime.resolve_cwd_for_turn(project_id, &cwd) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentTurnResponse {
+                    ok: false,
+                    turn_id: AgentTurnId::new_v4(),
+                    session_id: session_id.unwrap_or_else(AgentSessionId::new_v4),
+                    status: AgentTurnStatus::Failed,
+                    event_id_prefix: String::new(),
+                    error: Some(error.to_string()),
+                }),
+            );
+        }
+    };
 
     let is_new_session = session_id.is_none();
     let session_id = session_id.unwrap_or_else(AgentSessionId::new_v4);
@@ -1515,6 +1849,7 @@ async fn agent_turn(
         max_turns: None,
         yolo: true,
         cwd,
+        project_id,
         client_type,
     };
 

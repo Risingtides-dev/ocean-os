@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
+                project_id: None,
                 client_type: Some("cli".into()),
             };
             let res: PromptResponse = client

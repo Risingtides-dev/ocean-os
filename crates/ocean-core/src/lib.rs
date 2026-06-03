@@ -81,10 +81,68 @@ pub struct PromptRequest {
     pub yolo: bool,
     #[serde(default)]
     pub cwd: String,
+    /// The project this turn belongs to. When set, the daemon resolves the
+    /// project's `workspace_root` and uses it as the working directory if `cwd`
+    /// is empty — so a thin client can steer by project id without re-resolving
+    /// paths. See [`Project`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     /// Identifies the client surface so the agent can tailor responses.
     /// Known values: "tui", "surface-web", "surface-gpui", "surface-native", "cli", "leo-voice"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+}
+
+/// Stable id for a [`Project`].
+pub type ProjectId = Uuid;
+
+/// Per-project configuration. All optional — a project can be just a named
+/// directory, or carry preferences the daemon applies to its sessions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    /// Preferred model for this project. Applied only when nothing higher in the
+    /// precedence chain is set — `OCEAN_MODEL` env and the operator's last
+    /// interactive pick both win over it (last-picked-wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// If set, restricts which tools sessions in this project may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+/// A named, directory-bound workspace. Sessions belong to whichever project owns
+/// the directory they bind to (a project's sessions = the sessions in its
+/// `workspace_root` bucket — the existing per-workspace session store).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: ProjectId,
+    pub name: String,
+    /// The canonical directory this project is bound to.
+    pub workspace_root: String,
+    #[serde(default)]
+    pub config: ProjectConfig,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+/// Response for `GET /v1/projects`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectsResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub projects: Vec<Project>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response for single-project endpoints (`POST`/`GET`/`PATCH /v1/projects[/{id}]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Response payload for `POST /v1/prompt`.

@@ -189,6 +189,11 @@ pub struct AgentTurnRequest {
     /// Optional room identifier for Track-0 room-scoped turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_id: Option<String>,
+    /// The project this turn belongs to. When set with an empty `cwd`, the
+    /// daemon binds the turn to the project's `workspace_root` — letting a thin
+    /// client steer by project id without re-resolving directory paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<uuid::Uuid>,
     /// Identifies the client surface so the agent can tailor responses.
     /// Known values: "tui", "surface-web", "surface-gpui", "surface-native", "cli", "leo-voice"
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,6 +382,251 @@ pub enum AgentTurnEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Longhouse — non-hierarchical multi-agent coordination (the "underwater
+// building" deck renders these). LonghouseEvents ride inside
+// `AgentTurnEvent::Extension { extension: "longhouse", payload }` so they
+// stream over the existing `/v1/agent/events` SSE contract without breaking
+// any client that doesn't understand them. See docs/LONGHOUSE_ORCHESTRATION.md
+// and the Living Deck section of the vision doc.
+// ---------------------------------------------------------------------------
+
+/// The standing departments of the longhouse. Each is a *federation* — a room
+/// in the building, a domain of competence. Queries route to the federation
+/// whose domain matches; couriers and the steward of that federation live here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Federation {
+    /// Builds & maintains the automations/workflows the other departments run on.
+    /// Most council sessions that produce *new capability* convene here.
+    Dev,
+    /// Notion CRM, outreach, deal motion.
+    Sales,
+    /// Content Lab — the production pipeline.
+    Content,
+    /// Campaign Hub — creator ops + the campaign databases.
+    Campaign,
+    /// Cross-cutting / not yet routed to a department.
+    Commons,
+}
+
+/// What an agent *is* within the longhouse. The load-bearing split: couriers
+/// **exercise** (do the work), stewards **oversee + recall** (watch runs, catch
+/// failures, assess, carry human feedback back, can restart/revoke a run).
+/// This mirrors the grant/exercise/revoke separation in the orchestration doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    /// A worker that carries out departmental tasks (draft, clip, update, build).
+    Courier,
+    /// The department's IT/overseer: watches cron + automation runs, ensures they
+    /// fire and recover, assesses results, proposes improvements, relays feedback.
+    Steward,
+    /// Per-topic: emits the single binding `Converged` — only when the daemon's
+    /// own quorum state already says converged. Ratifies, never overrides.
+    Firekeeper,
+    /// Per-topic: verifies *process* (did competent members weigh in? was quorum
+    /// genuinely credentialed?) without voting on content. Can procedurally veto.
+    Validator,
+}
+
+/// Why a topic was convened — the three entry points into the longhouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConveneTrigger {
+    /// A council was convened to deliberate a question.
+    Deliberation,
+    /// A user (operator) asked for a task or an answer.
+    UserRequest,
+    /// A scheduled cron / event-driven automation fired.
+    Cron,
+}
+
+/// A typed mark posted to a topic's blackboard (the stigmergic signal field).
+/// Aggregate weight + decay are computed by the daemon, never an LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkKind {
+    /// A candidate answer / plan.
+    Proposal,
+    /// Support for a proposal (raises its net weight).
+    Endorse,
+    /// Opposition to a proposal (cross-inhibition; lowers net weight).
+    Inhibit,
+    /// A fact / source / tool-result contributed to the deliberation.
+    Evidence,
+    /// A free-form note.
+    Note,
+}
+
+/// One member seated in a convened topic. The deck renders one agent sprite per
+/// `LonghouseMember`, skinned by `federation` + `role` + `model`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LonghouseMember {
+    /// Stable id for this seated agent (for the deck to track its sprite).
+    pub agent_id: Uuid,
+    /// Which department this agent belongs to.
+    pub federation: Federation,
+    /// Courier / steward / firekeeper / validator.
+    pub role: AgentRole,
+    /// Model driving this agent (e.g. "claude-opus-4-7", "kimi-k2.6").
+    /// Lets the deck color sprites by provider and shows the model menu live.
+    pub model: String,
+    /// Human-facing label (e.g. "Sales Courier 3").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// A typed mark on a topic's blackboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mark {
+    pub mark_id: Uuid,
+    /// The agent that posted it.
+    pub author: Uuid,
+    pub kind: MarkKind,
+    /// For endorse/inhibit: the proposal this mark targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Uuid>,
+    /// Short human-facing summary of the mark's content (the deck shows this on
+    /// the blackboard slab; full content lives in the agent's transcript).
+    pub summary: String,
+}
+
+/// Running tally for one proposal — the daemon-computed "pheromone level".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposalTally {
+    pub proposal: Uuid,
+    /// Net credential-weighted support (endorse − inhibit), after decay.
+    pub net_weight: f32,
+}
+
+/// Why a topic closed without a single converged answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbortReason {
+    /// The hard deadline fired with no clear leader.
+    Timeout,
+    /// Two+ proposals were irreconcilable.
+    Split,
+    /// The token budget ceiling was hit.
+    BudgetExhausted,
+    /// A run was recalled by a steward / operator.
+    Recalled,
+}
+
+/// The longhouse coordination events. Carried as the `payload` of
+/// `AgentTurnEvent::Extension { extension: "longhouse", .. }`.
+///
+/// The deck (the underwater-building UI) renders these spatially: a topic is a
+/// lit room, members swim in, marks land on the blackboard, the room brightens
+/// toward quorum, and `Converged` floods it with light.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "lh_type", rename_all = "snake_case")]
+pub enum LonghouseEvent {
+    /// A topic opened. The matching department room lights up.
+    TopicConvened {
+        topic_id: Uuid,
+        /// The board this topic deliberates on.
+        board_id: Uuid,
+        /// Which department room hosts it.
+        federation: Federation,
+        /// What kind of work this is.
+        trigger: ConveneTrigger,
+        /// Short human-facing description of the question/task.
+        title: String,
+        /// Hard deadline (epoch ms) after which the daemon forces resolution.
+        deadline_ms: i64,
+    },
+    /// The members routed into the topic. Sprites spawn, one per member.
+    Convened {
+        topic_id: Uuid,
+        members: Vec<LonghouseMember>,
+    },
+    /// A member posted a mark to the blackboard.
+    MarkPosted { topic_id: Uuid, mark: Mark },
+    /// The daemon recomputed quorum after a mark. Drives the room's quorum meter.
+    QuorumUpdated {
+        topic_id: Uuid,
+        tallies: Vec<ProposalTally>,
+        /// The current front-runner proposal, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leader: Option<Uuid>,
+        /// 0.0–1.0: how close the leader is to crossing the quorum threshold.
+        distance_to_quorum: f32,
+    },
+    /// A title (firekeeper/validator) was bound to a member for this topic.
+    RoleGranted {
+        topic_id: Uuid,
+        agent_id: Uuid,
+        role: AgentRole,
+    },
+    /// A title was pulled / a member was recalled (the steward/War-Chief action).
+    RoleRevoked {
+        topic_id: Uuid,
+        agent_id: Uuid,
+        reason: String,
+    },
+    /// A member accrued a soft strike (degraded output / ignored the board).
+    Warned {
+        topic_id: Uuid,
+        agent_id: Uuid,
+        strike: u8,
+        reason: String,
+    },
+    /// The single binding resolution — emitted by the firekeeper (or the daemon
+    /// on the no-tie fast path) only once the daemon's quorum state says so.
+    Converged {
+        topic_id: Uuid,
+        /// The winning proposal.
+        decision: Uuid,
+        /// Who signed the call (for the immutable decision log).
+        by: Uuid,
+    },
+    /// The topic ended without a converged answer.
+    Aborted { topic_id: Uuid, reason: AbortReason },
+    /// The topic closed; titles return to escrow, the room dims.
+    TopicClosed { topic_id: Uuid },
+    /// Steward heartbeat about a department's automation/cron runs. Lets the deck
+    /// show a department's "are the automations healthy" state outside of any
+    /// single deliberation (the steward at its station, runs green/red).
+    RunHealth {
+        federation: Federation,
+        /// Total automation runs the steward is overseeing.
+        runs_total: u32,
+        /// How many are currently healthy / green.
+        runs_healthy: u32,
+        /// Optional note (e.g. "restarted nightly clip job").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+}
+
+impl LonghouseEvent {
+    /// The extension tag used when wrapping this in `AgentTurnEvent::Extension`.
+    pub const EXTENSION: &'static str = "longhouse";
+
+    /// Wrap this longhouse event as an `AgentTurnEvent::Extension` so it can be
+    /// published on the existing agent event bus / `/v1/agent/events` SSE.
+    pub fn into_turn_event(self) -> AgentTurnEvent {
+        AgentTurnEvent::Extension {
+            extension: Self::EXTENSION.to_string(),
+            payload: serde_json::to_value(self).unwrap_or(Value::Null),
+        }
+    }
+
+    /// Try to extract a `LonghouseEvent` from an `AgentTurnEvent` if it is a
+    /// longhouse extension. Returns `None` for any other event (clients ignore
+    /// unrecognised extensions). This is what the deck calls on each SSE line.
+    pub fn from_turn_event(event: &AgentTurnEvent) -> Option<Self> {
+        match event {
+            AgentTurnEvent::Extension { extension, payload } if extension == Self::EXTENSION => {
+                serde_json::from_value(payload.clone()).ok()
+            }
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Backward-compatibility notes
 // ---------------------------------------------------------------------------
 // The /v1/agent/* slice is the **product** API.  It replaces the mental model
@@ -410,6 +660,48 @@ mod tests {
         assert!(json.starts_with(r#"{"type":"turn_started","#));
         assert!(json.contains("\"turn_id\""));
         assert!(json.contains("\"session_id\""));
+    }
+
+    #[test]
+    fn longhouse_event_rides_extension_and_round_trips() {
+        let topic = Uuid::new_v4();
+        let ev = LonghouseEvent::TopicConvened {
+            topic_id: topic,
+            board_id: Uuid::new_v4(),
+            federation: Federation::Sales,
+            trigger: ConveneTrigger::UserRequest,
+            title: "status of the Warner campaign".into(),
+            deadline_ms: 1_700_000_000_000,
+        };
+        // Wrap into the SSE-carried AgentTurnEvent::Extension.
+        let wrapped = ev.clone().into_turn_event();
+        match &wrapped {
+            AgentTurnEvent::Extension { extension, .. } => {
+                assert_eq!(extension, "longhouse");
+            }
+            _ => panic!("expected Extension"),
+        }
+        // It serializes as a normal agent event (so SSE clients see it).
+        let json = serde_json::to_string(&wrapped).unwrap();
+        assert!(json.contains(r#""type":"extension""#));
+        assert!(json.contains(r#""lh_type":"topic_convened""#));
+        assert!(json.contains("Warner"));
+
+        // The deck extracts it back; unrelated events return None.
+        let back = LonghouseEvent::from_turn_event(&wrapped).expect("should extract");
+        match back {
+            LonghouseEvent::TopicConvened { federation, trigger, .. } => {
+                assert_eq!(federation, Federation::Sales);
+                assert_eq!(trigger, ConveneTrigger::UserRequest);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let not_lh = AgentTurnEvent::TurnStarted {
+            turn_id: AgentTurnId::new_v4(),
+            session_id: AgentSessionId::new_v4(),
+            model: None,
+        };
+        assert!(LonghouseEvent::from_turn_event(&not_lh).is_none());
     }
 
     #[test]

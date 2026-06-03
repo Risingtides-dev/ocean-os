@@ -8,8 +8,8 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
-    PromptRequest, PromptResponse, RequestId, RoomId, SessionDetail, SessionId, SessionRunState,
-    TokenUsage,
+    Project, ProjectId, PromptRequest, PromptResponse, RequestId, RoomId, SessionDetail, SessionId,
+    SessionRunState, TokenUsage,
     SessionSummary, SessionToolContext, SessionTranscriptEntry,
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 mod config;
 pub use config::{DaemonConfig, McpSection};
+mod project;
 
 const APP_NAME: &str = "ocean-rs";
 
@@ -255,6 +256,60 @@ impl AgentRuntime {
     /// without depending on the private session module.
     pub fn workspace_root_for(&self, cwd: &Path) -> PathBuf {
         session::workspace_root(cwd)
+    }
+
+    // ---- Projects ----------------------------------------------------------
+
+    /// Every registered project.
+    pub fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
+        project::load_all(&self.config_dir)
+    }
+
+    /// One project by id.
+    pub fn find_project(&self, id: ProjectId) -> anyhow::Result<Option<Project>> {
+        project::find_by_id(&self.config_dir, id)
+    }
+
+    /// Create or replace a project (by id), stamping `updated_ms` to `now_ms`.
+    pub fn upsert_project(&self, p: Project, now_ms: i64) -> anyhow::Result<Project> {
+        project::upsert(&self.config_dir, p, now_ms)
+    }
+
+    /// Remove a project. `false` if it didn't exist. Sessions are untouched.
+    pub fn delete_project(&self, id: ProjectId) -> anyhow::Result<bool> {
+        project::delete(&self.config_dir, id)
+    }
+
+    /// Resolve the working directory for a turn given an optional `project_id`
+    /// and the client-supplied `cwd`. This is the fix for the "everything
+    /// reverts to the daemon's launch dir" bug: the daemon no longer falls back
+    /// to its own process cwd.
+    ///
+    /// Precedence:
+    /// 1. non-empty `requested_cwd` always wins (client may target a sub-dir of
+    ///    the project, or work project-less as before);
+    /// 2. else, if a `project_id` is given, the project's `workspace_root`;
+    /// 3. else — no cwd and no project — an explicit error, never the daemon's
+    ///    own `current_dir()`.
+    pub fn resolve_cwd_for_turn(
+        &self,
+        project_id: Option<ProjectId>,
+        requested_cwd: &str,
+    ) -> anyhow::Result<String> {
+        let trimmed = requested_cwd.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+        if let Some(id) = project_id {
+            let proj = self
+                .find_project(id)?
+                .ok_or_else(|| anyhow::anyhow!("unknown project id {id}"))?;
+            return Ok(proj.workspace_root);
+        }
+        anyhow::bail!(
+            "no working directory: the turn supplied neither a cwd nor a project_id, \
+             so there is nothing to bind the session to (the daemon will not guess)"
+        )
     }
 
     /// One-shot legacy migration — safe to call repeatedly.
@@ -1430,6 +1485,7 @@ mod tests {
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
+                    project_id: None,
                     client_type: None,
                 },
                 PromptControl::yolo(false),
@@ -1464,6 +1520,7 @@ mod tests {
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
+                    project_id: None,
                     client_type: None,
                 },
                 PromptControl::yolo(false),
@@ -1508,6 +1565,7 @@ mod tests {
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
+                    project_id: None,
                     client_type: None,
                 },
                 PromptControl::yolo(false),
@@ -1530,6 +1588,7 @@ mod tests {
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
+                    project_id: None,
                     client_type: None,
                 },
                 PromptControl::yolo(false),
@@ -1563,6 +1622,7 @@ mod tests {
                     max_turns: None,
                     yolo: false,
                     cwd: ".".into(),
+                    project_id: None,
                     client_type: None,
                 },
                 PromptControl::yolo(false),
@@ -1580,6 +1640,7 @@ mod tests {
             max_turns: None,
             yolo: false,
             cwd: ".".into(),
+            project_id: None,
             client_type: None,
         };
         let (a, b) = tokio::join!(
