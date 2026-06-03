@@ -58,9 +58,59 @@ pub struct LaunchedChrome {
     pub browser: Browser,
 }
 
-/// Launch Chrome via chromiumoxide using our flag set. Spawns the required
-/// CDP event-handler task internally.
+/// Spawn the CDP handler-polling task that keeps a Browser making progress.
+fn spawn_handler(mut handler: chromiumoxide::Handler) {
+    tokio::spawn(async move {
+        while let Some(ev) = handler.next().await {
+            if ev.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// If a Chrome is already running on this profile, return its CDP HTTP endpoint
+/// (e.g. "http://127.0.0.1:NNNN"). Chrome writes the live port to
+/// `<user-data-dir>/DevToolsActivePort` (first line). We verify it actually
+/// responds before trusting it — a stale file from a dead Chrome is common.
+async fn running_cdp_endpoint(cfg: &LaunchConfig) -> Option<String> {
+    let port_file = cfg.profile_dir.join("DevToolsActivePort");
+    let contents = std::fs::read_to_string(&port_file).ok()?;
+    let port: u16 = contents.lines().next()?.trim().parse().ok()?;
+    let url = format!("http://127.0.0.1:{port}");
+    // Probe /json/version — only return the endpoint if Chrome answers.
+    let ok = reqwest::Client::new()
+        .get(format!("{url}/json/version"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    ok.then_some(url)
+}
+
+/// Connect to (attach) or launch Chrome. ATTACH-FIRST: if a Chrome is already
+/// alive on this profile we connect to it over CDP rather than launching a
+/// second instance (which would fail on the profile's SingletonLock). Only when
+/// nothing is running do we launch fresh.
 pub async fn launch(cfg: &LaunchConfig) -> Result<LaunchedChrome, BrowserError> {
+    if let Some(endpoint) = running_cdp_endpoint(cfg).await {
+        match Browser::connect(endpoint.clone()).await {
+            Ok((browser, handler)) => {
+                spawn_handler(handler);
+                tracing::info!(%endpoint, "attached to already-running Chrome");
+                return Ok(LaunchedChrome { browser });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "attach to running Chrome failed; launching fresh");
+            }
+        }
+    }
+    launch_fresh(cfg).await
+}
+
+/// Launch a brand-new Chrome via chromiumoxide using our flag set.
+async fn launch_fresh(cfg: &LaunchConfig) -> Result<LaunchedChrome, BrowserError> {
     // NOTE: chromiumoxide's `.arg()` parses a bare flag (no leading `--`); it
     // adds the dashes itself. And it injects `--disable-extensions` UNLESS you
     // register extensions via `.extension()`, which also emits `--load-extension`.
@@ -98,19 +148,10 @@ pub async fn launch(cfg: &LaunchConfig) -> Result<LaunchedChrome, BrowserError> 
         .build()
         .map_err(|e| BrowserError::Launch(e.to_string()))?;
 
-    let (browser, mut handler) = Browser::launch(config)
+    let (browser, handler) = Browser::launch(config)
         .await
         .map_err(|e| BrowserError::Launch(e.to_string()))?;
-
-    // The handler future must be polled for CDP to make progress.
-    tokio::spawn(async move {
-        while let Some(ev) = handler.next().await {
-            if ev.is_err() {
-                break;
-            }
-        }
-    });
-
+    spawn_handler(handler);
     Ok(LaunchedChrome { browser })
 }
 
