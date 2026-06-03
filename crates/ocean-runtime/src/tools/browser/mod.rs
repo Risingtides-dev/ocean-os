@@ -61,12 +61,19 @@ pub struct BrowserProvider {
 }
 
 impl BrowserProvider {
-    /// Build a provider. `profile_dir` persists logins; `extension_dir` (if it
-    /// exists) preloads the Ocean cockpit extension.
-    pub fn new(profile_dir: PathBuf, extension_dir: Option<PathBuf>) -> Self {
+    /// Build a provider. `profile_dir` is Chrome's user-data dir (point at the
+    /// real Chrome data dir to inherit the user's logins); `profile_directory`
+    /// is the sub-profile (e.g. "Default"); `extension_dir` (if it exists)
+    /// preloads the Ocean cockpit extension.
+    pub fn new(
+        profile_dir: PathBuf,
+        profile_directory: Option<String>,
+        extension_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             cfg: LaunchConfig {
                 profile_dir,
+                profile_directory,
                 extension_dir,
                 headless: false,
                 port: 0,

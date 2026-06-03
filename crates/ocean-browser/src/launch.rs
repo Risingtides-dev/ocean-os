@@ -11,8 +11,12 @@ use crate::error::BrowserError;
 /// Inputs that determine how Chrome is launched.
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
-    /// Persistent profile dir so logins survive restarts.
+    /// Persistent profile dir so logins survive restarts. Point this at the
+    /// user's real Chrome data dir to inherit all existing logins.
     pub profile_dir: PathBuf,
+    /// Chrome's `--profile-directory` (e.g. "Default") — which profile *inside*
+    /// the data dir to use. None lets Chrome pick its default.
+    pub profile_directory: Option<String>,
     /// Unpacked extension to preload (the Ocean cockpit). None in tests/headless.
     pub extension_dir: Option<PathBuf>,
     pub headless: bool,
@@ -29,6 +33,9 @@ impl LaunchConfig {
             "--no-first-run".to_string(),
             "--no-default-browser-check".to_string(),
         ];
+        if let Some(profile) = &self.profile_directory {
+            args.push(format!("--profile-directory={profile}"));
+        }
         if self.headless {
             args.push("--headless=new".to_string());
         }
@@ -52,10 +59,21 @@ pub async fn launch(cfg: &LaunchConfig) -> Result<LaunchedChrome, BrowserError> 
     // NOTE: chromiumoxide's `.arg()` parses a bare flag (no leading `--`); it
     // adds the dashes itself. And it injects `--disable-extensions` UNLESS you
     // register extensions via `.extension()`, which also emits `--load-extension`.
+    //
+    // We `.disable_default_args()` to strip chromiumoxide's automation tells —
+    // notably `enable-automation` (sites like Google detect it and refuse
+    // sign-in) and `disable-sync` (logs the profile out of Chrome sync). Then we
+    // re-add ONLY the harmless flags we actually want.
     let mut builder = BrowserConfig::builder()
         .user_data_dir(&cfg.profile_dir)
+        .disable_default_args()
         .arg("no-first-run")
-        .arg("no-default-browser-check");
+        .arg("no-default-browser-check")
+        // Hides the navigator.webdriver tell so login flows behave normally.
+        .arg("disable-blink-features=AutomationControlled");
+    if let Some(profile) = &cfg.profile_directory {
+        builder = builder.arg(format!("profile-directory={profile}"));
+    }
     if cfg.headless {
         builder = builder.arg("headless=new");
     } else {
@@ -96,6 +114,7 @@ mod tests {
     fn flags_include_profile_and_extension() {
         let cfg = LaunchConfig {
             profile_dir: Path::new("/tmp/ocean-profile").to_path_buf(),
+            profile_directory: None,
             extension_dir: Some(Path::new("/tmp/ocean-ext").to_path_buf()),
             headless: false,
             port: 0,
@@ -105,12 +124,14 @@ mod tests {
         assert!(args.iter().any(|a| a == "--load-extension=/tmp/ocean-ext"));
         assert!(args.iter().any(|a| a.starts_with("--remote-debugging-port=")));
         assert!(!args.iter().any(|a| a == "--headless=new"));
+        assert!(!args.iter().any(|a| a.starts_with("--profile-directory")));
     }
 
     #[test]
     fn headless_adds_flag() {
         let cfg = LaunchConfig {
             profile_dir: Path::new("/tmp/p").to_path_buf(),
+            profile_directory: None,
             extension_dir: None,
             headless: true,
             port: 9333,
@@ -119,5 +140,19 @@ mod tests {
         assert!(args.iter().any(|a| a == "--headless=new"));
         assert!(args.iter().any(|a| a == "--remote-debugging-port=9333"));
         assert!(!args.iter().any(|a| a.starts_with("--load-extension")));
+    }
+
+    #[test]
+    fn flags_include_profile_directory_when_set() {
+        let cfg = LaunchConfig {
+            profile_dir: Path::new("/tmp/real-chrome").to_path_buf(),
+            profile_directory: Some("Default".to_string()),
+            extension_dir: None,
+            headless: false,
+            port: 0,
+        };
+        let args = cfg.to_args();
+        assert!(args.iter().any(|a| a == "--user-data-dir=/tmp/real-chrome"));
+        assert!(args.iter().any(|a| a == "--profile-directory=Default"));
     }
 }

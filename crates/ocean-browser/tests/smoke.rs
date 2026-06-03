@@ -8,6 +8,7 @@ use ocean_browser::{BrowserHandle, LaunchConfig};
 async fn navigate_and_screenshot() {
     let cfg = LaunchConfig {
         profile_dir: std::env::temp_dir().join("ocean-test-profile"),
+        profile_directory: None,
         extension_dir: None,
         headless: true,
         port: 0,
@@ -24,6 +25,7 @@ async fn navigate_and_screenshot() {
 async fn read_page_finds_link() {
     let cfg = LaunchConfig {
         profile_dir: std::env::temp_dir().join("ocean-test-profile2"),
+        profile_directory: None,
         extension_dir: None,
         headless: true,
         port: 0,

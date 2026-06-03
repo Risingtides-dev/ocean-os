@@ -601,15 +601,21 @@ async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
     let mut providers: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
 
     // Browser control. Chrome is launched lazily on the first turn that asks for
-    // tools (see BrowserProvider). The profile persists logins across restarts;
-    // the extension dir, if present, preloads the Ocean cockpit side panel.
-    let browser_profile = config_dir.join("chrome-profile");
+    // tools (see BrowserProvider). We point at the user's REAL Chrome profile so
+    // the agent inherits their existing logins (Google, socials, dashboards) —
+    // overridable via OCEAN_CHROME_USER_DATA_DIR / OCEAN_CHROME_PROFILE. The
+    // extension dir, if present, preloads the Ocean cockpit side panel.
+    let (browser_profile, browser_profile_dir) = resolve_chrome_profile();
     let browser_ext = {
         let p = config_dir.join("chrome-extension");
         p.exists().then_some(p)
     };
     providers.push(Arc::new(
-        ocean_runtime::tools::browser::BrowserProvider::new(browser_profile, browser_ext),
+        ocean_runtime::tools::browser::BrowserProvider::new(
+            browser_profile,
+            browser_profile_dir,
+            browser_ext,
+        ),
     ));
 
     let cfg = match config::DaemonConfig::load(config_dir) {
@@ -646,6 +652,41 @@ async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
     }
 
     CapabilityRegistry::new(providers)
+}
+
+/// Resolve which Chrome profile the browser tools drive. Defaults to the user's
+/// REAL Chrome profile (so the agent inherits existing logins) and the "Default"
+/// sub-profile. Both are overridable by env:
+///   OCEAN_CHROME_USER_DATA_DIR — Chrome --user-data-dir (the data dir)
+///   OCEAN_CHROME_PROFILE       — Chrome --profile-directory (e.g. "Default")
+/// Returns (user_data_dir, Some(profile_directory)).
+fn resolve_chrome_profile() -> (PathBuf, Option<String>) {
+    let data_dir = std::env::var_os("OCEAN_CHROME_USER_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(default_chrome_user_data_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp/ocean-chrome"));
+    let profile = std::env::var("OCEAN_CHROME_PROFILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some("Default".to_string()));
+    (data_dir, profile)
+}
+
+/// The OS-default Chrome user-data dir, if HOME is known.
+fn default_chrome_user_data_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let base = PathBuf::from(home);
+    #[cfg(target_os = "macos")]
+    let p = base
+        .join("Library")
+        .join("Application Support")
+        .join("Google")
+        .join("Chrome");
+    #[cfg(target_os = "linux")]
+    let p = base.join(".config").join("google-chrome");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let p = base.join("chrome");
+    p.exists().then_some(p)
 }
 
 /// Parse `<config_dir>/tools.env` into a name→value map. Best-effort: a missing
@@ -1783,6 +1824,30 @@ Companion repo (separate, non-Rust): github.com/Risingtides-dev/ocean-surface, t
 ## Tools available
 
 read, write, edit (files); ls, glob (filesystem nav); grep (content search); bash (shell with timeout); fetch (HTTP GET); todo_write (track multi-step work).
+
+**Browser control** — you can drive a real Chrome over the DevTools Protocol:
+`browser_navigate` (open a URL), `browser_read_page` (structured read: title, URL,
+visible interactive elements each with a `ref` selector, and visible text),
+`browser_screenshot` (PNG of the page), `browser_click` (by `ref` from read_page,
+OR by `x`/`y` pixel for canvas/video), `browser_type` (type into the focused
+element), `browser_key` (press Enter/Tab/etc.), `browser_scroll`, `browser_eval_js`
+(run JS in the page), `browser_console`, `browser_network`.
+
+## Driving the browser
+
+When the user asks you to do anything on the web — open a site, fill a form, click
+through a flow, scrape a page, check something live — USE THE BROWSER TOOLS. Don't
+answer web tasks from memory; actually drive Chrome and report what you see.
+
+The loop: `browser_navigate` → `browser_read_page` to see what's on the page and
+get element `ref`s → `browser_click {ref}` / `browser_type {text}` / `browser_key`
+to act → `browser_read_page` again to confirm. Prefer `browser_read_page` (cheap,
+precise) over screenshots. Only `browser_screenshot` when the page is visual
+(canvas, video, maps) or `read_page` reports `visual_hint: true` — then click by
+`x`/`y` from what you see. Chrome launches automatically on your first browser
+call and persists logins across turns, so a site you logged into stays logged in.
+Navigation, clicks, typing, keypresses, and eval prompt the user for permission;
+reads and screenshots don't.
 
 ## How to respond
 
