@@ -633,9 +633,14 @@ fn state_from_provider_config(provider_config: ProviderConfig) -> anyhow::Result
         .credential
         .as_ref()
         .map(|credential| credential.secret.expose().to_string());
+    // `provider/model` (e.g. "deepseek/deepseek-v4-pro"). Shows the model, not
+    // just the provider, so a within-provider swap (deepseek-chat →
+    // deepseek-v4-pro) is visible in the readout. Drops the legacy
+    // "ocean-native-" prefix — a relic of the pre-daemon monolith.
     let backend_name = format!(
-        "ocean-native-{}",
-        provider_config.selection.provider.as_str()
+        "{}/{}",
+        provider_config.selection.provider.as_str(),
+        provider_config.selection.model,
     );
     Ok(RuntimeState {
         model,
