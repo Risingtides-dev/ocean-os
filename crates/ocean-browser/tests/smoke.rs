@@ -10,6 +10,7 @@ async fn navigate_and_screenshot() {
         profile_dir: std::env::temp_dir().join("ocean-test-profile"),
         profile_directory: None,
         extension_dir: None,
+        chrome_executable: None,
         headless: true,
         port: 0,
     };
@@ -27,6 +28,7 @@ async fn read_page_finds_link() {
         profile_dir: std::env::temp_dir().join("ocean-test-profile2"),
         profile_directory: None,
         extension_dir: None,
+        chrome_executable: None,
         headless: true,
         port: 0,
     };

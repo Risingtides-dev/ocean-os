@@ -19,6 +19,11 @@ pub struct LaunchConfig {
     pub profile_directory: Option<String>,
     /// Unpacked extension to preload (the Ocean cockpit). None in tests/headless.
     pub extension_dir: Option<PathBuf>,
+    /// Explicit Chrome binary to launch. Set this to Chrome for Testing — current
+    /// stable Chrome (137+) removed `--load-extension`, so the cockpit extension
+    /// will NOT auto-load there; CfT still honors it. None lets chromiumoxide
+    /// auto-detect a system Chrome.
+    pub chrome_executable: Option<PathBuf>,
     pub headless: bool,
     /// 0 lets the OS pick a free port.
     pub port: u16,
@@ -66,7 +71,11 @@ pub async fn launch(cfg: &LaunchConfig) -> Result<LaunchedChrome, BrowserError> 
     // re-add ONLY the harmless flags we actually want.
     let mut builder = BrowserConfig::builder()
         .user_data_dir(&cfg.profile_dir)
-        .disable_default_args()
+        .disable_default_args();
+    if let Some(exe) = &cfg.chrome_executable {
+        builder = builder.chrome_executable(exe);
+    }
+    let mut builder = builder
         .arg("no-first-run")
         .arg("no-default-browser-check")
         // Hides the navigator.webdriver tell so login flows behave normally.
@@ -116,6 +125,7 @@ mod tests {
             profile_dir: Path::new("/tmp/ocean-profile").to_path_buf(),
             profile_directory: None,
             extension_dir: Some(Path::new("/tmp/ocean-ext").to_path_buf()),
+            chrome_executable: None,
             headless: false,
             port: 0,
         };
@@ -133,6 +143,7 @@ mod tests {
             profile_dir: Path::new("/tmp/p").to_path_buf(),
             profile_directory: None,
             extension_dir: None,
+            chrome_executable: None,
             headless: true,
             port: 9333,
         };
@@ -148,6 +159,7 @@ mod tests {
             profile_dir: Path::new("/tmp/real-chrome").to_path_buf(),
             profile_directory: Some("Default".to_string()),
             extension_dir: None,
+            chrome_executable: None,
             headless: false,
             port: 0,
         };

@@ -601,11 +601,14 @@ async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
     let mut providers: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
 
     // Browser control. Chrome is launched lazily on the first turn that asks for
-    // tools (see BrowserProvider). We point at the user's REAL Chrome profile so
-    // the agent inherits their existing logins (Google, socials, dashboards) —
-    // overridable via OCEAN_CHROME_USER_DATA_DIR / OCEAN_CHROME_PROFILE. The
-    // extension dir, if present, preloads the Ocean cockpit side panel.
-    let (browser_profile, browser_profile_dir) = resolve_chrome_profile();
+    // tools (see BrowserProvider). We drive **Chrome for Testing** with its own
+    // dedicated profile (NOT the user's everyday Chrome): current stable Chrome
+    // (137+) removed `--load-extension`, so the Ocean cockpit extension only
+    // auto-loads in CfT — and a dedicated profile means we never conflict with
+    // (or require quitting) the user's running Chrome. The user logs into their
+    // accounts once inside Ocean's CfT; the profile persists them.
+    let chrome_exe = resolve_chrome_for_testing(config_dir);
+    let browser_profile = config_dir.join("chrome-profile");
     let browser_ext = {
         let p = config_dir.join("chrome-extension");
         p.exists().then_some(p)
@@ -613,8 +616,9 @@ async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
     providers.push(Arc::new(
         ocean_runtime::tools::browser::BrowserProvider::new(
             browser_profile,
-            browser_profile_dir,
+            None,
             browser_ext,
+            chrome_exe,
         ),
     ));
 
@@ -654,39 +658,30 @@ async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
     CapabilityRegistry::new(providers)
 }
 
-/// Resolve which Chrome profile the browser tools drive. Defaults to the user's
-/// REAL Chrome profile (so the agent inherits existing logins) and the "Default"
-/// sub-profile. Both are overridable by env:
-///   OCEAN_CHROME_USER_DATA_DIR — Chrome --user-data-dir (the data dir)
-///   OCEAN_CHROME_PROFILE       — Chrome --profile-directory (e.g. "Default")
-/// Returns (user_data_dir, Some(profile_directory)).
-fn resolve_chrome_profile() -> (PathBuf, Option<String>) {
-    let data_dir = std::env::var_os("OCEAN_CHROME_USER_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(default_chrome_user_data_dir)
-        .unwrap_or_else(|| PathBuf::from("/tmp/ocean-chrome"));
-    let profile = std::env::var("OCEAN_CHROME_PROFILE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("Default".to_string()));
-    (data_dir, profile)
-}
-
-/// The OS-default Chrome user-data dir, if HOME is known.
-fn default_chrome_user_data_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let base = PathBuf::from(home);
-    #[cfg(target_os = "macos")]
-    let p = base
-        .join("Library")
-        .join("Application Support")
-        .join("Google")
-        .join("Chrome");
-    #[cfg(target_os = "linux")]
-    let p = base.join(".config").join("google-chrome");
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let p = base.join("chrome");
-    p.exists().then_some(p)
+/// Locate the Chrome for Testing binary the browser tools should drive. Current
+/// stable Chrome removed `--load-extension`, so we need CfT for the cockpit
+/// extension to auto-load. Resolution order:
+///   1. OCEAN_CHROME_EXECUTABLE env (explicit override)
+///   2. `<config_dir>/chrome-for-testing/.../Google Chrome for Testing` (staged)
+///   3. None — chromiumoxide falls back to auto-detecting system Chrome (the
+///      extension won't auto-load there, but navigation/screenshots still work)
+fn resolve_chrome_for_testing(config_dir: &Path) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("OCEAN_CHROME_EXECUTABLE") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let staged = config_dir
+        .join("chrome-for-testing")
+        .join("Google Chrome for Testing.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("Google Chrome for Testing");
+    if staged.exists() {
+        return Some(staged);
+    }
+    None
 }
 
 /// Parse `<config_dir>/tools.env` into a name→value map. Best-effort: a missing

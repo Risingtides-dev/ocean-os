@@ -69,12 +69,14 @@ impl BrowserProvider {
         profile_dir: PathBuf,
         profile_directory: Option<String>,
         extension_dir: Option<PathBuf>,
+        chrome_executable: Option<PathBuf>,
     ) -> Self {
         Self {
             cfg: LaunchConfig {
                 profile_dir,
                 profile_directory,
                 extension_dir,
+                chrome_executable,
                 headless: false,
                 port: 0,
             },
