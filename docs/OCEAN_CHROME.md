@@ -73,3 +73,42 @@ note. When browser work ends it emits `active: false` and focus releases.
 - `browser_read_page` is blind to canvas/video content — use
   `browser_screenshot` + x/y clicks there.
 - One tab at a time (the active page). Multi-tab orchestration is a follow-up.
+
+## Setup snags & gotchas (learned the hard way)
+
+These bit us during first bring-up; documented so they don't again.
+
+- **Config dir is `~/.config/ocean-rs`, not `ocean-rs`'s sibling.** `APP_NAME`
+  is `ocean-rs`, so the extension stages to `~/.config/ocean-rs/chrome-extension`
+  and the (own) profile would be `~/.config/ocean-rs/chrome-profile`.
+- **The daemon is supervised by a launchd agent** (`dev.ocean.ocean-daemon`,
+  submitted ad-hoc via `launchctl submit`, keepalive on, no plist file). It
+  auto-respawns the binary at `target/debug/ocean-daemon`. To pick up a new
+  build: build that debug binary, THEN
+  `launchctl kill TERM gui/$(id -u)/dev.ocean.ocean-daemon`. Build FIRST — the
+  respawn races a slow build and will relaunch the old binary.
+- **Chrome 148 removed `--load-extension`.** Command-line auto-loading of
+  unpacked extensions is gone in current stable Chrome, and the
+  `DisableLoadExtensionCommandLineSwitch` feature flag no longer overrides it.
+  CDP `Extensions.loadUnpacked` is also "Method not available." on 148.
+  Options: (a) load unpacked once manually at `chrome://extensions` (persists in
+  the profile), or (b) drive **Chrome for Testing**, which still honors
+  `--load-extension`.
+- **Extension CSP forbids inline `<script>` and `<style>`.** The side panel must
+  load its wasm init from an external file (`sidepanel.js`), not an inline
+  `<script type="module">`, or it silently never mounts (blank panel). Any CSS
+  must live in a linked stylesheet, never inline.
+- **Side panel needs a `height:100%` fallback chain.** `100dvh` collapses in the
+  side-panel document; `html,body,.ocean-surface { height:100% }` (with the
+  `dvh` rules after, for the PWA tab) makes it fill the panel.
+- **The extension talks straight to the daemon.** In `chrome-extension://`
+  context there's no same-origin proxy, so the surface skips `/api/config` and
+  uses `http://127.0.0.1:4780` directly (detected via `location.protocol`).
+- **Real-profile login conflict.** To inherit the user's logins, the daemon
+  points Chrome at the real Chrome user-data dir + `Default`
+  (`OCEAN_CHROME_USER_DATA_DIR` / `OCEAN_CHROME_PROFILE` override). Chrome will
+  NOT open a profile that another Chrome instance already has open — the user's
+  everyday Chrome must be quit while Ocean drives that profile. Launching with
+  the automation default-args (`enable-automation`) also makes sites refuse
+  sign-in, so we strip them via `disable_default_args()` and add
+  `disable-blink-features=AutomationControlled`.
