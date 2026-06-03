@@ -178,6 +178,9 @@ pub struct ProviderReadiness {
 #[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProviderConfigError {
     UnknownModel { model: String },
+    /// No model was selected anywhere — no `OCEAN_MODEL`, no persisted choice.
+    /// The daemon never picks a model for you; you set it.
+    NoModelSelected,
     MissingBaseUrl { provider: String },
     MissingCredential { provider: String },
     InvalidAuthFile { path: String, message: String },
@@ -187,6 +190,11 @@ impl fmt::Display for ProviderConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownModel { model } => write!(f, "unknown model '{model}'"),
+            Self::NoModelSelected => write!(
+                f,
+                "no model selected — set OCEAN_MODEL or pick one via POST /v1/model \
+                 (the daemon never defaults to a model for you)"
+            ),
             Self::MissingBaseUrl { provider } => {
                 write!(f, "missing base URL for provider {provider}")
             }
@@ -296,7 +304,20 @@ pub fn known_models() -> Vec<KnownModel> {
 
 /// Resolve model selection without reading credential values.
 pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, ProviderConfigError> {
-    let model = normalize_model_id(env.get("OCEAN_MODEL").unwrap_or("deepseek-chat"));
+    // No hardcoded model. The operator's choice flows in as OCEAN_MODEL (set
+    // explicitly, or injected from the persisted last-used selection). A cold
+    // machine with no choice anywhere may set OCEAN_DEFAULT_MODEL in its env —
+    // still config, never code. If nothing is selected, we error rather than
+    // silently pick one for you.
+    let chosen = env
+        .get("OCEAN_MODEL")
+        .or_else(|| env.get("OCEAN_DEFAULT_MODEL"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(chosen) = chosen else {
+        return Err(ProviderConfigError::NoModelSelected);
+    };
+    let model = normalize_model_id(chosen);
     let provider_override = env.get("OCEAN_PROVIDER").map(str::trim);
 
     if let Some(provider) = provider_override {
