@@ -1,0 +1,32 @@
+[package]
+name = "ocean-acp"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+description = "ACP (Agent Client Protocol) bridge — exposes the Ocean daemon to Zed and other ACP editors over stdio."
+
+[[bin]]
+name = "ocean-acp"
+path = "src/main.rs"
+
+[dependencies]
+agent-client-protocol = "0.13"
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = "1"
+clap = { workspace = true }
+futures = "0.3"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+# The daemon wire types (AgentTurnRequest/Response/Event) live in ocean-agent-sdk;
+# reuse them directly so the bridge never drifts from the daemon contract.
+ocean-agent-sdk = { workspace = true }
