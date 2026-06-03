@@ -2603,6 +2603,9 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
                 .into_owned(),
             guidance: None,
             room_id: Some(room_id.to_string()),
+            // The TUI always sends its real cwd, so it never needs a project to
+            // bind correctly — the non-empty cwd wins on the daemon side.
+            project_id: None,
             client_type: Some("tui".into()),
         };
         app.streaming_agent_turn_id = None;
