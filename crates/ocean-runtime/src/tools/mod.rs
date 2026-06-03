@@ -3,6 +3,7 @@
 //! Mirrors the core toolset shipped in `packages/coding-agent/src/core/...`.
 
 pub mod bash;
+pub mod browser;
 pub mod component;
 pub mod edit;
 pub mod glob_tool;

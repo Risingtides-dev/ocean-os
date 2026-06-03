@@ -18,6 +18,13 @@ pub enum ToolSideEffect {
     Unmount {
         id: String,
     },
+    /// Signals the daemon that a browser tool started (`active: true`) or the
+    /// turn's browser work is winding down (`active: false`). The daemon relays
+    /// this onto the SSE bus as `browser-active` / `browser-idle` so the
+    /// extension side panel can auto-focus / release.
+    BrowserActivity {
+        active: bool,
+    },
 }
 
 /// A live result returned from a tool execution.
@@ -194,5 +201,10 @@ pub enum AgentEvent {
     /// The agent wants the client to remove a previously rendered component.
     Unmount {
         id: String,
+    },
+    /// A browser tool started (`active: true`) or browser work wound down
+    /// (`active: false`). Drives the extension side-panel auto-focus handoff.
+    BrowserActivity {
+        active: bool,
     },
 }

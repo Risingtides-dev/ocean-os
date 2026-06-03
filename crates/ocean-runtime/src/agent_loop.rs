@@ -251,6 +251,9 @@ pub async fn run_agent_with_history(
                     ToolSideEffect::Unmount { id } => {
                         emit(&events, AgentEvent::Unmount { id: id.clone() });
                     }
+                    ToolSideEffect::BrowserActivity { active } => {
+                        emit(&events, AgentEvent::BrowserActivity { active: *active });
+                    }
                 }
             }
             // The live SSE display (ToolExecutionEnd above) got the FULL output.
