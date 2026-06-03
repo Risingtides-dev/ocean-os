@@ -377,6 +377,13 @@ pub enum AgentTurnEvent {
         session_id: AgentSessionId,
         component_id: String,
     },
+    /// A browser tool started (`active: true`) or browser work wound down
+    /// (`active: false`). The extension side panel listens for this to
+    /// auto-focus while Ocean drives the browser, and release afterward.
+    BrowserActivity {
+        session_id: AgentSessionId,
+        active: bool,
+    },
     /// Catch-all for unexpected or extension events.  Includes the raw payload.
     Extension { extension: String, payload: Value },
 }

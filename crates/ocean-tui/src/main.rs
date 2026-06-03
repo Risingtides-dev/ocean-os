@@ -3176,6 +3176,14 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
         } => {
             app.push_transcript(format!("component unmounted `{component_id}`"));
         }
+        AgentTurnEvent::BrowserActivity { active, .. } => {
+            // The TUI isn't the browser cockpit; just note the handoff.
+            app.push_transcript(if active {
+                "🌊 Ocean is driving the browser…".to_string()
+            } else {
+                "🌊 browser handoff released".to_string()
+            });
+        }
     }
 }
 
@@ -3725,6 +3733,9 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             session_id: _,
             component_id,
         } => format!("component unmounted {component_id}"),
+        AgentTurnEvent::BrowserActivity { active, .. } => {
+            format!("browser activity: {}", if *active { "active" } else { "idle" })
+        }
     }
 }
 

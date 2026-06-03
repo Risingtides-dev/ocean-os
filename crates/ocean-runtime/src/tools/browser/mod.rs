@@ -8,10 +8,14 @@ pub mod input;
 pub mod nav;
 pub mod perceive;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use ocean_browser::BrowserHandle;
+use async_trait::async_trait;
+use ocean_browser::{BrowserHandle, LaunchConfig};
+use tokio::sync::Mutex;
 
+use crate::capability::{CapabilityProvider, ProviderHealth, SessionContext, SharedTool};
 use crate::types::{AgentTool, AgentToolResult, ToolSideEffect};
 
 /// Shared dependency injected into every browser tool.
@@ -42,4 +46,69 @@ pub fn browser_tools(ctx: BrowserToolCtx) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(inspect::BrowserConsoleTool { ctx: ctx.clone() }),
         Arc::new(inspect::BrowserNetworkTool { ctx }),
     ]
+}
+
+/// Capability provider that lazily launches Chrome the first time a turn asks
+/// for tools, then serves the browser tool suite. The first `tools()` call
+/// pays the launch cost (a few hundred ms); subsequent turns reuse the handle.
+///
+/// If Chrome fails to launch the provider serves **no** tools and logs a
+/// warning — the agent simply won't have browser tools that session, rather
+/// than the daemon failing to start or the turn erroring.
+pub struct BrowserProvider {
+    cfg: LaunchConfig,
+    handle: Mutex<Option<Arc<BrowserHandle>>>,
+}
+
+impl BrowserProvider {
+    /// Build a provider. `profile_dir` persists logins; `extension_dir` (if it
+    /// exists) preloads the Ocean cockpit extension.
+    pub fn new(profile_dir: PathBuf, extension_dir: Option<PathBuf>) -> Self {
+        Self {
+            cfg: LaunchConfig {
+                profile_dir,
+                extension_dir,
+                headless: false,
+                port: 0,
+            },
+            handle: Mutex::new(None),
+        }
+    }
+
+    /// Get-or-launch the shared handle.
+    async fn ensure(&self) -> Option<Arc<BrowserHandle>> {
+        let mut guard = self.handle.lock().await;
+        if let Some(h) = guard.as_ref() {
+            return Some(h.clone());
+        }
+        match BrowserHandle::launch(self.cfg.clone()).await {
+            Ok(h) => {
+                let h = Arc::new(h);
+                *guard = Some(h.clone());
+                Some(h)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "browser launch failed; browser tools unavailable");
+                None
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl CapabilityProvider for BrowserProvider {
+    fn id(&self) -> &str {
+        "browser"
+    }
+
+    async fn tools(&self, _ctx: &SessionContext) -> Vec<SharedTool> {
+        match self.ensure().await {
+            Some(handle) => browser_tools(BrowserToolCtx { handle }),
+            None => Vec::new(),
+        }
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Ready
+    }
 }

@@ -1963,6 +1963,12 @@ async fn agent_turn(
                         component_id: id,
                     });
                 }
+                AgentEvent::BrowserActivity { active } => {
+                    bridge_bus.emit(AgentTurnEvent::BrowserActivity {
+                        session_id: bridge_session_id,
+                        active,
+                    });
+                }
                 _ => {}
             }
         }
@@ -2322,6 +2328,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
         } => None,
         AgentTurnEvent::ComponentRender { .. } => None,
         AgentTurnEvent::ComponentUnmount { .. } => None,
+        AgentTurnEvent::BrowserActivity { .. } => None,
     }
 }
 
@@ -2341,6 +2348,7 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
         } => "extension",
         AgentTurnEvent::ComponentRender { .. } => "component_render",
         AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
+        AgentTurnEvent::BrowserActivity { .. } => "browser_activity",
     }
 }
 

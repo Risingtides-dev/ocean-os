@@ -600,6 +600,18 @@ impl PermissionPolicy for StaticPermissionPolicy {
 async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
     let mut providers: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
 
+    // Browser control. Chrome is launched lazily on the first turn that asks for
+    // tools (see BrowserProvider). The profile persists logins across restarts;
+    // the extension dir, if present, preloads the Ocean cockpit side panel.
+    let browser_profile = config_dir.join("chrome-profile");
+    let browser_ext = {
+        let p = config_dir.join("chrome-extension");
+        p.exists().then_some(p)
+    };
+    providers.push(Arc::new(
+        ocean_runtime::tools::browser::BrowserProvider::new(browser_profile, browser_ext),
+    ));
+
     let cfg = match config::DaemonConfig::load(config_dir) {
         Ok(c) => c,
         Err(e) => {
