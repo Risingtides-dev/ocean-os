@@ -99,9 +99,10 @@ impl AgentRuntime {
     /// preserves every existing caller and test; the daemon upgrades the
     /// registry with `.with_extensions().await` right after construction.
     pub fn from_env() -> anyhow::Result<Self> {
-        let state = build_state_from_env()?;
+        let config_dir = config_dir_from_env();
+        let state = build_state_from_env(&config_dir)?;
         let runtime = Self {
-            config_dir: config_dir_from_env(),
+            config_dir,
             state: Arc::new(RwLock::new(state)),
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -179,6 +180,9 @@ impl AgentRuntime {
             state.provider_config.selection.model.clone(),
         );
         *self.state.write().expect("runtime state poisoned") = state;
+        // Remember this choice so the next daemon start resumes on it instead of
+        // snapping back to a hardcoded default. Last-used wins.
+        persist_last_model(&self.config_dir, &label.1);
         Ok(label)
     }
 
@@ -620,8 +624,26 @@ fn load_tools_env(config_dir: &Path) -> HashMap<String, String> {
     map
 }
 
-/// Resolve a fresh runtime state from the current process env.
-fn build_state_from_env() -> anyhow::Result<RuntimeState> {
+/// Resolve a fresh runtime state at startup. Model precedence:
+///   1. explicit `OCEAN_MODEL` in the env (operator/CI override — always wins),
+///   2. the last model the operator selected via `set_model` (persisted),
+///   3. the provider layer's own fallback (true first run only).
+///
+/// This is why the daemon resumes on whatever you last used instead of snapping
+/// back to a hardcoded model on every restart.
+fn build_state_from_env(config_dir: &std::path::Path) -> anyhow::Result<RuntimeState> {
+    // If OCEAN_MODEL is explicitly set, honor it untouched. Otherwise, if we
+    // have a persisted last-used model, inject it as OCEAN_MODEL so the normal
+    // resolution path picks it up. Only with neither do we hit the provider
+    // default.
+    if std::env::var_os("OCEAN_MODEL").is_none() {
+        if let Some(last) = load_last_model(config_dir) {
+            let mut env = ProviderEnv::from_process();
+            env.vars.insert("OCEAN_MODEL".to_string(), last);
+            let provider_config = resolve_provider_config(&env)?;
+            return state_from_provider_config(provider_config);
+        }
+    }
     let provider_config = resolve_provider_config_from_env()?;
     state_from_provider_config(provider_config)
 }
@@ -688,6 +710,30 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
             }
         }),
     }
+}
+
+/// File under `config_dir` that remembers the last model the operator selected,
+/// so the daemon resumes on it across restarts instead of snapping back to a
+/// hardcoded default.
+const LAST_MODEL_FILE: &str = "last_model";
+
+/// Persist the operator's current model choice (best-effort; a write failure is
+/// logged, never fatal — losing the hint just falls back to the default).
+fn persist_last_model(config_dir: &std::path::Path, model: &str) {
+    let path = config_dir.join(LAST_MODEL_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, model.trim()) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to persist last model");
+    }
+}
+
+/// Read the last persisted model choice, if any. `None` on first run / unreadable.
+fn load_last_model(config_dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(config_dir.join(LAST_MODEL_FILE)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn config_dir_from_env() -> PathBuf {
