@@ -1,0 +1,24 @@
+id = "ocean-site-docs"
+description = "Ocean OS docs-site heartbeat: one small architecture/product docs slice per scheduled run."
+cwd = "/Users/risingtidesdev/dev/ocean-os"
+client_type = "heartbeat-cron"
+session_file = "~/.local/state/ocean-heartbeat/ocean-site-docs.session"
+timeout_seconds = 3300
+
+prompt = '''Heartbeat: resume work on the Ocean OS documentation website in docs/ocean-os-site.
+
+Compaction/handoff is mandatory:
+- First read docs/ocean-os-site/HEARTBEAT_STATE.md. Treat it as the compact durable memory for this project.
+- Do not rely on old chat history being available.
+- At the end of the slice, update docs/ocean-os-site/HEARTBEAT_STATE.md with completed work, files changed, assets captured/queued, gotchas, and next recommended target.
+- Keep HEARTBEAT_STATE.md concise; overwrite stale detail instead of growing forever.
+
+Rules:
+- Work in ONE small slice only. Do not vomit-blast the whole site.
+- Inspect the current site and repo state first.
+- Prefer the next incomplete docs page in this order unless already done: daemon, runtime, protocol/events, Ocean Surface, TUI, CLI/SDK, providers/models, sessions/storage.
+- Ground claims in current repo files and cite paths in the page content where useful.
+- If a surface needs screenshots, only capture what is actually runnable; mark unavailable captures honestly.
+- Do not kill user processes. Do not perform destructive cleanup. Do not rewrite completed pages unless needed for navigation consistency.
+- After edits, launch the edited page in the attached browser and leave a clear file:// URL in the final summary.
+- Keep this as a real paginated architecture/product documentation site, not a one-shot manifesto.'''
