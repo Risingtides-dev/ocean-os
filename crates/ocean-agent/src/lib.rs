@@ -415,6 +415,19 @@ impl AgentRuntime {
         };
         session.bind_workspace(Path::new(&req.cwd));
 
+        // Surface identity (Fixes 1–3). The session remembers the surface it
+        // was last steered from. Detect a switch (e.g. a session started in the
+        // GPUI app, continued from the Chrome extension) so the agent is told,
+        // then record the new surface on the session for next turn / resume.
+        let prev_surface = session.client_type.clone();
+        let surface_switched = match (prev_surface.as_deref(), req.client_type.as_deref()) {
+            (Some(old), Some(new)) => old != new,
+            _ => false,
+        };
+        if req.client_type.is_some() {
+            session.client_type = req.client_type.clone();
+        }
+
         let mut history = session.messages.clone();
         // OpenAI-compatible providers (DeepSeek, OpenAI o-series, xAI, etc.)
         // do not accept assistant `thinking` blocks as input on the next turn —
@@ -431,7 +444,26 @@ impl AgentRuntime {
         ) {
             strip_assistant_thinking_content(&mut history);
         }
-        history.push(Message::user_text(req.prompt));
+        // Per-turn surface flag (Fix 2): every user turn is prefixed with a
+        // canonical `[FLAG]` so the agent always knows which surface this turn
+        // arrived on — robust to session reuse across surfaces (the system
+        // prompt alone isn't, since a resumed session can switch surfaces).
+        // On a detected surface switch (Fix 3), lead with a one-line notice.
+        let user_text = {
+            let flag = system_prompt::surface_flag(req.client_type.as_deref());
+            let mut out = String::new();
+            if surface_switched {
+                let from = system_prompt::surface_flag(prev_surface.as_deref());
+                out.push_str(&format!(
+                    "[surface switch: the user is now messaging you via [{flag}] (was [{from}]). \
+                     Adjust your rendering and tone to this surface.]\n",
+                ));
+            }
+            out.push_str(&format!("[{flag}] "));
+            out.push_str(&req.prompt);
+            out
+        };
+        history.push(Message::user_text(user_text));
 
         let PromptControl {
             permission,
@@ -928,6 +960,13 @@ mod session {
         /// Git short-commit captured at session creation, when in a repo.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub git_commit: Option<String>,
+        /// The client surface this session is currently bound to (the last
+        /// `client_type` seen on a turn). Lets the runtime detect a
+        /// surface switch between turns (Fix 3) and re-inject the right
+        /// surface profile on resume (Fix 5). Old session files predate this
+        /// field and deserialize as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client_type: Option<String>,
     }
 
     impl Session {
@@ -952,6 +991,7 @@ mod session {
                 cwd: None,
                 git_branch: None,
                 git_commit: None,
+                client_type: None,
             }
         }
 
@@ -1515,6 +1555,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
+    #[test]
+    fn session_persists_and_roundtrips_client_type() {
+        let config_dir = temp_config_dir("client-type-roundtrip");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let mut s = session::Session::new(&model);
+        s.bind_workspace(Path::new("."));
+        s.client_type = Some("surface-gpui".into());
+        let id = s.id;
+        session::save(&config_dir, &s).unwrap();
+
+        let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
+        assert_eq!(
+            loaded.client_type.as_deref(),
+            Some("surface-gpui"),
+            "the session must remember which surface it was bound to so a \
+             surface switch can be detected on the next turn"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn legacy_session_without_client_type_loads_as_none() {
+        // A session file written before the client_type field existed must
+        // still deserialize (serde default), not error.
+        let config_dir = temp_config_dir("client-type-legacy");
+        let id = SessionId::new_v4();
+        let bucket = session::sessions_dir(&config_dir).join("legacy");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let legacy = format!(
+            r#"{{"id":"{id}","created_ms":0,"updated_ms":0,"model":"m","provider":"p","messages":[]}}"#
+        );
+        std::fs::write(bucket.join(format!("{id}.json")), legacy).unwrap();
+
+        let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
+        assert!(loaded.client_type.is_none());
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
     #[tokio::test]
     async fn missing_credential_preflight_names_ocean_provider_and_model() {
         let config_dir = temp_config_dir("missing-credential");
@@ -1956,6 +2034,29 @@ Do not use `component_render`, `component_wait`, web widgets, Leptos component a
         )
     }
 
+    /// The Chrome extension side panel. Same Leptos render surface as the web
+    /// PWA (so the full component kit applies), but it is **docked inside the
+    /// user's real Chrome** — which changes how you should think about the
+    /// browser tools.
+    fn extension_surface_prompt(prompt: &str) -> String {
+        format!(
+            "{prompt}\n\n## Current client\n\n\
+You are speaking through the **Ocean cockpit — the Chrome extension side panel \
+docked inside the user's own Chrome window**, not a detached web app. Responses \
+render as HTML with the rich interactive Leptos components, inline images, and \
+live UI described below.\n\n\
+**You are attached to the browser the user is looking at.** When they say \"this \
+page\", \"this video\", \"this profile\", \"here\", or ask what's on screen, they \
+mean the tab currently open next to you in that same Chrome. Your browser tools \
+(`browser_read_page`, `browser_screenshot`, `browser_click`, `browser_navigate`, \
+etc.) act on **that live browser** — so don't answer from memory and don't assume \
+you can't see it. Call `browser_read_page` to read what's actually on the tab \
+before responding about it. Logins and open tabs persist across turns because it \
+is the user's real, signed-in browser session.\n\n\
+{WEB_SURFACE_COMPONENT_PROMPT}\n"
+        )
+    }
+
     fn gpui_surface_prompt(prompt: &str, client_label: &str) -> String {
         format!(
             "{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**.\n\n{GPUI_SURFACE_PROMPT}\n"
@@ -1978,22 +2079,207 @@ Do not use `component_render`, `component_wait`, web widgets, Leptos component a
         )
     }
 
+    /// Canonical surface flag for a `client_type` string. This is the single
+    /// source of truth shared by the per-turn flag stamp (Fix 2), the
+    /// surface-switch notice (Fix 3), and the per-surface profile lookup
+    /// (Fix 5). It is reconciled with the `ocean-agents` surface-profile
+    /// registry: every flag here maps 1:1 to an `assistants/<DIR>` profile
+    /// directory via [`surface_dir`]. Unknown clients get `[?]`.
+    pub fn surface_flag(client_type: Option<&str>) -> &'static str {
+        match client_type {
+            Some("surface-extension") => "BRWSR",
+            Some("tui") => "TUI",
+            Some("surface-web") => "WEB",
+            Some("surface-gpui") | Some("surface-native") => "GUI",
+            Some("cli") => "CLI",
+            Some("leo-voice") => "VOX",
+            Some("acp-zed") => "ACP",
+            Some("surface-slack") => "SLACK",
+            Some("surface-canvas") => "CNVS",
+            Some("surface-mobile") => "MOBL",
+            _ => "?",
+        }
+    }
+
+    /// The `assistants/<DIR>` profile directory name for a `client_type`.
+    /// Mirrors [`surface_flag`] (same labels). When the on-disk
+    /// `assistants/<DIR>/` profile tree lands in `ocean-agents` (Fix 5,
+    /// file-loaded direction), this is the key `build_system_prompt` resolves
+    /// against — preferring the file profile, falling back to the seed const.
+    ///
+    /// TODO(fix5/ocean-agents): once the file-loaded path exists, look up
+    /// `assistants/<surface_dir>/system.md` here and prefer it over the const.
+    /// Also unresolved (parked for John): org file-tree / namespacing so many
+    /// agents can share one surface without their profiles/tools bleeding —
+    /// symlink-vs-resolver for composing agent-dir CLAUDE.md + the surface
+    /// profile in one `load_project_prompt` ancestor-walk.
+    // Wired by Fix 5 (file-loaded profile path); kept now so the taxonomy seam
+    // is a single source of truth and downstream (ocean-agents) can rely on it.
+    #[allow(dead_code)]
+    pub fn surface_dir(client_type: Option<&str>) -> &'static str {
+        surface_flag(client_type)
+    }
+
+    /// Root of the editable per-surface profile tree. ocean-agents owns the
+    /// content (`assistants/<DIR>/system.md`); the daemon only *reads* it at
+    /// turn time so a surface's role/SOPs/limits can be hot-reconfigured
+    /// without a Rust rebuild. Override with `OCEAN_ASSISTANTS_DIR`; default is
+    /// `assistants/` under the Ocean config dir.
+    fn assistants_root() -> Option<PathBuf> {
+        if let Ok(dir) = std::env::var("OCEAN_ASSISTANTS_DIR") {
+            if !dir.is_empty() {
+                return Some(PathBuf::from(dir));
+            }
+        }
+        // Mirror the daemon's config-dir resolution (XDG / ~/.config/ocean-rs).
+        dirs_config_dir().map(|c| c.join("assistants"))
+    }
+
+    fn dirs_config_dir() -> Option<PathBuf> {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("ocean-rs"));
+            }
+        }
+        std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .map(|h| PathBuf::from(h).join(".config").join("ocean-rs"))
+    }
+
+    /// Prefer an on-disk surface profile for this `client_type` over the
+    /// compiled-in const. Returns the file's contents when present and
+    /// non-empty, else `None` (caller falls back to the seed const). This is
+    /// the R2 file-loaded seam — the consts stay as seed + fallback, but the
+    /// editable file wins, enabling hot-reconfigure (ocean-agents).
+    fn load_surface_profile(client_type: Option<&str>) -> Option<String> {
+        load_surface_profile_from(assistants_root()?.as_path(), client_type)
+    }
+
+    /// Inner form that reads from an explicit root — keeps the file-loaded
+    /// logic testable without mutating global env.
+    fn load_surface_profile_from(root: &Path, client_type: Option<&str>) -> Option<String> {
+        let dir = surface_dir(client_type);
+        if dir == "?" {
+            return None;
+        }
+        let path = root.join(dir).join("system.md");
+        let content = std::fs::read_to_string(&path).ok()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     fn append_client_type(prompt: &str, client_type: Option<&str>) -> String {
+        // File-loaded surface profile wins when present (R2 / ocean-agents
+        // hot-reconfigure). Falls through to the seed consts below otherwise.
+        if let Some(profile) = load_surface_profile(client_type) {
+            return format!("{prompt}\n\n## Current client\n\n{profile}\n");
+        }
         match client_type {
             Some("tui") => tui_surface_prompt(prompt),
             Some("surface-web") => web_surface_prompt(prompt, "Ocean Surface (web) — a browser PWA"),
+            Some("surface-extension") => extension_surface_prompt(prompt),
             Some("surface-gpui") => gpui_surface_prompt(prompt, "Ocean GUI (GPUI native desktop)"),
             Some("surface-native") => gpui_surface_prompt(prompt, "Ocean native surface"),
             Some("cli") => cli_surface_prompt(prompt),
             Some("leo-voice") => voice_surface_prompt(prompt),
+            // Slack / Canvas / Mobile are first-class now (ocean-agents R3): the
+            // Slack assistant is being built downstream, so the runtime arms
+            // exist ahead of the inbound path. Content is a stub today (base
+            // prompt + surface label); it evolves into a file-loaded profile.
+            Some("surface-slack") => stub_surface_prompt(prompt, "Slack (Ocean assistant in a Slack workspace)"),
+            Some("surface-canvas") => stub_surface_prompt(prompt, "a Slack Canvas surface"),
+            Some("surface-mobile") => stub_surface_prompt(prompt, "the Ocean mobile app"),
             Some(other) => format!("{prompt}\n\n## Current client\n\nYou are speaking through an unknown client: `{other}`.\n"),
             None => prompt.to_string(),
         }
     }
 
+    /// Minimal per-surface prompt for surfaces whose full profile hasn't been
+    /// authored yet. Seed only — replaced by a file-loaded `assistants/<DIR>`
+    /// profile when Fix 5's file path lands.
+    fn stub_surface_prompt(prompt: &str, client_label: &str) -> String {
+        format!("{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**.\n")
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::build_system_prompt;
+        use super::{
+            build_system_prompt, load_surface_profile_from, surface_dir, surface_flag,
+        };
+        use std::path::Path;
+
+        #[test]
+        fn file_loaded_surface_profile_wins_over_const() {
+            // R2: an on-disk assistants/<DIR>/system.md must override the seed
+            // const so a surface can be reconfigured without a rebuild.
+            let root = std::env::temp_dir().join(format!(
+                "ocean-assistants-test-{}",
+                super::super::SessionId::new_v4()
+            ));
+            let dir = root.join("SLACK");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("system.md"), "CUSTOM SLACK PROFILE FROM FILE").unwrap();
+
+            let loaded = load_surface_profile_from(&root, Some("surface-slack"));
+            assert_eq!(loaded.as_deref(), Some("CUSTOM SLACK PROFILE FROM FILE"));
+
+            // Unknown surface never resolves a file.
+            assert!(load_surface_profile_from(&root, Some("who-knows")).is_none());
+            // Missing file → None (falls back to const).
+            assert!(load_surface_profile_from(&root, Some("tui")).is_none());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn missing_profile_root_falls_back_to_const() {
+            let root = Path::new("/nonexistent/ocean/assistants/root");
+            assert!(load_surface_profile_from(root, Some("surface-slack")).is_none());
+        }
+
+        #[test]
+        fn surface_flag_taxonomy_is_canonical() {
+            // Canonical map reconciled with the ocean-agents surface-profile
+            // registry (addendum R1). These exact labels are load-bearing —
+            // downstream keys its assistants/<DIR> tree against them, so a
+            // rename here is a cross-repo break.
+            assert_eq!(surface_flag(Some("surface-extension")), "BRWSR");
+            assert_eq!(surface_flag(Some("tui")), "TUI");
+            assert_eq!(surface_flag(Some("surface-web")), "WEB");
+            assert_eq!(surface_flag(Some("surface-gpui")), "GUI");
+            assert_eq!(surface_flag(Some("surface-native")), "GUI");
+            assert_eq!(surface_flag(Some("cli")), "CLI");
+            assert_eq!(surface_flag(Some("leo-voice")), "VOX");
+            assert_eq!(surface_flag(Some("acp-zed")), "ACP");
+            // Slack / Canvas / Mobile are first-class now (R3), not future.
+            assert_eq!(surface_flag(Some("surface-slack")), "SLACK");
+            assert_eq!(surface_flag(Some("surface-canvas")), "CNVS");
+            assert_eq!(surface_flag(Some("surface-mobile")), "MOBL");
+            // Unknown / absent → sentinel, never a panic.
+            assert_eq!(surface_flag(Some("who-knows")), "?");
+            assert_eq!(surface_flag(None), "?");
+            // surface_dir mirrors surface_flag (same labels, one source).
+            assert_eq!(surface_dir(Some("surface-slack")), "SLACK");
+        }
+
+        #[test]
+        fn slack_and_canvas_have_real_arms_not_unknown_fallthrough() {
+            // R3: the runtime must recognize these surfaces ahead of the
+            // inbound path, so they don't resolve to "unknown client".
+            for ct in ["surface-slack", "surface-canvas", "surface-mobile"] {
+                let prompt = build_system_prompt(None, Some(ct));
+                assert!(
+                    !prompt.contains("unknown client"),
+                    "{ct} must have a real surface arm, not the fallthrough"
+                );
+                assert!(prompt.contains("## Current client"));
+            }
+        }
 
         #[test]
         fn web_surface_gets_leptos_component_guidance() {
@@ -2002,6 +2288,22 @@ Do not use `component_render`, `component_wait`, web widgets, Leptos component a
             assert!(prompt.contains("Leptos components"));
             assert!(prompt.contains("component_render"));
             assert!(prompt.contains("Responses render as HTML"));
+        }
+
+        #[test]
+        fn extension_surface_knows_it_is_docked_in_chrome() {
+            let prompt = build_system_prompt(None, Some("surface-extension"));
+
+            // Same rich component surface as the web PWA…
+            assert!(prompt.contains("Leptos components"));
+            assert!(prompt.contains("component_render"));
+            // …but it must know it's the in-Chrome side panel attached to the
+            // user's real browser, not a detached web app.
+            assert!(prompt.contains("Chrome extension side panel"));
+            assert!(prompt.contains("attached to the browser the user is looking at"));
+            assert!(prompt.contains("browser_read_page"));
+            // It must NOT claim to be a browser PWA like surface-web does.
+            assert!(!prompt.contains("a browser PWA"));
         }
 
         #[test]

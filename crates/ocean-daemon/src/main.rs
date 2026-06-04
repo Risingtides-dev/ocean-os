@@ -2153,12 +2153,38 @@ async fn component_event(
     }
 }
 
+#[derive(Debug, serde::Deserialize, Default)]
+struct AgentEventsQuery {
+    /// When set, the SSE stream only delivers events for this session. Without
+    /// it the stream is the legacy global firehose (every session's events).
+    /// This is the server-side floor for the cross-surface bleed: the GPUI app
+    /// and the Chrome extension subscribe scoped to their own session id and no
+    /// longer interleave each other's transcript.
+    #[serde(default)]
+    session_id: Option<AgentSessionId>,
+}
+
 async fn agent_events(
     State(state): State<AppState>,
+    Query(q): Query<AgentEventsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let want = q.session_id;
     let stream =
-        BroadcastStream::new(state.agent_events.subscribe()).filter_map(|event| match event {
+        BroadcastStream::new(state.agent_events.subscribe()).filter_map(move |event| match event {
             Ok(envelope) => {
+                // Scope to the requested session when one was given. Events that
+                // carry no session_id (e.g. Extension) always pass through —
+                // they aren't session-scoped. Every session-bearing event is
+                // dropped unless it matches; SessionCreated/TurnStarted carry
+                // their own id, so a client that already knows its session id
+                // still receives its own adoption events.
+                if let Some(want) = want {
+                    if let Some(sid) = envelope.event.session_id() {
+                        if sid != want {
+                            return None;
+                        }
+                    }
+                }
                 let id = envelope.id.to_string();
                 let event_type = agent_event_type_name(&envelope.event);
                 let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {

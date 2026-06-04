@@ -388,6 +388,30 @@ pub enum AgentTurnEvent {
     Extension { extension: String, payload: Value },
 }
 
+impl AgentTurnEvent {
+    /// The session this event belongs to, when it carries one. `Extension`
+    /// events have no session and return `None`. The daemon's SSE handler uses
+    /// this to scope a per-subscriber stream to a single session so two
+    /// concurrent sessions (e.g. the GPUI app and the Chrome extension) don't
+    /// interleave their output into each other's transcript.
+    pub fn session_id(&self) -> Option<AgentSessionId> {
+        match self {
+            AgentTurnEvent::TurnStarted { session_id, .. }
+            | AgentTurnEvent::AssistantTextDelta { session_id, .. }
+            | AgentTurnEvent::ThinkingDelta { session_id, .. }
+            | AgentTurnEvent::ToolCallStarted { session_id, .. }
+            | AgentTurnEvent::ToolCallChunk { session_id, .. }
+            | AgentTurnEvent::ToolCallFinished { session_id, .. }
+            | AgentTurnEvent::TurnFinished { session_id, .. }
+            | AgentTurnEvent::SessionCreated { session_id, .. }
+            | AgentTurnEvent::ComponentRender { session_id, .. }
+            | AgentTurnEvent::ComponentUnmount { session_id, .. }
+            | AgentTurnEvent::BrowserActivity { session_id, .. } => Some(*session_id),
+            AgentTurnEvent::Extension { .. } => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Longhouse — non-hierarchical multi-agent coordination (the "underwater
 // building" deck renders these). LonghouseEvents ride inside
@@ -670,6 +694,33 @@ mod tests {
     }
 
     #[test]
+    fn session_id_accessor_extracts_session_for_filtering() {
+        // The daemon's per-session SSE filter relies on this accessor. A
+        // session-bearing event returns its id; Extension (no session) returns
+        // None and therefore always passes the filter.
+        let sid = AgentSessionId::new_v4();
+        let started = AgentTurnEvent::TurnStarted {
+            turn_id: AgentTurnId::new_v4(),
+            session_id: sid,
+            model: None,
+        };
+        assert_eq!(started.session_id(), Some(sid));
+
+        let delta = AgentTurnEvent::AssistantTextDelta {
+            session_id: sid,
+            turn_id: AgentTurnId::new_v4(),
+            delta: "hi".into(),
+        };
+        assert_eq!(delta.session_id(), Some(sid));
+
+        let ext = AgentTurnEvent::Extension {
+            extension: "longhouse".into(),
+            payload: serde_json::json!({}),
+        };
+        assert_eq!(ext.session_id(), None);
+    }
+
+    #[test]
     fn longhouse_event_rides_extension_and_round_trips() {
         let topic = Uuid::new_v4();
         let ev = LonghouseEvent::TopicConvened {
@@ -736,6 +787,7 @@ mod tests {
             cwd: "/home/user/project".into(),
             guidance: Some(vec!["be concise".into()]),
             room_id: Some("pm".into()),
+            project_id: None,
             client_type: Some("surface-web".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
