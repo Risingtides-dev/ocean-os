@@ -38,9 +38,67 @@ For a different bind address:
 OCEAN_BIND=127.0.0.1:4781 cargo run -p ocean-daemon
 ```
 
-Keep `OCEAN_BIND` loopback-only unless the operator has explicitly approved remote exposure and a security layer. The current daemon permits broad CORS and should be treated as local-only.
+Keep `OCEAN_BIND` loopback-only unless the operator has explicitly approved remote exposure and a security layer. CORS is now restricted to a localhost whitelist by default (see [Trust boundary](#trust-boundary-permissions--cors)); the daemon should still be treated as local-only.
 
 ## Configuration
+
+### Trust boundary: permissions & CORS
+
+The daemon is a local trust boundary. Two env vars control how strict it is.
+**Both default to the safe setting** — you only set them to loosen the daemon.
+
+#### `OCEAN_YOLO` — per-tool permission gating (OCEAN-51)
+
+By default (`OCEAN_YOLO` unset), the product agent-turn path
+(`POST /v1/agent/turns` and the `POST /v1/agent/voice` wrapper) **gates every
+mutating tool call** through the permission machinery: the daemon emits a
+`permission_request` event and the turn blocks until an operator allows or denies
+it via `POST /v1/permissions/{id}/decision` (the TUI does this with `Shift-Y` /
+`Shift-N`).
+
+```bash
+# Default: gated. Mutating tools require approval.
+cargo run -p ocean-daemon
+
+# Opt in to fire-and-forget for trusted automation. Every tool auto-approved.
+OCEAN_YOLO=1 cargo run -p ocean-daemon
+```
+
+Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Anything
+else (including unset) keeps gating **on**.
+
+> ⚠️ **Behavior change.** Before this fix, `/v1/agent/turns` hardcoded yolo mode,
+> so the permission machinery was dead for every shipped surface. Now it is live
+> by default. A surface that issues mutating tools (write/edit/bash) but has no
+> approval UI will see those turns **stall waiting for a decision**. If a surface
+> isn't ready to handle approvals yet, run the daemon with `OCEAN_YOLO=1`
+> (trusted/local automation only) until that surface ships an approval flow.
+> Read-only turns are unaffected.
+
+#### `OCEAN_ALLOWED_ORIGINS` — CORS whitelist (OCEAN-53)
+
+The daemon previously reflected **any** browser origin (`Access-Control-Allow-Origin: *`),
+letting any web page the operator visited drive the local daemon cross-origin.
+It now only accepts:
+
+- Loopback web origins on **any** port — `http(s)://localhost`, `http(s)://127.0.0.1`,
+  `http(s)://[::1]` (covers `trunk serve` :8080, vite :5173, the surface proxy
+  :8790, and the daemon itself).
+- `chrome-extension://…` origins — the Ocean side-panel runs from a per-install
+  extension id and already declares the daemon in its MV3 `host_permissions`.
+- Anything listed in `OCEAN_ALLOWED_ORIGINS` (comma-separated, exact match,
+  trailing slash optional) — e.g. a tunnel hostname for phone access.
+
+```bash
+# Add a tunnel/host origin for remote (e.g. phone-over-tunnel) access:
+OCEAN_ALLOWED_ORIGINS="https://ocean.mytunnel.dev,https://app.example.com" \
+  cargo run -p ocean-daemon
+```
+
+The surface **proxy** and the **native GPUI** client are server-side / native
+HTTP callers and never send a browser `Origin`, so CORS does not gate them — only
+direct browser-to-daemon calls (the PWA pointed straight at `:4780`, and the
+Chrome extension) are affected.
 
 ### Daemon URL for clients
 

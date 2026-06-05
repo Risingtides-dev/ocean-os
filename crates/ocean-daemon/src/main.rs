@@ -11,7 +11,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
@@ -50,7 +50,7 @@ use tokio_stream::{
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
 use uuid::Uuid;
@@ -303,6 +303,87 @@ impl AgentEventBus {
     }
 }
 
+/// OCEAN-51: whether the daemon runs the product agent-turn path
+/// (`POST /v1/agent/turns`, and the voice wrapper) in "yolo" mode — every tool
+/// auto-approved, no per-tool permission gating.
+///
+/// Default is `false`: tool calls are gated by `DaemonPermissionPolicy` exactly
+/// as the permission machinery was designed, and a mutating tool will emit a
+/// `PermissionRequest` event and block until an operator decision arrives via
+/// `POST /v1/permissions/{id}/decision`.
+///
+/// Set `OCEAN_YOLO=1` (or `true`/`yes`/`on`) to restore the previous
+/// fire-and-forget behavior for trusted automation. This is the documented,
+/// explicit operator opt-in — the bypass is NEVER the silent default.
+///
+/// Read fresh on each turn (not cached) so an operator can flip it by restarting
+/// with a different env without code changes, and so tests can scope it.
+fn yolo_enabled() -> bool {
+    matches!(
+        env::var("OCEAN_YOLO")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Parse a comma-separated `OCEAN_ALLOWED_ORIGINS` list into normalized origins.
+/// Whitespace is trimmed, empty entries dropped, and a trailing slash removed so
+/// `https://app.example.com/` and `https://app.example.com` both match the
+/// browser-sent `Origin` header (which never has a trailing slash).
+fn parse_allowed_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// CORS gate (OCEAN-53). Returns true for origins the daemon trusts:
+///
+/// 1. Loopback web origins on any port: `http://localhost:*`,
+///    `http://127.0.0.1:*`, `http://[::1]:*` (and their `https` forms). This
+///    covers the browser PWA however it's served (`trunk serve` :8080, vite
+///    :5173, the surface proxy :8790) without hardcoding ports.
+/// 2. Any `chrome-extension://...` origin — the Ocean side-panel extension runs
+///    from a per-install id we can't enumerate, and it already declares the
+///    daemon in its MV3 `host_permissions`/CSP `connect-src`.
+/// 3. Exact matches against operator-configured `OCEAN_ALLOWED_ORIGINS` (e.g. a
+///    tunnel hostname for phone access).
+///
+/// Everything else (arbitrary public web pages) is rejected.
+fn is_trusted_origin(origin: &HeaderValue, extra: &[String]) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    is_loopback_origin(origin)
+        || origin.starts_with("chrome-extension://")
+        || extra.iter().any(|allowed| allowed == origin)
+}
+
+/// True for `http(s)://localhost|127.0.0.1|[::1]` with any (or no) port. Matches
+/// only the exact loopback hosts — `localhost.evil.com` and
+/// `127.0.0.1.evil.com` do NOT match because the host segment must end right
+/// after the loopback name (`:` for a port, or end-of-string).
+fn is_loopback_origin(origin: &str) -> bool {
+    let host = match origin.strip_prefix("http://") {
+        Some(rest) => rest,
+        None => match origin.strip_prefix("https://") {
+            Some(rest) => rest,
+            None => return false,
+        },
+    };
+    // Strip the port (everything after the first ':'), if present. IPv6 `[::1]`
+    // is handled explicitly below since it contains its own colons in brackets.
+    if let Some(rest) = host.strip_prefix("[::1]") {
+        return rest.is_empty() || rest.starts_with(':');
+    }
+    let host_only = host.split(':').next().unwrap_or(host);
+    host_only == "localhost" || host_only == "127.0.0.1"
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -344,10 +425,29 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // OCEAN-53: the daemon is a local trust boundary; reflecting any origin
+    // (`allow_origin(Any)`) let any web page in the operator's browser drive it
+    // cross-origin. We restrict to a safe localhost set plus operator-configured
+    // extras (`OCEAN_ALLOWED_ORIGINS`). See `cors_allowed_origins`.
+    //
+    // Why a predicate (and not a fixed list): the browser PWA can be served from
+    // any loopback port (`trunk serve` → :8080, vite → :5173, the proxy → :8790)
+    // and the Chrome side-panel runs from a per-install `chrome-extension://<id>`
+    // origin we can't enumerate ahead of time. `is_trusted_origin` matches those
+    // classes by shape, so we don't have to hardcode every port. The proxy and
+    // native GPUI client are server-side/native HTTP callers and never send a
+    // browser `Origin`, so CORS does not gate them at all.
+    let extra_origins = env::var("OCEAN_ALLOWED_ORIGINS").unwrap_or_default();
+    let extra_origins: Vec<String> = parse_allowed_origins(&extra_origins);
+    if !extra_origins.is_empty() {
+        tracing::info!(origins = ?extra_origins, "OCEAN_ALLOWED_ORIGINS: extra CORS origins");
+    }
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(move |origin, _req| {
+            is_trusted_origin(origin, &extra_origins)
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers(Any);
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
         .route("/", get(root))
@@ -3049,6 +3149,13 @@ async fn agent_turn(
         },
     );
 
+    // OCEAN-51: permission gating is ON by default. Previously this path
+    // hardcoded `yolo: true`, auto-approving every tool call and making the
+    // entire per-tool permission machinery dead code for the shipped product
+    // surfaces. Now the mode is operator-controlled via `OCEAN_YOLO` (default
+    // off → real gating). The bypass is opt-in, not the silent default.
+    let yolo = yolo_enabled();
+
     let guided_prompt = apply_room_guidance(room_id, &prompt);
     let mut prompt_req = PromptRequest {
         prompt: guided_prompt,
@@ -3059,7 +3166,7 @@ async fn agent_turn(
         // rather than silently forking a fresh transcript under the same id.
         create_if_missing: is_new_session,
         max_turns: None,
-        yolo: true,
+        yolo,
         cwd,
         project_id,
         client_type,
@@ -3206,8 +3313,10 @@ async fn agent_turn(
         }
     });
 
+    // Same `yolo` flag drives the permission policy: `false` (default) builds a
+    // gating `DaemonPermissionPolicy`; `true` builds the auto-allow policy.
     let control =
-        build_prompt_control(&state, request_id, Some(core_sid(session_id)), true, cancel)
+        build_prompt_control(&state, request_id, Some(core_sid(session_id)), yolo, cancel)
             .with_event_sink(event_tx)
             // Per-turn reasoning override (OCEAN-28/41): threads the optional
             // request `thinking_level` into this turn's config only, leaving the
@@ -4538,6 +4647,7 @@ mod tests {
         assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
     }
 
+
     // --- OCEAN-52/55: session↔workspace binding + traversal guard -----------
 
     #[test]
@@ -4627,5 +4737,163 @@ mod tests {
         // A literal dir literally named "..something" is not a parent ref.
         assert!(!cwd_has_traversal("/a/..b/c"));
         assert!(!cwd_has_traversal("/work/repo"));
+    }
+
+    // --- OCEAN-51: permission gating on by default, opt-in yolo --------------
+
+    fn gating_policy(allow_mutating: bool) -> DaemonPermissionPolicy {
+        DaemonPermissionPolicy {
+            allow_mutating,
+            request_id: RequestId::new_v4(),
+            session_id: None,
+            events: EventBus::new(16),
+            permissions: Arc::new(RwLock::new(HashMap::new())),
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            cancel: CancellationToken::new(),
+            seen_permissions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Default mode (allow_mutating = false): a tool call must NOT auto-allow.
+    /// `check` blocks waiting on an operator decision, so a bounded wait must
+    /// time out rather than returning a decision. This proves the per-tool
+    /// gating machinery is live (the bug was that it was dead — auto-allowed).
+    #[tokio::test]
+    async fn permission_gating_on_by_default_blocks_until_decision() {
+        let policy = gating_policy(false);
+        let args = json!({"path": "src/lib.rs"});
+        let check = policy.check("write", &args);
+        let timed =
+            tokio::time::timeout(std::time::Duration::from_millis(150), check).await;
+        assert!(
+            timed.is_err(),
+            "default gating must suspend on a permission decision, not auto-allow"
+        );
+
+        // And it must have registered a pending permission + emitted a request,
+        // i.e. the gating path actually ran (not a silent allow).
+        assert_eq!(
+            policy.permissions.read().await.len(),
+            1,
+            "a pending permission waiter must be registered while gated"
+        );
+    }
+
+    /// Opt-in yolo (allow_mutating = true) restores fire-and-forget: every tool
+    /// call resolves to Allow immediately, no waiter, no blocking.
+    #[tokio::test]
+    async fn permission_yolo_opt_in_auto_allows() {
+        let policy = gating_policy(true);
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            policy.check("write", &json!({"path": "src/lib.rs"})),
+        )
+        .await
+        .expect("yolo mode must resolve immediately");
+        assert!(
+            matches!(decision, AgentPermissionDecision::Allow),
+            "yolo mode auto-allows mutating tools"
+        );
+        assert_eq!(
+            policy.permissions.read().await.len(),
+            0,
+            "yolo mode registers no permission waiter"
+        );
+    }
+
+    /// `OCEAN_YOLO` parsing: default/empty/garbage = gated (false); the
+    /// documented truthy spellings = bypass (true). This is the operator opt-in
+    /// switch; it must default safe.
+    #[test]
+    fn ocean_yolo_env_defaults_off_and_opts_in_explicitly() {
+        // Serialize env mutation within this test; restore the prior value.
+        let prior = env::var("OCEAN_YOLO").ok();
+
+        env::remove_var("OCEAN_YOLO");
+        assert!(!yolo_enabled(), "unset OCEAN_YOLO must gate (default off)");
+
+        for off in ["", "0", "false", "no", "off", "nonsense"] {
+            env::set_var("OCEAN_YOLO", off);
+            assert!(!yolo_enabled(), "OCEAN_YOLO={off:?} must stay gated");
+        }
+        for on in ["1", "true", "TRUE", "Yes", "on"] {
+            env::set_var("OCEAN_YOLO", on);
+            assert!(yolo_enabled(), "OCEAN_YOLO={on:?} must opt into bypass");
+        }
+
+        match prior {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+    }
+
+    // --- OCEAN-53: CORS origin whitelist ------------------------------------
+
+    fn origin(s: &str) -> HeaderValue {
+        HeaderValue::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn cors_allows_localhost_on_any_port() {
+        let extra: Vec<String> = vec![];
+        for o in [
+            "http://localhost:8080",  // trunk serve (PWA)
+            "http://localhost:5173",  // vite (canvas-web)
+            "http://127.0.0.1:8790",  // surface proxy
+            "http://127.0.0.1:4780",  // daemon itself
+            "https://localhost:3000", // https loopback
+            "http://[::1]:8080",      // ipv6 loopback
+            "http://localhost",       // no explicit port
+        ] {
+            assert!(
+                is_trusted_origin(&origin(o), &extra),
+                "loopback origin {o} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_allows_chrome_extension_origin() {
+        let extra: Vec<String> = vec![];
+        assert!(
+            is_trusted_origin(&origin("chrome-extension://abcdefghijklmnop"), &extra),
+            "the Ocean side-panel extension origin must be allowed"
+        );
+    }
+
+    #[test]
+    fn cors_allows_configured_extra_origins() {
+        let extra = parse_allowed_origins("https://ocean.example.com, https://tunnel.test/");
+        assert!(is_trusted_origin(
+            &origin("https://ocean.example.com"),
+            &extra
+        ));
+        // trailing slash in config is normalized away to match the Origin header
+        assert!(is_trusted_origin(&origin("https://tunnel.test"), &extra));
+    }
+
+    #[test]
+    fn cors_rejects_untrusted_public_origins() {
+        let extra = parse_allowed_origins("https://ocean.example.com");
+        for o in [
+            "https://evil.com",
+            "http://localhost.evil.com",   // not a real loopback host
+            "http://127.0.0.1.evil.com",   // not a real loopback host
+            "https://notlocalhost",        // unrelated
+            "http://ocean.example.com",    // http when only https was allowed
+        ] {
+            assert!(
+                !is_trusted_origin(&origin(o), &extra),
+                "untrusted origin {o} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_allowed_origins_trims_and_drops_empties() {
+        let parsed = parse_allowed_origins("  https://a.com ,, https://b.com/ ,  ");
+        assert_eq!(parsed, vec!["https://a.com", "https://b.com"]);
+        assert!(parse_allowed_origins("").is_empty());
+        assert!(parse_allowed_origins("   ,  , ").is_empty());
     }
 }
