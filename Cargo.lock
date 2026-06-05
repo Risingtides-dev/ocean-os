@@ -1746,6 +1746,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-heartbeat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "ocean-longhouse"
 version = "0.1.0"
 dependencies = [

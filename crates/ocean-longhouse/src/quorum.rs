@@ -9,9 +9,10 @@
 //! Properties it implements, all from `docs/LONGHOUSE_ORCHESTRATION.md` §5:
 //!
 //! * **Credential-weighted tallies (C1).** Each real agent contributes *one*
-//!   weight toward any given proposal. A chatty agent that posts 100
-//!   endorsements still counts as one credential — the engine keeps only an
-//!   agent's most recent stance per proposal.
+//!   weight across the *whole field* — one live stance per agent, latest wins.
+//!   A chatty agent that posts 100 endorsements still counts as one credential,
+//!   and an agent that endorses A then switches to B no longer counts toward A:
+//!   posting a stance clears that agent's prior stance on any other proposal.
 //! * **Cross-inhibition (T2).** `endorse` marks add net weight; `inhibit` marks
 //!   subtract it. Two rival proposals actively suppress each other so a
 //!   symmetric split cannot silently "win".
@@ -136,8 +137,11 @@ impl Stance {
 /// One proposal's accumulated state.
 #[derive(Debug, Default, Clone)]
 struct ProposalState {
-    /// Most-recent stance per author — this is the credential-weighting rule:
-    /// one stance per real agent, latest wins. Author is the agent's stable id.
+    /// Most-recent stance per author *on this proposal*. The credential rule is
+    /// stronger than per-proposal, though: an author holds only one live stance
+    /// across the entire field (see [`QuorumEngine::clear_author_elsewhere`]),
+    /// so the same id never appears in two `ProposalState`s at once. Author is
+    /// the agent's stable id.
     stances: HashMap<Uuid, Stance>,
     /// Author who proposed it (also counts as the proposer's implicit endorse).
     proposer: Uuid,
@@ -204,14 +208,21 @@ impl QuorumEngine {
     pub fn propose(&mut self, proposal: Uuid, author: Uuid, now_ms: i64) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let entry = self
-            .proposals
+        self.proposals
             .entry(proposal)
             .or_insert_with(|| ProposalState {
                 proposer: author,
                 seq,
                 ..Default::default()
             });
+        // One stance per real agent, latest wins across the *whole* field: a
+        // proposal is also the proposer's implicit endorse, so clear any prior
+        // stance this author held on a different proposal first.
+        self.clear_author_elsewhere(author, proposal);
+        let entry = self
+            .proposals
+            .get_mut(&proposal)
+            .expect("proposal just inserted");
         // The proposer counts as one endorsing credential.
         entry.stances.insert(
             author,
@@ -220,6 +231,20 @@ impl QuorumEngine {
                 at_ms: now_ms,
             },
         );
+    }
+
+    /// Remove this author's stance from every proposal *except* `keep`. Enforces
+    /// the "one stance per real agent, latest wins across the field" rule: when
+    /// an agent switches its target (endorse A, then endorse/inhibit B), the
+    /// stale mark on the old proposal must not keep contributing the agent's
+    /// credential weight, or the agent is counted multiple times across the
+    /// field and quorum converges on inflated/stale support.
+    fn clear_author_elsewhere(&mut self, author: Uuid, keep: Uuid) {
+        for (id, state) in self.proposals.iter_mut() {
+            if *id != keep {
+                state.stances.remove(&author);
+            }
+        }
     }
 
     /// Record an endorsement of `proposal` by `author` with `weight` (default
@@ -252,6 +277,14 @@ impl QuorumEngine {
         if entry.seq == seq {
             self.next_seq += 1;
         }
+        // One stance per real agent, latest wins across the *whole* field: drop
+        // any prior stance this author held on another proposal so its decayed
+        // weight stops counting once the agent moves its support/inhibition.
+        self.clear_author_elsewhere(author, proposal);
+        let entry = self
+            .proposals
+            .get_mut(&proposal)
+            .expect("proposal just inserted");
         entry.stances.insert(
             author,
             Stance {
@@ -615,6 +648,75 @@ mod tests {
             "proposer(1) + one spammer credential(1) = 2.0, got {net}"
         );
         assert!(!eng.is_converged(), "two credentials < cutoff 5.0");
+    }
+
+    // Regression for the PR #33 review: an agent that endorses proposal A and
+    // then later endorses/inhibits proposal B must be counted only ONCE across
+    // the field — its prior stance on A must be cleared, not left contributing
+    // its credential weight to both proposals. "One stance per real agent,
+    // latest wins" applies field-wide, not per-proposal.
+    #[test]
+    fn agent_switching_proposals_drops_prior_stance() {
+        let mut eng = QuorumEngine::new(QuorumConfig {
+            rule: QuorumRule::NetWeight {
+                cutoff: 2.0,
+                margin: 1.0,
+            },
+            mark_ttl_ms: 60_000,
+            tie_break_seed: 1,
+        });
+        let (pa, pb) = (uid(1), uid(2));
+        // Distinct proposers so A and B each have a standing credential that is
+        // NOT the switching worker, isolating the worker's single moving stance.
+        let (pa_author, pb_author) = (uid(10), uid(20));
+        let worker = uid(50);
+        let t = 0;
+
+        eng.propose(pa, pa_author, t); // A net = 1.0 (pa_author)
+        eng.propose(pb, pb_author, t); // B net = 1.0 (pb_author)
+
+        // Round 2: the worker endorses A. A should now be 2.0, B still 1.0.
+        eng.endorse(pa, worker, None, t);
+        {
+            let tallies = eng.tallies(t);
+            let net_a = tallies.iter().find(|x| x.proposal == pa).unwrap().net_weight;
+            let net_b = tallies.iter().find(|x| x.proposal == pb).unwrap().net_weight;
+            assert!((net_a - 2.0).abs() < 1e-3, "A should be 2.0 after worker endorse, got {net_a}");
+            assert!((net_b - 1.0).abs() < 1e-3, "B should still be 1.0, got {net_b}");
+        }
+
+        // Later round: the same worker switches its support to B (endorse B).
+        // The BUG: without clearing, the worker's stance on A would remain, so A
+        // stays at 2.0 AND B climbs to 2.0 — the worker is credential-counted on
+        // both proposals at once. Correct behaviour: A drops back to 1.0 (only
+        // pa_author left) and B rises to 2.0 (pb_author + worker).
+        eng.endorse(pb, worker, None, t);
+        let tallies = eng.tallies(t);
+        let net_a = tallies.iter().find(|x| x.proposal == pa).unwrap().net_weight;
+        let net_b = tallies.iter().find(|x| x.proposal == pb).unwrap().net_weight;
+        assert!(
+            (net_a - 1.0).abs() < 1e-3,
+            "A must drop to 1.0 once the worker leaves it; got {net_a} (double-counting bug)"
+        );
+        assert!(
+            (net_b - 2.0).abs() < 1e-3,
+            "B should be 2.0 (pb_author + worker), got {net_b}"
+        );
+
+        // Same must hold when the switch is an *inhibit* on the new proposal:
+        // the worker's prior endorse on B must go, leaving B at pb_author - worker.
+        eng.inhibit(pa, worker, None, t); // worker now inhibits A
+        let tallies = eng.tallies(t);
+        let net_a = tallies.iter().find(|x| x.proposal == pa).unwrap().net_weight;
+        let net_b = tallies.iter().find(|x| x.proposal == pb).unwrap().net_weight;
+        assert!(
+            (net_a - 0.0).abs() < 1e-3,
+            "A should be 0.0 (pa_author 1.0 - worker inhibit 1.0), got {net_a}"
+        );
+        assert!(
+            (net_b - 1.0).abs() < 1e-3,
+            "B must drop back to 1.0 once the worker leaves it; got {net_b} (double-counting bug)"
+        );
     }
 
     // A clear leader at the deadline converges even without crossing quorum
