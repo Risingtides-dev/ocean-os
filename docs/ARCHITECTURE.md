@@ -25,6 +25,41 @@ ocean-agent
   session persistence, daemon-safe permissions, project prompt loading, and
   protocol/event mapping. Wraps ocean-runtime + ocean-protocol in-process.
 
+ocean-agent-sdk
+  Typed product vocabulary shared by the daemon and all clients: AgentSession,
+  AgentTurn, AgentTurnEvent (the canonical SSE payload), session create/list
+  request/response types, and LonghouseEvent. Deliberately separate from
+  ocean-core so the product contract is explicit and isolated.
+
+ocean-mcp
+  Ocean as an MCP *client*. Connects to external Model Context Protocol servers
+  and exposes their tools to the agent through the runtime's CapabilityProvider
+  seam — this is how the keys in tools.env (Brave, Slack, Linear, …) become
+  agent tools without hardcoded native Rust tools. Depends one-way on
+  ocean-runtime; the runtime never depends back on it.
+
+ocean-browser
+  Typed async handle to a Chrome instance driven over the DevTools Protocol.
+  Launch/attach, navigation, screenshot, hybrid read_page, inspect, Layer-3
+  input, live network capture, downloads, and a tab shell that treats tabs as
+  first-class addressable objects. Powers the runtime's browser tool suite.
+
+ocean-longhouse
+  The real quorum engine and convening flow behind the longhouse deck. A pure,
+  daemon-computed QuorumEngine counts credential-weighted, time-decaying,
+  cross-inhibiting marks and decides when a proposal crosses quorum — never an
+  LLM. The convene flow staffs a council with real LLM workers on cheap models,
+  runs a two-round propose → endorse/inhibit protocol, and emits the existing
+  LonghouseEvents so the deck renders a live council with zero deck changes.
+
+ocean-acp
+  ACP (Agent Client Protocol) bridge. Exposes the Ocean daemon to Zed and other
+  ACP editors over stdio, mapping editor sessions onto daemon turns.
+
+ocean-heartbeat
+  Scheduler binary for Ocean daemon routines: prompt-injection hooks now,
+  courier jobs later. Generates and runs schedulers that drive the daemon URL.
+
 ocean-daemon
   Long-running OS service. Owns API surface for OceanTUI/Ocean GUI and
   calls the native runtime in-process. It must not shell out to a second agent
@@ -44,11 +79,12 @@ ocean-tui
   - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
 ```
 
-Planned crates:
+Planned crates (extensibility phase — not yet in the workspace):
 
 ```text
 ocean-store
-  SQLite session/event store.
+  SQLite session/event store. (Today session/event persistence lives inside
+  ocean-agent; ocean-store would extract it into a dedicated crate.)
 
 ocean-plugin
   WASM/subprocess plugin runtime.

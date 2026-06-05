@@ -39,6 +39,25 @@ GET /v1/agent/events?session_id=<id>
 POST /v1/agent/turns { session_id, prompt, client_type }
 ```
 
+`POST /v1/agent/sessions` is **live** in the daemon today. It explicitly
+allocates and persists a session before the first turn instead of relying on the
+implicit create-on-turn path. Shape:
+
+```text
+POST /v1/agent/sessions
+  { "workspace_root": "<path>",       # required; resolved to git toplevel if inside a repo
+    "project_id": "<uuid>",           # optional; falls back to the project's workspace_root
+    "client_type": "surface-gpui" }   # optional render/communication medium
+
+-> { "session_id": "<id>",
+     "cwd": "<resolved working dir>",
+     "client_type": "surface-gpui" }
+```
+
+The returned `session_id` is then carried on `GET /v1/agent/events?session_id=<id>`
+and on every `POST /v1/agent/turns`. The session owns its `cwd`; turns inherit it
+and do not need to resend a workspace root.
+
 Two surfaces intentionally sharing one session both subscribe to the same `session_id`.
 Two surfaces on different sessions cannot receive each other's session-bearing events.
 
