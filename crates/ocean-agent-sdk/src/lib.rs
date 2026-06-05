@@ -138,6 +138,11 @@ pub struct AgentSession {
     /// Turn that is currently running in this session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn: Option<AgentTurnId>,
+    /// Surface that last steered this session (e.g. `surface-extension`,
+    /// `surface-web`). Recorded per turn by the runtime; surfaced here so
+    /// clients can render which surface owns the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

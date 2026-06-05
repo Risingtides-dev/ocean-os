@@ -2581,6 +2581,7 @@ async fn agent_session(
                         created_at: ms_to_datetime(session.created_ms),
                         updated_at: ms_to_datetime(session.updated_ms),
                         active_turn,
+                        client_type: session.client_type.clone(),
                     }),
                     turns,
                     error: None,
@@ -3179,6 +3180,7 @@ mod tests {
             cwd: Some("/work/repo/sub".into()),
             git_branch: None,
             git_commit: None,
+            client_type: None,
         }
     }
 

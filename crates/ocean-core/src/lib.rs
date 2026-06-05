@@ -279,6 +279,11 @@ pub struct SessionDetail {
     pub git_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_commit: Option<String>,
+    /// Surface that last steered this session (e.g. `surface-extension`,
+    /// `surface-web`). Recorded per turn by the runtime; surfaced here so
+    /// clients can render which surface owns the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
 }
 
 /// Response payload for `GET /v1/sessions/{id}`.
