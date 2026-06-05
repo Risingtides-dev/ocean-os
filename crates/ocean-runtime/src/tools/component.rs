@@ -283,7 +283,32 @@ impl ComponentWaitRegistry {
 /// Tool that blocks the agent turn until the user interacts with a rendered
 /// component. Uses the global [`COMPONENT_WAIT_REGISTRY`] shared with the
 /// daemon's `/v1/component/event` route.
-pub struct ComponentWaitTool;
+///
+/// `session_id` is the authoritative session id injected from the turn's
+/// [`SessionContext`](crate::capability::SessionContext) when the tool is built
+/// (OCEAN-60). When present it overrides any `session_id` the model puts in
+/// args — the registry key must match the session the daemon resolves component
+/// events against, and trusting model-supplied ids lets a hallucinated id wait
+/// on a key no event will ever resolve. `None` (ad-hoc/test construction) falls
+/// back to the args value for backward compatibility.
+#[derive(Default)]
+pub struct ComponentWaitTool {
+    session_id: Option<String>,
+}
+
+impl ComponentWaitTool {
+    /// Construct with no bound session — `execute` falls back to the
+    /// model-supplied `session_id` arg. Used by ad-hoc/test paths.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct bound to a session. `execute` uses this id and ignores the
+    /// model-supplied `session_id` arg.
+    pub fn for_session(session_id: Option<String>) -> Self {
+        Self { session_id }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ComponentWaitTool {
@@ -300,17 +325,13 @@ impl AgentTool for ComponentWaitTool {
          rendered component (e.g. click a kanban card, submit a form). \
          Returns the interaction event as JSON. Use this to build conversational \
          workflows around live UI: render a form, wait for submit, process the data. \
-         The agent must pass the current `session_id` in args."
+         The session id is injected automatically — just pass the component `id`."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "session_id": {
-                    "type": "string",
-                    "description": "Current agent session id (the agent must inject this from context)"
-                },
                 "id": {
                     "type": "string",
                     "description": "Component id to wait for interaction on"
@@ -321,16 +342,22 @@ impl AgentTool for ComponentWaitTool {
                     "description": "Max wait time in milliseconds"
                 }
             },
-            "required": ["session_id", "id"]
+            "required": ["id"]
         })
     }
 
     async fn execute(&self, _tool_call_id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let session_id = args
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'session_id' (agent must pass the current session id)")?
-            .to_string();
+        // The session id is injected from SessionContext when the tool is built
+        // (OCEAN-60). Only fall back to the model-supplied arg when no session
+        // was bound (ad-hoc/test construction).
+        let session_id = match &self.session_id {
+            Some(sid) => sid.clone(),
+            None => args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'session_id' (no session bound and none supplied in args)")?
+                .to_string(),
+        };
 
         let component_id = args
             .get("id")
@@ -377,5 +404,52 @@ impl AgentTool for ComponentWaitTool {
                 "timed out waiting for interaction on '{component_id}'"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::AgentTool;
+
+    /// A session-bound tool ignores the model-supplied `session_id` arg and
+    /// keys the wait on the injected session (OCEAN-60). With a 1ms timeout it
+    /// runs to the timeout error — proving it did not reject on a missing arg.
+    #[tokio::test]
+    async fn bound_session_does_not_require_session_arg() {
+        let tool = ComponentWaitTool::for_session(Some("injected-sess".into()));
+        let args = json!({ "id": "comp-1", "timeout_ms": 1 });
+        let res = tool.execute("call-1", args).await;
+        let err = res.expect_err("a 1ms wait with no interaction must time out");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
+
+    /// An unbound tool (ad-hoc/test path) still falls back to the model-supplied
+    /// `session_id` arg, and errors clearly when it is absent.
+    #[tokio::test]
+    async fn unbound_tool_requires_session_arg() {
+        let tool = ComponentWaitTool::new();
+        let args = json!({ "id": "comp-1", "timeout_ms": 1 });
+        let err = tool
+            .execute("call-1", args)
+            .await
+            .expect_err("missing session arg with no binding must error");
+        assert!(err.contains("session_id"), "unexpected error: {err}");
+    }
+
+    /// Bound tool uses the injected id even when the model supplies a different
+    /// one — the injected value wins, never the model's.
+    #[tokio::test]
+    async fn injected_session_overrides_model_arg() {
+        let tool = ComponentWaitTool::for_session(Some("real-sess".into()));
+        // Model lies about the session; the tool must ignore it. With a 1ms
+        // timeout we just confirm it ran (timed out) rather than erroring on
+        // the arg, i.e. it used the injected id.
+        let args = json!({ "session_id": "hallucinated", "id": "comp-2", "timeout_ms": 1 });
+        let err = tool
+            .execute("call-2", args)
+            .await
+            .expect_err("should time out, not error on args");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
     }
 }

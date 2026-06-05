@@ -35,6 +35,9 @@ pub fn default_tools() -> Vec<Arc<dyn AgentTool>> {
         Arc::new(todo::TodoTool::new()),
         Arc::new(component::ComponentRenderTool),
         Arc::new(component::ComponentUnmountTool),
-        Arc::new(component::ComponentWaitTool),
+        // Unbound: falls back to the model-supplied `session_id` arg. The
+        // session-scoped `BuiltinProvider` rebuilds this one with the turn's
+        // session id (OCEAN-60); this default is for ad-hoc/test paths.
+        Arc::new(component::ComponentWaitTool::new()),
     ]
 }
