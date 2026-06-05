@@ -439,16 +439,38 @@ pub enum AgentTurnEvent {
         session_id: AgentSessionId,
         active: bool,
     },
-    /// Catch-all for unexpected or extension events.  Includes the raw payload.
-    Extension { extension: String, payload: Value },
+    /// Catch-all for unexpected or extension events (e.g. Longhouse council
+    /// events). Includes the raw payload and an optional session scope.
+    ///
+    /// `scope` controls SSE delivery (see [`AgentTurnEvent::session_id`]):
+    /// - `Some(session_id)` — the event belongs to a session and is delivered
+    ///   only to subscribers scoped to that session (or the `?all=1` firehose).
+    /// - `None` — the event is genuinely global-by-design (e.g. a Longhouse
+    ///   council spanning many agents/sessions). It is delivered **only** to
+    ///   subscribers who opt into the global stream via `?all=1`, never to
+    ///   session-scoped subscribers. This is the Invariant 5 exception.
+    Extension {
+        extension: String,
+        payload: Value,
+        /// Optional session this extension event is associated with. When set,
+        /// the daemon's SSE filter scopes delivery to that session. When
+        /// `None`, the event is council-wide / global and only reaches `?all=1`
+        /// subscribers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<AgentSessionId>,
+    },
 }
 
 impl AgentTurnEvent {
-    /// The session this event belongs to, when it carries one. `Extension`
-    /// events have no session and return `None`. The daemon's SSE handler uses
-    /// this to scope a per-subscriber stream to a single session so two
-    /// concurrent sessions (e.g. the GPUI app and the Chrome extension) don't
-    /// interleave their output into each other's transcript.
+    /// The session this event belongs to, when it carries one. The daemon's SSE
+    /// handler uses this to scope a per-subscriber stream to a single session so
+    /// two concurrent sessions (e.g. the GPUI app and the Chrome extension)
+    /// don't interleave their output into each other's transcript.
+    ///
+    /// `Extension` events carry an optional `scope`: a session-associated
+    /// extension event returns `Some(scope)` and is filtered like any other
+    /// session-bearing event; a council-wide one returns `None` and reaches only
+    /// `?all=1` subscribers. See [`AgentTurnEvent::Extension`].
     pub fn session_id(&self) -> Option<AgentSessionId> {
         match self {
             AgentTurnEvent::TurnStarted { session_id, .. }
@@ -462,7 +484,7 @@ impl AgentTurnEvent {
             | AgentTurnEvent::ComponentRender { session_id, .. }
             | AgentTurnEvent::ComponentUnmount { session_id, .. }
             | AgentTurnEvent::BrowserActivity { session_id, .. } => Some(*session_id),
-            AgentTurnEvent::Extension { .. } => None,
+            AgentTurnEvent::Extension { scope, .. } => *scope,
         }
     }
 }
@@ -690,12 +712,33 @@ impl LonghouseEvent {
     /// The extension tag used when wrapping this in `AgentTurnEvent::Extension`.
     pub const EXTENSION: &'static str = "longhouse";
 
-    /// Wrap this longhouse event as an `AgentTurnEvent::Extension` so it can be
-    /// published on the existing agent event bus / `/v1/agent/events` SSE.
+    /// Wrap this longhouse event as a council-wide `AgentTurnEvent::Extension`
+    /// (no session scope) so it can be published on the existing agent event bus
+    /// / `/v1/agent/events` SSE. A Longhouse council spans many agents/sessions,
+    /// so by default it has no single owning session: the event reaches only
+    /// `?all=1` (global-stream) subscribers — the deck — never an unrelated
+    /// session-scoped subscriber. Use [`into_turn_event_scoped`] when a council
+    /// IS tied to a specific session/room.
+    ///
+    /// [`into_turn_event_scoped`]: LonghouseEvent::into_turn_event_scoped
     pub fn into_turn_event(self) -> AgentTurnEvent {
         AgentTurnEvent::Extension {
             extension: Self::EXTENSION.to_string(),
             payload: serde_json::to_value(self).unwrap_or(Value::Null),
+            scope: None,
+        }
+    }
+
+    /// Wrap this longhouse event as an `AgentTurnEvent::Extension` scoped to a
+    /// specific session. The daemon's SSE filter then delivers it like any
+    /// other session-bearing event: only to subscribers on that session (and
+    /// the `?all=1` firehose). Use this when a council is convened on behalf of
+    /// one session/room rather than as a standalone, multi-session deliberation.
+    pub fn into_turn_event_scoped(self, scope: AgentSessionId) -> AgentTurnEvent {
+        AgentTurnEvent::Extension {
+            extension: Self::EXTENSION.to_string(),
+            payload: serde_json::to_value(self).unwrap_or(Value::Null),
+            scope: Some(scope),
         }
     }
 
@@ -704,9 +747,9 @@ impl LonghouseEvent {
     /// unrecognised extensions). This is what the deck calls on each SSE line.
     pub fn from_turn_event(event: &AgentTurnEvent) -> Option<Self> {
         match event {
-            AgentTurnEvent::Extension { extension, payload } if extension == Self::EXTENSION => {
-                serde_json::from_value(payload.clone()).ok()
-            }
+            AgentTurnEvent::Extension {
+                extension, payload, ..
+            } if extension == Self::EXTENSION => serde_json::from_value(payload.clone()).ok(),
             _ => None,
         }
     }
@@ -751,8 +794,9 @@ mod tests {
     #[test]
     fn session_id_accessor_extracts_session_for_filtering() {
         // The daemon's per-session SSE filter relies on this accessor. A
-        // session-bearing event returns its id; Extension (no session) returns
-        // None and therefore always passes the filter.
+        // session-bearing event returns its id; a council-wide Extension (no
+        // scope) returns None (global-by-design, `?all=1` only); a scoped
+        // Extension returns its scope and is filtered like any session event.
         let sid = AgentSessionId::new_v4();
         let started = AgentTurnEvent::TurnStarted {
             turn_id: AgentTurnId::new_v4(),
@@ -768,11 +812,21 @@ mod tests {
         };
         assert_eq!(delta.session_id(), Some(sid));
 
+        // Council-wide extension: no scope -> None.
         let ext = AgentTurnEvent::Extension {
             extension: "longhouse".into(),
             payload: serde_json::json!({}),
+            scope: None,
         };
         assert_eq!(ext.session_id(), None);
+
+        // Session-scoped extension: returns its scope for filtering.
+        let scoped = AgentTurnEvent::Extension {
+            extension: "longhouse".into(),
+            payload: serde_json::json!({}),
+            scope: Some(sid),
+        };
+        assert_eq!(scoped.session_id(), Some(sid));
     }
 
     #[test]

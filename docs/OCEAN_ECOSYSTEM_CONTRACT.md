@@ -18,8 +18,24 @@ Status: active contract for runtime and first-party surfaces.
 2. A session stores its workspace root when created; turns inherit cwd from the session.
 3. Product surfaces subscribe with `GET /v1/agent/events?session_id=<id>`.
 4. Product surfaces submit turns with `session_id=<id>`.
-5. SSE events never change a surface's active session. Only user attach/select or explicit session creation can do that.
-6. The global `/v1/agent/events` stream is for debug and legacy clients only.
+5. SSE events never change a surface's active session, and never cross between
+   sessions. A subscriber on `?session_id=<id>` receives only that session's
+   events. Only user attach/select or explicit session creation can change a
+   surface's active session.
+   - **Extension-event exception.** `AgentTurnEvent::Extension` events (e.g.
+     Longhouse council events) carry an optional `scope`. A council spans many
+     agents/sessions, so it often has no single owning session. Delivery rules:
+     - `scope = Some(session_id)` — treated exactly like any session-bearing
+       event: delivered only to that session's subscribers (and `?all=1`).
+     - `scope = None` (council-wide / global-by-design) — delivered **only** to
+       subscribers who opt into the global stream via `?all=1`. It is **never**
+       delivered to a session-scoped subscriber. This keeps the no-crossing
+       guarantee intact: a council never leaks into an unrelated session's
+       transcript; it reaches the deck (which subscribes globally) by design.
+6. The global `/v1/agent/events` stream (no `session_id`, opt in with `?all=1`)
+   is for debug, the Longhouse deck, and legacy clients only. Session-bearing
+   events and council-wide extension events are delivered there only when
+   `?all=1` is set.
 7. `client_type` describes render/communication medium. It is not a session id, workspace id, LiveKit participant id, or canvas id.
 
 ## Runtime Flow
