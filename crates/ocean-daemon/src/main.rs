@@ -11,7 +11,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
-    http::{Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
@@ -29,10 +29,9 @@ use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectResponse,
-    ProjectsResponse, PromptRequest, RequestControlResponse,
-    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, RoomId,
-    RoomPanelSnapshot, RoomSnapshot, RoomsResponse, SessionDetail, SessionId, SessionResponse,
-    SessionRunState, SessionSummary,
+    ProjectsResponse, PromptRequest, RequestControlResponse, RequestCreateResponse, RequestId,
+    RequestState, RequestStatus, RequestsResponse, RoomId, RoomPanelSnapshot, RoomSnapshot,
+    RoomsResponse, SessionDetail, SessionId, SessionResponse, SessionRunState, SessionSummary,
 };
 use ocean_runtime::{
     tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
@@ -337,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/v1/agent/turns", post(agent_turn))
+        .route("/v1/agent/voice", post(agent_voice))
         .route("/v1/agent/events", get(agent_events))
         .route(
             "/v1/agent/sessions",
@@ -363,6 +363,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/component/event", post(component_event))
         .route("/v1/longhouse/demo", post(longhouse_demo))
         .route("/v1/longhouse/convene", post(longhouse_convene))
+        .route("/v1/calls/demo", post(call_demo))
+        .route("/v1/calls/place", post(call_place))
+        .route("/v1/calls/webhook", post(call_webhook))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -387,12 +390,14 @@ async fn root() -> Json<serde_json::Value> {
             "GET /health",
             "GET /ready",
             "POST /v1/agent/turns",
+            "POST /v1/agent/voice",
             "GET /v1/agent/events",
             "POST /v1/agent/sessions",
             "GET /v1/agent/sessions",
             "GET /v1/agent/sessions/{id}",
             "GET /v1/events",
             "POST /v1/prompt",
+            "POST /v1/agent/sessions",
             "GET /v1/requests",
             "POST /v1/requests",
             "POST /v1/requests/{id}/cancel",
@@ -412,7 +417,10 @@ async fn root() -> Json<serde_json::Value> {
             "GET /v1/models",
             "POST /v1/component/event",
             "POST /v1/longhouse/demo",
-            "POST /v1/longhouse/convene"
+            "POST /v1/longhouse/convene",
+            "POST /v1/calls/demo",
+            "POST /v1/calls/place",
+            "POST /v1/calls/webhook"
         ]
     }))
 }
@@ -1105,6 +1113,208 @@ async fn longhouse_convene(
     }))
 }
 
+/// Bridges ocean-call's orchestrator events onto the daemon EventBus, turning
+/// each OceanEvent into an EventEnvelope on the real SSE rail.
+struct BusSink {
+    events: EventBus,
+}
+
+impl ocean_call::EventSink for BusSink {
+    fn emit(&mut self, event: ocean_core::OceanEvent) {
+        self.events.emit(ocean_core::EventEnvelope::new(event));
+    }
+}
+
+/// Demo: run the ocean-call orchestrator over a scripted transcript and emit
+/// the real call events (CallStarted/Transcript/Task/Summary/Ended) onto the
+/// SSE rail. Proves the daemon→orchestrator→EventBus path end to end WITHOUT
+/// any Twilio/LiveKit account — the live `place_call` path is gated on those.
+async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
+    use ocean_call::{CallSession, Summarizer, SummaryPolicy, TranscriptSegment, WakeGate};
+
+    let mut sink = BusSink {
+        events: state.events.clone(),
+    };
+    let mut session = CallSession::new(
+        format!("demo-{}", Uuid::new_v4()),
+        Summarizer::new(SummaryPolicy {
+            every_n_segments: 3,
+            silence_ms: 15_000,
+        }),
+        WakeGate::new(false, 2_000),
+    );
+
+    session.start(&mut sink, "call:demo", vec!["sip:+17035081859".into()]);
+    let script = [
+        ("caller", "hey thanks for jumping on", 0u64),
+        ("caller", "so for the Warner Q3 push", 2_000),
+        ("caller", "I'll send the master to Atlantic tonight", 4_000),
+        ("caller", "and we need to verify the toll-free number by Friday", 7_000),
+        ("caller", "hey Ocean what did we just agree to", 10_000),
+    ];
+    for (speaker, text, ms) in script {
+        session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+    }
+    session.end(&mut sink, 12_000);
+
+    Json(json!({ "ok": true, "streaming_on": "/v1/events" }))
+}
+
+#[derive(serde::Deserialize)]
+struct PlaceCallRequest {
+    /// Number to dial; any common format (normalized to E.164 server-side).
+    to: String,
+}
+
+/// Place a real outbound call. The operator's trigger: POST { "to": "..." }.
+///
+/// If the SIP/LiveKit env is configured (LIVEKIT_URL/_API_KEY/_API_SECRET +
+/// OCEAN_CALL_OUTBOUND_TRUNK + OCEAN_CALL_CALLER_NUMBER), this mints a call
+/// room and dials via the verified LiveKit SIP bridge. If not, it returns 503
+/// naming exactly what's unset — so the only thing between here and a ringing
+/// phone is John's Twilio upgrade + LiveKit Cloud account, and the error says so.
+async fn call_place(
+    State(state): State<AppState>,
+    Json(req): Json<PlaceCallRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use ocean_call::{normalize_e164, CallBridge, LiveKitSipBridge, SipConfig};
+
+    let Some(dialed) = normalize_e164(&req.to) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": format!("not a valid phone number: {}", req.to) })),
+        );
+    };
+
+    let config = match SipConfig::from_env() {
+        Ok(c) => c,
+        Err(missing) => {
+            // Not a code failure — the account/creds aren't provisioned yet.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "blocked_on": "telephony not configured",
+                    "missing": missing,
+                    "needed_env": [
+                        "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
+                        "OCEAN_CALL_OUTBOUND_TRUNK", "OCEAN_CALL_CALLER_NUMBER"
+                    ],
+                    "note": "Requires a LiveKit Cloud account + a Twilio SIP trunk (paid). Once set, this route dials for real."
+                })),
+            );
+        }
+    };
+
+    let bridge = match LiveKitSipBridge::new(config) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    // Mint a call room and emit CallStarted so subscribers see the attempt.
+    let room = format!("call:{}", Uuid::new_v4());
+    state.events.emit(ocean_core::EventEnvelope::new(
+        ocean_core::OceanEvent::CallStarted {
+            call_id: room.clone(),
+            room_id: room.clone(),
+            participants: vec![format!("sip:{dialed}")],
+        },
+    ));
+
+    match bridge.place_call(&dialed, &room).await {
+        Ok(call) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "dialed": call.dialed,
+                "room": call.room,
+                "participant_id": call.participant_id,
+                "streaming_on": "/v1/events"
+            })),
+        ),
+        Err(e) => {
+            // Balance the lifecycle: we already emitted CallStarted, so a failed
+            // dial MUST emit CallEnded or subscribers (TUI/surface) are left with
+            // a phantom call stuck "in progress" forever.
+            state.events.emit(ocean_core::EventEnvelope::new(
+                ocean_core::OceanEvent::CallEnded {
+                    call_id: room.clone(),
+                    duration_ms: 0,
+                },
+            ));
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "ok": false, "error": format!("dial failed: {e}") })),
+            )
+        }
+    }
+}
+
+/// LiveKit webhook receiver. LiveKit POSTs room lifecycle events here; we
+/// verify the signature, and on a `room_started` for a `call_` room emit
+/// CallStarted (and CallEnded on `room_finished`) onto the SSE rail. This is
+/// the trigger that lets an INBOUND call (someone dialing Ocean's number, which
+/// SIP-routes into a call_<caller>_<random> room) reach the pipeline.
+///
+/// The live room-audio tap (room_tap::live) needs the native `livekit-tap`
+/// feature; this endpoint proves the reception + lifecycle path without it, so
+/// a real call already produces call_started/call_ended on /v1/events.
+async fn call_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Ok(api_key), Ok(api_secret)) = (
+        std::env::var("LIVEKIT_API_KEY"),
+        std::env::var("LIVEKIT_API_SECRET"),
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": "LIVEKIT_API_KEY/SECRET not set" })),
+        );
+    };
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    match ocean_call::verify_and_decide(&api_key, &api_secret, &body, auth) {
+        Ok(ocean_call::WebhookAction::JoinCall { room }) => {
+            state.events.emit(ocean_core::EventEnvelope::new(
+                ocean_core::OceanEvent::CallStarted {
+                    call_id: room.clone(),
+                    room_id: room.clone(),
+                    participants: vec![],
+                },
+            ));
+            tracing::info!(%room, "inbound call room started");
+            (StatusCode::OK, Json(json!({ "ok": true, "action": "join", "room": room })))
+        }
+        Ok(ocean_call::WebhookAction::EndCall { room }) => {
+            state.events.emit(ocean_core::EventEnvelope::new(
+                ocean_core::OceanEvent::CallEnded {
+                    call_id: room.clone(),
+                    duration_ms: 0,
+                },
+            ));
+            (StatusCode::OK, Json(json!({ "ok": true, "action": "end", "room": room })))
+        }
+        Ok(ocean_call::WebhookAction::Ignore) => {
+            (StatusCode::OK, Json(json!({ "ok": true, "action": "ignore" })))
+        }
+        Err(e) => {
+            // Verification failed — do NOT act. Log and 200 so LiveKit doesn't retry-storm.
+            tracing::warn!(error = %e, "rejected livekit webhook");
+            (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() })))
+        }
+    }
+}
+
 async fn model_set(
     State(state): State<AppState>,
     Json(req): Json<ModelSetRequest>,
@@ -1139,7 +1349,11 @@ struct PatchProjectRequest {
 /// `GET /v1/projects` — list all registered projects.
 async fn projects_list(State(state): State<AppState>) -> Json<ProjectsResponse> {
     match state.runtime.list_projects() {
-        Ok(projects) => Json(ProjectsResponse { ok: true, projects, error: None }),
+        Ok(projects) => Json(ProjectsResponse {
+            ok: true,
+            projects,
+            error: None,
+        }),
         Err(e) => Json(ProjectsResponse {
             ok: false,
             projects: vec![],
@@ -1165,11 +1379,19 @@ async fn project_create(
     match state.runtime.upsert_project(project, now) {
         Ok(project) => (
             StatusCode::CREATED,
-            Json(ProjectResponse { ok: true, project: Some(project), error: None }),
+            Json(ProjectResponse {
+                ok: true,
+                project: Some(project),
+                error: None,
+            }),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ProjectResponse { ok: false, project: None, error: Some(e.to_string()) }),
+            Json(ProjectResponse {
+                ok: false,
+                project: None,
+                error: Some(e.to_string()),
+            }),
         ),
     }
 }
@@ -1224,7 +1446,11 @@ async fn project_patch(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ProjectResponse { ok: false, project: None, error: Some(e.to_string()) }),
+                Json(ProjectResponse {
+                    ok: false,
+                    project: None,
+                    error: Some(e.to_string()),
+                }),
             )
         }
     };
@@ -1236,11 +1462,19 @@ async fn project_patch(
     match state.runtime.upsert_project(updated, now) {
         Ok(project) => (
             StatusCode::OK,
-            Json(ProjectResponse { ok: true, project: Some(project), error: None }),
+            Json(ProjectResponse {
+                ok: true,
+                project: Some(project),
+                error: None,
+            }),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ProjectResponse { ok: false, project: None, error: Some(e.to_string()) }),
+            Json(ProjectResponse {
+                ok: false,
+                project: None,
+                error: Some(e.to_string()),
+            }),
         ),
     }
 }
@@ -1701,6 +1935,25 @@ fn event_summary(event: &EventEnvelope) -> String {
                 .unwrap_or_default()
         ),
         OceanEvent::Error { message } => format!("{actor} · error: {}", trim_line(message, 48)),
+        OceanEvent::CallStarted { room_id, .. } => format!("{actor} · call started · {room_id}"),
+        OceanEvent::CallTranscriptSegment { speaker, text, .. } => {
+            format!("{actor} · {speaker}: {}", trim_line(text, 42))
+        }
+        OceanEvent::CallSummaryUpdated { summary, .. } => {
+            format!("{actor} · call summary: {}", trim_line(summary, 42))
+        }
+        OceanEvent::CallTaskDetected { title, .. } => {
+            format!("{actor} · task: {}", trim_line(title, 44))
+        }
+        OceanEvent::CallWakeTriggered { utterance } => {
+            format!("{actor} · wake: {}", trim_line(utterance, 44))
+        }
+        OceanEvent::CallAgentSpoke { text } => {
+            format!("{actor} · spoke: {}", trim_line(text, 44))
+        }
+        OceanEvent::CallEnded { duration_ms, .. } => {
+            format!("{actor} · call ended · {duration_ms}ms")
+        }
     }
 }
 
@@ -2043,6 +2296,49 @@ async fn update_request_finished(
 // ---------------------------------------------------------------------------
 // /v1/agent/* handlers — product-shaped agent-turn API
 // ---------------------------------------------------------------------------
+
+/// Voice turn input. STT happens client-side (or at the surface proxy), so the
+/// daemon receives an already-transcribed utterance. This makes voice a
+/// first-class daemon turn — any surface (web, TUI, a future always-on wake-word
+/// listener) can speak to Ocean through the same session machinery instead of
+/// voice being a web-UI-only feature.
+#[derive(serde::Deserialize)]
+struct AgentVoiceRequest {
+    #[serde(default)]
+    session_id: Option<AgentSessionId>,
+    /// The transcribed utterance.
+    transcript: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    room_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<Uuid>,
+}
+
+/// POST /v1/agent/voice — accept a transcribed utterance and run it as a normal
+/// agent turn tagged `client_type = "voice"`. Thin wrapper over `agent_turn` so
+/// it inherits cwd resolution, per-session locking, cancellation, and SSE
+/// streaming with zero duplication.
+async fn agent_voice(
+    State(state): State<AppState>,
+    Json(req): Json<AgentVoiceRequest>,
+) -> (StatusCode, Json<AgentTurnResponse>) {
+    let turn = AgentTurnRequest {
+        session_id: req.session_id,
+        prompt: req.transcript,
+        cwd: req.cwd,
+        guidance: None,
+        room_id: req.room_id,
+        project_id: req.project_id,
+        // Canonical voice client_type (see AgentTurnRequest::client_type docs).
+        client_type: Some("leo-voice".to_string()),
+        // Voice turns defer to the runtime's global reasoning/model selection.
+        thinking_level: None,
+        model_id: None,
+    };
+    agent_turn(State(state), Json(turn)).await
+}
 
 async fn agent_turn(
     State(state): State<AppState>,
@@ -2471,13 +2767,16 @@ async fn component_event(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
 
 #[derive(Debug, serde::Deserialize, Default)]
 struct AgentEventsQuery {
-    /// When set, the SSE stream only delivers events for this session. Without
-    /// it the stream is the legacy global firehose (every session's events).
-    /// This is the server-side floor for the cross-surface bleed: the GPUI app
-    /// and the Chrome extension subscribe scoped to their own session id and no
-    /// longer interleave each other's transcript.
+    /// When set, the SSE stream only delivers events for this session.
+    ///
+    /// Without it the stream deliberately omits session-bearing events. Older
+    /// global subscribers may stay connected, but they cannot receive or adopt
+    /// another surface's transcript. Operator diagnostics can opt into the old
+    /// firehose explicitly with `?all=1`.
     #[serde(default)]
     session_id: Option<AgentSessionId>,
+    #[serde(default)]
+    all: Option<String>,
 }
 
 async fn agent_events(
@@ -2485,21 +2784,19 @@ async fn agent_events(
     Query(q): Query<AgentEventsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let want = q.session_id;
+    let all = q
+        .all
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"));
     let stream =
         BroadcastStream::new(state.agent_events.subscribe()).filter_map(move |event| match event {
             Ok(envelope) => {
-                // Scope to the requested session when one was given. Events that
-                // carry no session_id (e.g. Extension) always pass through —
-                // they aren't session-scoped. Every session-bearing event is
-                // dropped unless it matches; SessionCreated/TurnStarted carry
-                // their own id, so a client that already knows its session id
-                // still receives its own adoption events.
-                if let Some(want) = want {
-                    if let Some(sid) = envelope.event.session_id() {
-                        if sid != want {
-                            return None;
-                        }
-                    }
+                // Scope to the requested session when one was given. If no
+                // session was requested, do not stream session-bearing events by
+                // default; this prevents any stale/global first-party client
+                // from adopting or rendering another surface's active session.
+                if !should_emit_agent_event(want, all, &envelope.event) {
+                    return None;
                 }
                 let id = envelope.id.to_string();
                 let event_type = agent_event_type_name(&envelope.event);
@@ -2516,6 +2813,18 @@ async fn agent_events(
             }
         });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn should_emit_agent_event(
+    want: Option<AgentSessionId>,
+    all: bool,
+    event: &AgentTurnEvent,
+) -> bool {
+    match (want, event.session_id()) {
+        (Some(want), Some(sid)) => sid == want,
+        (None, Some(_)) => all,
+        _ => true,
+    }
 }
 
 async fn agent_sessions(
@@ -2907,6 +3216,13 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
         OceanEvent::TurnFinished { .. } => "turn_finished",
         OceanEvent::Cancelled { .. } => "cancelled",
         OceanEvent::Error { .. } => "error",
+        OceanEvent::CallStarted { .. } => "call_started",
+        OceanEvent::CallTranscriptSegment { .. } => "call_transcript_segment",
+        OceanEvent::CallSummaryUpdated { .. } => "call_summary_updated",
+        OceanEvent::CallTaskDetected { .. } => "call_task_detected",
+        OceanEvent::CallWakeTriggered { .. } => "call_wake_triggered",
+        OceanEvent::CallAgentSpoke { .. } => "call_agent_spoke",
+        OceanEvent::CallEnded { .. } => "call_ended",
     }
 }
 
@@ -3147,6 +3463,37 @@ mod tests {
         assert_eq!(parse_agent_turn_room(None).unwrap(), None);
         let guided = apply_room_guidance(None, "build the thing");
         assert_eq!(guided, "build the thing");
+    }
+
+    #[test]
+    fn agent_event_filter_requires_session_or_explicit_global_opt_in() {
+        let session_a = AgentSessionId::new_v4();
+        let session_b = AgentSessionId::new_v4();
+        let event = AgentTurnEvent::TurnStarted {
+            turn_id: AgentTurnId::new_v4(),
+            session_id: session_a,
+            model: Some("model-a".to_string()),
+        };
+
+        assert!(should_emit_agent_event(Some(session_a), false, &event));
+        assert!(!should_emit_agent_event(Some(session_b), false, &event));
+        assert!(!should_emit_agent_event(None, false, &event));
+        assert!(should_emit_agent_event(None, true, &event));
+    }
+
+    #[test]
+    fn agent_event_filter_keeps_sessionless_extension_events() {
+        let event = AgentTurnEvent::Extension {
+            extension: "longhouse".to_string(),
+            payload: json!({"ok": true}),
+        };
+
+        assert!(should_emit_agent_event(None, false, &event));
+        assert!(should_emit_agent_event(
+            Some(AgentSessionId::new_v4()),
+            false,
+            &event
+        ));
     }
 
     #[test]

@@ -14,6 +14,8 @@ members = [
   "crates/ocean-cli",
   "crates/ocean-tui",
   "crates/ocean-browser",
+  "crates/ocean-heartbeat",
+  "crates/ocean-call",
 ]
 resolver = "2"
 
@@ -50,6 +52,7 @@ ocean-agent-sdk = { path = "crates/ocean-agent-sdk" }
 ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }
 ocean-browser = { path = "crates/ocean-browser" }
+ocean-call = { path = "crates/ocean-call" }
 # Default features only ("bytes"). The `fetcher`/`rustls`/`native-tls` features
 # pull in chromiumoxide_fetcher (auto-downloads Chromium) which has a broken zip
 # gate in 0.9.1 — and we drive the system Chrome, so we never want the fetcher.

@@ -3582,6 +3582,33 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
             app.push_transcript(format!("✗ error {}", compact_text(message, 60)));
             app.status = compact_text(message, 72);
         }
+        OceanEvent::CallStarted { room_id, .. } => {
+            app.status = format!("call started · {room_id}");
+            app.push_transcript_if_new(format!("☎ call started · {room_id}"));
+        }
+        OceanEvent::CallTranscriptSegment {
+            speaker, text, is_final, ..
+        } => {
+            if *is_final {
+                app.push_transcript_if_new(format!("{speaker}: {text}"));
+            }
+        }
+        OceanEvent::CallSummaryUpdated { summary, .. } => {
+            app.status = format!("call summary: {}", compact_text(summary, 56));
+        }
+        OceanEvent::CallTaskDetected { title, .. } => {
+            app.push_transcript_if_new(format!("◆ task detected: {title}"));
+        }
+        OceanEvent::CallWakeTriggered { utterance } => {
+            app.push_transcript_if_new(format!("◇ hey Ocean — {}", compact_text(utterance, 56)));
+        }
+        OceanEvent::CallAgentSpoke { text } => {
+            app.push_transcript_if_new(format!("☉ Ocean: {text}"));
+        }
+        OceanEvent::CallEnded { duration_ms, .. } => {
+            app.status = format!("call ended · {duration_ms}ms");
+            app.push_transcript_if_new(format!("☎ call ended · {duration_ms}ms"));
+        }
     }
 }
 
@@ -4096,7 +4123,10 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             component_id,
         } => format!("component unmounted {component_id}"),
         AgentTurnEvent::BrowserActivity { active, .. } => {
-            format!("browser activity: {}", if *active { "active" } else { "idle" })
+            format!(
+                "browser activity: {}",
+                if *active { "active" } else { "idle" }
+            )
         }
     }
 }
@@ -4159,6 +4189,25 @@ fn summarize_event(envelope: &EventEnvelope) -> String {
         },
         OceanEvent::Error { message } => {
             format!("{request}error: {}", compact_text(message, 72))
+        }
+        OceanEvent::CallStarted { room_id, .. } => format!("{request}call_started: {room_id}"),
+        OceanEvent::CallTranscriptSegment { speaker, text, .. } => {
+            format!("{request}call_segment: {speaker}: {}", compact_text(text, 56))
+        }
+        OceanEvent::CallSummaryUpdated { summary, .. } => {
+            format!("{request}call_summary: {}", compact_text(summary, 56))
+        }
+        OceanEvent::CallTaskDetected { title, .. } => {
+            format!("{request}call_task: {}", compact_text(title, 56))
+        }
+        OceanEvent::CallWakeTriggered { utterance } => {
+            format!("{request}call_wake: {}", compact_text(utterance, 56))
+        }
+        OceanEvent::CallAgentSpoke { text } => {
+            format!("{request}call_spoke: {}", compact_text(text, 56))
+        }
+        OceanEvent::CallEnded { duration_ms, .. } => {
+            format!("{request}call_ended: {duration_ms}ms")
         }
     }
 }
