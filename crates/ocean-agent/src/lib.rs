@@ -320,6 +320,41 @@ impl AgentRuntime {
         session::detail(&self.config_dir, id)
     }
 
+    /// Explicitly mint a session container *before* any turn is run, per the
+    /// ecosystem contract. Mirrors the implicit create-on-turn path's session
+    /// setup (mint id → `bind_workspace(cwd)` → persist) but runs no agent loop
+    /// and stores no messages — the session starts empty.
+    ///
+    /// Like the implicit path, this always mints a *fresh* session id; it does
+    /// not adopt an existing session that happens to share a workspace. The
+    /// surface owns the returned `session_id` and threads it onto every turn.
+    ///
+    /// `client_type`, when supplied, is recorded on the session so the first
+    /// turn's surface profile is correct even if that turn omits it.
+    pub fn create_session(
+        &self,
+        cwd: &str,
+        client_type: Option<String>,
+    ) -> anyhow::Result<(SessionId, String, Option<String>)> {
+        anyhow::ensure!(
+            !cwd.trim().is_empty(),
+            "cannot create a session: no working directory to bind it to"
+        );
+        let snapshot = self.snapshot();
+        // The id is freshly minted and not yet known to any client, so no turn
+        // can be racing it — no per-session lock is needed here (unlike the
+        // run path, which serializes load→run→save on an id a client may
+        // already be steering).
+        let session_id = SessionId::new_v4();
+        let mut session = session::Session::new_with_id(session_id, &snapshot.model);
+        session.bind_workspace(Path::new(cwd));
+        if client_type.is_some() {
+            session.client_type = client_type.clone();
+        }
+        session::save(&self.config_dir, &session)?;
+        Ok((session.id, cwd.to_string(), session.client_type))
+    }
+
     fn provider_preflight_error(&self) -> Option<String> {
         let readiness = self.provider_readiness();
         if readiness.ok {
@@ -1488,6 +1523,38 @@ mod tests {
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    #[test]
+    fn create_session_mints_empty_workspace_bound_session_without_a_prompt() {
+        let config_dir = temp_config_dir("create-session");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        // No prompt is supplied — the container is created on its own.
+        let (id, cwd, client_type) = runtime
+            .create_session(".", Some("surface-web".into()))
+            .unwrap();
+        assert_eq!(cwd, ".");
+        assert_eq!(client_type.as_deref(), Some("surface-web"));
+
+        // It is persisted and resumable, with zero turns and the surface tagged.
+        let detail = runtime.session_detail(id).unwrap();
+        assert_eq!(detail.turns, 0);
+        assert!(detail.resumable);
+        assert_eq!(runtime.list_sessions(None).unwrap().len(), 1);
+
+        // Each create mints a fresh id (matches the implicit create-on-turn path).
+        let (id2, _, _) = runtime.create_session(".", None).unwrap();
+        assert_ne!(id, id2);
+        assert_eq!(runtime.list_sessions(None).unwrap().len(), 2);
+
+        // An empty cwd has nothing to bind to and is rejected.
+        assert!(runtime.create_session("   ", None).is_err());
+
+        let _ = std::fs::remove_dir_all(config_dir);
     }
 
     #[test]
