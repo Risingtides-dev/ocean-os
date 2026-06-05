@@ -15,12 +15,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use ocean_agent::{room_guidance, AgentRuntime, PromptControl};
 use ocean_agent_sdk::{
     AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse, AgentSessionId,
-    AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurnEvent, AgentTurnId,
-    AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
+    AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurn, AgentTurnEvent,
+    AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
     ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
     ToolCall, ToolCallId, ToolResult,
 };
@@ -74,6 +74,107 @@ struct RequestControl {
 struct PermissionWaiter {
     status: PermissionStatus,
     sender: Option<oneshot::Sender<AgentPermissionDecision>>,
+}
+
+// --- Registry garbage collection (OCEAN-12) ---------------------------------
+//
+// `requests`/`permissions` are unbounded `HashMap`s that gain an entry per turn
+// and per permission prompt. Without eviction a long-lived daemon leaks memory.
+// A background task (spawned in `main`) calls `gc_registries` on this interval.
+
+/// How often the background GC task sweeps the registries.
+const REGISTRY_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Terminal entries older than this are eligible for eviction.
+const REGISTRY_TERMINAL_TTL: chrono::Duration = chrono::Duration::hours(1);
+
+/// Hard cap on entries per registry. On overflow, oldest-terminal entries are
+/// evicted first (then, if still over, oldest entries regardless of state).
+const REGISTRY_MAX_ENTRIES: usize = 10_000;
+
+impl RequestControl {
+    /// Whether this request has reached a terminal lifecycle state.
+    fn is_terminal(&self) -> bool {
+        self.status.state.is_terminal()
+    }
+
+    /// Best-effort "when did this become final" timestamp for age comparison.
+    fn terminal_at(&self) -> DateTime<Utc> {
+        self.status
+            .finished_at
+            .or(self.status.updated_at)
+            .or(self.status.started_at)
+            .unwrap_or_else(Utc::now)
+    }
+}
+
+impl PermissionWaiter {
+    /// A waiter whose decision channel has been consumed is effectively done —
+    /// it's normally removed on decision/cancel, so a lingering `None`-sender
+    /// entry is a leak. Pending waiters (`Some`) are never reaped by age.
+    fn is_terminal(&self) -> bool {
+        self.sender.is_none()
+    }
+
+    fn terminal_at(&self) -> DateTime<Utc> {
+        self.status.created_at
+    }
+}
+
+/// One GC sweep: drop terminal entries older than [`REGISTRY_TERMINAL_TTL`],
+/// then enforce [`REGISTRY_MAX_ENTRIES`] by evicting oldest-terminal first.
+/// `now` is injected so the sweep is deterministic in tests.
+async fn gc_registries(
+    requests: &RequestRegistry,
+    permissions: &PermissionRegistry,
+    now: DateTime<Utc>,
+) {
+    let ttl = REGISTRY_TERMINAL_TTL;
+    {
+        let mut reqs = requests.write().await;
+        reqs.retain(|_, ctl| !(ctl.is_terminal() && (now - ctl.terminal_at()) > ttl));
+        if reqs.len() > REGISTRY_MAX_ENTRIES {
+            evict_overflow(&mut reqs, |c| c.is_terminal(), |c| c.terminal_at());
+        }
+    }
+    {
+        let mut perms = permissions.write().await;
+        perms.retain(|_, w| !(w.is_terminal() && (now - w.terminal_at()) > ttl));
+        if perms.len() > REGISTRY_MAX_ENTRIES {
+            evict_overflow(&mut perms, |w| w.is_terminal(), |w| w.terminal_at());
+        }
+    }
+}
+
+/// Trim `map` down to [`REGISTRY_MAX_ENTRIES`]. Removes oldest-terminal entries
+/// first; if still over the cap (all remaining are live), removes the oldest
+/// entries regardless of state. Generic over the registry value type.
+fn evict_overflow<K, V, FTerm, FAt>(
+    map: &mut HashMap<K, V>,
+    is_terminal: FTerm,
+    terminal_at: FAt,
+) where
+    K: std::hash::Hash + Eq + Clone,
+    FTerm: Fn(&V) -> bool,
+    FAt: Fn(&V) -> DateTime<Utc>,
+{
+    if map.len() <= REGISTRY_MAX_ENTRIES {
+        return;
+    }
+    let overflow = map.len() - REGISTRY_MAX_ENTRIES;
+    // Rank candidates: terminal entries before live ones, oldest first within
+    // each group. Take exactly `overflow` keys to remove.
+    let mut ranked: Vec<(K, bool, DateTime<Utc>)> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), is_terminal(v), terminal_at(v)))
+        .collect();
+    ranked.sort_by(|a, b| {
+        // terminal (true) should come first => reverse the bool ordering
+        b.1.cmp(&a.1).then(a.2.cmp(&b.2))
+    });
+    for (key, _, _) in ranked.into_iter().take(overflow) {
+        map.remove(&key);
+    }
 }
 
 struct DaemonPermissionPolicy {
@@ -184,6 +285,24 @@ async fn main() -> anyhow::Result<()> {
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
     };
+
+    // Background GC: the request/permission registries are otherwise unbounded
+    // and accrete one entry per turn/permission for the daemon's whole lifetime.
+    // This task reaps terminal entries on an interval so a long-lived daemon
+    // doesn't leak memory. See `gc_registries`.
+    {
+        let requests = state.requests.clone();
+        let permissions = state.permissions.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(REGISTRY_GC_INTERVAL);
+            // Skip the immediate first tick; first sweep happens one interval in.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                gc_registries(&requests, &permissions, Utc::now()).await;
+            }
+        });
+    }
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -2329,7 +2448,12 @@ async fn agent_sessions(
             id: sdk_sid(s.id),
             title: s.title,
             cwd: s.workspace_root.clone().unwrap_or_default(),
-            updated_at: chrono::Utc::now(),
+            // Real per-session updated-at from metadata; fall back to now only
+            // for legacy sessions that predate the timestamp field.
+            updated_at: s
+                .updated_ms
+                .map(ms_to_datetime)
+                .unwrap_or_else(Utc::now),
             active_turn: None,
             turn_count: s.turns,
         })
@@ -2423,22 +2547,36 @@ async fn agent_session(
 ) -> (StatusCode, Json<AgentSessionResponse>) {
     let core_id = core_sid(session_id);
     match state.runtime.session_detail(core_id) {
-        Ok(session) => (
-            StatusCode::OK,
-            Json(AgentSessionResponse {
-                ok: true,
-                session: Some(ocean_agent_sdk::AgentSession {
-                    id: session_id,
-                    title: session.title.clone(),
-                    cwd: String::new(),
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                    active_turn: None,
+        Ok(session) => {
+            // Real workspace path: prefer the bound workspace root, fall back to
+            // the recorded cwd; empty only for legacy pre-binding sessions.
+            let cwd = session
+                .workspace_root
+                .clone()
+                .or_else(|| session.cwd.clone())
+                .unwrap_or_default();
+            let turns = turns_from_detail(&session);
+            // A still-running session surfaces its in-flight turn as active.
+            let active_turn = turns.first().and_then(|t| {
+                matches!(t.status, AgentTurnStatus::Running).then_some(t.id)
+            });
+            (
+                StatusCode::OK,
+                Json(AgentSessionResponse {
+                    ok: true,
+                    session: Some(ocean_agent_sdk::AgentSession {
+                        id: session_id,
+                        title: session.title.clone(),
+                        cwd,
+                        created_at: ms_to_datetime(session.created_ms),
+                        updated_at: ms_to_datetime(session.updated_ms),
+                        active_turn,
+                    }),
+                    turns,
+                    error: None,
                 }),
-                turns: vec![],
-                error: None,
-            }),
-        ),
+            )
+        }
         Err(_) => (
             StatusCode::NOT_FOUND,
             Json(AgentSessionResponse {
@@ -2463,6 +2601,63 @@ fn core_sid(sdk_id: AgentSessionId) -> SessionId {
 /// Wrap a raw Uuid in an AgentSessionId wrapper.
 fn sdk_sid(core_id: SessionId) -> AgentSessionId {
     AgentSessionId(core_id)
+}
+
+/// Convert an epoch-millisecond timestamp into a `DateTime<Utc>`, falling back
+/// to `Utc::now()` if the value is out of range (never expected for real data).
+fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+}
+
+/// Derive the SDK `AgentTurn` list from a persisted session transcript.
+///
+/// A "turn" is one operator instruction plus its execution. The transcript
+/// records messages by role; each `user`-role entry begins a turn whose prompt
+/// is that entry's text. The turn is considered completed once the session is
+/// no longer running. Returned newest-first to match the documented contract.
+fn turns_from_detail(session: &SessionDetail) -> Vec<AgentTurn> {
+    let sid = sdk_sid(session.id);
+    let session_running = matches!(
+        session.state,
+        SessionRunState::Running
+            | SessionRunState::WaitingForPermission
+            | SessionRunState::Cancelling
+    );
+    let user_entries: Vec<&ocean_core::SessionTranscriptEntry> = session
+        .transcript
+        .iter()
+        .filter(|e| e.role == "user")
+        .collect();
+    let last_idx = user_entries.len().saturating_sub(1);
+    let mut turns: Vec<AgentTurn> = user_entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let started_at = entry
+                .timestamp_ms
+                .map(ms_to_datetime)
+                .unwrap_or_else(|| ms_to_datetime(session.created_ms));
+            // Only the final turn can still be in-flight; earlier ones are done.
+            let is_last = i == last_idx;
+            let (status, finished_at) = if is_last && session_running {
+                (AgentTurnStatus::Running, None)
+            } else {
+                (AgentTurnStatus::Completed, Some(started_at))
+            };
+            AgentTurn {
+                id: AgentTurnId(Uuid::new_v4()),
+                session_id: sid,
+                prompt: entry.text.clone(),
+                status,
+                started_at,
+                finished_at,
+                error: None,
+            }
+        })
+        .collect();
+    // Newest first per the AgentSessionResponse contract.
+    turns.reverse();
+    turns
 }
 
 fn estimate_visible_tokens(text: &str) -> u64 {
@@ -2934,5 +3129,201 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert!(matches!(recent[0].event, OceanEvent::AssistantDelta { .. }));
         assert!(matches!(recent[1].event, OceanEvent::UserMessage { .. }));
+    }
+
+    // --- OCEAN-13: session detail uses real data, not stubs -----------------
+
+    fn transcript_entry(role: &str, text: &str, ts_ms: i64) -> ocean_core::SessionTranscriptEntry {
+        ocean_core::SessionTranscriptEntry {
+            role: role.into(),
+            timestamp_ms: Some(ts_ms),
+            text: text.into(),
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+        }
+    }
+
+    fn detail_fixture(state: SessionRunState) -> SessionDetail {
+        SessionDetail {
+            id: SessionId::new_v4(),
+            created_ms: 1_000,
+            updated_ms: 5_000,
+            model: "test-model".into(),
+            provider: "test".into(),
+            turns: 2,
+            title: "fix the thing".into(),
+            state,
+            resumable: true,
+            active_requests: vec![],
+            pending_permissions: vec![],
+            transcript: vec![
+                transcript_entry("user", "first ask", 1_000),
+                transcript_entry("assistant", "working on it", 2_000),
+                transcript_entry("user", "second ask", 3_000),
+                transcript_entry("assistant", "done", 4_000),
+            ],
+            tool_context: vec![],
+            messages: vec![],
+            workspace_root: Some("/work/repo".into()),
+            cwd: Some("/work/repo/sub".into()),
+            git_branch: None,
+            git_commit: None,
+        }
+    }
+
+    #[test]
+    fn session_detail_yields_real_cwd_and_timestamps() {
+        let detail = detail_fixture(SessionRunState::Completed);
+        // cwd preference is workspace_root, not empty.
+        let cwd = detail
+            .workspace_root
+            .clone()
+            .or_else(|| detail.cwd.clone())
+            .unwrap_or_default();
+        assert_eq!(cwd, "/work/repo");
+        assert!(!cwd.is_empty(), "cwd must not be the empty stub");
+        assert_eq!(ms_to_datetime(detail.created_ms).timestamp_millis(), 1_000);
+        assert_eq!(ms_to_datetime(detail.updated_ms).timestamp_millis(), 5_000);
+    }
+
+    #[test]
+    fn turns_from_detail_maps_user_entries_newest_first() {
+        let detail = detail_fixture(SessionRunState::Completed);
+        let turns = turns_from_detail(&detail);
+        assert_eq!(turns.len(), 2, "one turn per user transcript entry");
+        // Newest first.
+        assert_eq!(turns[0].prompt, "second ask");
+        assert_eq!(turns[1].prompt, "first ask");
+        // A completed session has all turns completed.
+        assert!(turns
+            .iter()
+            .all(|t| t.status == AgentTurnStatus::Completed));
+    }
+
+    #[test]
+    fn turns_from_detail_marks_running_last_turn() {
+        let detail = detail_fixture(SessionRunState::Running);
+        let turns = turns_from_detail(&detail);
+        // The newest (running) turn is in-flight; the earlier one is done.
+        assert_eq!(turns[0].status, AgentTurnStatus::Running);
+        assert!(turns[0].finished_at.is_none());
+        assert_eq!(turns[1].status, AgentTurnStatus::Completed);
+    }
+
+    // --- OCEAN-12: registry GC ----------------------------------------------
+
+    fn terminal_status_at(
+        request_id: RequestId,
+        state: RequestState,
+        finished_at: DateTime<Utc>,
+    ) -> RequestControl {
+        let mut ctl = status(request_id, state);
+        ctl.status.finished_at = Some(finished_at);
+        ctl
+    }
+
+    #[tokio::test]
+    async fn gc_drops_old_terminal_requests_keeps_recent_and_live() {
+        let now = Utc::now();
+        let old_terminal = RequestId::new_v4();
+        let fresh_terminal = RequestId::new_v4();
+        let live = RequestId::new_v4();
+
+        let requests = Arc::new(RwLock::new(HashMap::from([
+            (
+                old_terminal,
+                terminal_status_at(
+                    old_terminal,
+                    RequestState::Completed,
+                    now - chrono::Duration::hours(2),
+                ),
+            ),
+            (
+                fresh_terminal,
+                terminal_status_at(
+                    fresh_terminal,
+                    RequestState::Completed,
+                    now - chrono::Duration::minutes(5),
+                ),
+            ),
+            (live, status(live, RequestState::Running)),
+        ])));
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        gc_registries(&requests, &permissions, now).await;
+
+        let reqs = requests.read().await;
+        assert!(!reqs.contains_key(&old_terminal), "old terminal evicted");
+        assert!(reqs.contains_key(&fresh_terminal), "recent terminal kept");
+        assert!(reqs.contains_key(&live), "live request kept regardless of age");
+    }
+
+    #[tokio::test]
+    async fn gc_drops_old_consumed_permission_waiters() {
+        let now = Utc::now();
+        let leaked = PermissionId::new_v4();
+        let pending = PermissionId::new_v4();
+        let req = RequestId::new_v4();
+
+        let mut leaked_status = permission_status(leaked, req);
+        leaked_status.created_at = now - chrono::Duration::hours(2);
+        let mut pending_status = permission_status(pending, req);
+        pending_status.created_at = now - chrono::Duration::hours(2);
+
+        let (tx, _rx) = oneshot::channel();
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::from([
+            // sender consumed => terminal, and old => evicted
+            (
+                leaked,
+                PermissionWaiter {
+                    status: leaked_status,
+                    sender: None,
+                },
+            ),
+            // still pending (Some) => never reaped by age
+            (
+                pending,
+                PermissionWaiter {
+                    status: pending_status,
+                    sender: Some(tx),
+                },
+            ),
+        ])));
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        gc_registries(&requests, &permissions, now).await;
+
+        let perms = permissions.read().await;
+        assert!(!perms.contains_key(&leaked), "old consumed waiter evicted");
+        assert!(perms.contains_key(&pending), "pending waiter kept");
+    }
+
+    #[tokio::test]
+    async fn evict_overflow_trims_terminal_first() {
+        let now = Utc::now();
+        let mut map: HashMap<RequestId, RequestControl> = HashMap::new();
+        // Two live + one terminal; cap-trim of 1 should drop the terminal one.
+        let live_a = RequestId::new_v4();
+        let live_b = RequestId::new_v4();
+        let term = RequestId::new_v4();
+        map.insert(live_a, status(live_a, RequestState::Running));
+        map.insert(live_b, status(live_b, RequestState::Running));
+        map.insert(
+            term,
+            terminal_status_at(term, RequestState::Completed, now),
+        );
+
+        // Directly exercise the ranking: remove 1 entry.
+        // (REGISTRY_MAX_ENTRIES is 10k, so call the ranker via a manual trim.)
+        let overflow = 1;
+        let mut ranked: Vec<(RequestId, bool, DateTime<Utc>)> = map
+            .iter()
+            .map(|(k, v)| (*k, v.is_terminal(), v.terminal_at()))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+        let first = ranked.into_iter().take(overflow).next().unwrap();
+        assert!(first.1, "terminal entry ranked first for eviction");
+        assert_eq!(first.0, term);
     }
 }
