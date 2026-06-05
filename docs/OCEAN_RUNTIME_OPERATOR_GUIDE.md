@@ -256,6 +256,7 @@ GET    /ready                             readiness (model/credentials wired)
 
 # Agent product API (session-scoped — first-party surfaces)
 POST   /v1/agent/turns                    submit a turn { prompt, cwd, session_id, ... }
+POST   /v1/agent/voice                    submit a voice turn (transcribed prompt; voice surface)
 GET    /v1/agent/events                   SSE stream; ?session_id=<id> scopes to one session
 POST   /v1/agent/sessions                 create a session before the first turn
 GET    /v1/agent/sessions                 list agent sessions
@@ -298,6 +299,13 @@ POST   /v1/component/event                surface component interaction event
 # Longhouse (council / quorum)
 POST   /v1/longhouse/demo                 scripted demo harness (fake events)
 POST   /v1/longhouse/convene              convene a real council; events on /v1/agent/events
+GET    /v1/longhouse/topics               list longhouse topics
+GET    /v1/longhouse/topics/{id}          longhouse topic detail
+
+# Calls (Twilio/LiveKit call-intelligence pipeline — ocean-call)
+POST   /v1/calls/demo                     scripted call-pipeline demo (fake transcript/events)
+POST   /v1/calls/place                    place an outbound call (SIP bridge → LiveKit room)
+POST   /v1/calls/webhook                  Twilio/LiveKit inbound webhook (call status, media)
 ```
 
 ### Synchronous prompt

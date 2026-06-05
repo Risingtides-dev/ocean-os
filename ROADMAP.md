@@ -32,6 +32,13 @@
 - [x] Per-turn wall-clock timeout (OCEAN-17)
 - [x] Session registry GC + real session detail/list fields (OCEAN-12/13/19)
 - [x] Session-scoped SSE — `?session_id=` filtering for first-party surfaces (OCEAN-15)
+- [x] Extension-event scoping — Extension/Longhouse events scoped, Invariant 5 exception documented (OCEAN-56)
+- [x] Per-session / per-turn model override — independent windows pin their own model (OCEAN-36/46)
+- [x] Per-turn `thinking_level` — per-turn reasoning-effort override without mutating global state (OCEAN-28/41/35)
+- [x] Surface-extension system prompt — `surface-extension` arm in `append_client_type` (OCEAN-14/16/50)
+- [x] Persistent `Room` struct — durable rooms + read-only browser tool perms + MCP per-session unblock (OCEAN-20/44/39)
+- [x] Longhouse topics endpoints — `GET /v1/longhouse/topics` + `/topics/{id}`, claim_outcome quorum gate (OCEAN-58/59)
+- [x] Call pipeline — inbound+outbound Twilio/LiveKit call-intelligence service (`ocean-call`)
 - [x] Browser control surface — CDP-driven Chrome tool suite (Layer-3 input,
       live network capture, downloads, tab shell)
 - [x] ACP bridge — Ocean daemon exposed to Zed and other ACP editors

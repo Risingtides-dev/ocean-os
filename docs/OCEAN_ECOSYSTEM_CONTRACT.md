@@ -77,6 +77,36 @@ and do not need to resend a workspace root.
 Two surfaces intentionally sharing one session both subscribe to the same `session_id`.
 Two surfaces on different sessions cannot receive each other's session-bearing events.
 
+### Turn request shape
+
+The full `AgentTurnRequest` accepted by `POST /v1/agent/turns` (source of truth:
+`crates/ocean-agent-sdk/src/lib.rs`, `struct AgentTurnRequest`):
+
+```text
+POST /v1/agent/turns
+  { "prompt": "<operator instruction>",   # required
+    "cwd": "<working directory>",         # required (may be empty when project_id is set)
+    "session_id": "<id>",                 # optional; a new session is created if omitted
+    "client_type": "surface-gpui",        # optional render/communication medium
+    "project_id": "<uuid>",               # optional; with empty cwd the daemon binds the
+                                          #   turn to the project's workspace_root
+    "room_id": "<id>",                    # optional; Track-0 room-scoped turns
+    "guidance": ["focus on tests"],       # optional list of guidance hints
+    "thinking_level": "high",             # optional ThinkingLevel; per-turn reasoning-effort
+                                          #   override, applied to this turn only (does not
+                                          #   mutate the runtime's global thinking_level)
+    "model_id": "claude-opus-4-7" }       # optional; per-turn / per-session model override
+                                          #   (OCEAN-36). Drives this turn only, leaving the
+                                          #   runtime's global model selection untouched, so
+                                          #   independent client windows can each pin a model
+                                          #   without racing through POST /v1/model.
+```
+
+Every field except `prompt` and `cwd` is optional. `thinking_level` and
+`model_id` are per-turn overrides: they never mutate global runtime state, which
+is what lets two ACP/surface windows run different models or reasoning efforts
+against the same daemon concurrently.
+
 ## Implementation Anchors
 
 Runtime side:
