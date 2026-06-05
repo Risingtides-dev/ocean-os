@@ -1374,6 +1374,7 @@ mod session {
             cwd: session.cwd,
             git_branch: session.git_branch,
             git_commit: session.git_commit,
+            client_type: session.client_type,
         }
     }
 
