@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use ocean_runtime::capability::{CapabilityProvider, ProviderHealth, SessionContext, SharedTool};
 use ocean_runtime::types::{AgentTool, AgentToolResult};
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 
 use crate::client::{McpClient, McpToolDef};
@@ -123,7 +123,7 @@ impl McpProvider {
                 let cache: ToolCache = Arc::new(RwLock::new(Arc::new(tools)));
                 // Watch for tools/list_changed and refresh the cache in the
                 // background (OCEAN-32).
-                let signal = client.lock().await.tools_changed_signal();
+                let signal = client.tools_changed_signal();
                 spawn_tools_changed_watcher(cfg.name.clone(), client, cache.clone(), signal);
                 Ok(Self {
                     id,
@@ -157,21 +157,24 @@ impl McpProvider {
         args: &[String],
         env: &[(String, String)],
         connect_timeout: Duration,
-    ) -> anyhow::Result<(Arc<Mutex<McpClient>>, Vec<McpToolDef>)> {
+    ) -> anyhow::Result<(Arc<McpClient>, Vec<McpToolDef>)> {
         let transport = StdioTransport::spawn(command, args, env)?;
         // Keep the client's default per-call timeout (30s) for live tool calls.
         // The handshake below is bounded separately by the outer `timeout`, so we
         // deliberately do NOT shrink the client's request timeout to
         // `connect_timeout` here — doing so would also throttle every later
         // `tools/call` to the (short) connect budget.
-        let client = McpClient::new(Box::new(transport));
-        let client = Arc::new(Mutex::new(client));
+        //
+        // The client multiplexes internally (OCEAN-44): its methods take `&self`
+        // and a single I/O task owns the transport, so concurrent callers don't
+        // serialize. We therefore share it as a plain `Arc`, with no outer mutex —
+        // a slow tool call in one session no longer head-of-line blocks another.
+        let client = Arc::new(McpClient::new(Box::new(transport)));
 
         // Handshake + discovery under one overall deadline.
         let defs: Vec<McpToolDef> = tokio::time::timeout(connect_timeout, async {
-            let mut guard = client.lock().await;
-            guard.initialize("ocean").await?;
-            guard.list_tools().await
+            client.initialize("ocean").await?;
+            client.list_tools().await
         })
         .await
         .map_err(|_| anyhow::anyhow!("MCP server `{server_name}` connect timed out"))??;
@@ -186,7 +189,7 @@ impl McpProvider {
 fn build_tools(
     server_name: &str,
     defs: Vec<McpToolDef>,
-    client: &Arc<Mutex<McpClient>>,
+    client: &Arc<McpClient>,
 ) -> Vec<SharedTool> {
     defs.into_iter()
         .map(|def| {
@@ -208,7 +211,7 @@ fn build_tools(
 /// handle's last sender goes away) — i.e. when the provider is torn down.
 fn spawn_tools_changed_watcher(
     server_name: String,
-    client: Arc<Mutex<McpClient>>,
+    client: Arc<McpClient>,
     cache: ToolCache,
     signal: Arc<tokio::sync::Notify>,
 ) {
@@ -216,10 +219,7 @@ fn spawn_tools_changed_watcher(
         loop {
             signal.notified().await;
             tracing::info!(server = %server_name, "refreshing MCP tool list after list_changed");
-            let fetched = {
-                let mut guard = client.lock().await;
-                guard.list_tools().await
-            };
+            let fetched = client.list_tools().await;
             match fetched {
                 Ok(defs) => {
                     let count = defs.len();
@@ -271,7 +271,7 @@ struct McpTool {
     remote_name: String,
     description: String,
     parameters: Value,
-    client: Arc<Mutex<McpClient>>,
+    client: Arc<McpClient>,
 }
 
 #[async_trait]
@@ -295,8 +295,10 @@ impl AgentTool for McpTool {
     }
 
     async fn execute(&self, _tool_call_id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let mut client = self.client.lock().await;
-        match client.call_tool(&self.remote_name, args).await {
+        // No lock across the call: the client multiplexes internally, so a slow
+        // call here does not block other sessions' calls to the same server
+        // (OCEAN-44).
+        match self.client.call_tool(&self.remote_name, args).await {
             Ok(res) if res.is_error => {
                 // Tool-execution error: surface as an error tool result so the
                 // model can react, not as a hard failure.

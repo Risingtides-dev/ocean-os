@@ -2,23 +2,46 @@
 //! (`initialize` → `notifications/initialized`), discovers tools
 //! (`tools/list`, following pagination), and invokes them (`tools/call`).
 //!
-//! This is a deliberately small, synchronous-request-over-async-transport
-//! client: each call writes a request and reads lines until it sees the
-//! matching response id. Server-initiated notifications encountered in between
-//! are logged and skipped. That is sufficient for a single-caller-at-a-time
-//! provider (the registry calls one server at a time during startup discovery
-//! and serialized per turn). It is NOT safe to share one `McpClient` across
-//! concurrent callers without external locking — the provider wraps it in a
-//! `Mutex` for exactly this reason.
+//! ## Concurrency (OCEAN-44)
+//!
+//! A single MCP server connection is one duplex line-stream shared across every
+//! session that can reach the server's tools. The naive design — wrap the whole
+//! client in one `Mutex` and hold it for the entire request round-trip — turns
+//! that shared stream into a head-of-line bottleneck: a slow `tools/call` in
+//! session A holds the lock and blocks session B's unrelated call for the full
+//! duration (up to the 30s per-request timeout).
+//!
+//! This client removes that blocking by **multiplexing** over the stream. A
+//! dedicated background **I/O task** owns the transport and is the only thing
+//! that ever touches it — so reads and writes never interleave across callers.
+//! Callers don't lock the client across the await:
+//!
+//! 1. allocate a request id (atomic counter, no lock),
+//! 2. register a `oneshot` waiter under a *brief* registry lock,
+//! 3. hand the framed line to the I/O task over an mpsc channel (the task does
+//!    the actual `send`, so writes are serialized without callers blocking each
+//!    other),
+//! 4. await the `oneshot` — lock-free — bounded by the per-request timeout.
+//!
+//! The I/O task reads each inbound line and routes responses to the matching
+//! waiter by id; `tools/list_changed` notifications fire the `tools_changed`
+//! signal; everything else is logged and dropped. Because awaiting the response
+//! holds no lock, two concurrent `call_tool`s on the same server now overlap
+//! instead of serializing — a slow A no longer blocks B.
+//!
+//! All public methods therefore take `&self`: the provider no longer needs an
+//! outer `Mutex<McpClient>`, just an `Arc<McpClient>`.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use ocean_protocol::Content;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Notify;
-use tokio::time::{timeout_at, Duration, Instant};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::time::{timeout, Duration};
 
 use crate::jsonrpc::{Incoming, Notification, Request};
 use crate::transport::Transport;
@@ -69,30 +92,66 @@ impl McpCallResult {
     }
 }
 
+/// The outcome the I/O task routes back to a waiting request: either the
+/// JSON-RPC `result` (or `Null`) or an error string lifted from the response's
+/// `error` object.
+type ResponseSlot = oneshot::Sender<Result<Value, String>>;
+
+/// Pending-response registry: request id → its waiter. Locked only briefly to
+/// insert/remove — never across the await of the response itself.
+type Pending = Arc<Mutex<HashMap<u64, ResponseSlot>>>;
+
+/// One line queued for the I/O task to write. An optional `ack` lets `notify()`
+/// surface a transport write error (a request, by contrast, waits on its
+/// response slot, so it leaves `ack` empty).
+struct Outgoing {
+    line: String,
+    ack: Option<oneshot::Sender<Result<()>>>,
+}
+
 pub struct McpClient {
-    // `+ Send` is required (not implied by the `Send` supertrait): an erased
-    // `dyn Transport` does not carry the `Send` auto-trait, which would make the
-    // whole client `!Send` and violate the runtime's `CapabilityProvider` /
-    // `AgentTool` Send bounds.
-    transport: Box<dyn Transport + Send>,
-    next_id: u64,
-    /// Per-request timeout. Bounds the whole request (not each line), so a
-    /// chatty server can't stall a call indefinitely. The spec requires senders
-    /// to time out rather than hang forever.
+    /// Channel into the I/O task: every outbound line goes through here so the
+    /// task — the sole owner of the transport — performs the actual write. This
+    /// serializes writes without forcing callers to hold a lock across their
+    /// response wait.
+    outbound: mpsc::UnboundedSender<Outgoing>,
+    /// Monotonic request id source. Atomic so `request()` needs no lock to
+    /// allocate an id.
+    next_id: AtomicU64,
+    /// Pending responses keyed by request id. The I/O task removes and fires the
+    /// matching `oneshot` when a response arrives.
+    pending: Pending,
+    /// Per-request timeout. Bounds the whole request, so a slow or silent server
+    /// can't make a caller wait forever. The spec requires senders to time out
+    /// rather than hang.
     request_timeout: Duration,
-    /// Notified whenever a `tools/list_changed` notification is observed while
-    /// draining the request loop. The provider waits on this to trigger a
-    /// background re-fetch + atomic swap of its cached tool list (OCEAN-32).
+    /// Notified whenever a `tools/list_changed` notification is observed by the
+    /// I/O task. The provider waits on this to trigger a background re-fetch +
+    /// atomic swap of its cached tool list (OCEAN-32).
     tools_changed: Arc<Notify>,
 }
 
 impl McpClient {
     pub fn new(transport: Box<dyn Transport + Send>) -> Self {
-        Self {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let tools_changed = Arc::new(Notify::new());
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outgoing>();
+
+        // The I/O task owns the transport outright and is the *only* thing that
+        // touches it — so reads and writes never interleave across callers.
+        spawn_io_task(
             transport,
-            next_id: 1,
+            outbound_rx,
+            pending.clone(),
+            tools_changed.clone(),
+        );
+
+        Self {
+            outbound: outbound_tx,
+            next_id: AtomicU64::new(1),
+            pending,
             request_timeout: Duration::from_secs(30),
-            tools_changed: Arc::new(Notify::new()),
+            tools_changed,
         }
     }
 
@@ -112,17 +171,15 @@ impl McpClient {
         self
     }
 
-    fn take_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
+    fn take_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Run the initialize handshake. Returns the server's reported name, when
     /// present. Sends `initialize`, waits for the result, then fires the
     /// `notifications/initialized` notification as required before any other
     /// requests.
-    pub async fn initialize(&mut self, client_name: &str) -> Result<String> {
+    pub async fn initialize(&self, client_name: &str) -> Result<String> {
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
@@ -150,7 +207,7 @@ impl McpClient {
     }
 
     /// List all tools, following `nextCursor` pagination to completion.
-    pub async fn list_tools(&mut self) -> Result<Vec<McpToolDef>> {
+    pub async fn list_tools(&self) -> Result<Vec<McpToolDef>> {
         #[derive(Deserialize)]
         struct ListResult {
             #[serde(default)]
@@ -176,7 +233,7 @@ impl McpClient {
     }
 
     /// Invoke a tool by its server-side name with JSON arguments.
-    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<McpCallResult> {
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpCallResult> {
         let params = json!({ "name": name, "arguments": arguments });
         let result = self.request("tools/call", Some(params)).await?;
 
@@ -194,78 +251,205 @@ impl McpClient {
         Ok(McpCallResult { content, is_error })
     }
 
-    /// Cleanly shut the connection down.
-    pub async fn close(&mut self) -> Result<()> {
-        self.transport.close().await
+    /// Best-effort shutdown signal. The real teardown happens when the last
+    /// `McpClient` is dropped: that closes the `outbound` channel, the I/O task
+    /// observes the close and shuts the transport down. Retained as an awaitable
+    /// API for callers that previously relied on `close()`.
+    pub async fn close(&self) -> Result<()> {
+        Ok(())
     }
 
-    /// Send a request and read lines until the matching response arrives.
-    /// Bounded by `request_timeout` for the whole call. Skips and logs any
-    /// server notification or mismatched-id message seen in the meantime.
-    async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+    /// Send a request and await its response, multiplexed over the shared stream.
+    ///
+    /// Registers a response slot, hands the framed line to the I/O task, then
+    /// awaits the slot bounded by `request_timeout`. Crucially, **no lock is held
+    /// across the await** — concurrent requests from other sessions proceed in
+    /// parallel rather than queuing behind this one (OCEAN-44).
+    async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
         let id = self.take_id();
         let req = Request::new(id, method, params);
         let line = serde_json::to_string(&req)?;
-        self.transport.send(&line).await?;
 
-        // Absolute deadline for the WHOLE request, computed once. The loop below
-        // may read several lines (skipping server notifications / stale ids), so
-        // a per-line timeout would let a chatty server stall us indefinitely as
-        // long as each individual line arrived in time. `timeout_at` against a
-        // fixed instant bounds the total wait regardless of how many interleaved
-        // messages arrive.
-        let deadline = Instant::now() + self.request_timeout;
-        loop {
-            let next = timeout_at(deadline, self.transport.recv())
-                .await
-                .map_err(|_| anyhow!("MCP request `{method}` timed out"))??;
-            let Some(raw) = next else {
-                return Err(anyhow!(
+        // Register the waiter BEFORE sending so a fast server can't answer before
+        // we're listening for it.
+        let (tx, rx) = oneshot::channel::<Result<Value, String>>();
+        self.pending.lock().await.insert(id, tx);
+
+        // Hand the line to the I/O task to write. If the channel is closed the
+        // I/O task is gone (server exited / transport dropped).
+        if self.outbound.send(Outgoing { line, ack: None }).is_err() {
+            self.pending.lock().await.remove(&id);
+            return Err(anyhow!("MCP request `{method}` failed: connection closed"));
+        }
+
+        // Await the response with no lock held. On timeout, clean up the slot so
+        // a late response doesn't leak an entry.
+        match timeout(self.request_timeout, rx).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(rpc_err))) => Err(anyhow!(rpc_err)),
+            Ok(Err(_recv)) => {
+                // I/O task dropped the sender → connection closed mid-flight.
+                Err(anyhow!(
                     "MCP server closed the connection during `{method}`"
-                ));
-            };
-            let msg: Incoming = match serde_json::from_str(&raw) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(error = %e, "unparseable MCP message; skipping");
-                    continue;
-                }
-            };
-            if !msg.is_response() {
-                // Server-initiated notification. `tools/list_changed` invalidates
-                // the provider's cached tool snapshot: fire the signal so the
-                // provider's watcher re-fetches in the background (OCEAN-32).
-                // Other notifications are logged and skipped while we keep
-                // waiting for our response.
-                if let Some(m) = &msg.method {
-                    if m == TOOLS_LIST_CHANGED {
-                        tracing::info!(
-                            notification = %m,
-                            "MCP tools/list_changed received; invalidating cached tool list"
-                        );
-                        self.tools_changed.notify_one();
-                    } else {
-                        tracing::debug!(notification = %m, "ignoring MCP server notification");
-                    }
-                }
-                continue;
+                ))
             }
-            if !msg.matches_id(id) {
-                tracing::warn!(got = ?msg.id, want = id, "out-of-order MCP response; skipping");
-                continue;
+            Err(_elapsed) => {
+                self.pending.lock().await.remove(&id);
+                Err(anyhow!("MCP request `{method}` timed out"))
             }
-            if let Some(err) = msg.error {
-                return Err(anyhow!(err));
-            }
-            return Ok(msg.result.unwrap_or(Value::Null));
         }
     }
 
-    async fn notify(&mut self, method: &str, params: Option<Value>) -> Result<()> {
+    /// Fire a notification (no id, no response expected). Still routed through
+    /// the I/O task so it can't interleave with a concurrent request's write;
+    /// awaits the write ack so a transport error still surfaces.
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
         let note = Notification::new(method, params);
         let line = serde_json::to_string(&note)?;
-        self.transport.send(&line).await
+        let (ack_tx, ack_rx) = oneshot::channel::<Result<()>>();
+        self.outbound
+            .send(Outgoing {
+                line,
+                ack: Some(ack_tx),
+            })
+            .map_err(|_| anyhow!("MCP notify `{method}` failed: connection closed"))?;
+        ack_rx
+            .await
+            .map_err(|_| anyhow!("MCP notify `{method}` failed: connection closed"))?
     }
+}
+
+/// Spawn the single I/O task that owns the transport. It drives both directions:
+/// drains the outbound channel to write framed lines, and reads inbound lines to
+/// route responses to waiters / fire the `tools_changed` signal. Owning the
+/// transport in one task is what makes concurrent callers safe without a lock
+/// held across the round-trip (OCEAN-44).
+fn spawn_io_task(
+    mut transport: Box<dyn Transport + Send>,
+    mut outbound: mpsc::UnboundedReceiver<Outgoing>,
+    pending: Pending,
+    tools_changed: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // Outbound: a caller queued a line to write.
+                maybe_out = outbound.recv() => {
+                    let Some(out) = maybe_out else {
+                        // All client handles dropped: shut the connection down.
+                        let _ = transport.close().await;
+                        break;
+                    };
+                    let res = transport.send(&out.line).await;
+                    match out.ack {
+                        Some(ack) => {
+                            let _ = ack.send(res);
+                        }
+                        None => {
+                            if let Err(e) = res {
+                                // A request's write failed. The line is opaque
+                                // here, so we can't map it back to a specific id;
+                                // log it and let the waiting request surface a
+                                // timeout. Rare — stdin writes fail only on a dead
+                                // child, which also closes recv and ends the task.
+                                tracing::warn!(error = %e, "MCP transport write failed");
+                            }
+                        }
+                    }
+                }
+
+                // Inbound: the server sent a line.
+                read = transport.recv() => {
+                    match read {
+                        Ok(Some(raw)) => {
+                            route_inbound(&raw, &pending, &tools_changed).await;
+                        }
+                        Ok(None) => {
+                            // EOF: server exited. Fail every pending waiter so
+                            // in-flight requests return promptly instead of
+                            // waiting out their timeout.
+                            fail_all_pending(&pending).await;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MCP transport read failed; closing connection");
+                            fail_all_pending(&pending).await;
+                            let _ = transport.close().await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Parse one inbound line and route it: a response goes to its waiter by id; a
+/// `tools/list_changed` notification fires the signal; anything else is logged.
+async fn route_inbound(raw: &str, pending: &Pending, tools_changed: &Arc<Notify>) {
+    let msg: Incoming = match serde_json::from_str(raw) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "unparseable MCP message; skipping");
+            return;
+        }
+    };
+
+    if !msg.is_response() {
+        // Server-initiated notification. `tools/list_changed` invalidates the
+        // provider's cached tool snapshot (OCEAN-32); others are logged.
+        if let Some(m) = &msg.method {
+            if m == TOOLS_LIST_CHANGED {
+                tracing::info!(
+                    notification = %m,
+                    "MCP tools/list_changed received; invalidating cached tool list"
+                );
+                tools_changed.notify_one();
+            } else {
+                tracing::debug!(notification = %m, "ignoring MCP server notification");
+            }
+        }
+        return;
+    }
+
+    // A response: pull the matching waiter by id and deliver. MCP ids are the
+    // numbers we sent (string-encoded ids accepted via `response_id`).
+    let Some(id) = response_id(&msg) else {
+        tracing::warn!(got = ?msg.id, "MCP response with unusable id; skipping");
+        return;
+    };
+    let slot = pending.lock().await.remove(&id);
+    match slot {
+        Some(tx) => {
+            let payload = if let Some(err) = msg.error {
+                Err(err.to_string())
+            } else {
+                Ok(msg.result.unwrap_or(Value::Null))
+            };
+            // If the receiver is gone (caller timed out), this just drops.
+            let _ = tx.send(payload);
+        }
+        None => {
+            tracing::warn!(id, "out-of-order or stale MCP response; no waiter");
+        }
+    }
+}
+
+/// Extract the numeric id from a response, accepting a string-encoded number
+/// (some servers echo ids as strings).
+fn response_id(msg: &Incoming) -> Option<u64> {
+    match &msg.id {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Fail every still-pending request so callers don't wait out their full timeout
+/// when the connection drops. Dropping each `oneshot` sender (via `clear`) makes
+/// the waiting `request()` see a recv error and return "connection closed".
+async fn fail_all_pending(pending: &Pending) {
+    pending.lock().await.clear();
 }
 
 /// Map MCP content blocks onto Ocean's [`Content`] model.
