@@ -1,5 +1,7 @@
 # Ocean OS architecture
 
+> Last validated against source: 2026-06-05.
+
 Ocean OS is a Rust-native coding-agent runtime and daemon. The daemon owns runtime authority; `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that runtime.
 
 ## Crates
@@ -59,6 +61,18 @@ ocean-acp
 ocean-heartbeat
   Scheduler binary for Ocean daemon routines: prompt-injection hooks now,
   courier jobs later. Generates and runs schedulers that drive the daemon URL.
+
+ocean-call
+  Daemon-side Twilio/LiveKit call-intelligence pipeline. A real phone number,
+  bridged via Twilio SIP into a LiveKit room, that Ocean joins as a server-side
+  participant. Over one shared audio stream it runs two lanes: a passive lane
+  (server-side room audio tap → streaming STT → rolling summarizer + task
+  detection, emitting call OceanEvents onto the daemon SSE rail) and an
+  active, wake-word-gated lane ("hey Ocean…" → wake-gate → one ephemeral agent
+  turn → TTS speaker back into the call). Components: room_tap, frame
+  re-chunker, stt (+ stt_xai), summarizer, task_detector, wake gate,
+  sip_bridge, speaker (TTS), and a Twilio/LiveKit webhook. Backs
+  POST /v1/calls/place, /v1/calls/webhook, and /v1/calls/demo on the daemon.
 
 ocean-daemon
   Long-running OS service. Owns API surface for OceanTUI/Ocean GUI and

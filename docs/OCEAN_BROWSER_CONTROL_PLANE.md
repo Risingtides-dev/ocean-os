@@ -48,15 +48,15 @@ solved work.
 | Active page prefers the real tab | ✓ | `active_page()` skips `chrome-extension://` and devtools — `crates/ocean-browser/src/lib.rs:37–82` |
 | `CapabilityProvider` registry (ordered, first-claim-wins) | ✓ | `crates/ocean-runtime/src/capability.rs:65`; MCP rides the same path (`crates/ocean-mcp`) |
 | `client_type` plumbing end-to-end | ✓ | `AgentTurnRequest.client_type` (`crates/ocean-agent-sdk/src/lib.rs:200`) → daemon (`crates/ocean-daemon/src/main.rs:1757–1853`) → `build_system_prompt` (`crates/ocean-agent/src/lib.rs:452`) → `append_client_type` (`lib.rs:1981`) |
-| **Dedicated extension prompt** | **✗ not built** | `append_client_type` (`crates/ocean-agent/src/lib.rs:1981–1991`) has arms for `tui`, `surface-web`, `surface-gpui`, `surface-native`, `cli`, `leo-voice`, and a generic `Some(other)` fallthrough. **There is no `surface-extension` arm anywhere in the repo.** A `surface-extension` client_type currently resolves to the generic *"You are speaking through an unknown client"* message. |
+| **Dedicated extension prompt** | ✓ | `append_client_type` (`crates/ocean-agent/src/lib.rs`) has a `Some("surface-extension") => extension_surface_prompt(prompt)` arm alongside `tui`, `surface-web`, `surface-gpui`, `surface-native`, `cli`, `leo-voice`, and the generic `Some(other)` fallthrough (OCEAN-16). A `surface-extension` client_type now resolves to a dedicated extension prompt, not the generic *"unknown client"* message. |
 
 **ocean-surface side (not verified from this doc's session — confirm against the `ocean-surface`
 repo before relying on these):** the surface reportedly computes `surface_client_type()` and
 emits `"surface-extension"` when running under `chrome-extension://`
 (`crates/ocean-surface-ui/src/daemon.rs`), and the MV3 `manifest.json` declares only
 `["sidePanel","storage"]` plus a host permission to `127.0.0.1:4780` — no `tabs`, `scripting`,
-or `debugger`. If those hold, then the **plumbing carries an identity the daemon doesn't yet
-specialize for** (see Phase 1).
+or `debugger`. The daemon now specializes for that identity: the `surface-extension`
+arm in `append_client_type` is in place (Phase 1 done).
 
 ---
 
@@ -64,24 +64,24 @@ specialize for** (see Phase 1).
 
 ```
 P1 identity ──> P2 active-tab ──> P3 ClientContext ──> P4 multi-tab ──> P5 DOM bridge ──> P6 registry
-(plumbed,        (highest          (typed schema      (scale past      (heaviest        (more tools,
- 1 arm left)      leverage,         the plane          one page)        escalation,      not a new
+(DONE,           (highest          (typed schema      (scale past      (heaviest        (more tools,
+ OCEAN-16)        leverage,         the plane          one page)        escalation,      not a new
                   next)             hangs off)                          gated)           transport)
 ```
 
-### Phase 1 — Surface identity (plumbing done; one small gap)
+### Phase 1 — Surface identity (DONE, OCEAN-16)
 
-The `client_type` string already flows extension → daemon → system prompt. The only missing
-piece is a **dedicated `surface-extension` arm** in `append_client_type`
-(`crates/ocean-agent/src/lib.rs:1981`), mirroring the existing `surface-web` / `surface-gpui`
-arms, with a prompt that tells the agent:
+The `client_type` string flows extension → daemon → system prompt, and the daemon now has a
+**dedicated `surface-extension` arm** in `append_client_type`
+(`crates/ocean-agent/src/lib.rs`, `Some("surface-extension") => extension_surface_prompt(prompt)`),
+mirroring the existing `surface-web` / `surface-gpui` arms, with a prompt that tells the agent:
 
 - it is docked inside the user's Chrome (extension side panel), and
 - its `browser_*` tools drive a live browser tab (not a headless scratch instance the user
   can't see).
 
-This is the cheapest first move and the prerequisite for everything below making sense to the
-model. *(Doc only — not written here.)*
+This was the cheapest first move and the prerequisite for everything below making sense to the
+model. *(Shipped in OCEAN-16.)*
 
 ### Phase 2 — Active-tab context (highest leverage, next)
 

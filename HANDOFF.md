@@ -31,9 +31,9 @@ phased build* the doc describes — which is a separate, future effort, not part
 
 If you (local agent) are meant to continue, the natural next steps are:
 1. Get John's answers to the three open decisions (§6 of the doc).
-2. Start Phase 1's one remaining gap: add a `surface-extension` arm to `append_client_type`
-   (`crates/ocean-agent/src/lib.rs:1981`), mirroring the existing `surface-web`/`surface-gpui` arms.
-   This is the smallest concrete code step the doc identifies.
+2. Phase 1 is now DONE (OCEAN-16): `append_client_type` has a
+   `Some("surface-extension") => extension_surface_prompt(prompt)` arm in
+   `crates/ocean-agent/src/lib.rs`. The next concrete step is Phase 2 (active-tab context).
 
 ## Verified ground truth (don't re-verify from scratch)
 
@@ -53,11 +53,12 @@ If you (local agent) are meant to continue, the natural next steps are:
   `guidance` dropped at 1763) → `build_system_prompt` (`crates/ocean-agent/src/lib.rs:452`) →
   `append_client_type` (`lib.rs:1981`).
 
-**Two things the original draft got wrong (the doc corrects them):**
-1. **Phase 1 is NOT done.** There is no `surface-extension` arm and no `extension_surface_prompt`
-   anywhere in the repo (checked all branches). A `surface-extension` client_type currently falls
-   through to the generic `Some(other)` "unknown client" message. Plumbing is real; the dedicated
-   extension prompt is not built.
+**Note on Phase 1 (updated 2026-06-05, OCEAN-66):**
+1. **Phase 1 is now DONE (OCEAN-16).** `append_client_type` has a
+   `Some("surface-extension") => extension_surface_prompt(prompt)` arm in
+   `crates/ocean-agent/src/lib.rs`. (At the time this handoff was first written the arm did not
+   exist and a `surface-extension` client_type fell through to the generic "unknown client"
+   message — that gap is now closed.)
 2. **`ocean-acp` ≠ "ACP-level".** `crates/ocean-acp/` is the *Agent Client Protocol* bridge for Zed.
    John's "ACP-level control plane" means breadth of browser control, not that crate. Don't conflate.
 
@@ -88,9 +89,9 @@ daemon restart.
 1. **Goal & framing** — agent as first-class browser operator across four surfaces (UI / API /
    CLI-style / dev tools); current single-browser daemon-driven Chrome-for-Testing model; one-line
    ACP disambiguation.
-2. **The floor** — table of what exists today, each row citing a real path, plus the honest caveat
-   that the `surface-extension` prompt arm does not exist yet.
-3. **Phased roadmap** — P1 identity (plumbed, 1 arm left) → P2 active-tab context (highest leverage,
+2. **The floor** — table of what exists today, each row citing a real path. (The
+   `surface-extension` prompt arm now exists — shipped in OCEAN-16.)
+3. **Phased roadmap** — P1 identity (DONE, OCEAN-16) → P2 active-tab context (highest leverage,
    next; daemon-side (a) vs extension `tabs` (b)) → P3 typed `ClientContext` (schema + serde
    dual-compat) → P4 per-tab/multi-tab steering → P5 DOM bridge / content-script reach (gated) →
    P6 tool-registry expansion (ACP/MCP shape).
