@@ -31,7 +31,11 @@ impl AgentTool for BrowserClickTool {
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
         if let Some(r) = args.get("ref").and_then(|v| v.as_str()) {
-            self.ctx.lazy.get().await?.click_selector(r)
+            self.ctx
+                .lazy
+                .get()
+                .await?
+                .click_selector(r)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(active_result(format!("clicked {r}")))
@@ -39,7 +43,11 @@ impl AgentTool for BrowserClickTool {
             args.get("x").and_then(|v| v.as_f64()),
             args.get("y").and_then(|v| v.as_f64()),
         ) {
-            self.ctx.lazy.get().await?.click_xy(x, y)
+            self.ctx
+                .lazy
+                .get()
+                .await?
+                .click_xy(x, y)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(active_result(format!("clicked ({x},{y})")))
@@ -72,7 +80,11 @@ impl AgentTool for BrowserTypeTool {
             .get("text")
             .and_then(|v| v.as_str())
             .ok_or("missing 'text'")?;
-        self.ctx.lazy.get().await?.type_text(text)
+        self.ctx
+            .lazy
+            .get()
+            .await?
+            .type_text(text)
             .await
             .map_err(|e| e.to_string())?;
         Ok(active_result(format!("typed {} chars", text.len())))
@@ -102,7 +114,11 @@ impl AgentTool for BrowserKeyTool {
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or("missing 'key'")?;
-        self.ctx.lazy.get().await?.press_key(key)
+        self.ctx
+            .lazy
+            .get()
+            .await?
+            .press_key(key)
             .await
             .map_err(|e| e.to_string())?;
         Ok(active_result(format!("pressed {key}")))
@@ -133,7 +149,11 @@ impl AgentTool for BrowserScrollTool {
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
         let dx = args.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let dy = args.get("dy").and_then(|v| v.as_f64()).unwrap_or(600.0);
-        self.ctx.lazy.get().await?.scroll_by(dx, dy)
+        self.ctx
+            .lazy
+            .get()
+            .await?
+            .scroll_by(dx, dy)
             .await
             .map_err(|e| e.to_string())?;
         Ok(active_result(format!("scrolled ({dx},{dy})")))

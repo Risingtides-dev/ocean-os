@@ -36,5 +36,8 @@ async fn read_page_finds_link() {
     h.navigate("https://example.com").await.expect("nav");
     let read = h.read_page().await.expect("read");
     assert!(read.text.to_lowercase().contains("example"));
-    assert!(read.elements.iter().any(|e| e.role == "a" || e.role == "link"));
+    assert!(read
+        .elements
+        .iter()
+        .any(|e| e.role == "a" || e.role == "link"));
 }

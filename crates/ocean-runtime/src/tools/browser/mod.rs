@@ -3,10 +3,11 @@
 //! emits a `BrowserActivity { active: true }` side-effect so the daemon can
 //! drive the side-panel handoff.
 
-pub mod inspect;
 pub mod input;
+pub mod inspect;
 pub mod nav;
 pub mod perceive;
+pub mod tabs;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,10 +38,16 @@ impl LazyBrowser {
     }
 
     /// Get-or-launch the shared browser. Called from inside a tool's execute().
+    /// If the cached handle's browser process/websocket is dead we drop it and
+    /// re-launch — this is the fix for "CDP receiver is gone" / stale handles
+    /// persisting across turns.
     pub async fn get(&self) -> Result<Arc<BrowserHandle>, String> {
         let mut guard = self.handle.lock().await;
         if let Some(h) = guard.as_ref() {
-            return Ok(h.clone());
+            if h.is_alive().await {
+                return Ok(h.clone());
+            }
+            tracing::warn!("cached browser handle is dead; dropping and re-launching");
         }
         let h = Arc::new(
             BrowserHandle::launch((*self.cfg).clone())
@@ -79,7 +86,12 @@ pub fn browser_tools(ctx: BrowserToolCtx) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(input::BrowserScrollTool { ctx: ctx.clone() }),
         Arc::new(inspect::BrowserEvalJsTool { ctx: ctx.clone() }),
         Arc::new(inspect::BrowserConsoleTool { ctx: ctx.clone() }),
-        Arc::new(inspect::BrowserNetworkTool { ctx }),
+        Arc::new(inspect::BrowserNetworkTool { ctx: ctx.clone() }),
+        // Shell layer — tab control (the Layer-3 jump).
+        Arc::new(tabs::BrowserListTabsTool { ctx: ctx.clone() }),
+        Arc::new(tabs::BrowserOpenTabTool { ctx: ctx.clone() }),
+        Arc::new(tabs::BrowserSwitchTabTool { ctx: ctx.clone() }),
+        Arc::new(tabs::BrowserCloseTabTool { ctx }),
     ]
 }
 

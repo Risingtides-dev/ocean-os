@@ -171,9 +171,13 @@ mod tests {
             port: 0,
         };
         let args = cfg.to_args();
-        assert!(args.iter().any(|a| a == "--user-data-dir=/tmp/ocean-profile"));
+        assert!(args
+            .iter()
+            .any(|a| a == "--user-data-dir=/tmp/ocean-profile"));
         assert!(args.iter().any(|a| a == "--load-extension=/tmp/ocean-ext"));
-        assert!(args.iter().any(|a| a.starts_with("--remote-debugging-port=")));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("--remote-debugging-port=")));
         assert!(!args.iter().any(|a| a == "--headless=new"));
         assert!(!args.iter().any(|a| a.starts_with("--profile-directory")));
     }
