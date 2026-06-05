@@ -31,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 mod config;
 pub use config::{DaemonConfig, McpSection};
 mod project;
+mod rooms;
+pub use rooms::{RoomRecord, RoomRegistry, RoomStoreError};
 
 const APP_NAME: &str = "ocean-rs";
 

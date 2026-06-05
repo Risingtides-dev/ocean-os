@@ -487,6 +487,139 @@ impl Room {
     }
 }
 
+/// What kind of entry a [`RoomMessage`] is. The transcript is a flat,
+/// append-only event log per the collaboration model's "Room = collaboration /
+/// event layer (who says what, when)". Kept minimal: chat lines plus a couple of
+/// structural markers. Richer kinds (tool calls, renders, turn boundaries) are
+/// future work and can be added without breaking existing serde.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomMessageKind {
+    /// A human/agent/bot chat line (the common case).
+    Message,
+    /// A participant joined the room.
+    ParticipantJoined,
+    /// A participant left the room.
+    ParticipantLeft,
+    /// A system/notice line (e.g. an auto-convene notification).
+    System,
+}
+
+/// One entry in a [`Room`]'s transcript (OCEAN-65). Carries author attribution
+/// per the collaboration model's "every room event carries author identity".
+///
+/// `author_id` is a [`RoomParticipant::id`] when the author is a known
+/// participant; for system-generated entries it may be a synthetic id like
+/// `"system"`. `seq` is a monotonically increasing, room-scoped sequence number
+/// assigned by the store so clients can request `after_seq` tails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomMessage {
+    /// Room-scoped, monotonically increasing sequence number (assigned by store).
+    pub seq: u64,
+    /// Participant id of the author (or a synthetic id like `"system"`).
+    pub author_id: String,
+    /// What kind of actor authored this entry, for attribution in the UI.
+    pub author_kind: RoomParticipantKind,
+    /// What kind of transcript entry this is.
+    pub kind: RoomMessageKind,
+    /// The body text. For structural markers this is a short human description.
+    pub body: String,
+    /// When the entry was appended.
+    pub created_at: DateTime<Utc>,
+}
+
+/// A room-level event that the [`RoomTriggerPolicy`] is evaluated against
+/// (OCEAN-65). This is the "what just happened" input to trigger evaluation; the
+/// policy decides whether it should wake/convene an agent. Mirrors the
+/// collaboration model's `TriggerPolicy` fields one-for-one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum RoomTriggerEvent {
+    /// A participant was @-mentioned in a transcript message.
+    Mention { participant_id: String },
+    /// A reply landed in a thread a participant is part of.
+    ThreadReply { participant_id: String },
+    /// A rendered component emitted an interaction event.
+    ComponentEvent { component_id: String },
+    /// A scheduled tick fired (cron-driven). Carries no payload here.
+    Schedule,
+}
+
+/// The decision produced by [`evaluate_trigger_policy`]: whether a room event
+/// should auto-convene/notify, and a short human-readable reason. When
+/// `should_convene` is true the daemon emits a notification event and (in the
+/// future) queues a turn for the named participant; see the daemon wiring point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerDecision {
+    /// Whether this event should wake/convene an agent.
+    pub should_convene: bool,
+    /// Which participant (if any) should be woken. `None` for schedule ticks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_participant: Option<String>,
+    /// Human-readable explanation, surfaced in logs and the notice event.
+    pub reason: String,
+}
+
+/// Decide whether a [`RoomTriggerEvent`] should auto-convene/notify, given a
+/// room's optional [`RoomTriggerPolicy`] (OCEAN-65).
+///
+/// This is the pure, testable core of trigger evaluation — no I/O, no awaits.
+/// The daemon calls it at the wiring point (after appending a transcript entry
+/// or receiving a component event) and, on a positive decision, emits a notice
+/// event. The actual auto-convene (queuing a turn for the target agent) hooks in
+/// where the daemon already spawns agent turns; until that lands the decision is
+/// observable purely as an emitted event.
+///
+/// An absent policy (`None`) never convenes. Each policy flag gates exactly one
+/// event variant, matching the collaboration model's `TriggerPolicy`.
+pub fn evaluate_trigger_policy(
+    policy: Option<&RoomTriggerPolicy>,
+    event: &RoomTriggerEvent,
+) -> TriggerDecision {
+    let Some(policy) = policy else {
+        return TriggerDecision {
+            should_convene: false,
+            target_participant: None,
+            reason: "no trigger policy configured".into(),
+        };
+    };
+
+    match event {
+        RoomTriggerEvent::Mention { participant_id } if policy.on_mention => TriggerDecision {
+            should_convene: true,
+            target_participant: Some(participant_id.clone()),
+            reason: format!("on_mention: @{participant_id} mentioned"),
+        },
+        RoomTriggerEvent::ThreadReply { participant_id } if policy.on_thread_reply => {
+            TriggerDecision {
+                should_convene: true,
+                target_participant: Some(participant_id.clone()),
+                reason: format!("on_thread_reply: reply in {participant_id}'s thread"),
+            }
+        }
+        RoomTriggerEvent::ComponentEvent { component_id } if policy.on_component_event => {
+            TriggerDecision {
+                should_convene: true,
+                target_participant: None,
+                reason: format!("on_component_event: component '{component_id}' emitted"),
+            }
+        }
+        RoomTriggerEvent::Schedule if policy.on_schedule.is_some() => TriggerDecision {
+            should_convene: true,
+            target_participant: None,
+            reason: format!(
+                "on_schedule: cron '{}' fired",
+                policy.on_schedule.as_deref().unwrap_or("")
+            ),
+        },
+        _ => TriggerDecision {
+            should_convene: false,
+            target_participant: None,
+            reason: "policy does not match this event".into(),
+        },
+    }
+}
+
 /// Response payload for `POST /v1/requests`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestCreateResponse {
@@ -863,6 +996,79 @@ mod tests {
         assert!(room.trigger_policy.is_none());
         assert_eq!(room.created_at, room.updated_at);
         assert_eq!(room.id.as_str(), "r1");
+    }
+
+    #[test]
+    fn trigger_policy_fires_on_matching_mention() {
+        let policy = RoomTriggerPolicy {
+            on_mention: true,
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::Mention {
+                participant_id: "ocean".into(),
+            },
+        );
+        assert!(decision.should_convene);
+        assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
+    }
+
+    #[test]
+    fn trigger_policy_ignores_unmatched_event() {
+        // on_mention enabled, but a component event arrives — must not convene.
+        let policy = RoomTriggerPolicy {
+            on_mention: true,
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::ComponentEvent {
+                component_id: "map-1".into(),
+            },
+        );
+        assert!(!decision.should_convene);
+        assert!(decision.target_participant.is_none());
+    }
+
+    #[test]
+    fn trigger_policy_absent_never_convenes() {
+        let decision = evaluate_trigger_policy(
+            None,
+            &RoomTriggerEvent::Mention {
+                participant_id: "ocean".into(),
+            },
+        );
+        assert!(!decision.should_convene);
+    }
+
+    #[test]
+    fn trigger_policy_schedule_uses_cron_in_reason() {
+        let policy = RoomTriggerPolicy {
+            on_schedule: Some("0 9 * * *".into()),
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(Some(&policy), &RoomTriggerEvent::Schedule);
+        assert!(decision.should_convene);
+        assert!(decision.reason.contains("0 9 * * *"));
+    }
+
+    #[test]
+    fn room_message_roundtrips_through_serde() {
+        let msg = RoomMessage {
+            seq: 3,
+            author_id: "john".into(),
+            author_kind: RoomParticipantKind::Human,
+            kind: RoomMessageKind::Message,
+            body: "@ocean fix the markers".into(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["seq"], 3);
+        assert_eq!(json["author_kind"], "human");
+        assert_eq!(json["kind"], "message");
+        let roundtrip: RoomMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, msg);
     }
 
     #[test]

@@ -30,8 +30,10 @@ use ocean_core::{
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectResponse,
     ProjectsResponse, PromptRequest, RequestControlResponse, RequestCreateResponse, RequestId,
-    RequestState, RequestStatus, RequestsResponse, RoomId, RoomPanelSnapshot, RoomSnapshot,
-    RoomsResponse, SessionDetail, SessionId, SessionResponse, SessionRunState, SessionSummary,
+    evaluate_trigger_policy, RequestState, RequestStatus, RequestsResponse, RoomId, RoomKey,
+    RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind, RoomSnapshot,
+    RoomTriggerEvent, RoomTriggerPolicy, RoomsResponse, SessionDetail, SessionId, SessionResponse,
+    SessionRunState, SessionSummary,
 };
 use ocean_runtime::{
     tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
@@ -65,9 +67,16 @@ struct AppState {
     /// observability deck survives a refresh (OCEAN-58). Convergence is still
     /// decided only by the per-council `QuorumEngine`; this only mirrors it.
     longhouse: LonghouseRegistryHandle,
+    /// Persistent Room lifecycle store (OCEAN-65): the durable `Room` entities
+    /// (roster + transcript + trigger policy), distinct from the Track-0
+    /// `RoomSnapshot` projection served by `GET /v1/rooms`. In-memory for now;
+    /// SQLite persistence is a future ticket. Held behind a std `Mutex` like the
+    /// longhouse registry — the guard is always dropped before any `await`.
+    rooms: RoomRegistryHandle,
 }
 
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
+type RoomRegistryHandle = Arc<Mutex<ocean_agent::RoomRegistry>>;
 
 type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
 type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
@@ -314,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
+        rooms: Arc::new(Mutex::new(ocean_agent::RoomRegistry::new())),
     };
 
     // Background GC: the request/permission registries are otherwise unbounded
@@ -358,6 +368,31 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/permissions", get(permissions))
         .route("/v1/permissions/{id}/decision", post(permission_decision))
         .route("/v1/rooms", get(rooms))
+        // Persistent Room lifecycle (OCEAN-65). Namespaced under `/persistent`
+        // so it never shadows the Track-0 projection route `/v1/rooms/{room_id}`
+        // below: `persistent` is a reserved segment, real room keys live one
+        // level deeper at `/v1/rooms/persistent/{key}`.
+        .route(
+            "/v1/rooms/persistent",
+            get(rooms_list_persistent).post(room_create),
+        )
+        .route("/v1/rooms/persistent/{key}", get(room_get))
+        .route(
+            "/v1/rooms/persistent/{key}/participants",
+            post(room_join),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/participants/{participant_id}",
+            axum::routing::delete(room_leave),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/messages",
+            post(room_post_message),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/transcript",
+            get(room_transcript),
+        )
         .route("/v1/rooms/{room_id}", get(room))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
@@ -415,6 +450,13 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/permissions/{id}/decision",
             "GET /v1/rooms",
             "GET /v1/rooms/{room_id}",
+            "GET /v1/rooms/persistent",
+            "POST /v1/rooms/persistent",
+            "GET /v1/rooms/persistent/{key}",
+            "POST /v1/rooms/persistent/{key}/participants",
+            "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
+            "POST /v1/rooms/persistent/{key}/messages",
+            "GET /v1/rooms/persistent/{key}/transcript",
             "GET /v1/sessions",
             "GET /v1/sessions/{id}",
             "GET /v1/projects",
@@ -1396,6 +1438,324 @@ async fn longhouse_topic(
                 "error": format!("no longhouse topic with id '{id}'"),
             })),
         ),
+    }
+}
+
+// ---- Persistent Rooms (OCEAN-65) -------------------------------------------
+//
+// These routes serve the *persistent* `Room` lifecycle: create, fetch, roster
+// join/leave, post message, read transcript. They are intentionally additive and
+// fully separate from the Track-0 `RoomSnapshot` projection (`GET /v1/rooms`,
+// `GET /v1/rooms/{room_id}`), which is untouched. They also live entirely apart
+// from the `agent_turn` handler and its cwd/permission machinery, which is in
+// flight on held security PRs — none of this code touches turn execution.
+//
+// Error shape mirrors `GET /v1/longhouse/topics/{topic_id}`: a typed `{ ok,
+// error }` body, 400 on a bad key, 404 on an unknown room. The store maps to
+// status codes in `room_store_error_status`.
+
+/// Run a closure with the locked room registry, recovering a poisoned lock the
+/// same way the longhouse handlers do (`into_inner`). Synchronous: the guard is
+/// dropped before this returns, so no `await` is ever held across the lock.
+fn with_rooms<T>(state: &AppState, f: impl FnOnce(&mut ocean_agent::RoomRegistry) -> T) -> T {
+    let mut guard = match state.rooms.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut guard)
+}
+
+/// Map a store error onto an HTTP status + typed JSON body.
+fn room_store_error_response(
+    err: ocean_agent::RoomStoreError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use ocean_agent::RoomStoreError::*;
+    let status = match &err {
+        BadKey(_) => StatusCode::BAD_REQUEST,
+        UnknownRoom(_) | UnknownParticipant { .. } => StatusCode::NOT_FOUND,
+        AlreadyExists(_) => StatusCode::CONFLICT,
+    };
+    (
+        status,
+        Json(json!({ "ok": false, "error": err.to_string() })),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct RoomCreateRequest {
+    /// Persistent room key, e.g. `"ocean-surface-map-fix"`. Must be non-empty.
+    key: String,
+    /// Human-readable room name.
+    name: String,
+    /// Optional trigger policy controlling auto-convene/notify behaviour.
+    #[serde(default)]
+    trigger_policy: Option<RoomTriggerPolicy>,
+}
+
+/// `POST /v1/rooms/persistent` — create a persistent room.
+async fn room_create(
+    State(state): State<AppState>,
+    Json(req): Json<RoomCreateRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(req.key.trim());
+    let result = with_rooms(&state, |reg| {
+        reg.create(key, req.name, req.trigger_policy, Utc::now())
+    });
+    match result {
+        Ok(rec) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "room": rec.room })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `GET /v1/rooms/persistent` — list all persistent rooms (no transcripts).
+async fn rooms_list_persistent(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let rooms = with_rooms(&state, |reg| reg.list());
+    Json(json!({ "ok": true, "rooms": rooms }))
+}
+
+/// `GET /v1/rooms/persistent/{key}` — one persistent room (with its transcript).
+async fn room_get(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
+        );
+    }
+    let key = RoomKey::new(trimmed);
+    match with_rooms(&state, |reg| reg.get(&key)) {
+        Some(rec) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "room": rec.room, "transcript": rec.transcript })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("no room with key '{key}'") })),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RoomJoinRequest {
+    /// Stable participant id, unique within the room.
+    id: String,
+    /// Display name shown in the roster and transcript.
+    display_name: String,
+    /// What kind of actor is joining. Defaults to `human`.
+    #[serde(default = "default_participant_kind")]
+    kind: RoomParticipantKind,
+}
+
+fn default_participant_kind() -> RoomParticipantKind {
+    RoomParticipantKind::Human
+}
+
+/// `POST /v1/rooms/persistent/{key}/participants` — add a participant.
+async fn room_join(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<RoomJoinRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    let participant = RoomParticipant {
+        id: req.id,
+        kind: req.kind,
+        display_name: req.display_name,
+    };
+    let result =
+        with_rooms(&state, |reg| reg.add_participant(&key, participant, Utc::now()));
+    match result {
+        Ok(rec) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "room": rec.room })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `DELETE /v1/rooms/persistent/{key}/participants/{participant_id}` — remove a
+/// participant from the roster.
+async fn room_leave(
+    State(state): State<AppState>,
+    Path((key, participant_id)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    let result = with_rooms(&state, |reg| {
+        reg.remove_participant(&key, participant_id.trim(), Utc::now())
+    });
+    match result {
+        Ok(rec) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "room": rec.room })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RoomMessageRequest {
+    /// Author participant id (or a synthetic id like `"system"`).
+    author_id: String,
+    /// Author kind for attribution. Defaults to `human`.
+    #[serde(default = "default_participant_kind")]
+    author_kind: RoomParticipantKind,
+    /// Message body. `@id` mentions in the body drive trigger evaluation.
+    body: String,
+}
+
+/// `POST /v1/rooms/persistent/{key}/messages` — append a chat message to the
+/// transcript, then evaluate the room's trigger policy against any @-mentions in
+/// the body. On a positive decision, emit a `room.trigger` notice onto the agent
+/// event bus (the observable half of auto-convene).
+async fn room_post_message(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<RoomMessageRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    let append = with_rooms(&state, |reg| {
+        reg.append_message(
+            &key,
+            req.author_id.clone(),
+            req.author_kind,
+            RoomMessageKind::Message,
+            req.body.clone(),
+            Utc::now(),
+        )
+        .map(|msg| (msg, reg.trigger_policy(&key)))
+    });
+
+    let (msg, policy) = match append {
+        Ok(v) => v,
+        Err(e) => return room_store_error_response(e),
+    };
+
+    // ---- Trigger policy evaluation wiring point (OCEAN-65) -----------------
+    //
+    // Parse @-mentions from the message body and evaluate each against the
+    // room's trigger policy. For every positive decision we emit a notice event
+    // and append a `System` transcript line so the convene is auditable in the
+    // room itself.
+    //
+    // The notice event is the observable contract today. The ACTUAL
+    // auto-convene — queuing an agent turn for `decision.target_participant` —
+    // hooks in HERE: the daemon already spawns turns via `agent_turn` /
+    // `state.runtime`; a follow-up wires that target id + the room transcript
+    // (as read-before-answer context) into a queued `AgentTurnRequest`. That is
+    // deliberately deferred so this PR stays out of the in-flight `agent_turn`
+    // handler and its permission/cwd code on the held security PRs.
+    let mut fired = Vec::new();
+    for participant_id in parse_mentions(&req.body) {
+        let decision = evaluate_trigger_policy(
+            policy.as_ref(),
+            &RoomTriggerEvent::Mention {
+                participant_id: participant_id.clone(),
+            },
+        );
+        if decision.should_convene {
+            // Emit a notice onto the agent event bus so any subscriber sees the
+            // would-be convene. Uses the generic Extension event so it never
+            // collides with the Track-0/longhouse event scoping rules.
+            state
+                .agent_events
+                .emit(AgentTurnEvent::Extension {
+                    extension: "room_trigger".into(),
+                    payload: json!({
+                        "room": key.as_str(),
+                        "target": decision.target_participant,
+                        "reason": decision.reason,
+                        "triggered_by_seq": msg.seq,
+                    }),
+                    // Room-wide, not session-scoped: reaches `?all=1` subscribers
+                    // only, exactly like longhouse council events (Invariant 5
+                    // exception). Keeps this out of any single session's stream.
+                    scope: None,
+                });
+            // Audit line inside the room.
+            let _ = with_rooms(&state, |reg| {
+                reg.append_message(
+                    &key,
+                    "system",
+                    RoomParticipantKind::System,
+                    RoomMessageKind::System,
+                    format!(
+                        "auto-convene: {} ({})",
+                        decision.target_participant.clone().unwrap_or_default(),
+                        decision.reason
+                    ),
+                    Utc::now(),
+                )
+            });
+            fired.push(decision);
+        }
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({ "ok": true, "message": msg, "triggers_fired": fired })),
+    )
+}
+
+/// Extract `@id` mentions from a message body. A mention is `@` followed by a
+/// run of id-safe characters (alphanumerics, `-`, `_`). Returns ids without the
+/// leading `@`, de-duplicated in first-seen order.
+fn parse_mentions(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j > start {
+                let id = body[start..j].to_string();
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+#[derive(serde::Deserialize)]
+struct TranscriptQuery {
+    /// If set, return only entries with `seq > after_seq` (live-tail).
+    #[serde(default)]
+    after_seq: Option<u64>,
+}
+
+/// `GET /v1/rooms/persistent/{key}/transcript` — read a room's transcript,
+/// optionally only entries after a given seq.
+async fn room_transcript(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(q): Query<TranscriptQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    match with_rooms(&state, |reg| reg.transcript(&key, q.after_seq)) {
+        Ok(transcript) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "transcript": transcript })),
+        ),
+        Err(e) => room_store_error_response(e),
     }
 }
 
@@ -3936,5 +4296,70 @@ mod tests {
         assert_ne!(first, other_tool, "different tool mints a new id");
 
         assert_eq!(seen.lock().unwrap().len(), 3, "three distinct keys cached");
+    }
+
+    // ---- Persistent Rooms (OCEAN-65) ---------------------------------------
+
+    #[test]
+    fn parse_mentions_extracts_dedup_in_order() {
+        let ids = parse_mentions("@ocean fix it then @reviewer check, cc @ocean");
+        assert_eq!(ids, vec!["ocean".to_string(), "reviewer".to_string()]);
+    }
+
+    #[test]
+    fn parse_mentions_handles_no_mentions_and_punctuation() {
+        assert!(parse_mentions("just a plain line").is_empty());
+        // trailing punctuation terminates the id.
+        assert_eq!(parse_mentions("ping @ocean!"), vec!["ocean".to_string()]);
+        // bare @ is not a mention.
+        assert!(parse_mentions("email me @ work").is_empty());
+    }
+
+    #[test]
+    fn room_store_error_maps_to_expected_status() {
+        use ocean_agent::RoomStoreError;
+        let (s, _) = room_store_error_response(RoomStoreError::BadKey("".into()));
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) =
+            room_store_error_response(RoomStoreError::UnknownRoom(RoomKey::new("x")));
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) =
+            room_store_error_response(RoomStoreError::AlreadyExists(RoomKey::new("x")));
+        assert_eq!(s, StatusCode::CONFLICT);
+        let (s, _) = room_store_error_response(RoomStoreError::UnknownParticipant {
+            room: RoomKey::new("x"),
+            participant: "p".into(),
+        });
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn mention_with_policy_produces_convene_decision() {
+        // The exact inputs the message handler feeds the evaluator: a stored
+        // room's policy + a Mention event parsed from the body. Proves the
+        // trigger wiring point fires on a matching event.
+        let mut reg = ocean_agent::RoomRegistry::new();
+        let key = RoomKey::new("r1");
+        reg.create(
+            key.clone(),
+            "R1",
+            Some(RoomTriggerPolicy {
+                on_mention: true,
+                ..Default::default()
+            }),
+            Utc::now(),
+        )
+        .unwrap();
+
+        let mentions = parse_mentions("@ocean please look");
+        assert_eq!(mentions, vec!["ocean".to_string()]);
+        let decision = evaluate_trigger_policy(
+            reg.trigger_policy(&key).as_ref(),
+            &RoomTriggerEvent::Mention {
+                participant_id: mentions[0].clone(),
+            },
+        );
+        assert!(decision.should_convene);
+        assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
     }
 }
