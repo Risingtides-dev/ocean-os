@@ -2162,8 +2162,18 @@ async fn agent_turn(
             },
         );
     }
+    // A per-turn timeout (OCEAN-17) surfaces as code 408 from the runtime; map
+    // it to HTTP 408 Request Timeout so callers can distinguish a hung-provider
+    // abort from a normal failed turn. Every other outcome keeps the
+    // fire-and-acknowledge 202 envelope (the turn ran; success/failure lives in
+    // the body + streamed events).
+    let http_status = if !res.ok && res.code == Some(408) {
+        StatusCode::REQUEST_TIMEOUT
+    } else {
+        StatusCode::ACCEPTED
+    };
     (
-        StatusCode::ACCEPTED,
+        http_status,
         Json(AgentTurnResponse {
             ok: true,
             turn_id,

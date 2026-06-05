@@ -112,22 +112,42 @@ pub struct AgentConfig {
     pub thinking_level: ThinkingLevel,
     pub stream_options: StreamOptions,
     pub max_turns: u32,
+    /// Total wall-clock deadline for a single turn's LLM stream
+    /// (provider request + full stream consumption). `None` falls back to
+    /// [`AgentConfig::DEFAULT_TURN_TIMEOUT_SECS`]. A hung or slow provider that
+    /// exceeds this window aborts the turn with [`crate::error::AgentError::Timeout`].
+    pub turn_timeout_secs: Option<u32>,
     pub tools: Vec<Arc<dyn AgentTool>>,
     pub system_prompt: String,
     pub permission: Arc<dyn PermissionPolicy>,
 }
 
 impl AgentConfig {
+    /// Default total per-turn deadline when `turn_timeout_secs` is `None`.
+    pub const DEFAULT_TURN_TIMEOUT_SECS: u32 = 300;
+
     pub fn new(model: Model, system_prompt: impl Into<String>) -> Self {
         Self {
             model,
             thinking_level: ThinkingLevel::Off,
             stream_options: StreamOptions::default(),
             max_turns: 32,
+            turn_timeout_secs: None,
             tools: Vec::new(),
             system_prompt: system_prompt.into(),
             permission: Arc::new(AllowAllPolicy),
         }
+    }
+
+    /// Resolved per-turn deadline in seconds (configured value or the default).
+    pub fn turn_timeout_secs(&self) -> u32 {
+        self.turn_timeout_secs
+            .unwrap_or(Self::DEFAULT_TURN_TIMEOUT_SECS)
+    }
+
+    pub fn with_turn_timeout_secs(mut self, secs: Option<u32>) -> Self {
+        self.turn_timeout_secs = secs;
+        self
     }
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
@@ -207,4 +227,41 @@ pub enum AgentEvent {
     BrowserActivity {
         active: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ocean_protocol::Model;
+
+    fn cfg() -> AgentConfig {
+        AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test")
+    }
+
+    #[test]
+    fn turn_timeout_defaults_to_300s_when_unset() {
+        let c = cfg();
+        assert_eq!(c.turn_timeout_secs, None, "field starts unset");
+        assert_eq!(
+            c.turn_timeout_secs(),
+            AgentConfig::DEFAULT_TURN_TIMEOUT_SECS,
+            "unset resolves to the default"
+        );
+        assert_eq!(AgentConfig::DEFAULT_TURN_TIMEOUT_SECS, 300);
+    }
+
+    #[test]
+    fn with_turn_timeout_secs_overrides_the_default() {
+        let c = cfg().with_turn_timeout_secs(Some(45));
+        assert_eq!(c.turn_timeout_secs, Some(45));
+        assert_eq!(c.turn_timeout_secs(), 45, "explicit value wins over default");
+    }
+
+    #[test]
+    fn with_turn_timeout_secs_none_falls_back_to_default() {
+        // Passing None (e.g. OCEAN_TURN_TIMEOUT_SECS unset upstream) must keep
+        // the resolved deadline at the default, never zero.
+        let c = cfg().with_turn_timeout_secs(None);
+        assert_eq!(c.turn_timeout_secs(), AgentConfig::DEFAULT_TURN_TIMEOUT_SECS);
+    }
 }
