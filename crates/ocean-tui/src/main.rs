@@ -3527,10 +3527,28 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
 ///
 /// `scoped_session_id` is a shared handle holding the TUI's active session id.
 /// The daemon filters events server-side when the request carries
-/// `?session_id=<id>`, so we re-read this handle on every (re)connect and scope
-/// the subscription to the active session — avoiding the session-bleed risk of
-/// the global firehose (OCEAN-15 / OCEAN_ECOSYSTEM_CONTRACT.md). When the handle
-/// is `None` (no session selected yet) we fall back to the global stream.
+/// `?session_id=<id>`, so we open the subscription scoped to the active session
+/// — avoiding the session-bleed risk of the global firehose
+/// (OCEAN-15 / OCEAN_ECOSYSTEM_CONTRACT.md). When the handle is `None` (no
+/// session selected yet) we fall back to the global stream.
+///
+/// Re-reading the handle only on reconnect is **not** enough: the daemon holds
+/// the SSE connection open with `KeepAlive`, so a long-lived connection captured
+/// the `?session_id` query exactly once and would keep delivering the previously
+/// scoped (or global) firehose after the operator switches sessions. We close
+/// that hole two ways:
+///
+/// 1. **Forced reconnect on change.** The connection is opened pinned to a
+///    specific `connection_scope`. On every line read — including the periodic
+///    `KeepAlive` comment, which guarantees the loop wakes even when no events
+///    flow — we compare the shared handle against that pinned scope. If it
+///    changed, we drop this response (cancelling the stale daemon-side
+///    subscription) and reconnect with the new `?session_id`.
+/// 2. **Client-side filter.** Until the reconnect lands, every event is checked
+///    against the *current* scoped id and dropped if it belongs to another
+///    session, so no foreign event is ever rendered even within the switch
+///    window. The daemon-side scoping in (1) is the real win; this is
+///    belt-and-suspenders.
 fn spawn_daemon_agent_event_stream(
     url: String,
     scoped_session_id: Arc<Mutex<Option<AgentSessionId>>>,
@@ -3551,9 +3569,13 @@ fn spawn_daemon_agent_event_stream(
         let base_url = format!("{}/v1/agent/events", url.trim_end_matches('/'));
 
         loop {
-            // Re-read the active session on each (re)connect so switching
-            // sessions live re-scopes the subscription.
-            let events_url = match scoped_session_id.lock().ok().and_then(|g| *g) {
+            // Re-read the active session on each (re)connect and pin THIS
+            // connection to that scope. The read loop below watches for the
+            // shared handle diverging from `connection_scope` and forces a
+            // reconnect when it does, so a live session switch actually re-scopes
+            // the stream instead of waiting for an incidental disconnect.
+            let connection_scope = scoped_session_id.lock().ok().and_then(|g| *g);
+            let events_url = match connection_scope {
                 Some(sid) => format!("{base_url}?session_id={sid}"),
                 None => base_url.clone(),
             };
@@ -3584,8 +3606,23 @@ fn spawn_daemon_agent_event_stream(
             let mut line = String::new();
             let mut event_name = String::new();
             let mut data_lines: Vec<String> = Vec::new();
+            // True when we tore the stream down because the active session
+            // changed (not an error/EOF). A deliberate switch reconnects
+            // immediately; only error/EOF backs off before retrying.
+            let mut scope_changed = false;
 
-            loop {
+            'read: loop {
+                // Forced reconnect on session switch: if the shared handle no
+                // longer matches the scope this connection was opened with, tear
+                // this stream down and reconnect with the new `?session_id`. This
+                // runs on every line — crucially including the periodic KeepAlive
+                // comment — so the re-scope happens within the keepalive interval
+                // even on an otherwise idle stream.
+                if scoped_session_id.lock().ok().and_then(|g| *g) != connection_scope {
+                    scope_changed = true;
+                    break 'read;
+                }
+
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
@@ -3596,7 +3633,22 @@ fn spawn_daemon_agent_event_stream(
                                 let payload = data_lines.join("\n");
                                 match parse_agent_turn_event(&payload) {
                                     Ok(Some(event)) => {
-                                        if tx.send(Action::AgentStreamEvent(event)).is_err() {
+                                        // Client-side scope guard: when scoped to
+                                        // a specific session, drop any event that
+                                        // belongs to a different one, so no
+                                        // foreign session's output is rendered
+                                        // even before the reconnect above lands.
+                                        let current_scope =
+                                            scoped_session_id.lock().ok().and_then(|g| *g);
+                                        let belongs = match (current_scope, event.session_id()) {
+                                            (Some(scope), Some(evt_sid)) => scope == evt_sid,
+                                            // Unscoped (global) stream, or an event
+                                            // with no session id: pass through.
+                                            (None, _) | (_, None) => true,
+                                        };
+                                        if belongs
+                                            && tx.send(Action::AgentStreamEvent(event)).is_err()
+                                        {
                                             return;
                                         }
                                     }
@@ -3641,7 +3693,11 @@ fn spawn_daemon_agent_event_stream(
                 }
             }
 
-            thread::sleep(Duration::from_secs(2));
+            // A deliberate session switch reconnects right away (re-scope now);
+            // an error/EOF backs off to avoid hammering the daemon.
+            if !scope_changed {
+                thread::sleep(Duration::from_secs(2));
+            }
         }
     });
 }
