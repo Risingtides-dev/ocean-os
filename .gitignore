@@ -38,3 +38,4 @@ __pycache__/
 
 # Local Claude Code session state (per-developer)
 .claude/
+.ocean-orchestrator/
