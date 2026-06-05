@@ -91,6 +91,11 @@ struct Cli {
         default_value = DEFAULT_DAEMON_URL
     )]
     url: String,
+
+    /// Working directory / project root. Overrides OCEAN_PROJECT env var and
+    /// current directory. You can also switch at runtime with `/cd <path>`.
+    #[arg(long, env = "OCEAN_PROJECT")]
+    project: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2014,13 +2019,25 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Mesh(mesh)) => run_mesh(mesh),
-        None => run_daemon(cli.url),
+        None => run_daemon(cli.url, cli.project),
     }
 }
 
-fn run_daemon(url: String) -> anyhow::Result<()> {
+fn resolve_project_root(cli_project: Option<&str>) -> PathBuf {
+    if let Some(path) = cli_project.filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Ok(path) = std::env::var("OCEAN_PROJECT") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
     let client = DaemonClient::new()?;
-    let root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = resolve_project_root(project.as_deref());
     let (action_tx, action_rx) = mpsc::channel();
     let mut state = AppState::new(
         UiMode::Daemon(Box::new(DaemonApp::new(url, root))),
@@ -2447,10 +2464,8 @@ fn daemon_refresh_health(client: &DaemonClient, app: &mut DaemonApp) {
 }
 
 fn daemon_refresh_sessions(client: &DaemonClient, app: &mut DaemonApp) {
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-    match client.sessions(&app.url, cwd.as_deref(), app.show_all_sessions) {
+    let cwd = app.root.to_string_lossy().into_owned();
+    match client.sessions(&app.url, Some(&cwd), app.show_all_sessions) {
         Ok(res) if res.ok => {
             app.set_sessions(res.sessions);
             app.status = format!(
@@ -3647,23 +3662,17 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             short_id(turn_id),
             short_id(session_id)
         ),
-        AgentTurnEvent::AssistantTextDelta {
-            turn_id, delta, ..
-        } => format!(
+        AgentTurnEvent::AssistantTextDelta { turn_id, delta, .. } => format!(
             "agent assistant_delta [{}]: {}",
             short_id(turn_id),
             compact_text(delta, 72)
         ),
-        AgentTurnEvent::ThinkingDelta {
-            turn_id, delta, ..
-        } => format!(
+        AgentTurnEvent::ThinkingDelta { turn_id, delta, .. } => format!(
             "agent thinking_delta [{}]: {}",
             short_id(turn_id),
             compact_text(delta, 72)
         ),
-        AgentTurnEvent::ToolCallStarted {
-            turn_id, call, ..
-        } => format!(
+        AgentTurnEvent::ToolCallStarted { turn_id, call, .. } => format!(
             "agent tool_started [{}] {} args={}",
             short_id(turn_id),
             compact_text(&call.name, 20),

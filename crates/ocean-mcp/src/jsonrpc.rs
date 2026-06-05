@@ -130,7 +130,10 @@ mod tests {
         // as a notification (which would hang the request until timeout).
         let msg = parse(r#"{"jsonrpc":"2.0","id":"7","result":{}}"#);
         assert!(msg.is_response(), "string-id message is a response");
-        assert!(msg.matches_id(7), "string id matches the numeric id we sent");
+        assert!(
+            msg.matches_id(7),
+            "string id matches the numeric id we sent"
+        );
     }
 
     #[test]

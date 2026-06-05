@@ -8,6 +8,8 @@ members = [
   "crates/ocean-agent",
   "crates/ocean-agent-sdk",
   "crates/ocean-providers",
+  "crates/ocean-longhouse",
+  "crates/ocean-heartbeat",
   "crates/ocean-daemon",
   "crates/ocean-cli",
   "crates/ocean-tui",
@@ -53,3 +55,4 @@ ocean-browser = { path = "crates/ocean-browser" }
 # gate in 0.9.1 — and we drive the system Chrome, so we never want the fetcher.
 chromiumoxide = { version = "0.9" }
 base64 = "0.22"
+ocean-longhouse = { path = "crates/ocean-longhouse" }

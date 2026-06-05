@@ -47,11 +47,7 @@ impl StdioTransport {
     /// child only). The parent environment is inherited so the server can see
     /// PATH etc.; the explicit `env` entries are the secrets resolved by name
     /// from the daemon's process env — they are NOT logged here.
-    pub fn spawn(
-        command: &str,
-        args: &[String],
-        env: &[(String, String)],
-    ) -> Result<Self> {
+    pub fn spawn(command: &str, args: &[String], env: &[(String, String)]) -> Result<Self> {
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -64,10 +60,7 @@ impl StdioTransport {
             .spawn()
             .with_context(|| format!("spawn MCP server `{command}`"))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .context("MCP child stdin not captured")?;
+        let stdin = child.stdin.take().context("MCP child stdin not captured")?;
         let stdout = child
             .stdout
             .take()

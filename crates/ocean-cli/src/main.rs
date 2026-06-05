@@ -2,6 +2,22 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ocean_core::{HealthResponse, PromptRequest, PromptResponse, SessionId, SessionResponse};
 
+fn resolve_cwd(project: Option<&str>) -> String {
+    // OCEAN_PROJECT env var takes lowest precedence among explicit overrides
+    if let Some(path) = project.filter(|p| !p.is_empty()) {
+        return path.to_string();
+    }
+    if let Ok(path) = std::env::var("OCEAN_PROJECT") {
+        if !path.is_empty() {
+            return path;
+        }
+    }
+    std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ocean-rs", about = "Ocean OS agent runtime client")]
 struct Cli {
@@ -11,6 +27,10 @@ struct Cli {
         default_value = "http://127.0.0.1:4780"
     )]
     url: String,
+    /// Working directory / project root for the session.
+    /// Overrides OCEAN_PROJECT env var and current directory.
+    #[arg(long, env = "OCEAN_PROJECT")]
+    project: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -29,6 +49,23 @@ enum Cmd {
     Session {
         id: SessionId,
     },
+}
+
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        let safe = byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~';
+        if safe {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 #[tokio::main]
@@ -65,10 +102,7 @@ async fn main() -> anyhow::Result<()> {
                 create_if_missing: true,
                 max_turns,
                 yolo,
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
+                cwd: resolve_cwd(cli.project.as_deref()),
                 project_id: None,
                 client_type: Some("cli".into()),
             };
@@ -90,8 +124,14 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Cmd::Sessions => {
+            let cwd = resolve_cwd(cli.project.as_deref());
+            let url = format!(
+                "{}/v1/sessions?cwd={}",
+                cli.url.trim_end_matches('/'),
+                urlencoding(&cwd)
+            );
             let text = client
-                .get(format!("{}/v1/sessions", cli.url))
+                .get(url)
                 .send()
                 .await?
                 .error_for_status()?

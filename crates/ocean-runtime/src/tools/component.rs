@@ -176,14 +176,11 @@ impl AgentTool for ComponentRenderTool {
         // Warn but don't reject unknown kinds — forward-compat for new clients.
         let mut warnings = String::new();
         if !VALID_KINDS.contains(&kind.as_str()) {
-            warnings = format!(
-                " (warning: unknown component kind '{kind}', clients may ignore it)"
-            );
+            warnings =
+                format!(" (warning: unknown component kind '{kind}', clients may ignore it)");
         }
 
-        let summary = format!(
-            "rendered component '{component_id}' of kind '{kind}'{warnings}",
-        );
+        let summary = format!("rendered component '{component_id}' of kind '{kind}'{warnings}",);
 
         Ok(AgentToolResult {
             content: vec![ocean_protocol::Content::text(summary)],
@@ -251,9 +248,7 @@ impl AgentTool for ComponentUnmountTool {
                 "component_id": component_id,
             }),
             terminate: false,
-            side_effects: vec![ToolSideEffect::Unmount {
-                id: component_id,
-            }],
+            side_effects: vec![ToolSideEffect::Unmount { id: component_id }],
         })
     }
 }
@@ -357,11 +352,7 @@ impl AgentTool for ComponentWaitTool {
             pending.insert((session_id.clone(), component_id.clone()), tx);
         }
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            rx,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await;
 
         {
             let mut pending = COMPONENT_WAIT_REGISTRY
@@ -374,14 +365,17 @@ impl AgentTool for ComponentWaitTool {
         match result {
             Ok(Ok(event)) => Ok(AgentToolResult {
                 content: vec![ocean_protocol::Content::text(
-                    serde_json::to_string(&event).unwrap_or_else(|_| r#"{"type":"unknown"}"#.into())
+                    serde_json::to_string(&event)
+                        .unwrap_or_else(|_| r#"{"type":"unknown"}"#.into()),
                 )],
                 details: event,
                 terminate: false,
                 side_effects: Vec::new(),
             }),
             Ok(Err(_)) => Err("component interaction channel closed unexpectedly".into()),
-            Err(_) => Err(format!("timed out waiting for interaction on '{component_id}'")),
+            Err(_) => Err(format!(
+                "timed out waiting for interaction on '{component_id}'"
+            )),
         }
     }
 }
