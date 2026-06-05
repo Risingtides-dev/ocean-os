@@ -30,3 +30,6 @@ uuid = { workspace = true }
 # The daemon wire types (AgentTurnRequest/Response/Event) live in ocean-agent-sdk;
 # reuse them directly so the bridge never drifts from the daemon contract.
 ocean-agent-sdk = { workspace = true }
+# Control-plane wire types: the legacy /v1/events envelope + permission
+# decision request/decision enums, reused so the bridge never drifts.
+ocean-core = { workspace = true }
