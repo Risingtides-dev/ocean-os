@@ -2393,19 +2393,18 @@ is the user's real, signed-in browser session.\n\n\
     }
 
     /// The `assistants/<DIR>` profile directory name for a `client_type`.
-    /// Mirrors [`surface_flag`] (same labels). When the on-disk
-    /// `assistants/<DIR>/` profile tree lands in `ocean-agents` (Fix 5,
-    /// file-loaded direction), this is the key `build_system_prompt` resolves
-    /// against — preferring the file profile, falling back to the seed const.
+    /// Mirrors [`surface_flag`] (same labels). This is the key the file-loaded
+    /// profile path resolves against in [`load_surface_profile_from`].
     ///
-    /// TODO(fix5/ocean-agents): once the file-loaded path exists, look up
-    /// `assistants/<surface_dir>/system.md` here and prefer it over the const.
-    /// Also unresolved (parked for John): org file-tree / namespacing so many
-    /// agents can share one surface without their profiles/tools bleeding —
-    /// symlink-vs-resolver for composing agent-dir CLAUDE.md + the surface
-    /// profile in one `load_project_prompt` ancestor-walk.
-    // Wired by Fix 5 (file-loaded profile path); kept now so the taxonomy seam
-    // is a single source of truth and downstream (ocean-agents) can rely on it.
+    /// File-loaded profiles are implemented — the runtime prefers
+    /// `assistants/<surface_dir>/system.md` when present, falling back to const
+    /// seeds. Author profiles in `ocean-agents/assistants/<DIR>/`; loaded at
+    /// runtime, no rebuild.
+    ///
+    /// Still parked for John: org file-tree / namespacing so many agents can
+    /// share one surface without their profiles/tools bleeding — symlink-vs-
+    /// resolver for composing agent-dir CLAUDE.md + the surface profile in one
+    /// `load_project_prompt` ancestor-walk.
     #[allow(dead_code)]
     pub fn surface_dir(client_type: Option<&str>) -> &'static str {
         surface_flag(client_type)

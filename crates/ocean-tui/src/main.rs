@@ -1254,7 +1254,12 @@ impl DaemonApp {
                 }
             }
             // RoleGranted / RoleRevoked / Warned / RunHealth carry no quorum
-            // state the deck-lite F3 view renders today; ignore for now.
+            // state the deck-lite F3 view renders today.
+            //
+            // Scope: post-MVP. Role/health state is not yet rendered in the F3
+            // deck; these are dropped to avoid polluting topic history. (They
+            // are still formatted by `summarize_longhouse_event` for the raw
+            // event log — only the per-topic deck ignores them.)
             _ => {}
         }
         self.longhouse_topics
