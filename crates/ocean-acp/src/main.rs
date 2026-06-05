@@ -77,6 +77,11 @@ struct SessionState {
     /// is running so `session/cancel` can target `POST /v1/requests/{id}/cancel`,
     /// cleared when the turn ends. `None` between turns.
     active_request_id: Option<String>,
+    /// Per-session model override chosen via `session/set_mode` (OCEAN-36).
+    /// Sent as `model_id` on every turn for THIS session only, so two editor
+    /// windows can each pin a different model without racing each other through
+    /// the daemon's global model swap. `None` uses the daemon's global default.
+    model_id: Option<String>,
 }
 
 impl Sessions {
@@ -87,6 +92,7 @@ impl Sessions {
                 cwd,
                 daemon_id: None,
                 active_request_id: None,
+                model_id: None,
             },
         );
     }
@@ -151,6 +157,33 @@ impl Sessions {
             .expect("sessions mutex poisoned")
             .get(acp_session_id)
             .and_then(|s| s.active_request_id.clone())
+    }
+
+    /// Pin a per-session model (OCEAN-36). Returns `false` if the ACP session is
+    /// unknown (e.g. set_mode before session/new), so the caller can decide how
+    /// to surface it.
+    fn set_model_id(&self, acp_session_id: &str, model_id: String) -> bool {
+        match self
+            .inner
+            .lock()
+            .expect("sessions mutex poisoned")
+            .get_mut(acp_session_id)
+        {
+            Some(state) => {
+                state.model_id = Some(model_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The per-session model override, if one was set via `session/set_mode`.
+    fn model_id(&self, acp_session_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("sessions mutex poisoned")
+            .get(acp_session_id)
+            .and_then(|s| s.model_id.clone())
     }
 }
 
@@ -223,34 +256,37 @@ async fn main() -> AcpResult<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
-        // --- session/set_mode (model swap from Zed's picker) ---------------
+        // --- session/set_mode (per-session model selection) ----------------
         .on_receive_request(
             {
-                let client = client.clone();
+                let sessions = sessions.clone();
                 async move |req: SetSessionModeRequest, responder, conn: ConnectionTo<Client>| {
-                    // ACP mode id == Ocean model id. Swap on the daemon, then
-                    // confirm back to Zed with a current-mode update.
+                    // ACP mode id == Ocean model id. OCEAN-36: store the choice
+                    // on THIS session and ride it on each turn as `model_id`,
+                    // rather than swapping the daemon's GLOBAL model. The old
+                    // global `set_model` made two editor windows clobber each
+                    // other's model selection (a race); a per-session override
+                    // is isolated, so each window keeps its own model.
                     let model_id = req.mode_id.0.to_string();
                     let acp_session = req.session_id.clone();
-                    match client.set_model(&model_id).await {
-                        Ok((provider, model)) => {
-                            tracing::info!(%model_id, %provider, %model, "model swapped via session/set_mode");
-                            let _ = conn.send_notification(SessionNotification::new(
-                                acp_session,
-                                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
-                                    SessionModeId::new(model_id),
-                                )),
-                            ));
-                            // SetSessionModeResponse is a unit-ish ack.
-                            responder.respond(Default::default())
-                        }
-                        Err(err) => {
-                            tracing::error!(%model_id, error = %err, "model swap failed");
-                            responder.respond_with_error(agent_client_protocol::util::internal_error(
-                                format!("model swap failed: {err:#}"),
-                            ))
-                        }
+                    let known = sessions.set_model_id(&acp_session.0.to_string(), model_id.clone());
+                    if !known {
+                        // set_mode before session/new — record nothing, but still
+                        // ack so the editor isn't left waiting. The session map is
+                        // populated at session/new; a later set_mode will stick.
+                        tracing::warn!(%model_id, "set_mode for unknown session; ack without pinning");
+                    } else {
+                        tracing::info!(%model_id, "model pinned for session (per-turn override)");
                     }
+                    // Confirm the selection back to Zed regardless.
+                    let _ = conn.send_notification(SessionNotification::new(
+                        acp_session,
+                        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                            SessionModeId::new(model_id),
+                        )),
+                    ));
+                    // SetSessionModeResponse is a unit-ish ack.
+                    responder.respond(Default::default())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -391,6 +427,10 @@ async fn run_turn(
     //   - first turn  → submit with `None`; the response carries the real id.
     //   - later turns → resume with the stored daemon id.
     let known_daemon_id = sessions.daemon_id(acp_session_id);
+    // Per-session model override (OCEAN-36): if this session picked a model via
+    // session/set_mode, ride it on the turn so the daemon drives just this turn
+    // with it — no global swap, no cross-window race.
+    let model_id = sessions.model_id(acp_session_id);
 
     // Subscribe BEFORE submitting so we can't miss early deltas (the daemon
     // stream is global and live; there's no replay).
@@ -400,7 +440,7 @@ async fn run_turn(
         .context("open daemon event stream")?;
 
     let submitted = client
-        .submit_turn(prompt, cwd, known_daemon_id.clone())
+        .submit_turn(prompt, cwd, known_daemon_id.clone(), model_id)
         .await
         .context("submit turn")?;
 
@@ -739,5 +779,36 @@ mod tests {
         let v = serde_json::to_value(&deny).unwrap();
         assert_eq!(v["decision"], "deny");
         assert_eq!(v["reason"], "nope");
+    }
+
+    // OCEAN-36: two ACP sessions must keep independent model selections.
+    // Before the fix, set_mode swapped the daemon's global model, so the second
+    // window clobbered the first. Now each session pins its own `model_id`.
+    #[test]
+    fn per_session_model_is_isolated() {
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj/a".into());
+        sessions.insert("acp-b".into(), "/proj/b".into());
+
+        assert!(sessions.set_model_id("acp-a", "claude-opus-4-7".into()));
+        assert!(sessions.set_model_id("acp-b", "deepseek-v4-pro".into()));
+
+        // Neither selection bleeds into the other.
+        assert_eq!(sessions.model_id("acp-a").as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(sessions.model_id("acp-b").as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn model_defaults_to_none_until_set() {
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj/a".into());
+        assert_eq!(sessions.model_id("acp-a"), None);
+    }
+
+    #[test]
+    fn set_model_for_unknown_session_reports_false() {
+        let sessions = Sessions::default();
+        assert!(!sessions.set_model_id("missing", "kimi-k2.6".into()));
+        assert_eq!(sessions.model_id("missing"), None);
     }
 }

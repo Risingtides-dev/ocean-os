@@ -186,6 +186,25 @@ impl AgentRuntime {
         Ok(label)
     }
 
+    /// Resolve a fresh [`RuntimeState`] for a model alias **without** mutating
+    /// the runtime's global state or persisting the choice (OCEAN-36).
+    ///
+    /// This is the per-turn counterpart to [`set_model`](Self::set_model): it
+    /// runs the same provider-config resolution (so credentials, base_url, and
+    /// the openai-vs-anthropic provider routing all match), but returns the
+    /// state for the caller to use for a single turn. Two concurrent turns can
+    /// therefore drive different models without racing through the shared
+    /// global selection. Fails (touching nothing) if the alias doesn't resolve
+    /// or has no credential.
+    fn resolve_state_for_model(&self, model_spec: &str) -> anyhow::Result<RuntimeState> {
+        let mut env = ProviderEnv::from_process();
+        env.vars
+            .insert("OCEAN_MODEL".to_string(), model_spec.to_string());
+        let provider_config = resolve_provider_config(&env)
+            .map_err(|e| anyhow::anyhow!("failed to resolve model `{model_spec}`: {e}"))?;
+        state_from_provider_config(provider_config)
+    }
+
     pub async fn prompt(&self, req: PromptRequest, control: PromptControl) -> PromptResponse {
         let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
         let mut req = req;
@@ -196,7 +215,38 @@ impl AgentRuntime {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        if let Some(stderr) = self.provider_preflight_error() {
+        // Resolve the EFFECTIVE turn state before any readiness/dispatch check
+        // (OCEAN-36 + Codex). When the turn pins a per-session `model_id`, the
+        // override — not the runtime's global model — must drive the provider
+        // preflight, the Fake-vs-real dispatch, and the run itself. Resolving it
+        // here (rather than inside `run_prompt`) means a turn pinned to a ready
+        // model is no longer rejected because the *global* model is degraded, and
+        // an ACP turn pinned to a real model is never silently routed through a
+        // global `fake-ok`. A bad alias fails the turn cleanly, touching nothing.
+        let turn_state = match control.model_id.as_deref() {
+            Some(model_spec) => match self.resolve_state_for_model(model_spec) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    return PromptResponse {
+                        request_id: Some(request_id),
+                        ok: false,
+                        session_id: req.session_id,
+                        code: None,
+                        wall_ms: start.elapsed().as_millis() as u64,
+                        stdout: String::new(),
+                        stderr: e.to_string(),
+                        cwd,
+                        usage: TokenUsage::default(),
+                    };
+                }
+            },
+            None => None,
+        };
+        let global_snapshot = self.snapshot();
+        let snapshot: &RuntimeState = turn_state.as_ref().unwrap_or(&global_snapshot);
+
+        // Readiness check against the EFFECTIVE provider/model for this turn.
+        if let Some(stderr) = Self::preflight_error_for(snapshot) {
             return PromptResponse {
                 request_id: Some(request_id),
                 ok: false,
@@ -210,11 +260,10 @@ impl AgentRuntime {
             };
         }
 
-        let snapshot = self.snapshot();
         let result = if snapshot.provider_config.selection.provider == ProviderId::Fake {
-            self.run_fake_prompt(req.clone(), &snapshot).await
+            self.run_fake_prompt(req.clone(), snapshot).await
         } else {
-            self.run_prompt(req.clone(), control, &snapshot).await
+            self.run_prompt(req.clone(), control, snapshot).await
         };
 
         match result {
@@ -366,8 +415,12 @@ impl AgentRuntime {
         Ok((session.id, cwd.to_string(), session.client_type))
     }
 
-    fn provider_preflight_error(&self) -> Option<String> {
-        let readiness = self.provider_readiness();
+    /// Readiness preflight for a *specific* resolved state, so a per-turn model
+    /// override (OCEAN-36) is checked against the model that will actually run —
+    /// not the global one. Returns `None` when ready, else a human-readable
+    /// reason.
+    fn preflight_error_for(snapshot: &RuntimeState) -> Option<String> {
+        let readiness = snapshot.provider_config.readiness();
         if readiness.ok {
             return None;
         }
@@ -432,6 +485,12 @@ impl AgentRuntime {
         snapshot: &RuntimeState,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
+
+        // `snapshot` is already the EFFECTIVE turn state: `prompt()` resolved the
+        // per-turn `model_id` override (OCEAN-36) before the readiness/dispatch
+        // check and handed it down here, so every downstream read (model,
+        // provider routing, api_key, base_url, the thinking-strip check) sees the
+        // override consistently. The runtime's global selection is never touched.
 
         // Resolve the effective session id up front so we can serialize on it.
         // None means "new session" — mint the id now so the lock still covers
@@ -515,6 +574,9 @@ impl AgentRuntime {
             cancel,
             event_sink,
             thinking_level,
+            // `model_id` was already consumed above (turn_state resolution); it
+            // is discarded here so the destructure stays exhaustive.
+            model_id: _,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
         // built-ins plus any connected MCP/skill providers, deduped first-wins.
@@ -651,6 +713,12 @@ pub struct PromptControl {
     /// turn's* `AgentConfig` only — the runtime's global `thinking_level` is
     /// never mutated. `None` leaves the global default in force.
     pub thinking_level: Option<ocean_protocol::ThinkingLevel>,
+    /// Per-turn model override (OCEAN-36). When `Some`, *this turn only* is
+    /// driven by the given model alias — the runtime's global model selection
+    /// is never mutated. This lets independent client windows (e.g. two
+    /// Zed/ACP sessions) each pin their own model without racing each other
+    /// through the global `set_model` swap. `None` uses the global model.
+    pub model_id: Option<String>,
 }
 
 impl PromptControl {
@@ -660,6 +728,7 @@ impl PromptControl {
             cancel: None,
             event_sink: None,
             thinking_level: None,
+            model_id: None,
         }
     }
 
@@ -681,6 +750,13 @@ impl PromptControl {
     /// runtime's global `thinking_level`).
     pub fn with_thinking_level(mut self, level: Option<ocean_protocol::ThinkingLevel>) -> Self {
         self.thinking_level = level;
+        self
+    }
+
+    /// Pin this turn to a specific model alias without touching global state
+    /// (OCEAN-36). `None` (or an empty string) leaves the global model in force.
+    pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
+        self.model_id = model_id.filter(|m| !m.trim().is_empty());
         self
     }
 }
@@ -1750,6 +1826,71 @@ mod tests {
         assert!(runtime.list_sessions(None).unwrap().is_empty());
         let missing = runtime.session_detail(SessionId::new_v4()).unwrap_err();
         assert!(missing.to_string().contains("not found"));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // OCEAN-36 / Codex: the per-turn readiness preflight must evaluate the
+    // EFFECTIVE turn state, not a fixed global one. This is the unit the fix
+    // hinges on — `prompt()` now resolves the override first and feeds the
+    // resulting state to `preflight_error_for`, so a turn pinned to a ready
+    // model is no longer rejected because some *other* (global) model is
+    // degraded, and a degraded override is still caught.
+    #[test]
+    fn preflight_error_for_evaluates_the_given_state_not_a_global_one() {
+        // A ready state (credential present) preflights clean...
+        let ready = state_from_provider_config(provider_config(
+            ProviderId::DeepSeek,
+            "deepseek-v4-pro",
+            true,
+        ))
+        .unwrap();
+        assert!(
+            AgentRuntime::preflight_error_for(&ready).is_none(),
+            "a credentialed state must pass preflight"
+        );
+
+        // ...while a degraded state (no credential) is reported against ITS own
+        // provider/model, regardless of any global selection.
+        let degraded = state_from_provider_config(provider_config(
+            ProviderId::DeepSeek,
+            "deepseek-v4-pro",
+            false,
+        ))
+        .unwrap();
+        let err = AgentRuntime::preflight_error_for(&degraded)
+            .expect("an uncredentialed state must fail preflight");
+        assert!(err.contains("deepseek"));
+        assert!(err.contains("deepseek-v4-pro"));
+    }
+
+    // The Fake dispatch must also key off the EFFECTIVE state. A Fake global
+    // model with no credential still runs the fake path (no remote call), which
+    // confirms the dispatch reads the resolved snapshot `prompt()` hands down.
+    #[tokio::test]
+    async fn fake_global_without_override_still_takes_fake_path() {
+        let config_dir = temp_config_dir("fake-effective-dispatch");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "hi".into(),
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+        assert!(res.ok, "fake provider should run without credentials");
+        assert!(res.stdout.contains("OCEAN_FAKE_OK"));
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
