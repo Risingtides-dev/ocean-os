@@ -397,7 +397,15 @@ async fn route_inbound(raw: &str, pending: &Pending, tools_changed: &Arc<Notify>
 
     if !msg.is_response() {
         // Server-initiated notification. `tools/list_changed` invalidates the
-        // provider's cached tool snapshot (OCEAN-32); others are logged.
+        // provider's cached tool snapshot (OCEAN-32).
+        //
+        // Scope: notifications are logged and dropped — there is no dispatch
+        // table beyond the single `tools/list_changed` case. Any future MCP
+        // server emitting other notifications (progress, resource updates,
+        // log messages, etc.) will be silently dropped here. Upgrade path: a
+        // `broadcast::channel` for async notifications that subscribers can
+        // observe, replacing this single-signal `Notify`. The `trace!` below
+        // keeps the drop visible when debugging until then.
         if let Some(m) = &msg.method {
             if m == TOOLS_LIST_CHANGED {
                 tracing::info!(
@@ -406,7 +414,10 @@ async fn route_inbound(raw: &str, pending: &Pending, tools_changed: &Arc<Notify>
                 );
                 tools_changed.notify_one();
             } else {
-                tracing::debug!(notification = %m, "ignoring MCP server notification");
+                tracing::trace!(
+                    notification = %m,
+                    "dropping unhandled MCP server notification (no dispatch table)"
+                );
             }
         }
         return;
