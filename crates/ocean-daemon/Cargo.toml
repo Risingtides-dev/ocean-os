@@ -17,6 +17,7 @@ axum.workspace = true
 chrono.workspace = true
 ocean-agent.workspace = true
 ocean-agent-sdk.workspace = true
+ocean-call.workspace = true
 ocean-core.workspace = true
 ocean-longhouse.workspace = true
 ocean-protocol.workspace = true

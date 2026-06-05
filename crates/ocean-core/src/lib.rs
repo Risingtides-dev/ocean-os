@@ -636,6 +636,60 @@ pub enum OceanEvent {
     Error {
         message: String,
     },
+
+    // ---- Call-intelligence events (ocean-call crate) ----
+    // A live PSTN call, bridged via SIP into a LiveKit room, produces these on
+    // the same SSE rail. The passive lane emits transcript/summary/task events;
+    // the wake-gated active lane emits wake/spoke events. See
+    // docs/superpowers/specs/2026-06-05-ocean-call-intelligence-design.md.
+    /// A call connected and Ocean joined its room as a server participant.
+    CallStarted {
+        call_id: String,
+        room_id: String,
+        #[serde(default)]
+        participants: Vec<String>,
+    },
+    /// One transcribed segment from the call's audio. `final` is false while the
+    /// segment is still being revised by streaming STT.
+    CallTranscriptSegment {
+        speaker: String,
+        text: String,
+        start_ms: u64,
+        #[serde(rename = "final")]
+        is_final: bool,
+    },
+    /// The rolling auto-summary of the call so far, as of `as_of_ms`.
+    CallSummaryUpdated {
+        summary: String,
+        as_of_ms: u64,
+    },
+    /// A task / action-item detected on the call. Detect-and-notify only —
+    /// acting on it is always a separate, human-approved turn.
+    CallTaskDetected {
+        task_id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assignee: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_quote: Option<String>,
+        #[serde(default)]
+        confidence: f32,
+    },
+    /// The wake word ("hey Ocean") fired; `utterance` is what followed it.
+    CallWakeTriggered {
+        utterance: String,
+    },
+    /// Ocean spoke `text` back into the call via TTS (active lane only).
+    CallAgentSpoke {
+        text: String,
+    },
+    /// The call ended; `duration_ms` is its total wall-clock length.
+    CallEnded {
+        call_id: String,
+        duration_ms: u64,
+    },
 }
 
 /// Envelope shared by the SSE stream and persisted event logs.
@@ -809,5 +863,80 @@ mod tests {
         assert!(room.trigger_policy.is_none());
         assert_eq!(room.created_at, room.updated_at);
         assert_eq!(room.id.as_str(), "r1");
+    }
+
+    #[test]
+    fn call_started_event_tag_and_roundtrip() {
+        let event = OceanEvent::CallStarted {
+            call_id: "call-1".into(),
+            room_id: "call:abc".into(),
+            participants: vec!["sip:+17035081859".into()],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "call_started");
+        assert_eq!(json["call_id"], "call-1");
+        let roundtrip: OceanEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn transcript_segment_uses_final_field_name() {
+        // The spec names the field `final`; it's a Rust keyword so it's
+        // serialized via #[serde(rename = "final")] over `is_final`.
+        let event = OceanEvent::CallTranscriptSegment {
+            speaker: "caller".into(),
+            text: "let's ship friday".into(),
+            start_ms: 4200,
+            is_final: true,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "call_transcript_segment");
+        assert_eq!(json["final"], true);
+        assert!(json.get("is_final").is_none(), "must serialize as `final`");
+        let roundtrip: OceanEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn task_detected_omits_optional_fields_when_absent() {
+        let event = OceanEvent::CallTaskDetected {
+            task_id: "t1".into(),
+            title: "send the master to Atlantic".into(),
+            assignee: None,
+            due: None,
+            source_quote: None,
+            confidence: 0.0,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "call_task_detected");
+        assert!(json.get("assignee").is_none());
+        assert!(json.get("due").is_none());
+        let roundtrip: OceanEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn all_call_events_roundtrip() {
+        let events = vec![
+            OceanEvent::CallSummaryUpdated {
+                summary: "discussed release timing".into(),
+                as_of_ms: 60_000,
+            },
+            OceanEvent::CallWakeTriggered {
+                utterance: "what did we decide".into(),
+            },
+            OceanEvent::CallAgentSpoke {
+                text: "you agreed on Friday".into(),
+            },
+            OceanEvent::CallEnded {
+                call_id: "call-1".into(),
+                duration_ms: 612_000,
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_value(&event).unwrap();
+            let roundtrip: OceanEvent = serde_json::from_value(json).unwrap();
+            assert_eq!(roundtrip, event);
+        }
     }
 }

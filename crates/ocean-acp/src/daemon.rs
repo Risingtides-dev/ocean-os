@@ -149,8 +149,18 @@ impl DaemonClient {
 
     /// Open the daemon's global agent event stream. Yields every
     /// [`AgentTurnEvent`] for every session; filter by `session_id` downstream.
+    ///
+    /// The `?all=1` is required: the daemon's default `/v1/agent/events` scoping
+    /// (OCEAN-15) drops every session-bearing event for a query-less subscriber
+    /// so product surfaces can't adopt another surface's session. The ACP bridge
+    /// is the explicit legacy/debug exception — it subscribes BEFORE it knows the
+    /// daemon session id (that arrives in the submit response) and filters by
+    /// session id downstream, so it must opt into the full firehose with `all=1`
+    /// or it never sees its own turn's deltas / `TurnFinished` and the editor
+    /// hangs. This is the daemon-sanctioned escape hatch and re-opens no bleed
+    /// for first-party surfaces, which keep using a scoped `?session_id`.
     pub async fn event_stream(&self) -> Result<EventStream> {
-        let url = format!("{}/v1/agent/events", self.base_url);
+        let url = format!("{}/v1/agent/events?all=1", self.base_url);
         let resp = self
             .http
             .get(&url)
