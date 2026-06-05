@@ -245,18 +245,59 @@ Main MeshFloor references:
 
 ## HTTP API quick reference
 
-Current daemon routes from source:
+Full daemon route table, read from `crates/ocean-daemon/src/main.rs` (the
+`Router::route()` calls). Grouped by concern:
 
 ```text
-GET  /
-GET  /health
-GET  /v1/events
-POST /v1/prompt
-GET  /v1/requests
-POST /v1/requests
-POST /v1/requests/{id}/cancel
-POST /v1/permissions/{id}/decision
-GET  /v1/sessions
+# Liveness
+GET    /                                  root banner
+GET    /health                            liveness check
+GET    /ready                             readiness (model/credentials wired)
+
+# Agent product API (session-scoped — first-party surfaces)
+POST   /v1/agent/turns                    submit a turn { prompt, cwd, session_id, ... }
+GET    /v1/agent/events                   SSE stream; ?session_id=<id> scopes to one session
+POST   /v1/agent/sessions                 create a session before the first turn
+GET    /v1/agent/sessions                 list agent sessions
+GET    /v1/agent/sessions/{id}            agent session detail
+
+# Legacy / debug prompt + request API
+GET    /v1/events                         global SSE stream (debug/legacy)
+POST   /v1/prompt                         synchronous one-shot prompt
+GET    /v1/requests                       list async requests
+POST   /v1/requests                       enqueue an async request
+POST   /v1/requests/{id}/cancel           cancel an in-flight request
+
+# Permissions
+GET    /v1/permissions                    list pending permission requests
+POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
+
+# Rooms
+GET    /v1/rooms                          list rooms
+GET    /v1/rooms/{room_id}                room detail
+
+# Sessions (legacy view)
+GET    /v1/sessions                       list sessions
+GET    /v1/sessions/{id}                  session detail / transcript
+
+# Projects (named directory-bound workspaces)
+GET    /v1/projects                       list registered projects
+POST   /v1/projects                       create a project bound to a directory
+GET    /v1/projects/{id}                  project detail
+PATCH  /v1/projects/{id}                  update name and/or config (partial)
+DELETE /v1/projects/{id}                  delete a project (sessions become project-less)
+
+# Model selection
+GET    /v1/model                          current provider/model
+POST   /v1/model                          set provider/model
+GET    /v1/models                         available models for a client picker
+
+# Surface components
+POST   /v1/component/event                surface component interaction event
+
+# Longhouse (council / quorum)
+POST   /v1/longhouse/demo                 scripted demo harness (fake events)
+POST   /v1/longhouse/convene              convene a real council; events on /v1/agent/events
 ```
 
 ### Synchronous prompt
