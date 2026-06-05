@@ -370,7 +370,10 @@ fn estimate_tokens_json<T: serde::Serialize>(value: &T) -> usize {
 /// the only risk is the *oldest kept* message being an orphan `ToolResult` whose
 /// originating assistant turn was trimmed away — so we drop any such leading
 /// orphan(s). (Pairing within the kept suffix is intact by construction.)
-fn trim_to_context_window(
+///
+/// Exposed `pub` so the no-orphan-tool-result invariant can be exercised by the
+/// `trim_invariants` property test in `crates/ocean-runtime/tests/`.
+pub fn trim_to_context_window(
     messages: &[Message],
     system_prompt: &str,
     context_window: u32,
@@ -411,13 +414,60 @@ fn trim_to_context_window(
     while keep_from < messages.len() && matches!(messages[keep_from], Message::ToolResult(_)) {
         keep_from += 1;
     }
-    // Never return empty: if trimming orphans ate everything, fall back to the
-    // last message alone.
+    // Never return empty: if dropping leading orphans ate everything, the last
+    // message must itself be a tool result whose call fell outside the budget
+    // window. We cannot keep that result alone — a `ToolResult` with no matching
+    // `ToolCall` is rejected by providers (Anthropic/OpenAI both 400). So expand
+    // the window back to the assistant turn that issued the call, keeping the
+    // pair intact. The budget is a soft target; one over-budget pair is always
+    // preferable to an invalid request. If no matching call exists anywhere
+    // (never happens for histories the loop builds), the interior pairing pass
+    // below will drop the orphan and we fall back to the last message.
     if keep_from >= messages.len() {
-        keep_from = messages.len() - 1;
+        keep_from = anchor_including_call_for_last(messages);
     }
 
-    let kept = messages.len() - keep_from;
+    let suffix = &messages[keep_from..];
+
+    // Final pairing pass. The contiguous suffix above can still contain an
+    // *interior* orphan tool result — e.g. when the cut splits a batch of
+    // parallel tool calls so some results in the kept window answer a call that
+    // was trimmed. A `ToolResult` with no matching `ToolCall` earlier in the
+    // request is rejected by providers, so we drop any such orphan, anywhere in
+    // the kept slice. This keeps the returned history provider-valid for *any*
+    // input shape, not just the well-ordered call-then-result histories the
+    // loop normally produces.
+    let mut seen_calls: HashSet<&str> = HashSet::new();
+    let mut out: Vec<Message> = Vec::with_capacity(suffix.len());
+    for msg in suffix {
+        if let Message::Assistant(a) = msg {
+            for c in &a.content {
+                if let Content::ToolCall { id, .. } = c {
+                    seen_calls.insert(id.as_str());
+                }
+            }
+        }
+        if let Message::ToolResult(r) = msg {
+            if !seen_calls.contains(r.tool_call_id.as_str()) {
+                continue; // orphan — its ToolCall is not in the kept window
+            }
+        }
+        out.push(msg.clone());
+    }
+    // Last resort: if every kept message was an orphan tool result (a history
+    // whose final tool result has no matching call anywhere), keep the most
+    // recent non-tool-result message so we never hand back an empty request.
+    if out.is_empty() && !messages.is_empty() {
+        if let Some(msg) = messages
+            .iter()
+            .rev()
+            .find(|m| !matches!(m, Message::ToolResult(_)))
+        {
+            out.push(msg.clone());
+        }
+    }
+
+    let kept = out.len();
     if kept < messages.len() {
         tracing::debug!(
             total = messages.len(),
@@ -427,7 +477,33 @@ fn trim_to_context_window(
             "trimmed message history to fit context window"
         );
     }
-    messages[keep_from..].to_vec()
+    out
+}
+
+/// Anchor index for the fallback case where budget-trimming + orphan-dropping
+/// emptied the window because the **last** message is a tool result. Returns
+/// the index of the assistant message that issued the matching `ToolCall`, so
+/// the kept slice `[idx..]` carries the call/result pair (no orphan). If no
+/// matching call exists anywhere — which the agent loop never produces, since
+/// it always emits the call before the result — return the last index and let
+/// the interior pairing pass drop the unpaired result.
+fn anchor_including_call_for_last(messages: &[Message]) -> usize {
+    let last = messages.len() - 1;
+    let Message::ToolResult(result) = &messages[last] else {
+        return last;
+    };
+    for idx in (0..last).rev() {
+        if let Message::Assistant(a) = &messages[idx] {
+            let issues_call = a
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::ToolCall { id, .. } if *id == result.tool_call_id));
+            if issues_call {
+                return idx;
+            }
+        }
+    }
+    last
 }
 
 fn emit(sink: &Option<mpsc::UnboundedSender<AgentEvent>>, ev: AgentEvent) {

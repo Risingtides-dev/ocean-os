@@ -514,6 +514,7 @@ impl AgentRuntime {
             permission,
             cancel,
             event_sink,
+            thinking_level,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
         // built-ins plus any connected MCP/skill providers, deduped first-wins.
@@ -532,6 +533,13 @@ impl AgentRuntime {
         .with_max_turns(req.max_turns.unwrap_or(32))
         .with_turn_timeout_secs(turn_timeout_secs_from_env())
         .with_permission(permission);
+        // Per-turn reasoning override (OCEAN-41): when the turn carries an
+        // explicit `thinking_level`, apply it to *this* turn's config only. The
+        // runtime's global `thinking_level` is untouched, so the next turn falls
+        // back to the default unless it too overrides.
+        if let Some(level) = thinking_level {
+            cfg = cfg.with_thinking(level);
+        }
         cfg.stream_options.api_key = snapshot.api_key.clone();
         cfg.stream_options.base_url = Some(snapshot.provider_config.selection.base_url.clone());
         cfg.stream_options.cancel = cancel;
@@ -639,6 +647,10 @@ pub struct PromptControl {
     /// The daemon uses this to push real-time deltas onto its broadcast bus
     /// so SSE consumers (TUI/CLI) can render text as it streams.
     pub event_sink: Option<mpsc::UnboundedSender<AgentEvent>>,
+    /// Per-turn reasoning effort override. When `Some`, it is applied to *this
+    /// turn's* `AgentConfig` only — the runtime's global `thinking_level` is
+    /// never mutated. `None` leaves the global default in force.
+    pub thinking_level: Option<ocean_protocol::ThinkingLevel>,
 }
 
 impl PromptControl {
@@ -647,6 +659,7 @@ impl PromptControl {
             permission,
             cancel: None,
             event_sink: None,
+            thinking_level: None,
         }
     }
 
@@ -661,6 +674,13 @@ impl PromptControl {
 
     pub fn with_event_sink(mut self, sink: mpsc::UnboundedSender<AgentEvent>) -> Self {
         self.event_sink = Some(sink);
+        self
+    }
+
+    /// Override the reasoning effort for this turn only (does not touch the
+    /// runtime's global `thinking_level`).
+    pub fn with_thinking_level(mut self, level: Option<ocean_protocol::ThinkingLevel>) -> Self {
+        self.thinking_level = level;
         self
     }
 }
