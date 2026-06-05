@@ -23,6 +23,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+/// Per-turn reasoning effort. Re-exported from `ocean-protocol` so clients can
+/// set `AgentTurnRequest::thinking_level` without depending on the protocol
+/// crate directly.
+pub use ocean_protocol::ThinkingLevel;
+
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
@@ -203,6 +208,11 @@ pub struct AgentTurnRequest {
     /// Known values: "tui", "surface-web", "surface-gpui", "surface-native", "cli", "leo-voice"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+    /// Per-turn reasoning effort override. When set, the daemon applies this
+    /// `ThinkingLevel` to *this turn only* — it does not mutate the runtime's
+    /// global `thinking_level`. `None` leaves the global default in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 /// Response payload for `POST /v1/agent/turns`.
@@ -830,14 +840,36 @@ mod tests {
             room_id: Some("pm".into()),
             project_id: None,
             client_type: Some("surface-web".into()),
+            thinking_level: Some(ThinkingLevel::High),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
         assert!(json.contains("\"cwd\""));
         assert!(json.contains("\"room_id\":\"pm\""));
+        // `ThinkingLevel` serializes lowercase (see ocean_protocol::ThinkingLevel).
+        assert!(json.contains("\"thinking_level\":\"high\""));
         let back: AgentTurnRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.prompt, "list the src directory");
         assert_eq!(back.room_id.as_deref(), Some("pm"));
+        assert_eq!(back.thinking_level, Some(ThinkingLevel::High));
+    }
+
+    #[test]
+    fn agent_turn_request_thinking_level_omitted_when_none() {
+        // The per-turn override is optional; when unset the field must not
+        // appear on the wire, so existing clients are unaffected.
+        let req = AgentTurnRequest {
+            session_id: None,
+            prompt: "hi".into(),
+            cwd: "/tmp".into(),
+            guidance: None,
+            room_id: None,
+            project_id: None,
+            client_type: None,
+            thinking_level: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("thinking_level"));
     }
 
     #[test]

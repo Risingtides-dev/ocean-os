@@ -2056,6 +2056,7 @@ async fn agent_turn(
         room_id,
         project_id,
         client_type,
+        thinking_level,
     } = req;
 
     // Resolve the working directory: a non-empty cwd wins; else the project's
@@ -2272,7 +2273,11 @@ async fn agent_turn(
 
     let control =
         build_prompt_control(&state, request_id, Some(core_sid(session_id)), true, cancel)
-            .with_event_sink(event_tx);
+            .with_event_sink(event_tx)
+            // Per-turn reasoning override (OCEAN-28/41): threads the optional
+            // request `thinking_level` into this turn's config only, leaving the
+            // runtime's global thinking_level untouched.
+            .with_thinking_level(thinking_level);
     let res = state.runtime.prompt(prompt_req, control).await;
     // Wait for the bridge to drain (the sender has been dropped by now).
     let _ = bridge.await;

@@ -31,6 +31,13 @@ tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [[test]]
 name = "tools_smoke"
 path = "tests/tools_smoke.rs"
+
+[[test]]
+name = "trim_invariants"
+path = "tests/trim_invariants.rs"

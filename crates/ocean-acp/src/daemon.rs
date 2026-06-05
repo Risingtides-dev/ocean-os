@@ -110,6 +110,9 @@ impl DaemonClient {
             room_id: None,
             project_id: None,
             client_type: Some(CLIENT_TYPE.to_string()),
+            // ACP bridge has no per-turn reasoning control; defer to the
+            // runtime's global thinking_level.
+            thinking_level: None,
         };
 
         let url = format!("{}/v1/agent/turns", self.base_url);

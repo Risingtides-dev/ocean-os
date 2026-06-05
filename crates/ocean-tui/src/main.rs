@@ -2645,6 +2645,9 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             // bind correctly — the non-empty cwd wins on the daemon side.
             project_id: None,
             client_type: Some("tui".into()),
+            // The TUI has no per-turn reasoning control yet; defer to the
+            // runtime's global thinking_level.
+            thinking_level: None,
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(
