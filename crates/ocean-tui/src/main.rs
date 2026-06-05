@@ -2829,6 +2829,8 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             // The TUI has no per-turn reasoning control yet; defer to the
             // runtime's global thinking_level.
             thinking_level: None,
+            // The TUI uses the daemon's global model selection.
+            model_id: None,
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(

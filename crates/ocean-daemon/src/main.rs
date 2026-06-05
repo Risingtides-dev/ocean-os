@@ -2057,6 +2057,7 @@ async fn agent_turn(
         project_id,
         client_type,
         thinking_level,
+        model_id,
     } = req;
 
     // Resolve the working directory: a non-empty cwd wins; else the project's
@@ -2117,8 +2118,11 @@ async fn agent_turn(
     };
 
     // Emit turn_started, tagged with the model driving this turn so clients
-    // can show it live and reflect a mid-session swap.
-    let (_provider, current_model) = state.runtime.current_model();
+    // can show it live and reflect a mid-session swap. A per-turn `model_id`
+    // override (OCEAN-36) wins over the global model for this readout, so the
+    // client sees the model that actually drives the turn.
+    let (_provider, global_model) = state.runtime.current_model();
+    let turn_model = model_id.clone().unwrap_or(global_model);
     emit_agent(
         &state.events,
         &state.agent_events,
@@ -2126,7 +2130,7 @@ async fn agent_turn(
         AgentTurnEvent::TurnStarted {
             turn_id,
             session_id,
-            model: Some(current_model),
+            model: Some(turn_model),
         },
     );
 
@@ -2277,7 +2281,11 @@ async fn agent_turn(
             // Per-turn reasoning override (OCEAN-28/41): threads the optional
             // request `thinking_level` into this turn's config only, leaving the
             // runtime's global thinking_level untouched.
-            .with_thinking_level(thinking_level);
+            .with_thinking_level(thinking_level)
+            // Per-turn model override (OCEAN-36): threads the optional request
+            // `model_id` into this turn's config only, leaving the runtime's
+            // global model selection untouched.
+            .with_model_id(model_id.clone());
     let res = state.runtime.prompt(prompt_req, control).await;
     // Wait for the bridge to drain (the sender has been dropped by now).
     let _ = bridge.await;

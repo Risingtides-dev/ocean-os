@@ -64,8 +64,15 @@ impl DaemonClient {
             .context("decode models response")
     }
 
-    /// Swap the daemon's active model. Mirrors `POST /v1/model { model }`.
-    /// Returns the now-current `(provider, model)` on success.
+    /// Swap the daemon's active *global* model. Mirrors `POST /v1/model
+    /// { model }` and returns the now-current `(provider, model)` on success.
+    ///
+    /// OCEAN-36: ocean-acp no longer calls this on `session/set_mode` — that
+    /// global swap raced two editor windows against each other. Model selection
+    /// now rides per-turn via `AgentTurnRequest::model_id`. This method is kept
+    /// as a thin client for the still-supported global endpoint (e.g. an
+    /// operator CLI), hence `allow(dead_code)`.
+    #[allow(dead_code)]
     pub async fn set_model(&self, model: &str) -> Result<(String, String)> {
         let url = format!("{}/v1/model", self.base_url);
         let resp: ModelSetResponse = self
@@ -98,6 +105,7 @@ impl DaemonClient {
         prompt: String,
         cwd: String,
         session_id: Option<String>,
+        model_id: Option<String>,
     ) -> Result<AgentTurnResponse> {
         let body = AgentTurnRequest {
             session_id: session_id
@@ -114,6 +122,8 @@ impl DaemonClient {
             // ACP bridge has no per-turn reasoning control; defer to the
             // runtime's global thinking_level.
             thinking_level: None,
+            // Per-session model override (OCEAN-36): drives this turn only.
+            model_id,
         };
 
         let url = format!("{}/v1/agent/turns", self.base_url);
@@ -347,6 +357,10 @@ pub struct ModelsResponse {
     pub models: Vec<ModelInfo>,
 }
 
+/// Decoded body of `POST /v1/model`. Only used by [`DaemonClient::set_model`],
+/// which OCEAN-36 left in place for the global endpoint but no longer calls on
+/// the per-session path; hence `allow(dead_code)`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct ModelSetResponse {
     ok: bool,

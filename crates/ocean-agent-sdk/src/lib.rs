@@ -213,6 +213,14 @@ pub struct AgentTurnRequest {
     /// global `thinking_level`. `None` leaves the global default in force.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ThinkingLevel>,
+    /// Per-turn / per-session model override (OCEAN-36). When set, the daemon
+    /// drives *this turn only* with the given model alias, leaving the runtime's
+    /// global model selection untouched. This lets independent client windows
+    /// (e.g. two Zed/ACP sessions) each pin their own model without racing each
+    /// other through the global `POST /v1/model` swap. `None` falls back to the
+    /// global runtime model as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 /// Response payload for `POST /v1/agent/turns`.
@@ -841,6 +849,7 @@ mod tests {
             project_id: None,
             client_type: Some("surface-web".into()),
             thinking_level: Some(ThinkingLevel::High),
+            model_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
@@ -867,9 +876,12 @@ mod tests {
             project_id: None,
             client_type: None,
             thinking_level: None,
+            model_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("thinking_level"));
+        // model_id is also skip_serializing_if = "Option::is_none".
+        assert!(!json.contains("model_id"));
     }
 
     #[test]
