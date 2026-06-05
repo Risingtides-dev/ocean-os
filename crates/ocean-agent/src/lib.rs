@@ -20,8 +20,8 @@ use ocean_providers::{
 // a direct ocean-providers dependency.
 pub use ocean_providers::{known_models, KnownModel};
 use ocean_runtime::{
-    run_agent_with_history, AgentConfig, AgentEvent, BuiltinProvider, CapabilityProvider,
-    CapabilityRegistry, PermissionDecision, PermissionPolicy, SessionContext,
+    run_agent_with_history, AgentConfig, AgentError, AgentEvent, BuiltinProvider,
+    CapabilityProvider, CapabilityRegistry, PermissionDecision, PermissionPolicy, SessionContext,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -229,17 +229,28 @@ impl AgentRuntime {
                 cwd,
                 usage,
             },
-            Err(e) => PromptResponse {
-                request_id: Some(request_id),
-                ok: false,
-                session_id: req.session_id,
-                code: None,
-                wall_ms: start.elapsed().as_millis() as u64,
-                stdout: String::new(),
-                stderr: e.to_string(),
-                cwd,
-                usage: TokenUsage::default(),
-            },
+            Err(e) => {
+                // Surface a per-turn timeout distinctly so the daemon can map it
+                // to HTTP 408. `run_agent_with_history` propagates the failure as
+                // an `anyhow::Error`, so recover the concrete `AgentError` variant
+                // by downcast; a `Timeout` sets code 408, everything else stays
+                // `None` (generic failure).
+                let code = e
+                    .downcast_ref::<AgentError>()
+                    .filter(|err| matches!(err, AgentError::Timeout { .. }))
+                    .map(|_| 408);
+                PromptResponse {
+                    request_id: Some(request_id),
+                    ok: false,
+                    session_id: req.session_id,
+                    code,
+                    wall_ms: start.elapsed().as_millis() as u64,
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                    cwd,
+                    usage: TokenUsage::default(),
+                }
+            }
         }
     }
 
@@ -519,6 +530,7 @@ impl AgentRuntime {
         )
         .with_tools(tools)
         .with_max_turns(req.max_turns.unwrap_or(32))
+        .with_turn_timeout_secs(turn_timeout_secs_from_env())
         .with_permission(permission);
         cfg.stream_options.api_key = snapshot.api_key.clone();
         cfg.stream_options.base_url = Some(snapshot.provider_config.selection.base_url.clone());
@@ -602,6 +614,21 @@ impl AgentRuntime {
         };
         Ok((session.id, stdout, stderr, usage))
     }
+}
+
+/// Per-turn timeout (seconds) from the environment.
+///
+/// Reads `OCEAN_TURN_TIMEOUT_SECS`. Returns `Some(n)` for a valid positive
+/// integer, and `None` when the variable is unset, empty, unparseable, or `0`
+/// — in which case [`AgentConfig`] falls back to
+/// [`AgentConfig::DEFAULT_TURN_TIMEOUT_SECS`] (300s). A `0` is treated as
+/// "unset" rather than "deadline of zero" so a stray value can never make every
+/// turn time out instantly.
+fn turn_timeout_secs_from_env() -> Option<u32> {
+    std::env::var("OCEAN_TURN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|secs| *secs > 0)
 }
 
 #[derive(Clone)]

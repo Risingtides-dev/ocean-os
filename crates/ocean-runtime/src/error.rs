@@ -14,6 +14,9 @@ pub enum AgentError {
     #[error("agent reached max turns ({0})")]
     MaxTurns(u32),
 
+    #[error("agent turn exceeded {secs}s timeout")]
+    Timeout { secs: u32 },
+
     #[error("{0}")]
     Other(String),
 }

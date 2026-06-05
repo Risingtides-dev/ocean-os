@@ -85,39 +85,61 @@ pub async fn run_agent_with_history(
             options.reasoning = Some(config.thinking_level);
         }
 
-        let mut stream = stream_simple(&config.model, &ctx, &options).await?;
-
         let mut final_message: Option<ocean_protocol::AssistantMessage> = None;
         let mut stop = StopReason::Stop;
 
-        while let Some(ev) = stream.next().await {
-            let ev = ev?;
-            match ev {
-                AssistantMessageEvent::Done { reason, message } => {
-                    stop = reason;
-                    // Accumulate this round's real provider usage.
-                    total_usage.input += message.usage.input;
-                    total_usage.output += message.usage.output;
-                    total_usage.cache_read += message.usage.cache_read;
-                    total_usage.cache_write += message.usage.cache_write;
-                    total_usage.total_tokens += message.usage.total_tokens;
-                    final_message = Some(message);
-                    break;
+        // Bound the entire turn — provider request + full stream consumption —
+        // by a single wall-clock deadline. A hung or slow provider that never
+        // finishes streaming would otherwise block this turn forever; on elapse
+        // we abort with `AgentError::Timeout` and unwind the run. This is a
+        // *total* per-turn deadline (not an idle/inter-chunk timeout): the whole
+        // round must complete within the window, matching the intent of bounding
+        // a turn that a provider has hung on.
+        let timeout_secs = config.turn_timeout_secs();
+        let stream_work = async {
+            let mut stream = stream_simple(&config.model, &ctx, &options).await?;
+            while let Some(ev) = stream.next().await {
+                let ev = ev?;
+                match ev {
+                    AssistantMessageEvent::Done { reason, message } => {
+                        stop = reason;
+                        // Accumulate this round's real provider usage.
+                        total_usage.input += message.usage.input;
+                        total_usage.output += message.usage.output;
+                        total_usage.cache_read += message.usage.cache_read;
+                        total_usage.cache_write += message.usage.cache_write;
+                        total_usage.total_tokens += message.usage.total_tokens;
+                        final_message = Some(message);
+                        break;
+                    }
+                    AssistantMessageEvent::Error { reason: _, error } => {
+                        let err_msg = error
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "provider error".into());
+                        return Err(AgentError::Other(err_msg));
+                    }
+                    AssistantMessageEvent::TextDelta { delta, .. } => {
+                        emit(&events, AgentEvent::TextDelta { delta });
+                    }
+                    AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                        emit(&events, AgentEvent::ThinkingDelta { delta });
+                    }
+                    _ => {}
                 }
-                AssistantMessageEvent::Error { reason: _, error } => {
-                    let err_msg = error
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "provider error".into());
-                    return Err(AgentError::Other(err_msg));
-                }
-                AssistantMessageEvent::TextDelta { delta, .. } => {
-                    emit(&events, AgentEvent::TextDelta { delta });
-                }
-                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                    emit(&events, AgentEvent::ThinkingDelta { delta });
-                }
-                _ => {}
+            }
+            Ok::<(), AgentError>(())
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs as u64),
+            stream_work,
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(AgentError::Timeout { secs: timeout_secs });
             }
         }
 
