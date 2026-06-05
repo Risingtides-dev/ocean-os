@@ -2921,9 +2921,18 @@ fn should_emit_agent_event(
     event: &AgentTurnEvent,
 ) -> bool {
     match (want, event.session_id()) {
+        // Session-scoped subscriber: deliver only its own session's events.
+        // A session-less event (a council-wide `Extension`) is NOT this
+        // session's event, so it is dropped here — the Invariant 5 exception:
+        // global-by-design extension events never leak into a scoped stream.
         (Some(want), Some(sid)) => sid == want,
+        (Some(_), None) => false,
+        // No session requested: session-bearing events (and session-scoped
+        // extension events) require the explicit `?all=1` firehose opt-in.
         (None, Some(_)) => all,
-        _ => true,
+        // No session requested, session-less event (council-wide `Extension`):
+        // global-by-design, delivered only to the `?all=1` firehose.
+        (None, None) => all,
     }
 }
 
@@ -3228,10 +3237,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             title: _,
             cwd: _,
         } => Some(OceanEvent::SessionCreated),
-        AgentTurnEvent::Extension {
-            extension: _,
-            payload: _,
-        } => None,
+        AgentTurnEvent::Extension { .. } => None,
         AgentTurnEvent::ComponentRender { .. } => None,
         AgentTurnEvent::ComponentUnmount { .. } => None,
         AgentTurnEvent::BrowserActivity { .. } => None,
@@ -3248,10 +3254,7 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
         AgentTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
         AgentTurnEvent::TurnFinished { .. } => "turn_finished",
         AgentTurnEvent::SessionCreated { .. } => "session_created",
-        AgentTurnEvent::Extension {
-            extension: _,
-            payload: _,
-        } => "extension",
+        AgentTurnEvent::Extension { .. } => "extension",
         AgentTurnEvent::ComponentRender { .. } => "component_render",
         AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
         AgentTurnEvent::BrowserActivity { .. } => "browser_activity",
@@ -3581,19 +3584,50 @@ mod tests {
         assert!(should_emit_agent_event(None, true, &event));
     }
 
+    // OCEAN-56: a council-wide (sessionless) Longhouse/Extension event must NOT
+    // leak into a session-scoped subscriber's stream — that would violate
+    // Invariant 5. It is global-by-design, so it reaches only the `?all=1`
+    // firehose. A session-scoped Extension event is filtered like any
+    // session-bearing event.
     #[test]
-    fn agent_event_filter_keeps_sessionless_extension_events() {
-        let event = AgentTurnEvent::Extension {
-            extension: "longhouse".to_string(),
-            payload: json!({"ok": true}),
-        };
+    fn council_wide_extension_event_is_global_opt_in_only() {
+        let council = LonghouseEvent::TopicConvened {
+            topic_id: Uuid::new_v4(),
+            board_id: Uuid::new_v4(),
+            federation: Federation::Sales,
+            trigger: ConveneTrigger::Deliberation,
+            title: "which creators for Warner Q3".into(),
+            deadline_ms: 1_700_000_000_000,
+        }
+        .into_turn_event();
 
-        assert!(should_emit_agent_event(None, false, &event));
-        assert!(should_emit_agent_event(
-            Some(AgentSessionId::new_v4()),
-            false,
-            &event
-        ));
+        // A subscriber scoped to ANY session must NOT receive it.
+        let unrelated = AgentSessionId::new_v4();
+        assert!(!should_emit_agent_event(Some(unrelated), false, &council));
+
+        // A plain global subscriber (no `?all=1`) must NOT receive it either —
+        // global-by-design events are opt-in, not default.
+        assert!(!should_emit_agent_event(None, false, &council));
+
+        // Only the explicit `?all=1` firehose receives it.
+        assert!(should_emit_agent_event(None, true, &council));
+    }
+
+    #[test]
+    fn session_scoped_extension_event_is_filtered_like_a_session_event() {
+        let session_a = AgentSessionId::new_v4();
+        let session_b = AgentSessionId::new_v4();
+        let scoped = LonghouseEvent::TopicClosed {
+            topic_id: Uuid::new_v4(),
+        }
+        .into_turn_event_scoped(session_a);
+
+        // Matching session gets it; unrelated session does not.
+        assert!(should_emit_agent_event(Some(session_a), false, &scoped));
+        assert!(!should_emit_agent_event(Some(session_b), false, &scoped));
+        // Plain global subscriber does not; `?all=1` does.
+        assert!(!should_emit_agent_event(None, false, &scoped));
+        assert!(should_emit_agent_event(None, true, &scoped));
     }
 
     #[test]

@@ -3386,7 +3386,9 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 )),
             }
         }
-        AgentTurnEvent::Extension { extension, payload } => {
+        AgentTurnEvent::Extension {
+            extension, payload, ..
+        } => {
             // Longhouse extensions are already handled above; only log the
             // generic fallback for other extensions.
             if extension != LonghouseEvent::EXTENSION {
@@ -4103,7 +4105,9 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
                 format_agent_turn_perf(*wall_ms, *output_tokens, *tokens_per_second)
             ),
         },
-        AgentTurnEvent::Extension { extension, payload } => format!(
+        AgentTurnEvent::Extension {
+            extension, payload, ..
+        } => format!(
             "agent extension {} {}",
             extension,
             compact_text(&payload.to_string(), 72)
