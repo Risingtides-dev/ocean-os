@@ -11,13 +11,21 @@
 //! concurrent callers without external locking — the provider wraps it in a
 //! `Mutex` for exactly this reason.
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
+use ocean_protocol::Content;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 use tokio::time::{timeout_at, Duration, Instant};
 
 use crate::jsonrpc::{Incoming, Notification, Request};
 use crate::transport::Transport;
+
+/// The MCP method a server sends to announce its tool list changed. Receiving
+/// this invalidates the provider's cached tool snapshot (OCEAN-32).
+const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 
 /// Protocol version this client speaks. The server echoes the same version if
 /// it supports it, or negotiates down; we accept whatever it returns.
@@ -34,15 +42,31 @@ pub struct McpToolDef {
     pub input_schema: Value,
 }
 
-/// Result of a `tools/call`: flattened content text plus the error flag.
+/// Result of a `tools/call`: the server's content blocks mapped onto Ocean's
+/// shared [`Content`] model, plus the error flag.
 #[derive(Debug, Clone)]
 pub struct McpCallResult {
-    /// Concatenated text of all `text` content blocks. Non-text blocks (image,
-    /// audio, resource) are summarized with a placeholder line.
-    pub text: String,
+    /// The result's content blocks. `text` blocks become [`Content::Text`];
+    /// `image` blocks are preserved as [`Content::Image`] (base64 + mime) so the
+    /// model actually receives the image rather than a dropped placeholder.
+    /// Genuinely unsupported kinds (audio, embedded resources) are logged and
+    /// rendered as a text placeholder so the model knows content was elided.
+    pub content: Vec<Content>,
     /// The server's `isError` flag (tool-execution error, distinct from a
     /// protocol error which surfaces as `Err`).
     pub is_error: bool,
+}
+
+impl McpCallResult {
+    /// Concatenated text of all text blocks. Used for the error path (the model
+    /// surfaces a tool error as a string) and for callers that only want text.
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 pub struct McpClient {
@@ -56,6 +80,10 @@ pub struct McpClient {
     /// chatty server can't stall a call indefinitely. The spec requires senders
     /// to time out rather than hang forever.
     request_timeout: Duration,
+    /// Notified whenever a `tools/list_changed` notification is observed while
+    /// draining the request loop. The provider waits on this to trigger a
+    /// background re-fetch + atomic swap of its cached tool list (OCEAN-32).
+    tools_changed: Arc<Notify>,
 }
 
 impl McpClient {
@@ -64,7 +92,14 @@ impl McpClient {
             transport,
             next_id: 1,
             request_timeout: Duration::from_secs(30),
+            tools_changed: Arc::new(Notify::new()),
         }
+    }
+
+    /// A handle that fires each time the server announces `tools/list_changed`.
+    /// The provider clones this and spawns a watcher that re-discovers tools.
+    pub fn tools_changed_signal(&self) -> Arc<Notify> {
+        self.tools_changed.clone()
     }
 
     /// Override the per-request timeout. (Connect bounds the handshake with its
@@ -150,13 +185,13 @@ impl McpClient {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let text = result
+        let content = result
             .get("content")
             .and_then(|c| c.as_array())
-            .map(|blocks| flatten_content(blocks))
+            .map(|blocks| map_content(name, blocks))
             .unwrap_or_default();
 
-        Ok(McpCallResult { text, is_error })
+        Ok(McpCallResult { content, is_error })
     }
 
     /// Cleanly shut the connection down.
@@ -197,10 +232,21 @@ impl McpClient {
                 }
             };
             if !msg.is_response() {
-                // Server-initiated notification (e.g. tools/list_changed). Not
-                // handled yet; log and keep waiting for our response.
+                // Server-initiated notification. `tools/list_changed` invalidates
+                // the provider's cached tool snapshot: fire the signal so the
+                // provider's watcher re-fetches in the background (OCEAN-32).
+                // Other notifications are logged and skipped while we keep
+                // waiting for our response.
                 if let Some(m) = &msg.method {
-                    tracing::debug!(notification = %m, "ignoring MCP server notification");
+                    if m == TOOLS_LIST_CHANGED {
+                        tracing::info!(
+                            notification = %m,
+                            "MCP tools/list_changed received; invalidating cached tool list"
+                        );
+                        self.tools_changed.notify_one();
+                    } else {
+                        tracing::debug!(notification = %m, "ignoring MCP server notification");
+                    }
                 }
                 continue;
             }
@@ -222,21 +268,157 @@ impl McpClient {
     }
 }
 
-/// Flatten MCP content blocks into a single string for the agent transcript.
-/// Text blocks are concatenated; other kinds get a short placeholder so the
-/// model knows non-text content came back.
-fn flatten_content(blocks: &[Value]) -> String {
-    let mut parts = Vec::new();
+/// Map MCP content blocks onto Ocean's [`Content`] model.
+///
+/// - `text` → [`Content::Text`].
+/// - `image` → [`Content::Image`] (base64 data + mime). Previously these were
+///   silently dropped behind an `[image content omitted]` placeholder; now the
+///   image actually reaches the model. MCP image blocks are
+///   `{ "type": "image", "data": "<base64>", "mimeType": "image/png" }`.
+/// - anything else (audio, embedded resources, unknown kinds) is genuinely
+///   unsupported by the content model today: it is logged clearly and replaced
+///   with a text placeholder so the model knows content was elided rather than
+///   the call having returned nothing.
+fn map_content(tool_name: &str, blocks: &[Value]) -> Vec<Content> {
+    let mut out = Vec::new();
     for b in blocks {
         match b.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                    parts.push(t.to_string());
+                    out.push(Content::text(t));
                 }
             }
-            Some(other) => parts.push(format!("[{other} content omitted]")),
+            Some("image") => match image_block(b) {
+                Some(content) => out.push(content),
+                None => {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        "MCP image result block missing `data`/`mimeType`; dropping it"
+                    );
+                    out.push(Content::text("[image content omitted: malformed image block]"));
+                }
+            },
+            Some(other) => {
+                // Audio, embedded resources, and unknown kinds have no Content
+                // variant today. Log loudly (so an operator can see a real tool
+                // is returning content we discard) and leave a breadcrumb for
+                // the model instead of silently swallowing it.
+                tracing::warn!(
+                    tool = %tool_name,
+                    kind = %other,
+                    "MCP tool returned an unsupported content block; representing it as a placeholder"
+                );
+                out.push(Content::text(format!(
+                    "[{other} content omitted: unsupported by Ocean's content model]"
+                )));
+            }
             None => {}
         }
     }
-    parts.join("\n")
+    out
+}
+
+/// Build a [`Content::Image`] from an MCP `image` block, if it has the required
+/// `data` (base64) and `mimeType` fields.
+fn image_block(b: &Value) -> Option<Content> {
+    let data = b.get("data").and_then(|d| d.as_str())?;
+    let mime = b
+        .get("mimeType")
+        .and_then(|m| m.as_str())
+        .unwrap_or("image/png");
+    Some(Content::Image {
+        data: data.to_string(),
+        mime_type: mime.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn text_blocks_map_to_text_content() {
+        let blocks = vec![
+            json!({ "type": "text", "text": "hello" }),
+            json!({ "type": "text", "text": "world" }),
+        ];
+        let content = map_content("t", &blocks);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].as_text(), Some("hello"));
+        assert_eq!(content[1].as_text(), Some("world"));
+    }
+
+    #[test]
+    fn image_block_is_preserved_as_image_content() {
+        // OCEAN-48: image results must reach the model as a real image, not a
+        // dropped placeholder.
+        let blocks = vec![json!({
+            "type": "image",
+            "data": "aGVsbG8=",
+            "mimeType": "image/png"
+        })];
+        let content = map_content("screenshot", &blocks);
+        assert_eq!(content.len(), 1);
+        match &content[0] {
+            Content::Image { data, mime_type } => {
+                assert_eq!(data, "aGVsbG8=");
+                assert_eq!(mime_type, "image/png");
+            }
+            other => panic!("expected image content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_without_mime_defaults_to_png() {
+        let blocks = vec![json!({ "type": "image", "data": "Zm9v" })];
+        let content = map_content("t", &blocks);
+        match &content[0] {
+            Content::Image { mime_type, .. } => assert_eq!(mime_type, "image/png"),
+            other => panic!("expected image content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_image_block_becomes_a_placeholder() {
+        // Missing `data` → can't build an image; leave a breadcrumb, don't drop
+        // silently.
+        let blocks = vec![json!({ "type": "image", "mimeType": "image/png" })];
+        let content = map_content("t", &blocks);
+        assert_eq!(content.len(), 1);
+        assert!(content[0]
+            .as_text()
+            .unwrap()
+            .contains("image content omitted"));
+    }
+
+    #[test]
+    fn unsupported_block_is_logged_placeholder_not_dropped() {
+        // OCEAN-48: audio/resource have no Content variant; represent them with a
+        // clear placeholder rather than silently dropping the call's output.
+        let blocks = vec![
+            json!({ "type": "audio", "data": "...", "mimeType": "audio/wav" }),
+            json!({ "type": "text", "text": "caption" }),
+        ];
+        let content = map_content("t", &blocks);
+        assert_eq!(content.len(), 2);
+        assert!(content[0].as_text().unwrap().contains("audio content omitted"));
+        assert_eq!(content[1].as_text(), Some("caption"));
+    }
+
+    #[test]
+    fn call_result_text_accessor_joins_only_text() {
+        let res = McpCallResult {
+            content: vec![
+                Content::text("a"),
+                Content::Image {
+                    data: "x".into(),
+                    mime_type: "image/png".into(),
+                },
+                Content::text("b"),
+            ],
+            is_error: false,
+        };
+        assert_eq!(res.text(), "a\nb");
+    }
 }

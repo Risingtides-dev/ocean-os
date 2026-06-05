@@ -10,6 +10,9 @@ rust-version.workspace = true
 # The capability seam we implement. ocean-mcp depends UP into ocean-runtime;
 # ocean-runtime must never depend back on ocean-mcp.
 ocean-runtime = { path = "../ocean-runtime" }
+# Shared content model. A tool result's `content` is `Vec<Content>`, so the MCP
+# client builds `Content::Image` blocks for non-text MCP results directly.
+ocean-protocol = { path = "../ocean-protocol" }
 
 anyhow.workspace = true
 async-trait.workspace = true
@@ -30,6 +33,3 @@ doc = false
 # Parses the [[mcp.server]] section in the config test; the daemon's real
 # loader (ocean-agent) carries the non-dev toml dependency.
 toml.workspace = true
-# The e2e test inspects tool-result Content (transitive via ocean-runtime, but
-# named explicitly so the test crate can `use` it).
-ocean-protocol = { path = "../ocean-protocol" }

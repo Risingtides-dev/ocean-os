@@ -15,24 +15,32 @@ use async_trait::async_trait;
 use ocean_runtime::capability::{CapabilityProvider, ProviderHealth, SessionContext, SharedTool};
 use ocean_runtime::types::{AgentTool, AgentToolResult};
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 
 use crate::client::{McpClient, McpToolDef};
 use crate::config::{McpServerConfig, McpTransportKind};
-use crate::transport::StdioTransport;
+use crate::transport::{HttpTransport, StdioTransport};
 
 /// Separator between the server name and the remote tool name in the namespaced
 /// id exposed to the agent. Double underscore matches the convention used by
 /// other MCP hosts and is unlikely to appear in a built-in tool name.
 const NS: &str = "__";
 
+/// The cached tool list, behind an async lock and an `Arc` so it can be swapped
+/// atomically when the server announces `tools/list_changed`. Readers clone the
+/// inner `Arc` under a short read lock; the watcher swaps the whole `Arc` under
+/// a write lock — so an in-flight `tools()` call never observes a partial list.
+type ToolCache = Arc<RwLock<Arc<Vec<SharedTool>>>>;
+
 /// A provider backed by a single MCP server.
 pub struct McpProvider {
     id: String,
-    /// Cached, namespaced tools discovered at connect time. Empty if the server
-    /// failed to start (provider stays registered but contributes nothing).
-    tools: Vec<SharedTool>,
+    /// Cached, namespaced tools. Seeded at connect time and atomically swapped
+    /// by the background watcher on `tools/list_changed` (OCEAN-32). Empty if
+    /// the server failed to start (provider stays registered but contributes
+    /// nothing).
+    tools: ToolCache,
     health: ProviderHealth,
 }
 
@@ -57,12 +65,28 @@ impl McpProvider {
             return Ok(Self::empty(id, ProviderHealth::Unavailable));
         }
 
-        if cfg.transport != McpTransportKind::Stdio {
-            tracing::warn!(
-                server = %cfg.name,
-                "only stdio MCP transport is implemented; skipping this server"
-            );
-            return Ok(Self::empty(id, ProviderHealth::Unavailable));
+        if cfg.transport == McpTransportKind::Http {
+            // HTTP transport: fail fast on a connection problem with a typed,
+            // explicit error rather than a swallowed warning (OCEAN-47). The
+            // endpoint is carried in `command` for HTTP servers (the URL).
+            let endpoint = cfg.command.clone().unwrap_or_default();
+            match HttpTransport::connect(&endpoint).await {
+                Ok(_transport) => {
+                    // Reserved for when the streamable-HTTP wire lands; until
+                    // then `connect` cannot reach this arm.
+                    tracing::info!(server = %cfg.name, "MCP HTTP server connected");
+                    return Ok(Self::empty(id, ProviderHealth::Degraded));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        server = %cfg.name,
+                        endpoint = %endpoint,
+                        error = %e,
+                        "MCP HTTP server connection failed; contributing no tools"
+                    );
+                    return Ok(Self::empty(id, ProviderHealth::Unavailable));
+                }
+            }
         }
 
         let command = match &cfg.command {
@@ -86,7 +110,8 @@ impl McpProvider {
 
         // Everything below is best-effort; fold failures into an empty provider.
         match Self::connect_inner(&cfg.name, &command, &cfg.args, &env, connect_timeout).await {
-            Ok(tools) => {
+            Ok((client, defs)) => {
+                let tools = build_tools(&cfg.name, defs, &client);
                 tracing::info!(server = %cfg.name, tools = tools.len(), "MCP server ready");
                 // A server that started cleanly but advertises no tools is
                 // reachable-but-useless: Degraded, not Ready.
@@ -95,7 +120,16 @@ impl McpProvider {
                 } else {
                     ProviderHealth::Ready
                 };
-                Ok(Self { id, tools, health })
+                let cache: ToolCache = Arc::new(RwLock::new(Arc::new(tools)));
+                // Watch for tools/list_changed and refresh the cache in the
+                // background (OCEAN-32).
+                let signal = client.lock().await.tools_changed_signal();
+                spawn_tools_changed_watcher(cfg.name.clone(), client, cache.clone(), signal);
+                Ok(Self {
+                    id,
+                    tools: cache,
+                    health,
+                })
             }
             Err(e) => {
                 tracing::warn!(server = %cfg.name, error = %e, "MCP server unavailable; contributing no tools");
@@ -107,20 +141,23 @@ impl McpProvider {
     fn empty(id: String, health: ProviderHealth) -> Self {
         Self {
             id,
-            tools: Vec::new(),
+            tools: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             health,
         }
     }
 
-    /// The fallible core of connect: spawn, handshake, list, wrap. Bounded by
-    /// `connect_timeout` end-to-end so a hung server can't wedge startup.
+    /// The fallible core of connect: spawn and handshake, returning the shared
+    /// client and the discovered tool definitions. Bounded by `connect_timeout`
+    /// end-to-end so a hung server can't wedge startup. Tool *wrapping* happens
+    /// in [`build_tools`] so the same path serves both connect and a later
+    /// `tools/list_changed` refresh.
     async fn connect_inner(
         server_name: &str,
         command: &str,
         args: &[String],
         env: &[(String, String)],
         connect_timeout: Duration,
-    ) -> anyhow::Result<Vec<SharedTool>> {
+    ) -> anyhow::Result<(Arc<Mutex<McpClient>>, Vec<McpToolDef>)> {
         let transport = StdioTransport::spawn(command, args, env)?;
         // Keep the client's default per-call timeout (30s) for live tool calls.
         // The handshake below is bounded separately by the outer `timeout`, so we
@@ -139,22 +176,74 @@ impl McpProvider {
         .await
         .map_err(|_| anyhow::anyhow!("MCP server `{server_name}` connect timed out"))??;
 
-        let tools: Vec<SharedTool> = defs
-            .into_iter()
-            .map(|def| {
-                let tool: SharedTool = Arc::new(McpTool {
-                    namespaced_name: format!("mcp{NS}{server_name}{NS}{}", def.name),
-                    remote_name: def.name,
-                    description: def.description.unwrap_or_else(|| "MCP tool".to_string()),
-                    parameters: normalize_schema(def.input_schema),
-                    client: client.clone(),
-                });
-                tool
-            })
-            .collect();
-
-        Ok(tools)
+        Ok((client, defs))
     }
+}
+
+/// Wrap discovered tool definitions into namespaced [`SharedTool`]s bound to the
+/// shared client. Shared by initial connect and `tools/list_changed` refresh so
+/// both produce identically-shaped tools.
+fn build_tools(
+    server_name: &str,
+    defs: Vec<McpToolDef>,
+    client: &Arc<Mutex<McpClient>>,
+) -> Vec<SharedTool> {
+    defs.into_iter()
+        .map(|def| {
+            let tool: SharedTool = Arc::new(McpTool {
+                namespaced_name: format!("mcp{NS}{server_name}{NS}{}", def.name),
+                remote_name: def.name,
+                description: def.description.unwrap_or_else(|| "MCP tool".to_string()),
+                parameters: normalize_schema(def.input_schema),
+                client: client.clone(),
+            });
+            tool
+        })
+        .collect()
+}
+
+/// Spawn a background task that, each time the server announces
+/// `tools/list_changed`, re-fetches `tools/list` and atomically swaps the cached
+/// snapshot (OCEAN-32). The task ends when the client is dropped (the `Notify`
+/// handle's last sender goes away) — i.e. when the provider is torn down.
+fn spawn_tools_changed_watcher(
+    server_name: String,
+    client: Arc<Mutex<McpClient>>,
+    cache: ToolCache,
+    signal: Arc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        loop {
+            signal.notified().await;
+            tracing::info!(server = %server_name, "refreshing MCP tool list after list_changed");
+            let fetched = {
+                let mut guard = client.lock().await;
+                guard.list_tools().await
+            };
+            match fetched {
+                Ok(defs) => {
+                    let count = defs.len();
+                    let rebuilt = build_tools(&server_name, defs, &client);
+                    // Atomic swap: replace the whole Arc under a write lock so a
+                    // concurrent reader sees either the old or new list, never a
+                    // partial one.
+                    *cache.write().await = Arc::new(rebuilt);
+                    tracing::info!(
+                        server = %server_name,
+                        tools = count,
+                        "MCP tool list refreshed after list_changed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        server = %server_name,
+                        error = %e,
+                        "MCP tools/list refresh failed; keeping previous tool list"
+                    );
+                }
+            }
+        }
+    });
 }
 
 #[async_trait]
@@ -164,7 +253,10 @@ impl CapabilityProvider for McpProvider {
     }
 
     async fn tools(&self, _ctx: &SessionContext) -> Vec<SharedTool> {
-        self.tools.clone()
+        // Clone the current snapshot's contents under a short read lock. Cloning
+        // the `SharedTool` Arcs is cheap; the lock is released immediately.
+        let snapshot = self.tools.read().await.clone();
+        (*snapshot).clone()
     }
 
     async fn health(&self) -> ProviderHealth {
@@ -208,13 +300,20 @@ impl AgentTool for McpTool {
             Ok(res) if res.is_error => {
                 // Tool-execution error: surface as an error tool result so the
                 // model can react, not as a hard failure.
-                Err(if res.text.is_empty() {
+                let text = res.text();
+                Err(if text.is_empty() {
                     format!("MCP tool `{}` reported an error", self.remote_name)
                 } else {
-                    res.text
+                    text
                 })
             }
-            Ok(res) => Ok(AgentToolResult::text(res.text)),
+            Ok(res) => Ok(AgentToolResult {
+                // Preserve the full content blocks (text + image), so image
+                // results reach the model instead of being flattened to a
+                // placeholder string.
+                content: res.content,
+                ..Default::default()
+            }),
             Err(e) => Err(format!("MCP call failed: {e}")),
         }
     }
