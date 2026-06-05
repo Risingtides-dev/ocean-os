@@ -272,9 +272,18 @@ POST   /v1/requests/{id}/cancel           cancel an in-flight request
 GET    /v1/permissions                    list pending permission requests
 POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
 
-# Rooms
-GET    /v1/rooms                          list rooms
-GET    /v1/rooms/{room_id}                room detail
+# Rooms — Track-0 projection (RoomSnapshot)
+GET    /v1/rooms                          list room projections
+GET    /v1/rooms/{room_id}                room projection detail (pm|writers|orch_mesh|review)
+
+# Rooms — persistent lifecycle (OCEAN-65; in-memory store)
+GET    /v1/rooms/persistent               list persistent rooms
+POST   /v1/rooms/persistent               create a room { key, name, trigger_policy? }
+GET    /v1/rooms/persistent/{key}         room + transcript
+POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
+DELETE /v1/rooms/persistent/{key}/participants/{id}       leave
+POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
+GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N)
 
 # Sessions (legacy view)
 GET    /v1/sessions                       list sessions
