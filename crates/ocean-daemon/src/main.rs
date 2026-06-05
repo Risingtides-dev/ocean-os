@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
     env,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -177,6 +178,20 @@ fn evict_overflow<K, V, FTerm, FAt>(
     }
 }
 
+/// Stable hash of a tool call's args for permission deduplication. Serializes
+/// the `Value` to canonical JSON (serde_json sorts object keys deterministically
+/// for a given `Value` shape) and hashes the bytes, so equal args produce equal
+/// keys within one turn. Falls back to hashing the `Debug` form if serialization
+/// ever fails (it won't for a `serde_json::Value`).
+fn permission_args_hash(args: &Value) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match serde_json::to_vec(args) {
+        Ok(bytes) => bytes.hash(&mut hasher),
+        Err(_) => format!("{args:?}").hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
 struct DaemonPermissionPolicy {
     allow_mutating: bool,
     request_id: RequestId,
@@ -185,6 +200,14 @@ struct DaemonPermissionPolicy {
     permissions: PermissionRegistry,
     requests: RequestRegistry,
     cancel: CancellationToken,
+    /// Dedupe map for identical (tool, args) pairs within this turn's scope.
+    /// A `DaemonPermissionPolicy` instance is built once per turn in
+    /// `build_prompt_control`, so a per-instance cache is per-turn. When the
+    /// agent re-issues an identical tool+args call (e.g. retrying after a
+    /// failure) we reuse the original `PermissionId` instead of minting a new
+    /// one, so the same approval doesn't surface twice in the UI. Keyed on the
+    /// tool name plus a stable hash of the canonical args JSON.
+    seen_permissions: Arc<Mutex<HashMap<(String, u64), PermissionId>>>,
 }
 
 #[derive(Clone)]
@@ -352,12 +375,22 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn root() -> Json<serde_json::Value> {
+    // OCEAN-25: this list mirrors the `Router::route()` calls in `main()` exactly,
+    // grouped by concern. Keep it in sync with both the router above and the
+    // authoritative route table in docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md whenever a
+    // route is added or removed.
     Json(json!({
         "ok": true,
         "service": "ocean-daemon",
         "routes": [
+            "GET /",
             "GET /health",
             "GET /ready",
+            "POST /v1/agent/turns",
+            "GET /v1/agent/events",
+            "POST /v1/agent/sessions",
+            "GET /v1/agent/sessions",
+            "GET /v1/agent/sessions/{id}",
             "GET /v1/events",
             "POST /v1/prompt",
             "GET /v1/requests",
@@ -365,8 +398,21 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/requests/{id}/cancel",
             "GET /v1/permissions",
             "POST /v1/permissions/{id}/decision",
+            "GET /v1/rooms",
+            "GET /v1/rooms/{room_id}",
             "GET /v1/sessions",
-            "GET /v1/sessions/{id}"
+            "GET /v1/sessions/{id}",
+            "GET /v1/projects",
+            "POST /v1/projects",
+            "GET /v1/projects/{id}",
+            "PATCH /v1/projects/{id}",
+            "DELETE /v1/projects/{id}",
+            "GET /v1/model",
+            "POST /v1/model",
+            "GET /v1/models",
+            "POST /v1/component/event",
+            "POST /v1/longhouse/demo",
+            "POST /v1/longhouse/convene"
         ]
     }))
 }
@@ -610,6 +656,7 @@ fn build_prompt_control(
             permissions: state.permissions.clone(),
             requests: state.requests.clone(),
             cancel: cancel.clone(),
+            seen_permissions: Arc::new(Mutex::new(HashMap::new())),
         })
     } else {
         Arc::new(DaemonPermissionPolicy {
@@ -620,6 +667,7 @@ fn build_prompt_control(
             permissions: state.permissions.clone(),
             requests: state.requests.clone(),
             cancel: cancel.clone(),
+            seen_permissions: Arc::new(Mutex::new(HashMap::new())),
         })
     };
 
@@ -633,7 +681,21 @@ impl PermissionPolicy for DaemonPermissionPolicy {
             return AgentPermissionDecision::Allow;
         }
 
-        let permission_id = PermissionId::new_v4();
+        // OCEAN-21: within one turn, an identical tool+args combination must map
+        // to a single, stable `PermissionId`. Re-issuing the same call (e.g. the
+        // agent retrying after a failure) otherwise mints a fresh id and shows a
+        // duplicate approval in the UI. Reuse the original id for identical
+        // tool+args; only the first occurrence allocates a new one.
+        let dedupe_key = (tool_name.to_string(), permission_args_hash(args));
+        let permission_id = {
+            let mut seen = self
+                .seen_permissions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *seen
+                .entry(dedupe_key)
+                .or_insert_with(PermissionId::new_v4)
+        };
         let reason = format!("permission required for {tool_name}");
         let status = PermissionStatus {
             permission_id,
@@ -3335,5 +3397,48 @@ mod tests {
         let first = ranked.into_iter().take(overflow).next().unwrap();
         assert!(first.1, "terminal entry ranked first for eviction");
         assert_eq!(first.0, term);
+    }
+
+    #[test]
+    fn permission_args_hash_is_stable_for_equal_args() {
+        let a = json!({"path": "src/lib.rs", "content": "x"});
+        let b = json!({"path": "src/lib.rs", "content": "x"});
+        assert_eq!(permission_args_hash(&a), permission_args_hash(&b));
+    }
+
+    #[test]
+    fn permission_args_hash_differs_for_different_args() {
+        let a = json!({"path": "src/lib.rs"});
+        let b = json!({"path": "src/main.rs"});
+        assert_ne!(permission_args_hash(&a), permission_args_hash(&b));
+    }
+
+    // OCEAN-21: identical (tool, args) within one turn must reuse the same
+    // PermissionId; a different tool or different args must get a distinct one.
+    // This exercises the same dedupe map / keying used in
+    // `DaemonPermissionPolicy::check`.
+    #[test]
+    fn permission_dedupe_reuses_id_for_identical_tool_and_args() {
+        let seen: Arc<Mutex<HashMap<(String, u64), PermissionId>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let mint = |tool: &str, args: &Value| -> PermissionId {
+            let key = (tool.to_string(), permission_args_hash(args));
+            let mut guard = seen.lock().unwrap();
+            *guard.entry(key).or_insert_with(PermissionId::new_v4)
+        };
+
+        let args = json!({"path": "src/lib.rs"});
+        let first = mint("write", &args);
+        let retry = mint("write", &json!({"path": "src/lib.rs"}));
+        assert_eq!(first, retry, "retrying identical tool+args reuses the id");
+
+        let other_args = mint("write", &json!({"path": "src/main.rs"}));
+        assert_ne!(first, other_args, "different args mint a new id");
+
+        let other_tool = mint("edit", &args);
+        assert_ne!(first, other_tool, "different tool mints a new id");
+
+        assert_eq!(seen.lock().unwrap().len(), 3, "three distinct keys cached");
     }
 }
