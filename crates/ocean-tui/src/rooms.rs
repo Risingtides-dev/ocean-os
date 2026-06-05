@@ -256,7 +256,9 @@ fn draw_runtime_room_panes(frame: &mut Frame<'_>, area: Rect, app: &crate::Daemo
     match app.active_room {
         crate::WorkspaceRoom::PM => draw_room_pm_runtime(frame, area, snapshot),
         crate::WorkspaceRoom::Writers => draw_room_writers_runtime(frame, area, snapshot),
-        crate::WorkspaceRoom::Orchestrator => draw_room_orch_mesh_runtime(frame, area, snapshot),
+        crate::WorkspaceRoom::Orchestrator => {
+            draw_room_orch_mesh_runtime(frame, area, snapshot, app)
+        }
         crate::WorkspaceRoom::Rev => draw_room_review_runtime(frame, area, snapshot),
         _ => draw_lines_pane(
             frame,
@@ -334,7 +336,12 @@ fn draw_room_writers_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &crate
     );
 }
 
-fn draw_room_orch_mesh_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::RoomSnapshot) {
+fn draw_room_orch_mesh_runtime(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &crate::RoomSnapshot,
+    app: &crate::DaemonApp,
+) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -372,16 +379,30 @@ fn draw_room_orch_mesh_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &cra
         snapshot.panels.get(2),
     );
 
+    // Split the center column: runtime control rail on top, the live Longhouse
+    // council (with quorum meter) on the bottom (OCEAN-42).
+    let center_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(cols[1]);
+
     if snapshot.panels.len() > 3 {
         draw_panel_pane(
             frame,
-            cols[1],
+            center_rows[0],
             snapshot.panels.get(3).map(|panel| panel.title.as_str()),
             snapshot.panels.get(3),
         );
     } else {
-        draw_panel_pane(frame, cols[1], Some("Runtime control rail"), None);
+        draw_panel_pane(frame, center_rows[0], Some("Runtime control rail"), None);
     }
+
+    draw_lines_pane(
+        frame,
+        center_rows[1],
+        "Longhouse council",
+        app.longhouse_lines(center_rows[1].width.saturating_sub(2) as usize),
+    );
 
     draw_panel_pane(
         frame,

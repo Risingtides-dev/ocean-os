@@ -22,7 +22,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ocean_agent_sdk::{
-    AgentSessionId, AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse,
+    AgentSessionId, AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, Federation,
+    LonghouseEvent,
 };
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
@@ -41,6 +42,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 mod rooms;
 mod splash;
@@ -387,6 +389,9 @@ struct DaemonApp {
     pm_thinking_default_expanded: bool,
     tool_timeline: Vec<ToolTimelineEntry>,
     diff_snippets: Vec<String>,
+    /// Live Longhouse council topics, parsed from `AgentTurnEvent::Extension`
+    /// (`extension == "longhouse"`). Rendered in the Orchestrator room (F3).
+    longhouse_topics: Vec<LonghouseTopic>,
     room_snapshots: Vec<RoomSnapshot>,
     support: WorkspaceSupportState,
     status: String,
@@ -429,6 +434,7 @@ impl DaemonApp {
             pm_thinking_default_expanded: false,
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
+            longhouse_topics: Vec::new(),
             room_snapshots: Vec::new(),
             support: WorkspaceSupportState::default(),
             status: "starting workspace shell".to_string(),
@@ -1187,6 +1193,125 @@ impl DaemonApp {
         self.pending_permissions.first()
     }
 
+    /// Number of approvals currently waiting on an operator decision. Used by
+    /// the room header to surface a pending-count badge (OCEAN-29).
+    fn pending_permission_count(&self) -> usize {
+        self.pending_permissions.len()
+    }
+
+    /// Fold a parsed `LonghouseEvent` into the tracked council topics so the
+    /// Orchestrator room can render live quorum state (OCEAN-42).
+    fn apply_longhouse_event(&mut self, event: &LonghouseEvent) {
+        match event {
+            LonghouseEvent::TopicConvened {
+                topic_id,
+                federation,
+                title,
+                ..
+            } => {
+                let topic = self.longhouse_topic_mut(*topic_id);
+                topic.federation = Some(*federation);
+                topic.title = title.clone();
+            }
+            LonghouseEvent::Convened { topic_id, .. } => {
+                let _ = self.longhouse_topic_mut(*topic_id);
+            }
+            LonghouseEvent::MarkPosted { topic_id, mark } => {
+                let summary = mark.summary.clone();
+                let topic = self.longhouse_topic_mut(*topic_id);
+                topic.marks += 1;
+                push_bounded(&mut topic.recent_marks, summary, 5);
+            }
+            LonghouseEvent::QuorumUpdated {
+                topic_id,
+                tallies,
+                distance_to_quorum,
+                ..
+            } => {
+                let proposals = tallies.len();
+                let distance = distance_to_quorum.clamp(0.0, 1.0);
+                let topic = self.longhouse_topic_mut(*topic_id);
+                topic.proposals = proposals;
+                topic.distance_to_quorum = distance;
+            }
+            LonghouseEvent::Converged {
+                topic_id, decision, ..
+            } => {
+                let label = format!("converged → {}", short_id(*decision));
+                let topic = self.longhouse_topic_mut(*topic_id);
+                topic.distance_to_quorum = 1.0;
+                topic.resolution = Some(label);
+            }
+            LonghouseEvent::Aborted { topic_id, reason } => {
+                let label = format!("aborted ({reason:?})");
+                let topic = self.longhouse_topic_mut(*topic_id);
+                topic.resolution = Some(label);
+            }
+            LonghouseEvent::TopicClosed { topic_id } => {
+                let topic = self.longhouse_topic_mut(*topic_id);
+                if topic.resolution.is_none() {
+                    topic.resolution = Some("closed".to_string());
+                }
+            }
+            // RoleGranted / RoleRevoked / Warned / RunHealth carry no quorum
+            // state the deck-lite F3 view renders today; ignore for now.
+            _ => {}
+        }
+        self.longhouse_topics
+            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    }
+
+    fn longhouse_topic_mut(&mut self, topic_id: Uuid) -> &mut LonghouseTopic {
+        if let Some(idx) = self
+            .longhouse_topics
+            .iter()
+            .position(|topic| topic.topic_id == topic_id)
+        {
+            self.longhouse_topics[idx].updated_at = Utc::now();
+            return &mut self.longhouse_topics[idx];
+        }
+        self.longhouse_topics.push(LonghouseTopic::new(topic_id));
+        let last = self.longhouse_topics.len() - 1;
+        &mut self.longhouse_topics[last]
+    }
+
+    /// Render the live Longhouse council state for the Orchestrator room (F3),
+    /// including a per-topic quorum meter.
+    fn longhouse_lines(&self, width: usize) -> Vec<Line<'static>> {
+        if self.longhouse_topics.is_empty() {
+            return vec![
+                Line::from("No Longhouse topics convened."),
+                Line::from("Council events stream in on F3 as topics open."),
+            ];
+        }
+        let mut lines = Vec::new();
+        for topic in self.longhouse_topics.iter().take(3) {
+            let badge = topic
+                .resolution
+                .clone()
+                .unwrap_or_else(|| format!("{} proposals", topic.proposals));
+            lines.push(Line::from(format!(
+                "▣ {} [{}] {}",
+                compact_text(&topic.title, width.saturating_sub(28).max(12)),
+                topic.federation_label(),
+                badge
+            )));
+            lines.push(Line::from(format!(
+                "  quorum {} {:>3}%  · {} marks",
+                quorum_meter(topic.distance_to_quorum, 16),
+                (topic.distance_to_quorum * 100.0).round() as i32,
+                topic.marks
+            )));
+            if let Some(mark) = topic.recent_marks.last() {
+                lines.push(Line::from(format!(
+                    "  last mark: {}",
+                    compact_text(mark, width.saturating_sub(13).max(12))
+                )));
+            }
+        }
+        lines
+    }
+
     fn set_permissions(&mut self, permissions: Vec<PermissionStatus>) {
         self.pending_permissions = permissions
             .into_iter()
@@ -1351,6 +1476,54 @@ impl PendingPermission {
                 .map(|json| compact_text(&json, 56))
                 .unwrap_or_else(|_| "{}".to_string()),
             updated_at: Some(status.created_at),
+        }
+    }
+}
+
+/// One Longhouse council topic the TUI is tracking, distilled from the live
+/// `LonghouseEvent` stream so the Orchestrator room (F3) can show a quorum meter
+/// and the latest marks without re-deriving state on every render.
+#[derive(Debug, Clone)]
+struct LonghouseTopic {
+    topic_id: Uuid,
+    federation: Option<Federation>,
+    title: String,
+    /// 0.0–1.0: how close the leader is to crossing the quorum threshold.
+    distance_to_quorum: f32,
+    /// Number of proposals currently on the blackboard (from the latest tally).
+    proposals: usize,
+    /// Total marks observed for this topic.
+    marks: usize,
+    /// Recent mark summaries, newest last.
+    recent_marks: Vec<String>,
+    /// Set once the topic converges (or aborts); drives the "decided" badge.
+    resolution: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+impl LonghouseTopic {
+    fn new(topic_id: Uuid) -> Self {
+        Self {
+            topic_id,
+            federation: None,
+            title: "(untitled topic)".to_string(),
+            distance_to_quorum: 0.0,
+            proposals: 0,
+            marks: 0,
+            recent_marks: Vec::new(),
+            resolution: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn federation_label(&self) -> &'static str {
+        match self.federation {
+            Some(Federation::Dev) => "dev",
+            Some(Federation::Sales) => "sales",
+            Some(Federation::Content) => "content",
+            Some(Federation::Campaign) => "campaign",
+            Some(Federation::Commons) => "commons",
+            None => "—",
         }
     }
 }
@@ -1975,6 +2148,13 @@ struct AgentRecord {
     lifecycle: Option<String>,
     #[serde(default)]
     status_message: Option<String>,
+    #[serde(
+        default,
+        rename = "sessionId",
+        alias = "session_id",
+        alias = "session"
+    )]
+    session_id: Option<String>,
     #[serde(default)]
     activity: Option<AgentActivity>,
 }
@@ -1991,6 +2171,7 @@ struct AgentActivity {
 struct AgentView {
     agent: String,
     pid: Option<i32>,
+    session_id: Option<String>,
     updated_at: Option<String>,
     model: Option<String>,
     provider: Option<String>,
@@ -3040,6 +3221,17 @@ fn daemon_apply_agent_turn_response(app: &mut DaemonApp, response: AgentTurnResp
 fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
     app.push_activity(summarize_agent_event(&event));
 
+    // Longhouse council events ride on `AgentTurnEvent::Extension`. Fold them
+    // into the tracked topics (OCEAN-42) before the by-value match consumes the
+    // event for the generic-extension fallback.
+    if let Some(lh) = LonghouseEvent::from_turn_event(&event) {
+        app.apply_longhouse_event(&lh);
+        app.push_activity(format!(
+            "longhouse: {}",
+            compact_text(&summarize_longhouse_event(&lh), 72)
+        ));
+    }
+
     match event {
         AgentTurnEvent::SessionCreated {
             session_id,
@@ -3193,11 +3385,15 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             }
         }
         AgentTurnEvent::Extension { extension, payload } => {
-            app.push_activity(format!(
-                "agent_extension: {} {}",
-                extension,
-                compact_text(&payload.to_string(), 72)
-            ));
+            // Longhouse extensions are already handled above; only log the
+            // generic fallback for other extensions.
+            if extension != LonghouseEvent::EXTENSION {
+                app.push_activity(format!(
+                    "agent_extension: {} {}",
+                    extension,
+                    compact_text(&payload.to_string(), 72)
+                ));
+            }
         }
         AgentTurnEvent::ComponentRender {
             session_id: _,
@@ -3741,6 +3937,61 @@ fn parse_agent_turn_event(payload: &str) -> Result<Option<AgentTurnEvent>, Strin
     }
 }
 
+/// Short, human-facing one-liner for a Longhouse council event (activity feed).
+fn summarize_longhouse_event(event: &LonghouseEvent) -> String {
+    match event {
+        LonghouseEvent::TopicConvened {
+            topic_id, title, ..
+        } => format!("convened [{}] {}", short_id(*topic_id), compact_text(title, 40)),
+        LonghouseEvent::Convened {
+            topic_id, members, ..
+        } => format!("seated {} members [{}]", members.len(), short_id(*topic_id)),
+        LonghouseEvent::MarkPosted { topic_id, mark } => format!(
+            "mark {:?} [{}] {}",
+            mark.kind,
+            short_id(*topic_id),
+            compact_text(&mark.summary, 32)
+        ),
+        LonghouseEvent::QuorumUpdated {
+            topic_id,
+            distance_to_quorum,
+            ..
+        } => format!(
+            "quorum {}% [{}]",
+            (distance_to_quorum.clamp(0.0, 1.0) * 100.0).round() as i32,
+            short_id(*topic_id)
+        ),
+        LonghouseEvent::Converged {
+            topic_id, decision, ..
+        } => format!(
+            "converged [{}] → {}",
+            short_id(*topic_id),
+            short_id(*decision)
+        ),
+        LonghouseEvent::Aborted { topic_id, reason } => {
+            format!("aborted [{}] {:?}", short_id(*topic_id), reason)
+        }
+        LonghouseEvent::TopicClosed { topic_id } => {
+            format!("closed [{}]", short_id(*topic_id))
+        }
+        LonghouseEvent::RoleGranted {
+            topic_id, role, ..
+        } => format!("role {:?} granted [{}]", role, short_id(*topic_id)),
+        LonghouseEvent::RoleRevoked { topic_id, .. } => {
+            format!("role revoked [{}]", short_id(*topic_id))
+        }
+        LonghouseEvent::Warned {
+            topic_id, strike, ..
+        } => format!("warned (strike {}) [{}]", strike, short_id(*topic_id)),
+        LonghouseEvent::RunHealth {
+            federation,
+            runs_healthy,
+            runs_total,
+            ..
+        } => format!("run health {federation:?} {runs_healthy}/{runs_total}"),
+    }
+}
+
 fn summarize_agent_event(event: &AgentTurnEvent) -> String {
     match event {
         AgentTurnEvent::SessionCreated {
@@ -4217,6 +4468,7 @@ fn classify_agent(record: AgentRecord) -> Option<AgentView> {
     Some(AgentView {
         agent: agent_name,
         pid: record.pid,
+        session_id: record.session_id,
         updated_at,
         model: record.model,
         provider: record.provider,
@@ -4308,17 +4560,22 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     frame.render_widget(outer, area);
 
     let input_height = if inner.height > 14 { 7 } else { 4 };
+    let approvals_h = approvals_band_height(app);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
+            Constraint::Length(approvals_h),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(input_height),
         ])
         .split(inner);
 
-    let transcript_area = layout[0];
+    if approvals_h > 0 {
+        draw_approvals_panel(frame, layout[0], app);
+    }
+    let transcript_area = layout[1];
     // Inset 2 cols on each side for breathing room.
     let inset = ratatui::layout::Rect {
         x: transcript_area.x + 2,
@@ -4358,18 +4615,18 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     frame.render_widget(Clear, transcript_area);
     frame.render_widget(Paragraph::new(rendered).wrap(Wrap { trim: false }), inset);
 
-    let separator = "─".repeat(layout[1].width as usize);
+    let separator = "─".repeat(layout[2].width as usize);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             separator,
             Style::default().fg(Color::DarkGray),
         ))),
-        layout[1],
+        layout[2],
     );
 
     frame.render_widget(
         Paragraph::new(pm_agent_input_lines(app, input_height as usize)).wrap(Wrap { trim: false }),
-        layout[2],
+        layout[3],
     );
 }
 
@@ -4793,11 +5050,13 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         return;
     }
 
+    let approvals_h = approvals_band_height(app);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
             Constraint::Length(5),
+            Constraint::Length(approvals_h),
             Constraint::Min(18),
             Constraint::Length(5),
             Constraint::Length(2),
@@ -4805,7 +5064,10 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         .split(frame.area());
 
     draw_daemon_header(frame, layout[0], app);
-    rooms::draw_daemon_room_body(frame, layout[1], app);
+    if approvals_h > 0 {
+        draw_approvals_panel(frame, layout[1], app);
+    }
+    rooms::draw_daemon_room_body(frame, layout[2], app);
     frame.render_widget(
         Paragraph::new(app.composer_lines())
             .block(
@@ -4815,9 +5077,9 @@ fn draw_daemon_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
                     .border_style(focus_border_style(app.focus, FocusPane::Composer)),
             )
             .wrap(Wrap { trim: false }),
-        layout[2],
+        layout[3],
     );
-    frame.render_widget(daemon_footer(app), layout[3]);
+    frame.render_widget(daemon_footer(app), layout[4]);
 }
 
 fn draw_daemon_ui_compact(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
@@ -4826,11 +5088,13 @@ fn draw_daemon_ui_compact(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         return;
     }
 
+    let approvals_h = approvals_band_height(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
             Constraint::Length(5),
+            Constraint::Length(approvals_h),
             Constraint::Min(10),
             Constraint::Length(5),
             Constraint::Length(2),
@@ -4838,7 +5102,10 @@ fn draw_daemon_ui_compact(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
         .split(frame.area());
 
     draw_daemon_header(frame, chunks[0], app);
-    rooms::draw_daemon_room_body(frame, chunks[1], app);
+    if approvals_h > 0 {
+        draw_approvals_panel(frame, chunks[1], app);
+    }
+    rooms::draw_daemon_room_body(frame, chunks[2], app);
     frame.render_widget(
         Paragraph::new(app.composer_lines())
             .block(
@@ -4848,9 +5115,51 @@ fn draw_daemon_ui_compact(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
                     .border_style(focus_border_style(app.focus, FocusPane::Composer)),
             )
             .wrap(Wrap { trim: false }),
-        chunks[2],
+        chunks[3],
     );
-    frame.render_widget(daemon_footer(app), chunks[3]);
+    frame.render_widget(daemon_footer(app), chunks[4]);
+}
+
+/// Height (in rows, borders included) the first-class approvals panel needs
+/// given the current pending count. Returns 0 when nothing is waiting so the
+/// band collapses entirely (OCEAN-29).
+fn approvals_band_height(app: &DaemonApp) -> u16 {
+    let pending = app.pending_permission_count();
+    if pending == 0 {
+        return 0;
+    }
+    // 2 border rows + 1 header hint + up to 3 lines per request (cap 2 requests).
+    let body = (pending.min(2) * 3) as u16 + 1;
+    body + 2
+}
+
+/// Render the prominent, impossible-to-miss approvals panel (OCEAN-29). This is
+/// rendered as its own band above the room body whenever an approval is
+/// waiting, rather than being buried in the support pane.
+fn draw_approvals_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &DaemonApp,
+) {
+    let pending = app.pending_permission_count();
+    let title = format!(
+        "⚠ APPROVALS — {pending} WAITING · Ctrl-Y approve · Ctrl-N deny"
+    );
+    let panel = Paragraph::new(app.pending_permission_lines())
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        )
+        .style(Style::default().fg(Color::Yellow))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
 }
 
 fn draw_daemon_header(
@@ -4864,37 +5173,62 @@ fn draw_daemon_header(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| app.root.display().to_string());
+    let pending = app.pending_permission_count();
+    let mut title_line = vec![
+        Span::styled(
+            "◉",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(health_label, Style::default().fg(health_color)),
+        Span::raw("  "),
+        Span::styled(
+            "Ocean Agent / Tides Mesh command center",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if pending > 0 {
+        // Make pending approvals impossible to miss from the room header
+        // (OCEAN-29): bright, reversed badge with the live count.
+        title_line.push(Span::raw("  "));
+        title_line.push(Span::styled(
+            format!(" ⚠ {pending} APPROVAL{} WAITING ", if pending == 1 { "" } else { "S" }),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::RAPID_BLINK),
+        ));
+    }
     let header = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                "◉",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(health_label, Style::default().fg(health_color)),
-            Span::raw("  "),
-            Span::styled(
-                "Ocean Agent / Tides Mesh command center",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Line::from(title_line),
         Line::from(format!(
             "root {} · active {}",
             root_label,
             app.active_room.label(),
         )),
         Line::from(workspace_room_tabs_line(app.active_room)),
-        Line::from(format!(
-            "support: backend {} · stream {} · approvals {} · checked {}",
-            app.status_label().0,
-            app.stream_status,
-            app.pending_permissions.len(),
-            app.checked_text()
-        )),
+        Line::from(vec![
+            Span::raw(format!(
+                "support: backend {} · stream {} · approvals ",
+                app.status_label().0,
+                app.stream_status,
+            )),
+            Span::styled(
+                pending.to_string(),
+                if pending > 0 {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::raw(format!(" · checked {}", app.checked_text())),
+        ]),
     ])
     .block(Block::default().title("Ocean").borders(Borders::ALL))
     .wrap(Wrap { trim: true });
@@ -5002,10 +5336,7 @@ fn draw_mesh_ui(frame: &mut ratatui::Frame<'_>, app: &MeshApp, state: &MeshState
             state.agent_counts.away,
             state.agent_counts.stale
         )),
-        Line::from(mesh_tabs_line(
-            active_center_tab(app.active_tab),
-            app.paused,
-        )),
+        Line::from(mesh_tabs_line(app.active_tab, app.paused)),
     ])
     .block(
         Block::default()
@@ -5122,7 +5453,8 @@ fn draw_mesh_center(
     match app.active_tab {
         MeshTab::Events => draw_mesh_events(frame, area, state),
         MeshTab::Inbox => draw_mesh_inbox(frame, area, state, &app.agent),
-        _ => draw_mesh_board(frame, area, state),
+        MeshTab::Agents => draw_mesh_agents(frame, area, state),
+        MeshTab::Board => draw_mesh_board(frame, area, state),
     }
 }
 
@@ -5187,13 +5519,6 @@ fn draw_mesh_agent_status_panel(
         .block(Block::default().title(agent_name).borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(panel, area);
-}
-
-fn active_center_tab(tab: MeshTab) -> MeshTab {
-    match tab {
-        MeshTab::Agents => MeshTab::Board,
-        other => other,
-    }
 }
 
 fn agent_source_dirs(root: &Path) -> Vec<PathBuf> {
@@ -5309,13 +5634,20 @@ fn draw_mesh_agents(
     area: ratatui::layout::Rect,
     state: &MeshState,
 ) {
-    let mut lines = vec![Line::from(
-        "state    agent              pid     age   model/provider        last        preview",
-    )];
+    let counts = &state.agent_counts;
+    let mut lines = vec![
+        Line::from(format!(
+            "members {} · active {} · away {} · stale {}",
+            counts.total, counts.active, counts.away, counts.stale
+        )),
+        Line::from(
+            "state    agent              session   pid     age   last              preview",
+        ),
+    ];
     for agent in state
         .agents
         .iter()
-        .take(area.height.saturating_sub(3) as usize)
+        .take(area.height.saturating_sub(4) as usize)
     {
         lines.push(Line::from(render_agent_line(agent, area.width as usize)));
     }
@@ -5473,32 +5805,39 @@ fn render_agent_line(agent: &AgentView, width: usize) -> String {
     let model = agent
         .model
         .as_deref()
-        .or(agent.provider.as_deref())
-        .unwrap_or("—");
+        .or(agent.provider.as_deref());
+    let session = agent
+        .session_id
+        .as_deref()
+        .map(short_id)
+        .unwrap_or_else(|| "—".to_string());
     let last = agent
         .last_event
         .as_deref()
         .or(agent.lifecycle.as_deref())
         .unwrap_or("—");
+    // Fold model/provider into the trailing preview so the session id earns a
+    // dedicated column in the agents view (OCEAN-30).
+    let tail = match model {
+        Some(model) => format!("{} · {}{}", compact_text(preview, 40), model, reason),
+        None => format!("{}{}", preview, reason),
+    };
     let base = format!(
-        "{:<8} {:<18} {:<7} {:<5} {:<20} {:<10}",
+        "{:<8} {:<18} {:<9} {:<7} {:<5} {:<17}",
         state,
         compact_text(&agent.agent, 18),
+        session,
         agent
             .pid
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "—".to_string()),
         time_ago(agent.updated_at.as_deref()),
-        compact_text(model, 20),
-        compact_text(last, 10)
+        compact_text(last, 17)
     );
     format!(
         "{} {}",
         base,
-        compact_text(
-            &format!("{}{}", preview, reason),
-            width.saturating_sub(base.len() + 1)
-        )
+        compact_text(&tail, width.saturating_sub(base.len() + 1))
     )
 }
 
@@ -5627,6 +5966,21 @@ fn session_run_state_label(state: SessionRunState) -> &'static str {
 
 fn short_id(id: impl ToString) -> String {
     id.to_string().chars().take(8).collect()
+}
+
+/// ASCII quorum meter: a `width`-cell bar filled proportional to `fraction`
+/// (clamped 0.0–1.0). Used by the Longhouse F3 view (OCEAN-42).
+fn quorum_meter(fraction: f32, width: usize) -> String {
+    let width = width.max(1);
+    let filled = ((fraction.clamp(0.0, 1.0)) * width as f32).round() as usize;
+    let filled = filled.min(width);
+    let mut bar = String::with_capacity(width + 2);
+    bar.push('[');
+    for cell in 0..width {
+        bar.push(if cell < filled { '█' } else { '·' });
+    }
+    bar.push(']');
+    bar
 }
 
 fn compact_text(text: &str, limit: usize) -> String {
@@ -5891,6 +6245,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ocean_agent_sdk::ConveneTrigger;
     use ocean_core::EventEnvelope;
     use serde_json::json;
     use std::{
@@ -6441,6 +6796,7 @@ mod tests {
             cwd: None,
             git_branch: None,
             git_commit: None,
+            client_type: None,
         };
 
         let lines = DaemonApp::session_detail_lines(&detail).join("\n");
@@ -6458,9 +6814,124 @@ mod tests {
     }
 
     #[test]
-    fn active_center_tab_preserves_agents_board_mapping() {
-        assert_eq!(active_center_tab(MeshTab::Agents), MeshTab::Board);
-        assert_eq!(active_center_tab(MeshTab::Inbox), MeshTab::Inbox);
+    fn mesh_agents_tab_highlights_distinctly_not_board() {
+        // OCEAN-30: the Agents tab is now a first-class center view, so the tab
+        // bar highlights Agents directly instead of folding back to Board.
+        let line = mesh_tabs_line(MeshTab::Agents, false);
+        assert!(line.contains("[4:AGENTS]"));
+        assert!(!line.contains("[1:BOARD]"));
+    }
+
+    #[test]
+    fn quorum_meter_fills_proportionally() {
+        assert_eq!(quorum_meter(0.0, 4), "[····]");
+        assert_eq!(quorum_meter(0.5, 4), "[██··]");
+        assert_eq!(quorum_meter(1.0, 4), "[████]");
+        // Out-of-range fractions clamp.
+        assert_eq!(quorum_meter(2.0, 4), "[████]");
+    }
+
+    #[test]
+    fn longhouse_events_drive_topic_quorum_state() {
+        use ocean_agent_sdk::{Mark, MarkKind, ProposalTally};
+
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let topic_id = Uuid::new_v4();
+        let proposal = Uuid::new_v4();
+
+        app.apply_longhouse_event(&LonghouseEvent::TopicConvened {
+            topic_id,
+            board_id: Uuid::new_v4(),
+            federation: Federation::Sales,
+            trigger: ConveneTrigger::Deliberation,
+            title: "ship the clip job".to_string(),
+            deadline_ms: 0,
+        });
+        app.apply_longhouse_event(&LonghouseEvent::MarkPosted {
+            topic_id,
+            mark: Mark {
+                mark_id: Uuid::new_v4(),
+                author: Uuid::new_v4(),
+                kind: MarkKind::Proposal,
+                target: None,
+                summary: "use the nightly pipeline".to_string(),
+            },
+        });
+        app.apply_longhouse_event(&LonghouseEvent::QuorumUpdated {
+            topic_id,
+            tallies: vec![ProposalTally {
+                proposal,
+                net_weight: 0.8,
+            }],
+            leader: Some(proposal),
+            distance_to_quorum: 0.75,
+        });
+
+        assert_eq!(app.longhouse_topics.len(), 1);
+        let topic = &app.longhouse_topics[0];
+        assert_eq!(topic.title, "ship the clip job");
+        assert_eq!(topic.federation_label(), "sales");
+        assert_eq!(topic.marks, 1);
+        assert_eq!(topic.proposals, 1);
+        assert!((topic.distance_to_quorum - 0.75).abs() < f32::EPSILON);
+
+        let rendered = app
+            .longhouse_lines(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("ship the clip job"));
+        assert!(rendered.contains("quorum"));
+        assert!(rendered.contains("75%"));
+
+        // Convergence flips the meter to full and stamps a resolution badge.
+        app.apply_longhouse_event(&LonghouseEvent::Converged {
+            topic_id,
+            decision: proposal,
+            by: Uuid::new_v4(),
+        });
+        assert!(app.longhouse_topics[0].resolution.is_some());
+        assert!((app.longhouse_topics[0].distance_to_quorum - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn longhouse_extension_event_is_parsed_from_stream() {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let topic_id = Uuid::new_v4();
+        let turn_event = LonghouseEvent::TopicConvened {
+            topic_id,
+            board_id: Uuid::new_v4(),
+            federation: Federation::Dev,
+            trigger: ConveneTrigger::UserRequest,
+            title: "wire the F3 deck".to_string(),
+            deadline_ms: 0,
+        }
+        .into_turn_event();
+
+        daemon_apply_agent_stream_event(&mut app, turn_event);
+
+        assert_eq!(app.longhouse_topics.len(), 1);
+        assert_eq!(app.longhouse_topics[0].title, "wire the F3 deck");
+    }
+
+    #[test]
+    fn approvals_band_collapses_when_empty_and_grows_when_pending() {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        assert_eq!(approvals_band_height(&app), 0);
+
+        app.set_permissions(vec![PermissionStatus {
+            permission_id: PermissionId::new_v4(),
+            request_id: RequestId::new_v4(),
+            session_id: Some(SessionId::new_v4()),
+            tool: "bash".to_string(),
+            reason: "permission required for bash".to_string(),
+            args: json!({"command": "rm -rf /tmp/scratch"}),
+            created_at: Utc::now(),
+        }]);
+
+        assert_eq!(app.pending_permission_count(), 1);
+        assert!(approvals_band_height(&app) > 0);
     }
 
     #[test]
@@ -6492,6 +6963,7 @@ mod tests {
             last_event: None,
             lifecycle: None,
             status_message: Some("ready".to_string()),
+            session_id: Some("sess-abc-123".to_string()),
             activity: Some(AgentActivity {
                 last_activity_at: Some("2026-05-25T13:13:49.262Z".to_string()),
                 last_tool_call: Some("test: passed".to_string()),
@@ -6503,6 +6975,11 @@ mod tests {
         assert_eq!(agent.agent, "BRICK");
         assert_eq!(agent.preview.as_deref(), Some("ready"));
         assert_eq!(agent.last_event.as_deref(), Some("test: passed"));
+        assert_eq!(agent.session_id.as_deref(), Some("sess-abc-123"));
+        // The agents view (OCEAN-30) surfaces the session id + last event.
+        let line = render_agent_line(&agent, 120);
+        assert!(line.contains(&short_id("sess-abc-123")));
+        assert!(line.contains("test: passed"));
     }
 
     #[test]
