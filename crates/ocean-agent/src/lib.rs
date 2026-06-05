@@ -844,6 +844,12 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
                 anyhow::bail!("unsupported anthropic model '{}'", selection.model);
             }
         }),
+        ProviderId::Google => Ok(match selection.model.as_str() {
+            "gemini-2.0-flash" => Model::gemini_2_0_flash(),
+            _ => {
+                anyhow::bail!("unsupported google model '{}'", selection.model);
+            }
+        }),
     }
 }
 

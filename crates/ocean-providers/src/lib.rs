@@ -18,6 +18,10 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 // same streaming path as DeepSeek's reasoner models.
 const MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/v1";
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
+// Google Generative AI (Gemini). Routed through ocean-protocol's
+// `google-generative-ai` provider, which targets the v1beta surface under
+// this base — not an OpenAI-compatible endpoint.
+const GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 /// Stable provider identifier used by Ocean runtime components.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +36,8 @@ pub enum ProviderId {
     MiniMax,
     /// Moonshot AI / Kimi (OpenAI-compatible chat-completions; K2 family).
     Kimi,
+    /// Google Generative AI (Gemini family; v1beta generativelanguage API).
+    Google,
     OpenAiCompatible,
     Fake,
 }
@@ -45,6 +51,7 @@ impl ProviderId {
             Self::Anthropic => "anthropic",
             Self::MiniMax => "minimax",
             Self::Kimi => "kimi",
+            Self::Google => "google",
             Self::OpenAiCompatible => "openai-compatible",
             Self::Fake => "fake",
         }
@@ -59,6 +66,7 @@ impl ProviderId {
             Self::Anthropic => &["OCEAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             Self::MiniMax => &["OCEAN_MINIMAX_API_KEY", "MINIMAX_API_KEY"],
             Self::Kimi => &["OCEAN_MOONSHOT_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"],
+            Self::Google => &["OCEAN_GOOGLE_API_KEY", "GOOGLE_API_KEY"],
             Self::Fake => &[],
         }
     }
@@ -299,6 +307,7 @@ pub fn known_models() -> Vec<KnownModel> {
         m("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6"),
         m("minimax-m2", "minimax", "MiniMax M2"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
+        m("gemini-2.0-flash", "google", "Gemini 2.0 Flash"),
     ]
 }
 
@@ -442,6 +451,16 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             128_000,
             8_192,
         )),
+        // Google Gemini family. Routed through ocean-protocol's
+        // `google-generative-ai` provider (not OpenAI-compatible). Model ids
+        // are lowercase, so casing survives normalization as-is.
+        "gemini" | "gemini-2.0-flash" | "gemini-2-0-flash" => Ok(model_selection(
+            ProviderId::Google,
+            "gemini-2.0-flash",
+            GOOGLE_BASE_URL,
+            1_000_000,
+            8_192,
+        )),
         "fake" | "fake-ok" => Ok(model_selection(
             ProviderId::Fake,
             "fake-ok",
@@ -517,6 +536,13 @@ fn model_for_explicit_provider(
             model,
             MOONSHOT_BASE_URL,
             256_000,
+            8_192,
+        )),
+        "google" | "gemini" => Ok(model_selection(
+            ProviderId::Google,
+            model,
+            GOOGLE_BASE_URL,
+            1_000_000,
             8_192,
         )),
         "openai-compatible" => {
@@ -697,6 +723,24 @@ mod tests {
             resolve_model_selection(&env(&[("OCEAN_MODEL", "DeepSeek V4 Pro")])).unwrap();
         assert_eq!(selection.provider, ProviderId::DeepSeek);
         assert_eq!(selection.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn maps_gemini_2_0_flash_to_google_provider() {
+        let selection =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "gemini-2.0-flash")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::Google);
+        assert_eq!(selection.model, "gemini-2.0-flash");
+        assert_eq!(selection.base_url, GOOGLE_BASE_URL);
+        assert_eq!(selection.context_window, 1_000_000);
+        assert_eq!(selection.max_output_tokens, 8_192);
+    }
+
+    #[test]
+    fn gemini_alias_routes_to_google_provider() {
+        let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", "gemini")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::Google);
+        assert_eq!(selection.model, "gemini-2.0-flash");
     }
 
     #[test]
