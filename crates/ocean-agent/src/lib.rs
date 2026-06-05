@@ -9,8 +9,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
     Project, ProjectId, PromptRequest, PromptResponse, RequestId, RoomId, SessionDetail, SessionId,
-    SessionRunState, TokenUsage,
-    SessionSummary, SessionToolContext, SessionTranscriptEntry,
+    SessionRunState, SessionSummary, SessionToolContext, SessionTranscriptEntry, TokenUsage,
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
 use ocean_providers::{
@@ -1410,7 +1409,9 @@ mod tests {
 
     #[test]
     fn cap_session_history_is_noop_under_limit() {
-        let msgs: Vec<Message> = (0..10).map(|i| Message::user_text(format!("m{i}"))).collect();
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| Message::user_text(format!("m{i}")))
+            .collect();
         assert_eq!(cap_session_history(msgs).len(), 10);
     }
 
@@ -1422,7 +1423,10 @@ mod tests {
         let capped = cap_session_history(msgs);
         assert!(capped.len() <= MAX_SESSION_MESSAGES);
         // Oldest dropped, newest retained.
-        assert!(matches!(capped.last(), Some(Message::Assistant(_)) | Some(Message::User { .. })));
+        assert!(matches!(
+            capped.last(),
+            Some(Message::Assistant(_)) | Some(Message::User { .. })
+        ));
         if let Some(Message::User { content, .. }) = capped.last() {
             let want = format!("m{}", MAX_SESSION_MESSAGES + 50 - 1);
             assert!(content.iter().any(|c| c.as_text() == Some(want.as_str())));
@@ -1698,7 +1702,11 @@ mod tests {
             )
             .await;
         assert!(!res.ok, "strict resume of unknown session must fail");
-        assert!(res.stderr.contains("session not found"), "stderr: {}", res.stderr);
+        assert!(
+            res.stderr.contains("session not found"),
+            "stderr: {}",
+            res.stderr
+        );
         // And no session was created under the ghost id.
         assert!(runtime.session_detail(ghost).is_err());
         assert!(runtime.list_sessions(None).unwrap().is_empty());
@@ -1720,7 +1728,11 @@ mod tests {
                 PromptControl::yolo(false),
             )
             .await;
-        assert!(ok.ok, "create_if_missing should accept a new id: {}", ok.stderr);
+        assert!(
+            ok.ok,
+            "create_if_missing should accept a new id: {}",
+            ok.stderr
+        );
         assert_eq!(ok.session_id, Some(ghost));
         let _ = std::fs::remove_dir_all(config_dir);
     }
@@ -1783,9 +1795,18 @@ mod tests {
             .filter(|t| t.role == "user")
             .map(|t| t.text.clone())
             .collect();
-        assert!(user_texts.iter().any(|t| t.contains("first")), "lost 'first': {user_texts:?}");
-        assert!(user_texts.iter().any(|t| t.contains("alpha")), "lost 'alpha': {user_texts:?}");
-        assert!(user_texts.iter().any(|t| t.contains("bravo")), "lost 'bravo': {user_texts:?}");
+        assert!(
+            user_texts.iter().any(|t| t.contains("first")),
+            "lost 'first': {user_texts:?}"
+        );
+        assert!(
+            user_texts.iter().any(|t| t.contains("alpha")),
+            "lost 'alpha': {user_texts:?}"
+        );
+        assert!(
+            user_texts.iter().any(|t| t.contains("bravo")),
+            "lost 'bravo': {user_texts:?}"
+        );
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
@@ -1974,7 +1995,8 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
         if project.is_empty() {
             append_client_type(BASE_SYSTEM_PROMPT, client_type)
         } else {
-            let prompt = format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----\n{project}");
+            let prompt =
+                format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----\n{project}");
             append_client_type(&prompt, client_type)
         }
     }
