@@ -2414,7 +2414,12 @@ is the user's real, signed-in browser session.\n\n\
 
         #[test]
         fn extension_surface_knows_it_is_docked_in_chrome() {
-            let prompt = build_system_prompt(None, Some("surface-extension"));
+            // Tests the BUILT-IN (const) extension prompt — the fallback when no
+            // on-disk BRWSR profile exists. Call the const builder directly (it
+            // never file-loads) so a real
+            // ~/.config/ocean-rs/assistants/BRWSR/system.md (the intended Fix-5
+            // hot-reconfigure override) doesn't shadow the source under test.
+            let prompt = super::extension_surface_prompt(super::BASE_SYSTEM_PROMPT);
 
             // Same rich component surface as the web PWA…
             assert!(prompt.contains("Leptos components"));
