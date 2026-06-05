@@ -6,6 +6,7 @@
 pub mod input;
 pub mod inspect;
 pub mod nav;
+pub mod network;
 pub mod perceive;
 pub mod tabs;
 
@@ -91,7 +92,11 @@ pub fn browser_tools(ctx: BrowserToolCtx) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(tabs::BrowserListTabsTool { ctx: ctx.clone() }),
         Arc::new(tabs::BrowserOpenTabTool { ctx: ctx.clone() }),
         Arc::new(tabs::BrowserSwitchTabTool { ctx: ctx.clone() }),
-        Arc::new(tabs::BrowserCloseTabTool { ctx }),
+        Arc::new(tabs::BrowserCloseTabTool { ctx: ctx.clone() }),
+        // Network capture — the scraping unlock (read real response bodies).
+        Arc::new(network::BrowserCaptureNetworkTool { ctx: ctx.clone() }),
+        Arc::new(network::BrowserCapturedRequestsTool { ctx: ctx.clone() }),
+        Arc::new(network::BrowserResponseBodyTool { ctx }),
     ]
 }
 

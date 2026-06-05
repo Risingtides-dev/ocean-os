@@ -2,11 +2,13 @@
 
 pub mod error;
 pub mod launch;
+pub mod netcap;
 pub mod perception;
 pub mod shell;
 
 pub use error::BrowserError;
 pub use launch::{launch, LaunchConfig, LaunchedChrome};
+pub use netcap::{CapturedResponse, NetCapture};
 pub use perception::{ElementRef, PageRead};
 pub use shell::{BrowserContext, TabId, TabInfo};
 
@@ -25,6 +27,8 @@ use tokio::sync::Mutex;
 pub struct BrowserHandle {
     inner: Arc<Mutex<LaunchedChrome>>,
     page: Arc<Mutex<Option<Page>>>,
+    /// Active network capture (opt-in via `start_netcap`). None until started.
+    netcap: Arc<Mutex<Option<netcap::NetCapture>>>,
 }
 
 impl BrowserHandle {
@@ -33,6 +37,7 @@ impl BrowserHandle {
         Ok(Self {
             inner: Arc::new(Mutex::new(chrome)),
             page: Arc::new(Mutex::new(None)),
+            netcap: Arc::new(Mutex::new(None)),
         })
     }
 
