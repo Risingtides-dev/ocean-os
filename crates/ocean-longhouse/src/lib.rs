@@ -36,12 +36,16 @@ pub mod agent;
 pub mod config;
 pub mod convene;
 pub mod quorum;
+pub mod registry;
 pub mod replay;
 
 pub use agent::ModelHandle;
 pub use config::{LonghouseConfig, LonghouseMode};
-pub use convene::{convene, Clock, ConveneOutcome, ConveneRequest, SystemClock};
+pub use convene::{
+    claim_outcome, ClaimError, Clock, ConveneOutcome, ConveneRequest, SystemClock, convene,
+};
 pub use quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
+pub use registry::{LonghouseRegistry, TopicSnapshot, TopicState};
 pub use replay::{replay, sweep, RecordedMark, RecordedMarkKind, Recording, ReplayResult};
 
 // Re-export the SDK event vocabulary so daemon callers can `use

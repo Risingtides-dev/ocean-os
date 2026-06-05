@@ -376,16 +376,40 @@ where
             .or_else(|| workers.first().map(|w| w.agent_id))
             .unwrap_or_else(Uuid::new_v4);
 
-        emit(LonghouseEvent::RoleGranted {
-            topic_id,
-            agent_id: firekeeper,
-            role: AgentRole::Firekeeper,
-        });
-        emit(LonghouseEvent::Converged {
-            topic_id,
-            decision,
-            by: firekeeper,
-        });
+        // The accountability brake: the firekeeper may only emit the single
+        // binding `Converged` if the daemon's own quorum state already agrees
+        // the topic is converged (or was force-resolved at the deadline). This
+        // is the load-bearing gate — a firekeeper can never ratify a decision
+        // the quorum engine doesn't back. See [`claim_outcome`].
+        match claim_outcome(&mut engine, firekeeper, decision, now) {
+            Ok(()) => {
+                emit(LonghouseEvent::RoleGranted {
+                    topic_id,
+                    agent_id: firekeeper,
+                    role: AgentRole::Firekeeper,
+                });
+                emit(LonghouseEvent::Converged {
+                    topic_id,
+                    decision,
+                    by: firekeeper,
+                });
+            }
+            Err(err) => {
+                // The firekeeper tried to ratify a decision the quorum engine
+                // does not back. Refuse the claim and abort the topic rather
+                // than emit an unaccountable `Converged`.
+                tracing::warn!(
+                    topic = %topic_id,
+                    firekeeper = %firekeeper,
+                    error = %err,
+                    "firekeeper claim_outcome rejected; aborting topic"
+                );
+                emit(LonghouseEvent::Aborted {
+                    topic_id,
+                    reason: AbortReason::Split,
+                });
+            }
+        }
     }
 
     emit(LonghouseEvent::TopicClosed { topic_id });
@@ -400,6 +424,84 @@ where
             question: req.question.clone(),
             marks: recorded,
         },
+    }
+}
+
+/// Why a firekeeper's claimed `Converged` was refused by the daemon's quorum
+/// state. The firekeeper *ratifies* a decision the engine already owns; it can
+/// never manufacture one. Each variant is a distinct way the claim disagreed
+/// with the daemon-computed field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaimError {
+    /// The engine has not converged and is not at/over its deadline — there is
+    /// no resolved decision for the firekeeper to ratify yet. This is the core
+    /// accountability brake: a premature `Converged` claim lands here.
+    NotConverged,
+    /// The engine *has* converged, but on a *different* proposal than the one
+    /// the firekeeper tried to ratify. The firekeeper may only sign the
+    /// engine's own decision, never substitute its own.
+    WrongDecision {
+        /// The proposal the engine actually converged on.
+        engine_decision: Uuid,
+        /// The proposal the firekeeper tried to ratify.
+        claimed: Uuid,
+    },
+}
+
+impl std::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaimError::NotConverged => write!(
+                f,
+                "quorum has not converged; firekeeper may not emit Converged"
+            ),
+            ClaimError::WrongDecision {
+                engine_decision,
+                claimed,
+            } => write!(
+                f,
+                "firekeeper claimed {claimed} but quorum converged on {engine_decision}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
+/// The accountability brake on the single binding `Converged`.
+///
+/// A firekeeper does not *decide* — the daemon-side [`QuorumEngine`] does. The
+/// firekeeper only *ratifies* (signs) a decision the engine already owns. This
+/// gate enforces exactly that: it returns `Ok(())` only when the engine's own
+/// quorum state agrees the topic is resolved **and** agrees on the same
+/// proposal the firekeeper is trying to ratify. Otherwise it refuses with a
+/// [`ClaimError`] so the caller must not emit `Converged`.
+///
+/// Concretely, a claim is accepted only if the engine reports
+/// [`QuorumOutcome::Converged`] for `claimed` at `now_ms`. The deadline path is
+/// covered because [`QuorumEngine::force_resolve`] latches `converged` before
+/// the firekeeper is bound (see [`convene`]), so by the time this runs a
+/// deadline-forced resolution already reads back as `Converged`. A firekeeper
+/// that tries to emit `Converged` while the field is still `Pending` — the
+/// premature-claim attack this gate exists to stop — gets [`ClaimError::NotConverged`].
+pub fn claim_outcome(
+    engine: &mut QuorumEngine,
+    _firekeeper: Uuid,
+    claimed: Uuid,
+    now_ms: i64,
+) -> Result<(), ClaimError> {
+    match engine.evaluate(now_ms) {
+        QuorumOutcome::Converged { decision, .. } => {
+            if decision == claimed {
+                Ok(())
+            } else {
+                Err(ClaimError::WrongDecision {
+                    engine_decision: decision,
+                    claimed,
+                })
+            }
+        }
+        QuorumOutcome::Pending { .. } => Err(ClaimError::NotConverged),
     }
 }
 
@@ -611,5 +713,134 @@ mod tests {
         // Sorted by id -> uid(1) first.
         assert!(text.starts_with("1. answer one"));
         assert!(text.contains("2. answer nine"));
+    }
+
+    // --- OCEAN-59: the firekeeper accountability brake -----------------------
+
+    use crate::quorum::{QuorumConfig, QuorumEngine, QuorumRule};
+
+    fn fast_quorum() -> QuorumConfig {
+        QuorumConfig {
+            rule: QuorumRule::NetWeight {
+                cutoff: 2.0,
+                margin: 1.0,
+            },
+            mark_ttl_ms: 60_000,
+            tie_break_seed: 1,
+        }
+    }
+
+    // The core OCEAN-59 guarantee: a firekeeper that tries to ratify `Converged`
+    // while the quorum engine is still `Pending` is REFUSED. A premature
+    // Converged claim must never be accepted.
+    #[test]
+    fn claim_outcome_rejects_premature_converged() {
+        let mut eng = QuorumEngine::new(fast_quorum());
+        let proposal = uid(1);
+        let proposer = uid(10);
+        let firekeeper = proposer;
+        let t = 0;
+
+        // Only the proposer's implicit endorse: net 1.0 < cutoff 2.0 -> Pending.
+        eng.propose(proposal, proposer, t);
+        assert!(
+            !eng.is_converged(),
+            "engine must still be pending before the gate"
+        );
+
+        // The firekeeper jumps the gun and tries to ratify Converged anyway.
+        let result = claim_outcome(&mut eng, firekeeper, proposal, t);
+        assert_eq!(
+            result,
+            Err(ClaimError::NotConverged),
+            "a premature Converged claim must be rejected"
+        );
+        // And the rejected claim must not have latched convergence as a side effect.
+        assert!(!eng.is_converged());
+    }
+
+    // Once the quorum engine genuinely converges, the firekeeper may ratify the
+    // engine's decision — the gate opens.
+    #[test]
+    fn claim_outcome_accepts_when_quorum_converged() {
+        let mut eng = QuorumEngine::new(fast_quorum());
+        let proposal = uid(1);
+        let (a, b) = (uid(10), uid(11));
+        let t = 0;
+
+        eng.propose(proposal, a, t); // net 1.0
+        eng.endorse(proposal, b, None, t); // net 2.0 -> crosses cutoff, no rival
+        assert!(matches!(
+            eng.evaluate(t),
+            QuorumOutcome::Converged { .. }
+        ));
+
+        // The firekeeper ratifies the engine's own decision: accepted.
+        assert_eq!(claim_outcome(&mut eng, a, proposal, t), Ok(()));
+    }
+
+    // A firekeeper may only sign the engine's decision, not substitute its own:
+    // claiming a *different* proposal than the converged one is refused.
+    #[test]
+    fn claim_outcome_rejects_wrong_decision() {
+        let mut eng = QuorumEngine::new(fast_quorum());
+        let (winner, other) = (uid(1), uid(2));
+        let (a, b) = (uid(10), uid(11));
+        let t = 0;
+
+        eng.propose(winner, a, t);
+        eng.endorse(winner, b, None, t); // winner net 2.0 -> converges on `winner`
+        eng.propose(other, uid(20), t); // a rival proposal exists but didn't win
+        assert!(matches!(
+            eng.evaluate(t),
+            QuorumOutcome::Converged { .. }
+        ));
+
+        let result = claim_outcome(&mut eng, a, other, t);
+        assert_eq!(
+            result,
+            Err(ClaimError::WrongDecision {
+                engine_decision: winner,
+                claimed: other,
+            }),
+            "firekeeper may not ratify a proposal the engine did not choose"
+        );
+    }
+
+    // The deadline path: a force-resolved topic latches `converged`, so a
+    // firekeeper bound after force_resolve can ratify it — the gate respects the
+    // timeout resolution exactly as the convene() flow relies on.
+    #[test]
+    fn claim_outcome_accepts_after_force_resolve_timeout() {
+        let cfg = QuorumConfig {
+            rule: QuorumRule::NetWeight {
+                cutoff: 10.0, // unreachably high; only the deadline resolves it
+                margin: 1.0,
+            },
+            mark_ttl_ms: 60_000,
+            tie_break_seed: 1,
+        };
+        let mut eng = QuorumEngine::new(cfg);
+        let (winner, runner) = (uid(1), uid(2));
+        eng.propose(winner, uid(10), 0);
+        eng.endorse(winner, uid(11), None, 0); // winner net 2.0
+        eng.propose(runner, uid(20), 0); // runner net 1.0 -> winner leads by margin
+
+        // Still pending mid-flight (cutoff unreachable).
+        assert!(matches!(eng.evaluate(0), QuorumOutcome::Pending { .. }));
+        // A firekeeper claim here would be premature.
+        assert_eq!(
+            claim_outcome(&mut eng, uid(10), winner, 0),
+            Err(ClaimError::NotConverged)
+        );
+
+        // Deadline forces resolution on the clear leader, latching converged.
+        let forced = eng
+            .force_resolve(0, AbortReason::Timeout, true)
+            .expect("clear leader force-resolves");
+        assert_eq!(forced, winner);
+
+        // Now the firekeeper may ratify the timeout-forced decision.
+        assert_eq!(claim_outcome(&mut eng, uid(10), winner, 0), Ok(()));
     }
 }
