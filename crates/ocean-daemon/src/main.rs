@@ -60,7 +60,14 @@ struct AppState {
     agent_events: AgentEventBus,
     requests: RequestRegistry,
     permissions: PermissionRegistry,
+    /// Read-side projection of longhouse councils: a `topic_id -> TopicSnapshot`
+    /// store folded from the events each council emits, so the quorum
+    /// observability deck survives a refresh (OCEAN-58). Convergence is still
+    /// decided only by the per-council `QuorumEngine`; this only mirrors it.
+    longhouse: LonghouseRegistryHandle,
 }
+
+type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
 
 type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
 type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
@@ -306,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         agent_events: AgentEventBus::new(1024),
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
+        longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
     };
 
     // Background GC: the request/permission registries are otherwise unbounded
@@ -363,6 +371,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/component/event", post(component_event))
         .route("/v1/longhouse/demo", post(longhouse_demo))
         .route("/v1/longhouse/convene", post(longhouse_convene))
+        .route("/v1/longhouse/topics", get(longhouse_topics))
+        .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
         .route("/v1/calls/demo", post(call_demo))
         .route("/v1/calls/place", post(call_place))
         .route("/v1/calls/webhook", post(call_webhook))
@@ -418,6 +428,8 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/component/event",
             "POST /v1/longhouse/demo",
             "POST /v1/longhouse/convene",
+            "GET /v1/longhouse/topics",
+            "GET /v1/longhouse/topics/{topic_id}",
             "POST /v1/calls/demo",
             "POST /v1/calls/place",
             "POST /v1/calls/webhook"
@@ -855,12 +867,25 @@ async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// events. This is a development harness, not the production convening path.
 async fn longhouse_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
     let bus = state.agent_events.clone();
+    let registry = state.longhouse.clone();
     let topic_id = Uuid::new_v4();
     let board_id = Uuid::new_v4();
 
     tokio::spawn(async move {
         use tokio::time::{sleep, Duration};
-        let emit = |ev: LonghouseEvent| bus.emit(ev.into_turn_event());
+        // Tee every demo event into the read-side registry before publishing to
+        // the bus — identical to the `longhouse_convene` path (OCEAN-58 / Codex).
+        // Without this, a demo council's TopicConvened/TopicClosed stream renders
+        // live but never lands in the topic store, so GET /v1/longhouse/topics
+        // stays empty and GET /v1/longhouse/topics/{id} 404s for the demo's id.
+        // The std Mutex guard is dropped before any await (the closure is fully
+        // synchronous), so it never blocks the scheduler.
+        let emit = |ev: LonghouseEvent| {
+            if let Ok(mut reg) = registry.lock() {
+                reg.ingest(&ev);
+            }
+            bus.emit(ev.into_turn_event());
+        };
 
         // 1. A user asks the Sales room a question → the room lights up.
         emit(LonghouseEvent::TopicConvened {
@@ -1079,6 +1104,7 @@ async fn longhouse_convene(
     Json(req): Json<LonghouseConveneRequest>,
 ) -> Json<serde_json::Value> {
     let bus = state.agent_events.clone();
+    let registry = state.longhouse.clone();
     let federation = parse_federation(req.federation.as_deref());
 
     let mut convene_req = ocean_longhouse::ConveneRequest::new(req.question.clone(), federation);
@@ -1092,8 +1118,16 @@ async fn longhouse_convene(
     tokio::spawn(async move {
         let clock = ocean_longhouse::SystemClock;
         // Emit each longhouse event onto the agent bus, exactly as the demo does
-        // (`bus.emit(ev.into_turn_event())`), so existing SSE clients render it.
+        // (`bus.emit(ev.into_turn_event())`), so existing SSE clients render it —
+        // AND tee it into the read-side registry so the topic survives a refresh
+        // (OCEAN-58). The registry is the durable mirror; the bus is the live feed.
         let outcome = ocean_longhouse::convene(convene_req, &clock, |ev| {
+            // Fold into the observable topic store first, then publish to the bus.
+            // A std Mutex is fine: the guard is dropped before any await (the
+            // closure is fully synchronous), so it never blocks the scheduler.
+            if let Ok(mut reg) = registry.lock() {
+                reg.ingest(&ev);
+            }
             bus.emit(ev.into_turn_event());
         })
         .await;
@@ -1312,6 +1346,56 @@ async fn call_webhook(
             tracing::warn!(error = %e, "rejected livekit webhook");
             (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() })))
         }
+    }
+}
+
+/// `GET /v1/longhouse/topics` — list every tracked longhouse topic with its full
+/// observable state (members, marks, tallies, leader, deadline, firekeeper,
+/// decision, state). Read-only mirror of the per-council quorum engine, folded
+/// from the event stream so the quorum observability deck survives a refresh
+/// (OCEAN-58).
+async fn longhouse_topics(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let topics = match state.longhouse.lock() {
+        Ok(reg) => reg.topics(),
+        Err(poisoned) => poisoned.into_inner().topics(),
+    };
+    Json(json!({ "ok": true, "topics": topics }))
+}
+
+/// `GET /v1/longhouse/topics/{topic_id}` — one topic's full observable state by
+/// id. 404 if the topic id is unknown, 400 if it isn't a valid UUID. Mirrors the
+/// `GET /v1/rooms/{room_id}` shape: a typed error body, never a panic.
+async fn longhouse_topic(
+    State(state): State<AppState>,
+    Path(topic_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let id = match Uuid::parse_str(topic_id.trim()) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("invalid topic id '{topic_id}'; expected a UUID"),
+                })),
+            );
+        }
+    };
+
+    let snapshot = match state.longhouse.lock() {
+        Ok(reg) => reg.topic(&id),
+        Err(poisoned) => poisoned.into_inner().topic(&id),
+    };
+
+    match snapshot {
+        Some(topic) => (StatusCode::OK, Json(json!({ "ok": true, "topic": topic }))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("no longhouse topic with id '{id}'"),
+            })),
+        ),
     }
 }
 
