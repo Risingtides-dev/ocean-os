@@ -3,6 +3,7 @@
 //! emits a `BrowserActivity { active: true }` side-effect so the daemon can
 //! drive the side-panel handoff.
 
+pub mod downloads;
 pub mod input;
 pub mod inspect;
 pub mod nav;
@@ -96,7 +97,10 @@ pub fn browser_tools(ctx: BrowserToolCtx) -> Vec<Arc<dyn AgentTool>> {
         // Network capture — the scraping unlock (read real response bodies).
         Arc::new(network::BrowserCaptureNetworkTool { ctx: ctx.clone() }),
         Arc::new(network::BrowserCapturedRequestsTool { ctx: ctx.clone() }),
-        Arc::new(network::BrowserResponseBodyTool { ctx }),
+        Arc::new(network::BrowserResponseBodyTool { ctx: ctx.clone() }),
+        // Downloads — file flows into the agent's hands (Layer 3).
+        Arc::new(downloads::BrowserEnableDownloadsTool { ctx: ctx.clone() }),
+        Arc::new(downloads::BrowserDownloadsTool { ctx }),
     ]
 }
 

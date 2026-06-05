@@ -1,11 +1,13 @@
 //! Typed async handle to a Chrome instance over the DevTools Protocol.
 
+pub mod downloads;
 pub mod error;
 pub mod launch;
 pub mod netcap;
 pub mod perception;
 pub mod shell;
 
+pub use downloads::{DownloadInfo, DownloadState};
 pub use error::BrowserError;
 pub use launch::{launch, LaunchConfig, LaunchedChrome};
 pub use netcap::{CapturedResponse, NetCapture};
@@ -29,6 +31,8 @@ pub struct BrowserHandle {
     page: Arc<Mutex<Option<Page>>>,
     /// Active network capture (opt-in via `start_netcap`). None until started.
     netcap: Arc<Mutex<Option<netcap::NetCapture>>>,
+    /// Active download tracking (opt-in via `enable_downloads`). None until on.
+    downloads: Arc<Mutex<Option<downloads::DownloadTracker>>>,
 }
 
 impl BrowserHandle {
@@ -38,6 +42,7 @@ impl BrowserHandle {
             inner: Arc::new(Mutex::new(chrome)),
             page: Arc::new(Mutex::new(None)),
             netcap: Arc::new(Mutex::new(None)),
+            downloads: Arc::new(Mutex::new(None)),
         })
     }
 
