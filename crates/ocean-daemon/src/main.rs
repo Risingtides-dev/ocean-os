@@ -18,8 +18,9 @@ use axum::{
 use chrono::Utc;
 use ocean_agent::{room_guidance, AgentRuntime, PromptControl};
 use ocean_agent_sdk::{
-    AgentRole, AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse,
-    AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
+    AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse, AgentSessionId,
+    AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurnEvent, AgentTurnId,
+    AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
     ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
     ToolCall, ToolCallId, ToolResult,
 };
@@ -195,7 +196,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/ready", get(ready))
         .route("/v1/agent/turns", post(agent_turn))
         .route("/v1/agent/events", get(agent_events))
-        .route("/v1/agent/sessions", get(agent_sessions))
+        .route(
+            "/v1/agent/sessions",
+            get(agent_sessions).post(agent_sessions_create),
+        )
         .route("/v1/agent/sessions/{id}", get(agent_session))
         .route("/v1/events", get(events))
         .route("/v1/prompt", post(prompt))
@@ -2335,6 +2339,82 @@ async fn agent_sessions(
         sessions: summaries,
         error: None,
     })
+}
+
+/// `POST /v1/agent/sessions` — explicit session creation before the first turn.
+///
+/// Per `OCEAN_ECOSYSTEM_CONTRACT`, a surface mints its session here, then posts
+/// turns carrying that `session_id`. This binds the workspace and records the
+/// client surface up front; it runs no agent loop. The implicit create-on-turn
+/// path (a turn with no `session_id`) is unchanged and still works for clients
+/// that don't call this endpoint.
+async fn agent_sessions_create(
+    State(state): State<AppState>,
+    Json(req): Json<AgentSessionCreateRequest>,
+) -> (StatusCode, Json<AgentSessionCreateResponse>) {
+    let AgentSessionCreateRequest {
+        workspace_root,
+        project_id,
+        client_type,
+    } = req;
+
+    // Resolve the working directory with the same precedence the turn path uses:
+    // a non-empty workspace_root wins; else the project's workspace_root; else an
+    // explicit error — never the daemon's own launch dir.
+    let cwd = match state
+        .runtime
+        .resolve_cwd_for_turn(project_id, &workspace_root)
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::warn!(%error, "agent_sessions_create: cwd resolution failed");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentSessionCreateResponse {
+                    session_id: AgentSessionId::new_v4(),
+                    cwd: String::new(),
+                    client_type: None,
+                }),
+            );
+        }
+    };
+
+    match state.runtime.create_session(&cwd, client_type) {
+        Ok((core_id, bound_cwd, stored_client_type)) => {
+            let session_id = sdk_sid(core_id);
+            // Announce the new session on the agent event bus so live consumers
+            // (and the legacy mirror) see it the same way the turn path does.
+            emit_agent(
+                &state.events,
+                &state.agent_events,
+                session_id,
+                AgentTurnEvent::SessionCreated {
+                    session_id,
+                    title: String::new(),
+                    cwd: bound_cwd.clone(),
+                },
+            );
+            (
+                StatusCode::OK,
+                Json(AgentSessionCreateResponse {
+                    session_id,
+                    cwd: bound_cwd,
+                    client_type: stored_client_type,
+                }),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "agent_sessions_create: create_session failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(AgentSessionCreateResponse {
+                    session_id: AgentSessionId::new_v4(),
+                    cwd: String::new(),
+                    client_type: None,
+                }),
+            )
+        }
+    }
 }
 
 async fn agent_session(

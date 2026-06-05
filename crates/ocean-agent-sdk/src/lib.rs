@@ -213,6 +213,38 @@ pub struct AgentTurnResponse {
     pub error: Option<String>,
 }
 
+/// Request payload for `POST /v1/agent/sessions`.
+///
+/// Explicit session creation, per `OCEAN_ECOSYSTEM_CONTRACT`: a surface mints
+/// the session container (workspace-bound, identity-tagged) *before* posting its
+/// first turn, instead of relying on the implicit create-on-turn path. No
+/// prompt is run — this only allocates and persists the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionCreateRequest {
+    /// Workspace anchor for the session. The daemon resolves this to a git
+    /// toplevel when inside a repo, else uses it verbatim.
+    pub workspace_root: String,
+    /// Optional project this session belongs to. When `workspace_root` is empty,
+    /// the daemon falls back to the project's own `workspace_root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    /// Identifies the client surface so the agent can tailor responses on the
+    /// first turn. Known values: "tui", "surface-web", "surface-gpui",
+    /// "surface-native", "cli", "leo-voice".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
+}
+
+/// Response payload for `POST /v1/agent/sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionCreateResponse {
+    pub session_id: AgentSessionId,
+    /// The working directory the session was bound to.
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
+}
+
 /// Summary item returned by `GET /v1/agent/sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionSummary {
