@@ -2784,6 +2784,131 @@ async fn agent_voice(
     agent_turn(State(state), Json(turn)).await
 }
 
+/// Outcome of binding a turn's requested cwd against the session it claims to
+/// resume. See [`resolve_bound_cwd`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CwdBindingError {
+    /// The resumed session is bound to one workspace, but the turn supplied a
+    /// cwd that resolves to a *different* workspace. A forged `session_id`
+    /// pointed at an arbitrary cwd is a session-hijack attempt (OCEAN-52a):
+    /// reject rather than relocate the session into the attacker's directory.
+    WorkspaceMismatch {
+        requested_workspace: String,
+        session_workspace: String,
+    },
+    /// The requested cwd contains a parent-dir (`..`) traversal component, so it
+    /// could escape its intended workspace into an arbitrary filesystem location
+    /// (OCEAN-52b). Legit cwds are already-resolved absolute paths.
+    PathTraversal { cwd: String },
+}
+
+impl CwdBindingError {
+    fn message(&self) -> String {
+        match self {
+            CwdBindingError::WorkspaceMismatch {
+                requested_workspace,
+                session_workspace,
+            } => format!(
+                "session/workspace mismatch: this session is bound to workspace \
+                 {session_workspace}, but the turn's cwd resolves to {requested_workspace}. \
+                 A resumed turn cannot relocate its session to a different workspace."
+            ),
+            CwdBindingError::PathTraversal { cwd } => format!(
+                "rejected cwd {cwd}: a working directory must be an absolute, \
+                 already-resolved path with no parent-directory ('..') components."
+            ),
+        }
+    }
+}
+
+/// True if `cwd` contains a parent-directory (`..`) component, which could let a
+/// forged path escape its intended workspace boundary. We check lexically (not
+/// via `canonicalize`) so the guard is deterministic and does not depend on the
+/// path existing on disk — a resolved turn cwd should never contain `..`.
+fn cwd_has_traversal(cwd: &str) -> bool {
+    std::path::Path::new(cwd)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// Resolve the working directory a turn will actually execute in, enforcing the
+/// session↔workspace binding (OCEAN-52) and pinning resumed turns to their
+/// session's bound workspace (OCEAN-55).
+///
+/// - `requested_cwd`: the cwd already resolved by `resolve_cwd_for_turn`
+///   (non-empty: the client's cwd, or a project's workspace_root).
+/// - `requested_workspace_root`: the workspace root `requested_cwd` maps to
+///   (git toplevel, or the cwd itself), computed by the caller.
+/// - `session_binding`: `Some((session_cwd, session_workspace_root))` when the
+///   turn resumes an existing session that carries a bound workspace; `None` for
+///   a brand-new session (implicit or explicit) or a legacy session with no
+///   recorded workspace.
+///
+/// Returns the cwd to run in. For a NEW session this is `requested_cwd` (the
+/// first turn legitimately sets the cwd). For a RESUMED session this is the
+/// session's *bound* cwd — the turn is pinned to where the session was started,
+/// never an arbitrary `requested_cwd`, after validating the two share a
+/// workspace root.
+fn resolve_bound_cwd(
+    requested_cwd: &str,
+    requested_workspace_root: &str,
+    session_binding: Option<(&str, &str)>,
+) -> Result<String, CwdBindingError> {
+    // Path-traversal guard applies to every turn: the resolved cwd must not
+    // contain `..` components that could escape into a parent / arbitrary dir.
+    if cwd_has_traversal(requested_cwd) {
+        return Err(CwdBindingError::PathTraversal {
+            cwd: requested_cwd.to_string(),
+        });
+    }
+
+    match session_binding {
+        // RESUMED session: validate the binding, then pin to the session's
+        // bound cwd. The requested cwd's workspace must match the session's
+        // bound workspace, otherwise this is a cross-workspace hijack.
+        Some((session_cwd, session_workspace)) => {
+            if requested_workspace_root != session_workspace {
+                return Err(CwdBindingError::WorkspaceMismatch {
+                    requested_workspace: requested_workspace_root.to_string(),
+                    session_workspace: session_workspace.to_string(),
+                });
+            }
+            // The session's own bound cwd must also be traversal-free (it was
+            // captured at creation, but validate defensively).
+            if cwd_has_traversal(session_cwd) {
+                return Err(CwdBindingError::PathTraversal {
+                    cwd: session_cwd.to_string(),
+                });
+            }
+            Ok(session_cwd.to_string())
+        }
+        // NEW session (or legacy with no bound workspace): the first turn sets
+        // the cwd. Run in the requested cwd as before.
+        None => Ok(requested_cwd.to_string()),
+    }
+}
+
+/// Look up the workspace binding (`cwd`, `workspace_root`) of an existing
+/// session, if it exists on disk and carries a recorded workspace. Returns
+/// `None` for an unknown session (the strict resume-vs-create check downstream
+/// in the agent loop turns that into the canonical "session not found" error)
+/// or a legacy session with no bound workspace.
+fn session_workspace_binding(
+    runtime: &AgentRuntime,
+    session_id: AgentSessionId,
+) -> Option<(String, String)> {
+    let detail = runtime.session_detail(core_sid(session_id)).ok()?;
+    match (detail.cwd, detail.workspace_root) {
+        (Some(cwd), Some(root)) => Some((cwd, root)),
+        // Defensive: workspace_root and cwd are bound together, but if only one
+        // is present, fall back to whichever we have for both fields so the
+        // binding check still has a boundary to enforce.
+        (Some(cwd), None) => Some((cwd.clone(), cwd)),
+        (None, Some(root)) => Some((root.clone(), root)),
+        (None, None) => None,
+    }
+}
+
 async fn agent_turn(
     State(state): State<AppState>,
     Json(req): Json<AgentTurnRequest>,
@@ -2825,6 +2950,56 @@ async fn agent_turn(
     let turn_id = AgentTurnId::new_v4();
     let request_id = turn_id.0;
     let event_prefix = request_id.to_string()[..8].to_string();
+
+    // Session↔workspace binding (OCEAN-52) + resume cwd pinning (OCEAN-55).
+    //
+    // A NEW session (`is_new_session`) legitimately sets its own cwd: the
+    // path-traversal guard still applies, but there is no prior workspace to
+    // bind against. A RESUMED session (client supplied a `session_id` that
+    // exists on disk) is PINNED to the workspace it was started in — the turn
+    // executes in the session's bound cwd, never an arbitrary `req.cwd` — after
+    // validating that the requested cwd resolves to the *same* workspace root.
+    // A mismatch is a cross-workspace hijack (forged session_id pointed at an
+    // arbitrary cwd) and is rejected. An unknown `session_id` yields no binding
+    // here; the strict resume check inside the agent loop surfaces it as the
+    // canonical "session not found" error, preserving existing behaviour.
+    let requested_workspace_root = state
+        .runtime
+        .workspace_root_for(std::path::Path::new(&cwd))
+        .to_string_lossy()
+        .into_owned();
+    let session_binding = if is_new_session {
+        None
+    } else {
+        session_workspace_binding(&state.runtime, session_id)
+    };
+    let cwd = match resolve_bound_cwd(
+        &cwd,
+        &requested_workspace_root,
+        session_binding
+            .as_ref()
+            .map(|(c, r)| (c.as_str(), r.as_str())),
+    ) {
+        Ok(resolved) => resolved,
+        Err(binding_error) => {
+            tracing::warn!(
+                %session_id,
+                error = %binding_error.message(),
+                "agent_turn: rejected by session/workspace binding guard"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentTurnResponse {
+                    ok: false,
+                    turn_id,
+                    session_id,
+                    status: AgentTurnStatus::Failed,
+                    event_id_prefix: event_prefix,
+                    error: Some(binding_error.message()),
+                }),
+            );
+        }
+    };
 
     if is_new_session {
         emit_agent(
@@ -4361,5 +4536,96 @@ mod tests {
         );
         assert!(decision.should_convene);
         assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
+    }
+
+    // --- OCEAN-52/55: session↔workspace binding + traversal guard -----------
+
+    #[test]
+    fn new_session_runs_in_requested_cwd() {
+        // A brand-new session (no prior binding) legitimately sets its own cwd.
+        let out = resolve_bound_cwd("/work/repo/sub", "/work/repo", None)
+            .expect("new session cwd should be accepted");
+        assert_eq!(
+            out, "/work/repo/sub",
+            "a new session runs in exactly the requested cwd"
+        );
+    }
+
+    #[test]
+    fn resumed_turn_pinned_to_session_bound_cwd_not_req_cwd() {
+        // The session was started in /work/repo/sub (workspace /work/repo). The
+        // resumed turn supplies the same workspace via a *different* sub-dir,
+        // but execution must pin to the session's bound cwd, not req.cwd.
+        let out = resolve_bound_cwd(
+            "/work/repo/another-sub",
+            "/work/repo",
+            Some(("/work/repo/sub", "/work/repo")),
+        )
+        .expect("matching workspace should be accepted");
+        assert_eq!(
+            out, "/work/repo/sub",
+            "a resumed turn executes in the session's bound cwd, not req.cwd"
+        );
+    }
+
+    #[test]
+    fn resumed_turn_session_cwd_equal_to_req_cwd_is_pinned() {
+        // The common case: the client re-sends the same cwd it started in.
+        let out = resolve_bound_cwd(
+            "/work/repo",
+            "/work/repo",
+            Some(("/work/repo", "/work/repo")),
+        )
+        .expect("identical workspace should be accepted");
+        assert_eq!(out, "/work/repo");
+    }
+
+    #[test]
+    fn session_cwd_mismatch_is_rejected() {
+        // A forged session_id whose bound workspace differs from the cwd the
+        // turn points at is a cross-workspace hijack — reject it.
+        let err = resolve_bound_cwd(
+            "/etc",                                  // attacker cwd
+            "/etc",                                  // its workspace
+            Some(("/work/repo/sub", "/work/repo")),  // session bound elsewhere
+        )
+        .expect_err("cross-workspace resume must be rejected");
+        assert_eq!(
+            err,
+            CwdBindingError::WorkspaceMismatch {
+                requested_workspace: "/etc".into(),
+                session_workspace: "/work/repo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn path_traversal_cwd_is_rejected_for_new_session() {
+        let err = resolve_bound_cwd("/work/repo/../../etc", "/work/repo", None)
+            .expect_err("traversal cwd must be rejected");
+        assert!(matches!(err, CwdBindingError::PathTraversal { .. }));
+    }
+
+    #[test]
+    fn path_traversal_cwd_is_rejected_for_resumed_session() {
+        // Even when the (lexical) workspace strings would match, a `..` in the
+        // requested cwd is rejected before any binding comparison.
+        let err = resolve_bound_cwd(
+            "/work/repo/../repo",
+            "/work/repo",
+            Some(("/work/repo", "/work/repo")),
+        )
+        .expect_err("traversal cwd must be rejected on resume too");
+        assert!(matches!(err, CwdBindingError::PathTraversal { .. }));
+    }
+
+    #[test]
+    fn cwd_has_traversal_detects_parent_components_only() {
+        assert!(cwd_has_traversal("/a/../b"));
+        assert!(cwd_has_traversal("../b"));
+        assert!(!cwd_has_traversal("/a/b/c"));
+        // A literal dir literally named "..something" is not a parent ref.
+        assert!(!cwd_has_traversal("/a/..b/c"));
+        assert!(!cwd_has_traversal("/work/repo"));
     }
 }
