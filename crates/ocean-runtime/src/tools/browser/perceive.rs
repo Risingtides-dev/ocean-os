@@ -20,6 +20,10 @@ impl AgentTool for BrowserReadPageTool {
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })
     }
+    fn requires_permission(&self) -> bool {
+        // Read-only perception; never mutates page state.
+        false
+    }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
         let read = self
             .ctx
@@ -51,6 +55,10 @@ impl AgentTool for BrowserScreenshotTool {
             "type": "object",
             "properties": { "full_page": { "type": "boolean", "default": false } }
         })
+    }
+    fn requires_permission(&self) -> bool {
+        // Read-only perception; never mutates page state.
+        false
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
         let full = args

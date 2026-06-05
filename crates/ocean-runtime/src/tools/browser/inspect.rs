@@ -54,6 +54,10 @@ impl AgentTool for BrowserConsoleTool {
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })
     }
+    fn requires_permission(&self) -> bool {
+        // Read-only perception; never mutates page state.
+        false
+    }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
         let out = self
             .ctx
@@ -81,6 +85,10 @@ impl AgentTool for BrowserNetworkTool {
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })
+    }
+    fn requires_permission(&self) -> bool {
+        // Read-only perception; never mutates page state.
+        false
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
         let out = self

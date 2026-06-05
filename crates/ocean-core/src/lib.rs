@@ -371,6 +371,122 @@ pub struct RoomsResponse {
     pub error: Option<String>,
 }
 
+/// Free-form identifier for a *persistent* [`Room`] entity (OCEAN-39).
+///
+/// Distinct from [`RoomId`], which is a closed enum of the four Track-0
+/// projection rooms. A persistent room is created dynamically (e.g.
+/// `"ocean-surface-map-fix"`), so it carries an open string key rather than an
+/// enum variant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RoomKey(pub String);
+
+impl RoomKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RoomKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How a room's agents are woken. The data-model half of the collaboration
+/// model's trigger policy (OCEAN-39); the runtime that acts on it is future
+/// work. All fields default off, so an absent/partial policy means "no
+/// automatic triggers".
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RoomTriggerPolicy {
+    /// Wake an agent when it is @-mentioned in the transcript.
+    #[serde(default)]
+    pub on_mention: bool,
+    /// Wake an agent when someone replies in a thread it participates in.
+    #[serde(default)]
+    pub on_thread_reply: bool,
+    /// Wake an agent when a rendered component emits an interaction event.
+    #[serde(default)]
+    pub on_component_event: bool,
+    /// Optional cron expression for scheduled wake-ups. `None` = no schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_schedule: Option<String>,
+}
+
+/// A participant in a [`Room`] — a human, agent, bot, tool, or system actor.
+/// Minimal identity foundation per the collaboration model (OCEAN-39): enough
+/// to attribute messages and assemble a roster. Capabilities, transport, and
+/// agent profiles are future work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomParticipant {
+    /// Stable participant id, unique within the room.
+    pub id: String,
+    /// What kind of actor this is.
+    pub kind: RoomParticipantKind,
+    /// Display name shown in the transcript and roster.
+    pub display_name: String,
+}
+
+/// The kind of actor a [`RoomParticipant`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomParticipantKind {
+    Human,
+    Agent,
+    Bot,
+    Tool,
+    System,
+}
+
+/// A **persistent room entity** (OCEAN-39).
+///
+/// This is the durable data-model foundation for Ocean Rooms described in
+/// `docs/OCEAN_ROOMS_COLLABORATION_MODEL.md`: a room that owns a participant
+/// roster, identity, timestamps, and an optional trigger policy. It is
+/// deliberately distinct from [`RoomSnapshot`], which is a *projection* of
+/// runtime state for a Track-0 panel view — `Room` is the thing that is stored,
+/// `RoomSnapshot` is a derived view.
+///
+/// Kept intentionally minimal and compiling: the full room lifecycle (message
+/// transcripts, turn queues, UI state, execution contexts) is future work. This
+/// struct is the seed those build on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Room {
+    /// Persistent, free-form room id (e.g. `"ocean-surface-map-fix"`).
+    pub id: RoomKey,
+    /// Human-readable room name.
+    pub name: String,
+    /// Current participant roster (humans, agents, bots, tools, system).
+    #[serde(default)]
+    pub participants: Vec<RoomParticipant>,
+    /// When the room was first created.
+    pub created_at: DateTime<Utc>,
+    /// When the room last changed (roster, metadata, or — later — transcript).
+    pub updated_at: DateTime<Utc>,
+    /// Optional policy for how this room's agents are triggered. `None` = no
+    /// automatic triggers configured yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_policy: Option<RoomTriggerPolicy>,
+}
+
+impl Room {
+    /// Create a new, empty persistent room with `created_at == updated_at` set to
+    /// `now`. Roster starts empty and no trigger policy is configured.
+    pub fn new(id: RoomKey, name: impl Into<String>, now: DateTime<Utc>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            participants: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            trigger_policy: None,
+        }
+    }
+}
+
 /// Response payload for `POST /v1/requests`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestCreateResponse {
@@ -652,5 +768,46 @@ mod tests {
 
         let roundtrip: RoomsResponse = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, response);
+    }
+
+    #[test]
+    fn persistent_room_entity_roundtrips_through_serde() {
+        // OCEAN-39: the persistent Room data model — distinct from RoomSnapshot —
+        // must serialize/deserialize with its roster, timestamps, and optional
+        // trigger policy intact.
+        let now = Utc::now();
+        let mut room = Room::new(RoomKey::new("ocean-surface-map-fix"), "Map Fix", now);
+        room.participants.push(RoomParticipant {
+            id: "john".into(),
+            kind: RoomParticipantKind::Human,
+            display_name: "John".into(),
+        });
+        room.participants.push(RoomParticipant {
+            id: "ocean".into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: "@ocean".into(),
+        });
+        room.trigger_policy = Some(RoomTriggerPolicy {
+            on_mention: true,
+            ..Default::default()
+        });
+
+        let json = serde_json::to_value(&room).unwrap();
+        assert_eq!(json["id"], "ocean-surface-map-fix");
+        assert_eq!(json["participants"][1]["kind"], "agent");
+        assert_eq!(json["trigger_policy"]["on_mention"], true);
+
+        let roundtrip: Room = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, room);
+    }
+
+    #[test]
+    fn new_room_starts_empty_with_no_trigger_policy() {
+        let now = Utc::now();
+        let room = Room::new(RoomKey::new("r1"), "R1", now);
+        assert!(room.participants.is_empty());
+        assert!(room.trigger_policy.is_none());
+        assert_eq!(room.created_at, room.updated_at);
+        assert_eq!(room.id.as_str(), "r1");
     }
 }
