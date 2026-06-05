@@ -14,9 +14,15 @@
 //! - The Ocean daemon must already be running (default `http://127.0.0.1:4780`,
 //!   override with `--daemon-url` or `OCEAN_ACP_DAEMON_URL`).
 //!
-//! Permissions: v1 relies on the daemon's own permission policy (it does not
-//! surface tool approvals to the editor). The seam to forward
-//! `session/request_permission` to Zed is noted in `prompt` below.
+//! Permissions: when the daemon gates a tool, it raises a `PermissionRequest`
+//! on its control stream (`/v1/events`). The bridge forwards that to the editor
+//! as a `session/request_permission` request, waits for Zed's allow/deny, and
+//! POSTs the decision to `/v1/permissions/{id}/decision`. See [`run_turn`].
+//!
+//! Cancellation: a `session/cancel` notification from the editor is mapped to
+//! `POST /v1/requests/{turn_id}/cancel` on the daemon (the daemon's per-turn
+//! `request_id` IS the `turn_id` we get back from a turn submission). See the
+//! `CancelNotification` handler below.
 
 mod convert;
 mod daemon;
@@ -25,9 +31,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, CurrentModeUpdate, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
+    AgentCapabilities, CancelNotification, CurrentModeUpdate, InitializeRequest,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionMode, SessionModeId,
     SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result as AcpResult, Stdio};
 use anyhow::Context;
@@ -64,6 +73,10 @@ struct SessionState {
     cwd: String,
     /// The daemon's real session id, learned from the first turn's response.
     daemon_id: Option<String>,
+    /// The in-flight turn's daemon request id (== the turn id). Set while a turn
+    /// is running so `session/cancel` can target `POST /v1/requests/{id}/cancel`,
+    /// cleared when the turn ends. `None` between turns.
+    active_request_id: Option<String>,
 }
 
 impl Sessions {
@@ -73,6 +86,7 @@ impl Sessions {
             SessionState {
                 cwd,
                 daemon_id: None,
+                active_request_id: None,
             },
         );
     }
@@ -104,6 +118,39 @@ impl Sessions {
         {
             state.daemon_id = Some(daemon_id);
         }
+    }
+
+    /// Mark the request id of the turn currently running for this session.
+    fn set_active_request(&self, acp_session_id: &str, request_id: String) {
+        if let Some(state) = self
+            .inner
+            .lock()
+            .expect("sessions mutex poisoned")
+            .get_mut(acp_session_id)
+        {
+            state.active_request_id = Some(request_id);
+        }
+    }
+
+    /// Clear the active request id (turn ended).
+    fn clear_active_request(&self, acp_session_id: &str) {
+        if let Some(state) = self
+            .inner
+            .lock()
+            .expect("sessions mutex poisoned")
+            .get_mut(acp_session_id)
+        {
+            state.active_request_id = None;
+        }
+    }
+
+    /// The request id of the turn currently running for this session, if any.
+    fn active_request(&self, acp_session_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("sessions mutex poisoned")
+            .get(acp_session_id)
+            .and_then(|s| s.active_request_id.clone())
     }
 }
 
@@ -228,38 +275,96 @@ async fn main() -> AcpResult<()> {
                         }
                     };
 
-                    let stop = match run_turn(&client, &sessions, &conn, &session_id, prompt, cwd)
-                        .await
-                    {
-                        Ok(stop) => stop,
-                        Err(err) => {
-                            tracing::error!(%session_id, error = %err, "turn failed");
-                            // Surface the failure to the editor as a message,
-                            // then end the turn so the UI isn't left spinning.
-                            let _ = conn.send_notification(SessionNotification::new(
-                                SessionId::new(session_id.clone()),
-                                agent_client_protocol::schema::SessionUpdate::AgentMessageChunk(
-                                    agent_client_protocol::schema::ContentChunk::new(text_block(
-                                        format!("⚠️ ocean-acp: {err:#}"),
-                                    )),
-                                ),
-                            ));
-                            StopReason::Refusal
+                    // Run the turn OFF the event loop. A turn streams for the
+                    // whole prompt; awaiting it inline would block the dispatch
+                    // loop, so `session/cancel` and Zed's permission responses
+                    // could never be processed mid-turn. Spawning frees the loop
+                    // — `run_turn` itself calls `send_request(...).block_task()`
+                    // for permission prompts, which is only safe in a spawned
+                    // task. The `responder` is fulfilled when the turn ends.
+                    let client = client.clone();
+                    let sessions = sessions.clone();
+                    conn.spawn({
+                        let conn = conn.clone();
+                        async move {
+                            let stop = match run_turn(
+                                &client, &sessions, &conn, &session_id, prompt, cwd,
+                            )
+                            .await
+                            {
+                                Ok(stop) => stop,
+                                Err(err) => {
+                                    tracing::error!(%session_id, error = %err, "turn failed");
+                                    // Surface the failure to the editor as a
+                                    // message, then end the turn so the UI isn't
+                                    // left spinning.
+                                    let _ = conn.send_notification(SessionNotification::new(
+                                        SessionId::new(session_id.clone()),
+                                        SessionUpdate::AgentMessageChunk(
+                                            agent_client_protocol::schema::ContentChunk::new(
+                                                text_block(format!("⚠️ ocean-acp: {err:#}")),
+                                            ),
+                                        ),
+                                    ));
+                                    StopReason::Refusal
+                                }
+                            };
+                            // The turn is done; drop the cancel target.
+                            sessions.clear_active_request(&session_id);
+                            let _ = responder.respond(PromptResponse::new(stop));
+                            Ok(())
                         }
-                    };
+                    })?;
 
-                    responder.respond(PromptResponse::new(stop))
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
-        // --- everything else (cancel, load, authenticate, …) ---------------
+        // --- session/cancel ------------------------------------------------
+        .on_receive_notification(
+            {
+                let sessions = sessions.clone();
+                let client = client.clone();
+                async move |notif: CancelNotification, conn: ConnectionTo<Client>| {
+                    // Per-turn cancel. Map the ACP session to the in-flight
+                    // turn's daemon request id and POST the cancel. The daemon's
+                    // turn request_id IS the turn_id we recorded at submit time.
+                    let acp_session = notif.session_id.0.to_string();
+                    let Some(request_id) = sessions.active_request(&acp_session) else {
+                        // No turn running for this session — nothing to cancel.
+                        tracing::debug!(%acp_session, "session/cancel: no active turn");
+                        return Ok(());
+                    };
+                    // Don't block the dispatch loop on the daemon round-trip.
+                    conn.spawn({
+                        let client = client.clone();
+                        async move {
+                            match uuid::Uuid::parse_str(&request_id) {
+                                Ok(id) => {
+                                    if let Err(err) = client.cancel_request(id).await {
+                                        tracing::warn!(%request_id, error = %err, "cancel POST failed");
+                                    } else {
+                                        tracing::info!(%request_id, "per-turn cancel forwarded to daemon");
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(%request_id, error = %err, "cancel: bad request id");
+                                }
+                            }
+                            Ok(())
+                        }
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        // --- everything else (load, authenticate, …) ----------------------
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {
-                // session/cancel arrives here as a notification. The daemon turn
-                // will end on its own; we simply don't have a per-turn cancel
-                // wired yet. Other unhandled messages get a clean error so the
-                // client isn't left waiting on a response.
+                // Unhandled messages get a clean error so the client isn't left
+                // waiting on a response.
                 message.respond_with_error(
                     agent_client_protocol::util::internal_error("unhandled message"),
                     cx,
@@ -314,6 +419,11 @@ async fn run_turn(
     let turn_id = submitted.turn_id.0.to_string();
     tracing::info!(%acp_session_id, %turn_id, status = ?submitted.status, "turn submitted");
 
+    // The daemon's per-turn request id IS the turn id (see
+    // `ocean-daemon::agent_turn`). Record it so a `session/cancel` for this ACP
+    // session can target `POST /v1/requests/{request_id}/cancel`.
+    sessions.set_active_request(acp_session_id, turn_id.clone());
+
     // If the daemon failed the turn synchronously, there will be no stream
     // events for it — surface the reason now instead of blocking forever.
     if matches!(submitted.status, ocean_agent_sdk::AgentTurnStatus::Failed) {
@@ -322,6 +432,19 @@ async fn run_turn(
             .unwrap_or_else(|| "daemon rejected the turn".to_string());
         anyhow::bail!(reason);
     }
+
+    // Spawn the permission bridge for this turn. The daemon raises tool-approval
+    // requests on its control stream (`/v1/events`), not the typed agent stream,
+    // so this watcher subscribes there, forwards any `PermissionRequest` scoped
+    // to OUR request to the editor as `session/request_permission`, waits for
+    // Zed's allow/deny, and POSTs the decision back. It self-terminates when the
+    // turn ends (see `spawn_permission_bridge`).
+    spawn_permission_bridge(
+        client,
+        conn,
+        acp_session_id.to_string(),
+        turn_id.clone(),
+    )?;
 
     // ACP notifications are tagged with the ACP session id Zed knows; SSE
     // filtering uses the daemon's id the events actually carry.
@@ -363,6 +486,152 @@ async fn run_turn(
                 .map_err(|e| anyhow::anyhow!("send session/update: {e}"))?;
         }
     }
+}
+
+/// Permission option ids the editor echoes back in its `Selected` outcome. The
+/// kind drives the icon/treatment Zed shows; the id is what we match on.
+const OPT_ALLOW: &str = "allow";
+const OPT_DENY: &str = "deny";
+
+/// Spawn a per-turn permission bridge.
+///
+/// The daemon surfaces tool approvals on its legacy control stream
+/// (`/v1/events`) as `PermissionRequest` envelopes carrying a `permission_id`
+/// and `request_id`. This task watches that stream for our turn's
+/// `request_id`, forwards each pending approval to the editor as a
+/// `session/request_permission` request, blocks for Zed's response, and POSTs
+/// the resulting decision to `/v1/permissions/{id}/decision`.
+///
+/// Lifetime: the task self-terminates when it observes a terminal control
+/// event (`TurnFinished` / `Cancelled` / `Error`) for our `request_id`, or when
+/// the control stream closes.
+///
+/// Note: as of writing, the daemon submits ACP turns with `yolo: true`, so the
+/// gate auto-allows and no `PermissionRequest` is raised. This wiring activates
+/// the moment ACP turns run gated (daemon-side change); it is correct and inert
+/// until then.
+fn spawn_permission_bridge(
+    client: &DaemonClient,
+    conn: &ConnectionTo<Client>,
+    acp_session_id: String,
+    request_id: String,
+) -> anyhow::Result<()> {
+    use ocean_core::OceanEvent;
+
+    let client = client.clone();
+    let bridge_conn = conn.clone();
+    conn.spawn({
+        let conn = bridge_conn.clone();
+        async move {
+            let mut stream = match client.ocean_event_stream().await {
+                Ok(s) => s,
+                Err(err) => {
+                    // Without the control stream we just can't surface prompts;
+                    // the turn still runs (and, under yolo, never gates).
+                    tracing::warn!(%request_id, error = %err, "permission bridge: control stream unavailable");
+                    return Ok(());
+                }
+            };
+            let acp_session = SessionId::new(acp_session_id.clone());
+
+            loop {
+                let envelope = match stream.next_event().await {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => return Ok(()), // stream closed
+                    Err(err) => {
+                        tracing::warn!(%request_id, error = %err, "permission bridge: stream read error");
+                        return Ok(());
+                    }
+                };
+
+                // Scope to OUR turn (the control feed is global).
+                if envelope
+                    .request_id
+                    .is_some_and(|r| r.to_string() != request_id)
+                {
+                    continue;
+                }
+
+                match &envelope.event {
+                    OceanEvent::PermissionRequest { tool, reason, .. } => {
+                        let Some(permission_id) = envelope.permission_id else {
+                            tracing::warn!(%request_id, "permission_request without permission_id; skipping");
+                            continue;
+                        };
+
+                        // Describe the gated tool to the editor.
+                        let mut fields = ToolCallUpdateFields::default();
+                        fields.title = Some(format!("{tool}: {reason}"));
+                        let tool_call = ToolCallUpdate::new(
+                            agent_client_protocol::schema::ToolCallId::new(permission_id.to_string()),
+                            fields,
+                        );
+                        let options = vec![
+                            PermissionOption::new(
+                                PermissionOptionId::new(OPT_ALLOW),
+                                "Allow",
+                                PermissionOptionKind::AllowOnce,
+                            ),
+                            PermissionOption::new(
+                                PermissionOptionId::new(OPT_DENY),
+                                "Reject",
+                                PermissionOptionKind::RejectOnce,
+                            ),
+                        ];
+
+                        // Ask Zed and wait. We're in a spawned task, so
+                        // `block_task()` is safe (it does not block the event
+                        // loop). A failed round-trip is treated as a denial so
+                        // the daemon waiter is always released.
+                        let outcome = conn
+                            .send_request(RequestPermissionRequest::new(
+                                acp_session.clone(),
+                                tool_call,
+                                options,
+                            ))
+                            .block_task()
+                            .await;
+
+                        let (allow, deny_reason) = match outcome {
+                            Ok(resp) => match resp.outcome {
+                                RequestPermissionOutcome::Selected(sel) => {
+                                    (sel.option_id.0.as_ref() == OPT_ALLOW, None)
+                                }
+                                // Editor cancelled the turn before deciding.
+                                RequestPermissionOutcome::Cancelled => (
+                                    false,
+                                    Some("permission request cancelled by editor".to_string()),
+                                ),
+                                // Forward-compatible: unknown outcome → deny.
+                                _ => (false, Some("unknown permission outcome".to_string())),
+                            },
+                            Err(err) => {
+                                tracing::warn!(%permission_id, error = %err, "request_permission failed; denying");
+                                (false, Some(format!("editor permission request failed: {err}")))
+                            }
+                        };
+
+                        if let Err(err) = client
+                            .decide_permission(permission_id, allow, deny_reason)
+                            .await
+                        {
+                            tracing::warn!(%permission_id, error = %err, "permission decision POST failed");
+                        } else {
+                            tracing::info!(%permission_id, allow, "permission decision forwarded to daemon");
+                        }
+                    }
+                    // Terminal control events for our turn → stop watching.
+                    OceanEvent::TurnFinished { .. }
+                    | OceanEvent::Cancelled { .. }
+                    | OceanEvent::Error { .. } => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })?;
+    Ok(())
 }
 
 /// Build an ACP [`SessionModeState`] from the daemon's model roster, so Zed
@@ -421,4 +690,54 @@ fn event_session_id(event: &ocean_agent_sdk::AgentTurnEvent) -> Option<String> {
         E::Extension { .. } => return None,
     };
     Some(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_request_tracks_and_clears_per_session() {
+        let sessions = Sessions::default();
+        sessions.insert("acp-1".into(), "/tmp".into());
+
+        // No turn yet → no cancel target.
+        assert_eq!(sessions.active_request("acp-1"), None);
+
+        sessions.set_active_request("acp-1", "req-abc".into());
+        assert_eq!(sessions.active_request("acp-1"), Some("req-abc".into()));
+
+        // A second session's turn must not leak across.
+        assert_eq!(sessions.active_request("acp-2"), None);
+
+        sessions.clear_active_request("acp-1");
+        assert_eq!(sessions.active_request("acp-1"), None);
+    }
+
+    #[test]
+    fn permission_decision_serializes_to_daemon_shape() {
+        use ocean_core::{PermissionDecision, PermissionDecisionRequest};
+
+        let id = uuid::Uuid::new_v4();
+
+        // Allow → flat `{ permission_id, decision: "allow" }`.
+        let allow = PermissionDecisionRequest {
+            permission_id: id,
+            decision: PermissionDecision::Allow,
+        };
+        let v = serde_json::to_value(&allow).unwrap();
+        assert_eq!(v["permission_id"], id.to_string());
+        assert_eq!(v["decision"], "allow");
+
+        // Deny carries the reason inline (flattened).
+        let deny = PermissionDecisionRequest {
+            permission_id: id,
+            decision: PermissionDecision::Deny {
+                reason: Some("nope".into()),
+            },
+        };
+        let v = serde_json::to_value(&deny).unwrap();
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(v["reason"], "nope");
+    }
 }

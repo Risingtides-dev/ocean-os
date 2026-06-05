@@ -13,6 +13,7 @@
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
 use ocean_agent_sdk::{AgentTurnEvent, AgentTurnRequest, AgentTurnResponse};
+use ocean_core::{EventEnvelope, PermissionDecision, PermissionDecisionRequest};
 use serde::Deserialize;
 use std::pin::Pin;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
@@ -160,6 +161,78 @@ impl DaemonClient {
         let lines = BufReader::new(StreamReader::new(byte_stream)).lines();
         Ok(EventStream { lines })
     }
+
+    /// Open the daemon's GLOBAL legacy control stream (`/v1/events`). Unlike
+    /// `/v1/agent/events` (typed `AgentTurnEvent`s), this feed carries the
+    /// permission lifecycle — `PermissionRequest` / `PermissionDecision` — that
+    /// the agent stream omits. The bridge watches it during a turn so it can
+    /// forward a pending tool approval to the editor. Yields decoded
+    /// [`EventEnvelope`]s; filter by `request_id` / `session_id` downstream.
+    pub async fn ocean_event_stream(&self) -> Result<OceanEventStream> {
+        let url = format!("{}/v1/events", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+            .with_context(|| format!("GET {url} (SSE)"))?
+            .error_for_status()
+            .context("daemon rejected the control event subscription")?;
+
+        let byte_stream: IoByteStream = Box::pin(
+            resp.bytes_stream()
+                .map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+        );
+        let lines = BufReader::new(StreamReader::new(byte_stream)).lines();
+        Ok(OceanEventStream { lines })
+    }
+
+    /// Resolve a pending permission by id. Mirrors
+    /// `POST /v1/permissions/{id}/decision`. `allow == true` sends `Allow`,
+    /// otherwise `Deny { reason }`. This releases the daemon-side waiter the
+    /// agent loop is blocked on.
+    pub async fn decide_permission(
+        &self,
+        permission_id: uuid::Uuid,
+        allow: bool,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let decision = if allow {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny { reason }
+        };
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision,
+        };
+        let url = format!("{}/v1/permissions/{}/decision", self.base_url, permission_id);
+        self.http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("daemon rejected the permission decision")?;
+        Ok(())
+    }
+
+    /// Cancel an in-flight request (a turn). Mirrors
+    /// `POST /v1/requests/{id}/cancel`. The daemon's turn `request_id` IS the
+    /// `turn_id` returned by `submit_turn`, so callers pass that through.
+    pub async fn cancel_request(&self, request_id: uuid::Uuid) -> Result<()> {
+        let url = format!("{}/v1/requests/{}/cancel", self.base_url, request_id);
+        self.http
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("daemon rejected the cancel request")?;
+        Ok(())
+    }
 }
 
 /// A stream of decoded [`AgentTurnEvent`]s parsed from the daemon SSE feed.
@@ -193,6 +266,34 @@ impl EventStream {
                 Ok(ev) => return Ok(Some(ev)),
                 // Daemon emits `{"type":"error",...}` control frames and may add
                 // new event kinds; skip anything we can't decode.
+                Err(_) => continue,
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A stream of decoded [`EventEnvelope`]s parsed from the daemon's legacy
+/// `/v1/events` SSE feed. Same line framing as [`EventStream`]; we decode the
+/// `data:` payload as the flattened control envelope and skip anything that
+/// isn't a recognisable envelope (e.g. `{"type":"error",…}` keep-alives).
+pub struct OceanEventStream {
+    lines: Lines<BufReader<StreamReader<IoByteStream, bytes::Bytes>>>,
+}
+
+impl OceanEventStream {
+    /// Pull the next decoded control envelope, or `Ok(None)` at end-of-stream.
+    pub async fn next_event(&mut self) -> Result<Option<EventEnvelope>> {
+        while let Some(line) = self.lines.next_line().await.context("read SSE line")? {
+            let Some(rest) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = rest.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<EventEnvelope>(payload) {
+                Ok(ev) => return Ok(Some(ev)),
                 Err(_) => continue,
             }
         }
