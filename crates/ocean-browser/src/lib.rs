@@ -3,10 +3,12 @@
 pub mod error;
 pub mod launch;
 pub mod perception;
+pub mod shell;
 
 pub use error::BrowserError;
 pub use launch::{launch, LaunchConfig, LaunchedChrome};
 pub use perception::{ElementRef, PageRead};
+pub use shell::{BrowserContext, TabId, TabInfo};
 
 /// Re-exported result alias used across the crate.
 pub type Result<T> = std::result::Result<T, BrowserError>;
@@ -32,6 +34,14 @@ impl BrowserHandle {
             inner: Arc::new(Mutex::new(chrome)),
             page: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Quick health check: can we reach the browser over CDP?
+    /// Returns false if the websocket/process is gone, allowing callers to
+    /// drop this handle and re-launch fresh.
+    pub async fn is_alive(&self) -> bool {
+        let chrome = self.inner.lock().await;
+        chrome.browser.pages().await.is_ok()
     }
 
     /// Get (or create) the active page.
@@ -214,6 +224,64 @@ impl BrowserHandle {
         )
         .await
     }
+
+    // --- shell-layer support (see shell.rs) -------------------------------
+    // The shell module needs to coordinate with the cached active page and the
+    // underlying chromiumoxide Browser. These are crate-internal seams so tab
+    // control and page-level tools share one notion of "the active tab".
+
+    /// Snapshot every open page. `chromiumoxide::Browser` isn't `Clone`, so the
+    /// shell can't hold a handle to it — instead we briefly lock `inner`, pull
+    /// the live `Vec<Page>` (pages *are* cloneable), and release. All shell tab
+    /// operations work off that snapshot.
+    pub(crate) async fn snapshot_pages(&self) -> Result<Vec<Page>> {
+        let chrome = self.inner.lock().await;
+        chrome
+            .browser
+            .pages()
+            .await
+            .map_err(|e| BrowserError::Cdp(e.to_string()))
+    }
+
+    /// Open a new page at `url` (locks `inner` briefly). Returns the page.
+    pub(crate) async fn new_page(&self, url: &str) -> Result<Page> {
+        let chrome = self.inner.lock().await;
+        chrome
+            .browser
+            .new_page(url)
+            .await
+            .map_err(|e| BrowserError::Cdp(e.to_string()))
+    }
+
+    /// The CDP target id of the currently cached active page, if any is live.
+    pub(crate) async fn active_target_id(&self) -> Option<shell::TabId> {
+        let guard = self.page.lock().await;
+        let p = guard.as_ref()?;
+        // Only report it if the tab is still alive.
+        if p.url().await.is_ok() {
+            Some(shell::TabId(p.target_id().inner().clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Make `page` the active page that subsequent page-level tools act on.
+    pub(crate) async fn set_active_page(&self, page: Page) {
+        *self.page.lock().await = Some(page);
+    }
+
+    /// Drop the active-page cache if it points at `id` (e.g. that tab was
+    /// closed), so the next page-level call re-resolves a live tab.
+    pub(crate) async fn clear_active_if(&self, id: &shell::TabId) {
+        let mut guard = self.page.lock().await;
+        let is_match = match guard.as_ref() {
+            Some(p) => p.target_id().as_ref() == id.0.as_str(),
+            None => false,
+        };
+        if is_match {
+            *guard = None;
+        }
+    }
 }
 
 /// Dispatch a single key as a keyDown/keyUp pair via raw CDP. Mirrors
@@ -226,8 +294,8 @@ async fn dispatch_key(page: &Page, key: &str) -> Result<()> {
     };
     use chromiumoxide::keys::get_key_definition;
 
-    let def = get_key_definition(key)
-        .ok_or_else(|| BrowserError::Cdp(format!("unknown key: {key}")))?;
+    let def =
+        get_key_definition(key).ok_or_else(|| BrowserError::Cdp(format!("unknown key: {key}")))?;
 
     let mut cmd = DispatchKeyEventParams::builder();
     let down_type = if let Some(txt) = def.text {

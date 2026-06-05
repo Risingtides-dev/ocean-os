@@ -27,7 +27,14 @@ impl AgentTool for BrowserEvalJsTool {
             .get("source")
             .and_then(|v| v.as_str())
             .ok_or("missing 'source'")?;
-        let out = self.ctx.lazy.get().await?.eval_js(src).await.map_err(|e| e.to_string())?;
+        let out = self
+            .ctx
+            .lazy
+            .get()
+            .await?
+            .eval_js(src)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(active_result(out))
     }
 }
@@ -48,7 +55,12 @@ impl AgentTool for BrowserConsoleTool {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let out = self.ctx.lazy.get().await?.read_console()
+        let out = self
+            .ctx
+            .lazy
+            .get()
+            .await?
+            .read_console()
             .await
             .map_err(|e| e.to_string())?;
         Ok(active_result(out))
@@ -71,7 +83,12 @@ impl AgentTool for BrowserNetworkTool {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let out = self.ctx.lazy.get().await?.read_network()
+        let out = self
+            .ctx
+            .lazy
+            .get()
+            .await?
+            .read_network()
             .await
             .map_err(|e| e.to_string())?;
         Ok(active_result(out))
