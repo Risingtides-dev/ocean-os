@@ -108,8 +108,22 @@ impl CapabilityProvider for BuiltinProvider {
         "builtin"
     }
 
-    async fn tools(&self, _ctx: &SessionContext) -> Vec<SharedTool> {
-        self.tools.clone()
+    async fn tools(&self, ctx: &SessionContext) -> Vec<SharedTool> {
+        let mut tools = self.tools.clone();
+        // OCEAN-60: `component_wait` must key its registry entry on the session
+        // the daemon resolves component events against. Rebind it to this turn's
+        // session id from SessionContext so it never trusts a model-supplied id.
+        // (`default_tools()` provides an unbound instance for ad-hoc/test paths.)
+        if let Some(session_id) = &ctx.session_id {
+            for tool in tools.iter_mut() {
+                if tool.name() == "component_wait" {
+                    *tool = Arc::new(crate::tools::component::ComponentWaitTool::for_session(
+                        Some(session_id.clone()),
+                    ));
+                }
+            }
+        }
+        tools
     }
 }
 
@@ -264,6 +278,44 @@ mod tests {
         for n in names(&default_tools()) {
             assert!(got.contains(&n), "missing built-in {n}");
         }
+    }
+
+    /// OCEAN-60: the built-in provider rebinds `component_wait` to the turn's
+    /// session id from SessionContext. The rebound tool runs without a
+    /// model-supplied `session_id` arg (it times out rather than erroring on a
+    /// missing arg). With no session in the ctx, the unbound default falls back
+    /// to requiring the arg.
+    #[tokio::test]
+    async fn builtin_provider_injects_session_into_component_wait() {
+        let provider = BuiltinProvider::new();
+
+        // With a session bound in ctx, component_wait needs no session arg.
+        let got = provider.tools(&ctx()).await;
+        let wait = got
+            .iter()
+            .find(|t| t.name() == "component_wait")
+            .expect("component_wait present");
+        let err = wait
+            .execute("c1", json!({ "id": "x", "timeout_ms": 1 }))
+            .await
+            .expect_err("a 1ms wait with no interaction times out");
+        assert!(err.contains("timed out"), "expected timeout, got: {err}");
+
+        // With no session in ctx, the unbound default still requires the arg.
+        let no_sess = SessionContext {
+            cwd: PathBuf::from("/tmp"),
+            session_id: None,
+        };
+        let got = provider.tools(&no_sess).await;
+        let wait = got
+            .iter()
+            .find(|t| t.name() == "component_wait")
+            .expect("component_wait present");
+        let err = wait
+            .execute("c2", json!({ "id": "x", "timeout_ms": 1 }))
+            .await
+            .expect_err("missing session arg with no binding errors");
+        assert!(err.contains("session_id"), "expected session_id error, got: {err}");
     }
 
     #[tokio::test]

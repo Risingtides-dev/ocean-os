@@ -2468,8 +2468,19 @@ async fn agent_turn(
     let bridge = tokio::spawn(async move {
         let mut tool_call_ids: HashMap<String, ToolCallId> = HashMap::new();
         while let Some(ev) = event_rx.recv().await {
+            // Every runtime AgentEvent now carries its own `session_id`
+            // (OCEAN-54), stamped by the agent loop from AgentConfig. The bridge
+            // still re-attaches `bridge_session_id` below, which is now
+            // redundant — the native id equals the bridge id for this turn — but
+            // kept so the SSE payload type (`SessionId` Uuid) is unchanged. The
+            // debug_assert documents the invariant without affecting release.
+            debug_assert!(
+                ev.session_id().is_none()
+                    || ev.session_id() == Some(bridge_session_id.to_string()).as_deref(),
+                "runtime event session_id must match the bridge session id"
+            );
             match ev {
-                AgentEvent::TextDelta { delta } => {
+                AgentEvent::TextDelta { delta, .. } => {
                     if delta.is_empty() {
                         continue;
                     }
@@ -2479,7 +2490,7 @@ async fn agent_turn(
                         delta,
                     });
                 }
-                AgentEvent::ThinkingDelta { delta } => {
+                AgentEvent::ThinkingDelta { delta, .. } => {
                     if delta.is_empty() {
                         continue;
                     }
@@ -2493,6 +2504,7 @@ async fn agent_turn(
                     tool_call_id,
                     tool_name,
                     args,
+                    ..
                 } => {
                     let call_id = ToolCallId(Uuid::new_v4());
                     tool_call_ids.insert(tool_call_id, call_id.clone());
@@ -2511,6 +2523,7 @@ async fn agent_turn(
                     tool_name: _,
                     is_error,
                     content,
+                    ..
                 } => {
                     let call_id = tool_call_ids
                         .remove(&tool_call_id)
@@ -2527,7 +2540,9 @@ async fn agent_turn(
                         },
                     });
                 }
-                AgentEvent::PermissionDenied { tool_name, reason } => {
+                AgentEvent::PermissionDenied {
+                    tool_name, reason, ..
+                } => {
                     let call_id = ToolCallId(Uuid::new_v4());
                     bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
                         session_id: bridge_session_id,
@@ -2545,6 +2560,7 @@ async fn agent_turn(
                     kind,
                     props,
                     replace,
+                    ..
                 } => {
                     bridge_bus.emit(AgentTurnEvent::ComponentRender {
                         session_id: bridge_session_id,
@@ -2554,13 +2570,13 @@ async fn agent_turn(
                         replace,
                     });
                 }
-                AgentEvent::Unmount { id } => {
+                AgentEvent::Unmount { id, .. } => {
                     bridge_bus.emit(AgentTurnEvent::ComponentUnmount {
                         session_id: bridge_session_id,
                         component_id: id,
                     });
                 }
-                AgentEvent::BrowserActivity { active } => {
+                AgentEvent::BrowserActivity { active, .. } => {
                     bridge_bus.emit(AgentTurnEvent::BrowserActivity {
                         session_id: bridge_session_id,
                         active,

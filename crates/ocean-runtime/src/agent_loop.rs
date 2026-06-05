@@ -42,10 +42,25 @@ pub async fn run_agent_with_history(
     mut messages: Vec<Message>,
     events: Option<mpsc::UnboundedSender<AgentEvent>>,
 ) -> Result<AgentRun> {
+    // Session this run belongs to (if any). Stamped onto every event we emit so
+    // the daemon/SDK can route by session natively instead of re-attaching it.
+    let sid = config.session_id.clone();
+
     if let Some(last) = messages.last().cloned() {
-        emit(&events, AgentEvent::UserMessage { message: last });
+        emit(
+            &events,
+            AgentEvent::UserMessage {
+                session_id: sid.clone(),
+                message: last,
+            },
+        );
     }
-    emit(&events, AgentEvent::AgentStart);
+    emit(
+        &events,
+        AgentEvent::AgentStart {
+            session_id: sid.clone(),
+        },
+    );
 
     let tool_index: HashMap<String, Arc<dyn AgentTool>> = config
         .tools
@@ -64,8 +79,22 @@ pub async fn run_agent_with_history(
     let mut total_usage = ocean_protocol::Usage::default();
 
     'outer: while turn < config.max_turns {
+        // Honor a cancellation request before starting another round. The daemon
+        // signals `StreamOptions::cancel` from POST /v1/requests/{id}/cancel; the
+        // provider stream also observes it mid-flight, but checking here stops the
+        // loop cleanly between rounds (e.g. cancel arriving during tool execution)
+        // and unwinds with `AgentError::Cancelled` rather than running one more turn.
+        if is_cancelled(config) {
+            return Err(AgentError::Cancelled);
+        }
+
         turn += 1;
-        emit(&events, AgentEvent::TurnStart);
+        emit(
+            &events,
+            AgentEvent::TurnStart {
+                session_id: sid.clone(),
+            },
+        );
 
         let ctx = Context {
             system_prompt: Some(config.system_prompt.clone()),
@@ -99,7 +128,22 @@ pub async fn run_agent_with_history(
         let stream_work = async {
             let mut stream = stream_simple(&config.model, &ctx, &options).await?;
             while let Some(ev) = stream.next().await {
-                let ev = ev?;
+                // A cancel can land mid-stream (client hit halt while the
+                // assistant was still typing). The provider also yields
+                // `Error::Cancelled` on its own, but checking here breaks out
+                // immediately and surfaces a clean `AgentError::Cancelled`
+                // rather than waiting on the next chunk.
+                if is_cancelled(config) {
+                    return Err(AgentError::Cancelled);
+                }
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    // The provider maps a cancel-token trip to `Error::Cancelled`;
+                    // normalize it to the agent-level `Cancelled` so callers see a
+                    // single cancellation type regardless of where it tripped.
+                    Err(ocean_protocol::Error::Cancelled) => return Err(AgentError::Cancelled),
+                    Err(e) => return Err(AgentError::from(e)),
+                };
                 match ev {
                     AssistantMessageEvent::Done { reason, message } => {
                         stop = reason;
@@ -120,10 +164,22 @@ pub async fn run_agent_with_history(
                         return Err(AgentError::Other(err_msg));
                     }
                     AssistantMessageEvent::TextDelta { delta, .. } => {
-                        emit(&events, AgentEvent::TextDelta { delta });
+                        emit(
+                            &events,
+                            AgentEvent::TextDelta {
+                                session_id: sid.clone(),
+                                delta,
+                            },
+                        );
                     }
                     AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                        emit(&events, AgentEvent::ThinkingDelta { delta });
+                        emit(
+                            &events,
+                            AgentEvent::ThinkingDelta {
+                                session_id: sid.clone(),
+                                delta,
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -154,6 +210,7 @@ pub async fn run_agent_with_history(
         emit(
             &events,
             AgentEvent::AssistantMessage {
+                session_id: sid.clone(),
                 message: assistant_message,
             },
         );
@@ -172,7 +229,12 @@ pub async fn run_agent_with_history(
             .collect();
 
         if tool_calls.is_empty() || stop != StopReason::ToolUse {
-            emit(&events, AgentEvent::TurnEnd);
+            emit(
+                &events,
+                AgentEvent::TurnEnd {
+                    session_id: sid.clone(),
+                },
+            );
             break 'outer;
         }
 
@@ -180,6 +242,12 @@ pub async fn run_agent_with_history(
         for (id, name, args) in tool_calls {
             // Permission gate (only for tools that require it, and only once
             // per name per run if the user said "allow session").
+            //
+            // ToolExecutionStart MUST be emitted *after* this gate (OCEAN-60):
+            // a denied tool takes the `Deny` arm's `continue` below and never
+            // reaches the Start emit, so it never produces a Start-without-End
+            // orphan on the event stream. Only tools that are actually about to
+            // run emit Start, and every Start is paired with a ToolExecutionEnd.
             let tool_obj = tool_index.get(&name);
             let needs_perm = tool_obj.map(|t| t.requires_permission()).unwrap_or(false)
                 && !session_allowed.contains(&name);
@@ -193,6 +261,7 @@ pub async fn run_agent_with_history(
                         emit(
                             &events,
                             AgentEvent::PermissionDenied {
+                                session_id: sid.clone(),
                                 tool_name: name.clone(),
                                 reason: reason.clone(),
                             },
@@ -214,6 +283,7 @@ pub async fn run_agent_with_history(
             emit(
                 &events,
                 AgentEvent::ToolExecutionStart {
+                    session_id: sid.clone(),
                     tool_call_id: id.clone(),
                     tool_name: name.clone(),
                     args: args.clone(),
@@ -247,6 +317,7 @@ pub async fn run_agent_with_history(
             emit(
                 &events,
                 AgentEvent::ToolExecutionEnd {
+                    session_id: sid.clone(),
                     tool_call_id: id.clone(),
                     tool_name: name.clone(),
                     is_error,
@@ -265,6 +336,7 @@ pub async fn run_agent_with_history(
                         emit(
                             &events,
                             AgentEvent::Render {
+                                session_id: sid.clone(),
                                 id: id.clone(),
                                 kind: kind.clone(),
                                 props: props.clone(),
@@ -273,10 +345,22 @@ pub async fn run_agent_with_history(
                         );
                     }
                     ToolSideEffect::Unmount { id } => {
-                        emit(&events, AgentEvent::Unmount { id: id.clone() });
+                        emit(
+                            &events,
+                            AgentEvent::Unmount {
+                                session_id: sid.clone(),
+                                id: id.clone(),
+                            },
+                        );
                     }
                     ToolSideEffect::BrowserActivity { active } => {
-                        emit(&events, AgentEvent::BrowserActivity { active: *active });
+                        emit(
+                            &events,
+                            AgentEvent::BrowserActivity {
+                                session_id: sid.clone(),
+                                active: *active,
+                            },
+                        );
                     }
                 }
             }
@@ -294,7 +378,12 @@ pub async fn run_agent_with_history(
             };
             messages.push(Message::ToolResult(tr));
         }
-        emit(&events, AgentEvent::TurnEnd);
+        emit(
+            &events,
+            AgentEvent::TurnEnd {
+                session_id: sid.clone(),
+            },
+        );
         if any_terminate {
             break;
         }
@@ -307,6 +396,7 @@ pub async fn run_agent_with_history(
     emit(
         &events,
         AgentEvent::AgentEnd {
+            session_id: sid.clone(),
             messages: messages.clone(),
         },
     );
@@ -512,10 +602,25 @@ fn emit(sink: &Option<mpsc::UnboundedSender<AgentEvent>>, ev: AgentEvent) {
     }
 }
 
+/// Whether this run has been asked to cancel. Reads the cancellation token the
+/// daemon wires into `StreamOptions::cancel` (set by POST
+/// /v1/requests/{id}/cancel). Returns `false` when no token is present — ad-hoc
+/// runs (tests, embedded use) are never cancelled this way.
+fn is_cancelled(config: &AgentConfig) -> bool {
+    config
+        .stream_options
+        .cancel
+        .as_ref()
+        .map(|c| c.is_cancelled())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocean_protocol::ToolResultMessage;
+    use crate::types::AgentConfig;
+    use ocean_protocol::{Model, ToolResultMessage};
+    use tokio_util::sync::CancellationToken;
 
     fn user(s: &str) -> Message {
         Message::user_text(s)
@@ -590,5 +695,82 @@ mod tests {
         let small = "ok".to_string();
         let capped = cap_tool_content(vec![Content::text(small.clone())]);
         assert_eq!(capped[0].as_text(), Some(small.as_str()));
+    }
+
+    /// A config carrying an already-cancelled token must abort the run with
+    /// `AgentError::Cancelled` *before* touching the provider (OCEAN-57). The
+    /// cancellation check sits at the top of the turn loop, ahead of any
+    /// `stream_simple` call, so no network/credentials are needed here.
+    #[tokio::test]
+    async fn cancelled_token_aborts_before_provider_call() {
+        let token = CancellationToken::new();
+        token.cancel(); // pre-cancelled: the very first round must bail out
+
+        let mut cfg = AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test")
+            .with_session_id("sess-cancel");
+        cfg.stream_options.cancel = Some(token);
+
+        let err = run_agent(&cfg, user("hello"), None)
+            .await
+            .err()
+            .expect("a pre-cancelled run must return Err, not Ok");
+        assert!(
+            matches!(err, AgentError::Cancelled),
+            "expected AgentError::Cancelled, got {err:?}"
+        );
+    }
+
+    /// Events the loop emits before the first provider round (UserMessage,
+    /// AgentStart) must carry the config's session id (OCEAN-54). We pair this
+    /// with a pre-cancelled token so the run returns deterministically without a
+    /// live provider, while still exercising the emit path.
+    #[tokio::test]
+    async fn emitted_events_carry_config_session_id() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let mut cfg = AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test")
+            .with_session_id("sess-42");
+        cfg.stream_options.cancel = Some(token);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = run_agent(&cfg, user("hi"), Some(tx)).await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(!events.is_empty(), "loop should emit at least UserMessage + AgentStart");
+        for ev in &events {
+            assert_eq!(
+                ev.session_id(),
+                Some("sess-42"),
+                "every emitted event must carry the config session id: {ev:?}"
+            );
+        }
+        // Sanity: the pre-start events are present.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessage { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AgentStart { .. })));
+    }
+
+    /// With no session bound, events carry `None` (ad-hoc/test runs).
+    #[tokio::test]
+    async fn emitted_events_have_no_session_id_when_unset() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let mut cfg = AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test");
+        cfg.stream_options.cancel = Some(token);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = run_agent(&cfg, user("hi"), Some(tx)).await;
+
+        while let Ok(ev) = rx.try_recv() {
+            assert_eq!(ev.session_id(), None, "unset session must stay None: {ev:?}");
+        }
     }
 }

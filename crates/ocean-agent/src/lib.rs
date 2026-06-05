@@ -594,7 +594,10 @@ impl AgentRuntime {
         .with_tools(tools)
         .with_max_turns(req.max_turns.unwrap_or(32))
         .with_turn_timeout_secs(turn_timeout_secs_from_env())
-        .with_permission(permission);
+        .with_permission(permission)
+        // Stamp the session onto every runtime AgentEvent so the daemon SSE
+        // bridge can route by session natively (OCEAN-54).
+        .with_session_id(session_id.to_string());
         // Per-turn reasoning override (OCEAN-41): when the turn carries an
         // explicit `thinking_level`, apply it to *this* turn's config only. The
         // runtime's global `thinking_level` is untouched, so the next turn falls
@@ -625,8 +628,8 @@ impl AgentRuntime {
                 let _ = sink.send(ev.clone());
             }
             match ev {
-                AgentEvent::TextDelta { delta } => stdout.push_str(&delta),
-                AgentEvent::ThinkingDelta { delta } => {
+                AgentEvent::TextDelta { delta, .. } => stdout.push_str(&delta),
+                AgentEvent::ThinkingDelta { delta, .. } => {
                     stderr.push_str("thinking: ");
                     stderr.push_str(&delta);
                     stderr.push('\n');
@@ -650,7 +653,9 @@ impl AgentRuntime {
                         if is_error { "error" } else { "ok" }
                     ));
                 }
-                AgentEvent::PermissionDenied { tool_name, reason } => {
+                AgentEvent::PermissionDenied {
+                    tool_name, reason, ..
+                } => {
                     stderr.push_str(&format!("✗ permission denied for {tool_name}: {reason}\n"));
                 }
                 _ => {}

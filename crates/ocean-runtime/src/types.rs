@@ -120,6 +120,11 @@ pub struct AgentConfig {
     pub tools: Vec<Arc<dyn AgentTool>>,
     pub system_prompt: String,
     pub permission: Arc<dyn PermissionPolicy>,
+    /// Session this run belongs to, when known. Every [`AgentEvent`] the loop
+    /// emits is stamped with this id so downstream consumers (daemon SSE bridge,
+    /// SDK) can route events without re-attaching session context themselves.
+    /// `None` for ad-hoc runs (tests, embedded use) that have no session.
+    pub session_id: Option<String>,
 }
 
 impl AgentConfig {
@@ -136,7 +141,15 @@ impl AgentConfig {
             tools: Vec::new(),
             system_prompt: system_prompt.into(),
             permission: Arc::new(AllowAllPolicy),
+            session_id: None,
         }
+    }
+
+    /// Attach the session id this run belongs to. Stamped onto every emitted
+    /// [`AgentEvent`].
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 
     /// Resolved per-turn deadline in seconds (configured value or the default).
@@ -172,34 +185,53 @@ impl AgentConfig {
 }
 
 /// Events emitted by the agent loop, mirroring `AgentEvent` in TS.
+///
+/// Every variant carries a `session_id: Option<String>` — the session the run
+/// belongs to, stamped by the loop from [`AgentConfig::session_id`] at every
+/// emit site. Downstream consumers (the daemon SSE bridge, the SDK) can route
+/// events by this id natively instead of re-attaching session context after the
+/// fact. It is `None` only for ad-hoc runs with no session (tests, embedded use).
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    AgentStart,
+    AgentStart {
+        session_id: Option<String>,
+    },
     AgentEnd {
+        session_id: Option<String>,
         messages: Vec<Message>,
     },
-    TurnStart,
-    TurnEnd,
+    TurnStart {
+        session_id: Option<String>,
+    },
+    TurnEnd {
+        session_id: Option<String>,
+    },
     AssistantMessage {
+        session_id: Option<String>,
         message: Message,
     },
     UserMessage {
+        session_id: Option<String>,
         message: Message,
     },
     /// Streaming text chunk while the assistant types.
     TextDelta {
+        session_id: Option<String>,
         delta: String,
     },
     /// Streaming thinking chunk.
     ThinkingDelta {
+        session_id: Option<String>,
         delta: String,
     },
     ToolExecutionStart {
+        session_id: Option<String>,
         tool_call_id: String,
         tool_name: String,
         args: Value,
     },
     ToolExecutionEnd {
+        session_id: Option<String>,
         tool_call_id: String,
         tool_name: String,
         is_error: bool,
@@ -207,12 +239,14 @@ pub enum AgentEvent {
     },
     /// Permission denied for a tool call (the loop appended an error tool result).
     PermissionDenied {
+        session_id: Option<String>,
         tool_name: String,
         reason: String,
     },
     /// The agent wants the client to mount or update an interactive component.
     /// Clients maintain a component registry per session.
     Render {
+        session_id: Option<String>,
         id: String,
         kind: String,
         props: Value,
@@ -220,13 +254,37 @@ pub enum AgentEvent {
     },
     /// The agent wants the client to remove a previously rendered component.
     Unmount {
+        session_id: Option<String>,
         id: String,
     },
     /// A browser tool started (`active: true`) or browser work wound down
     /// (`active: false`). Drives the extension side-panel auto-focus handoff.
     BrowserActivity {
+        session_id: Option<String>,
         active: bool,
     },
+}
+
+impl AgentEvent {
+    /// The session this event belongs to, if the run had one.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            AgentEvent::AgentStart { session_id }
+            | AgentEvent::AgentEnd { session_id, .. }
+            | AgentEvent::TurnStart { session_id }
+            | AgentEvent::TurnEnd { session_id }
+            | AgentEvent::AssistantMessage { session_id, .. }
+            | AgentEvent::UserMessage { session_id, .. }
+            | AgentEvent::TextDelta { session_id, .. }
+            | AgentEvent::ThinkingDelta { session_id, .. }
+            | AgentEvent::ToolExecutionStart { session_id, .. }
+            | AgentEvent::ToolExecutionEnd { session_id, .. }
+            | AgentEvent::PermissionDenied { session_id, .. }
+            | AgentEvent::Render { session_id, .. }
+            | AgentEvent::Unmount { session_id, .. }
+            | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_deref(),
+        }
+    }
 }
 
 #[cfg(test)]
