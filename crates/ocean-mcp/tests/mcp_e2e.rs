@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use ocean_mcp::{McpProvider, McpServerConfig, McpTransportKind};
+use ocean_protocol::Content;
 use ocean_runtime::capability::{
     CapabilityProvider, CapabilityRegistry, ProviderHealth, SessionContext,
 };
@@ -100,6 +101,76 @@ async fn bad_command_is_non_fatal_and_contributes_no_tools() {
         .expect("a broken server must not fail the whole connect");
     assert_eq!(provider.health().await, ProviderHealth::Unavailable);
     assert!(provider.tools(&SessionContext::default()).await.is_empty());
+}
+
+#[tokio::test]
+async fn image_result_reaches_caller_as_image_content() {
+    // OCEAN-48: an MCP `image` result block must arrive as Content::Image, not a
+    // dropped placeholder.
+    let provider = McpProvider::connect(&server_cfg(), |_| None, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let tools = provider.tools(&SessionContext::default()).await;
+    let shot = tools
+        .iter()
+        .find(|t| t.name() == "mcp__fake__shot")
+        .expect("shot tool present");
+
+    let out = shot.execute("call-shot", json!({})).await.unwrap();
+    // Text caption preserved...
+    assert!(out
+        .content
+        .iter()
+        .any(|c| c.as_text() == Some("here is a screenshot")));
+    // ...and the image is real, not a placeholder string.
+    let img = out
+        .content
+        .iter()
+        .find(|c| matches!(c, Content::Image { .. }))
+        .expect("image content present");
+    if let Content::Image { data, mime_type } = img {
+        assert_eq!(data, "aGVsbG8=");
+        assert_eq!(mime_type, "image/png");
+    }
+}
+
+#[tokio::test]
+async fn list_changed_refreshes_cached_tools() {
+    // OCEAN-32: after a tools/list_changed notification, the provider's cached
+    // tool snapshot must pick up the server's new tool via background re-fetch.
+    let provider = McpProvider::connect(&server_cfg(), |_| None, Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let before = provider.tools(&SessionContext::default()).await;
+    assert!(
+        !before.iter().any(|t| t.name() == "mcp__fake__grown"),
+        "grown tool should not exist before list_changed"
+    );
+
+    // Calling `grow` makes the server emit notifications/tools/list_changed; the
+    // client observes it in its request loop and signals the watcher, which
+    // re-fetches and swaps the cache.
+    let grow = before
+        .iter()
+        .find(|t| t.name() == "mcp__fake__grow")
+        .expect("grow tool present");
+    grow.execute("call-grow", json!({})).await.unwrap();
+
+    // The refresh happens on a background task; poll briefly for the swap.
+    let mut found = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = provider.tools(&SessionContext::default()).await;
+        if now.iter().any(|t| t.name() == "mcp__fake__grown") {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "cached tool list should include `grown` after list_changed refresh"
+    );
 }
 
 #[tokio::test]

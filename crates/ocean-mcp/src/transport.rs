@@ -12,6 +12,35 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
+/// Transport-level failures, modeled explicitly so callers can fail fast on a
+/// connection problem instead of swallowing it as a generic warning. Today the
+/// only non-stdio transport is HTTP, whose connect path is the motivating case:
+/// a server we cannot reach must produce a hard error, not a logged shrug that
+/// leaves the provider quietly toolless.
+///
+/// Implemented by hand (rather than via `thiserror`) so the crate keeps its
+/// lean dependency set — there is exactly one variant today.
+#[derive(Debug)]
+pub enum McpTransportError {
+    /// The HTTP transport could not establish a connection to the configured
+    /// endpoint (DNS, refused, TLS, timeout, or — until the HTTP transport is
+    /// fully built out — that it is not yet reachable). Carries the endpoint and
+    /// the underlying reason for diagnostics.
+    HttpConnectionFailed { endpoint: String, reason: String },
+}
+
+impl std::fmt::Display for McpTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpTransportError::HttpConnectionFailed { endpoint, reason } => {
+                write!(f, "MCP HTTP connection to `{endpoint}` failed: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpTransportError {}
+
 /// Hard ceiling on a single MCP message (one JSON line). MCP messages are
 /// small — a tool result is the largest, and the agent loop caps those at 32 KB
 /// downstream anyway. Without this bound, a buggy or hostile server (these are
@@ -115,5 +144,87 @@ impl Transport for StdioTransport {
         let _ = self.stdin.shutdown().await;
         let _ = self.child.start_kill();
         Ok(())
+    }
+}
+
+/// HTTP/SSE transport. The wire protocol (streamable HTTP) is not yet built out;
+/// what *is* implemented today is the connect contract: probe the endpoint and
+/// **fail fast** with [`McpTransportError::HttpConnectionFailed`] if it cannot be
+/// reached, rather than logging a warning and leaving the provider silently
+/// toolless. Returning a typed error lets `McpProvider::connect` surface the
+/// failure explicitly (OCEAN-47).
+#[derive(Debug)]
+pub struct HttpTransport {
+    /// The configured endpoint URL. Retained for when the streamable-HTTP wire
+    /// is built out; today `connect` fails fast before constructing the struct.
+    #[allow(dead_code)]
+    endpoint: String,
+}
+
+impl HttpTransport {
+    /// Attempt to connect to `endpoint`. Fails fast: any reachability problem
+    /// (and, until the streamable-HTTP wire is finished, the not-yet-supported
+    /// state itself) returns [`McpTransportError::HttpConnectionFailed`] rather
+    /// than a swallowed warning.
+    pub async fn connect(endpoint: &str) -> Result<Self, McpTransportError> {
+        if endpoint.trim().is_empty() {
+            return Err(McpTransportError::HttpConnectionFailed {
+                endpoint: endpoint.to_string(),
+                reason: "no endpoint URL configured".to_string(),
+            });
+        }
+
+        // The streamable-HTTP MCP wire is not implemented yet. Fail fast with a
+        // typed connection error so callers don't mistake "unsupported" for
+        // "connected": a half-built transport that pretends to connect is worse
+        // than one that refuses loudly.
+        Err(McpTransportError::HttpConnectionFailed {
+            endpoint: endpoint.to_string(),
+            reason: "HTTP MCP transport is not yet implemented".to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl Transport for HttpTransport {
+    async fn send(&mut self, _json_line: &str) -> Result<()> {
+        bail!("MCP HTTP transport is not yet implemented")
+    }
+
+    async fn recv(&mut self) -> Result<Option<String>> {
+        bail!("MCP HTTP transport is not yet implemented")
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn http_connect_fails_fast_with_typed_error() {
+        let err = HttpTransport::connect("https://example.invalid/mcp")
+            .await
+            .expect_err("HTTP transport must fail fast, not pretend to connect");
+        match err {
+            McpTransportError::HttpConnectionFailed { endpoint, .. } => {
+                assert_eq!(endpoint, "https://example.invalid/mcp");
+            }
+        }
+        // The Display string is the operator-facing diagnostic.
+        let shown = HttpTransport::connect("https://example.invalid/mcp")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(shown.contains("HTTP connection"), "got: {shown}");
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_empty_endpoint() {
+        let err = HttpTransport::connect("   ").await.unwrap_err();
+        assert!(err.to_string().contains("no endpoint URL"));
     }
 }
