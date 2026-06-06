@@ -248,8 +248,36 @@ impl EventBus {
         }
     }
 
+    // Used by the daemon unit tests; the live `/v1/events` handler now uses
+    // `subscribe_with_replay` (OCEAN-129).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.tx.subscribe()
+    }
+
+    /// OCEAN-129: atomically subscribe to the live broadcast and snapshot the
+    /// history buffer under the same lock so no event slips through the seam.
+    /// When `last_event_id` is present and still buffered, returns the buffered
+    /// envelopes strictly AFTER it (in emission order) to replay before the live
+    /// stream attaches; otherwise the replay vec is empty (id aged out / no
+    /// header) and the caller just attaches the live stream as before.
+    fn subscribe_with_replay(
+        &self,
+        last_event_id: Option<Uuid>,
+    ) -> (Vec<EventEnvelope>, broadcast::Receiver<EventEnvelope>) {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let rx = self.tx.subscribe();
+        let replay = match last_event_id {
+            Some(want) => match history.iter().position(|env| env.id == want) {
+                Some(pos) => history.iter().skip(pos + 1).cloned().collect(),
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        (replay, rx)
     }
 
     fn recent(&self, limit: usize) -> Vec<EventEnvelope> {
@@ -282,13 +310,30 @@ impl EventBus {
     }
 }
 
+/// How many recent agent events the bus retains for `Last-Event-ID` replay
+/// (OCEAN-129). Each envelope is a small enum value plus a UUID — well under a
+/// few KB even for the largest variants (tool chunks / thinking deltas) — so
+/// 2048 entries caps the buffer at a handful of MB while covering a generous
+/// reconnect window (a full streaming turn is typically a few hundred events).
+/// When the buffer overflows, the oldest entries are evicted; a client whose
+/// `Last-Event-ID` has already aged out simply gets the live stream with no
+/// replay (same as the pre-OCEAN-129 behavior), so memory stays bounded.
+const AGENT_EVENT_REPLAY_BUFFER: usize = 2048;
+
 /// Parallel broadcast bus that carries `AgentTurnEvent`s with full fidelity
 /// (turn_id, call_id, thinking deltas, tool chunks). The legacy `OceanEvent`
 /// bus still ships, but `/v1/agent/events` subscribes here so the TUI can
 /// render real-time streaming output without the lossy round-trip.
+///
+/// OCEAN-129: the bus also keeps a bounded in-memory ring buffer of recent
+/// envelopes keyed by id so a reconnecting SSE client carrying a
+/// `Last-Event-ID` header can be replayed the events it missed while away,
+/// before it attaches to the live broadcast.
 #[derive(Clone)]
 struct AgentEventBus {
     tx: broadcast::Sender<AgentEventEnvelope>,
+    history: Arc<Mutex<VecDeque<AgentEventEnvelope>>>,
+    history_limit: usize,
 }
 
 #[derive(Clone)]
@@ -300,30 +345,88 @@ struct AgentEventEnvelope {
 impl AgentEventBus {
     fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<AgentEventEnvelope> {
-        self.tx.subscribe()
+        Self {
+            tx,
+            history: Arc::new(Mutex::new(VecDeque::with_capacity(
+                AGENT_EVENT_REPLAY_BUFFER.min(256),
+            ))),
+            history_limit: AGENT_EVENT_REPLAY_BUFFER,
+        }
     }
 
     fn emit(&self, event: AgentTurnEvent) {
+        let envelope = AgentEventEnvelope {
+            id: Uuid::new_v4(),
+            event,
+        };
+
+        // Record into the bounded replay ring BEFORE broadcasting so that a
+        // client which subscribes (and snapshots the buffer) concurrently with
+        // this emit can never observe the live event without also finding it in
+        // the replay buffer — closing the gap/dupe seam (OCEAN-129).
+        {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            history.push_back(envelope.clone());
+            while history.len() > self.history_limit {
+                history.pop_front();
+            }
+        }
+
         // `broadcast::send` errors only when there are no live receivers (no SSE
         // client subscribed to `/v1/agent/events`). That's expected during idle
         // periods, so debug — not warn. Per-subscriber *lag* (a slow client that
         // overflows the ring buffer) surfaces on the RECEIVE side as
         // `Lagged(n)`, which the SSE handlers log at warn (OCEAN-87).
-        if self
-            .tx
-            .send(AgentEventEnvelope {
-                id: Uuid::new_v4(),
-                event,
-            })
-            .is_err()
-        {
+        if self.tx.send(envelope).is_err() {
             tracing::debug!("AgentEventBus: no active subscribers for event");
         }
     }
+
+    /// Atomically subscribe to the live broadcast and snapshot the replay
+    /// buffer under the same lock, so no event can slip between the two. If
+    /// `last_event_id` is present and still in the buffer, returns the buffered
+    /// envelopes strictly AFTER it (in emission order) for replay; otherwise the
+    /// replay vector is empty (the id aged out, or no header was sent), and the
+    /// caller just attaches the live stream — matching pre-OCEAN-129 behavior.
+    ///
+    /// Holding the `history` lock across `self.tx.subscribe()` is the seam
+    /// guarantee: `emit` takes the same lock before it sends, so every event is
+    /// either already in the snapshot (and will be replayed) or will arrive on
+    /// the freshly-created live receiver — never both, never neither. Replayed
+    /// ids are still deduped against the live tail by the handler as a belt-and-
+    /// suspenders measure.
+    fn subscribe_with_replay(
+        &self,
+        last_event_id: Option<Uuid>,
+    ) -> (Vec<AgentEventEnvelope>, broadcast::Receiver<AgentEventEnvelope>) {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let rx = self.tx.subscribe();
+        let replay = match last_event_id {
+            Some(want) => match history.iter().position(|env| env.id == want) {
+                // Found: replay everything strictly after it.
+                Some(pos) => history.iter().skip(pos + 1).cloned().collect(),
+                // Not found (aged out / unknown id): no replay.
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        (replay, rx)
+    }
+}
+
+/// Parse a `Last-Event-ID` SSE reconnect header (RFC: EventSource sets it to the
+/// last `id:` it saw) into a `Uuid`. Returns `None` when absent or unparseable.
+fn parse_last_event_id(headers: &HeaderMap) -> Option<Uuid> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| Uuid::parse_str(raw.trim()).ok())
 }
 
 /// OCEAN-51: whether the daemon runs the product agent-turn path
@@ -693,23 +796,47 @@ async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
     )
 }
 
+fn legacy_event_to_sse(envelope: &EventEnvelope) -> Event {
+    let event_type = event_type_name(&envelope.event);
+    let id = envelope.id.to_string();
+    let data = serde_json::to_string(envelope).unwrap_or_else(|err| {
+        json!({
+            "id": envelope.id,
+            "at": envelope.at,
+            "type": "error",
+            "message": format!("serialize event: {err}")
+        })
+        .to_string()
+    });
+    Event::default().id(id).event(event_type).data(data)
+}
+
 async fn events(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|event| match event {
+    // OCEAN-129: honor `Last-Event-ID` on reconnect — replay buffered events
+    // newer than the client's last-seen id, then attach the live broadcast.
+    let last_event_id = parse_last_event_id(&headers);
+    let (replay, live_rx) = state.events.subscribe_with_replay(last_event_id);
+
+    let mut replayed_ids: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::with_capacity(replay.len());
+    let replay_events: Vec<Result<Event, Infallible>> = replay
+        .into_iter()
+        .map(|envelope| {
+            replayed_ids.insert(envelope.id);
+            Ok(legacy_event_to_sse(&envelope))
+        })
+        .collect();
+
+    let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
         Ok(envelope) => {
-            let event_type = event_type_name(&envelope.event);
-            let id = envelope.id.to_string();
-            let data = serde_json::to_string(&envelope).unwrap_or_else(|err| {
-                json!({
-                    "id": envelope.id,
-                    "at": envelope.at,
-                    "type": "error",
-                    "message": format!("serialize event: {err}")
-                })
-                .to_string()
-            });
-            Some(Ok(Event::default().id(id).event(event_type).data(data)))
+            // Seam dedupe: drop anything already replayed.
+            if replayed_ids.remove(&envelope.id) {
+                return None;
+            }
+            Some(Ok(legacy_event_to_sse(&envelope)))
         }
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
             // A slow SSE consumer overflowed the 1024-slot ring and silently
@@ -726,6 +853,8 @@ async fn events(
         }
     });
 
+    // Replay first (in emission order), then the live broadcast.
+    let stream = tokio_stream::iter(replay_events).chain(live);
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -4014,44 +4143,82 @@ struct AgentEventsQuery {
 async fn agent_events(
     State(state): State<AppState>,
     Query(q): Query<AgentEventsQuery>,
+    headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let want = q.session_id;
     let all = q
         .all
         .as_deref()
         .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"));
-    let stream =
-        BroadcastStream::new(state.agent_events.subscribe()).filter_map(move |event| match event {
-            Ok(envelope) => {
-                // Scope to the requested session when one was given. If no
-                // session was requested, do not stream session-bearing events by
-                // default; this prevents any stale/global first-party client
-                // from adopting or rendering another surface's active session.
-                if !should_emit_agent_event(want, all, &envelope.event) {
-                    return None;
-                }
-                let id = envelope.id.to_string();
-                let event_type = agent_event_type_name(&envelope.event);
-                let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
-                    r#"{"type":"error","message":"serialize failed"}"#.to_string()
-                });
-                Some(Ok(Event::default().id(id).event(event_type).data(data)))
+
+    // OCEAN-129: honor `Last-Event-ID` on reconnect. Subscribe to the live
+    // broadcast and snapshot the replay buffer under one lock so nothing falls
+    // through the seam, then replay the buffered events newer than the client's
+    // last-seen id BEFORE the live stream. The same `?session_id=`/`?all=`
+    // scoping is applied to replayed events, so a reconnecting client never
+    // sees another session's events on replay.
+    let last_event_id = parse_last_event_id(&headers);
+    let (replay, live_rx) = state.agent_events.subscribe_with_replay(last_event_id);
+
+    // Track replayed ids so any event that lands on the live receiver between
+    // the snapshot and now (there should be none, given the shared lock, but be
+    // defensive) is not delivered twice across the replay/live seam.
+    let mut replayed_ids: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::with_capacity(replay.len());
+    let replay_events: Vec<Result<Event, Infallible>> = replay
+        .into_iter()
+        .filter_map(|envelope| {
+            if !should_emit_agent_event(want, all, &envelope.event) {
+                return None;
             }
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                // A slow `/v1/agent/events` consumer overflowed the ring and lost
-                // `skipped` agent-turn events (thinking deltas, tool chunks).
-                // Log at warn so the drop is visible in the daemon log, not just
-                // pushed to the client (OCEAN-87).
-                tracing::warn!(
-                    skipped,
-                    "agent_events SSE subscriber lagged; dropped events"
-                );
-                let data =
-                    json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
-                        .to_string();
-                Some(Ok(Event::default().event("error").data(data)))
+            replayed_ids.insert(envelope.id);
+            let id = envelope.id.to_string();
+            let event_type = agent_event_type_name(&envelope.event);
+            let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
+                r#"{"type":"error","message":"serialize failed"}"#.to_string()
+            });
+            Some(Ok(Event::default().id(id).event(event_type).data(data)))
+        })
+        .collect();
+
+    let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
+        Ok(envelope) => {
+            // Skip anything already delivered during replay (seam dedupe).
+            if replayed_ids.remove(&envelope.id) {
+                return None;
             }
-        });
+            // Scope to the requested session when one was given. If no
+            // session was requested, do not stream session-bearing events by
+            // default; this prevents any stale/global first-party client
+            // from adopting or rendering another surface's active session.
+            if !should_emit_agent_event(want, all, &envelope.event) {
+                return None;
+            }
+            let id = envelope.id.to_string();
+            let event_type = agent_event_type_name(&envelope.event);
+            let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
+                r#"{"type":"error","message":"serialize failed"}"#.to_string()
+            });
+            Some(Ok(Event::default().id(id).event(event_type).data(data)))
+        }
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            // A slow `/v1/agent/events` consumer overflowed the ring and lost
+            // `skipped` agent-turn events (thinking deltas, tool chunks).
+            // Log at warn so the drop is visible in the daemon log, not just
+            // pushed to the client (OCEAN-87).
+            tracing::warn!(
+                skipped,
+                "agent_events SSE subscriber lagged; dropped events"
+            );
+            let data =
+                json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
+                    .to_string();
+            Some(Ok(Event::default().event("error").data(data)))
+        }
+    });
+
+    // Replay first (in emission order), then the live broadcast.
+    let stream = tokio_stream::iter(replay_events).chain(live);
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -4532,6 +4699,135 @@ mod tests {
             args: json!({"path": "src/lib.rs"}),
             created_at: Utc::now(),
         }
+    }
+
+    // ---- OCEAN-129: Last-Event-ID replay ----
+
+    fn delta_event(session_id: AgentSessionId, text: &str) -> AgentTurnEvent {
+        AgentTurnEvent::AssistantTextDelta {
+            session_id,
+            turn_id: AgentTurnId::new_v4(),
+            delta: text.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_bus_replays_events_after_last_event_id() {
+        let bus = AgentEventBus::new(64);
+        let sid = AgentSessionId::new_v4();
+
+        // No last-event-id => no replay (matches pre-OCEAN-129 behavior).
+        let (none_replay, _rx) = bus.subscribe_with_replay(None);
+        assert!(none_replay.is_empty(), "no last-event-id => no replay");
+
+        bus.emit(delta_event(sid, "first"));
+        // capture id of "first" via the internal buffer
+        let first_id = {
+            let h = bus.history.lock().unwrap();
+            h.back().unwrap().id
+        };
+        bus.emit(delta_event(sid, "second"));
+        bus.emit(delta_event(sid, "third"));
+
+        let (replay, _rx) = bus.subscribe_with_replay(Some(first_id));
+        let texts: Vec<String> = replay
+            .iter()
+            .filter_map(|env| match &env.event {
+                AgentTurnEvent::AssistantTextDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["second", "third"], "replay events after last id");
+    }
+
+    #[tokio::test]
+    async fn agent_bus_unknown_last_event_id_replays_nothing() {
+        let bus = AgentEventBus::new(64);
+        let sid = AgentSessionId::new_v4();
+        bus.emit(delta_event(sid, "a"));
+        bus.emit(delta_event(sid, "b"));
+
+        // An id never seen (or aged out) => empty replay, fall back to live only.
+        let (replay, _rx) = bus.subscribe_with_replay(Some(Uuid::new_v4()));
+        assert!(replay.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_bus_replay_respects_session_scope() {
+        // Replayed events must still be filtered by the requested session, so a
+        // reconnecting client cannot be leaked another session's events.
+        let bus = AgentEventBus::new(64);
+        let mine = AgentSessionId::new_v4();
+        let other = AgentSessionId::new_v4();
+
+        bus.emit(delta_event(mine, "mine-1"));
+        let anchor = {
+            let h = bus.history.lock().unwrap();
+            h.back().unwrap().id
+        };
+        bus.emit(delta_event(other, "other-secret"));
+        bus.emit(delta_event(mine, "mine-2"));
+
+        let (replay, _rx) = bus.subscribe_with_replay(Some(anchor));
+        // Apply the SAME scoping the handler applies on replay.
+        let visible: Vec<String> = replay
+            .iter()
+            .filter(|env| should_emit_agent_event(Some(mine), false, &env.event))
+            .filter_map(|env| match &env.event {
+                AgentTurnEvent::AssistantTextDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            visible,
+            vec!["mine-2"],
+            "only my session's later events replay; other session's are filtered out"
+        );
+        assert!(
+            !replay
+                .iter()
+                .any(|env| should_emit_agent_event(Some(mine), false, &env.event)
+                    && matches!(&env.event, AgentTurnEvent::AssistantTextDelta { delta, .. } if delta == "other-secret")),
+            "other session's event must never pass the scope filter on replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_bus_replay_buffer_is_bounded() {
+        // Buffer caps at AGENT_EVENT_REPLAY_BUFFER; oldest entries evict so
+        // memory stays bounded and aged-out ids replay nothing.
+        let bus = AgentEventBus::new(8);
+        let sid = AgentSessionId::new_v4();
+        let mut first_id = None;
+        for i in 0..(AGENT_EVENT_REPLAY_BUFFER + 50) {
+            bus.emit(delta_event(sid, &format!("e{i}")));
+            if i == 0 {
+                first_id = Some(bus.history.lock().unwrap().back().unwrap().id);
+            }
+        }
+        let len = bus.history.lock().unwrap().len();
+        assert!(len <= AGENT_EVENT_REPLAY_BUFFER, "buffer must stay bounded");
+        // The very first id has aged out => no replay (graceful fallback).
+        let (replay, _rx) = bus.subscribe_with_replay(first_id);
+        assert!(replay.is_empty(), "aged-out id replays nothing");
+    }
+
+    #[tokio::test]
+    async fn parse_last_event_id_reads_header() {
+        let id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "last-event-id",
+            HeaderValue::from_str(&id.to_string()).unwrap(),
+        );
+        assert_eq!(parse_last_event_id(&headers), Some(id));
+
+        let empty = HeaderMap::new();
+        assert_eq!(parse_last_event_id(&empty), None);
+
+        let mut bad = HeaderMap::new();
+        bad.insert("last-event-id", HeaderValue::from_static("not-a-uuid"));
+        assert_eq!(parse_last_event_id(&bad), None);
     }
 
     #[tokio::test]
