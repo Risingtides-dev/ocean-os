@@ -170,9 +170,14 @@ The binary command name is `ocean-rs` and supports:
 
 ```text
 ocean-rs health
-ocean-rs prompt [--yolo] [--max-turns N] <prompt...>
+ocean-rs prompt [--max-turns N] <prompt...>
 ocean-rs sessions
 ```
+
+> The `--yolo` flag still parses for backward compatibility but is **inert**
+> (OCEAN-160 / OCEAN-162): passing it prints a warning and does not change
+> behavior. Mutating-tool auto-approval is controlled only by setting
+> `OCEAN_YOLO=1` on the **daemon** process.
 
 When running from Cargo, include the Cargo separator before CLI args:
 
@@ -414,7 +419,7 @@ curl -sS -X POST http://127.0.0.1:4780/v1/permissions/<permission-id>/decision \
   -d '{"permission_id":"<permission-id>","decision":"deny","reason":"operator denied"}'
 ```
 
-Use `{"permission_id":"<permission-id>","decision":"allow"}` only when the operator explicitly approves the requested action. Mutating tools without approval should remain denied unless `--yolo` was intentionally used.
+Use `{"permission_id":"<permission-id>","decision":"allow"}` only when the operator explicitly approves the requested action. Mutating tools without approval should remain denied unless the daemon was intentionally started with `OCEAN_YOLO=1` (the per-call `--yolo` flag is inert; see OCEAN-160 / OCEAN-162).
 
 ## Logs and events
 

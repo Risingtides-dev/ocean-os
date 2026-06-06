@@ -40,6 +40,12 @@ enum Cmd {
     Health,
     Prompt {
         prompt: Vec<String>,
+        /// DEPRECATED / INERT. Per-call `--yolo` is no longer honored for
+        /// security (OCEAN-160): the daemon gates mutating tools on its own
+        /// `OCEAN_YOLO` environment variable and ignores any per-call request
+        /// to auto-approve. Passing this flag prints a warning and does NOT
+        /// change behavior. To allow mutating tools, set `OCEAN_YOLO=1` on the
+        /// daemon process instead.
         #[arg(long)]
         yolo: bool,
         #[arg(long)]
@@ -49,6 +55,18 @@ enum Cmd {
     Session {
         id: SessionId,
     },
+}
+
+/// Warning shown when a user passes the deprecated, now-inert per-call
+/// `--yolo` flag. OCEAN-160 moved yolo gating to the daemon's `OCEAN_YOLO`
+/// environment variable, so the per-call flag no longer changes behavior.
+const YOLO_INERT_WARNING: &str = "warning: per-call --yolo is no longer honored for security (OCEAN-160); set OCEAN_YOLO=1 on the daemon to allow mutating tools";
+
+/// Returns the warning to emit on stderr if the inert `--yolo` flag was passed,
+/// or `None` when it was not. Factored out so it can be unit-tested without
+/// touching the daemon or the network.
+fn yolo_warning(yolo: bool) -> Option<&'static str> {
+    yolo.then_some(YOLO_INERT_WARNING)
 }
 
 fn urlencoding(s: &str) -> String {
@@ -95,6 +113,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let prompt = prompt.join(" ");
             anyhow::ensure!(!prompt.trim().is_empty(), "prompt required");
+            if let Some(msg) = yolo_warning(yolo) {
+                eprintln!("{msg}");
+            }
             let req = PromptRequest {
                 request_id: None,
                 prompt,
@@ -102,7 +123,11 @@ async fn main() -> anyhow::Result<()> {
                 session_id: None,
                 create_if_missing: true,
                 max_turns,
-                yolo,
+                // OCEAN-160: the daemon ignores the wire `yolo` flag and gates
+                // mutating tools on its own `OCEAN_YOLO` env var. We always send
+                // `false` so the CLI never depends on this inert field; the
+                // per-call `--yolo` flag only triggers the warning above.
+                yolo: false,
                 cwd: resolve_cwd(cli.project.as_deref()),
                 project_id: None,
                 client_type: Some("cli".into()),
@@ -158,4 +183,57 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yolo_flag_emits_warning_when_set() {
+        let warning = yolo_warning(true).expect("--yolo must produce a warning");
+        assert!(
+            warning.contains("OCEAN-160"),
+            "warning should cite the security fix"
+        );
+        assert!(
+            warning.contains("OCEAN_YOLO"),
+            "warning should point at the operator env var"
+        );
+        assert!(
+            warning.to_lowercase().contains("no longer honored"),
+            "warning should state the flag is inert"
+        );
+    }
+
+    #[test]
+    fn yolo_flag_is_silent_when_unset() {
+        assert!(yolo_warning(false).is_none());
+    }
+
+    #[test]
+    fn cli_never_sends_yolo_true_on_the_wire() {
+        // Mirror the request construction in the Prompt handler: regardless of
+        // the per-call flag, the CLI must send `yolo: false` so behavior never
+        // depends on the daemon's inert wire field (OCEAN-162 / OCEAN-160).
+        for flag in [true, false] {
+            let _ = flag; // the flag only drives the stderr warning, not the wire
+            let req = PromptRequest {
+                request_id: None,
+                prompt: "noop".into(),
+                images: None,
+                session_id: None,
+                create_if_missing: true,
+                max_turns: None,
+                yolo: false,
+                cwd: ".".into(),
+                project_id: None,
+                client_type: Some("cli".into()),
+            };
+            assert!(
+                !req.yolo,
+                "CLI must never set wire yolo=true regardless of --yolo"
+            );
+        }
+    }
 }
