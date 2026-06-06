@@ -343,7 +343,20 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         body["temperature"] = json!(t);
     }
     if let Some(m) = options.max_tokens {
-        body["max_tokens"] = json!(m);
+        // OCEAN-141: real api.openai.com models (o-series, gpt-5-class) on the
+        // Chat Completions path REJECT `max_tokens` with HTTP 400 "Unsupported
+        // parameter: 'max_tokens'" — it is deprecated there in favor of
+        // `max_completion_tokens` and is outright incompatible with o-series.
+        // The retry layer treats 400 as fatal, so every turn dies on the token
+        // cap. Other openai-compatible backends (DeepSeek/Kimi/MiniMax) still
+        // accept the legacy `max_tokens`, so we gate by `model.provider` — the
+        // SAME per-backend dispatch `apply_reasoning` (OCEAN-134) uses — rather
+        // than blasting one param everywhere.
+        let cap_param = match model.provider.as_str() {
+            "openai" => "max_completion_tokens",
+            _ => "max_tokens",
+        };
+        body[cap_param] = json!(m);
     }
     if let Some(level) = options.reasoning {
         apply_reasoning(&mut body, model, level);
@@ -1028,6 +1041,60 @@ mod tests {
             "unknown backend must not receive reasoning_effort: {body}"
         );
         assert!(body.get("thinking").is_none(), "unknown backend must not receive thinking: {body}");
+    }
+
+    // OCEAN-141: token-cap param parity. Real api.openai.com models (o-series,
+    // gpt-5-class) on the Chat Completions path reject the deprecated `max_tokens`
+    // with HTTP 400 and require `max_completion_tokens`. `build_body` must emit
+    // `max_completion_tokens` (NOT `max_tokens`) for the OpenAI-family provider,
+    // gating on `model.provider` the same way `apply_reasoning` does.
+    #[test]
+    fn build_body_emits_max_completion_tokens_for_openai() {
+        let opts = StreamOptions {
+            max_tokens: Some(1024),
+            ..Default::default()
+        };
+        let body = build_body(&openai_model(), &Context::default(), &opts);
+        assert_eq!(
+            body["max_completion_tokens"], 1024,
+            "OpenAI must receive max_completion_tokens: {body}"
+        );
+        // The legacy param must NOT be present — o-series 400s on it.
+        assert!(
+            body.get("max_tokens").is_none(),
+            "OpenAI must not receive the deprecated max_tokens: {body}"
+        );
+    }
+
+    // Other openai-compatible backends (DeepSeek/Kimi/MiniMax) still accept the
+    // legacy `max_tokens`, so build_body must keep emitting it for them — flipping
+    // them to max_completion_tokens would risk breaking those gateways.
+    #[test]
+    fn build_body_keeps_max_tokens_for_openai_compat_backend() {
+        let opts = StreamOptions {
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        assert_eq!(
+            body["max_tokens"], 2048,
+            "openai-compatible backends must keep the legacy max_tokens: {body}"
+        );
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "openai-compatible backends must not receive max_completion_tokens: {body}"
+        );
+    }
+
+    // No token cap set → neither param is emitted.
+    #[test]
+    fn build_body_omits_token_cap_when_unset() {
+        let body = build_body(&openai_model(), &Context::default(), &StreamOptions::default());
+        assert!(body.get("max_tokens").is_none(), "max_tokens must be absent when unset: {body}");
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "max_completion_tokens must be absent when unset: {body}"
+        );
     }
 
     // OCEAN-101: a structured refusal must decode into `ChunkDelta.refusal` so it
