@@ -107,16 +107,80 @@ ocean-tui
   - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
 ```
 
-Planned crates (extensibility phase — not yet in the workspace):
+## Built, pending daemon integration
+
+These crates and types **exist and are tested** in the workspace, but the daemon
+does not yet construct or register them — so the *library exists* while the
+*feature does not yet work* live. This section is operator honesty: it names the
+gap so nobody assumes a capability is on just because the crate compiles.
 
 ```text
 ocean-store
-  SQLite session/event store. (Today session/event persistence lives inside
-  ocean-agent; ocean-store would extract it into a dedicated crate.)
+  SQLite-backed durable Room store (SqliteRoomStore). Mirrors the in-memory
+  RoomRegistry API method-for-method behind a `dyn RoomStore` trait, with its
+  own unit tests (including a reopen-survives-restart test).
+  STATUS: NOT wired. The daemon still constructs the in-memory
+  `ocean_agent::RoomRegistry` (crates/ocean-daemon/src/main.rs) and does not
+  even depend on `ocean-store`. The crate's own top-level docs say so: "the
+  daemon is not wired to use this store — that is a separate follow-up ticket."
+  OPERATOR IMPACT: persistent rooms, their rosters, and their transcripts live
+  in process memory and are LOST on every daemon restart. Durable rooms only
+  take effect once the daemon swaps its `Mutex<RoomRegistry>` for the SQLite
+  store (the method names/signatures already match, so it is a field-type swap).
 
 ocean-plugin
-  WASM/subprocess plugin runtime.
+  Subprocess plugin runtime + a `PluginProvider` that implements the runtime's
+  `CapabilityProvider` seam (the same seam `ocean-mcp` uses), exposing plugin
+  tools to the agent as `plugin__<plugin>__<tool>` (OCEAN-95).
+  STATUS: NOT wired. The daemon's capability registry is built by
+  `build_capability_registry` (in ocean-agent), which registers only
+  BuiltinProvider, BrowserProvider, and any configured McpProviders. No
+  `PluginProvider` is constructed, and neither the daemon nor ocean-agent
+  depends on `ocean-plugin`.
+  OPERATOR IMPACT: installed plugins contribute ZERO tools to a turn. The
+  plugin transport runs in isolation; nothing in the live agent path loads,
+  lists, or calls it yet.
+
+Content::Image (multimodal content — built, partial wiring)
+  The protocol type `Content::Image { data, mime_type }` exists and is PRODUCED
+  today — the browser `perceive` tool captures screenshots as image content,
+  and the Anthropic provider serializes it correctly, so screenshots reach
+  Claude models end-to-end.
+  STATUS: cross-provider wiring incomplete. The OpenAI provider's user-message
+  encoder filters content to text only (`filter_map(as_text)`) and Gemini has
+  no Image arm; the daemon's transcript flattener also ignores Image (text-only
+  view).
+  OPERATOR IMPACT: vision/browser turns are first-class on Anthropic models but
+  silently text-only on OpenAI/Gemini — a screenshot taken mid-turn never
+  reaches a non-Anthropic model. The type is defined; the cross-provider feature
+  is not complete.
+
+ocean-acp permission forwarding (wired-but-inert)
+  The per-turn ACP permission bridge (`spawn_permission_bridge`) is fully built:
+  it watches the daemon control stream, forwards each `PermissionRequest` to the
+  editor as `session/request_permission`, and POSTs the decision back to
+  `POST /v1/permissions/{id}/decision`.
+  STATUS: inert. The daemon submits ACP turns with `yolo: true`, so the gate
+  auto-allows and no `PermissionRequest` is ever raised — the bridge never has
+  anything to forward. It activates the instant ACP turns run non-yolo, a
+  daemon-side change (OCEAN-51 / #54).
+  OPERATOR IMPACT: in Zed today, Ocean tool calls run under the daemon's yolo
+  path with NO editor-side approval prompt, even though the approval plumbing
+  exists end-to-end.
 ```
+
+The same "library exists vs feature works" gap also covers two items tracked in
+their own docs:
+
+- **Room auto-convene** — the trigger policy is stored and evaluated
+  (`evaluate_trigger_policy`), and `room_post_message` emits a `room_trigger`
+  notice + audit line on a matching `@mention`, but it does NOT yet queue an
+  agent turn for the mentioned participant, so no agent actually wakes up. See
+  `docs/OCEAN_ROOMS_COLLABORATION_MODEL.md` § "Mentions and triggers".
+- **Longhouse governance (quorum steps 6+)** — the convergence engine (steps
+  1–5) is built and tested; the escrow trio (TitleRegistry + Revoker +
+  validator escrow) and the unforgeable `claim_outcome` gate are stubbed. See
+  `docs/LONGHOUSE.md` § "Built vs unbuilt".
 
 ## API model
 

@@ -130,11 +130,15 @@ You should get back an `initialize` result (`"protocolVersion":1`) and a
 
 ## Limitations / next steps
 
-- **Permissions**: v1 relies on the daemon's own permission policy (turns run
-  with the daemon's `yolo` path); tool approvals are **not** surfaced to the
-  editor yet. The daemon already exposes `GET /v1/permissions` +
-  `POST /v1/permissions/{id}/decision`, so forwarding `session/request_permission`
-  to Zed is the natural follow-up.
+- **Permissions — wired but inert.** The per-turn permission bridge IS built:
+  `spawn_permission_bridge` subscribes to the daemon control stream, forwards any
+  `PermissionRequest` scoped to the current turn to the editor as
+  `session/request_permission`, waits for Zed's allow/deny, and POSTs the result
+  to `POST /v1/permissions/{id}/decision`. It is **inert today** because the
+  daemon submits ACP turns with `yolo: true`, so the gate auto-allows and no
+  `PermissionRequest` is ever raised. The forwarding activates the moment ACP
+  turns run non-yolo (a daemon-side change); the bridge is correct and waiting
+  (OCEAN-51 / #54). See `docs/ARCHITECTURE.md` § "Built, pending daemon integration".
 - **Cancel**: `session/cancel` is acknowledged but not wired to a per-turn
   daemon cancel (`POST /v1/requests/{id}/cancel` exists for this).
 - **Components**: rendered as Markdown summaries. Rich/interactive rendering has
