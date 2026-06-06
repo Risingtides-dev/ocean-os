@@ -22,6 +22,7 @@ ocean-core.workspace = true
 ocean-longhouse.workspace = true
 ocean-protocol.workspace = true
 ocean-runtime.workspace = true
+ocean-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -31,3 +32,6 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
