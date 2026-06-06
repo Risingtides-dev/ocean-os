@@ -26,7 +26,15 @@ use crate::types::{
     StreamOptions, ThinkingLevel, Usage,
 };
 
+// Gemini's v1beta REST / SSE wire shape is camelCase (`functionCall`,
+// `finishReason`, `usageMetadata`, `modelVersion`, …). These decode structs MUST
+// declare `rename_all = "camelCase"` or every field silently fails to
+// deserialize and falls back to its `#[serde(default)]` — which is exactly the
+// OCEAN-145 P1: `function_call` (snake) never matched the wire `functionCall`,
+// so the captured `id` was always empty and parallel same-tool disambiguation
+// was inert. (The same latent bug affected usage/finishReason decoding.)
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct Chunk {
     #[serde(default)]
     candidates: Vec<Candidate>,
@@ -37,6 +45,7 @@ struct Chunk {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct Candidate {
     #[serde(default)]
     content: Option<CandidateContent>,
@@ -45,12 +54,14 @@ struct Candidate {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct CandidateContent {
     #[serde(default)]
     parts: Vec<Part>,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct Part {
     #[serde(default)]
     text: Option<String>,
@@ -59,6 +70,7 @@ struct Part {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct FunctionCall {
     // OCEAN-145 (2): Gemini 3 models return a unique `id` on every functionCall;
     // older models omit it. Capture the wire id when present so it round-trips
@@ -97,6 +109,7 @@ fn classify_finish_reason(reason: &str) -> (StopReason, bool) {
 }
 
 #[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
 struct UsageMetadata {
     #[serde(default)]
     prompt_token_count: u64,
@@ -923,6 +936,78 @@ mod tests {
             "ok",
             "successful result output must be untouched (no ERROR prefix)"
         );
+    }
+
+    // OCEAN-145 (2) WIRE CONTRACT: the decode path must parse Gemini's ACTUAL
+    // camelCase SSE shape — `functionCall` (not snake `function_call`) carrying a
+    // top-level `id` and `args`. This is the bug Codex caught: without
+    // rename_all="camelCase" the `functionCall` field silently fell back to its
+    // default (None) on the real wire, so the captured id was ALWAYS empty and
+    // the disambiguation we built was inert. This test feeds the real wire JSON
+    // (the exact string `serde_json::from_str::<Chunk>` sees in the stream loop),
+    // NOT a hand-built struct, so it actually exercises the wire contract.
+    #[test]
+    fn decode_real_camelcase_functioncall_captures_wire_id() {
+        // Shape taken from ai.google.dev streamGenerateContent SSE: camelCase
+        // `functionCall`, with the Gemini-3 unique `id` and `args`, plus a
+        // camelCase `finishReason` and `usageMetadata` so we prove those decode
+        // too (they were latently broken by the same snake_case mismatch).
+        let wire = r#"{
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "id": "function-call-abc123",
+                                    "name": "get_weather",
+                                    "args": {"location": "Boston, MA"}
+                                }
+                            }
+                        ],
+                        "role": "model"
+                    },
+                    "finishReason": "STOP"
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 18
+            },
+            "modelVersion": "gemini-3-pro"
+        }"#;
+
+        let chunk: Chunk =
+            serde_json::from_str(wire).expect("real Gemini camelCase chunk must deserialize");
+
+        // The functionCall part decoded from the REAL wire key (not defaulted away).
+        let part = &chunk.candidates[0]
+            .content
+            .as_ref()
+            .expect("content")
+            .parts[0];
+        let fc = part
+            .function_call
+            .as_ref()
+            .expect("functionCall part must decode from camelCase wire — not fall back to default");
+        // The wire id is captured (this is what round-trips into functionResponse.id).
+        assert_eq!(
+            fc.id.as_deref(),
+            Some("function-call-abc123"),
+            "Gemini's wire functionCall.id must be captured from the real SSE shape"
+        );
+        assert_eq!(fc.name, "get_weather");
+        assert_eq!(fc.args["location"], "Boston, MA");
+
+        // And the other camelCase fields decode too (regression guard for the
+        // same snake_case mismatch that silently broke usage + finishReason).
+        assert_eq!(chunk.candidates[0].finish_reason.as_deref(), Some("STOP"));
+        assert_eq!(chunk.model_version.as_deref(), Some("gemini-3-pro"));
+        let usage = chunk.usage_metadata.expect("usageMetadata must decode");
+        assert_eq!(usage.prompt_token_count, 11);
+        assert_eq!(usage.candidates_token_count, 7);
+        assert_eq!(usage.total_token_count, 18);
     }
 
     // OCEAN-145 (2): two PARALLEL calls to the SAME tool must be distinguishable.
