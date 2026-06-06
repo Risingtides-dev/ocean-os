@@ -3225,6 +3225,33 @@ is the user's real, signed-in browser session.\n\n\
         };
         use std::path::Path;
 
+        /// RAII guard that pins a process-global env var for the duration of a
+        /// test and restores the prior value on drop. Used to isolate
+        /// `build_system_prompt` from on-disk surface-profile overrides
+        /// (`OCEAN_ASSISTANTS_DIR`) so the compiled fallback is the path under
+        /// test, without leaking the override into other tests.
+        struct EnvVarGuard {
+            key: &'static str,
+            prior: Option<std::ffi::OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prior = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, prior }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match self.prior.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
         #[test]
         fn file_loaded_surface_profile_wins_over_const() {
             // R2: an on-disk assistants/<DIR>/system.md must override the seed
@@ -3299,6 +3326,24 @@ is the user's real, signed-in browser session.\n\n\
         /// surface-specific guidance, and must not bleed another surface's UX.
         #[test]
         fn slack_canvas_mobile_get_real_profiles_not_stub() {
+            // This test asserts against the COMPILED FALLBACK profiles
+            // (SLACK/CNVS/MOBL consts). But `build_system_prompt` resolves an
+            // on-disk `assistants/<DIR>/system.md` first via
+            // `load_surface_profile` → `assistants_root()`, which honors
+            // `OCEAN_ASSISTANTS_DIR` (else ~/.config/ocean-rs/assistants). In
+            // any dev/CI env that has a real SLACK/CNVS/MOBL profile on disk
+            // (or with OCEAN_ASSISTANTS_DIR pointed at temp profiles), that
+            // file would shadow the consts under test and these assertions
+            // would check external content instead — wrong/flaky. Pin
+            // OCEAN_ASSISTANTS_DIR to a guaranteed-nonexistent root so
+            // `load_surface_profile` finds nothing and the const fallback is
+            // the path actually exercised — the same nonexistent-root idiom as
+            // `missing_profile_root_falls_back_to_const`.
+            let _guard = EnvVarGuard::set(
+                "OCEAN_ASSISTANTS_DIR",
+                "/nonexistent/ocean/assistants/root",
+            );
+
             let slack = build_system_prompt(None, Some("surface-slack"));
             // Slack-native: thread-aware, concise, mrkdwn-not-Markdown, canvas-aware.
             assert!(slack.contains("Slack surface UX"));
