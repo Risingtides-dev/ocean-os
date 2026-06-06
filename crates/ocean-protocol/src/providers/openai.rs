@@ -222,6 +222,34 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
                     "tool_call_id": tr.tool_call_id,
                     "content": text,
                 }));
+                // OpenAI Chat Completions cannot carry image parts inside a
+                // `role:tool` message — only text. Browser / computer-use tools
+                // return screenshots as Content::Image tool results, and the
+                // text-only `role:tool` message above silently drops them, so on
+                // OpenAI the model never sees the screenshot (OCEAN-131).
+                //
+                // The standard workaround: keep the textual tool result as the
+                // `role:tool` message (above), then immediately follow it with a
+                // `role:user` message carrying the image(s) as image_url
+                // data-URL parts — the same encoding used for user-message
+                // images (OCEAN-99). This is what surfaces the screenshot to the
+                // model. Text-only tool results add no extra message.
+                let image_parts: Vec<Value> = tr
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Image { data, mime_type } => Some(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", mime_type, data)
+                            }
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !image_parts.is_empty() {
+                    out.push(json!({"role": "user", "content": image_parts}));
+                }
             }
         }
     }
@@ -665,6 +693,71 @@ mod tests {
         let messages = vec![Message::user_text("hello")];
         let out = convert_messages(None, &messages);
         assert_eq!(out[0]["content"], "hello");
+    }
+
+    // OCEAN-131: tool-result image parity. OpenAI's `role:tool` message can only
+    // carry text, so a screenshot returned as a Content::Image tool result was
+    // silently dropped and never reached the model. The encoder must keep the
+    // textual `role:tool` message AND follow it with a `role:user` message
+    // carrying the image as an image_url data-URL part so the model sees it.
+    #[test]
+    fn tool_result_image_is_followed_by_user_image_url() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "call_123".into(),
+            tool_name: "browser_screenshot".into(),
+            content: vec![
+                Content::text("here is the screenshot"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(None, &messages);
+        // Two messages: the tool message, then a following user image message.
+        assert_eq!(out.len(), 2, "expected tool message + user image message, got {out:?}");
+
+        // The tool message keeps the text, unchanged.
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[0]["tool_call_id"], "call_123");
+        assert_eq!(out[0]["content"], "here is the screenshot");
+
+        // The following user message carries the image as an image_url data-URL —
+        // the image is NOT dropped.
+        assert_eq!(out[1]["role"], "user");
+        let parts = out[1]["content"]
+            .as_array()
+            .expect("image message content must be an array");
+        let image = parts
+            .iter()
+            .find(|p| p["type"] == "image_url")
+            .expect("image_url part missing — tool-result image was dropped");
+        assert_eq!(
+            image["image_url"]["url"],
+            "data:image/png;base64,AAECAwQ=",
+            "image_url data-URL malformed"
+        );
+    }
+
+    // A text-only tool result stays a single text-only `role:tool` message —
+    // no spurious following user message.
+    #[test]
+    fn text_only_tool_result_stays_single_tool_message() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "call_456".into(),
+            tool_name: "read_file".into(),
+            content: vec![Content::text("file contents")],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(None, &messages);
+        assert_eq!(out.len(), 1, "text-only tool result must not add a user message");
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[0]["content"], "file contents");
     }
 
     // OCEAN-101: a mid-stream error frame must decode into `Chunk.error` so the
