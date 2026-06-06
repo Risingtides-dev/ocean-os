@@ -1925,6 +1925,29 @@ async fn room_post_message(
                 continue;
             }
 
+            // Resolve the target participant id → an AGENT participant in the
+            // roster BEFORE writing any convene footprint. Only genuine `Agent`
+            // participants are runnable; a mention of a human/bot/tool id (or an
+            // unknown id) resolves to `None`. The policy may say "convene", but
+            // if there's no agent to wake then no convene actually happens — so
+            // neither the `room_trigger` event nor the `auto-convene:` transcript
+            // line may fire (OCEAN-128: writing the audit line for a non-agent
+            // mention claimed a convene that never occurred).
+            let resolved_agent = decision
+                .target_participant
+                .as_deref()
+                .and_then(|id| resolve_agent_participant(&roster, id));
+
+            // `triggers_fired` reflects raw policy evaluation; record it even
+            // when the mention is a non-agent so the response is honest about
+            // what the policy matched. The convene FOOTPRINT (event + audit line
+            // + queued turn) below is gated on an actually-resolved agent.
+            fired.push(decision.clone());
+
+            let Some(agent) = resolved_agent else {
+                continue;
+            };
+
             // Emit a notice onto the agent event bus so any subscriber sees the
             // convene. Uses the generic Extension event so it never collides
             // with the Track-0/longhouse event scoping rules.
@@ -1942,7 +1965,8 @@ async fn room_post_message(
                 scope: None,
             });
 
-            // Audit line inside the room.
+            // Audit line inside the room — only written now that an Agent has
+            // actually been resolved and is about to be convened.
             let _ = with_rooms(&state, |reg| {
                 reg.append_message(
                     &key,
@@ -1958,19 +1982,7 @@ async fn room_post_message(
                 )
             });
 
-            // Resolve the target participant id → an AGENT participant in the
-            // roster. Only genuine `Agent` participants are runnable; a mention
-            // of a human/bot/tool id (or an unknown id) emits the notice but
-            // queues nothing — there is no agent to wake.
-            if let Some(agent) = decision
-                .target_participant
-                .as_deref()
-                .and_then(|id| resolve_agent_participant(&roster, id))
-            {
-                spawn_room_agent_turn(state.clone(), key.clone(), agent, msg.seq);
-            }
-
-            fired.push(decision);
+            spawn_room_agent_turn(state.clone(), key.clone(), agent, msg.seq);
         }
     }
 
@@ -5142,6 +5154,65 @@ mod tests {
         );
         assert!(decision.should_convene);
         assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
+    }
+
+    #[test]
+    fn convene_audit_line_gated_on_agent_resolution() {
+        // OCEAN-128: `evaluate_trigger_policy` returns should_convene=true for
+        // ANY on_mention match, regardless of participant kind. The convene
+        // FOOTPRINT (the `auto-convene:` transcript line, the room_trigger
+        // event, and the queued turn) must only be written when the mention
+        // resolves to a runnable Agent — never for a human/bot/tool mention.
+        //
+        // This pins the split the handler now relies on: a convene decision for
+        // a human resolves to None (no footprint), and the same decision for an
+        // agent resolves to Some (footprint written + turn spawned).
+        let roster = vec![
+            RoomParticipant {
+                id: "john".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "John".into(),
+            },
+            RoomParticipant {
+                id: "ocean".into(),
+                kind: RoomParticipantKind::Agent,
+                display_name: "Ocean".into(),
+            },
+        ];
+
+        // A human mention: policy says convene, but there's no agent to wake.
+        // The handler's `let Some(agent) = ... else { continue }` short-circuits
+        // BEFORE the audit-line / event writes — so no convene footprint.
+        let human_decision = evaluate_trigger_policy(
+            Some(&RoomTriggerPolicy { on_mention: true, ..Default::default() }),
+            &RoomTriggerEvent::Mention { participant_id: "john".into() },
+        );
+        assert!(human_decision.should_convene, "policy still matches on @john");
+        assert!(
+            human_decision
+                .target_participant
+                .as_deref()
+                .and_then(|id| resolve_agent_participant(&roster, id))
+                .is_none(),
+            "a human mention must not resolve to an agent (no convene footprint)"
+        );
+
+        // An agent mention: resolves to the Agent participant, so the footprint
+        // (audit line + event + turn) is written.
+        let agent_decision = evaluate_trigger_policy(
+            Some(&RoomTriggerPolicy { on_mention: true, ..Default::default() }),
+            &RoomTriggerEvent::Mention { participant_id: "ocean".into() },
+        );
+        assert!(agent_decision.should_convene);
+        let resolved = agent_decision
+            .target_participant
+            .as_deref()
+            .and_then(|id| resolve_agent_participant(&roster, id));
+        assert!(
+            resolved.is_some(),
+            "an agent mention must resolve to the agent (convene footprint written)"
+        );
+        assert_eq!(resolved.unwrap().id, "ocean");
     }
 
 
