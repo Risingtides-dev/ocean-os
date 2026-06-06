@@ -41,6 +41,12 @@ const APP_NAME: &str = "ocean-rs";
 /// than wedging daemon startup.
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Subdirectory under the config dir where plugin packs live, each as its own
+/// directory containing a `plugin.toml`. Overridable via `OCEAN_PLUGINS_DIR`
+/// (mirrors how MCP servers are config-driven and how the config dir itself is
+/// env-overridable).
+const PLUGINS_DIRNAME: &str = "plugins";
+
 /// Room-specific operator guidance injected by the daemon before runtime turns.
 pub fn room_guidance(room_id: RoomId) -> &'static str {
     match room_id {
@@ -851,7 +857,87 @@ async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
         }
     }
 
+    // Discover + register subprocess plugins, the same way MCP servers are
+    // discovered from config and folded in as providers. Each plugin's tools
+    // require permission (PluginProvider tools report requires_permission ==
+    // true), so they're gated by the daemon's PermissionPolicy exactly like
+    // bash/write/edit and MCP tools — plugins never bypass the gate.
+    for provider in discover_plugin_providers(config_dir).await {
+        providers.push(provider);
+    }
+
     CapabilityRegistry::new(providers)
+}
+
+/// Resolve the plugins directory: `OCEAN_PLUGINS_DIR` if set, else
+/// `<config_dir>/plugins`. Mirrors `config_dir_from_env`'s env-override posture.
+fn plugins_dir(config_dir: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("OCEAN_PLUGINS_DIR") {
+        return PathBuf::from(path);
+    }
+    config_dir.join(PLUGINS_DIRNAME)
+}
+
+/// Scan the plugins directory, parse each `plugin.toml`, launch its subprocess,
+/// and wrap it in a [`PluginProvider`] for the registry.
+///
+/// Fail-soft throughout, mirroring MCP discovery: a missing or empty plugins
+/// directory yields no providers and no error (unchanged behavior); a plugin
+/// that fails to parse, launch, or list its tools is logged at warn and skipped
+/// — it can never break registry construction or daemon startup. The plugin's
+/// own `list_tools` failure is already absorbed into an empty,
+/// `Unavailable`-health provider by `PluginProvider::connect`; we only skip when
+/// the manifest can't be read or the subprocess can't be spawned at all.
+async fn discover_plugin_providers(config_dir: &Path) -> Vec<Arc<dyn CapabilityProvider>> {
+    let dir = plugins_dir(config_dir);
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        // No plugins directory is the normal case: no plugins, no error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "could not read plugins dir; no plugins loaded");
+            return Vec::new();
+        }
+    };
+
+    let mut providers: Vec<Arc<dyn CapabilityProvider>> = Vec::new();
+    for entry in entries.flatten() {
+        let plugin_dir = entry.path();
+        if !plugin_dir.is_dir() {
+            continue;
+        }
+        let manifest_path = plugin_dir.join("plugin.toml");
+        if !manifest_path.exists() {
+            continue;
+        }
+
+        let manifest = match ocean_plugin::PluginManifest::from_path(&manifest_path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(path = %manifest_path.display(), error = %e, "skipping plugin: manifest parse failed");
+                continue;
+            }
+        };
+
+        let plugin = match ocean_plugin::SubprocessPlugin::launch(&manifest, &plugin_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(plugin = %manifest.name, error = %e, "skipping plugin: failed to launch");
+                continue;
+            }
+        };
+
+        // connect() never errors on plugin-side failure: a plugin that can't
+        // list tools becomes an empty, Unavailable provider rather than aborting
+        // discovery.
+        let provider =
+            ocean_plugin::PluginProvider::connect(Arc::new(plugin) as Arc<dyn ocean_plugin::Plugin>)
+                .await;
+        providers.push(Arc::new(provider));
+    }
+
+    providers
 }
 
 /// Locate the Chrome for Testing binary the browser tools should drive. Current
@@ -1590,6 +1676,121 @@ mod tests {
             .map(|i| Message::user_text(format!("m{i}")))
             .collect();
         assert_eq!(cap_session_history(msgs).len(), 10);
+    }
+
+    /// Write a tiny stdio "plugin" — a shell script that speaks the same
+    /// JSON-RPC wire as `ocean-plugin`'s echo_plugin: it answers `list_tools`
+    /// with one `echo` tool and `invoke_tool` by echoing the args back. Returns
+    /// the script path (made executable). Used so the discovery test exercises a
+    /// real subprocess plugin without depending on another crate's test binary.
+    fn write_echo_plugin_script(dir: &Path) -> PathBuf {
+        let script = dir.join("echo-plugin.sh");
+        let body = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":[[:space:]]*\([0-9]*\).*/\1/p')
+  case "$line" in
+    *list_tools*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo the args back","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *invoke_tool*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"echoed":true}}\n' "$id"
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        script
+    }
+
+    // OCEAN-110: a plugin discovered under <config_dir>/plugins must have its
+    // declared tool surface into the capability registry, namespaced
+    // plugin__<name>__<tool>, alongside the built-ins. Proves the daemon now
+    // actually loads plugins + contributes their tools.
+    #[tokio::test]
+    async fn discovers_plugin_and_its_tool_appears_in_registry() {
+        let config_dir = temp_config_dir("plugin-discovery");
+        let plugin_dir = config_dir.join(PLUGINS_DIRNAME).join("echo-pack");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+
+        let script = write_echo_plugin_script(&plugin_dir);
+        // Manifest points entry at the script (relative to the plugin dir).
+        let manifest = format!(
+            "name = \"echo-pack\"\nversion = \"0.1.0\"\nentry = \"{}\"\n\n[[tool]]\nname = \"echo\"\ndescription = \"Echo the args back\"\n",
+            script.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(plugin_dir.join("plugin.toml"), manifest).unwrap();
+
+        let providers = discover_plugin_providers(&config_dir).await;
+        assert_eq!(providers.len(), 1, "exactly one plugin discovered");
+
+        // Compose with built-ins and assert the namespaced tool is present and
+        // gated (plugin tools require permission).
+        let mut all: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
+        all.extend(providers);
+        let registry = CapabilityRegistry::new(all);
+        let tools = registry.tools_for_session(&SessionContext::default()).await;
+        let echo = tools
+            .iter()
+            .find(|t| t.name() == "plugin__echo-pack__echo")
+            .expect("plugin tool namespaced into registry");
+        assert!(
+            echo.requires_permission(),
+            "plugin tools must be permission-gated"
+        );
+        assert!(
+            tools.iter().any(|t| t.name() == "bash"),
+            "built-ins still present"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // Missing plugins dir → no plugins, no error, unchanged behavior.
+    #[tokio::test]
+    async fn missing_plugins_dir_yields_no_providers() {
+        let config_dir = temp_config_dir("plugin-missing-dir");
+        // config_dir intentionally not created.
+        let providers = discover_plugin_providers(&config_dir).await;
+        assert!(providers.is_empty(), "no plugins dir → no providers");
+    }
+
+    // A plugin whose manifest can't parse is skipped, never breaking discovery
+    // of the valid plugin beside it.
+    #[tokio::test]
+    async fn bad_manifest_is_skipped_not_fatal() {
+        let config_dir = temp_config_dir("plugin-bad-manifest");
+        let plugins = config_dir.join(PLUGINS_DIRNAME);
+
+        // A broken plugin: manifest is not valid TOML / missing required fields.
+        let broken = plugins.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("plugin.toml"), "this is not = valid [ toml").unwrap();
+
+        // A good plugin alongside it.
+        let good = plugins.join("echo-pack");
+        std::fs::create_dir_all(&good).unwrap();
+        let script = write_echo_plugin_script(&good);
+        let manifest = format!(
+            "name = \"echo-pack\"\nversion = \"0.1.0\"\nentry = \"{}\"\n\n[[tool]]\nname = \"echo\"\n",
+            script.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(good.join("plugin.toml"), manifest).unwrap();
+
+        let providers = discover_plugin_providers(&config_dir).await;
+        assert_eq!(providers.len(), 1, "broken plugin skipped, good one loaded");
+
+        let _ = std::fs::remove_dir_all(config_dir);
     }
 
     #[test]
