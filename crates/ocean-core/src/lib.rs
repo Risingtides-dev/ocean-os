@@ -1053,6 +1053,214 @@ mod tests {
         assert!(decision.reason.contains("0 9 * * *"));
     }
 
+    // --- OCEAN-85: trigger-policy edge cases rounding out OCEAN-65 ---
+    //
+    // The four flags (on_mention / on_thread_reply / on_component_event /
+    // on_schedule) each gate exactly one event variant. Below we exercise the
+    // gaps the original OCEAN-65 tests left: the thread-reply flag (never
+    // touched before), the component-event MATCH (only its miss was tested),
+    // cross-event isolation (a flag must not fire a different variant), a
+    // multi-flag policy (every variant routes to the right branch), the
+    // empty/default policy (no variant fires), and the mention boundary (the
+    // decision targets the EXACT @id, never a partial/substring of it).
+
+    #[test]
+    fn trigger_policy_fires_on_matching_thread_reply() {
+        let policy = RoomTriggerPolicy {
+            on_thread_reply: true,
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::ThreadReply {
+                participant_id: "ocean".into(),
+            },
+        );
+        assert!(decision.should_convene);
+        assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
+        assert!(decision.reason.contains("on_thread_reply"));
+    }
+
+    #[test]
+    fn trigger_policy_fires_on_matching_component_event() {
+        let policy = RoomTriggerPolicy {
+            on_component_event: true,
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::ComponentEvent {
+                component_id: "map-1".into(),
+            },
+        );
+        assert!(decision.should_convene);
+        // Component events wake the room, not a specific participant.
+        assert!(decision.target_participant.is_none());
+        assert!(decision.reason.contains("map-1"));
+    }
+
+    #[test]
+    fn trigger_policy_flag_does_not_fire_a_different_event_variant() {
+        // Each flag gates ONE variant. With only `on_mention` enabled, none of
+        // the other three variants may convene — even though their own flags
+        // would have matched them, those flags are off here.
+        let policy = RoomTriggerPolicy {
+            on_mention: true,
+            ..Default::default()
+        };
+        for event in [
+            RoomTriggerEvent::ThreadReply {
+                participant_id: "ocean".into(),
+            },
+            RoomTriggerEvent::ComponentEvent {
+                component_id: "map-1".into(),
+            },
+            RoomTriggerEvent::Schedule,
+        ] {
+            let decision = evaluate_trigger_policy(Some(&policy), &event);
+            assert!(
+                !decision.should_convene,
+                "on_mention must not fire {event:?}"
+            );
+            assert!(decision.target_participant.is_none());
+        }
+        // ...but its own variant still fires, proving the policy isn't inert.
+        let hit = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::Mention {
+                participant_id: "ocean".into(),
+            },
+        );
+        assert!(hit.should_convene);
+    }
+
+    #[test]
+    fn trigger_policy_schedule_flag_does_not_fire_a_mention() {
+        // The inverse of the above for the Option-typed flag: a schedule policy
+        // must not be tricked into convening on a mention.
+        let policy = RoomTriggerPolicy {
+            on_schedule: Some("0 9 * * *".into()),
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::Mention {
+                participant_id: "ocean".into(),
+            },
+        );
+        assert!(!decision.should_convene);
+        assert!(decision.target_participant.is_none());
+    }
+
+    #[test]
+    fn trigger_policy_multi_flag_routes_each_event_to_its_own_branch() {
+        // All flags on at once: every variant convenes, and each carries the
+        // target/reason of its OWN branch (no cross-talk between branches).
+        let policy = RoomTriggerPolicy {
+            on_mention: true,
+            on_thread_reply: true,
+            on_component_event: true,
+            on_schedule: Some("*/5 * * * *".into()),
+        };
+
+        let mention = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::Mention {
+                participant_id: "alice".into(),
+            },
+        );
+        assert!(mention.should_convene);
+        assert_eq!(mention.target_participant.as_deref(), Some("alice"));
+        assert!(mention.reason.contains("on_mention"));
+
+        let reply = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::ThreadReply {
+                participant_id: "bob".into(),
+            },
+        );
+        assert!(reply.should_convene);
+        assert_eq!(reply.target_participant.as_deref(), Some("bob"));
+        assert!(reply.reason.contains("on_thread_reply"));
+
+        let component = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::ComponentEvent {
+                component_id: "chart".into(),
+            },
+        );
+        assert!(component.should_convene);
+        assert!(component.target_participant.is_none());
+        assert!(component.reason.contains("on_component_event"));
+
+        let schedule = evaluate_trigger_policy(Some(&policy), &RoomTriggerEvent::Schedule);
+        assert!(schedule.should_convene);
+        assert!(schedule.target_participant.is_none());
+        assert!(schedule.reason.contains("*/5 * * * *"));
+    }
+
+    #[test]
+    fn trigger_policy_default_all_off_never_convenes_for_any_event() {
+        // An explicit empty policy (all flags default-off) is distinct from an
+        // absent policy but must behave the same: no event variant fires.
+        let policy = RoomTriggerPolicy::default();
+        assert!(!policy.on_mention);
+        assert!(!policy.on_thread_reply);
+        assert!(!policy.on_component_event);
+        assert!(policy.on_schedule.is_none());
+
+        for event in [
+            RoomTriggerEvent::Mention {
+                participant_id: "ocean".into(),
+            },
+            RoomTriggerEvent::ThreadReply {
+                participant_id: "ocean".into(),
+            },
+            RoomTriggerEvent::ComponentEvent {
+                component_id: "c".into(),
+            },
+            RoomTriggerEvent::Schedule,
+        ] {
+            let decision = evaluate_trigger_policy(Some(&policy), &event);
+            assert!(
+                !decision.should_convene,
+                "empty policy must not convene on {event:?}"
+            );
+            assert!(decision.target_participant.is_none());
+        }
+    }
+
+    #[test]
+    fn trigger_policy_mention_targets_exact_participant_not_a_partial() {
+        // Boundary: the decision must target the WHOLE supplied id, never a
+        // prefix/substring of it. `@ocean` and `@ocean-ops` are distinct
+        // participants; mentioning one must not resolve to the other.
+        let policy = RoomTriggerPolicy {
+            on_mention: true,
+            ..Default::default()
+        };
+
+        let exact = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::Mention {
+                participant_id: "ocean".into(),
+            },
+        );
+        assert_eq!(exact.target_participant.as_deref(), Some("ocean"));
+
+        let longer = evaluate_trigger_policy(
+            Some(&policy),
+            &RoomTriggerEvent::Mention {
+                participant_id: "ocean-ops".into(),
+            },
+        );
+        assert_eq!(longer.target_participant.as_deref(), Some("ocean-ops"));
+        // The two mentions resolve to different targets — no substring collapse.
+        assert_ne!(exact.target_participant, longer.target_participant);
+        // And the reason names the exact id, not a truncation of it.
+        assert!(longer.reason.contains("ocean-ops"));
+    }
+
     #[test]
     fn room_message_roundtrips_through_serde() {
         let msg = RoomMessage {

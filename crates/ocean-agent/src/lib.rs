@@ -1627,6 +1627,86 @@ mod tests {
         assert!(!matches!(capped.first(), Some(Message::ToolResult(_))));
     }
 
+    // OCEAN-85: the orphan-trim drops a *run* of leading tool-results, not just
+    // one. If a turn ended mid-tool-call and the trim boundary lands inside a
+    // back-to-back batch of tool-results whose originating ToolCall was dropped,
+    // every one of them is an orphan a provider would reject on replay — the
+    // `while` loop must peel them all.
+    #[test]
+    fn cap_session_history_drops_a_run_of_leading_orphan_tool_results() {
+        use ocean_protocol::ToolResultMessage;
+        let orphan = |id: &str| {
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: id.into(),
+                tool_name: "bash".into(),
+                content: vec![Content::text("orphan")],
+                is_error: false,
+                timestamp: 0,
+            })
+        };
+
+        let mut msgs: Vec<Message> = Vec::new();
+        for _ in 0..MAX_SESSION_MESSAGES + 6 {
+            msgs.push(Message::user_text("u"));
+        }
+        // Three consecutive tool-results straddling the boundary, then real
+        // content. After trimming to MAX, the kept head begins with the run.
+        let boundary = msgs.len() - MAX_SESSION_MESSAGES;
+        msgs[boundary] = orphan("c1");
+        msgs[boundary + 1] = orphan("c2");
+        msgs[boundary + 2] = orphan("c3");
+
+        let capped = cap_session_history(msgs);
+        // The whole run is peeled — the head is NOT a tool-result...
+        assert!(
+            !matches!(capped.first(), Some(Message::ToolResult(_))),
+            "leading orphan run not fully dropped"
+        );
+        // ...and no orphan tool-result remains as the very first message.
+        assert!(matches!(capped.first(), Some(Message::User { .. })));
+    }
+
+    // OCEAN-85: trimming must not over-drop. A clean conversation that lands
+    // exactly on the cap, or just over it with no orphan at the boundary, keeps
+    // a non-tool-result head and stays within the bound.
+    #[test]
+    fn cap_session_history_keeps_clean_head_when_boundary_is_not_an_orphan() {
+        use ocean_protocol::{AssistantMessage, StopReason, Usage};
+        let assistant = || {
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::text("ok")],
+                api: "fake".into(),
+                provider: "fake".into(),
+                model: "fake-ok".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            })
+        };
+        // Alternating user/assistant, a few over the cap. No tool-results at all,
+        // so the boundary message is a normal turn — nothing should be peeled
+        // beyond the plain drain.
+        let mut msgs: Vec<Message> = Vec::new();
+        for i in 0..MAX_SESSION_MESSAGES + 8 {
+            if i % 2 == 0 {
+                msgs.push(Message::user_text(format!("u{i}")));
+            } else {
+                msgs.push(assistant());
+            }
+        }
+        let capped = cap_session_history(msgs);
+        assert_eq!(
+            capped.len(),
+            MAX_SESSION_MESSAGES,
+            "clean history should trim to exactly the cap, no over-drop"
+        );
+        assert!(
+            !matches!(capped.first(), Some(Message::ToolResult(_))),
+            "clean head must not be a tool-result"
+        );
+    }
+
     fn provider_config(provider: ProviderId, model: &str, credential: bool) -> ProviderConfig {
         ProviderConfig {
             selection: ocean_providers::ModelSelection {
@@ -2076,6 +2156,114 @@ mod tests {
             user_texts.iter().any(|t| t.contains("bravo")),
             "lost 'bravo': {user_texts:?}"
         );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn many_concurrent_turns_serialize_with_exact_transcript_integrity() {
+        // Harder version of the two-turn test: fire N turns at the SAME session
+        // all at once and prove the per-session lock serializes load→save with
+        // (a) no lost update — every distinct prompt survives, (b) no
+        // duplication — each survives exactly once, (c) no corruption — the
+        // final transcript is a clean user→assistant alternation of the exact
+        // expected length. Without serialization, concurrent load/append/save
+        // races drop messages and/or desync the user/assistant pairing.
+        const N: usize = 12;
+        let config_dir = temp_config_dir("many-concurrent-turns");
+        let runtime = Arc::new(runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        ));
+
+        // Seed the session so all N concurrent turns target a known id.
+        let seed = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "seed".into(),
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+        assert!(seed.ok);
+        let sid = seed.session_id.unwrap();
+
+        // Each task carries a uniquely-numbered prompt so we can verify the
+        // exact set survives (no lost update, no duplicate).
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let rt = Arc::clone(&runtime);
+            handles.push(tokio::spawn(async move {
+                rt.prompt(
+                    PromptRequest {
+                        prompt: format!("concurrent-prompt-{i}"),
+                        request_id: None,
+                        session_id: Some(sid),
+                        create_if_missing: false,
+                        max_turns: None,
+                        yolo: false,
+                        cwd: ".".into(),
+                        project_id: None,
+                        client_type: None,
+                    },
+                    PromptControl::yolo(false),
+                )
+                .await
+            }));
+        }
+        for h in handles {
+            let res = h.await.unwrap();
+            assert!(res.ok, "a concurrent turn failed: {}", res.stderr);
+        }
+
+        let detail = runtime.session_detail(sid).unwrap();
+
+        // (a) + (b): every numbered prompt is present exactly once. The fake
+        // provider prefixes a surface flag, so match on the unique suffix.
+        let user_texts: Vec<&str> = detail
+            .transcript
+            .iter()
+            .filter(|t| t.role == "user")
+            .map(|t| t.text.as_str())
+            .collect();
+        // Match on the exact trailing token (the stored text is
+        // `[FLAG] concurrent-prompt-N`), so `…-1` doesn't substring-collide with
+        // `…-10`/`…-11`.
+        for i in 0..N {
+            let needle = format!("concurrent-prompt-{i}");
+            let hits = user_texts.iter().filter(|t| t.ends_with(&needle)).count();
+            assert_eq!(
+                hits, 1,
+                "prompt {i} should appear exactly once, found {hits} in {user_texts:?}"
+            );
+        }
+        // Plus the seed: N concurrent + 1 seed distinct user turns.
+        assert!(user_texts.iter().any(|t| t.contains("seed")));
+
+        // (c) no corruption: transcript is a strict user→assistant alternation
+        // of exactly 2*(N+1) entries — every saved user turn kept its paired
+        // assistant reply, none interleaved or clobbered.
+        assert_eq!(
+            detail.transcript.len(),
+            2 * (N + 1),
+            "expected {} entries, got {}",
+            2 * (N + 1),
+            detail.transcript.len()
+        );
+        for (idx, entry) in detail.transcript.iter().enumerate() {
+            let expected = if idx % 2 == 0 { "user" } else { "assistant" };
+            assert_eq!(
+                entry.role, expected,
+                "entry {idx} should be {expected}, transcript desynced"
+            );
+        }
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
