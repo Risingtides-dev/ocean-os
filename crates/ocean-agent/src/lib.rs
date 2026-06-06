@@ -8,7 +8,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
-    Project, ProjectId, PromptImage, PromptRequest, PromptResponse, RequestId, RoomId,
+    ImageMeta, Project, ProjectId, PromptImage, PromptRequest, PromptResponse, RequestId, RoomId,
     SessionDetail, SessionId, SessionRunState, SessionSummary, SessionToolContext,
     SessionTranscriptEntry, TokenUsage,
 };
@@ -1697,12 +1697,13 @@ mod session {
         }
     }
 
-    fn transcript_entry(message: &Message) -> SessionTranscriptEntry {
+    pub(super) fn transcript_entry(message: &Message) -> SessionTranscriptEntry {
         match message {
             Message::User { content, timestamp } => SessionTranscriptEntry {
                 role: "user".into(),
                 timestamp_ms: Some(*timestamp),
                 text: text_from_content(content),
+                images: images_from_content(content),
                 tool_call_id: None,
                 tool_name: None,
                 is_error: None,
@@ -1711,6 +1712,7 @@ mod session {
                 role: "assistant".into(),
                 timestamp_ms: Some(assistant.timestamp),
                 text: text_from_content(&assistant.content),
+                images: images_from_content(&assistant.content),
                 tool_call_id: None,
                 tool_name: None,
                 is_error: assistant.error_message.as_ref().map(|_| true),
@@ -1719,6 +1721,7 @@ mod session {
                 role: "tool".into(),
                 timestamp_ms: Some(tool.timestamp),
                 text: text_from_content(&tool.content),
+                images: images_from_content(&tool.content),
                 tool_call_id: Some(tool.tool_call_id.clone()),
                 tool_name: Some(tool.tool_name.clone()),
                 is_error: Some(tool.is_error),
@@ -1769,6 +1772,23 @@ mod session {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// Project `Content::Image` blocks to lightweight `ImageMeta` (mime_type
+    /// only — never the base64 `data`). `text_from_content` drops Image blocks,
+    /// so without this an image-bearing turn would render as empty text and a
+    /// replaying client would lose all evidence an image was attached
+    /// (OCEAN-177). The raw bytes remain in `SessionDetail::messages`.
+    fn images_from_content(content: &[Content]) -> Vec<ImageMeta> {
+        content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Image { mime_type, .. } => Some(ImageMeta {
+                    mime_type: mime_type.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     fn truncate_title(text: &str) -> String {
@@ -1836,6 +1856,70 @@ mod tests {
             }
             other => panic!("expected Content::Image, got {other:?}"),
         }
+    }
+
+    // OCEAN-177: a turn carrying a `Content::Image` block must surface in the
+    // display projection. `text_from_content` keeps only Text/Thinking, so the
+    // transcript entry's `text` is empty for an image-only block — but `images`
+    // must still record the attachment (mime_type only, no base64) so a
+    // replaying client sees evidence an image was attached.
+    #[test]
+    fn transcript_entry_reflects_image_turns() {
+        let content = vec![
+            Content::Text {
+                text: "look at this".into(),
+            },
+            Content::Image {
+                data: "AAAAbase64payload".into(),
+                mime_type: "image/png".into(),
+            },
+        ];
+        let message = Message::User {
+            content,
+            timestamp: 1_700_000_000,
+        };
+
+        let entry = session::transcript_entry(&message);
+
+        assert_eq!(entry.role, "user");
+        assert_eq!(entry.text, "look at this", "text keeps the prompt text");
+        assert_eq!(entry.images.len(), 1, "the image block is recorded");
+        assert_eq!(entry.images[0].mime_type, "image/png");
+        // The base64 payload must NEVER be inlined into the display projection.
+        let serialized = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !serialized.contains("AAAAbase64payload"),
+            "image bytes must not leak into the transcript entry"
+        );
+
+        // An image-ONLY block still yields a non-empty projection via `images`
+        // even though `text` is empty.
+        let image_only = Message::User {
+            content: vec![Content::Image {
+                data: "BBBB".into(),
+                mime_type: "image/jpeg".into(),
+            }],
+            timestamp: 1_700_000_001,
+        };
+        let entry = session::transcript_entry(&image_only);
+        assert!(entry.text.is_empty(), "no Text/Thinking → empty text");
+        assert_eq!(entry.images.len(), 1);
+        assert_eq!(entry.images[0].mime_type, "image/jpeg");
+    }
+
+    // A turn with no images produces an empty `images` vec, which serde elides
+    // from the wire (`skip_serializing_if = "Vec::is_empty"`) — additive and
+    // backwards-compatible for existing clients.
+    #[test]
+    fn transcript_entry_without_images_omits_images_field() {
+        let message = Message::user_text("just text");
+        let entry = session::transcript_entry(&message);
+        assert!(entry.images.is_empty());
+        let serialized = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !serialized.contains("images"),
+            "empty images vec must not serialize"
+        );
     }
 
     // No images → plain-text message, identical to the prior behaviour.
