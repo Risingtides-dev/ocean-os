@@ -24,35 +24,38 @@
 //! `ocean-runtime`'s [`AgentTool`] trait describes a tool as `name()`,
 //! `description()`, `parameters() -> Value` (its JSON-Schema input), and
 //! `execute(id, args) -> Result`. A [`PluginTool`] is deliberately expressible in
-//! exactly those terms — `name`, `description`, `input_schema` — so that when the
-//! daemon adopts this crate (see below) it can wrap each `PluginTool` in a thin
-//! `AgentTool` adapter whose `execute` forwards to [`Plugin::invoke_tool`]. This
-//! crate stops short of that adapter on purpose: it has **no dependency on
-//! `ocean-runtime`**, keeping the seam additive and the dependency graph flat.
+//! exactly those terms — `name`, `description`, `input_schema` — so the adapter
+//! that exposes a plugin tool as a runtime tool reshapes nothing.
 //!
-//! [`AgentTool`]: https://docs.rs/ocean-runtime
+//! [`AgentTool`]: ocean_runtime::types::AgentTool
 //!
-//! ## How the runtime would adopt this (deferred — not wired here)
+//! ## The runtime adapter (OCEAN-95 — shipped, behind the `runtime` feature)
 //!
-//! This crate is library-only. Nothing in the daemon or runtime is touched. When
-//! the runtime is ready to load plugins, the integration is small and additive:
+//! [`PluginProvider`] is the runtime integration OCEAN-91 deferred. It implements
+//! `ocean-runtime`'s `CapabilityProvider` seam, so a plugin's tools compose into
+//! the **same** `CapabilityRegistry` as the built-ins and the MCP tools — one
+//! unified tool surface, no special-casing in the agent loop. This mirrors how
+//! `ocean-mcp`'s `McpProvider` plugs an MCP server into that same seam.
+//!
+//! It is gated behind the on-by-default `runtime` feature: disabling default
+//! features gives you the plain plugin transport with **no `ocean-runtime`
+//! dependency**, keeping the dependency graph flat for transport-only consumers.
+//!
+//! How a host wires it up (additive — no daemon/runtime edit required):
 //!
 //! 1. **Discover** plugin packs (e.g. a `plugins/<name>/plugin.toml` directory),
 //!    parse each with [`PluginManifest::parse`].
-//! 2. **Launch** each as a [`SubprocessPlugin`] via [`SubprocessPlugin::launch`]
-//!    (or hold them lazily and launch on first use).
-//! 3. **Adapt** each [`PluginTool`] into an `ocean_runtime::AgentTool`: the
-//!    adapter's `name()`/`description()`/`parameters()` come straight from the
-//!    [`PluginTool`]; its `execute(id, args)` calls
-//!    [`Plugin::invoke_tool`]`(name, args)` and maps the returned `Value` into an
-//!    `AgentToolResult`. Permission gating stays in the daemon's existing
-//!    `PermissionPolicy` — **plugins never bypass the permission gate.**
-//! 4. **Register** the adapted tools alongside the built-in ones in
-//!    `AgentConfig.tools`.
+//! 2. **Launch** each as a [`SubprocessPlugin`] via [`SubprocessPlugin::launch`].
+//! 3. **Adapt** each plugin with [`PluginProvider::connect`], which wraps every
+//!    [`PluginTool`] as an `AgentTool` whose `execute` forwards to
+//!    [`Plugin::invoke_tool`]. Tools are namespaced `plugin__<name>__<tool>`.
+//! 4. **Register** the `PluginProvider`(s) in the runtime's `CapabilityRegistry`
+//!    alongside `BuiltinProvider` and any `McpProvider`s.
 //!
-//! That wiring lives in `ocean-agent`/`ocean-daemon` in a follow-up ticket; doing
-//! it here would mean editing daemon code this PR is explicitly forbidden from
-//! touching.
+//! Permission gating stays in the daemon's existing `PermissionPolicy` — plugin
+//! tools report `requires_permission() == true`, so **plugins never bypass the
+//! permission gate.** The final registration step lives in `ocean-agent` /
+//! `ocean-daemon`; this crate provides the provider it will register.
 //!
 //! ## WASM-ready seam (deferred follow-up)
 //!
@@ -69,8 +72,14 @@ mod manifest;
 mod plugin;
 mod subprocess;
 
+#[cfg(feature = "runtime")]
+mod provider;
+
 pub mod jsonrpc;
 pub mod transport;
+
+#[cfg(feature = "runtime")]
+pub use provider::PluginProvider;
 
 pub use manifest::{ManifestError, PluginManifest, ToolDecl};
 pub use plugin::{Plugin, PluginError, PluginTool};

@@ -3076,6 +3076,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "ocean-protocol",
+ "ocean-runtime",
  "serde",
  "serde_json",
  "tokio",
