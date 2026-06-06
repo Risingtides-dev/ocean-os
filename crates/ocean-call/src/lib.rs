@@ -31,6 +31,7 @@ pub mod stt;
 pub mod stt_xai;
 pub mod summarizer;
 pub mod task_detector;
+pub mod token;
 pub mod wake;
 pub mod webhook;
 
@@ -41,5 +42,6 @@ pub use sip_bridge::{normalize_e164, CallBridge, LiveKitSipBridge, PlacedCall, S
 pub use stt::{SegmentAssembler, SegmentUpdate, SttProvider, TranscriptSegment};
 pub use summarizer::{SummaryAction, SummaryPolicy, Summarizer};
 pub use task_detector::{detect as detect_task, DetectedTask};
+pub use token::{mint_join_token, LiveKitTokenConfig, LiveKitTokenRequest, LiveKitTokenResponse};
 pub use wake::{match_wake, WakeAction, WakeGate, WakeMatch};
 pub use webhook::{decide as decide_webhook, verify_and_decide, WebhookAction};
