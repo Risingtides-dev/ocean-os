@@ -126,7 +126,9 @@ If Ocean spawns sub-agents (Flux, Pixel, Brick, etc.), they should share memory:
 
 ## 7. Implementation Crate Layout
 
-Memory lives in a dedicated **`crates/ocean-memory`** workspace crate — not in `ocean-core` (too heavy), not in `ocean-daemon` (blocks CLI/TUI from reading memory without the daemon), not in `ocean-store` (focused on daemon session persistence, not user-facing recall).
+> **Status:** `ocean-memory` is **[Not yet built — roadmap]** — no `crates/ocean-memory` exists in the workspace yet; the layout below is the planned design. The sibling `ocean-store` crate referenced here, by contrast, **is built** (`crates/ocean-store`): a SQLite-backed (`rusqlite`, bundled) durable store for daemon session/room persistence (`SqliteRoomStore`).
+
+Memory will live in a dedicated **`crates/ocean-memory`** workspace crate — not in `ocean-core` (too heavy), not in `ocean-daemon` (blocks CLI/TUI from reading memory without the daemon), not in `ocean-store` (focused on daemon session/room persistence, not user-facing recall).
 
 ### Crate tree
 

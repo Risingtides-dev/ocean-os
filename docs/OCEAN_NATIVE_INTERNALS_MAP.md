@@ -23,13 +23,20 @@ All four crates live under `crates/` and are edited as a single Rust workspace. 
 - fallback extraction of the last assistant text for smoke behavior
 - permission policy wiring to `ocean-runtime`
 
+## Extracted seams (built)
+
+These were once planned future seams and now exist as workspace crates:
+
+| Crate | Path | State |
+|---|---|---|
+| `ocean-store` | `crates/ocean-store` | Built. SQLite-backed (`rusqlite`, bundled) durable storage. Ships `SqliteRoomStore` — a synchronous `RoomStore`-trait implementation that mirrors the in-memory `RoomRegistry` in `ocean-agent` (`crates/ocean-agent/src/rooms.rs`) method-for-method, so the two are interchangeable behind a `dyn RoomStore`. |
+| `ocean-plugin` | `crates/ocean-plugin` | Built. Subprocess-first plugin runtime for agent skill packs. Ships the `Plugin` trait, `PluginManifest` (`plugin.toml` parser), and `SubprocessPlugin` (JSON-RPC 2.0 over stdio, mirroring `ocean-mcp`'s transport without depending on it). Behind the on-by-default `runtime` feature it exposes `PluginProvider`, a `CapabilityProvider` adapter that composes plugin tools into the same `CapabilityRegistry` as built-ins and MCP tools. |
+
 ## Planned future seams
 
 | Future crate | Pulls out of | Why |
 |---|---|---|
-| `ocean-store` | `ocean-agent` session JSON load/save | SQLite-backed session/event store, off the filesystem |
-| `ocean-tools` | `ocean-runtime::tools` | Stand alone so plugin runtimes can target a stable tool ABI |
-| `ocean-plugin` | new | WASM/subprocess plugin host |
+| `ocean-tools` | `ocean-runtime::tools` | [Not yet built — roadmap] Stand alone so plugin runtimes can target a stable tool ABI |
 
 ## Smoke contract
 
