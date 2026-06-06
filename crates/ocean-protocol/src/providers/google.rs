@@ -140,6 +140,10 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     .filter_map(|c| c.as_text().map(|s| s.to_string()))
                     .collect::<Vec<_>>()
                     .join("");
+                // The structured/textual tool output stays in the
+                // functionResponse part. The Gemini functionResponse schema
+                // carries the tool's text/JSON result; it has no slot for image
+                // bytes.
                 out.push(json!({
                     "role": "user",
                     "parts": [{
@@ -149,6 +153,26 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                         }
                     }]
                 }));
+                // OCEAN-132: tool-result images (browser / computer-use
+                // screenshots come back as Content::Image) were silently dropped
+                // — only `.as_text()` was collected above, so the model never saw
+                // the screenshot ("I can't see any screenshot"). Gemini reads
+                // images from inlineData parts, so follow the functionResponse
+                // with a user-role content carrying each image as an inlineData
+                // part (mirroring how user-message images are encoded above).
+                let image_parts: Vec<Value> = tr
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Image { data, mime_type } => Some(json!({
+                            "inlineData": {"mimeType": mime_type, "data": data}
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !image_parts.is_empty() {
+                    out.push(json!({"role": "user", "parts": image_parts}));
+                }
             }
         }
     }
@@ -466,6 +490,74 @@ mod tests {
             .expect("inlineData part missing — image was dropped");
         assert_eq!(image["inlineData"]["mimeType"], "image/png");
         assert_eq!(image["inlineData"]["data"], "AAECAwQ=");
+    }
+
+    // OCEAN-132: tool-result image parity. A Message::ToolResult carrying a
+    // Content::Image (browser / computer-use screenshot) must reach the model as
+    // a Gemini inlineData part — previously only `.as_text()` was collected into
+    // functionResponse.output, so the screenshot was silently dropped and the
+    // model replied "I can't see any screenshot".
+    #[test]
+    fn tool_result_image_is_encoded_as_inline_data_part() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "screenshot".into(),
+            content: vec![
+                Content::text("captured viewport"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+
+        // functionResponse still carries the textual output…
+        let fr = out
+            .iter()
+            .find(|c| c["parts"][0].get("functionResponse").is_some())
+            .expect("functionResponse missing");
+        assert_eq!(
+            fr["parts"][0]["functionResponse"]["response"]["output"],
+            "captured viewport"
+        );
+
+        // …and the image is present somewhere as an inlineData part (NOT dropped).
+        let image = out
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .find(|p| p.get("inlineData").is_some())
+            .expect("inlineData part missing — tool-result image was dropped");
+        assert_eq!(image["inlineData"]["mimeType"], "image/png");
+        assert_eq!(image["inlineData"]["data"], "AAECAwQ=");
+    }
+
+    // A text-only tool result stays exactly as before: one functionResponse
+    // content, no stray inlineData part appended.
+    #[test]
+    fn text_only_tool_result_stays_text_only() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "read_file".into(),
+            content: vec![Content::text("file contents here")],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        assert_eq!(out.len(), 1, "no extra image content should be appended");
+        assert_eq!(
+            out[0]["parts"][0]["functionResponse"]["response"]["output"],
+            "file contents here"
+        );
+        let has_inline = out
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .any(|p| p.get("inlineData").is_some());
+        assert!(!has_inline, "text-only result must not emit inlineData");
     }
 
     // OCEAN-101: a content-filter / abnormal finishReason must NOT map to a clean
