@@ -117,6 +117,10 @@ struct UsageMetadata {
     candidates_token_count: u64,
     #[serde(default)]
     total_token_count: u64,
+    // OCEAN-158: Gemini reports cached-prompt tokens under `cachedContentTokenCount`
+    // in usageMetadata. Decode it into usage.cache_read.
+    #[serde(default)]
+    cached_content_token_count: u64,
 }
 
 fn convert_messages(messages: &[Message]) -> Vec<Value> {
@@ -466,6 +470,7 @@ impl Provider for GoogleProvider {
                     usage.input = u.prompt_token_count;
                     usage.output = u.candidates_token_count;
                     usage.total_tokens = u.total_token_count;
+                    usage.cache_read = u.cached_content_token_count;
                 }
                 for cand in chunk.candidates {
                     if let Some(reason) = cand.finish_reason {
@@ -1008,6 +1013,26 @@ mod tests {
         assert_eq!(usage.prompt_token_count, 11);
         assert_eq!(usage.candidates_token_count, 7);
         assert_eq!(usage.total_token_count, 18);
+    }
+
+    // OCEAN-158: Gemini reports cached-prompt tokens under
+    // `cachedContentTokenCount` in usageMetadata. The decode struct must capture
+    // it (camelCase wire shape) so it can populate usage.cache_read; otherwise
+    // Gemini users see a false 0 in the cache-read HUD.
+    #[test]
+    fn usage_metadata_decodes_cached_content_token_count() {
+        let wire = r#"{
+            "promptTokenCount": 1500,
+            "candidatesTokenCount": 30,
+            "totalTokenCount": 1530,
+            "cachedContentTokenCount": 1280
+        }"#;
+        let usage: UsageMetadata =
+            serde_json::from_str(wire).expect("usageMetadata with cached count must decode");
+        assert_eq!(
+            usage.cached_content_token_count, 1280,
+            "cachedContentTokenCount must decode from the camelCase wire shape"
+        );
     }
 
     // OCEAN-145 (2): two PARALLEL calls to the SAME tool must be distinguishable.
