@@ -577,6 +577,13 @@ async fn main() -> anyhow::Result<()> {
             get(room_transcript),
         )
         .route("/v1/rooms/{room_id}", get(room))
+        // OCEAN-137: mint a LiveKit join token for a room. The proxy + web
+        // surface already POST to this path; the daemon honors it here so
+        // in-room voice/video connects on web instead of 404ing.
+        .route(
+            "/v1/rooms/{room_id}/livekit-token",
+            post(room_livekit_token),
+        )
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
         .route("/v1/projects", get(projects_list).post(project_create))
@@ -633,6 +640,7 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/permissions/{id}/decision",
             "GET /v1/rooms",
             "GET /v1/rooms/{room_id}",
+            "POST /v1/rooms/{room_id}/livekit-token",
             "GET /v1/rooms/persistent",
             "POST /v1/rooms/persistent",
             "GET /v1/rooms/persistent/{key}",
@@ -1621,6 +1629,65 @@ async fn call_webhook(
             tracing::warn!(error = %e, "rejected livekit webhook");
             (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() })))
         }
+    }
+}
+
+/// `POST /v1/rooms/{room_id}/livekit-token` — mint a LiveKit join token for a
+/// room (OCEAN-137).
+///
+/// This is the path the ocean-surface proxy and web surface already call to get
+/// a JWT for the `livekit-client` SDK; the daemon had every other room/calls
+/// route but not this one, so the proxied POST 404'd and in-room voice/video
+/// never connected on web. We honor the contract both clients expect here.
+///
+/// Reuses the LiveKit credentials + token signing in `ocean_call::token`, which
+/// reads just the three LiveKit auth vars (no Twilio SIP trunk needed). If those
+/// aren't configured, returns a clean 503 the surface renders as a degraded
+/// error (`{ ok:false, error }`) — never a 404. The response is
+/// `{ ok, url, token, room }`, the shape the web bridge decodes.
+async fn room_livekit_token(
+    Path(room_id): Path<String>,
+    body: Option<Json<ocean_call::LiveKitTokenRequest>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if room_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "room_id is empty" })),
+        );
+    }
+
+    // A missing/empty body is fine — the grants default to publish+subscribe.
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    let config = match ocean_call::LiveKitTokenConfig::from_env() {
+        Ok(c) => c,
+        Err(missing) => {
+            // Creds aren't provisioned — not a code failure. Clean 503 with a
+            // typed error the surface already handles (OCEAN-123), not a 404.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": "LiveKit not configured",
+                    "blocked_on": "livekit not configured",
+                    "missing": missing,
+                    "needed_env": ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"],
+                })),
+            );
+        }
+    };
+
+    match ocean_call::mint_join_token(&config, &room_id, &req) {
+        Ok(resp) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(resp).unwrap_or_else(|_| {
+                json!({ "ok": false, "error": "failed to encode token response" })
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e })),
+        ),
     }
 }
 

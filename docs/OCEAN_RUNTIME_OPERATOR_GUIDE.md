@@ -334,6 +334,7 @@ POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
 # Rooms — Track-0 projection (RoomSnapshot)
 GET    /v1/rooms                          list room projections
 GET    /v1/rooms/{room_id}                room projection detail (pm|writers|orch_mesh|review)
+POST   /v1/rooms/{room_id}/livekit-token  mint a LiveKit join token for the room (web in-room voice/video)
 
 # Rooms — persistent lifecycle (OCEAN-65; in-memory store)
 GET    /v1/rooms/persistent               list persistent rooms
