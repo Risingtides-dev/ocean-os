@@ -892,6 +892,163 @@ mod tests {
         assert!(matches!(back, AgentTurnEvent::ToolCallFinished { .. }));
     }
 
+    /// Invariant-5 / OCEAN-54 foundation: **every** `AgentTurnEvent` variant must
+    /// survive a JSON serialize → deserialize round-trip *and* report the same
+    /// session scope through `session_id()` afterward. The daemon's per-session
+    /// SSE filter routes purely on `session_id()`; if any variant lost or
+    /// mis-reported its scope across the wire, that filter would leak one
+    /// session's events into another's transcript (or drop them entirely). This
+    /// test enumerates all variants so a newly-added one without a `session_id`
+    /// (or with a broken accessor arm) trips the exhaustiveness `match` below and
+    /// fails to compile / round-trip, forcing the author to wire it in.
+    #[test]
+    fn every_agent_turn_event_variant_round_trips_with_session_id() {
+        let sid = AgentSessionId::new_v4();
+        let tid = AgentTurnId::new_v4();
+        let cid = ToolCallId::new_v4();
+
+        // One instance of every variant, each stamped with the SAME known
+        // session (or scope), so the post-round-trip assertion is unambiguous.
+        let session_scoped: Vec<AgentTurnEvent> = vec![
+            AgentTurnEvent::TurnStarted {
+                turn_id: tid,
+                session_id: sid,
+                model: Some("deepseek-v4-pro".into()),
+            },
+            AgentTurnEvent::AssistantTextDelta {
+                session_id: sid,
+                turn_id: tid,
+                delta: "hello".into(),
+            },
+            AgentTurnEvent::ThinkingDelta {
+                session_id: sid,
+                turn_id: tid,
+                delta: "thinking…".into(),
+            },
+            AgentTurnEvent::ToolCallStarted {
+                session_id: sid,
+                turn_id: tid,
+                call: ToolCall {
+                    id: cid.clone(),
+                    name: "read".into(),
+                    args_json: serde_json::json!({"path": "/tmp/x"}),
+                },
+            },
+            AgentTurnEvent::ToolCallChunk {
+                session_id: sid,
+                turn_id: tid,
+                call_id: cid.clone(),
+                chunk: "partial".into(),
+            },
+            AgentTurnEvent::ToolCallFinished {
+                session_id: sid,
+                turn_id: tid,
+                call_id: cid,
+                result: ToolResult {
+                    ok: true,
+                    output: "done".into(),
+                    metadata_json: None,
+                },
+            },
+            AgentTurnEvent::TurnFinished {
+                session_id: sid,
+                turn_id: tid,
+                status: AgentTurnStatus::Completed,
+                error: None,
+                wall_ms: Some(1234),
+                output_tokens: Some(42),
+                input_tokens: Some(100),
+                cache_read_tokens: Some(10),
+                tokens_per_second: Some(33.5),
+            },
+            AgentTurnEvent::SessionCreated {
+                session_id: sid,
+                title: "new session".into(),
+                cwd: "/home/user/project".into(),
+            },
+            AgentTurnEvent::ComponentRender {
+                session_id: sid,
+                component_id: "kanban-1".into(),
+                kind: "kanban".into(),
+                props: serde_json::json!({"columns": []}),
+                replace: false,
+            },
+            AgentTurnEvent::ComponentUnmount {
+                session_id: sid,
+                component_id: "kanban-1".into(),
+            },
+            AgentTurnEvent::BrowserActivity {
+                session_id: sid,
+                active: true,
+            },
+            // Session-scoped Extension: behaves like any session-bearing event.
+            AgentTurnEvent::Extension {
+                extension: "longhouse".into(),
+                payload: serde_json::json!({"k": "v"}),
+                scope: Some(sid),
+            },
+        ];
+
+        // Exhaustiveness guard: if a new variant is added without being listed
+        // above, this match fails to compile until the author handles it.
+        for ev in &session_scoped {
+            #[allow(clippy::match_same_arms)]
+            match ev {
+                AgentTurnEvent::TurnStarted { .. }
+                | AgentTurnEvent::AssistantTextDelta { .. }
+                | AgentTurnEvent::ThinkingDelta { .. }
+                | AgentTurnEvent::ToolCallStarted { .. }
+                | AgentTurnEvent::ToolCallChunk { .. }
+                | AgentTurnEvent::ToolCallFinished { .. }
+                | AgentTurnEvent::TurnFinished { .. }
+                | AgentTurnEvent::SessionCreated { .. }
+                | AgentTurnEvent::ComponentRender { .. }
+                | AgentTurnEvent::ComponentUnmount { .. }
+                | AgentTurnEvent::BrowserActivity { .. }
+                | AgentTurnEvent::Extension { .. } => {}
+            }
+        }
+
+        for ev in session_scoped {
+            // Pre-round-trip scope (the source of truth).
+            let want = ev.session_id();
+            assert_eq!(
+                want,
+                Some(sid),
+                "every session-scoped variant must report the stamped session: {ev:?}"
+            );
+
+            // Serialize → deserialize, then re-check the scope on the rebuilt
+            // value: the wire format must preserve session_id for routing.
+            let json = serde_json::to_string(&ev).expect("serialize");
+            let back: AgentTurnEvent =
+                serde_json::from_str(&json).expect("deserialize round-trips");
+            assert_eq!(
+                back.session_id(),
+                Some(sid),
+                "session_id must survive the JSON round-trip for {json}"
+            );
+        }
+
+        // The Invariant-5 exception: a council-wide Extension has NO scope. It is
+        // global-by-design and reaches only `?all=1` subscribers — never a
+        // session-scoped one. session_id() returns None before and after the
+        // round-trip.
+        let global = AgentTurnEvent::Extension {
+            extension: "longhouse".into(),
+            payload: serde_json::json!({"council": "dev"}),
+            scope: None,
+        };
+        assert_eq!(global.session_id(), None, "council-wide event has no scope");
+        let json = serde_json::to_string(&global).unwrap();
+        let back: AgentTurnEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.session_id(),
+            None,
+            "the None scope (global-by-design) must survive the round-trip"
+        );
+    }
+
     #[test]
     fn agent_turn_request_serde() {
         let req = AgentTurnRequest {

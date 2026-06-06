@@ -461,9 +461,29 @@ fn truncated_tool_use_result(id: &str, name: &str) -> Message {
 /// output still reaches the UI via the `ToolExecutionEnd` event.
 const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 
-/// Cap each text block of a tool result. Oversized text is truncated on a char
-/// boundary with a marker noting how much was elided; non-text content (images,
-/// etc.) passes through untouched.
+/// Max bytes of a single tool-result image block (the base64 `data` payload) we
+/// retain in the transcript. Images legitimately need far more room than a text
+/// dump, but they are *not* unbounded: a tool that returns a multi-megabyte
+/// screenshot or a binary blob mislabelled as an image would otherwise be
+/// re-sent verbatim on every subsequent round, ballooning input tokens with no
+/// ceiling — and base64 strings hold poorly in memory at scale. 256 KB of
+/// base64 (~192 KB of decoded image) is generous for a normal screenshot while
+/// still bounding the worst case. Oversized images are dropped from the
+/// transcript and replaced with a text marker; the full image still reaches the
+/// UI via the `ToolExecutionEnd` event.
+const MAX_TOOL_RESULT_IMAGE_BYTES: usize = 256 * 1024;
+
+/// Cap each block of a tool result so a single tool can't blow the context /
+/// memory budget:
+/// - Oversized **text** is truncated on a char boundary with a marker noting how
+///   much was elided.
+/// - Oversized **image** data (the base64 `data` payload) is dropped and
+///   replaced with a `[image omitted: …]` text marker. A normally-sized image
+///   passes through unchanged.
+///
+/// In both cases the full, untruncated output still reaches the UI via the
+/// `ToolExecutionEnd` event — only the copy retained in the model transcript is
+/// bounded.
 fn cap_tool_content(content: Vec<Content>) -> Vec<Content> {
     content
         .into_iter()
@@ -480,6 +500,19 @@ fn cap_tool_content(content: Vec<Content>) -> Vec<Content> {
                     "\n\n[… {elided} bytes truncated to fit context; full output shown in UI …]"
                 ));
                 Content::Text { text: truncated }
+            }
+            Content::Image { data, mime_type } if data.len() > MAX_TOOL_RESULT_IMAGE_BYTES => {
+                // Drop the oversized payload from the transcript, leaving a clear
+                // marker. We don't try to re-encode/resize the image here — the
+                // goal is purely to bound the bytes the model re-sends each round.
+                let bytes = data.len();
+                Content::Text {
+                    text: format!(
+                        "[image omitted: {bytes} bytes ({mime_type}) exceeds the \
+                         {MAX_TOOL_RESULT_IMAGE_BYTES}-byte tool-result image cap; \
+                         full image shown in UI]"
+                    ),
+                }
             }
             other => other,
         })
@@ -823,6 +856,54 @@ mod tests {
         let small = "ok".to_string();
         let capped = cap_tool_content(vec![Content::text(small.clone())]);
         assert_eq!(capped[0].as_text(), Some(small.as_str()));
+    }
+
+    #[test]
+    fn cap_tool_content_bounds_oversized_image() {
+        // A tool that returns a huge image (e.g. a multi-MB screenshot or a
+        // binary blob) must not pass through uncapped — that's the OOM / token
+        // explosion path. The oversized image is dropped and replaced with a
+        // text marker; the retained block must be far smaller than the input.
+        let huge = "A".repeat(MAX_TOOL_RESULT_IMAGE_BYTES * 2);
+        let original_len = huge.len();
+        let capped = cap_tool_content(vec![Content::Image {
+            data: huge,
+            mime_type: "image/png".into(),
+        }]);
+        assert_eq!(capped.len(), 1);
+        let text = capped[0]
+            .as_text()
+            .expect("oversized image should be replaced by a text marker");
+        assert!(text.contains("image omitted"), "marker text: {text}");
+        assert!(text.contains("image/png"), "marker keeps mime type: {text}");
+        assert!(
+            text.len() < 1024,
+            "marker must be tiny relative to the {original_len}-byte input, got {}",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn cap_tool_content_leaves_normal_image_untouched() {
+        // A normally-sized image passes through byte-for-byte: the cap only
+        // trips on the pathological case.
+        let data = "B".repeat(1024); // ~1 KB, well under the cap
+        let img = Content::Image {
+            data: data.clone(),
+            mime_type: "image/jpeg".into(),
+        };
+        let capped = cap_tool_content(vec![img.clone()]);
+        assert_eq!(capped.len(), 1);
+        match &capped[0] {
+            Content::Image {
+                data: d,
+                mime_type: m,
+            } => {
+                assert_eq!(d, &data, "image data must be untouched");
+                assert_eq!(m, "image/jpeg", "mime type must be untouched");
+            }
+            other => panic!("expected the image to pass through unchanged, got {other:?}"),
+        }
     }
 
     /// A config carrying an already-cancelled token must abort the run with
