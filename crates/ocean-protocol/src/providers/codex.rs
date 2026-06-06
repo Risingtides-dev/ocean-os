@@ -380,7 +380,10 @@ impl Provider for CodexProvider {
                 // also embeds `type` in the JSON payload. Prefer the payload type.
                 let value: Value = match serde_json::from_str(&ev.data) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "skipping unparseable Codex SSE frame");
+                        continue;
+                    }
                 };
                 let kind = value
                     .get("type")
@@ -490,6 +493,31 @@ impl Provider for CodexProvider {
                         }
                         break;
                     }
+                    // Safety refusal. The Responses API streams a decline through
+                    // its own refusal channel; without handling it the turn would
+                    // end with empty text and no explanation (OCEAN-101). Surface
+                    // it as visible assistant text.
+                    "response.refusal.delta" => {
+                        if let Ok(d) = serde_json::from_value::<TextDeltaEvent>(value) {
+                            if !d.delta.is_empty() {
+                                let idx = match text_index {
+                                    Some(i) => i,
+                                    None => {
+                                        let i = next_block_index;
+                                        next_block_index += 1;
+                                        text_index = Some(i);
+                                        yield Ok(AssistantMessageEvent::TextStart { content_index: i });
+                                        i
+                                    }
+                                };
+                                text_buf.push_str(&d.delta);
+                                yield Ok(AssistantMessageEvent::TextDelta {
+                                    content_index: idx,
+                                    delta: d.delta,
+                                });
+                            }
+                        }
+                    }
                     "response.failed" | "response.incomplete" => {
                         let parsed = serde_json::from_value::<FailedEvent>(value).ok();
                         let (code, message) = parsed
@@ -498,6 +526,22 @@ impl Provider for CodexProvider {
                             .unwrap_or_default();
                         yield Err(Error::InvalidResponse(format!(
                             "codex response {kind}: {code} {message}"
+                        )));
+                        return;
+                    }
+                    // Top-level transport/stream error event (distinct from the
+                    // `response.failed` envelope). The Responses API emits a bare
+                    // `error` event for stream-level failures; surface it instead
+                    // of silently ending the turn.
+                    "error" | "response.error" => {
+                        let message = value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| value.get("error").and_then(|e| e.get("message")).and_then(Value::as_str))
+                            .unwrap_or("unknown stream error")
+                            .to_string();
+                        yield Err(Error::InvalidResponse(format!(
+                            "codex stream error: {message}"
                         )));
                         return;
                     }
