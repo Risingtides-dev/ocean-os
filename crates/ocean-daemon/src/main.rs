@@ -433,9 +433,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let bind = env::var("OCEAN_BIND").unwrap_or_else(|_| "127.0.0.1:4780".to_string());
+
+    // The Longhouse read-side topic registry. Built BEFORE the runtime so the
+    // SAME handle is shared two ways (OCEAN-118): into the capability registry
+    // (so agents' `longhouse__convene` / `longhouse__board_read` tools drive it)
+    // AND onto AppState (so the operator's `/v1/longhouse/topics*` HTTP routes
+    // serve off it). One observable board for both surfaces.
+    let longhouse: LonghouseRegistryHandle =
+        Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new()));
+
     // Built-ins first, then connect any configured MCP servers (non-fatally)
     // and fold their tools into the capability registry before sharing it.
-    let runtime = Arc::new(AgentRuntime::from_env()?.with_extensions().await);
+    let runtime =
+        Arc::new(AgentRuntime::from_env()?.with_extensions(Some(longhouse.clone())).await);
 
     // Persistent rooms (OCEAN-107): open the durable SQLite store at startup so
     // rooms + transcripts survive a daemon restart. The DB lives under the same
@@ -459,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
         agent_events: AgentEventBus::new(1024),
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
-        longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
+        longhouse,
         rooms: Arc::new(Mutex::new(room_store)),
     };
 

@@ -166,10 +166,20 @@ impl AgentRuntime {
     /// logs a warning and contributes no tools, never blocking startup.
     ///
     /// Consuming builder so the daemon can do
-    /// `AgentRuntime::from_env()?.with_extensions().await` before sharing the
-    /// runtime behind an `Arc`.
-    pub async fn with_extensions(mut self) -> Self {
-        let registry = build_capability_registry(&self.config_dir).await;
+    /// `AgentRuntime::from_env()?.with_extensions(longhouse).await` before sharing
+    /// the runtime behind an `Arc`.
+    ///
+    /// `longhouse` is the daemon's shared read-side topic registry. Passing the
+    /// SAME `Arc` the HTTP routes serve off means a council convened via the
+    /// `longhouse__convene` tool, and the topics an agent reads via
+    /// `longhouse__board_read`, share one observable board with the operator
+    /// surface. `None` (tests / embedders without a daemon) simply omits the
+    /// Longhouse provider.
+    pub async fn with_extensions(
+        mut self,
+        longhouse: Option<ocean_longhouse::LonghouseRegistryHandle>,
+    ) -> Self {
+        let registry = build_capability_registry(&self.config_dir, longhouse).await;
         self.capabilities = Arc::new(registry);
         self
     }
@@ -842,7 +852,10 @@ impl PermissionPolicy for StaticPermissionPolicy {
 /// (`std::env::var`), which is loaded from `tools.env`. Names only ever leave
 /// this layer; values are injected straight into the child by `ocean-mcp` and
 /// are never logged.
-async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
+async fn build_capability_registry(
+    config_dir: &Path,
+    longhouse: Option<ocean_longhouse::LonghouseRegistryHandle>,
+) -> CapabilityRegistry {
     let mut providers: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
 
     // Browser control. Chrome is launched lazily on the first turn that asks for
@@ -907,6 +920,18 @@ async fn build_capability_registry(config_dir: &Path) -> CapabilityRegistry {
     // bash/write/edit and MCP tools — plugins never bypass the gate.
     for provider in discover_plugin_providers(config_dir).await {
         providers.push(provider);
+    }
+
+    // Longhouse council ops as tools (OCEAN-118): convene a council /
+    // read the board, namespaced `longhouse__*`. The provider holds the SAME
+    // registry handle the daemon serves its `/v1/longhouse/topics*` routes off,
+    // so tool-driven and operator-driven councils share one observable board.
+    // Its tools report `requires_permission == true`, so they're gated by the
+    // daemon's PermissionPolicy exactly like bash/write/edit and MCP/plugin
+    // tools — agents never bypass the gate (post-OCEAN-54). When no handle is
+    // supplied (tests / non-daemon embedders) the provider is simply omitted.
+    if let Some(registry) = longhouse {
+        providers.push(Arc::new(ocean_longhouse::LonghouseProvider::new(registry)));
     }
 
     CapabilityRegistry::new(providers)

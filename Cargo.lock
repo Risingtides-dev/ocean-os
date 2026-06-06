@@ -2911,6 +2911,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ocean-core",
+ "ocean-longhouse",
  "ocean-mcp",
  "ocean-plugin",
  "ocean-protocol",
@@ -3044,12 +3045,14 @@ name = "ocean-longhouse"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "futures",
  "ocean-agent-sdk",
  "ocean-protocol",
  "ocean-providers",
+ "ocean-runtime",
  "serde",
  "serde_json",
  "tokio",
