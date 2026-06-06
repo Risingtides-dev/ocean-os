@@ -21,6 +21,14 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# Streamable-HTTP MCP transport (OCEAN-166). `reqwest` drives the POST/GET
+# round-trips; `futures-util` + `eventsource-stream` parse the `text/event-stream`
+# responses the spec lets a server return for any request. Same HTTP stack the
+# protocol crate already uses, so no new transitive surface for the workspace.
+reqwest.workspace = true
+futures-util = "0.3"
+eventsource-stream = "0.2"
+
 # A tiny in-repo stdio MCP server lives at src/bin/fake_server.rs (auto-
 # discovered). Cargo builds it for tests and sets CARGO_BIN_EXE_fake_server, the
 # path the e2e test spawns as the MCP child. It uses serde_json (a normal dep).

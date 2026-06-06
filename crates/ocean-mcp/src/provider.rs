@@ -66,23 +66,57 @@ impl McpProvider {
         }
 
         if cfg.transport == McpTransportKind::Http {
-            // HTTP transport: fail fast on a connection problem with a typed,
-            // explicit error rather than a swallowed warning (OCEAN-47). The
-            // endpoint is carried in `command` for HTTP servers (the URL).
+            // Streamable-HTTP transport (OCEAN-166). The endpoint URL is carried
+            // in `command` for HTTP servers. Construct the transport (fails fast
+            // with a typed error on a bad/empty URL, OCEAN-47), then run the SAME
+            // handshake + discovery the stdio path does — so an HTTP MCP server
+            // actually contributes its tools instead of silently yielding none.
             let endpoint = cfg.command.clone().unwrap_or_default();
-            match HttpTransport::connect(&endpoint).await {
-                Ok(_transport) => {
-                    // Reserved for when the streamable-HTTP wire lands; until
-                    // then `connect` cannot reach this arm.
-                    tracing::info!(server = %cfg.name, "MCP HTTP server connected");
-                    return Ok(Self::empty(id, ProviderHealth::Degraded));
-                }
+            let transport = match HttpTransport::connect(&endpoint).await {
+                Ok(t) => t,
                 Err(e) => {
                     tracing::error!(
                         server = %cfg.name,
                         endpoint = %endpoint,
                         error = %e,
-                        "MCP HTTP server connection failed; contributing no tools"
+                        "MCP HTTP endpoint is invalid; contributing no tools"
+                    );
+                    return Ok(Self::empty(id, ProviderHealth::Unavailable));
+                }
+            };
+
+            // Best-effort, exactly like stdio: a server that fails to handshake
+            // or list tools folds into an empty, Unavailable provider rather than
+            // blocking startup.
+            match Self::handshake(&cfg.name, Box::new(transport), connect_timeout).await {
+                Ok((client, defs)) => {
+                    let tools = build_tools(&cfg.name, defs, &client);
+                    tracing::info!(
+                        server = %cfg.name,
+                        endpoint = %endpoint,
+                        tools = tools.len(),
+                        "MCP HTTP server ready"
+                    );
+                    let health = if tools.is_empty() {
+                        ProviderHealth::Degraded
+                    } else {
+                        ProviderHealth::Ready
+                    };
+                    let cache: ToolCache = Arc::new(RwLock::new(Arc::new(tools)));
+                    let signal = client.tools_changed_signal();
+                    spawn_tools_changed_watcher(cfg.name.clone(), client, cache.clone(), signal);
+                    return Ok(Self {
+                        id,
+                        tools: cache,
+                        health,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        server = %cfg.name,
+                        endpoint = %endpoint,
+                        error = %e,
+                        "MCP HTTP server unavailable; contributing no tools"
                     );
                     return Ok(Self::empty(id, ProviderHealth::Unavailable));
                 }
@@ -146,10 +180,9 @@ impl McpProvider {
         }
     }
 
-    /// The fallible core of connect: spawn and handshake, returning the shared
-    /// client and the discovered tool definitions. Bounded by `connect_timeout`
-    /// end-to-end so a hung server can't wedge startup. Tool *wrapping* happens
-    /// in [`build_tools`] so the same path serves both connect and a later
+    /// The fallible core of the stdio connect: spawn the child, then run the
+    /// shared [`handshake`](Self::handshake). Tool *wrapping* happens in
+    /// [`build_tools`] so the same path serves connect and a later
     /// `tools/list_changed` refresh.
     async fn connect_inner(
         server_name: &str,
@@ -159,19 +192,29 @@ impl McpProvider {
         connect_timeout: Duration,
     ) -> anyhow::Result<(Arc<McpClient>, Vec<McpToolDef>)> {
         let transport = StdioTransport::spawn(command, args, env)?;
-        // Keep the client's default per-call timeout (30s) for live tool calls.
-        // The handshake below is bounded separately by the outer `timeout`, so we
-        // deliberately do NOT shrink the client's request timeout to
-        // `connect_timeout` here — doing so would also throttle every later
-        // `tools/call` to the (short) connect budget.
-        //
-        // The client multiplexes internally (OCEAN-44): its methods take `&self`
-        // and a single I/O task owns the transport, so concurrent callers don't
-        // serialize. We therefore share it as a plain `Arc`, with no outer mutex —
-        // a slow tool call in one session no longer head-of-line blocks another.
-        let client = Arc::new(McpClient::new(Box::new(transport)));
+        Self::handshake(server_name, Box::new(transport), connect_timeout).await
+    }
 
-        // Handshake + discovery under one overall deadline.
+    /// Transport-agnostic handshake + discovery: wrap any [`Transport`] in a
+    /// client, run `initialize` → `tools/list` under one overall deadline, and
+    /// return the shared client and discovered tool defs. Shared by the stdio and
+    /// streamable-HTTP paths (OCEAN-166) so both negotiate identically.
+    ///
+    /// Bounded by `connect_timeout` end-to-end so a hung server can't wedge
+    /// startup. The client keeps its default per-call timeout (30s) for live tool
+    /// calls — we deliberately do NOT shrink it to `connect_timeout`, which would
+    /// also throttle every later `tools/call` to the (short) connect budget.
+    ///
+    /// The client multiplexes internally (OCEAN-44): its methods take `&self` and
+    /// a single I/O task owns the transport, so concurrent callers don't
+    /// serialize. We therefore share it as a plain `Arc`, with no outer mutex.
+    async fn handshake(
+        server_name: &str,
+        transport: Box<dyn crate::transport::Transport + Send>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<(Arc<McpClient>, Vec<McpToolDef>)> {
+        let client = Arc::new(McpClient::new(transport));
+
         let defs: Vec<McpToolDef> = tokio::time::timeout(connect_timeout, async {
             client.initialize("ocean").await?;
             client.list_tools().await

@@ -1,16 +1,23 @@
-//! Transport abstraction for MCP. One trait, one implementation today
-//! ([`StdioTransport`]); HTTP/SSE slots in behind the same trait later without
-//! touching the client.
+//! Transport abstraction for MCP. One trait, two implementations:
+//! [`StdioTransport`] (spawn a child, speak newline-delimited JSON over its
+//! stdio) and [`HttpTransport`] (the MCP streamable-HTTP transport). Both sit
+//! behind the same trait so [`McpClient`](crate::client::McpClient) drives
+//! either unchanged.
 //!
-//! The contract is line-oriented JSON: `send` writes exactly one JSON value as
-//! a single newline-terminated line; `recv` returns the next complete line.
-//! This matches the MCP stdio framing (newline-delimited, no embedded newlines).
+//! The contract is line-oriented JSON: `send` writes exactly one JSON value;
+//! `recv` returns the next complete JSON message. For stdio this is literal
+//! newline framing; for HTTP each POST round-trip queues the JSON-RPC messages
+//! from its response for `recv` to drain (see [`HttpTransport`]).
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use eventsource_stream::Eventsource;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::{mpsc, Mutex};
 
 /// Transport-level failures, modeled explicitly so callers can fail fast on a
 /// connection problem instead of swallowing it as a generic warning. Today the
@@ -147,55 +154,210 @@ impl Transport for StdioTransport {
     }
 }
 
-/// HTTP/SSE transport. The wire protocol (streamable HTTP) is not yet built out;
-/// what *is* implemented today is the connect contract: probe the endpoint and
-/// **fail fast** with [`McpTransportError::HttpConnectionFailed`] if it cannot be
-/// reached, rather than logging a warning and leaving the provider silently
-/// toolless. Returning a typed error lets `McpProvider::connect` surface the
-/// failure explicitly (OCEAN-47).
+/// Streamable-HTTP transport (MCP spec `2025-06-18`, the "Streamable HTTP"
+/// transport). It speaks the same line-oriented JSON contract as
+/// [`StdioTransport`] so [`McpClient`](crate::client::McpClient) drives it
+/// unchanged: `send` writes one JSON-RPC message, `recv` yields the next.
+///
+/// ## How the line contract maps onto HTTP
+///
+/// The wire is request/response, not a long-lived duplex pipe, so we bridge it
+/// to the trait's streaming shape with an internal inbound queue:
+///
+/// - `send(line)` HTTP-POSTs the JSON-RPC message to the endpoint with
+///   `Accept: application/json, text/event-stream`. Per spec the server answers
+///   a request with **either** a single `application/json` body **or** a
+///   `text/event-stream` (SSE) carrying one or more JSON-RPC messages. Either
+///   way, every JSON-RPC message in the response is pushed onto the inbound
+///   queue. A notification/response we send gets `202 Accepted` with no body —
+///   nothing is queued, matching stdio (where a notification draws no reply).
+/// - `recv()` pops the next queued message. `Ok(None)` means the transport was
+///   closed (the client's I/O task is shutting down).
+///
+/// ## Session id
+///
+/// The server **MAY** assign an `Mcp-Session-Id` on the `initialize` response.
+/// If it does, we capture it and echo it on every subsequent request, as the
+/// spec requires. A `404` to a request carrying a session id means the session
+/// was terminated server-side; we surface that as a transport error so the
+/// connection is torn down (the provider then contributes no tools rather than
+/// hanging).
 #[derive(Debug)]
 pub struct HttpTransport {
-    /// The configured endpoint URL. Retained for when the streamable-HTTP wire
-    /// is built out; today `connect` fails fast before constructing the struct.
-    #[allow(dead_code)]
+    client: reqwest::Client,
     endpoint: String,
+    /// Negotiated session id, set from the `Mcp-Session-Id` response header (if
+    /// the server assigns one) and echoed on every later request. Shared so the
+    /// `send` task can update it after `initialize` without `&mut`.
+    session_id: Arc<Mutex<Option<String>>>,
+    /// Inbound JSON-RPC messages parsed out of POST responses (single JSON or
+    /// SSE), waiting for `recv` to drain them.
+    inbound_rx: mpsc::UnboundedReceiver<String>,
+    inbound_tx: mpsc::UnboundedSender<String>,
 }
 
 impl HttpTransport {
-    /// Attempt to connect to `endpoint`. Fails fast: any reachability problem
-    /// (and, until the streamable-HTTP wire is finished, the not-yet-supported
-    /// state itself) returns [`McpTransportError::HttpConnectionFailed`] rather
-    /// than a swallowed warning.
+    /// Construct a streamable-HTTP transport for `endpoint`. Validates the URL is
+    /// non-empty and well-formed; a malformed/empty endpoint is a typed
+    /// [`McpTransportError::HttpConnectionFailed`] so the provider fails fast
+    /// rather than silently contributing no tools. Reachability of the server
+    /// itself is proven by the `initialize` handshake the client runs next — a
+    /// dead endpoint surfaces there as a POST error, which folds into the
+    /// provider's unavailable path.
     pub async fn connect(endpoint: &str) -> Result<Self, McpTransportError> {
-        if endpoint.trim().is_empty() {
+        let endpoint = endpoint.trim().to_string();
+        if endpoint.is_empty() {
             return Err(McpTransportError::HttpConnectionFailed {
-                endpoint: endpoint.to_string(),
+                endpoint,
                 reason: "no endpoint URL configured".to_string(),
             });
         }
+        // Reject anything that isn't an http(s) URL up front, with the same typed
+        // error — a `command`-style value (e.g. `npx`) in an http server entry is
+        // a config mistake we want to name loudly, not POST to.
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(McpTransportError::HttpConnectionFailed {
+                endpoint: endpoint.clone(),
+                reason: "endpoint must be an http:// or https:// URL".to_string(),
+            });
+        }
 
-        // The streamable-HTTP MCP wire is not implemented yet. Fail fast with a
-        // typed connection error so callers don't mistake "unsupported" for
-        // "connected": a half-built transport that pretends to connect is worse
-        // than one that refuses loudly.
-        Err(McpTransportError::HttpConnectionFailed {
-            endpoint: endpoint.to_string(),
-            reason: "HTTP MCP transport is not yet implemented".to_string(),
+        let client = reqwest::Client::builder()
+            // No global request timeout here: per-request bounds live in the
+            // client (handshake) and `McpClient` (live calls). A streaming SSE
+            // response can legitimately stay open longer than a single call.
+            .build()
+            .map_err(|e| McpTransportError::HttpConnectionFailed {
+                endpoint: endpoint.clone(),
+                reason: format!("could not build HTTP client: {e}"),
+            })?;
+
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            client,
+            endpoint,
+            session_id: Arc::new(Mutex::new(None)),
+            inbound_rx,
+            inbound_tx,
         })
+    }
+
+    /// POST one JSON-RPC line and route every JSON-RPC message in the response
+    /// onto the inbound queue. Handles both response shapes the spec permits:
+    /// a single `application/json` body, or a `text/event-stream` (SSE) of one
+    /// or more messages.
+    async fn post_line(&self, line: &str) -> Result<()> {
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .body(line.to_string());
+
+        // Echo the negotiated session id on every request after initialize.
+        if let Some(sid) = self.session_id.lock().await.clone() {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("POST to MCP endpoint `{}`", self.endpoint))?;
+
+        let status = resp.status();
+
+        // A terminated session: the client must start a fresh one. We don't
+        // auto-reinitialize mid-stream; tearing down is the safe, visible
+        // behavior (the provider then contributes no tools rather than wedging).
+        if status == reqwest::StatusCode::NOT_FOUND {
+            bail!("MCP HTTP session was terminated by the server (404); connection closed");
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("MCP HTTP request failed with status {status}: {body}");
+        }
+
+        // Capture (or refresh) the session id the server assigned. Per spec this
+        // arrives on the initialize response, but accepting it on any response is
+        // harmless and robust.
+        if let Some(sid) = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+        {
+            *self.session_id.lock().await = Some(sid);
+        }
+
+        // `202 Accepted` (no content) is the spec's answer to a notification or a
+        // response we sent — nothing to queue.
+        if status == reqwest::StatusCode::ACCEPTED {
+            return Ok(());
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        if content_type.contains("text/event-stream") {
+            // SSE: each `data:` event is one JSON-RPC message. Stream them onto
+            // the inbound queue as they arrive. The stream ends when the server
+            // closes it (it does so once it has sent the response to our
+            // request, per spec).
+            let mut events = resp.bytes_stream().eventsource();
+            while let Some(event) = events.next().await {
+                let event = event.context("reading MCP SSE event")?;
+                let data = event.data;
+                if data.trim().is_empty() {
+                    continue;
+                }
+                // Drop only if the client (and its inbound queue) is gone.
+                if self.inbound_tx.send(data).is_err() {
+                    break;
+                }
+            }
+        } else {
+            // Single JSON body (the common case for a stateless server).
+            let body = resp.text().await.context("reading MCP HTTP response body")?;
+            if !body.trim().is_empty() {
+                let _ = self.inbound_tx.send(body);
+            }
+        }
+
+        Ok(())
     }
 }
 
 #[async_trait]
 impl Transport for HttpTransport {
-    async fn send(&mut self, _json_line: &str) -> Result<()> {
-        bail!("MCP HTTP transport is not yet implemented")
+    async fn send(&mut self, json_line: &str) -> Result<()> {
+        self.post_line(json_line).await
     }
 
     async fn recv(&mut self) -> Result<Option<String>> {
-        bail!("MCP HTTP transport is not yet implemented")
+        // Yield the next message a prior POST queued. `None` once the channel is
+        // empty AND closed — i.e. the transport is being torn down.
+        Ok(self.inbound_rx.recv().await)
     }
 
     async fn close(&mut self) -> Result<()> {
+        // Best-effort: tell the server to drop the session (spec: HTTP DELETE
+        // with the session id). Failure is ignored — the connection is going
+        // away regardless.
+        if let Some(sid) = self.session_id.lock().await.clone() {
+            let _ = self
+                .client
+                .delete(&self.endpoint)
+                .header("Mcp-Session-Id", sid)
+                .send()
+                .await;
+        }
         Ok(())
     }
 }
@@ -203,28 +365,161 @@ impl Transport for HttpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn http_connect_fails_fast_with_typed_error() {
-        let err = HttpTransport::connect("https://example.invalid/mcp")
-            .await
-            .expect_err("HTTP transport must fail fast, not pretend to connect");
-        match err {
-            McpTransportError::HttpConnectionFailed { endpoint, .. } => {
-                assert_eq!(endpoint, "https://example.invalid/mcp");
-            }
-        }
-        // The Display string is the operator-facing diagnostic.
-        let shown = HttpTransport::connect("https://example.invalid/mcp")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(shown.contains("HTTP connection"), "got: {shown}");
-    }
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn http_connect_rejects_empty_endpoint() {
         let err = HttpTransport::connect("   ").await.unwrap_err();
         assert!(err.to_string().contains("no endpoint URL"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_non_http_endpoint() {
+        // A `command`-style value (e.g. `npx`) wrongly placed in an http server
+        // entry is a config mistake we name loudly rather than POST to.
+        let err = HttpTransport::connect("npx").await.unwrap_err();
+        assert!(
+            err.to_string().contains("http:// or https://"),
+            "got: {err}"
+        );
+        match err {
+            McpTransportError::HttpConnectionFailed { endpoint, .. } => {
+                assert_eq!(endpoint, "npx");
+            }
+        }
+    }
+
+    /// A minimal one-request-per-connection HTTP MCP server for tests. It reads
+    /// one POSTed JSON-RPC line, dispatches on the method, and replies with a
+    /// single `application/json` JSON-RPC body. Enough to exercise the transport
+    /// end-to-end without pulling a web framework into this crate.
+    async fn spawn_mock_http_mcp() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // Read headers + body. Bodies here are tiny and sent in one
+                    // shot, so a single read of the request is sufficient.
+                    let mut buf = vec![0u8; 8192];
+                    let n = match tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null);
+                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    let id = parsed.get("id").cloned();
+
+                    // Notifications (no id) → 202 with no body, per spec.
+                    if id.is_none() {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
+
+                    let result = match method {
+                        "initialize" => serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": { "tools": { "listChanged": true } },
+                            "serverInfo": { "name": "mock-http", "version": "0.0.0" }
+                        }),
+                        "tools/list" => serde_json::json!({
+                            "tools": [{
+                                "name": "echo",
+                                "description": "echoes input",
+                                "inputSchema": { "type": "object" }
+                            }]
+                        }),
+                        _ => serde_json::json!({}),
+                    };
+                    let payload = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result
+                    })
+                    .to_string();
+
+                    // Assign a session id on the initialize response, as a real
+                    // streamable-HTTP server may.
+                    let session_hdr = if method == "initialize" {
+                        "Mcp-Session-Id: test-session-123\r\n"
+                    } else {
+                        ""
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session_hdr}Content-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    #[tokio::test]
+    async fn http_transport_sends_and_receives_json_response() {
+        let endpoint = spawn_mock_http_mcp().await;
+        let mut t = HttpTransport::connect(&endpoint).await.unwrap();
+
+        // initialize round-trip.
+        t.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await
+            .unwrap();
+        let line = t.recv().await.unwrap().expect("a response line");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["serverInfo"]["name"], "mock-http");
+
+        // The session id from the initialize response is captured for reuse.
+        assert_eq!(
+            t.session_id.lock().await.clone(),
+            Some("test-session-123".to_string())
+        );
+
+        // A notification draws no queued reply (202, no body).
+        t.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await
+            .unwrap();
+
+        // tools/list round-trip yields the advertised tool.
+        t.send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+            .await
+            .unwrap();
+        let line = t.recv().await.unwrap().expect("a tools/list response");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["result"]["tools"][0]["name"], "echo");
+    }
+
+    #[tokio::test]
+    async fn http_transport_surfaces_404_as_terminated_session() {
+        // A server that always 404s a request → the transport reports the session
+        // terminated rather than hanging.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let mut t = HttpTransport::connect(&format!("http://{addr}/mcp"))
+            .await
+            .unwrap();
+        let err = t
+            .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("terminated"), "got: {err}");
     }
 }
