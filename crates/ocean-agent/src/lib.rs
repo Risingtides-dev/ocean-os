@@ -319,7 +319,7 @@ impl AgentRuntime {
         }
 
         let result = if snapshot.provider_config.selection.provider == ProviderId::Fake {
-            self.run_fake_prompt(req.clone(), snapshot).await
+            self.run_fake_prompt(req.clone(), control, snapshot).await
         } else {
             self.run_prompt(req.clone(), control, snapshot).await
         };
@@ -498,6 +498,7 @@ impl AgentRuntime {
     async fn run_fake_prompt(
         &self,
         req: PromptRequest,
+        control: PromptControl,
         snapshot: &RuntimeState,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
@@ -517,6 +518,26 @@ impl AgentRuntime {
         session.bind_workspace(Path::new(&req.cwd));
 
         let stdout = "OCEAN_FAKE_OK\n".to_string();
+
+        // OCEAN-127: emit the assistant text as a streaming delta, exactly like
+        // the real provider path does. `run_prompt` streams the model's reply
+        // through `AgentEvent::TextDelta`, which the daemon bridge converts into
+        // `AgentTurnEvent::AssistantTextDelta` on the scoped `?session_id=`
+        // stream. The fake path used to synthesize the assistant message in
+        // place and emit nothing, so a scoped subscriber saw only
+        // `turn_started` + `turn_finished` and the reply never rendered. Emit a
+        // single text delta here so the fake provider behaves like a real one
+        // for surfaces (TUI, web) that render the transcript off the scoped
+        // stream.
+        if let Some(sink) = control.event_sink.as_ref() {
+            // The session id is stamped on every runtime event (OCEAN-54); the
+            // daemon bridge re-uses it to scope the AssistantTextDelta.
+            let _ = sink.send(AgentEvent::TextDelta {
+                session_id: Some(session_id.to_string()),
+                delta: stdout.trim_end().to_string(),
+            });
+        }
+
         let mut messages = session.messages.clone();
         messages.push(Message::user_text(req.prompt));
         messages.push(Message::Assistant(AssistantMessage {
@@ -2358,6 +2379,66 @@ done
         assert_eq!(detail.transcript[1].role, "assistant");
         assert_eq!(detail.transcript[1].text, "OCEAN_FAKE_OK");
         assert_eq!(detail.messages.len(), 2);
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// OCEAN-127: the fake provider must stream its assistant reply through the
+    /// `event_sink` as an `AgentEvent::TextDelta`, the same channel the real
+    /// provider uses. The daemon bridge turns this into
+    /// `AssistantTextDelta` on the scoped `?session_id=` SSE stream, which is
+    /// the only source the TUI/web transcript renders from. Before the fix the
+    /// fake path emitted nothing, so a scoped subscriber saw only
+    /// `turn_started` + `turn_finished` and the reply never rendered.
+    #[tokio::test]
+    async fn fake_provider_streams_assistant_text_delta_on_event_sink() {
+        let config_dir = temp_config_dir("fake-delta");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let control = PromptControl::yolo(false).with_event_sink(tx);
+
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "Reply exactly: OCEAN_OK".into(),
+                    images: None,
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                },
+                control,
+            )
+            .await;
+
+        assert!(res.ok);
+        let session_id = res.session_id.unwrap();
+
+        // Drain the sink and find the streamed assistant text delta.
+        let mut deltas: Vec<(Option<String>, String)> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::TextDelta { session_id, delta } = ev {
+                deltas.push((session_id, delta));
+            }
+        }
+
+        assert_eq!(
+            deltas.len(),
+            1,
+            "fake provider should emit exactly one assistant text delta"
+        );
+        assert_eq!(deltas[0].1, "OCEAN_FAKE_OK");
+        // The delta must carry the turn's session id so the daemon bridge can
+        // scope the AssistantTextDelta to the `?session_id=` subscriber.
+        assert_eq!(deltas[0].0.as_deref(), Some(session_id.to_string().as_str()));
+
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
