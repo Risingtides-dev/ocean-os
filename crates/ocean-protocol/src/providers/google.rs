@@ -60,6 +60,13 @@ struct Part {
 
 #[derive(Deserialize, Debug)]
 struct FunctionCall {
+    // OCEAN-145 (2): Gemini 3 models return a unique `id` on every functionCall;
+    // older models omit it. Capture the wire id when present so it round-trips
+    // into the eventual functionResponse.id (the disambiguation channel for two
+    // parallel calls to the SAME tool). Absent → we synthesize a deterministic
+    // `call_<n>` in stream order so ordering is still preserved.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -122,11 +129,21 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     match c {
                         Content::Text { text } => parts.push(json!({"text": text})),
                         Content::ToolCall {
-                            name, arguments, ..
+                            id,
+                            name,
+                            arguments,
                         } => {
-                            parts.push(json!({
-                                "functionCall": {"name": name, "args": arguments}
-                            }));
+                            // OCEAN-145 (2): echo the call id on the replayed
+                            // functionCall so it round-trips with the matching
+                            // functionResponse.id below. Gemini 3 always returns a
+                            // unique functionCall.id; older models match by name
+                            // and ignore it. Including it lets the model pair up
+                            // parallel same-tool calls with their results.
+                            let mut call = json!({"name": name, "args": arguments});
+                            if !id.is_empty() {
+                                call["id"] = json!(id);
+                            }
+                            parts.push(json!({ "functionCall": call }));
                         }
                         // OCEAN-140: Gemini only replays model thinking via opaque
                         // `thoughtSignature` blobs attached to the original parts —
@@ -151,18 +168,45 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     .filter_map(|c| c.as_text().map(|s| s.to_string()))
                     .collect::<Vec<_>>()
                     .join("");
+                // OCEAN-145 (1): tool-error legibility. Anthropic surfaces a
+                // failure via a first-class `is_error: true` on the tool_result
+                // block, which the model is trained to read. Gemini has no such
+                // structured flag — stuffing `is_error` inside
+                // `functionResponse.response` is invisible to the model. So on an
+                // error result, prefix the output text with a clear "ERROR: "
+                // marker so the failure is legible even without a structured
+                // field. We keep the structured `is_error` too (harmless, and
+                // some tooling reads it), but the marker is what the model sees.
+                let output = if tr.is_error {
+                    format!("ERROR: {text}")
+                } else {
+                    text
+                };
+                // OCEAN-145 (2): parallel same-tool disambiguation. Gemini's REST
+                // functionResponse accepts an optional `id` field that the model
+                // uses to map each result back to its originating functionCall
+                // (verified via Context7 / ai.google.dev: "every FunctionResponse
+                // must include the id from its corresponding FunctionCall").
+                // Name-only matching breaks when two parallel calls target the
+                // SAME tool — the results become indistinguishable. Ocean's
+                // ToolResultMessage carries `tool_call_id`, which the decoder
+                // populated from Gemini's own functionCall.id (or a deterministic
+                // synthesized id), so echo it here to disambiguate. Older Gemini
+                // models that match by name simply ignore the extra field.
+                let mut fr = json!({
+                    "name": tr.tool_name,
+                    "response": {"output": output, "is_error": tr.is_error}
+                });
+                if !tr.tool_call_id.is_empty() {
+                    fr["id"] = json!(tr.tool_call_id);
+                }
                 // The structured/textual tool output stays in the
                 // functionResponse part. The Gemini functionResponse schema
                 // carries the tool's text/JSON result; it has no slot for image
                 // bytes.
                 out.push(json!({
                     "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": tr.tool_name,
-                            "response": {"output": text, "is_error": tr.is_error}
-                        }
-                    }]
+                    "parts": [{ "functionResponse": fr }]
                 }));
                 // OCEAN-132: tool-result images (browser / computer-use
                 // screenshots come back as Content::Image) were silently dropped
@@ -435,8 +479,33 @@ impl Provider for GoogleProvider {
                                 }
                             }
                             if let Some(fc) = part.function_call {
-                                let id = format!("call_{}", tool_blocks.len() + 1);
+                                // OCEAN-145 (2): prefer Gemini's own functionCall.id
+                                // (Gemini 3) so the result can round-trip back via
+                                // functionResponse.id and disambiguate parallel
+                                // same-tool calls. Fall back to a deterministic
+                                // order-preserving `call_<n>` when the model omits
+                                // an id (older models match by name).
+                                let id = fc
+                                    .id
+                                    .clone()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| format!("call_{}", tool_blocks.len() + 1));
                                 let block_index = text_index + if text_started { 1 } else { 0 } + tool_blocks.len();
+                                // OCEAN-145 (3): ACCEPTED PROVIDER LIMITATION — no
+                                // streamed tool-arg deltas. Gemini delivers the
+                                // entire functionCall (name + complete args) in a
+                                // single SSE part; unlike Anthropic/OpenAI it does
+                                // NOT stream partial argument JSON. We therefore
+                                // emit ToolCallStart immediately followed by
+                                // ToolCallEnd with the full args and zero
+                                // ToolArgsDelta events. We deliberately do NOT
+                                // fabricate fake arg-streaming for UI consistency:
+                                // the args genuinely arrive atomically, and faking
+                                // deltas would invent a partial-parse timeline that
+                                // never happened (risking malformed-JSON renders
+                                // mid-stream). This is faithful to Gemini's wire
+                                // format and is the documented, intentional
+                                // behavior — not a bug.
                                 yield Ok(AssistantMessageEvent::ToolCallStart {
                                     content_index: block_index,
                                     id: id.clone(),
@@ -800,6 +869,147 @@ mod tests {
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 8192,
             "thinkingConfig must be present alongside temperature: {body}"
+        );
+    }
+
+    // OCEAN-145 (1): a FAILED tool result must be legible to the model. Gemini
+    // has no first-class `is_error` channel the model reads, so the output text
+    // itself must carry an "ERROR: " marker. (The structured is_error flag is
+    // kept too, but the marker is what the model actually sees.)
+    #[test]
+    fn failed_tool_result_has_error_marker_in_output_text() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "run_cmd".into(),
+            content: vec![Content::text("command not found: frobnicate")],
+            is_error: true,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        let output = out[0]["parts"][0]["functionResponse"]["response"]["output"]
+            .as_str()
+            .expect("output text missing");
+        assert!(
+            output.starts_with("ERROR: "),
+            "failed tool result must prefix output with an ERROR marker so the \
+             model can see the failure: got {output:?}"
+        );
+        assert!(
+            output.contains("command not found: frobnicate"),
+            "original error text must be preserved after the marker: {output:?}"
+        );
+        // The structured flag is still kept for any tooling that reads it.
+        assert_eq!(
+            out[0]["parts"][0]["functionResponse"]["response"]["is_error"],
+            true
+        );
+    }
+
+    // OCEAN-145 (1) negative: a SUCCESSFUL tool result must NOT get the marker.
+    #[test]
+    fn successful_tool_result_has_no_error_marker() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "run_cmd".into(),
+            content: vec![Content::text("ok")],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        assert_eq!(
+            out[0]["parts"][0]["functionResponse"]["response"]["output"],
+            "ok",
+            "successful result output must be untouched (no ERROR prefix)"
+        );
+    }
+
+    // OCEAN-145 (2): two PARALLEL calls to the SAME tool must be distinguishable.
+    // Gemini's only disambiguation channel at the REST level is the
+    // functionResponse.id echoing the originating functionCall.id (name-matching
+    // alone makes two same-name results indistinguishable). The encoder must put
+    // each ToolResultMessage.tool_call_id onto functionResponse.id, and the
+    // replayed functionCall must carry its matching id.
+    #[test]
+    fn parallel_same_tool_results_are_disambiguated_by_id() {
+        let messages = vec![
+            // Model issued two parallel calls to the SAME tool.
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    Content::ToolCall {
+                        id: "fc-paris".into(),
+                        name: "get_temp".into(),
+                        arguments: serde_json::json!({"city": "Paris"}),
+                    },
+                    Content::ToolCall {
+                        id: "fc-london".into(),
+                        name: "get_temp".into(),
+                        arguments: serde_json::json!({"city": "London"}),
+                    },
+                ],
+                api: "generateContent".into(),
+                provider: "google".into(),
+                model: "gemini-3-pro".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: now_ms(),
+            }),
+            // Their results come back (order intentionally swapped).
+            Message::ToolResult(crate::types::ToolResultMessage {
+                tool_call_id: "fc-london".into(),
+                tool_name: "get_temp".into(),
+                content: vec![Content::text("12C")],
+                is_error: false,
+                timestamp: now_ms(),
+            }),
+            Message::ToolResult(crate::types::ToolResultMessage {
+                tool_call_id: "fc-paris".into(),
+                tool_name: "get_temp".into(),
+                content: vec![Content::text("18C")],
+                is_error: false,
+                timestamp: now_ms(),
+            }),
+        ];
+
+        let out = convert_messages(&messages);
+
+        // Replayed functionCalls each carry their id.
+        let model_parts = out[0]["parts"].as_array().expect("model parts");
+        assert_eq!(model_parts[0]["functionCall"]["id"], "fc-paris");
+        assert_eq!(model_parts[1]["functionCall"]["id"], "fc-london");
+
+        // Each functionResponse echoes the matching id, so even though both share
+        // the tool name "get_temp" the model can map each result correctly.
+        let london = &out[1]["parts"][0]["functionResponse"];
+        let paris = &out[2]["parts"][0]["functionResponse"];
+        assert_eq!(london["name"], "get_temp");
+        assert_eq!(paris["name"], "get_temp");
+        assert_eq!(london["id"], "fc-london");
+        assert_eq!(paris["id"], "fc-paris");
+        assert_eq!(london["response"]["output"], "12C");
+        assert_eq!(paris["response"]["output"], "18C");
+        // The two responses are NOT indistinguishable: ids differ.
+        assert_ne!(london["id"], paris["id"]);
+    }
+
+    // OCEAN-145 (2): a functionResponse with no id (empty tool_call_id) must not
+    // emit a null/empty id field — older name-matching models stay clean.
+    #[test]
+    fn tool_result_without_id_omits_id_field() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: String::new(),
+            tool_name: "read_file".into(),
+            content: vec![Content::text("contents")],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        assert!(
+            out[0]["parts"][0]["functionResponse"].get("id").is_none(),
+            "an empty tool_call_id must not produce a functionResponse.id field"
         );
     }
 
