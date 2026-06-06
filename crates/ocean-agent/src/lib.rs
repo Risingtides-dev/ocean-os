@@ -1041,7 +1041,12 @@ fn load_last_model(config_dir: &std::path::Path) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn config_dir_from_env() -> PathBuf {
+/// The directory the daemon uses for its on-disk state (sessions, projects, and
+/// the persistent-rooms SQLite DB). Resolved from `OCEAN_CONFIG_DIR`, then
+/// `XDG_CONFIG_HOME/ocean-rs`, then `~/.config/ocean-rs`, falling back to
+/// `./.ocean-rs`. Exposed so other crates (e.g. the daemon wiring `ocean-store`)
+/// place their files alongside the agent's, under one config dir.
+pub fn config_dir_from_env() -> PathBuf {
     if let Some(path) = std::env::var_os("OCEAN_CONFIG_DIR") {
         return PathBuf::from(path);
     }

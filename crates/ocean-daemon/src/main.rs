@@ -39,6 +39,9 @@ use ocean_runtime::{
     tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
     PermissionDecision as AgentPermissionDecision, PermissionPolicy,
 };
+// Brings the `RoomStore` trait methods (create/get/list/append_message/…) into
+// scope on `SqliteRoomStore` for the persistent-room handlers (OCEAN-107).
+use ocean_store::RoomStore;
 use serde_json::{json, Value};
 use tokio::{
     sync::{broadcast, oneshot, RwLock},
@@ -67,16 +70,18 @@ struct AppState {
     /// observability deck survives a refresh (OCEAN-58). Convergence is still
     /// decided only by the per-council `QuorumEngine`; this only mirrors it.
     longhouse: LonghouseRegistryHandle,
-    /// Persistent Room lifecycle store (OCEAN-65): the durable `Room` entities
-    /// (roster + transcript + trigger policy), distinct from the Track-0
-    /// `RoomSnapshot` projection served by `GET /v1/rooms`. In-memory for now;
-    /// SQLite persistence is a future ticket. Held behind a std `Mutex` like the
-    /// longhouse registry — the guard is always dropped before any `await`.
-    rooms: RoomRegistryHandle,
+    /// Persistent Room lifecycle store (OCEAN-65 / OCEAN-107): the durable `Room`
+    /// entities (roster + transcript + trigger policy), distinct from the Track-0
+    /// `RoomSnapshot` projection served by `GET /v1/rooms`. Backed by
+    /// `ocean_store::SqliteRoomStore` (OCEAN-86) so rooms and transcripts survive
+    /// daemon restarts. Held behind a std `Mutex` like the longhouse registry —
+    /// the guard is always dropped before any `await`, and every store method is
+    /// synchronous, so a std `Mutex` is correct and never blocks the scheduler.
+    rooms: RoomStoreHandle,
 }
 
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
-type RoomRegistryHandle = Arc<Mutex<ocean_agent::RoomRegistry>>;
+type RoomStoreHandle = Arc<Mutex<ocean_store::SqliteRoomStore>>;
 
 type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
 type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
@@ -430,6 +435,23 @@ async fn main() -> anyhow::Result<()> {
     // Built-ins first, then connect any configured MCP servers (non-fatally)
     // and fold their tools into the capability registry before sharing it.
     let runtime = Arc::new(AgentRuntime::from_env()?.with_extensions().await);
+
+    // Persistent rooms (OCEAN-107): open the durable SQLite store at startup so
+    // rooms + transcripts survive a daemon restart. The DB lives under the same
+    // config dir the agent uses for sessions/projects (`OCEAN_CONFIG_DIR`,
+    // `XDG_CONFIG_HOME/ocean-rs`, then `~/.config/ocean-rs`), as `rooms.db` —
+    // overridable wholesale with `OCEAN_DB_PATH`. `open` runs migrations
+    // idempotently, so this is safe on a fresh or an existing DB.
+    let rooms_db_path = room_db_path();
+    if let Some(parent) = rooms_db_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("creating rooms DB directory {}", parent.display())
+        })?;
+    }
+    let room_store = ocean_store::SqliteRoomStore::open(&rooms_db_path)
+        .with_context(|| format!("opening rooms DB at {}", rooms_db_path.display()))?;
+    tracing::info!(path = %rooms_db_path.display(), "persistent rooms store ready");
+
     let state = AppState {
         runtime,
         events: EventBus::new(1024),
@@ -437,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-        rooms: Arc::new(Mutex::new(ocean_agent::RoomRegistry::new())),
+        rooms: Arc::new(Mutex::new(room_store)),
     };
 
     // Background GC: the request/permission registries are otherwise unbounded
@@ -1654,10 +1676,21 @@ async fn longhouse_topic(
 // error }` body, 400 on a bad key, 404 on an unknown room. The store maps to
 // status codes in `room_store_error_status`.
 
-/// Run a closure with the locked room registry, recovering a poisoned lock the
-/// same way the longhouse handlers do (`into_inner`). Synchronous: the guard is
+/// Where the persistent-rooms SQLite DB lives. `OCEAN_DB_PATH` overrides the
+/// whole path; otherwise it is `rooms.db` under the agent's config dir
+/// (`ocean_agent::config_dir_from_env`), so the DB sits next to sessions and
+/// projects under one config directory.
+fn room_db_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("OCEAN_DB_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    ocean_agent::config_dir_from_env().join("rooms.db")
+}
+
+/// Run a closure with the locked room store, recovering a poisoned lock the same
+/// way the longhouse handlers do (`into_inner`). Synchronous: the guard is
 /// dropped before this returns, so no `await` is ever held across the lock.
-fn with_rooms<T>(state: &AppState, f: impl FnOnce(&mut ocean_agent::RoomRegistry) -> T) -> T {
+fn with_rooms<T>(state: &AppState, f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T) -> T {
     let mut guard = match state.rooms.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -1667,13 +1700,17 @@ fn with_rooms<T>(state: &AppState, f: impl FnOnce(&mut ocean_agent::RoomRegistry
 
 /// Map a store error onto an HTTP status + typed JSON body.
 fn room_store_error_response(
-    err: ocean_agent::RoomStoreError,
+    err: ocean_store::RoomStoreError,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use ocean_agent::RoomStoreError::*;
+    use ocean_store::RoomStoreError::*;
     let status = match &err {
         BadKey(_) => StatusCode::BAD_REQUEST,
         UnknownRoom(_) | UnknownParticipant { .. } => StatusCode::NOT_FOUND,
         AlreadyExists(_) => StatusCode::CONFLICT,
+        // A durable backend can fail on I/O or (de)serialization, which the
+        // in-memory registry never could. Surface those as 500s, not as a
+        // misleading 4xx.
+        Db(_) | Encode(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
         status,
@@ -1699,7 +1736,7 @@ async fn room_create(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(req.key.trim());
     let result = with_rooms(&state, |reg| {
-        reg.create(key, req.name, req.trigger_policy, Utc::now())
+        reg.create(key, &req.name, req.trigger_policy, Utc::now())
     });
     match result {
         Ok(rec) => (
@@ -1711,9 +1748,13 @@ async fn room_create(
 }
 
 /// `GET /v1/rooms/persistent` — list all persistent rooms (no transcripts).
-async fn rooms_list_persistent(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let rooms = with_rooms(&state, |reg| reg.list());
-    Json(json!({ "ok": true, "rooms": rooms }))
+async fn rooms_list_persistent(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_rooms(&state, |reg| reg.list()) {
+        Ok(rooms) => (StatusCode::OK, Json(json!({ "ok": true, "rooms": rooms }))),
+        Err(e) => room_store_error_response(e),
+    }
 }
 
 /// `GET /v1/rooms/persistent/{key}` — one persistent room (with its transcript).
@@ -1730,14 +1771,15 @@ async fn room_get(
     }
     let key = RoomKey::new(trimmed);
     match with_rooms(&state, |reg| reg.get(&key)) {
-        Some(rec) => (
+        Ok(Some(rec)) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "room": rec.room, "transcript": rec.transcript })),
         ),
-        None => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": format!("no room with key '{key}'") })),
         ),
+        Err(e) => room_store_error_response(e),
     }
 }
 
@@ -1822,13 +1864,13 @@ async fn room_post_message(
     let append = with_rooms(&state, |reg| {
         reg.append_message(
             &key,
-            req.author_id.clone(),
+            &req.author_id,
             req.author_kind,
             RoomMessageKind::Message,
-            req.body.clone(),
+            &req.body,
             Utc::now(),
         )
-        .map(|msg| (msg, reg.trigger_policy(&key)))
+        .and_then(|msg| reg.trigger_policy(&key).map(|policy| (msg, policy)))
     });
 
     let (msg, policy) = match append {
@@ -1884,7 +1926,7 @@ async fn room_post_message(
                     "system",
                     RoomParticipantKind::System,
                     RoomMessageKind::System,
-                    format!(
+                    &format!(
                         "auto-convene: {} ({})",
                         decision.target_participant.clone().unwrap_or_default(),
                         decision.reason
@@ -4770,7 +4812,7 @@ mod tests {
 
     #[test]
     fn room_store_error_maps_to_expected_status() {
-        use ocean_agent::RoomStoreError;
+        use ocean_store::RoomStoreError;
         let (s, _) = room_store_error_response(RoomStoreError::BadKey("".into()));
         assert_eq!(s, StatusCode::BAD_REQUEST);
         let (s, _) =
@@ -4784,6 +4826,52 @@ mod tests {
             participant: "p".into(),
         });
         assert_eq!(s, StatusCode::NOT_FOUND);
+        // Durable-backend failures are 500s, not misleading 4xx.
+        let (s, _) = room_store_error_response(RoomStoreError::Encode("boom".into()));
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// OCEAN-107: rooms + transcripts must survive a daemon restart. Open the
+    /// SQLite store at a path, create a room and post a message, drop the store
+    /// (simulating daemon shutdown), reopen at the same path, and assert the room
+    /// and its transcript are still there. This is the regression that the
+    /// in-memory `RoomRegistry` could never pass.
+    #[test]
+    fn persistent_rooms_survive_store_reopen() {
+        use ocean_store::{RoomStore, SqliteRoomStore};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("rooms.db");
+        let key = RoomKey::new("survives-restart");
+
+        {
+            let mut store = SqliteRoomStore::open(&db_path).unwrap();
+            store
+                .create(key.clone(), "Survives Restart", None, Utc::now())
+                .unwrap();
+            store
+                .append_message(
+                    &key,
+                    "john",
+                    RoomParticipantKind::Human,
+                    RoomMessageKind::Message,
+                    "still here after restart?",
+                    Utc::now(),
+                )
+                .unwrap();
+            // store dropped here — the daemon process "restarts".
+        }
+
+        let store = SqliteRoomStore::open(&db_path).unwrap();
+        let rec = store
+            .get(&key)
+            .unwrap()
+            .expect("room must survive the reopen");
+        assert_eq!(rec.room.name, "Survives Restart");
+        assert_eq!(rec.transcript.len(), 1);
+        assert_eq!(rec.transcript[0].body, "still here after restart?");
+        // And it shows up in the list view after the reopen.
+        let listed = store.list().unwrap();
+        assert!(listed.iter().any(|r| r.id == key));
     }
 
     #[test]
@@ -4791,7 +4879,8 @@ mod tests {
         // The exact inputs the message handler feeds the evaluator: a stored
         // room's policy + a Mention event parsed from the body. Proves the
         // trigger wiring point fires on a matching event.
-        let mut reg = ocean_agent::RoomRegistry::new();
+        use ocean_store::{RoomStore, SqliteRoomStore};
+        let mut reg = SqliteRoomStore::open_in_memory().unwrap();
         let key = RoomKey::new("r1");
         reg.create(
             key.clone(),
@@ -4806,8 +4895,9 @@ mod tests {
 
         let mentions = parse_mentions("@ocean please look");
         assert_eq!(mentions, vec!["ocean".to_string()]);
+        let policy = reg.trigger_policy(&key).unwrap();
         let decision = evaluate_trigger_policy(
-            reg.trigger_policy(&key).as_ref(),
+            policy.as_ref(),
             &RoomTriggerEvent::Mention {
                 participant_id: mentions[0].clone(),
             },
