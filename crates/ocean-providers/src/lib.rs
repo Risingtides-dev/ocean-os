@@ -468,6 +468,19 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             1_000,
             1_000,
         )),
+        // OCEAN-130: a keyless Fake variant that deterministically emits ONE
+        // tool call, so the permission gate's release path (block→decide→
+        // proceed) can be live-tested over HTTP with no external LLM key. Like
+        // `fake-ok` it needs no credential; the model id is preserved as
+        // `fake-tool` so the agent layer can route it through the real loop with
+        // an injected `FakeToolProvider`.
+        "fake-tool" => Ok(model_selection(
+            ProviderId::Fake,
+            "fake-tool",
+            "fake://local",
+            1_000,
+            1_000,
+        )),
         other if env.get("OCEAN_OPENAI_BASE_URL").is_some() => Ok(model_selection(
             ProviderId::OpenAiCompatible,
             other,
