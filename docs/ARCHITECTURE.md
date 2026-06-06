@@ -59,8 +59,19 @@ ocean-acp
   ACP editors over stdio, mapping editor sessions onto daemon turns.
 
 ocean-heartbeat
-  Scheduler binary for Ocean daemon routines: prompt-injection hooks now,
-  courier jobs later. Generates and runs schedulers that drive the daemon URL.
+  Standalone scheduler CLI for Ocean daemon routines: prompt-injection hooks
+  now, courier jobs later. It is a separate binary (`crates/ocean-heartbeat`,
+  src/main.rs) and an HTTP *client* of the daemon — NOT wired into the daemon
+  and not depended on by it (nothing in the workspace references
+  ocean-heartbeat). Meant to run under launchd/cron, it reads a TOML routine
+  (id, cwd, prompt, optional room_id/project_id, durable session file), GET-
+  prechecks the daemon's /health, then POSTs the routine prompt to
+  /v1/agent/turns and persists the returned session_id so successive runs
+  resume the same session. Subcommands: `run` (fire one routine now), `init`
+  (write a starter routine TOML), `component` (print a render-protocol stat
+  snapshot for PWA/dashboard clients), and `launchd` (print a macOS launchd
+  plist for the routine — does not install it). Targets the daemon at
+  OCEAN_DAEMON_URL / http://127.0.0.1:4780 by default.
 
 ocean-call
   Daemon-side Twilio/LiveKit call-intelligence pipeline. A real phone number,
