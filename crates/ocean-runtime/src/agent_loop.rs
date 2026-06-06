@@ -229,6 +229,27 @@ pub async fn run_agent_with_history(
             .collect();
 
         if tool_calls.is_empty() || stop != StopReason::ToolUse {
+            // The turn is ending without executing tools. There is one hazard
+            // here: the model may have *emitted* a complete tool_use block and
+            // still stopped for a non-ToolUse reason — most commonly
+            // `StopReason::Length`, where output was truncated at the token
+            // limit after a tool_call was already assembled (the provider
+            // reports `max_tokens`, not `tool_use`, as the stop reason). If we
+            // simply break, that assistant tool_use is pushed (above) and
+            // persisted with NO matching tool_result. On the *next* turn of the
+            // session the transcript replays `Assistant(tool_use) … User(prompt)`
+            // with an unanswered call — which Anthropic/OpenAI both 400 on
+            // ("tool_use ids found without tool_result"), silently breaking the
+            // whole session for every client. The trim path only drops orphan
+            // tool_*results*, never an orphan tool_*call*, so nothing downstream
+            // rescues this. We do NOT execute the call (its args may be truncated
+            // and the model did not intend ToolUse); instead we pair each orphan
+            // tool_use with a synthetic error tool_result so the transcript stays
+            // provider-valid and the truncation is surfaced honestly to the model
+            // on resume. See OCEAN-103.
+            for (id, name, _args) in &tool_calls {
+                messages.push(truncated_tool_use_result(id, name));
+            }
             emit(
                 &events,
                 AgentEvent::TurnEnd {
@@ -404,6 +425,26 @@ pub async fn run_agent_with_history(
         messages,
         stopped_at_turn_limit,
         usage: total_usage,
+    })
+}
+
+/// Build the synthetic error `ToolResult` that answers a tool_use the model
+/// emitted but the loop did not execute, because the turn stopped for a
+/// non-`ToolUse` reason (e.g. `StopReason::Length` truncating output after a
+/// complete tool_call was assembled). Pairing the orphan tool_use with this
+/// result keeps the persisted transcript provider-valid on the next turn —
+/// without it, the unanswered tool_use 400s the whole session. See OCEAN-103.
+fn truncated_tool_use_result(id: &str, name: &str) -> Message {
+    Message::ToolResult(ToolResultMessage {
+        tool_call_id: id.to_string(),
+        tool_name: name.to_string(),
+        content: vec![Content::text(
+            "tool call was not executed: the model's response was cut short \
+             (stop reason was not tool_use, e.g. the output token limit was \
+             reached) before this tool_use could be run",
+        )],
+        is_error: true,
+        timestamp: ocean_protocol::now_ms(),
     })
 }
 
@@ -677,6 +718,86 @@ mod tests {
             "kept history must not begin with an orphan tool result"
         );
         assert!(matches!(kept.last(), Some(Message::User { .. })));
+    }
+
+    /// OCEAN-103: a model can emit a complete tool_use and still stop for a
+    /// non-`ToolUse` reason (e.g. `StopReason::Length` — output truncated at the
+    /// token limit after the tool_call was assembled). The loop must NOT leave
+    /// that tool_use unanswered in the transcript: an assistant tool_use with no
+    /// matching tool_result is rejected (400) by Anthropic/OpenAI on the next
+    /// turn, silently breaking the whole session for every client. This exercises
+    /// the assembly the loop performs in that arm: push the assistant tool_use,
+    /// then pair each orphan with `truncated_tool_use_result`. We assert the
+    /// resulting transcript is provider-valid (every tool_use has a matching
+    /// tool_result) and that it stays valid through `trim_to_context_window`.
+    #[test]
+    fn truncated_tool_use_is_paired_with_a_result_no_orphan_call() {
+        use ocean_protocol::AssistantMessage;
+
+        // Assistant message carrying a complete tool_use, but stopped on Length.
+        let assistant = Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::text("partial answer"),
+                Content::ToolCall {
+                    id: "call-trunc".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({ "cmd": "echo hi" }),
+                },
+            ],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            usage: Default::default(),
+            stop_reason: StopReason::Length,
+            error_message: None,
+            timestamp: 0,
+        });
+
+        // Replicate the loop's non-ToolUse-stop assembly: push the assistant
+        // message, then pair every emitted tool_use with a synthetic result.
+        let mut messages = vec![user("do a thing"), assistant];
+        messages.push(truncated_tool_use_result("call-trunc", "bash"));
+
+        // Provider-validity invariant: every tool_use id has a matching
+        // tool_result later in the transcript.
+        assert_no_orphan_tool_use(&messages);
+
+        // The paired result must be a flagged error so the model sees the call
+        // didn't run, not a fake success.
+        let Some(Message::ToolResult(tr)) = messages.last() else {
+            panic!("last message must be the paired tool result");
+        };
+        assert!(tr.is_error, "truncated tool_use result must be is_error");
+        assert_eq!(tr.tool_call_id, "call-trunc");
+
+        // And the pairing survives a trim down to a tiny window: trimming must
+        // not reintroduce an orphan (of either kind).
+        let kept = trim_to_context_window(&messages, "sys", 200_000, 8_000);
+        assert_no_orphan_tool_use(&kept);
+    }
+
+    /// Assert no assistant tool_use is left without a matching tool_result later
+    /// in the transcript (the invariant providers enforce on the *next* turn).
+    fn assert_no_orphan_tool_use(messages: &[Message]) {
+        use std::collections::HashSet;
+        let mut answered: HashSet<&str> = HashSet::new();
+        for m in messages {
+            if let Message::ToolResult(r) = m {
+                answered.insert(r.tool_call_id.as_str());
+            }
+        }
+        for m in messages {
+            if let Message::Assistant(a) = m {
+                for c in &a.content {
+                    if let Content::ToolCall { id, .. } = c {
+                        assert!(
+                            answered.contains(id.as_str()),
+                            "orphan tool_use {id:?} has no matching tool_result: {messages:#?}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
