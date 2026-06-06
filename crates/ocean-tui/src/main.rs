@@ -2839,6 +2839,8 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             thinking_level: None,
             // The TUI uses the daemon's global model selection.
             model_id: None,
+            // The TUI does not attach images to turns.
+            images: None,
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(

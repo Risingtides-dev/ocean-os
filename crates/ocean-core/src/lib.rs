@@ -61,10 +61,27 @@ impl RequestState {
     }
 }
 
+/// An image attached to a prompt/turn (OCEAN-115). Mirrors
+/// `ocean_agent_sdk::TurnImage` but lives here so `ocean-core` stays free of an
+/// `ocean-protocol` dependency (same reasoning as [`TokenUsage`]). The agent
+/// layer converts each entry into a `Content::Image` block on the first user
+/// message of the turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptImage {
+    /// MIME type, e.g. `"image/png"`.
+    pub mime_type: String,
+    /// base64-encoded bytes, or a `data:<mime>;base64,...` URL.
+    pub data: String,
+}
+
 /// Payload for `POST /v1/prompt`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub prompt: String,
+    /// Optional images for this turn (OCEAN-115). Emitted as `Content::Image`
+    /// blocks on the first user message. Defaults to none for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<PromptImage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<RequestId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

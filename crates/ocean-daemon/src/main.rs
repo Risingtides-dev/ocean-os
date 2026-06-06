@@ -29,7 +29,8 @@ use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectResponse,
-    ProjectsResponse, PromptRequest, RequestControlResponse, RequestCreateResponse, RequestId,
+    ProjectsResponse, PromptImage, PromptRequest, RequestControlResponse, RequestCreateResponse,
+    RequestId,
     evaluate_trigger_policy, RequestState, RequestStatus, RequestsResponse, RoomId, RoomKey,
     RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind, RoomSnapshot,
     RoomTriggerEvent, RoomTriggerPolicy, RoomsResponse, SessionDetail, SessionId, SessionResponse,
@@ -2125,6 +2126,7 @@ fn spawn_room_agent_turn(
         let yolo = yolo_enabled();
         let mut prompt_req = PromptRequest {
             prompt,
+            images: None,
             request_id: Some(request_id),
             session_id: Some(core_sid(session_id)),
             create_if_missing: is_new,
@@ -3231,6 +3233,8 @@ async fn agent_voice(
         // Voice turns defer to the runtime's global reasoning/model selection.
         thinking_level: None,
         model_id: None,
+        // Voice turns carry no images.
+        images: None,
     };
     agent_turn(State(state), Json(turn)).await
 }
@@ -3403,7 +3407,21 @@ async fn agent_turn(
         client_type,
         thinking_level,
         model_id,
+        images,
     } = req;
+
+    // OCEAN-115: map the wire-level `TurnImage`s onto `ocean-core`'s `PromptImage`
+    // (kept separate so ocean-core stays free of an ocean-protocol dependency).
+    // The agent layer turns each into a `Content::Image` block on the first user
+    // message. `None`/empty leaves the turn text-only, unchanged.
+    let images: Option<Vec<PromptImage>> = images.map(|imgs| {
+        imgs.into_iter()
+            .map(|img| PromptImage {
+                mime_type: img.mime_type,
+                data: img.data,
+            })
+            .collect()
+    });
 
     // Resolve the working directory: a non-empty cwd wins; else the project's
     // workspace_root; else an explicit error — never the daemon's own launch
@@ -3539,6 +3557,7 @@ async fn agent_turn(
     let guided_prompt = apply_room_guidance(room_id, &prompt);
     let mut prompt_req = PromptRequest {
         prompt: guided_prompt,
+        images,
         request_id: Some(request_id),
         session_id: Some(core_sid(session_id)),
         // New session → allow creating under the freshly-minted id. Resume

@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             let req = PromptRequest {
                 request_id: None,
                 prompt,
+                images: None,
                 session_id: None,
                 create_if_missing: true,
                 max_turns,
