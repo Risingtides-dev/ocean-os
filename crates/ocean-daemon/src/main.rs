@@ -1861,64 +1861,76 @@ async fn room_post_message(
     Json(req): Json<RoomMessageRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
+    // Append the message, then read back the policy AND the participant roster
+    // in the same lock acquisition — we need the roster to resolve a mentioned
+    // id to a runnable agent participant. The std mutex guard is dropped when
+    // `with_rooms` returns; it is never held across an `.await`.
     let append = with_rooms(&state, |reg| {
-        reg.append_message(
+        let msg = reg.append_message(
             &key,
             &req.author_id,
             req.author_kind,
             RoomMessageKind::Message,
             &req.body,
             Utc::now(),
-        )
-        .and_then(|msg| reg.trigger_policy(&key).map(|policy| (msg, policy)))
+        )?;
+        let policy = reg.trigger_policy(&key)?;
+        let roster = reg
+            .get(&key)?
+            .map(|rec| rec.room.participants)
+            .unwrap_or_default();
+        Ok::<_, ocean_store::RoomStoreError>((msg, policy, roster))
     });
 
-    let (msg, policy) = match append {
-        Ok(v) => v,
+    let (msg, policy, roster) = match append {
+        Ok((msg, policy, roster)) => (msg, policy, roster),
         Err(e) => return room_store_error_response(e),
     };
 
-    // ---- Trigger policy evaluation wiring point (OCEAN-65) -----------------
+    // ---- Auto-convene wiring point (OCEAN-65 / OCEAN-111) -------------------
     //
-    // Parse @-mentions from the message body and evaluate each against the
-    // room's trigger policy. For every positive decision we emit a notice event
-    // and append a `System` transcript line so the convene is auditable in the
-    // room itself.
+    // Parse @-mentions from the message body, evaluate each against the room's
+    // trigger policy, and for every positive decision that resolves to an AGENT
+    // participant in the roster: (a) emit the `room_trigger` notice + an audit
+    // line (the observable contract, unchanged), and (b) ACTUALLY queue an
+    // agent turn that wakes the agent, gives it the room context, and posts its
+    // reply back into the transcript.
     //
-    // The notice event is the observable contract today. The ACTUAL
-    // auto-convene — queuing an agent turn for `decision.target_participant` —
-    // hooks in HERE: the daemon already spawns turns via `agent_turn` /
-    // `state.runtime`; a follow-up wires that target id + the room transcript
-    // (as read-before-answer context) into a queued `AgentTurnRequest`. That is
-    // deliberately deferred so this PR stays out of the in-flight `agent_turn`
-    // handler and its permission/cwd code on the held security PRs.
+    // Anti-loop guardrail #1 (the cheap, total one): an agent's OWN posted
+    // reply is authored as `RoomParticipantKind::Agent`, and we never evaluate
+    // triggers on agent-authored messages. So an agent that @-mentions another
+    // agent (or itself) in its reply can never ping-pong the room. Only
+    // human/bot/system-authored lines can convene an agent.
     let mut fired = Vec::new();
-    for participant_id in parse_mentions(&req.body) {
-        let decision = evaluate_trigger_policy(
-            policy.as_ref(),
-            &RoomTriggerEvent::Mention {
-                participant_id: participant_id.clone(),
-            },
-        );
-        if decision.should_convene {
+    if !matches!(req.author_kind, RoomParticipantKind::Agent) {
+        for participant_id in parse_mentions(&req.body) {
+            let decision = evaluate_trigger_policy(
+                policy.as_ref(),
+                &RoomTriggerEvent::Mention {
+                    participant_id: participant_id.clone(),
+                },
+            );
+            if !decision.should_convene {
+                continue;
+            }
+
             // Emit a notice onto the agent event bus so any subscriber sees the
-            // would-be convene. Uses the generic Extension event so it never
-            // collides with the Track-0/longhouse event scoping rules.
-            state
-                .agent_events
-                .emit(AgentTurnEvent::Extension {
-                    extension: "room_trigger".into(),
-                    payload: json!({
-                        "room": key.as_str(),
-                        "target": decision.target_participant,
-                        "reason": decision.reason,
-                        "triggered_by_seq": msg.seq,
-                    }),
-                    // Room-wide, not session-scoped: reaches `?all=1` subscribers
-                    // only, exactly like longhouse council events (Invariant 5
-                    // exception). Keeps this out of any single session's stream.
-                    scope: None,
-                });
+            // convene. Uses the generic Extension event so it never collides
+            // with the Track-0/longhouse event scoping rules.
+            state.agent_events.emit(AgentTurnEvent::Extension {
+                extension: "room_trigger".into(),
+                payload: json!({
+                    "room": key.as_str(),
+                    "target": decision.target_participant,
+                    "reason": decision.reason,
+                    "triggered_by_seq": msg.seq,
+                }),
+                // Room-wide, not session-scoped: reaches `?all=1` subscribers
+                // only, exactly like longhouse council events (Invariant 5
+                // exception). Keeps this out of any single session's stream.
+                scope: None,
+            });
+
             // Audit line inside the room.
             let _ = with_rooms(&state, |reg| {
                 reg.append_message(
@@ -1934,6 +1946,19 @@ async fn room_post_message(
                     Utc::now(),
                 )
             });
+
+            // Resolve the target participant id → an AGENT participant in the
+            // roster. Only genuine `Agent` participants are runnable; a mention
+            // of a human/bot/tool id (or an unknown id) emits the notice but
+            // queues nothing — there is no agent to wake.
+            if let Some(agent) = decision
+                .target_participant
+                .as_deref()
+                .and_then(|id| resolve_agent_participant(&roster, id))
+            {
+                spawn_room_agent_turn(state.clone(), key.clone(), agent, msg.seq);
+            }
+
             fired.push(decision);
         }
     }
@@ -1975,6 +2000,190 @@ fn parse_mentions(body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+// ---- Auto-convene: participant→session resolution + turn queueing (OCEAN-111)
+
+/// Fixed namespace for deriving a stable per-(room, agent) session id with UUID
+/// v5. Same room + same agent participant ⇒ same session every time, so the
+/// agent RESUMES its room transcript across mentions instead of forking a fresh
+/// session on every wake. The constant itself is arbitrary but must never
+/// change, or existing room-agent sessions would orphan.
+const ROOM_AGENT_SESSION_NS: Uuid = Uuid::from_u128(0x0ce1_a111_0000_4780_8000_526f_6f6d_4147);
+
+/// How many recent transcript lines to feed the woken agent as context. Enough
+/// to ground the reply in the conversation without bloating the prompt.
+const ROOM_CONTEXT_TAIL: usize = 20;
+
+/// Resolve a mentioned participant id to a runnable AGENT participant. Returns
+/// the participant only when it exists in the roster AND is of kind `Agent` —
+/// a mention of a human/bot/tool/system id (or an unknown id) resolves to
+/// `None`, so the notice still fires but no turn is queued.
+fn resolve_agent_participant(
+    roster: &[RoomParticipant],
+    participant_id: &str,
+) -> Option<RoomParticipant> {
+    roster
+        .iter()
+        .find(|p| p.id == participant_id && matches!(p.kind, RoomParticipantKind::Agent))
+        .cloned()
+}
+
+/// Deterministic session id for a (room, agent-participant) pair. Stable across
+/// daemon restarts and repeated mentions so the agent keeps one durable
+/// transcript per room.
+fn room_agent_session_id(room: &RoomKey, participant_id: &str) -> AgentSessionId {
+    let seed = format!("{}:{}", room.as_str(), participant_id);
+    sdk_sid(Uuid::new_v5(&ROOM_AGENT_SESSION_NS, seed.as_bytes()))
+}
+
+/// Build the prompt handed to a woken agent: a framing header that tells it it's
+/// answering a mention in a room, the recent transcript as context, and a
+/// pointer at the triggering line. `tail` is oldest→newest.
+fn build_room_prompt(
+    room: &RoomKey,
+    agent: &RoomParticipant,
+    tail: &[ocean_core::RoomMessage],
+    triggered_by_seq: u64,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "You are \"{}\" (participant id `{}`), an agent in the Ocean room \"{}\". \
+You were just @-mentioned. Read the recent transcript below and reply directly \
+to the mention. Your reply will be posted back into the room for everyone to \
+see, so address the room — do not narrate that you are an agent or that you \
+were mentioned.\n\n",
+        agent.display_name,
+        agent.id,
+        room.as_str(),
+    ));
+    out.push_str("--- recent room transcript ---\n");
+    for m in tail {
+        let marker = if m.seq == triggered_by_seq { "  «— mention" } else { "" };
+        out.push_str(&format!(
+            "[#{seq}] {author}: {body}{marker}\n",
+            seq = m.seq,
+            author = m.author_id,
+            body = m.body,
+            marker = marker,
+        ));
+    }
+    out.push_str("--- end transcript ---\n\nYour reply:");
+    out
+}
+
+/// Queue an agent turn in response to a room mention, run it asynchronously, and
+/// post the reply back into the room. The room store mutex is NEVER held across
+/// the await: every store touch goes through `with_rooms`, whose std guard is
+/// dropped synchronously before `runtime.prompt(...).await`.
+///
+/// Anti-loop guardrail #2: the reply is posted with `author_kind = Agent`, and
+/// `room_post_message` refuses to evaluate triggers on agent-authored messages,
+/// so a reply can never re-convene anyone.
+fn spawn_room_agent_turn(
+    state: AppState,
+    room: RoomKey,
+    agent: RoomParticipant,
+    triggered_by_seq: u64,
+) {
+    tokio::spawn(async move {
+        // Resolve a working directory for the turn. A room-bound agent has no
+        // project binding in the current data model, so fall back to the
+        // daemon's launch dir — a sensible default that always exists. (See the
+        // assumption documented on the PR: room participants gain a workspace
+        // binding in a follow-up; until then sessions are keyed by room+agent.)
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
+
+        let session_id = room_agent_session_id(&room, &agent.id);
+
+        // Read the recent transcript tail (read-before-answer context). Lock is
+        // dropped when `with_rooms` returns, before any await below.
+        let tail = with_rooms(&state, |reg| reg.transcript(&room, None))
+            .unwrap_or_default();
+        let tail: Vec<_> = tail
+            .into_iter()
+            .rev()
+            .take(ROOM_CONTEXT_TAIL)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let prompt = build_room_prompt(&room, &agent, &tail, triggered_by_seq);
+
+        // Does this session already exist on disk? If so we RESUME it (strict);
+        // otherwise we create it under the deterministic id. This mirrors the
+        // create-if-missing logic in `agent_turn`. `session_detail` errors on a
+        // missing/corrupt session, so `Ok` ⇒ exists ⇒ resume.
+        let is_new = state
+            .runtime
+            .session_detail(core_sid(session_id))
+            .is_err();
+
+        let request_id = Uuid::new_v4();
+        let yolo = yolo_enabled();
+        let mut prompt_req = PromptRequest {
+            prompt,
+            request_id: Some(request_id),
+            session_id: Some(core_sid(session_id)),
+            create_if_missing: is_new,
+            max_turns: None,
+            yolo,
+            cwd,
+            project_id: None,
+            client_type: Some("room".to_string()),
+        };
+
+        let (_request_id, cancel) = register_running_request(
+            &state,
+            &mut prompt_req,
+            format!("auto-convene: {} in room {}", agent.id, room.as_str()),
+            RequestState::Running,
+        )
+        .await;
+
+        let control =
+            build_prompt_control(&state, request_id, Some(core_sid(session_id)), yolo, cancel);
+
+        let res = state.runtime.prompt(prompt_req, control).await;
+        record_prompt_result(&state, request_id, &res).await;
+
+        // Post the agent's reply back into the room as the agent participant.
+        // The lock is taken synchronously here, after the await completed.
+        if res.ok {
+            let body = res.stdout.trim();
+            if !body.is_empty() {
+                let _ = with_rooms(&state, |reg| {
+                    reg.append_message(
+                        &room,
+                        &agent.id,
+                        RoomParticipantKind::Agent,
+                        RoomMessageKind::Message,
+                        body,
+                        Utc::now(),
+                    )
+                });
+            }
+        } else {
+            // Surface a failed convene as a system audit line so the room shows
+            // the agent was woken but could not answer (e.g. no provider key).
+            let _ = with_rooms(&state, |reg| {
+                reg.append_message(
+                    &room,
+                    "system",
+                    RoomParticipantKind::System,
+                    RoomMessageKind::System,
+                    &format!(
+                        "auto-convene failed for {}: {}",
+                        agent.id,
+                        res.stderr.lines().next().unwrap_or("turn failed")
+                    ),
+                    Utc::now(),
+                )
+            });
+        }
+    });
 }
 
 #[derive(serde::Deserialize)]
@@ -5256,5 +5465,191 @@ mod tests {
             agent_decision,
             AgentPermissionDecision::Allow | AgentPermissionDecision::AllowSession
         ));
+    }
+
+    // ---- Auto-convene end-to-end (OCEAN-111) -------------------------------
+
+    /// Serialize the runtime-building auto-convene tests: they mutate process
+    /// env (`OCEAN_MODEL`/`OCEAN_CONFIG_DIR`) to select the Fake provider, and
+    /// env is process-global, so two of them racing would clobber each other.
+    static AUTO_CONVENE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Build an `AppState` whose runtime is pinned to the Fake provider (so a
+    /// turn runs synchronously and deterministically with no live LLM) and whose
+    /// room store is a fresh in-memory SQLite DB. Returns the state plus the
+    /// tempdir guard (kept alive for the session config dir). Caller must hold
+    /// `AUTO_CONVENE_ENV_LOCK` for the duration.
+    fn fake_convene_state(tmp: &tempfile::TempDir) -> AppState {
+        std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
+        std::env::set_var("OCEAN_MODEL", "fake-ok");
+        // YOLO so the fake turn never blocks on a permission prompt (the fake
+        // provider does no tool calls, but keep the gate out of the path).
+        std::env::set_var("OCEAN_YOLO", "1");
+        let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
+        let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        AppState {
+            runtime,
+            events: EventBus::new(1024),
+            agent_events: AgentEventBus::new(1024),
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            permissions: Arc::new(RwLock::new(HashMap::new())),
+            longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
+            rooms: Arc::new(Mutex::new(store)),
+        }
+    }
+
+    /// Poll the room transcript until `pred` matches a message or the deadline
+    /// passes. The convened turn runs on a spawned task, so the reply lands
+    /// asynchronously after `room_post_message` returns.
+    async fn wait_for_message(
+        state: &AppState,
+        key: &RoomKey,
+        pred: impl Fn(&ocean_core::RoomMessage) -> bool,
+    ) -> Option<ocean_core::RoomMessage> {
+        for _ in 0..200 {
+            let found = with_rooms(state, |reg| reg.transcript(key, None))
+                .unwrap_or_default()
+                .into_iter()
+                .find(&pred);
+            if found.is_some() {
+                return found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn at_mention_queues_turn_and_posts_reply_back() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // Room with an agent participant `helper` and an on_mention policy.
+        let key = RoomKey::new("convene-room");
+        with_rooms(&state, |reg| {
+            reg.create(
+                key.clone(),
+                "Convene Room",
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )
+            .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        // A human @-mentions the agent → should convene + queue a turn.
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path("convene-room".to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@helper can you summarize the plan?".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let fired = body.0.get("triggers_fired").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(fired.len(), 1, "mention of an agent must fire exactly one trigger");
+
+        // The convened turn runs async; its reply lands as an Agent-authored
+        // message authored by `helper` carrying the fake provider's output.
+        let reply = wait_for_message(&state, &key, |m| {
+            m.author_id == "helper"
+                && matches!(m.author_kind, RoomParticipantKind::Agent)
+                && matches!(m.kind, RoomMessageKind::Message)
+        })
+        .await
+        .expect("the woken agent must post a reply back into the room");
+        assert!(
+            reply.body.contains("OCEAN_FAKE_OK"),
+            "reply should carry the (fake) provider output, got: {:?}",
+            reply.body
+        );
+
+        // A session was queued/registered for the deterministic room+agent id.
+        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let registered = state
+            .requests
+            .read()
+            .await
+            .values()
+            .any(|c| c.status.session_id == Some(expected_sid));
+        assert!(registered, "a turn must be registered for the room+agent session");
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_authored_message_does_not_self_trigger() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        let key = RoomKey::new("no-loop-room");
+        with_rooms(&state, |reg| {
+            reg.create(
+                key.clone(),
+                "No Loop Room",
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )
+            .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        // An AGENT posts a message that @-mentions another agent (and itself).
+        // This is exactly the ping-pong shape we must NOT amplify: agent-authored
+        // messages are never evaluated for triggers.
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path("no-loop-room".to_string()),
+            Json(RoomMessageRequest {
+                author_id: "helper".into(),
+                author_kind: RoomParticipantKind::Agent,
+                body: "done — cc @helper @other".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let fired = body.0.get("triggers_fired").and_then(|v| v.as_array()).unwrap();
+        assert!(
+            fired.is_empty(),
+            "an agent-authored message must never fire a trigger (anti-loop guard)"
+        );
+
+        // Give any errant spawned turn a moment; assert no turn was registered.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            state.requests.read().await.is_empty(),
+            "no turn may be queued from an agent-authored message"
+        );
+
+        std::env::remove_var("OCEAN_YOLO");
     }
 }
