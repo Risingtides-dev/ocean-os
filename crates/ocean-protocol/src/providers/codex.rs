@@ -182,11 +182,18 @@ fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
 }
 
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+    // OCEAN-165: do NOT set `parallel_tool_calls`. The Codex backend speaks the
+    // OpenAI Responses API, which accepts this param and defaults it to `true`
+    // (parallel tool calls allowed) when omitted. Hardcoding `false` forced every
+    // multi-tool turn to serialize: a 3-tool turn that is one round-trip on
+    // Anthropic/OpenAI/Gemini became 3 sequential round-trips here. The sibling
+    // providers (openai.rs, anthropic, google.rs) never set this field and so ride
+    // their API default; omitting it here restores parity — Codex now allows
+    // parallel tool calls like the rest.
     let mut body = json!({
         "model": model.id,
         "input": convert_input(&context.messages),
         "tool_choice": "auto",
-        "parallel_tool_calls": false,
         "store": false,
         "stream": true,
     });
@@ -822,6 +829,43 @@ mod tests {
         assert_eq!(out[0]["content"][0]["text"], "visible answer");
         assert_eq!(out[1]["type"], "function_call");
         assert_eq!(out[1]["name"], "calc");
+    }
+
+    fn codex_model() -> Model {
+        Model {
+            id: "gpt-5-codex".into(),
+            name: "GPT-5 Codex".into(),
+            api: "responses".into(),
+            provider: "codex".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            reasoning: true,
+            context_window: 272_000,
+            max_tokens: 16_384,
+        }
+    }
+
+    // OCEAN-165: the Codex backend speaks the OpenAI Responses API, which allows
+    // parallel tool calls by default (parallel_tool_calls defaults to true when
+    // omitted). The provider previously hardcoded `parallel_tool_calls: false`,
+    // serializing multi-tool turns vs Anthropic/OpenAI/Gemini. build_body must NOT
+    // emit the field at all, so Codex rides the API default like the siblings.
+    #[test]
+    fn build_body_does_not_force_parallel_tool_calls_off() {
+        let model = codex_model();
+        let context = Context::default();
+        let options = StreamOptions::default();
+
+        let body = build_body(&model, &context, &options);
+
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "Codex must not set parallel_tool_calls — it should ride the Responses \
+             API default (parallel allowed), matching the other providers. Got: {body}"
+        );
+        // Sanity: the rest of the request shape is intact.
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
     }
 
     // OCEAN-158: the Responses API reports cached-prompt tokens under
