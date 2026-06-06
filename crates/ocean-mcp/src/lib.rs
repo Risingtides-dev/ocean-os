@@ -11,7 +11,8 @@
 //!
 //! Layout:
 //! - [`jsonrpc`] — JSON-RPC 2.0 message types
-//! - [`transport`] — the [`Transport`](transport::Transport) trait + stdio impl
+//! - [`transport`] — the [`Transport`](transport::Transport) trait + stdio and
+//!   streamable-HTTP impls
 //! - [`client`] — [`McpClient`](client::McpClient): lifecycle, discovery, calls
 //! - [`config`] — [`McpServerConfig`](config::McpServerConfig) for `[[mcp.server]]`
 //! - [`provider`] — [`McpProvider`](provider::McpProvider): the registry adapter
@@ -25,4 +26,4 @@ pub mod transport;
 pub use client::{McpCallResult, McpClient, McpToolDef, PROTOCOL_VERSION};
 pub use config::{McpServerConfig, McpTransportKind};
 pub use provider::McpProvider;
-pub use transport::{StdioTransport, Transport};
+pub use transport::{HttpTransport, McpTransportError, StdioTransport, Transport};

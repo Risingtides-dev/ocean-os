@@ -2,6 +2,9 @@
 //! `fake_server` test binary). Exercises the full path: spawn → initialize →
 //! tools/list → tools/call, plus the provider's namespacing and the
 //! non-fatal-failure behaviour for a bad command.
+//!
+//! Also covers the streamable-HTTP transport (OCEAN-166) end-to-end against a
+//! mock HTTP MCP server, proving an `http`-typed config actually yields tools.
 
 use std::sync::Arc;
 
@@ -195,4 +198,93 @@ async fn registry_merges_builtins_with_live_mcp_server() {
     sorted.sort();
     sorted.dedup();
     assert_eq!(sorted.len(), names.len());
+}
+
+/// OCEAN-166: an `http`-transport server must actually contribute its tools, not
+/// silently yield none. This drives `McpProvider::connect` against a mock
+/// streamable-HTTP MCP server (a raw TCP listener replying with `application/json`
+/// JSON-RPC) and asserts the provider comes up `Ready` with namespaced tools.
+#[tokio::test]
+async fn http_transport_provider_yields_tools() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                let parsed: serde_json::Value =
+                    serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null);
+                let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = parsed.get("id").cloned();
+
+                // Notification → 202, no body.
+                if id.is_none() {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "mock-http", "version": "0.0.0" }
+                    }),
+                    "tools/list" => json!({
+                        "tools": [{
+                            "name": "ping",
+                            "description": "ping over http",
+                            "inputSchema": { "type": "object" }
+                        }]
+                    }),
+                    _ => json!({}),
+                };
+                let payload = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let cfg = McpServerConfig {
+        name: "remote".into(),
+        transport: McpTransportKind::Http,
+        command: Some(format!("http://{addr}/mcp")),
+        args: vec![],
+        env: vec![],
+        enabled: true,
+    };
+
+    let provider = McpProvider::connect(&cfg, |_| None, Duration::from_secs(10))
+        .await
+        .expect("http connect should succeed against a reachable endpoint");
+
+    assert_eq!(
+        provider.health().await,
+        ProviderHealth::Ready,
+        "an http server that lists tools must be Ready, not silently toolless"
+    );
+
+    let tools = provider.tools(&SessionContext::default()).await;
+    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    assert!(
+        names.contains(&"mcp__remote__ping"),
+        "http server's tool must be namespaced and present, got {names:?}"
+    );
 }

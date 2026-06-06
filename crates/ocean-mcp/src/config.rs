@@ -10,15 +10,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Which transport to use for a server. Only `stdio` is implemented today;
-/// the enum exists so a manifest can already name `http` and we add the
-/// transport behind it without a config migration.
+/// Which transport to use for a server: `stdio` (spawn a child process) or
+/// `http` (the MCP streamable-HTTP transport). For `http`, the `command` field
+/// carries the endpoint URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransportKind {
     #[default]
     Stdio,
-    /// Reserved — not yet implemented; configuring it is a startup warning.
+    /// Streamable-HTTP transport (OCEAN-166). The `command` field holds the
+    /// endpoint URL (`http://` / `https://`).
     Http,
 }
 
