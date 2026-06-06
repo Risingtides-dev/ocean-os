@@ -274,12 +274,23 @@ struct ResponsesUsage {
     // `input_tokens_details.cached_tokens`. Decode them into usage.cache_read.
     #[serde(default)]
     input_tokens_details: Option<InputTokensDetails>,
+    // OCEAN-164: the Responses API reports reasoning tokens under
+    // `output_tokens_details.reasoning_tokens`. They are already part of
+    // `output_tokens`, so we decode them only to surface the reasoning subset.
+    #[serde(default)]
+    output_tokens_details: Option<OutputTokensDetails>,
 }
 
 #[derive(Deserialize, Default)]
 struct InputTokensDetails {
     #[serde(default)]
     cached_tokens: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct OutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -540,6 +551,9 @@ impl Provider for CodexProvider {
                                 };
                                 if let Some(d) = u.input_tokens_details {
                                     usage.cache_read = d.cached_tokens;
+                                }
+                                if let Some(d) = u.output_tokens_details {
+                                    usage.reasoning = d.reasoning_tokens;
                                 }
                             }
                         }
@@ -827,6 +841,28 @@ mod tests {
             u.input_tokens_details.expect("details present").cached_tokens,
             1792,
             "cached_tokens must decode from input_tokens_details"
+        );
+    }
+
+    // OCEAN-164: the Responses API reports reasoning tokens under
+    // `output_tokens_details.reasoning_tokens`. The completed-event usage must
+    // decode that field so it can populate usage.reasoning. Reasoning is already
+    // inside output_tokens, so it is surfaced only to show the reasoning subset.
+    #[test]
+    fn responses_usage_decodes_reasoning_tokens() {
+        let raw = r#"{
+            "input_tokens": 2000,
+            "output_tokens": 320,
+            "total_tokens": 2320,
+            "output_tokens_details": {"reasoning_tokens": 256}
+        }"#;
+        let u: ResponsesUsage = serde_json::from_str(raw).expect("responses usage parses");
+        assert_eq!(
+            u.output_tokens_details
+                .expect("details present")
+                .reasoning_tokens,
+            256,
+            "reasoning_tokens must decode from output_tokens_details"
         );
     }
 }
