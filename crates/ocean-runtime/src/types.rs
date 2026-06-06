@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ocean_protocol::{Content, Message, Model, StreamOptions, ThinkingLevel, Tool};
+use ocean_protocol::{Content, Message, Model, Provider, StreamOptions, ThinkingLevel, Tool};
 use serde_json::Value;
 
 /// Side-effect events a tool may emit during execution. The agent loop forwards
@@ -125,6 +125,13 @@ pub struct AgentConfig {
     /// SDK) can route events without re-attaching session context themselves.
     /// `None` for ad-hoc runs (tests, embedded use) that have no session.
     pub session_id: Option<String>,
+    /// Optional provider override. When `None` (the production default) the loop
+    /// dispatches through [`ocean_protocol::stream_simple`], picking the real
+    /// provider from `model.api`. When `Some`, the loop streams from this
+    /// provider instead — the injection seam that lets end-to-end tests drive
+    /// the real agent loop against a scripted [`Provider`] with no network or
+    /// credentials. See `with_provider` and the e2e tests in `tests/`.
+    pub provider: Option<Arc<dyn Provider>>,
 }
 
 impl AgentConfig {
@@ -142,6 +149,7 @@ impl AgentConfig {
             system_prompt: system_prompt.into(),
             permission: Arc::new(AllowAllPolicy),
             session_id: None,
+            provider: None,
         }
     }
 
@@ -180,6 +188,15 @@ impl AgentConfig {
 
     pub fn with_thinking(mut self, level: ThinkingLevel) -> Self {
         self.thinking_level = level;
+        self
+    }
+
+    /// Inject a provider for the loop to stream from instead of the real
+    /// `stream_simple` dispatch. The injection seam that lets tests drive the
+    /// agent loop end-to-end against a scripted [`Provider`] — no network, no
+    /// credentials. Production never sets this (the field stays `None`).
+    pub fn with_provider(mut self, provider: Arc<dyn Provider>) -> Self {
+        self.provider = Some(provider);
         self
     }
 }

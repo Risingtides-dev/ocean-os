@@ -41,3 +41,7 @@ path = "tests/tools_smoke.rs"
 [[test]]
 name = "trim_invariants"
 path = "tests/trim_invariants.rs"
+
+[[test]]
+name = "agent_loop_e2e"
+path = "tests/agent_loop_e2e.rs"

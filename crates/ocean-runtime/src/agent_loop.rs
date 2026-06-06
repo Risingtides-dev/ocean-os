@@ -126,7 +126,14 @@ pub async fn run_agent_with_history(
         // a turn that a provider has hung on.
         let timeout_secs = config.turn_timeout_secs();
         let stream_work = async {
-            let mut stream = stream_simple(&config.model, &ctx, &options).await?;
+            // Stream from the injected provider when one is set (the e2e-test
+            // seam), otherwise dispatch to the real provider via `stream_simple`
+            // (`model.api` → Anthropic/OpenAI/…). Production never sets the
+            // override, so this is an unconditional `stream_simple` in practice.
+            let mut stream = match &config.provider {
+                Some(provider) => provider.stream(&config.model, &ctx, &options).await?,
+                None => stream_simple(&config.model, &ctx, &options).await?,
+            };
             while let Some(ev) = stream.next().await {
                 // A cancel can land mid-stream (client hit halt while the
                 // assistant was still typing). The provider also yields
