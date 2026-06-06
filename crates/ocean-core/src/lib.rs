@@ -234,6 +234,15 @@ pub enum SessionRunState {
     Errored,
 }
 
+/// Lightweight record of an image block present on a transcript entry. Carries
+/// only the `mime_type` so clients can render an image-attached badge/placeholder
+/// without the (potentially large) base64 payload being inlined into the
+/// transcript projection. The raw bytes still live in `SessionDetail::messages`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageMeta {
+    pub mime_type: String,
+}
+
 /// One display-ready transcript entry derived from a persisted session message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionTranscriptEntry {
@@ -242,6 +251,11 @@ pub struct SessionTranscriptEntry {
     pub timestamp_ms: Option<i64>,
     #[serde(default)]
     pub text: String,
+    /// Image blocks attached to this turn, by mime_type only (no base64). Empty
+    /// for turns with no images. Lets a replaying client show that an image was
+    /// attached even though `text` only carries Text/Thinking content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

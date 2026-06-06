@@ -5315,6 +5315,7 @@ mod tests {
             role: role.into(),
             timestamp_ms: Some(ts_ms),
             text: text.into(),
+            images: vec![],
             tool_call_id: None,
             tool_name: None,
             is_error: None,

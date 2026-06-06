@@ -6955,6 +6955,7 @@ mod tests {
                 role: "assistant".to_string(),
                 timestamp_ms: None,
                 text: "assistant summary line".to_string(),
+                images: vec![],
                 tool_call_id: None,
                 tool_name: None,
                 is_error: None,
