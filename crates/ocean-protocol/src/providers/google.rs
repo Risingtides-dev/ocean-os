@@ -201,8 +201,15 @@ fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
 /// Injects the reasoning budget onto the Gemini request body under
 /// `generationConfig.thinkingConfig`, using the REST shape the v1beta
 /// `generateContent` endpoint expects:
-/// `generationConfig.thinkingConfig.thinkingBudget` (token count) plus
-/// `includeThoughts` so thought summaries stream back.
+/// `generationConfig.thinkingConfig.thinkingBudget` (token count).
+///
+/// We deliberately do NOT set `includeThoughts`. With that flag on, Gemini
+/// streams "thought" parts (`text` + a `thought: true` marker), and this
+/// provider's stream loop emits every non-empty `part.text` as a normal
+/// `TextDelta` — so the reasoning summary would leak into the visible
+/// assistant answer. OCEAN-139's scope is only to request the thinking
+/// *budget* so the operator's reasoning level takes effect; surfacing thought
+/// summaries as proper Thinking blocks is OCEAN-140's concern.
 ///
 /// Before OCEAN-139 the Gemini provider silently dropped the operator's
 /// thinking level — `build_body` set `temperature`/`tools` but never emitted
@@ -220,7 +227,6 @@ fn apply_reasoning(body: &mut Value, level: ThinkingLevel) {
     }
     body["generationConfig"]["thinkingConfig"] = json!({
         "thinkingBudget": budget,
-        "includeThoughts": true,
     });
 }
 
@@ -680,9 +686,15 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 16384,
             "Gemini must receive generationConfig.thinkingConfig.thinkingBudget: {body}"
         );
-        assert_eq!(
-            body["generationConfig"]["thinkingConfig"]["includeThoughts"], true,
-            "includeThoughts must be set so thought summaries stream back: {body}"
+        // OCEAN-139: must NOT request thought parts. includeThoughts would make
+        // Gemini stream `thought: true` text parts, which this provider's loop
+        // emits as normal TextDelta — leaking the reasoning summary into the
+        // visible answer. Surfacing thoughts as Thinking blocks is OCEAN-140.
+        assert!(
+            body["generationConfig"]["thinkingConfig"]
+                .get("includeThoughts")
+                .is_none(),
+            "includeThoughts must NOT be sent — it leaks thought parts as visible text: {body}"
         );
     }
 
