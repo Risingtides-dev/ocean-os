@@ -221,6 +221,13 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
     }
+    // OCEAN-176: Codex speaks the OpenAI Responses API, whose output cap is the
+    // top-level `max_output_tokens` (NOT Chat-Completions `max_tokens` /
+    // `max_completion_tokens`). Without this the operator's output-length cap was
+    // silently dropped while every sibling provider honored it.
+    if let Some(m) = options.max_tokens {
+        body["max_output_tokens"] = json!(m);
+    }
     body
 }
 
@@ -1005,6 +1012,55 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
+    }
+
+    // OCEAN-176: Codex (OpenAI Responses API) must emit the operator's output cap
+    // as top-level `max_output_tokens` — the Responses-API field, NOT the
+    // Chat-Completions `max_tokens` / `max_completion_tokens`. It was silently
+    // dropped before, so gpt-5.x turns could run uncapped.
+    #[test]
+    fn build_body_emits_max_output_tokens_when_set() {
+        let model = codex_model();
+        let context = Context::default();
+        let options = StreamOptions {
+            max_tokens: Some(8192),
+            ..StreamOptions::default()
+        };
+
+        let body = build_body(&model, &context, &options);
+
+        assert_eq!(
+            body["max_output_tokens"], 8192,
+            "Codex must emit the Responses-API max_output_tokens cap. Got: {body}"
+        );
+        // It must be the Responses-API field name, not the Chat-Completions ones.
+        assert!(
+            body.get("max_tokens").is_none(),
+            "must not emit Chat-Completions max_tokens: {body}"
+        );
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "must not emit Chat-Completions max_completion_tokens: {body}"
+        );
+    }
+
+    // OCEAN-176: when no cap is set, no output-length field is emitted at all
+    // (rides the Responses API default), matching the sibling providers.
+    #[test]
+    fn build_body_omits_max_output_tokens_when_none() {
+        let model = codex_model();
+        let context = Context::default();
+        let options = StreamOptions {
+            max_tokens: None,
+            ..StreamOptions::default()
+        };
+
+        let body = build_body(&model, &context, &options);
+
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "Codex must omit max_output_tokens when no cap is set. Got: {body}"
+        );
     }
 
     fn fc_item(id: &str, call_id: &str, name: &str, arguments: &str) -> OutputItem {
