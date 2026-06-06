@@ -185,13 +185,54 @@ impl AgentRuntime {
     }
 
     /// Get (or create) the per-session turn lock for `id`.
+    ///
+    /// Two robustness properties (OCEAN-182):
+    ///
+    /// 1. **Poison recovery.** A panic inside the guarded section (load → run →
+    ///    save) poisons the std `Mutex` wrapping the registry. We recover via
+    ///    `into_inner()` — matching the daemon's event-bus idiom — instead of
+    ///    `.expect()`, so a single panicked turn can't permanently wedge every
+    ///    future turn on every session.
+    ///
+    /// 2. **Stale-entry pruning.** The HashMap held one `Arc<Mutex<()>>` per
+    ///    session ever touched, never removed → unbounded growth on a
+    ///    long-lived daemon. We opportunistically `retain` only entries that
+    ///    still have an active holder before handing out the requested lock.
+    ///
+    ///    Strong-count reasoning: an in-flight turn holds a CLONE of the Arc, so
+    ///    a live entry has `strong_count >= 2` (one in the map + one per active
+    ///    turn). An entry no turn holds has `strong_count == 1` (only the map).
+    ///    `retain(|_, l| Arc::strong_count(l) > 1)` therefore drops exactly the
+    ///    idle entries. Crucially this runs BEFORE we `entry(id).or_insert` the
+    ///    requested id: the lock we're about to hand out is either not yet in
+    ///    the map (fresh insert after retain) or is an existing live entry the
+    ///    caller already holds — never an idle entry that retain would prune.
+    ///    The clone we return then bumps the requested id's count to >= 2 before
+    ///    the registry lock is released, so a concurrent `session_lock` call
+    ///    can't prune it out from under us either.
     fn session_lock(&self, id: SessionId) -> Arc<tokio::sync::Mutex<()>> {
-        self.session_locks
+        let mut map = self
+            .session_locks
             .lock()
-            .expect("session_locks poisoned")
-            .entry(id)
+            .unwrap_or_else(|p| p.into_inner());
+        // Drop entries no active turn holds. Safe to run before inserting `id`:
+        // it only ever touches OTHER entries (an existing `id` entry is, by
+        // definition, currently held by this caller's in-flight turn and so has
+        // strong_count >= 2).
+        map.retain(|_, lock| Arc::strong_count(lock) > 1);
+        map.entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Test-only view of the live per-session lock registry size, so prune
+    /// tests can assert idle entries were evicted.
+    #[cfg(test)]
+    fn session_lock_count(&self) -> usize {
+        self.session_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     fn snapshot(&self) -> RuntimeState {
@@ -2277,6 +2318,109 @@ done
         assert!(room_guidance(RoomId::Writers).contains("Writers Room"));
         assert!(room_guidance(RoomId::OrchMesh).contains("ORCH + MESH"));
         assert!(room_guidance(RoomId::Review).contains("Review Room"));
+    }
+
+    fn lock_runtime(name: &str) -> AgentRuntime {
+        runtime(
+            temp_config_dir(name),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        )
+    }
+
+    // OCEAN-182 (Fix 1): a panic inside a guarded section poisons the std Mutex
+    // wrapping the registry. `session_lock` must recover via `into_inner()`
+    // instead of `.expect()` — otherwise one panicked turn wedges EVERY future
+    // turn on EVERY session for the life of the process.
+    #[test]
+    fn session_lock_survives_a_poisoned_registry() {
+        let rt = lock_runtime("lock-poison");
+
+        // Poison the std Mutex: panic while holding its guard, in a scoped
+        // thread so the panic doesn't unwind the test itself.
+        let locks = rt.session_locks.clone();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = locks.lock().unwrap();
+            panic!("poison the registry while holding the lock");
+        }));
+        assert!(res.is_err(), "the scoped panic should have been caught");
+        assert!(
+            rt.session_locks.lock().is_err(),
+            "registry mutex must now be poisoned"
+        );
+
+        // Despite the poison, handing out a session lock still works.
+        let id = SessionId::new_v4();
+        let lock = rt.session_lock(id);
+        assert_eq!(
+            Arc::strong_count(&lock),
+            2,
+            "the returned clone (1) + the map entry (1) == 2"
+        );
+    }
+
+    // OCEAN-182 (Fix 2): idle entries (no in-flight turn holding a clone) must
+    // be pruned so the registry doesn't grow unbounded on a long-lived daemon —
+    // while an ACTIVELY-held lock is never pruned out from under its turn.
+    #[test]
+    fn session_lock_prunes_idle_entries_but_keeps_held_ones() {
+        let rt = lock_runtime("lock-prune");
+
+        // Hold several sessions' locks SIMULTANEOUSLY (clones kept alive), so
+        // every entry is live (strong_count >= 2) across the touches and none
+        // is pruned yet.
+        let mut held: Vec<Arc<tokio::sync::Mutex<()>>> = Vec::new();
+        let mut idle_ids = Vec::new();
+        for _ in 0..5 {
+            let id = SessionId::new_v4();
+            idle_ids.push(id);
+            held.push(rt.session_lock(id));
+        }
+        assert_eq!(
+            rt.session_lock_count(),
+            5,
+            "all 5 entries are live while their clones are held"
+        );
+
+        // Drop every clone: now all 5 entries are idle (strong_count == 1).
+        drop(held);
+
+        // An actively-held session: keep its clone alive across the prune.
+        let held_id = SessionId::new_v4();
+        let _held = rt.session_lock(held_id); // strong_count == 2 (map + this clone)
+
+        // Requesting a brand-new id triggers the prune. The 5 now-idle entries
+        // are dropped; the held one survives; the new one is inserted.
+        let new_id = SessionId::new_v4();
+        let _new = rt.session_lock(new_id);
+
+        for id in &idle_ids {
+            assert!(
+                !rt.session_locks
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(id),
+                "idle session {id} must have been pruned"
+            );
+        }
+        assert_eq!(
+            rt.session_lock_count(),
+            2,
+            "only the actively-held session and the freshly-requested one remain"
+        );
+        assert!(
+            rt.session_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&held_id),
+            "an actively-held lock must NOT be pruned"
+        );
+        assert!(
+            rt.session_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&new_id),
+            "the just-requested lock must be present"
+        );
     }
 
     #[test]
