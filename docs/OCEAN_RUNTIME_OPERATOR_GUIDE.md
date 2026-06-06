@@ -213,6 +213,73 @@ A healthy prompt path should return assistant text plus a stderr footer like:
 
 Current CLI caveat: the CLI can print `ok=false` from the daemon yet still exit successfully. Operators must inspect the footer until CLI exit-code behavior is hardened.
 
+### Health & readiness — which probe to use
+
+The daemon exposes two distinct health endpoints with different meanings.
+Both are at the **root**, not under `/v1` — `GET /v1/health` does **not**
+exist, so a 404 there means "wrong path", not "daemon down". Verified against
+the `health` and `ready` route handlers in `crates/ocean-daemon/src/main.rs`.
+
+**`GET /health` — liveness (process is up and serving HTTP).**
+
+- **Always returns HTTP 200** as long as the process is accepting connections.
+  The body's `ok` field is hardcoded `true`; it does **not** reflect provider
+  state.
+- Body: `{"ok":true,"service":"ocean-daemon","version":"<v>","backend":"<name>"}`.
+- Says nothing about whether a provider/credential is configured. A daemon with
+  no API key still answers `/health` with 200.
+
+```bash
+curl -fsS http://127.0.0.1:4780/health
+```
+
+**`GET /ready` — readiness (a provider/model is wired up to execute turns).**
+
+- Calls `runtime.provider_readiness()` and serializes the result. **It also
+  always returns HTTP 200** — readiness is carried in the JSON **body**, not the
+  HTTP status code. There is no 500 on "not ready".
+- Body when ready:
+  `{"ok":true,"provider":"<id>","model":"<m>","base_url_host":"<host>","credential_present":true,...}`.
+- Body when **not** ready (e.g. no credential for a provider that needs one):
+  `{"ok":false,...,"credential_present":false,"error":{"code":"MISSING_CREDENTIAL",...}}` —
+  still HTTP 200.
+- Therefore an ops probe must inspect the **`ok` field of the body**, not the
+  status code, to detect a dead-provider daemon:
+
+```bash
+# "ready" only if the body says ok:true — a 200 alone is not enough.
+curl -fsS http://127.0.0.1:4780/ready | jq -e '.ok == true' >/dev/null
+```
+
+**Which to use where:**
+
+| Check | Endpoint | What "pass" means |
+|---|---|---|
+| launchd `KeepAlive` (restart-on-death) | `GET /health` | process is alive |
+| External readiness / monitoring probe (page on dead provider) | `GET /ready` + assert body `ok:true` | can actually run a turn |
+
+**Tradeoff and recommendation:**
+
+- The launchd job (`ocean-daemon-preview`) should key its `KeepAlive` /
+  liveness restart on **`/health`**. Restart only when the process is truly
+  gone. Wiring `KeepAlive` to `/ready` would restart-thrash the daemon on a
+  transient or operator-pending provider issue (e.g. key not yet set), which
+  fixes nothing — the credential is still missing after the restart.
+- The cost of `/health`-only KeepAlive is that a daemon with a dead/unconfigured
+  provider stays "up" and unrestarted. Cover that gap with a **separate external
+  readiness probe** that hits `/ready`, asserts body `ok:true`, and **alerts**
+  (does not auto-restart). Give that probe a sane timeout (a few seconds) and
+  do not let it drive process restarts.
+- Liveness restarts processes; readiness alerts humans. Keep them on different
+  endpoints.
+
+Restart the launchd-supervised daemon (a restart drops any in-flight session,
+so only restart when intended, not to clear a transient `/ready` blip):
+
+```bash
+launchctl kickstart -k gui/$(id -u)/ocean-daemon-preview
+```
+
 ### Sessions
 
 ```bash
