@@ -95,6 +95,21 @@ fn map_finish_reason(reason: &str) -> StopReason {
     }
 }
 
+/// OCEAN-142: decide whether a finished turn must be surfaced as an Error event
+/// rather than a normal Done.
+///
+/// A `content_filter` finish_reason maps to [`StopReason::Error`]. If the turn
+/// also produced no usable content, the runtime's agent loop would treat a Done
+/// (even one carrying `StopReason::Error`) as a clean, empty success — so the
+/// safety filter would never reach the user. In that empty/blocked case the
+/// stream must emit an `AssistantMessageEvent::Error` instead, mirroring the
+/// in-stream error-frame path and Gemini's blocking path. A partial-but-useful
+/// turn (some text or tool calls arrived before the filter) is preserved and
+/// must NOT be turned into an error.
+fn is_blocking_empty_turn(stop: StopReason, has_usable_content: bool) -> bool {
+    stop == StopReason::Error && !has_usable_content
+}
+
 #[derive(Deserialize, Debug, Default)]
 struct ChunkDelta {
     #[serde(default)]
@@ -699,6 +714,39 @@ impl Provider for OpenAiProvider {
                 text_buf = thinking_buf.clone();
             }
 
+            // OCEAN-142: the safety filter cut the turn off (`content_filter`
+            // finish_reason → StopReason::Error via map_finish_reason). If it
+            // produced NO usable content (no text — including promoted thinking
+            // above — and no tool calls), falling through to Done with
+            // error_message: None would let the runtime treat it as a clean,
+            // empty success (agent_loop only returns an error for the Error
+            // event, not for a Done carrying StopReason::Error). So mirror the
+            // in-stream error-frame path (above) and Gemini's blocking path
+            // (google.rs) — emit an Error event with a clear message so the
+            // filtering is actually surfaced to the user. A partial-but-useful
+            // turn (some text/tool calls arrived before the filter) is preserved
+            // and falls through to Done unchanged.
+            let has_usable_content =
+                !text_buf.is_empty() || !thinking_buf.is_empty() || has_tool_calls;
+            if is_blocking_empty_turn(stop, has_usable_content) {
+                tracing::warn!("OpenAI content filter blocked the response");
+                let am = AssistantMessage {
+                    content: vec![],
+                    api: api.clone(),
+                    provider: provider.clone(),
+                    model: response_model.clone().unwrap_or_else(|| model_id.clone()),
+                    usage: usage.clone(),
+                    stop_reason: StopReason::Error,
+                    error_message: Some(
+                        "OpenAI content filter blocked the response (finish_reason: content_filter)"
+                            .to_string(),
+                    ),
+                    timestamp: now_ms(),
+                };
+                yield Ok(AssistantMessageEvent::Error { reason: StopReason::Error, error: am });
+                return;
+            }
+
             let mut out_content: Vec<Content> = Vec::new();
             if !thinking_buf.is_empty() {
                 out_content.push(Content::Thinking {
@@ -953,6 +1001,41 @@ mod tests {
         assert_eq!(map_finish_reason("length"), StopReason::Length);
         assert_eq!(map_finish_reason("stop"), StopReason::Stop);
         assert_eq!(map_finish_reason("anything_else"), StopReason::Stop);
+    }
+
+    // OCEAN-142: changing the StopReason label is not enough — the runtime's
+    // agent loop only RETURNS an error for an `AssistantMessageEvent::Error`
+    // event; a `Done` carrying `StopReason::Error` is treated as a completed
+    // turn. So a bare `content_filter` with no usable content must take the
+    // blocking branch that emits an Error event, exactly like Gemini's blocking
+    // path. This asserts the actual user-visible decision, not just the label.
+    #[test]
+    fn bare_content_filter_takes_blocking_error_branch() {
+        // Full path: decode the wire finish_reason, map it, and ask whether the
+        // empty turn must surface as an Error event.
+        let raw = r#"{"index":0,"finish_reason":"content_filter"}"#;
+        let choice: ChunkChoice = serde_json::from_str(raw).expect("choice parses");
+        let stop = map_finish_reason(&choice.finish_reason.unwrap());
+
+        // No text, no thinking, no tool calls → blocked/empty → must error.
+        assert!(
+            is_blocking_empty_turn(stop, /* has_usable_content */ false),
+            "bare content_filter with no content must emit an Error event, \
+             not a clean Done",
+        );
+
+        // A partial-but-useful turn (content arrived before the filter) is
+        // preserved, NOT turned into an error.
+        assert!(
+            !is_blocking_empty_turn(stop, /* has_usable_content */ true),
+            "a content_filter turn that produced usable content must be \
+             preserved, not errored",
+        );
+
+        // Normal terminations never take the blocking branch, even when empty.
+        assert!(!is_blocking_empty_turn(StopReason::Stop, false));
+        assert!(!is_blocking_empty_turn(StopReason::ToolUse, true));
+        assert!(!is_blocking_empty_turn(StopReason::Length, false));
     }
 
     // OCEAN-134: reasoning-effort parity. `build_body` must translate
