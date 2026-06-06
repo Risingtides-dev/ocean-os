@@ -10,6 +10,7 @@ pub mod glob_tool;
 pub mod grep;
 pub mod ls;
 pub mod read;
+pub mod surface;
 pub mod todo;
 pub mod web_fetch;
 pub mod write;
@@ -35,6 +36,7 @@ pub fn default_tools() -> Vec<Arc<dyn AgentTool>> {
         Arc::new(todo::TodoTool::new()),
         Arc::new(component::ComponentRenderTool),
         Arc::new(component::ComponentUnmountTool),
+        Arc::new(surface::SurfacePatchTool),
         // Unbound: falls back to the model-supplied `session_id` arg. The
         // session-scoped `BuiltinProvider` rebuilds this one with the turn's
         // session id (OCEAN-60); this default is for ad-hoc/test paths.
