@@ -23,7 +23,7 @@ use crate::retry::{classify_status, parse_retry_after, with_retry, Attempt, Retr
 use crate::stream::AssistantMessageEventStream;
 use crate::types::{
     now_ms, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, StopReason,
-    StreamOptions, Usage,
+    StreamOptions, ThinkingLevel, Usage,
 };
 
 #[derive(Deserialize, Debug)]
@@ -179,6 +179,51 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
     out
 }
 
+/// Maps the operator-chosen `ThinkingLevel` into a Gemini `thinkingBudget`
+/// (token count). Gemini 2.x thinking models accept
+/// `generationConfig.thinkingConfig.thinkingBudget`: a token budget where `0`
+/// disables thinking and `-1` is automatic; the upper range is model-dependent.
+/// We mirror the per-level token budgets the Anthropic provider uses
+/// (`thinking_budget`) so the same operator level produces a comparable
+/// reasoning allowance across providers. `Off` returns `None` so nothing is
+/// emitted (parity with OCEAN-134's openai.rs).
+fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => Some(1024),
+        ThinkingLevel::Low => Some(2048),
+        ThinkingLevel::Medium => Some(8192),
+        ThinkingLevel::High => Some(16384),
+        ThinkingLevel::Xhigh => Some(24576),
+    }
+}
+
+/// Injects the reasoning budget onto the Gemini request body under
+/// `generationConfig.thinkingConfig`, using the REST shape the v1beta
+/// `generateContent` endpoint expects:
+/// `generationConfig.thinkingConfig.thinkingBudget` (token count) plus
+/// `includeThoughts` so thought summaries stream back.
+///
+/// Before OCEAN-139 the Gemini provider silently dropped the operator's
+/// thinking level — `build_body` set `temperature`/`tools` but never emitted
+/// `thinkingConfig`, so Medium/High was inert on Gemini while it worked on
+/// Anthropic (budget_tokens), Codex (effort), and OpenAI (reasoning_effort,
+/// OCEAN-134). `Off`/unset emits nothing.
+fn apply_reasoning(body: &mut Value, level: ThinkingLevel) {
+    let Some(budget) = thinking_budget(level) else {
+        return;
+    };
+    // generationConfig may already exist (temperature); merge into it rather
+    // than clobbering it.
+    if !body["generationConfig"].is_object() {
+        body["generationConfig"] = json!({});
+    }
+    body["generationConfig"]["thinkingConfig"] = json!({
+        "thinkingBudget": budget,
+        "includeThoughts": true,
+    });
+}
+
 fn build_body(context: &Context, options: &StreamOptions) -> Value {
     let mut body = json!({
         "contents": convert_messages(&context.messages),
@@ -188,6 +233,9 @@ fn build_body(context: &Context, options: &StreamOptions) -> Value {
     }
     if let Some(t) = options.temperature {
         body["generationConfig"] = json!({"temperature": t});
+    }
+    if let Some(level) = options.reasoning {
+        apply_reasoning(&mut body, level);
     }
     if !context.tools.is_empty() {
         let decls: Vec<Value> = context
@@ -583,6 +631,103 @@ mod tests {
             );
             assert!(blocking, "{reason} must be flagged as blocking");
         }
+    }
+
+    // OCEAN-139: reasoning parity (Gemini side of OCEAN-134). `build_body` must
+    // translate `options.reasoning` into
+    // `generationConfig.thinkingConfig.thinkingBudget`, and must omit
+    // thinkingConfig entirely when no reasoning level is set (or it's Off).
+    fn empty_context() -> Context {
+        Context {
+            messages: vec![Message::User {
+                content: vec![Content::text("hi")],
+                timestamp: now_ms(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_body_omits_thinking_config_when_unset() {
+        let body = build_body(&empty_context(), &StreamOptions::default());
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "thinkingConfig must not be sent when options.reasoning is None: {body}"
+        );
+    }
+
+    #[test]
+    fn build_body_omits_thinking_config_when_off() {
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let body = build_body(&empty_context(), &options);
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "ThinkingLevel::Off must not emit thinkingConfig: {body}"
+        );
+    }
+
+    #[test]
+    fn build_body_emits_thinking_config_when_set() {
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let body = build_body(&empty_context(), &options);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 16384,
+            "Gemini must receive generationConfig.thinkingConfig.thinkingBudget: {body}"
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"], true,
+            "includeThoughts must be set so thought summaries stream back: {body}"
+        );
+    }
+
+    #[test]
+    fn build_body_maps_thinking_levels_to_budgets() {
+        for (level, expected) in [
+            (ThinkingLevel::Minimal, 1024u32),
+            (ThinkingLevel::Low, 2048),
+            (ThinkingLevel::Medium, 8192),
+            (ThinkingLevel::High, 16384),
+            (ThinkingLevel::Xhigh, 24576),
+        ] {
+            let options = StreamOptions {
+                reasoning: Some(level),
+                ..Default::default()
+            };
+            let body = build_body(&empty_context(), &options);
+            assert_eq!(
+                body["generationConfig"]["thinkingConfig"]["thinkingBudget"], expected,
+                "level {level:?} mismapped: {body}"
+            );
+        }
+    }
+
+    // thinkingConfig must merge into an existing generationConfig (temperature),
+    // not clobber it.
+    #[test]
+    fn build_body_preserves_temperature_alongside_thinking_config() {
+        let options = StreamOptions {
+            temperature: Some(0.7),
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let body = build_body(&empty_context(), &options);
+        let temp = body["generationConfig"]["temperature"]
+            .as_f64()
+            .expect("temperature must survive alongside thinkingConfig");
+        assert!(
+            (temp - 0.7).abs() < 1e-6,
+            "temperature must survive alongside thinkingConfig: {body}"
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 8192,
+            "thinkingConfig must be present alongside temperature: {body}"
+        );
     }
 
     // Normal terminations stay normal.
