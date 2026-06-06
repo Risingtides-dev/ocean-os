@@ -20,7 +20,7 @@ use crate::retry::{classify_status, parse_retry_after, with_retry, Attempt, Retr
 use crate::stream::AssistantMessageEventStream;
 use crate::types::{
     now_ms, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, StopReason,
-    StreamOptions, Usage,
+    StreamOptions, ThinkingLevel, Usage,
 };
 
 #[derive(Deserialize, Debug)]
@@ -256,6 +256,70 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
     out
 }
 
+/// Maps the operator-chosen `ThinkingLevel` into the OpenAI Chat Completions
+/// `reasoning_effort` enum, which only understands `minimal | low | medium | high`.
+/// `Xhigh` has no distinct OpenAI level, so it folds into `high`.
+fn openai_reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => Some("minimal"),
+        ThinkingLevel::Low => Some("low"),
+        ThinkingLevel::Medium => Some("medium"),
+        ThinkingLevel::High | ThinkingLevel::Xhigh => Some("high"),
+    }
+}
+
+/// DeepSeek's effort scale differs from OpenAI's: it accepts only `high | max`,
+/// and documents that `low`/`medium` map up to `high` while `xhigh` maps to
+/// `max` (per the DeepSeek thinking-mode guide). DeepSeek also requires the
+/// `thinking` toggle to actually engage the reasoner.
+fn deepseek_reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium | ThinkingLevel::High => {
+            Some("high")
+        }
+        ThinkingLevel::Xhigh => Some("max"),
+    }
+}
+
+/// Injects the reasoning-effort request param onto an OpenAI-compatible body,
+/// using the right wire shape for the routed backend.
+///
+/// Before OCEAN-134 this was a no-op: every openai-completions model (OpenAI
+/// o-series, DeepSeek reasoner/v4, MiniMax M2, Kimi) silently dropped the
+/// thinking level the user picked. The decoder already reads `reasoning`/
+/// `reasoning_content` deltas — it just never asked for them.
+///
+/// Param names diverge per backend, so we gate by `model.provider` rather than
+/// blasting one param everywhere (an unknown field 400s on stricter gateways):
+///   - OpenAI o-series      → top-level `reasoning_effort` (minimal|low|medium|high)
+///   - DeepSeek (v4/reasoner) → `reasoning_effort` (high|max) + `thinking:{type:enabled}`
+///   - other openai-compatible backends → left untouched (no agreed param)
+fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
+    if level == ThinkingLevel::Off {
+        return;
+    }
+    match model.provider.as_str() {
+        "openai" => {
+            if let Some(effort) = openai_reasoning_effort(level) {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
+        "deepseek" => {
+            if let Some(effort) = deepseek_reasoning_effort(level) {
+                body["reasoning_effort"] = json!(effort);
+                body["thinking"] = json!({"type": "enabled"});
+            }
+        }
+        // MiniMax, Kimi, OpenRouter passthrough, and arbitrary `openai_compat`
+        // backends have no common reasoning-effort param — sending one risks a
+        // 400. They already stream reasoning by default, so we leave the body
+        // alone rather than guess a param.
+        _ => {}
+    }
+}
+
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut body = json!({
         "model": model.id,
@@ -268,6 +332,9 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     }
     if let Some(m) = options.max_tokens {
         body["max_tokens"] = json!(m);
+    }
+    if let Some(level) = options.reasoning {
+        apply_reasoning(&mut body, model, level);
     }
     if !context.tools.is_empty() {
         let tools: Vec<Value> = context
@@ -772,6 +839,131 @@ mod tests {
         assert!(desc.contains("rate limited"), "message lost: {desc}");
         assert!(desc.contains("rate_limit_error"), "type lost: {desc}");
         assert!(desc.contains("429"), "code lost: {desc}");
+    }
+
+    // OCEAN-134: reasoning-effort parity. `build_body` must translate
+    // `options.reasoning` into the right wire param for the routed backend, and
+    // must omit it entirely when no reasoning level is set (or it's Off).
+    fn openai_model() -> Model {
+        Model::openai_gpt_4o()
+    }
+
+    fn deepseek_model() -> Model {
+        Model::openai_compat(
+            "deepseek",
+            "deepseek-reasoner",
+            "https://api.deepseek.com/v1",
+            128_000,
+            8_192,
+        )
+    }
+
+    #[test]
+    fn build_body_omits_reasoning_when_unset() {
+        let body = build_body(&openai_model(), &Context::default(), &StreamOptions::default());
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort must not be sent when options.reasoning is None: {body}"
+        );
+        assert!(body.get("thinking").is_none(), "thinking must not be sent: {body}");
+    }
+
+    #[test]
+    fn build_body_omits_reasoning_when_off() {
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let body = build_body(&openai_model(), &Context::default(), &opts);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "ThinkingLevel::Off must not emit reasoning_effort: {body}"
+        );
+    }
+
+    #[test]
+    fn build_body_emits_openai_reasoning_effort() {
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let body = build_body(&openai_model(), &Context::default(), &opts);
+        assert_eq!(
+            body["reasoning_effort"], "high",
+            "OpenAI o-series must receive top-level reasoning_effort: {body}"
+        );
+        // OpenAI does not use the DeepSeek `thinking` toggle.
+        assert!(body.get("thinking").is_none(), "thinking toggle is DeepSeek-only: {body}");
+    }
+
+    #[test]
+    fn build_body_maps_openai_levels() {
+        for (level, expected) in [
+            (ThinkingLevel::Minimal, "minimal"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Xhigh, "high"),
+        ] {
+            let opts = StreamOptions {
+                reasoning: Some(level),
+                ..Default::default()
+            };
+            let body = build_body(&openai_model(), &Context::default(), &opts);
+            assert_eq!(body["reasoning_effort"], expected, "level {level:?} mismapped: {body}");
+        }
+    }
+
+    #[test]
+    fn build_body_emits_deepseek_reasoning_and_thinking_toggle() {
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::Low),
+            ..Default::default()
+        };
+        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        // DeepSeek maps low/medium/high all up to "high".
+        assert_eq!(
+            body["reasoning_effort"], "high",
+            "DeepSeek must map low up to high: {body}"
+        );
+        // DeepSeek needs the thinking toggle to engage the reasoner.
+        assert_eq!(
+            body["thinking"]["type"], "enabled",
+            "DeepSeek must enable the thinking toggle: {body}"
+        );
+    }
+
+    #[test]
+    fn build_body_maps_deepseek_xhigh_to_max() {
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::Xhigh),
+            ..Default::default()
+        };
+        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        assert_eq!(body["reasoning_effort"], "max", "DeepSeek xhigh must map to max: {body}");
+    }
+
+    #[test]
+    fn build_body_omits_reasoning_for_unknown_backend() {
+        // MiniMax / Kimi / arbitrary openai-compat backends have no agreed param;
+        // sending one risks a 400, so build_body must leave the body untouched.
+        let model = Model::openai_compat(
+            "minimax",
+            "MiniMax-M2",
+            "https://api.minimaxi.com/v1",
+            128_000,
+            8_192,
+        );
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let body = build_body(&model, &Context::default(), &opts);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "unknown backend must not receive reasoning_effort: {body}"
+        );
+        assert!(body.get("thinking").is_none(), "unknown backend must not receive thinking: {body}");
     }
 
     // OCEAN-101: a structured refusal must decode into `ChunkDelta.refusal` so it
