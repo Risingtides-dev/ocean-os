@@ -3135,6 +3135,7 @@ dependencies = [
  "futures",
  "glob",
  "ignore",
+ "ocean-agent-sdk",
  "ocean-browser",
  "ocean-protocol",
  "proptest",
