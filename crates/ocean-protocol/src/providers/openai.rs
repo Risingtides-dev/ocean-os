@@ -77,6 +77,24 @@ struct ChunkChoice {
     finish_reason: Option<String>,
 }
 
+/// Map an OpenAI (Chat Completions) `finish_reason` to a [`StopReason`].
+///
+/// `tool_calls` → ToolUse and `length` → Length are normal terminations.
+/// `content_filter` (OCEAN-142) is the safety filter cutting the turn off; with
+/// no accompanying refusal delta (OCEAN-101) it used to collapse into the
+/// catch-all clean `Stop`, hiding the truncation. We surface it as
+/// `StopReason::Error`, mirroring Gemini's `classify_finish_reason` in
+/// `google.rs`, so the operator/agent sees the turn was filtered rather than a
+/// silent, possibly-truncated stop. Everything else stays a clean `Stop`.
+fn map_finish_reason(reason: &str) -> StopReason {
+    match reason {
+        "tool_calls" => StopReason::ToolUse,
+        "length" => StopReason::Length,
+        "content_filter" => StopReason::Error,
+        _ => StopReason::Stop,
+    }
+}
+
 #[derive(Deserialize, Debug, Default)]
 struct ChunkDelta {
     #[serde(default)]
@@ -540,11 +558,7 @@ impl Provider for OpenAiProvider {
                 }
                 for choice in chunk.choices {
                     if let Some(reason) = choice.finish_reason {
-                        stop = match reason.as_str() {
-                            "tool_calls" => StopReason::ToolUse,
-                            "length" => StopReason::Length,
-                            _ => StopReason::Stop,
-                        };
+                        stop = map_finish_reason(reason.as_str());
                     }
                     if let Some(delta) = choice.delta {
                         // Reasoning / chain-of-thought (DeepSeek reasoner & v4-pro,
@@ -916,6 +930,29 @@ mod tests {
         assert!(desc.contains("rate limited"), "message lost: {desc}");
         assert!(desc.contains("rate_limit_error"), "type lost: {desc}");
         assert!(desc.contains("429"), "code lost: {desc}");
+    }
+
+    // OCEAN-142: a `content_filter` finish_reason means the safety filter cut
+    // the turn off. With no refusal delta (OCEAN-101) it must NOT collapse into
+    // a clean Stop — it has to surface as an error, like Gemini does. The other
+    // finish reasons keep their existing mapping.
+    #[test]
+    fn content_filter_finish_reason_is_error_not_stop() {
+        // The exact wire path: a chunk choice carrying only `finish_reason`.
+        let raw = r#"{"index":0,"finish_reason":"content_filter"}"#;
+        let choice: ChunkChoice = serde_json::from_str(raw).expect("choice parses");
+        let reason = choice.finish_reason.expect("finish_reason present");
+        assert_eq!(
+            map_finish_reason(&reason),
+            StopReason::Error,
+            "content_filter must surface as an error, not a silent clean Stop",
+        );
+
+        // Existing mappings are untouched.
+        assert_eq!(map_finish_reason("tool_calls"), StopReason::ToolUse);
+        assert_eq!(map_finish_reason("length"), StopReason::Length);
+        assert_eq!(map_finish_reason("stop"), StopReason::Stop);
+        assert_eq!(map_finish_reason("anything_else"), StopReason::Stop);
     }
 
     // OCEAN-134: reasoning-effort parity. `build_body` must translate
