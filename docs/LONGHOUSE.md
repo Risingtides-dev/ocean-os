@@ -73,10 +73,16 @@ Defaults should be conservative: disabled or embedded-only unless explicitly con
 
 ## API direction
 
-Existing embedded daemon routes:
+Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
 
 - `POST /v1/longhouse/demo`
 - `POST /v1/longhouse/convene`
+- `GET /v1/longhouse/topics` — list every topic's observable state. Returns
+  `{ "ok": true, "topics": [...] }` from the in-process topic registry.
+- `GET /v1/longhouse/topics/{topic_id}` — one topic's full observable state by
+  id. Returns `{ "ok": true, "topic": {...} }`; `400` with a typed `{ ok, error }`
+  body when `topic_id` is not a valid UUID, `404` when the id is unknown. Mirrors
+  the `GET /v1/rooms/{room_id}` error shape — never a panic.
 
 Local/remote service shape now starts with:
 

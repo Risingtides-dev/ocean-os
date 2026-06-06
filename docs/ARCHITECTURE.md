@@ -71,8 +71,22 @@ ocean-call
   active, wake-word-gated lane ("hey Ocean…" → wake-gate → one ephemeral agent
   turn → TTS speaker back into the call). Components: room_tap, frame
   re-chunker, stt (+ stt_xai), summarizer, task_detector, wake gate,
-  sip_bridge, speaker (TTS), and a Twilio/LiveKit webhook. Backs
-  POST /v1/calls/place, /v1/calls/webhook, and /v1/calls/demo on the daemon.
+  sip_bridge, speaker (TTS), and a Twilio/LiveKit webhook. Backs three daemon
+  routes (handlers in crates/ocean-daemon/src/main.rs):
+  - POST /v1/calls/place  — place a real outbound call: { "to": "<number>" }.
+    Normalizes to E.164, and if the SIP/LiveKit env is configured
+    (LIVEKIT_URL/_API_KEY/_API_SECRET + OCEAN_CALL_OUTBOUND_TRUNK +
+    OCEAN_CALL_CALLER_NUMBER) it mints a call room, emits CallStarted, and dials
+    via the LiveKit SIP bridge. Returns 503 naming the unset env when telephony
+    is not provisioned; emits CallEnded on a failed dial so no phantom call is
+    left "in progress".
+  - POST /v1/calls/webhook — LiveKit webhook receiver. Verifies the signature
+    and, on a room_started/room_finished for a call_ room, emits
+    CallStarted/CallEnded onto the SSE rail — the path that lets an INBOUND call
+    reach the pipeline.
+  - POST /v1/calls/demo  — scripted, no-telephony demo: runs a canned transcript
+    through the passive lane (summarizer + wake gate) and streams call
+    OceanEvents onto /v1/events. Proves the pipeline without a real phone line.
 
 ocean-daemon
   Long-running OS service. Owns API surface for OceanTUI/Ocean GUI and
