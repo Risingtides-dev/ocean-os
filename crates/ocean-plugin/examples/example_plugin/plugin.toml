@@ -1,0 +1,35 @@
+# ocean-example-plugin — a complete, runnable example plugin manifest.
+#
+# A plugin is a directory containing this `plugin.toml` plus an executable
+# `entry` that speaks JSON-RPC 2.0 over stdio. The daemon discovers plugins by
+# scanning <config_dir>/plugins/ (or $OCEAN_PLUGINS_DIR); each immediate
+# subdirectory holding a plugin.toml is one plugin.
+#
+# `name`    — stable id; namespaces this plugin's tools as plugin__<name>__<tool>.
+# `version` — semver by convention (not enforced).
+# `entry`   — path to the launchable executable, relative to THIS file's
+#             directory (an absolute path is used as-is). After building the
+#             example, copy the binary next to this manifest under this name:
+#
+#               cargo build --release --example ocean-example-plugin -p ocean-plugin
+#               cp target/release/examples/ocean-example-plugin \
+#                  ~/.config/ocean-rs/plugins/example-plugin/ocean-example-plugin
+#
+# `[[tool]]` — the tools this plugin advertises. The manifest is the source of
+#             truth for discovery; the launched subprocess re-confirms them live
+#             via `list_tools`. Each tool's `input_schema` is JSON Schema for its
+#             arguments (alias `inputSchema` is also accepted).
+
+name = "example-plugin"
+version = "0.1.0"
+entry = "ocean-example-plugin"
+
+[[tool]]
+name = "reverse_text"
+description = "Reverse a string. Returns { reversed: <string> }."
+input_schema = { type = "object", properties = { text = { type = "string", description = "The text to reverse." } }, required = ["text"] }
+
+[[tool]]
+name = "current_time"
+description = "Current Unix time in seconds. Takes no arguments. Returns { unix_seconds: <number> }."
+input_schema = { type = "object", properties = {} }

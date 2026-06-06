@@ -41,3 +41,13 @@ ocean-protocol = { path = "../ocean-protocol", optional = true }
 name = "echo_plugin"
 test = false
 doc = false
+
+# The runnable example plugin (`reverse_text` + `current_time`). Its source lives
+# inside the example plugin *pack* directory alongside its plugin.toml, so the
+# pack is a self-contained, copy-and-go unit. Built with
+# `cargo build --example ocean-example-plugin`; the example_loads_through_runtime
+# integration test resolves the built binary under target/<profile>/examples/.
+[[example]]
+name = "ocean-example-plugin"
+path = "examples/example_plugin/main.rs"
+doc = false
