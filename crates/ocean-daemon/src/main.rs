@@ -266,7 +266,13 @@ impl EventBus {
             }
         }
 
-        let _ = self.tx.send(event);
+        // `broadcast::send` errors only when there are zero live receivers; the
+        // event is still buffered for late subscribers and also lives in
+        // `history`, so this is expected (no SSE client connected) and logged at
+        // debug — not a dropped event (OCEAN-87).
+        if let Err(err) = self.tx.send(event) {
+            tracing::debug!(?err, "EventBus: no active subscribers for event");
+        }
     }
 }
 
@@ -296,10 +302,21 @@ impl AgentEventBus {
     }
 
     fn emit(&self, event: AgentTurnEvent) {
-        let _ = self.tx.send(AgentEventEnvelope {
-            id: Uuid::new_v4(),
-            event,
-        });
+        // `broadcast::send` errors only when there are no live receivers (no SSE
+        // client subscribed to `/v1/agent/events`). That's expected during idle
+        // periods, so debug — not warn. Per-subscriber *lag* (a slow client that
+        // overflows the ring buffer) surfaces on the RECEIVE side as
+        // `Lagged(n)`, which the SSE handlers log at warn (OCEAN-87).
+        if self
+            .tx
+            .send(AgentEventEnvelope {
+                id: Uuid::new_v4(),
+                event,
+            })
+            .is_err()
+        {
+            tracing::debug!("AgentEventBus: no active subscribers for event");
+        }
     }
 }
 
@@ -327,6 +344,22 @@ fn yolo_enabled() -> bool {
             .as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// HTTP methods advertised in the CORS preflight (`Access-Control-Allow-Methods`).
+/// Must cover EVERY method the router actually serves, or the browser's OPTIONS
+/// preflight fails and the real request never fires (OCEAN-87). The router serves
+/// GET/POST plus `PATCH /v1/projects/{id}`, `DELETE /v1/projects/{id}`, and
+/// `DELETE /v1/rooms/persistent/{key}/participants/{id}`; OPTIONS is the preflight
+/// method itself. Keep this in sync with the `Router::route()` method set.
+fn cors_allowed_methods() -> [Method; 5] {
+    [
+        Method::GET,
+        Method::POST,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ]
 }
 
 /// Parse a comma-separated `OCEAN_ALLOWED_ORIGINS` list into normalized origins.
@@ -420,7 +453,24 @@ async fn main() -> anyhow::Result<()> {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                gc_registries(&requests, &permissions, Utc::now()).await;
+                // Run each sweep on its own task so a panic inside
+                // `gc_registries` (e.g. a poisoned lock surfacing) is caught as a
+                // `JoinError` instead of killing this loop. A dead GC loop leaks
+                // the request/permission registries unbounded for the daemon's
+                // whole lifetime, silently — so we catch, log, and keep sweeping
+                // (OCEAN-87).
+                let reqs = requests.clone();
+                let perms = permissions.clone();
+                let sweep =
+                    tokio::spawn(
+                        async move { gc_registries(&reqs, &perms, Utc::now()).await },
+                    );
+                if let Err(join_err) = sweep.await {
+                    tracing::error!(
+                        error = %join_err,
+                        "registry GC sweep panicked; skipping this cycle, loop continues"
+                    );
+                }
             }
         });
     }
@@ -446,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(AllowOrigin::predicate(move |origin, _req| {
             is_trusted_origin(origin, &extra_origins)
         }))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods(cors_allowed_methods())
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
@@ -621,6 +671,11 @@ async fn events(
             Some(Ok(Event::default().id(id).event(event_type).data(data)))
         }
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            // A slow SSE consumer overflowed the 1024-slot ring and silently
+            // lost `skipped` events. Surface it server-side at warn so dropped
+            // events are visible in the daemon log, not just to the client
+            // (OCEAN-87).
+            tracing::warn!(skipped, "events SSE subscriber lagged; dropped events");
             let data = json!({
                 "type": "error",
                 "message": format!("event stream lagged by {skipped} events")
@@ -763,6 +818,12 @@ async fn permission_decision(
 
     let agent_decision = match decision.decision {
         PermissionDecisionBody::Allow => AgentPermissionDecision::Allow,
+        // "Allow for this session": the runtime records the tool in the agent
+        // loop's per-run `session_allowed` set, so identical follow-up calls of
+        // the same tool skip the permission gate for the rest of the run. Without
+        // this arm the wire decision could not reach the runtime at all (the
+        // wire enum previously had no `AllowSession` variant — OCEAN-74).
+        PermissionDecisionBody::AllowSession => AgentPermissionDecision::AllowSession,
         PermissionDecisionBody::Deny { reason } => AgentPermissionDecision::Deny {
             reason: reason.unwrap_or_else(|| "permission denied by operator".into()),
         },
@@ -786,7 +847,13 @@ async fn permission_decision(
         Some(waiter.status.request_id),
         Some(permission_id),
         OceanEvent::PermissionDecision {
-            allowed: matches!(agent_decision, AgentPermissionDecision::Allow),
+            // AllowSession is an allow (it permits the call to run) — only Deny
+            // is a non-allow. Reporting AllowSession as `allowed: false` would
+            // mislead clients into rendering an approved tool as blocked.
+            allowed: matches!(
+                agent_decision,
+                AgentPermissionDecision::Allow | AgentPermissionDecision::AllowSession
+            ),
             reason: match &agent_decision {
                 AgentPermissionDecision::Allow => None,
                 AgentPermissionDecision::AllowSession => Some("allow_session".into()),
@@ -967,6 +1034,39 @@ impl SessionListQuery {
             );
         }
         None
+    }
+}
+
+/// Optional workspace scope for `GET /v1/agent/sessions/{id}`. The session LIST
+/// path already scopes reads to a caller-declared workspace (OCEAN-52); the
+/// DETAIL path did not, so a caller could read another workspace's session
+/// transcript by id alone (OCEAN-74). When a scope is supplied here, the detail
+/// handler rejects a cross-workspace read with the same 400 shape the turn path
+/// uses. Absence of a scope preserves the legacy unscoped read for first-party
+/// callers that don't declare a workspace.
+#[derive(Debug, serde::Deserialize, Default)]
+struct SessionDetailQuery {
+    /// Exact workspace_root to scope the read to (wins over `cwd`).
+    #[serde(default)]
+    workspace: Option<String>,
+    /// A cwd the daemon resolves to a workspace root (git toplevel) first.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+impl SessionDetailQuery {
+    /// The workspace root the caller is claiming to read from, if any. `None`
+    /// means the caller declared no scope (legacy unscoped read).
+    fn requested_workspace(&self, runtime: &AgentRuntime) -> Option<String> {
+        if let Some(ws) = self.workspace.as_deref() {
+            return Some(ws.to_string());
+        }
+        self.cwd.as_deref().map(|cwd| {
+            runtime
+                .workspace_root_for(std::path::Path::new(cwd))
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 }
 
@@ -3009,6 +3109,35 @@ fn session_workspace_binding(
     }
 }
 
+/// Workspace-scoping guard for the session-DETAIL read path (`GET
+/// /v1/agent/sessions/{id}`), mirroring the turn path's session↔workspace
+/// binding (OCEAN-52) so a caller cannot read another workspace's session by id
+/// alone (OCEAN-74).
+///
+/// - `requested_workspace`: the workspace the caller declared via `?cwd=` /
+///   `?workspace=`, already resolved to a workspace root. `None` = the caller
+///   declared no scope.
+/// - `session_workspace`: the session's bound workspace root. `None` = a legacy
+///   session with no recorded workspace.
+///
+/// A cross-workspace read is rejected ONLY when BOTH are present and differ.
+/// When either is absent the read is allowed (an unscoped caller, or a legacy
+/// session with no boundary to enforce), preserving backward-compatible reads.
+fn session_detail_scope_check(
+    requested_workspace: Option<&str>,
+    session_workspace: Option<&str>,
+) -> Result<(), CwdBindingError> {
+    match (requested_workspace, session_workspace) {
+        (Some(requested), Some(bound)) if requested != bound => {
+            Err(CwdBindingError::WorkspaceMismatch {
+                requested_workspace: requested.to_string(),
+                session_workspace: bound.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn agent_turn(
     State(state): State<AppState>,
     Json(req): Json<AgentTurnRequest>,
@@ -3550,6 +3679,14 @@ async fn agent_events(
                 Some(Ok(Event::default().id(id).event(event_type).data(data)))
             }
             Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                // A slow `/v1/agent/events` consumer overflowed the ring and lost
+                // `skipped` agent-turn events (thinking deltas, tool chunks).
+                // Log at warn so the drop is visible in the daemon log, not just
+                // pushed to the client (OCEAN-87).
+                tracing::warn!(
+                    skipped,
+                    "agent_events SSE subscriber lagged; dropped events"
+                );
                 let data =
                     json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
                         .to_string();
@@ -3691,6 +3828,7 @@ async fn agent_sessions_create(
 async fn agent_session(
     State(state): State<AppState>,
     Path(session_id): Path<AgentSessionId>,
+    Query(q): Query<SessionDetailQuery>,
 ) -> (StatusCode, Json<AgentSessionResponse>) {
     let core_id = core_sid(session_id);
     match state.runtime.session_detail(core_id) {
@@ -3702,6 +3840,37 @@ async fn agent_session(
                 .clone()
                 .or_else(|| session.cwd.clone())
                 .unwrap_or_default();
+
+            // Workspace-scoping guard (OCEAN-74). The turn path binds a session
+            // to its workspace (OCEAN-52); this read path must honour the same
+            // boundary so a caller in workspace A cannot read workspace B's
+            // session transcript by id alone. When the caller declares a scope
+            // (`?cwd=` / `?workspace=`) and the session carries a bound
+            // workspace, a mismatch is a cross-workspace read: reject with the
+            // turn path's 400 shape. A scopeless read, or a legacy session with
+            // no bound workspace, falls through unchanged (backward compatible).
+            let requested_ws = q.requested_workspace(&state.runtime);
+            let session_ws =
+                session_workspace_binding(&state.runtime, session_id).map(|(_cwd, root)| root);
+            if let Err(err) =
+                session_detail_scope_check(requested_ws.as_deref(), session_ws.as_deref())
+            {
+                tracing::warn!(
+                    %session_id,
+                    error = %err.message(),
+                    "agent_session: rejected cross-workspace session-detail read"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AgentSessionResponse {
+                        ok: false,
+                        session: None,
+                        turns: vec![],
+                        error: Some(err.message()),
+                    }),
+                );
+            }
+
             let turns = turns_from_detail(&session);
             // A still-running session surfaces its in-flight turn as active.
             let active_turn = turns.first().and_then(|t| {
@@ -4895,5 +5064,107 @@ mod tests {
         assert_eq!(parsed, vec!["https://a.com", "https://b.com"]);
         assert!(parse_allowed_origins("").is_empty());
         assert!(parse_allowed_origins("   ,  , ").is_empty());
+    }
+
+    // --- OCEAN-87: CORS preflight covers every served method ----------------
+
+    /// The router serves PATCH (`/v1/projects/{id}`) and DELETE
+    /// (`/v1/projects/{id}`, room participants). Both MUST be in the preflight
+    /// allow-list or the browser's OPTIONS check fails and the call never fires.
+    #[test]
+    fn cors_allow_methods_include_patch_and_delete() {
+        let methods = cors_allowed_methods();
+        for required in [
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
+            assert!(
+                methods.contains(&required),
+                "CORS allow_methods must advertise {required} (a route serves it)"
+            );
+        }
+    }
+
+    // --- OCEAN-74: session-detail workspace scoping -------------------------
+
+    /// A caller declaring workspace A must NOT read a session bound to workspace
+    /// B: the detail read path enforces the same boundary as the turn path.
+    #[test]
+    fn session_detail_rejects_cross_workspace_read() {
+        let err = session_detail_scope_check(Some("/work/repo-a"), Some("/work/repo-b"))
+            .expect_err("a cross-workspace detail read must be rejected");
+        match err {
+            CwdBindingError::WorkspaceMismatch {
+                requested_workspace,
+                session_workspace,
+            } => {
+                assert_eq!(requested_workspace, "/work/repo-a");
+                assert_eq!(session_workspace, "/work/repo-b");
+            }
+            other => panic!("expected WorkspaceMismatch, got {other:?}"),
+        }
+    }
+
+    /// A caller in the same workspace, an unscoped caller, and a legacy session
+    /// with no bound workspace all read successfully (backward compatible).
+    #[test]
+    fn session_detail_allows_matching_or_unscoped_read() {
+        // Same workspace → allowed.
+        assert!(
+            session_detail_scope_check(Some("/work/repo"), Some("/work/repo")).is_ok(),
+            "a same-workspace read must be allowed"
+        );
+        // No declared scope → allowed (legacy first-party caller).
+        assert!(
+            session_detail_scope_check(None, Some("/work/repo")).is_ok(),
+            "an unscoped read must remain allowed"
+        );
+        // Legacy session with no bound workspace → allowed (no boundary to enforce).
+        assert!(
+            session_detail_scope_check(Some("/work/repo"), None).is_ok(),
+            "a session with no bound workspace has no boundary to enforce"
+        );
+    }
+
+    // --- OCEAN-74: AllowSession wire semantics ------------------------------
+
+    /// `{"decision":"allow_session"}` must decode to the wire `AllowSession`
+    /// variant and map to the runtime's `AllowSession` (allow + remember for the
+    /// run), not collapse into a plain `Allow` or fail to decode at all.
+    #[test]
+    fn allow_session_wire_decodes_and_maps_to_runtime() {
+        let permission_id = PermissionId::new_v4();
+        let body = json!({
+            "permission_id": permission_id,
+            "decision": "allow_session",
+        });
+        let req: PermissionDecisionRequest =
+            serde_json::from_value(body).expect("allow_session must be a valid wire decision");
+        assert_eq!(req.permission_id, permission_id);
+        assert!(
+            matches!(req.decision, PermissionDecisionBody::AllowSession),
+            "wire decision must decode to AllowSession, not Allow/Deny"
+        );
+
+        // The handler's mapping: AllowSession (wire) → AllowSession (runtime).
+        let agent_decision = match req.decision {
+            PermissionDecisionBody::Allow => AgentPermissionDecision::Allow,
+            PermissionDecisionBody::AllowSession => AgentPermissionDecision::AllowSession,
+            PermissionDecisionBody::Deny { reason } => AgentPermissionDecision::Deny {
+                reason: reason.unwrap_or_else(|| "denied".into()),
+            },
+        };
+        assert!(
+            matches!(agent_decision, AgentPermissionDecision::AllowSession),
+            "AllowSession must reach the runtime as AllowSession, granting for the run"
+        );
+        // And it counts as an allow for client-facing reporting (not a block).
+        assert!(matches!(
+            agent_decision,
+            AgentPermissionDecision::Allow | AgentPermissionDecision::AllowSession
+        ));
     }
 }
