@@ -315,10 +315,19 @@ fn build_body(context: &Context, options: &StreamOptions) -> Value {
         body["systemInstruction"] = json!({"role": "system", "parts": [{"text": sp}]});
     }
     if let Some(t) = options.temperature {
-        body["generationConfig"] = json!({"temperature": t});
+        if !body["generationConfig"].is_object() {
+            body["generationConfig"] = json!({});
+        }
+        body["generationConfig"]["temperature"] = json!(t);
     }
     if let Some(level) = options.reasoning {
         apply_reasoning(&mut body, level);
+    }
+    if let Some(m) = options.max_tokens {
+        if !body["generationConfig"].is_object() {
+            body["generationConfig"] = json!({});
+        }
+        body["generationConfig"]["maxOutputTokens"] = json!(m);
     }
     if !context.tools.is_empty() {
         let decls: Vec<Value> = context
@@ -893,6 +902,57 @@ mod tests {
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 8192,
             "thinkingConfig must be present alongside temperature: {body}"
+        );
+    }
+
+    // OCEAN-175: Gemini must honor the operator's output-length cap.
+    // build_body previously emitted temperature, reasoning, and tools but never
+    // generationConfig.maxOutputTokens, so options.max_tokens was silently
+    // dropped for Gemini while every other provider honored it.
+    #[test]
+    fn build_body_emits_max_output_tokens_when_set() {
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+        let body = build_body(&empty_context(), &options);
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"], 4096,
+            "Gemini must receive generationConfig.maxOutputTokens: {body}"
+        );
+    }
+
+    #[test]
+    fn build_body_omits_max_output_tokens_when_unset() {
+        let body = build_body(&empty_context(), &StreamOptions::default());
+        assert!(
+            body["generationConfig"]
+                .get("maxOutputTokens")
+                .is_none(),
+            "maxOutputTokens must not be sent when options.max_tokens is None: {body}"
+        );
+    }
+
+    // max_tokens must merge into an existing generationConfig (temperature),
+    // not clobber it — and vice versa.
+    #[test]
+    fn build_body_preserves_temperature_alongside_max_output_tokens() {
+        let options = StreamOptions {
+            temperature: Some(0.7),
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+        let body = build_body(&empty_context(), &options);
+        let temp = body["generationConfig"]["temperature"]
+            .as_f64()
+            .expect("temperature must survive alongside maxOutputTokens");
+        assert!(
+            (temp - 0.7).abs() < 1e-6,
+            "temperature must survive alongside maxOutputTokens: {body}"
+        );
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"], 4096,
+            "maxOutputTokens must be present alongside temperature: {body}"
         );
     }
 
