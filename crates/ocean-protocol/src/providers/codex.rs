@@ -56,15 +56,24 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
     for m in messages {
         match m {
             Message::User { content, .. } => {
-                let text = content
+                // Responses API content parts: input_text + input_image (data-URL).
+                let parts: Vec<Value> = content
                     .iter()
-                    .filter_map(|c| c.as_text().map(str::to_string))
-                    .collect::<Vec<_>>()
-                    .join("");
+                    .filter_map(|c| match c {
+                        Content::Text { text } => {
+                            Some(json!({"type": "input_text", "text": text}))
+                        }
+                        Content::Image { data, mime_type } => Some(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", mime_type, data),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
                 out.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
+                    "content": parts,
                 }));
             }
             Message::Assistant(a) => {
@@ -541,5 +550,44 @@ impl Provider for CodexProvider {
         };
 
         Ok(s.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::now_ms;
+
+    // OCEAN-99: vision parity for the OpenAI Responses API. A user image must
+    // serialize as an input_image content part (data-URL), not be dropped.
+    #[test]
+    fn user_image_is_encoded_as_input_image_part() {
+        let messages = vec![Message::User {
+            content: vec![
+                Content::text("describe this"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            timestamp: now_ms(),
+        }];
+
+        let out = convert_input(&messages);
+        assert_eq!(out.len(), 1);
+        let parts = out[0]["content"]
+            .as_array()
+            .expect("content array missing");
+
+        let has_text = parts
+            .iter()
+            .any(|p| p["type"] == "input_text" && p["text"] == "describe this");
+        assert!(has_text, "input_text part missing: {:?}", parts);
+
+        let image = parts
+            .iter()
+            .find(|p| p["type"] == "input_image")
+            .expect("input_image part missing — image was dropped");
+        assert_eq!(image["image_url"], "data:image/png;base64,AAECAwQ=");
     }
 }
