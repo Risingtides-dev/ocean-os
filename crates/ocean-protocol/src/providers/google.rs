@@ -83,7 +83,13 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
             Message::User { content, .. } => {
                 let parts: Vec<Value> = content
                     .iter()
-                    .filter_map(|c| c.as_text().map(|t| json!({"text": t})))
+                    .filter_map(|c| match c {
+                        Content::Text { text } => Some(json!({"text": text})),
+                        Content::Image { data, mime_type } => Some(json!({
+                            "inlineData": {"mimeType": mime_type, "data": data}
+                        })),
+                        _ => None,
+                    })
                     .collect();
                 out.push(json!({"role": "user", "parts": parts}));
             }
@@ -365,5 +371,43 @@ impl Provider for GoogleProvider {
 impl FunctionCall {
     fn finish_reason_set_to_tool_use(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::now_ms;
+
+    // OCEAN-99: vision parity. A user message carrying a Content::Image must
+    // serialize as a Gemini inlineData part, not be dropped to text-only.
+    #[test]
+    fn user_image_is_encoded_as_inline_data_part() {
+        let messages = vec![Message::User {
+            content: vec![
+                Content::text("describe this"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            timestamp: now_ms(),
+        }];
+
+        let out = convert_messages(&messages);
+        assert_eq!(out.len(), 1);
+        let parts = out[0]["parts"]
+            .as_array()
+            .expect("parts array missing");
+
+        let has_text = parts.iter().any(|p| p["text"] == "describe this");
+        assert!(has_text, "text part missing: {:?}", parts);
+
+        let image = parts
+            .iter()
+            .find(|p| p.get("inlineData").is_some())
+            .expect("inlineData part missing — image was dropped");
+        assert_eq!(image["inlineData"]["mimeType"], "image/png");
+        assert_eq!(image["inlineData"]["data"], "AAECAwQ=");
     }
 }

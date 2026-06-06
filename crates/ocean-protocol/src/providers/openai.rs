@@ -108,12 +108,36 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
     for m in messages {
         match m {
             Message::User { content, .. } => {
-                let text = content
+                // If any image is present, emit the content-array form so vision
+                // turns survive. Otherwise keep the simple string form.
+                let has_image = content
                     .iter()
-                    .filter_map(|c| c.as_text().map(|s| s.to_string()))
-                    .collect::<Vec<_>>()
-                    .join("");
-                out.push(json!({"role": "user", "content": text}));
+                    .any(|c| matches!(c, Content::Image { .. }));
+                if has_image {
+                    let parts: Vec<Value> = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            Content::Text { text } => {
+                                Some(json!({"type": "text", "text": text}))
+                            }
+                            Content::Image { data, mime_type } => Some(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", mime_type, data)
+                                }
+                            })),
+                            _ => None,
+                        })
+                        .collect();
+                    out.push(json!({"role": "user", "content": parts}));
+                } else {
+                    let text = content
+                        .iter()
+                        .filter_map(|c| c.as_text().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    out.push(json!({"role": "user", "content": text}));
+                }
             }
             Message::Assistant(a) => {
                 let mut text = String::new();
@@ -502,5 +526,58 @@ impl Provider for OpenAiProvider {
         };
 
         Ok(s.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::now_ms;
+
+    // OCEAN-99: vision parity. A user message carrying a Content::Image must
+    // serialize as the OpenAI image_url content part (data-URL), not be dropped
+    // into a text-only string.
+    #[test]
+    fn user_image_is_encoded_as_image_url_part() {
+        let messages = vec![Message::User {
+            content: vec![
+                Content::text("describe this"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            timestamp: now_ms(),
+        }];
+
+        let out = convert_messages(None, &messages);
+        assert_eq!(out.len(), 1);
+        let content = &out[0]["content"];
+        // Must be the array form, not a bare string.
+        assert!(content.is_array(), "expected content array, got {content}");
+        let parts = content.as_array().unwrap();
+
+        let has_text = parts
+            .iter()
+            .any(|p| p["type"] == "text" && p["text"] == "describe this");
+        assert!(has_text, "text part missing: {content}");
+
+        let image = parts
+            .iter()
+            .find(|p| p["type"] == "image_url")
+            .expect("image_url part missing — image was dropped");
+        assert_eq!(
+            image["image_url"]["url"],
+            "data:image/png;base64,AAECAwQ=",
+            "image_url data-URL malformed"
+        );
+    }
+
+    // Text-only user messages keep the simple string form (no regression).
+    #[test]
+    fn text_only_user_stays_string() {
+        let messages = vec![Message::user_text("hello")];
+        let out = convert_messages(None, &messages);
+        assert_eq!(out[0]["content"], "hello");
     }
 }
