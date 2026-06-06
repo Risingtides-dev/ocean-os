@@ -103,7 +103,20 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
                                 "call_id": id,
                             }));
                         }
-                        _ => {}
+                        // OCEAN-140: the Responses API replays chain-of-thought
+                        // only via the original `reasoning` items, carried across
+                        // turns as opaque `reasoning.encrypted_content` blobs tied
+                        // to the item id the API emitted. A `reasoning` input item
+                        // cannot be synthesized from free-form text — the API
+                        // rejects reconstructed reasoning. Ocean's
+                        // Content::Thinking carries an Anthropic-style thinking
+                        // string + signature, not an encrypted Responses reasoning
+                        // item, so there is nothing valid to re-encode here. Drop
+                        // it EXPLICITLY rather than via a silent `_ => {}` (kills
+                        // the OCEAN-101 silent-drop class).
+                        Content::Thinking { .. } => {}
+                        // Images never appear in assistant content on this API.
+                        Content::Image { .. } => {}
                     }
                 }
                 if !text.is_empty() {
@@ -730,5 +743,57 @@ mod tests {
                     .unwrap_or(false)),
             "no input_image should be emitted for a text-only tool result"
         );
+    }
+
+    // OCEAN-140: a replayed assistant turn carrying a Content::Thinking block must
+    // hit an EXPLICIT match arm, not the old silent `_ => {}`. The Responses API
+    // replays reasoning only via opaque encrypted_content items (which Ocean does
+    // not carry), so the documented behavior is an intentional drop: the thinking
+    // text must NOT leak into any emitted item, while the text message and
+    // function_call items survive in order.
+    #[test]
+    fn assistant_thinking_is_explicitly_dropped() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "secret chain of thought".into(),
+                    thinking_signature: Some("sig-abc".into()),
+                },
+                Content::text("visible answer"),
+                Content::ToolCall {
+                    id: "call_1".into(),
+                    name: "calc".into(),
+                    arguments: serde_json::json!({"x": 1}),
+                },
+            ],
+            api: "responses".into(),
+            provider: "codex".into(),
+            model: "gpt-5".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_input(&messages);
+
+        // No reasoning text or signature anywhere in the encoded input.
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(
+            !serialized.contains("secret chain of thought"),
+            "thinking text must not appear in encoded input: {serialized}"
+        );
+        assert!(
+            !serialized.contains("sig-abc"),
+            "thinking signature must not appear in encoded input: {serialized}"
+        );
+
+        // Exactly the assistant text message + the function_call survive.
+        assert_eq!(out.len(), 2, "thinking must not add an item: {out:?}");
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"][0]["text"], "visible answer");
+        assert_eq!(out[1]["type"], "function_call");
+        assert_eq!(out[1]["name"], "calc");
     }
 }
