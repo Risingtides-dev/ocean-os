@@ -270,6 +270,16 @@ struct ResponsesUsage {
     output_tokens: u64,
     #[serde(default)]
     total_tokens: u64,
+    // OCEAN-158: the Responses API reports cached-prompt tokens under
+    // `input_tokens_details.cached_tokens`. Decode them into usage.cache_read.
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -528,6 +538,9 @@ impl Provider for CodexProvider {
                                 } else {
                                     u.input_tokens + u.output_tokens
                                 };
+                                if let Some(d) = u.input_tokens_details {
+                                    usage.cache_read = d.cached_tokens;
+                                }
                             }
                         }
                         break;
@@ -795,5 +808,25 @@ mod tests {
         assert_eq!(out[0]["content"][0]["text"], "visible answer");
         assert_eq!(out[1]["type"], "function_call");
         assert_eq!(out[1]["name"], "calc");
+    }
+
+    // OCEAN-158: the Responses API reports cached-prompt tokens under
+    // `input_tokens_details.cached_tokens`. The completed-event usage must decode
+    // that field so it can populate usage.cache_read; otherwise Codex users see a
+    // false 0 in the cache-read HUD.
+    #[test]
+    fn responses_usage_decodes_cached_tokens() {
+        let raw = r#"{
+            "input_tokens": 2000,
+            "output_tokens": 80,
+            "total_tokens": 2080,
+            "input_tokens_details": {"cached_tokens": 1792}
+        }"#;
+        let u: ResponsesUsage = serde_json::from_str(raw).expect("responses usage parses");
+        assert_eq!(
+            u.input_tokens_details.expect("details present").cached_tokens,
+            1792,
+            "cached_tokens must decode from input_tokens_details"
+        );
     }
 }

@@ -155,6 +155,17 @@ struct ChunkUsage {
     completion_tokens: u64,
     #[serde(default)]
     total_tokens: u64,
+    // OCEAN-158: cached-prompt tokens live under `prompt_tokens_details.cached_tokens`
+    // on the Chat Completions API. Decode them so the cache-read HUD shows a true
+    // value instead of a structural 0.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 pub struct OpenAiProvider {
@@ -570,6 +581,9 @@ impl Provider for OpenAiProvider {
                     usage.input = u.prompt_tokens;
                     usage.output = u.completion_tokens;
                     usage.total_tokens = u.total_tokens;
+                    if let Some(d) = u.prompt_tokens_details {
+                        usage.cache_read = d.cached_tokens;
+                    }
                 }
                 for choice in chunk.choices {
                     if let Some(reason) = choice.finish_reason {
@@ -1229,6 +1243,29 @@ mod tests {
             delta.refusal.as_deref(),
             Some("I can't help with that."),
             "refusal text was dropped"
+        );
+    }
+
+    // OCEAN-158: a usage payload carrying `prompt_tokens_details.cached_tokens`
+    // must decode that count so it can populate usage.cache_read. Without the
+    // detail field the cache-read HUD shows a structural 0 for OpenAI users even
+    // when the prompt was cached.
+    #[test]
+    fn usage_decodes_cached_tokens_into_cache_read() {
+        let raw = r#"{
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 40,
+                "total_tokens": 1240,
+                "prompt_tokens_details": {"cached_tokens": 1024}
+            }
+        }"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("usage chunk parses");
+        let u = chunk.usage.expect("usage present");
+        assert_eq!(
+            u.prompt_tokens_details.expect("details present").cached_tokens,
+            1024,
+            "cached_tokens must decode from prompt_tokens_details"
         );
     }
 }

@@ -218,15 +218,58 @@ fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
     }
 }
 
+/// True for the Anthropic Messages family. Prompt caching via `cache_control`
+/// breakpoints is an Anthropic-only feature, so we gate emission on the model's
+/// API string. Any non-Anthropic backend routed through this provider (none
+/// today, but the gate keeps the contract explicit and test-checkable) gets a
+/// body with no `cache_control` markers.
+fn is_anthropic_family(model: &Model) -> bool {
+    model.api == "anthropic-messages" || model.provider == "anthropic"
+}
+
+const EPHEMERAL: &str = "ephemeral";
+
+fn cache_control() -> Value {
+    json!({"type": EPHEMERAL})
+}
+
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+    let cache = is_anthropic_family(model);
+
     let mut body = json!({
         "model": model.id,
         "max_tokens": options.max_tokens.unwrap_or(model.max_tokens),
         "messages": convert_messages(&context.messages),
         "stream": true,
     });
+
+    // OCEAN-159: emit Anthropic prompt-caching breakpoints on the stable prefix.
+    //
+    // Anthropic reads the cache prefix in a fixed order — tools, then system,
+    // then messages — and a `cache_control` marker caches everything up to and
+    // including the block it sits on. The API allows at most 4 breakpoints. We
+    // place at most 3, on the *last* block of each stable region so the whole
+    // region caches:
+    //   1. last tool definition  -> caches every tool schema
+    //   2. last system block     -> caches the system prompt
+    //   3. a rolling breakpoint near the end of history -> caches the stable
+    //      conversation prefix while leaving the newest turn(s) fresh
+    // This turns each agent-loop turn from "re-bill the full prompt" into
+    // "re-bill only the new tail", and is what makes usage.cache_read non-zero
+    // on Anthropic at all.
+
     if let Some(sp) = &context.system_prompt {
-        body["system"] = json!(sp);
+        if cache {
+            // Convert the system prompt to a single text block carrying the
+            // cache breakpoint (a bare string cannot hold cache_control).
+            body["system"] = json!([{
+                "type": "text",
+                "text": sp,
+                "cache_control": cache_control(),
+            }]);
+        } else {
+            body["system"] = json!(sp);
+        }
     }
     if let Some(t) = options.temperature {
         body["temperature"] = json!(t);
@@ -237,19 +280,50 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         }
     }
     if !context.tools.is_empty() {
+        let last = context.tools.len() - 1;
         let tools: Vec<Value> = context
             .tools
             .iter()
-            .map(|t| {
-                json!({
+            .enumerate()
+            .map(|(i, t)| {
+                let mut v = json!({
                     "name": t.name,
                     "description": t.description,
                     "input_schema": t.parameters,
-                })
+                });
+                // Breakpoint on the last tool caches the whole tool-definition
+                // prefix (tools are read before system/messages).
+                if cache && i == last {
+                    v["cache_control"] = cache_control();
+                }
+                v
             })
             .collect();
         body["tools"] = json!(tools);
     }
+
+    // Rolling message breakpoint: mark the last content block of the last
+    // *stable* message so the conversation prefix caches and only the freshest
+    // turn is re-billed. We treat everything except the final message as the
+    // stable prefix; with >=2 messages that means a breakpoint on the
+    // second-to-last message. With a single message there is no stable history
+    // yet, so we skip it (the system + tools breakpoints still cache the prefix).
+    if cache {
+        let n = context.messages.len();
+        if n >= 2 {
+            if let Some(arr) = body["messages"].as_array_mut() {
+                let target = n - 2;
+                if let Some(content) = arr[target].get_mut("content").and_then(Value::as_array_mut) {
+                    if let Some(last_block) = content.last_mut() {
+                        if let Some(obj) = last_block.as_object_mut() {
+                            obj.insert("cache_control".into(), cache_control());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     body
 }
 
@@ -561,5 +635,133 @@ impl Provider for AnthropicProvider {
         };
 
         Ok(s.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Context, Message, Tool};
+
+    fn anthropic_model() -> Model {
+        Model::anthropic_claude_sonnet_4_6()
+    }
+
+    // A non-Anthropic model routed through this provider's build_body — used to
+    // prove cache_control is gated to the Anthropic family only.
+    fn non_anthropic_model() -> Model {
+        let mut m = Model::anthropic_claude_sonnet_4_6();
+        m.api = "openai-completions".into();
+        m.provider = "openai".into();
+        m
+    }
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: name.into(),
+            description: format!("{name} tool"),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn ctx_with_history() -> Context {
+        Context {
+            system_prompt: Some("You are a helpful assistant.".into()),
+            messages: vec![
+                Message::user_text("first turn"),
+                Message::user_text("second turn"),
+                Message::user_text("newest turn"),
+            ],
+            tools: vec![tool("read_file"), tool("write_file")],
+        }
+    }
+
+    // OCEAN-159: on the Anthropic family, build_body must attach an ephemeral
+    // cache_control breakpoint on (1) the last tool definition, (2) the system
+    // block, and (3) a rolling message near the end of history — so the stable
+    // prefix caches and only the freshest turn is re-billed.
+    #[test]
+    fn anthropic_build_body_emits_cache_control_at_intended_positions() {
+        let body = build_body(&anthropic_model(), &ctx_with_history(), &StreamOptions::default());
+
+        // (1) Last tool carries the breakpoint; earlier tools do not.
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "only the LAST tool should carry cache_control: {body}"
+        );
+        assert_eq!(
+            tools[1]["cache_control"]["type"], "ephemeral",
+            "last tool must carry an ephemeral cache breakpoint: {body}"
+        );
+
+        // (2) System prompt became a text-block array with a breakpoint.
+        let system = body["system"].as_array().expect("system must be a block array");
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "You are a helpful assistant.");
+        assert_eq!(
+            system[0]["cache_control"]["type"], "ephemeral",
+            "system block must carry an ephemeral cache breakpoint: {body}"
+        );
+
+        // (3) Rolling message breakpoint on the second-to-last message; the
+        // newest turn stays fresh (uncached).
+        let msgs = body["messages"].as_array().expect("messages array");
+        let n = msgs.len();
+        let stable = &msgs[n - 2]["content"];
+        let stable_last = stable.as_array().expect("content array").last().unwrap();
+        assert_eq!(
+            stable_last["cache_control"]["type"], "ephemeral",
+            "the stable (second-to-last) message must carry the rolling breakpoint: {body}"
+        );
+        let newest = &msgs[n - 1]["content"];
+        let newest_last = newest.as_array().expect("content array").last().unwrap();
+        assert!(
+            newest_last.get("cache_control").is_none(),
+            "the newest turn must NOT be cached (stays fresh): {body}"
+        );
+
+        // Never exceed Anthropic's 4-breakpoint limit.
+        let serialized = serde_json::to_string(&body).unwrap();
+        let count = serialized.matches("\"cache_control\"").count();
+        assert!(count <= 4, "must not exceed 4 cache breakpoints, found {count}: {body}");
+    }
+
+    // Non-Anthropic models must get a clean body with no cache_control anywhere,
+    // and the system prompt stays a plain string (no array conversion).
+    #[test]
+    fn non_anthropic_build_body_emits_no_cache_control() {
+        let body = build_body(&non_anthropic_model(), &ctx_with_history(), &StreamOptions::default());
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("cache_control"),
+            "non-Anthropic models must not receive cache_control: {body}"
+        );
+        assert!(
+            body["system"].is_string(),
+            "non-Anthropic system prompt must stay a plain string: {body}"
+        );
+    }
+
+    // With a single message there is no stable history yet, so the rolling
+    // message breakpoint is skipped — but tools + system still cache the prefix.
+    #[test]
+    fn anthropic_build_body_skips_message_breakpoint_for_single_message() {
+        let ctx = Context {
+            system_prompt: Some("sys".into()),
+            messages: vec![Message::user_text("only turn")],
+            tools: vec![tool("read_file")],
+        };
+        let body = build_body(&anthropic_model(), &ctx, &StreamOptions::default());
+        let msgs = body["messages"].as_array().expect("messages array");
+        let only = msgs[0]["content"].as_array().expect("content array");
+        assert!(
+            only.last().unwrap().get("cache_control").is_none(),
+            "a lone message must not carry a rolling breakpoint: {body}"
+        );
+        // System + tool breakpoints are still present.
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
     }
 }
