@@ -6,6 +6,15 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+# The `runtime` feature pulls in `ocean-runtime` and exposes `PluginProvider`,
+# the adapter that surfaces a plugin's tools through the runtime's
+# `CapabilityProvider` seam (alongside built-ins and MCP). On by default so the
+# daemon gets it without extra config; a consumer that only wants the plugin
+# transport can disable default features and pay nothing for the runtime dep.
+default = ["runtime"]
+runtime = ["dep:ocean-runtime", "dep:ocean-protocol"]
+
 [dependencies]
 # Plugin tools and arguments are JSON values; manifests are TOML. The runtime
 # (tokio) and stdio process plumbing mirror ocean-mcp's proven transport so a
@@ -17,6 +26,13 @@ serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
+# Optional, behind the `runtime` feature: the capability seam this crate's
+# `PluginProvider` implements. ocean-plugin depends UP into ocean-runtime, like
+# ocean-mcp; ocean-runtime must never depend back. ocean-protocol provides the
+# `Content` model a tool result is built from.
+ocean-runtime = { path = "../ocean-runtime", optional = true }
+ocean-protocol = { path = "../ocean-protocol", optional = true }
 
 # A tiny in-repo stdio plugin lives at src/bin/echo_plugin.rs (auto-discovered).
 # Cargo builds it for tests and sets CARGO_BIN_EXE_echo_plugin, the path the
