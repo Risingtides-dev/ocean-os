@@ -183,6 +183,22 @@ pub struct AgentTurn {
 // Request / Response payloads
 // ---------------------------------------------------------------------------
 
+/// An image attached to an agent turn (OCEAN-115). Surfaces that can capture a
+/// screenshot (e.g. the Chrome extension's `window.__ocean_capture_visible_tab`,
+/// OCEAN-92) populate this so the turn carries vision input. The daemon turns
+/// each `TurnImage` into a `Content::Image` block on the first user message,
+/// which the provider encoders (OCEAN-99: Anthropic/OpenAI/Gemini/Codex) already
+/// know how to serialize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnImage {
+    /// MIME type of the image data, e.g. `"image/png"` or `"image/jpeg"`.
+    pub mime_type: String,
+    /// The image payload — base64-encoded bytes, or a `data:` URL (the daemon
+    /// strips a `data:<mime>;base64,` prefix if present, keeping only the
+    /// base64 body that `Content::Image` expects).
+    pub data: String,
+}
+
 /// Request payload for `POST /v1/agent/turns`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTurnRequest {
@@ -221,6 +237,12 @@ pub struct AgentTurnRequest {
     /// global runtime model as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Optional images attached to the turn (OCEAN-115). When present, the daemon
+    /// emits one `Content::Image` block per entry alongside the prompt text on the
+    /// FIRST user message of the turn, enabling vision end-to-end. Existing clients
+    /// that don't send this are unaffected (`#[serde(default)]` → `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<TurnImage>>,
 }
 
 /// Response payload for `POST /v1/agent/turns`.
@@ -1061,6 +1083,7 @@ mod tests {
             client_type: Some("surface-web".into()),
             thinking_level: Some(ThinkingLevel::High),
             model_id: None,
+            images: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
@@ -1088,11 +1111,14 @@ mod tests {
             client_type: None,
             thinking_level: None,
             model_id: None,
+            images: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("thinking_level"));
         // model_id is also skip_serializing_if = "Option::is_none".
         assert!(!json.contains("model_id"));
+        // images is skip_serializing_if = "Option::is_none" too.
+        assert!(!json.contains("images"));
     }
 
     #[test]

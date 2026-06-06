@@ -124,6 +124,8 @@ impl DaemonClient {
             thinking_level: None,
             // Per-session model override (OCEAN-36): drives this turn only.
             model_id,
+            // ACP bridge does not attach images to turns (yet).
+            images: None,
         };
 
         let url = format!("{}/v1/agent/turns", self.base_url);

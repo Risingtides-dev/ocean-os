@@ -8,8 +8,9 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
-    Project, ProjectId, PromptRequest, PromptResponse, RequestId, RoomId, SessionDetail, SessionId,
-    SessionRunState, SessionSummary, SessionToolContext, SessionTranscriptEntry, TokenUsage,
+    Project, ProjectId, PromptImage, PromptRequest, PromptResponse, RequestId, RoomId,
+    SessionDetail, SessionId, SessionRunState, SessionSummary, SessionToolContext,
+    SessionTranscriptEntry, TokenUsage,
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
 use ocean_providers::{
@@ -40,6 +41,45 @@ const APP_NAME: &str = "ocean-rs";
 /// startup. A server that exceeds this contributes no tools (non-fatal) rather
 /// than wedging daemon startup.
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build the first user `Message` of a turn from the prompt text and any
+/// attached images (OCEAN-115). The content is always `[Text, Image, Image…]`:
+/// the text leads, then one `Content::Image` block per image, so the provider
+/// encoders (OCEAN-99) serialize vision input alongside the instruction.
+///
+/// `images.is_none()`/empty reduces to the plain text path — identical to the
+/// previous `Message::user_text` behaviour, keeping non-vision turns unchanged.
+///
+/// Each image's `data` accepts either a bare base64 string or a
+/// `data:<mime>;base64,<body>` URL; the prefix is stripped so `Content::Image`
+/// holds only the base64 body it expects.
+fn build_user_message(text: String, images: Option<&[PromptImage]>) -> Message {
+    let mut content = vec![Content::text(text)];
+    if let Some(images) = images {
+        for img in images {
+            let data = strip_data_url_prefix(&img.data).to_string();
+            content.push(Content::Image {
+                data,
+                mime_type: img.mime_type.clone(),
+            });
+        }
+    }
+    Message::User {
+        content,
+        timestamp: ocean_protocol::now_ms(),
+    }
+}
+
+/// If `s` is a `data:<mime>;base64,<body>` URL, return just `<body>`; otherwise
+/// return `s` unchanged. `Content::Image.data` is the raw base64 body.
+fn strip_data_url_prefix(s: &str) -> &str {
+    if let Some(rest) = s.strip_prefix("data:") {
+        if let Some(idx) = rest.find("base64,") {
+            return &rest[idx + "base64,".len()..];
+        }
+    }
+    s
+}
 
 /// Subdirectory under the config dir where plugin packs live, each as its own
 /// directory containing a `plugin.toml`. Overridable via `OCEAN_PLUGINS_DIR`
@@ -575,7 +615,10 @@ impl AgentRuntime {
             out.push_str(&req.prompt);
             out
         };
-        history.push(Message::user_text(user_text));
+        // First user message of the turn: prompt text plus any attached images
+        // as `Content::Image` blocks (OCEAN-115). No images → plain-text message,
+        // identical to the prior `Message::user_text` path.
+        history.push(build_user_message(user_text, req.images.as_deref()));
 
         let PromptControl {
             permission,
@@ -1670,6 +1713,67 @@ mod tests {
         path
     }
 
+    // OCEAN-115: an image attached to a turn must reach the FIRST user message
+    // as a `Content::Image` block, alongside the prompt text, so the provider
+    // encoders (OCEAN-99) serialize vision input. This tests the exact seam that
+    // `run_prompt` uses to build that message.
+    #[test]
+    fn build_user_message_attaches_images_as_content_blocks() {
+        let images = vec![
+            PromptImage {
+                mime_type: "image/png".into(),
+                data: "AAAA".into(),
+            },
+            // A data-URL payload: the prefix must be stripped to the base64 body.
+            PromptImage {
+                mime_type: "image/jpeg".into(),
+                data: "data:image/jpeg;base64,BBBB".into(),
+            },
+        ];
+        let msg = build_user_message("look at this".into(), Some(&images));
+
+        let Message::User { content, .. } = msg else {
+            panic!("expected a user message");
+        };
+        // [Text, Image, Image] — text leads, one Image block per attachment.
+        assert_eq!(content.len(), 3, "text + 2 images");
+        assert!(matches!(&content[0], Content::Text { text } if text == "look at this"));
+
+        match &content[1] {
+            Content::Image { data, mime_type } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data, "AAAA");
+            }
+            other => panic!("expected Content::Image, got {other:?}"),
+        }
+        match &content[2] {
+            Content::Image { data, mime_type } => {
+                assert_eq!(mime_type, "image/jpeg");
+                // data-URL prefix stripped; only the base64 body remains.
+                assert_eq!(data, "BBBB");
+            }
+            other => panic!("expected Content::Image, got {other:?}"),
+        }
+    }
+
+    // No images → plain-text message, identical to the prior behaviour.
+    #[test]
+    fn build_user_message_without_images_is_text_only() {
+        let none = build_user_message("hi".into(), None);
+        let Message::User { content, .. } = none else {
+            panic!("expected a user message");
+        };
+        assert_eq!(content.len(), 1);
+        assert!(matches!(&content[0], Content::Text { text } if text == "hi"));
+
+        // An empty image slice is also text-only.
+        let empty = build_user_message("hi".into(), Some(&[]));
+        let Message::User { content, .. } = empty else {
+            panic!("expected a user message");
+        };
+        assert_eq!(content.len(), 1);
+    }
+
     #[test]
     fn cap_session_history_is_noop_under_limit() {
         let msgs: Vec<Message> = (0..10)
@@ -2099,6 +2203,7 @@ done
             .prompt(
                 PromptRequest {
                     prompt: "hello".into(),
+                    images: None,
                     request_id: None,
                     session_id: None,
                     create_if_missing: true,
@@ -2170,6 +2275,7 @@ done
             .prompt(
                 PromptRequest {
                     prompt: "hi".into(),
+                    images: None,
                     request_id: None,
                     session_id: None,
                     create_if_missing: true,
@@ -2199,6 +2305,7 @@ done
             .prompt(
                 PromptRequest {
                     prompt: "Reply exactly: OCEAN_OK".into(),
+                    images: None,
                     request_id: None,
                     session_id: None,
                     create_if_missing: true,
@@ -2244,6 +2351,7 @@ done
             .prompt(
                 PromptRequest {
                     prompt: "resume a session that doesn't exist".into(),
+                    images: None,
                     request_id: None,
                     session_id: Some(ghost),
                     create_if_missing: false,
@@ -2271,6 +2379,7 @@ done
             .prompt(
                 PromptRequest {
                     prompt: "now create it".into(),
+                    images: None,
                     request_id: None,
                     session_id: Some(ghost),
                     create_if_missing: true,
@@ -2309,6 +2418,7 @@ done
             .prompt(
                 PromptRequest {
                     prompt: "first".into(),
+                    images: None,
                     request_id: None,
                     session_id: None,
                     create_if_missing: true,
@@ -2327,6 +2437,7 @@ done
         // Now fire two more turns at that same session at once.
         let mk = |p: &str| PromptRequest {
             prompt: p.into(),
+            images: None,
             request_id: None,
             session_id: Some(sid),
             create_if_missing: false,
@@ -2386,6 +2497,7 @@ done
             .prompt(
                 PromptRequest {
                     prompt: "seed".into(),
+                    images: None,
                     request_id: None,
                     session_id: None,
                     create_if_missing: true,
@@ -2410,6 +2522,7 @@ done
                 rt.prompt(
                     PromptRequest {
                         prompt: format!("concurrent-prompt-{i}"),
+                        images: None,
                         request_id: None,
                         session_id: Some(sid),
                         create_if_missing: false,
