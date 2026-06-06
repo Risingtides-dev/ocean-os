@@ -384,7 +384,13 @@ impl Provider for AnthropicProvider {
                 }
                 let parsed: SseEvent = match serde_json::from_str(&ev.data) {
                     Ok(p) => p,
-                    Err(_) => continue,
+                    Err(e) => {
+                        // An SSE data frame we couldn't parse. Skip to stay
+                        // resilient, but log it (OCEAN-101) so a malformed frame
+                        // isn't an invisible black hole.
+                        tracing::debug!(error = %e, "skipping unparseable Anthropic SSE frame");
+                        continue;
+                    }
                 };
                 match parsed {
                     SseEvent::Ping | SseEvent::Other => {}
@@ -418,7 +424,17 @@ impl Provider for AnthropicProvider {
                                     name,
                                 });
                             }
-                            BlockStart::Other => {}
+                            BlockStart::Other => {
+                                // Unmapped block kind (redacted_thinking,
+                                // server_tool_use, web_search_result, image
+                                // output, …). We have no Content variant for it,
+                                // but log so the drop is visible instead of
+                                // silent (OCEAN-101).
+                                tracing::warn!(
+                                    content_index = index,
+                                    "Anthropic content_block_start of an unmapped kind; its content will be dropped"
+                                );
+                            }
                         }
                     }
                     SseEvent::ContentBlockDelta { index, delta } => {
@@ -439,7 +455,12 @@ impl Provider for AnthropicProvider {
                             BlockDelta::SignatureDelta { signature } => {
                                 st.signature = Some(signature);
                             }
-                            BlockDelta::Other => {}
+                            BlockDelta::Other => {
+                                tracing::warn!(
+                                    content_index = index,
+                                    "Anthropic content_block_delta of an unmapped kind; dropping its delta"
+                                );
+                            }
                         }
                     }
                     SseEvent::ContentBlockStop { index } => {

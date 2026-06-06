@@ -31,6 +31,42 @@ struct Chunk {
     usage: Option<ChunkUsage>,
     #[serde(default)]
     model: Option<String>,
+    /// Several OpenAI-compatible gateways (OpenRouter, Together, etc.) deliver a
+    /// mid-stream failure as a data frame carrying an `error` object instead of
+    /// an HTTP status — `{"error": {"message": "...", ...}}`. Without capturing
+    /// it the chunk parses with empty `choices` and the turn ends as a clean but
+    /// empty success, hiding the real failure (OCEAN-101).
+    #[serde(default)]
+    error: Option<StreamError>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct StreamError {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    code: Option<Value>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+impl StreamError {
+    fn describe(&self) -> String {
+        let mut s = String::new();
+        if let Some(k) = &self.kind {
+            s.push_str(k);
+            s.push_str(": ");
+        }
+        if self.message.is_empty() {
+            s.push_str("provider returned an in-stream error");
+        } else {
+            s.push_str(&self.message);
+        }
+        if let Some(c) = &self.code {
+            s.push_str(&format!(" (code: {c})"));
+        }
+        s
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -51,6 +87,12 @@ struct ChunkDelta {
     /// alias the same channel as `reasoning`. We accept both spellings.
     #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
+    /// OpenAI emits a structured refusal (safety decline) through its own
+    /// `refusal` channel with `content` left null. Previously this was ignored,
+    /// so a refused turn produced an empty assistant message with no explanation
+    /// (OCEAN-101). We surface it as visible text so the user sees the decline.
+    #[serde(default)]
+    refusal: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCallDelta>,
 }
@@ -347,8 +389,29 @@ impl Provider for OpenAiProvider {
                 }
                 let chunk: Chunk = match serde_json::from_str(&ev.data) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "skipping unparseable OpenAI SSE frame");
+                        continue;
+                    }
                 };
+                // Mid-stream error frame (OpenRouter/Together/etc.). Surface it
+                // rather than ending the turn as a clean empty success.
+                if let Some(err) = chunk.error {
+                    let msg = err.describe();
+                    tracing::warn!(error = %msg, "OpenAI-compatible stream returned an in-stream error");
+                    let am = AssistantMessage {
+                        content: vec![],
+                        api: api.clone(),
+                        provider: provider.clone(),
+                        model: response_model.clone().unwrap_or_else(|| model_id.clone()),
+                        usage: usage.clone(),
+                        stop_reason: StopReason::Error,
+                        error_message: Some(msg),
+                        timestamp: now_ms(),
+                    };
+                    yield Ok(AssistantMessageEvent::Error { reason: StopReason::Error, error: am });
+                    return;
+                }
                 if let Some(m) = chunk.model { response_model = Some(m); }
                 if let Some(u) = chunk.usage {
                     usage.input = u.prompt_tokens;
@@ -380,6 +443,29 @@ impl Provider for OpenAiProvider {
                                 };
                                 thinking_buf.push_str(&r);
                                 yield Ok(AssistantMessageEvent::ThinkingDelta {
+                                    content_index: idx,
+                                    delta: r,
+                                });
+                            }
+                        }
+                        // Structured refusal (safety decline). `content` is null
+                        // in this case, so without surfacing `refusal` the turn
+                        // would end empty with no explanation. Treat it as text so
+                        // the user actually sees why the model declined.
+                        if let Some(r) = delta.refusal {
+                            if !r.is_empty() {
+                                let idx = match text_index {
+                                    Some(i) => i,
+                                    None => {
+                                        let i = next_block_index;
+                                        next_block_index += 1;
+                                        text_index = Some(i);
+                                        yield Ok(AssistantMessageEvent::TextStart { content_index: i });
+                                        i
+                                    }
+                                };
+                                text_buf.push_str(&r);
+                                yield Ok(AssistantMessageEvent::TextDelta {
                                     content_index: idx,
                                     delta: r,
                                 });
@@ -579,5 +665,34 @@ mod tests {
         let messages = vec![Message::user_text("hello")];
         let out = convert_messages(None, &messages);
         assert_eq!(out[0]["content"], "hello");
+    }
+
+    // OCEAN-101: a mid-stream error frame must decode into `Chunk.error` so the
+    // loop can surface it. Previously this frame parsed with empty `choices` and
+    // the turn ended as a clean empty success, hiding the failure.
+    #[test]
+    fn in_stream_error_frame_is_captured() {
+        let raw = r#"{"error":{"message":"rate limited","type":"rate_limit_error","code":429}}"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("chunk parses");
+        let err = chunk.error.expect("error object must be captured, not dropped");
+        let desc = err.describe();
+        assert!(desc.contains("rate limited"), "message lost: {desc}");
+        assert!(desc.contains("rate_limit_error"), "type lost: {desc}");
+        assert!(desc.contains("429"), "code lost: {desc}");
+    }
+
+    // OCEAN-101: a structured refusal must decode into `ChunkDelta.refusal` so it
+    // can be surfaced as visible text. Previously `refusal` was ignored and the
+    // refused turn produced an empty message.
+    #[test]
+    fn refusal_delta_is_captured() {
+        let raw = r#"{"choices":[{"delta":{"refusal":"I can't help with that.","content":null}}]}"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("chunk parses");
+        let delta = chunk.choices[0].delta.as_ref().expect("delta present");
+        assert_eq!(
+            delta.refusal.as_deref(),
+            Some("I can't help with that."),
+            "refusal text was dropped"
+        );
     }
 }

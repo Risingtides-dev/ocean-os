@@ -66,6 +66,29 @@ struct FunctionCall {
     args: Value,
 }
 
+/// Classify a Gemini `finishReason` into the unified `StopReason`, flagging the
+/// abnormal/blocking reasons so they surface as an error rather than masquerading
+/// as a clean stop. Gemini returns reasons like `SAFETY`, `RECITATION`,
+/// `PROHIBITED_CONTENT`, `BLOCKLIST`, `SPII`, `MALFORMED_FUNCTION_CALL`,
+/// `IMAGE_SAFETY` — all of which previously mapped to a normal `Stop`, so a
+/// content-filtered response with empty content looked like a successful empty
+/// completion (OCEAN-101 silent-drop).
+///
+/// Returns `(StopReason, is_blocking)`. When `is_blocking` is true the caller
+/// surfaces an error so the operator/agent sees *why* the turn produced nothing
+/// instead of receiving a clean-but-empty assistant message.
+fn classify_finish_reason(reason: &str) -> (StopReason, bool) {
+    match reason {
+        // Normal completions.
+        "STOP" | "FINISH_REASON_UNSPECIFIED" | "" => (StopReason::Stop, false),
+        "MAX_TOKENS" => (StopReason::Length, false),
+        // Abnormal / blocking terminations — the model stopped because content
+        // was filtered, recited, malformed, etc. These must not look like a
+        // clean stop; surface them.
+        _ => (StopReason::Error, true),
+    }
+}
+
 #[derive(Deserialize, Debug, Default)]
 struct UsageMetadata {
     #[serde(default)]
@@ -272,6 +295,9 @@ impl Provider for GoogleProvider {
             let mut stop = StopReason::Stop;
             let mut usage = Usage::default();
             let mut response_model: Option<String> = None;
+            // Track an abnormal/blocking finishReason (SAFETY, RECITATION, …) so
+            // it surfaces as a real error instead of a clean empty completion.
+            let mut block_reason: Option<String> = None;
 
             while let Some(ev) = sse.next().await {
                 if let Some(c) = &cancel_for_stream {
@@ -284,7 +310,10 @@ impl Provider for GoogleProvider {
                 if ev.data.is_empty() { continue; }
                 let chunk: Chunk = match serde_json::from_str(&ev.data) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "skipping unparseable Gemini SSE frame");
+                        continue;
+                    }
                 };
                 if let Some(m) = chunk.model_version { response_model = Some(m); }
                 if let Some(u) = chunk.usage_metadata {
@@ -294,11 +323,15 @@ impl Provider for GoogleProvider {
                 }
                 for cand in chunk.candidates {
                     if let Some(reason) = cand.finish_reason {
-                        stop = match reason.as_str() {
-                            "STOP" => StopReason::Stop,
-                            "MAX_TOKENS" => StopReason::Length,
-                            _ => StopReason::Stop,
-                        };
+                        let (mapped, is_blocking) = classify_finish_reason(&reason);
+                        stop = mapped;
+                        if is_blocking {
+                            tracing::warn!(
+                                finish_reason = %reason,
+                                "Gemini terminated abnormally; surfacing as error"
+                            );
+                            block_reason = Some(reason);
+                        }
                     }
                     if let Some(content) = cand.content {
                         for part in content.parts {
@@ -338,6 +371,30 @@ impl Provider for GoogleProvider {
                 yield Ok(AssistantMessageEvent::TextEnd { content_index: text_index, content: text_buf.clone() });
                 text_index += 1;
             }
+
+            // A blocking finishReason (SAFETY / RECITATION / BLOCKLIST / …) that
+            // produced no usable content is an error, not a clean stop. Surface it
+            // so the caller sees *why* the turn yielded nothing rather than a
+            // silently-empty success (OCEAN-101).
+            if let Some(reason) = &block_reason {
+                if !text_started && tool_blocks.is_empty() {
+                    let am = AssistantMessage {
+                        content: vec![],
+                        api: api.clone(),
+                        provider: provider.clone(),
+                        model: response_model.clone().unwrap_or_else(|| model_id.clone()),
+                        usage: usage.clone(),
+                        stop_reason: StopReason::Error,
+                        error_message: Some(format!(
+                            "Gemini blocked the response (finishReason: {reason})"
+                        )),
+                        timestamp: now_ms(),
+                    };
+                    yield Ok(AssistantMessageEvent::Error { reason: StopReason::Error, error: am });
+                    return;
+                }
+            }
+
             if !tool_blocks.is_empty() && stop == StopReason::Stop {
                 stop = StopReason::ToolUse;
             }
@@ -409,5 +466,45 @@ mod tests {
             .expect("inlineData part missing — image was dropped");
         assert_eq!(image["inlineData"]["mimeType"], "image/png");
         assert_eq!(image["inlineData"]["data"], "AAECAwQ=");
+    }
+
+    // OCEAN-101: a content-filter / abnormal finishReason must NOT map to a clean
+    // `Stop`. Previously every non-MAX_TOKENS reason fell through to `Stop`, so a
+    // SAFETY/RECITATION block looked like a successful empty completion.
+    #[test]
+    fn blocking_finish_reasons_classify_as_error() {
+        for reason in [
+            "SAFETY",
+            "RECITATION",
+            "PROHIBITED_CONTENT",
+            "BLOCKLIST",
+            "SPII",
+            "MALFORMED_FUNCTION_CALL",
+            "IMAGE_SAFETY",
+            "OTHER",
+        ] {
+            let (stop, blocking) = classify_finish_reason(reason);
+            assert_eq!(
+                stop,
+                StopReason::Error,
+                "{reason} must surface as Error, not a silent Stop"
+            );
+            assert!(blocking, "{reason} must be flagged as blocking");
+        }
+    }
+
+    // Normal terminations stay normal.
+    #[test]
+    fn normal_finish_reasons_are_not_blocking() {
+        assert_eq!(classify_finish_reason("STOP"), (StopReason::Stop, false));
+        assert_eq!(classify_finish_reason(""), (StopReason::Stop, false));
+        assert_eq!(
+            classify_finish_reason("FINISH_REASON_UNSPECIFIED"),
+            (StopReason::Stop, false)
+        );
+        assert_eq!(
+            classify_finish_reason("MAX_TOKENS"),
+            (StopReason::Length, false)
+        );
     }
 }

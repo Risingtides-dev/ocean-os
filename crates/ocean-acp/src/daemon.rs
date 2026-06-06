@@ -285,8 +285,13 @@ impl EventStream {
             match serde_json::from_str::<AgentTurnEvent>(payload) {
                 Ok(ev) => return Ok(Some(ev)),
                 // Daemon emits `{"type":"error",...}` control frames and may add
-                // new event kinds; skip anything we can't decode.
-                Err(_) => continue,
+                // new event kinds; skip anything we can't decode — but log it
+                // (OCEAN-101) so a new/unknown event variant isn't an invisible
+                // drop that silently never reaches the editor.
+                Err(e) => {
+                    tracing::debug!(error = %e, payload, "skipping undecodable daemon AgentTurnEvent frame");
+                    continue;
+                }
             }
         }
         Ok(None)
@@ -314,7 +319,10 @@ impl OceanEventStream {
             }
             match serde_json::from_str::<EventEnvelope>(payload) {
                 Ok(ev) => return Ok(Some(ev)),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!(error = %e, payload, "skipping undecodable daemon EventEnvelope frame");
+                    continue;
+                }
             }
         }
         Ok(None)
