@@ -2912,6 +2912,7 @@ dependencies = [
  "chrono",
  "ocean-core",
  "ocean-mcp",
+ "ocean-plugin",
  "ocean-protocol",
  "ocean-providers",
  "ocean-runtime",

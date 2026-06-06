@@ -14,6 +14,7 @@ ocean-core.workspace = true
 ocean-providers.workspace = true
 ocean-runtime.workspace = true
 ocean-mcp.workspace = true
+ocean-plugin.workspace = true
 ocean-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
