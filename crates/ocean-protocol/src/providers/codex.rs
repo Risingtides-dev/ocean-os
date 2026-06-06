@@ -182,11 +182,18 @@ fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
 }
 
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+    // OCEAN-165: do NOT set `parallel_tool_calls`. The Codex backend speaks the
+    // OpenAI Responses API, which accepts this param and defaults it to `true`
+    // (parallel tool calls allowed) when omitted. Hardcoding `false` forced every
+    // multi-tool turn to serialize: a 3-tool turn that is one round-trip on
+    // Anthropic/OpenAI/Gemini became 3 sequential round-trips here. The sibling
+    // providers (openai.rs, anthropic, google.rs) never set this field and so ride
+    // their API default; omitting it here restores parity — Codex now allows
+    // parallel tool calls like the rest.
     let mut body = json!({
         "model": model.id,
         "input": convert_input(&context.messages),
         "tool_choice": "auto",
-        "parallel_tool_calls": false,
         "store": false,
         "stream": true,
     });
@@ -220,12 +227,20 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
 // --- SSE payload shapes (only the fields we consume) ---
 
 #[derive(Deserialize)]
-struct OutputItemDone {
+struct OutputItemEnvelope {
     item: OutputItem,
 }
 
 #[derive(Deserialize)]
 struct OutputItem {
+    // OCEAN-165: the item's own id (e.g. `fc_*`). The Responses API uses THIS as
+    // the `item_id` on `response.function_call_arguments.delta` frames, so it is
+    // the only stable key that ties streamed argument deltas to the right call
+    // when several function calls are in flight (parallel tool calls). `call_id`
+    // (the `call_*` token Ocean replays in function_call_output) is a SEPARATE id
+    // and must NOT be used to match streaming partials.
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     r#type: String,
     #[serde(default)]
@@ -315,10 +330,151 @@ struct ResponseError {
 
 #[derive(Default)]
 struct PartialToolCall {
+    /// The `call_id` (`call_*`) replayed back to the API in function_call_output.
+    /// Distinct from the map key, which is the item id (`fc_*`).
     id: String,
     name: String,
     args: String,
     block_index: usize,
+    /// Whether ToolCallStart has already been emitted for this block, so the
+    /// added/delta/done arms never double-start the same call.
+    started: bool,
+}
+
+/// OCEAN-165: item-id-keyed accumulator for streamed function calls.
+///
+/// Every function-call lifecycle frame on the Responses API carries the item id
+/// (`fc_*`): `output_item.added` introduces it, `function_call_arguments.delta`
+/// repeats it as `item_id`, and `output_item.done` reports it as `item.id`.
+/// Keying on item id (NOT `call_id`) is what makes PARALLEL tool calls correct —
+/// two interleaved calls never collide and each `done` finalizes its own block.
+///
+/// The struct owns block-index assignment and the started-once flag so the stream
+/// loop and the unit tests share the exact same disambiguation logic.
+#[derive(Default)]
+struct ToolCalls {
+    by_item: std::collections::BTreeMap<String, PartialToolCall>,
+    order: Vec<String>,
+}
+
+/// What a single frame did to the accumulator, so the stream loop knows which
+/// `AssistantMessageEvent`s to yield.
+struct ToolCallStep {
+    /// Set when this frame first started the block (emit ToolCallStart).
+    started: Option<ToolCallStarted>,
+    /// Block index + delta to forward (emit ToolCallDelta).
+    delta: Option<(usize, String)>,
+}
+
+struct ToolCallStarted {
+    block_index: usize,
+    call_id: String,
+    name: String,
+}
+
+/// A finalized call, in stream order.
+#[derive(Debug, PartialEq, Eq)]
+struct FinalToolCall {
+    block_index: usize,
+    call_id: String,
+    name: String,
+    args: String,
+}
+
+impl ToolCalls {
+    /// Ensure a block exists for `item_id`, assigning the next block index and
+    /// recording stream order the first time. Returns whether it was just started.
+    fn ensure(&mut self, item_id: &str, next_block_index: &mut usize) -> bool {
+        let exists_started = self.by_item.get(item_id).map(|e| e.started).unwrap_or(false);
+        if exists_started {
+            return false;
+        }
+        let entry = self.by_item.entry(item_id.to_string()).or_default();
+        entry.block_index = *next_block_index;
+        *next_block_index += 1;
+        entry.started = true;
+        self.order.push(item_id.to_string());
+        true
+    }
+
+    /// Handle `response.output_item.added` for a function_call item.
+    fn on_added(&mut self, item: &OutputItem, next_block_index: &mut usize) -> ToolCallStep {
+        let started = self.ensure(&item.id, next_block_index);
+        let entry = self.by_item.get_mut(&item.id).unwrap();
+        entry.id = item.call_id.clone();
+        entry.name = item.name.clone();
+        ToolCallStep {
+            started: started.then(|| ToolCallStarted {
+                block_index: entry.block_index,
+                call_id: item.call_id.clone(),
+                name: item.name.clone(),
+            }),
+            delta: None,
+        }
+    }
+
+    /// Handle `response.function_call_arguments.delta`.
+    fn on_args_delta(
+        &mut self,
+        item_id: &str,
+        delta: &str,
+        next_block_index: &mut usize,
+    ) -> ToolCallStep {
+        let started_now = self.ensure(item_id, next_block_index);
+        let entry = self.by_item.get_mut(item_id).unwrap();
+        let started = started_now.then(|| ToolCallStarted {
+            block_index: entry.block_index,
+            call_id: entry.id.clone(),
+            name: entry.name.clone(),
+        });
+        entry.args.push_str(delta);
+        let block_index = entry.block_index;
+        ToolCallStep {
+            started,
+            delta: Some((block_index, delta.to_string())),
+        }
+    }
+
+    /// Handle `response.output_item.done` for a function_call item.
+    fn on_done(&mut self, item: &OutputItem, next_block_index: &mut usize) -> ToolCallStep {
+        // Match by item id when present (the stable streaming key); otherwise
+        // synthesize a block under the call_id so the call is never lost.
+        let key = if !item.id.is_empty() {
+            item.id.clone()
+        } else {
+            item.call_id.clone()
+        };
+        let started_now = self.ensure(&key, next_block_index);
+        let entry = self.by_item.get_mut(&key).unwrap();
+        let started = started_now.then(|| ToolCallStarted {
+            block_index: entry.block_index,
+            call_id: item.call_id.clone(),
+            name: item.name.clone(),
+        });
+        entry.id = item.call_id.clone();
+        entry.name = item.name.clone();
+        if entry.args.is_empty() {
+            entry.args = item.arguments.clone();
+        }
+        ToolCallStep {
+            started,
+            delta: None,
+        }
+    }
+
+    /// Finalized calls in stream order, args parsed to JSON (empty → `{}`).
+    fn finalize(&self) -> Vec<FinalToolCall> {
+        self.order
+            .iter()
+            .filter_map(|k| self.by_item.get(k))
+            .map(|tc| FinalToolCall {
+                block_index: tc.block_index,
+                call_id: tc.id.clone(),
+                name: tc.name.clone(),
+                args: tc.args.clone(),
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -412,10 +568,11 @@ impl Provider for CodexProvider {
             let mut next_block_index: usize = 0;
             let mut text_buf = String::new();
             let mut text_index: Option<usize> = None;
-            // Tool calls keyed by the Responses `item_id` so streamed argument
-            // deltas land in the right block; finalized on output_item.done.
-            let mut tool_calls: std::collections::BTreeMap<String, PartialToolCall> = Default::default();
-            let mut tool_order: Vec<String> = Vec::new();
+            // OCEAN-165: item-id-keyed accumulator (see ToolCalls). Makes parallel
+            // tool calls correct — each call's added/delta/done frames are tied
+            // together by the Responses item id, so two in-flight calls never
+            // collide and each `done` finalizes the exact block it belongs to.
+            let mut tool_calls = ToolCalls::default();
             let mut stop = StopReason::Stop;
             let mut usage = Usage::default();
 
@@ -473,68 +630,58 @@ impl Provider for CodexProvider {
                             }
                         }
                     }
+                    // OCEAN-165: the Responses API introduces each function call
+                    // with an `output_item.added` frame carrying the item `id`
+                    // (`fc_*`), `call_id`, and `name` BEFORE any argument deltas.
+                    // Register the call (keyed by item id) up front.
+                    "response.output_item.added" => {
+                        if let Ok(added) = serde_json::from_value::<OutputItemEnvelope>(value) {
+                            let item = added.item;
+                            if item.r#type == "function_call" && !item.id.is_empty() {
+                                let step = tool_calls.on_added(&item, &mut next_block_index);
+                                if let Some(s) = step.started {
+                                    yield Ok(AssistantMessageEvent::ToolCallStart {
+                                        content_index: s.block_index,
+                                        id: s.call_id,
+                                        name: s.name,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     "response.function_call_arguments.delta" => {
                         if let Ok(d) = serde_json::from_value::<ArgsDeltaEvent>(value) {
                             if d.item_id.is_empty() || d.delta.is_empty() {
                                 continue;
                             }
-                            let is_new = !tool_calls.contains_key(&d.item_id);
-                            let entry = tool_calls.entry(d.item_id.clone()).or_default();
-                            if is_new {
-                                entry.block_index = next_block_index;
-                                next_block_index += 1;
-                                tool_order.push(d.item_id.clone());
+                            let step = tool_calls.on_args_delta(&d.item_id, &d.delta, &mut next_block_index);
+                            if let Some(s) = step.started {
                                 yield Ok(AssistantMessageEvent::ToolCallStart {
-                                    content_index: entry.block_index,
-                                    id: entry.id.clone(),
-                                    name: entry.name.clone(),
+                                    content_index: s.block_index,
+                                    id: s.call_id,
+                                    name: s.name,
                                 });
                             }
-                            entry.args.push_str(&d.delta);
-                            let block_index = entry.block_index;
-                            yield Ok(AssistantMessageEvent::ToolCallDelta {
-                                content_index: block_index,
-                                delta: d.delta,
-                            });
+                            if let Some((block_index, delta)) = step.delta {
+                                yield Ok(AssistantMessageEvent::ToolCallDelta {
+                                    content_index: block_index,
+                                    delta,
+                                });
+                            }
                         }
                     }
                     "response.output_item.done" => {
-                        if let Ok(done) = serde_json::from_value::<OutputItemDone>(value) {
+                        if let Ok(done) = serde_json::from_value::<OutputItemEnvelope>(value) {
                             let item = done.item;
                             if item.r#type == "function_call" {
                                 stop = StopReason::ToolUse;
-                                // Match the partial we accumulated (by call_id, or
-                                // create one if the args never streamed).
-                                let key = tool_calls
-                                    .iter()
-                                    .find(|(_, v)| v.id == item.call_id || v.id.is_empty())
-                                    .map(|(k, _)| k.clone());
-                                match key {
-                                    Some(k) => {
-                                        let entry = tool_calls.get_mut(&k).unwrap();
-                                        entry.id = item.call_id.clone();
-                                        entry.name = item.name.clone();
-                                        if entry.args.is_empty() {
-                                            entry.args = item.arguments.clone();
-                                        }
-                                    }
-                                    None => {
-                                        let block_index = next_block_index;
-                                        next_block_index += 1;
-                                        let key = item.call_id.clone();
-                                        tool_order.push(key.clone());
-                                        yield Ok(AssistantMessageEvent::ToolCallStart {
-                                            content_index: block_index,
-                                            id: item.call_id.clone(),
-                                            name: item.name.clone(),
-                                        });
-                                        tool_calls.insert(key, PartialToolCall {
-                                            id: item.call_id,
-                                            name: item.name,
-                                            args: item.arguments,
-                                            block_index,
-                                        });
-                                    }
+                                let step = tool_calls.on_done(&item, &mut next_block_index);
+                                if let Some(s) = step.started {
+                                    yield Ok(AssistantMessageEvent::ToolCallStart {
+                                        content_index: s.block_index,
+                                        id: s.call_id,
+                                        name: s.name,
+                                    });
                                 }
                             }
                         }
@@ -626,8 +773,7 @@ impl Provider for CodexProvider {
             if !text_buf.is_empty() {
                 out_content.push(Content::Text { text: text_buf.clone() });
             }
-            for key in &tool_order {
-                let Some(tc) = tool_calls.get(key) else { continue };
+            for tc in tool_calls.finalize() {
                 let args: Value = if tc.args.is_empty() {
                     Value::Object(Default::default())
                 } else {
@@ -635,13 +781,13 @@ impl Provider for CodexProvider {
                 };
                 yield Ok(AssistantMessageEvent::ToolCallEnd {
                     content_index: tc.block_index,
-                    id: tc.id.clone(),
+                    id: tc.call_id.clone(),
                     name: tc.name.clone(),
                     arguments: args.clone(),
                 });
                 out_content.push(Content::ToolCall {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
+                    id: tc.call_id,
+                    name: tc.name,
                     arguments: args,
                 });
             }
@@ -822,6 +968,140 @@ mod tests {
         assert_eq!(out[0]["content"][0]["text"], "visible answer");
         assert_eq!(out[1]["type"], "function_call");
         assert_eq!(out[1]["name"], "calc");
+    }
+
+    fn codex_model() -> Model {
+        Model {
+            id: "gpt-5-codex".into(),
+            name: "GPT-5 Codex".into(),
+            api: "responses".into(),
+            provider: "codex".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            reasoning: true,
+            context_window: 272_000,
+            max_tokens: 16_384,
+        }
+    }
+
+    // OCEAN-165: the Codex backend speaks the OpenAI Responses API, which allows
+    // parallel tool calls by default (parallel_tool_calls defaults to true when
+    // omitted). The provider previously hardcoded `parallel_tool_calls: false`,
+    // serializing multi-tool turns vs Anthropic/OpenAI/Gemini. build_body must NOT
+    // emit the field at all, so Codex rides the API default like the siblings.
+    #[test]
+    fn build_body_does_not_force_parallel_tool_calls_off() {
+        let model = codex_model();
+        let context = Context::default();
+        let options = StreamOptions::default();
+
+        let body = build_body(&model, &context, &options);
+
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "Codex must not set parallel_tool_calls — it should ride the Responses \
+             API default (parallel allowed), matching the other providers. Got: {body}"
+        );
+        // Sanity: the rest of the request shape is intact.
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+    }
+
+    fn fc_item(id: &str, call_id: &str, name: &str, arguments: &str) -> OutputItem {
+        OutputItem {
+            id: id.into(),
+            r#type: "function_call".into(),
+            name: name.into(),
+            arguments: arguments.into(),
+            call_id: call_id.into(),
+        }
+    }
+
+    // OCEAN-165: the core parallel-tool-calls correctness test. Two function calls
+    // stream with INTERLEAVED frames (added A, added B, args A, args B, args A,
+    // done B, done A) — the exact pattern that broke the old call_id /
+    // first-empty-partial matching. Both calls must finalize with the right
+    // id/name/args attached to the right block. This is what makes it safe to omit
+    // parallel_tool_calls (let Codex return multiple calls in one response).
+    #[test]
+    fn interleaved_parallel_tool_calls_finalize_to_correct_blocks() {
+        let mut tc = ToolCalls::default();
+        let mut next: usize = 0;
+
+        // The model opens two calls before completing either.
+        tc.on_added(&fc_item("fc_A", "call_A", "get_weather", ""), &mut next);
+        tc.on_added(&fc_item("fc_B", "call_B", "get_time", ""), &mut next);
+
+        // Argument deltas arrive interleaved, keyed by item id.
+        tc.on_args_delta("fc_A", "{\"city\":", &mut next);
+        tc.on_args_delta("fc_B", "{\"tz\":", &mut next);
+        tc.on_args_delta("fc_A", "\"SF\"}", &mut next);
+        tc.on_args_delta("fc_B", "\"UTC\"}", &mut next);
+
+        // Done events arrive OUT OF ORDER relative to start (B before A).
+        tc.on_done(
+            &fc_item("fc_B", "call_B", "get_time", "{\"tz\":\"UTC\"}"),
+            &mut next,
+        );
+        tc.on_done(
+            &fc_item("fc_A", "call_A", "get_weather", "{\"city\":\"SF\"}"),
+            &mut next,
+        );
+
+        let finals = tc.finalize();
+        assert_eq!(finals.len(), 2, "both parallel calls must survive: {finals:?}");
+
+        // Stream order preserved: A was added first, so it stays block 0.
+        let a = &finals[0];
+        assert_eq!(a.block_index, 0);
+        assert_eq!(a.call_id, "call_A");
+        assert_eq!(a.name, "get_weather");
+        assert_eq!(a.args, "{\"city\":\"SF\"}");
+
+        let b = &finals[1];
+        assert_eq!(b.block_index, 1);
+        assert_eq!(b.call_id, "call_B");
+        assert_eq!(b.name, "get_time");
+        assert_eq!(b.args, "{\"tz\":\"UTC\"}");
+    }
+
+    // OCEAN-165: a call whose args never stream and that has no `added` frame —
+    // only an `output_item.done` — must still finalize from the done payload alone.
+    #[test]
+    fn done_only_tool_call_finalizes_from_done_payload() {
+        let mut tc = ToolCalls::default();
+        let mut next: usize = 0;
+
+        tc.on_done(
+            &fc_item("fc_X", "call_X", "noop", "{\"k\":1}"),
+            &mut next,
+        );
+
+        let finals = tc.finalize();
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].call_id, "call_X");
+        assert_eq!(finals[0].name, "noop");
+        assert_eq!(finals[0].args, "{\"k\":1}");
+    }
+
+    // OCEAN-165: ToolCallStart must fire exactly once per call. `added` then
+    // `delta` then `done` for the same item id must only report `started` on the
+    // first frame, never re-start the block.
+    #[test]
+    fn tool_call_starts_exactly_once() {
+        let mut tc = ToolCalls::default();
+        let mut next: usize = 0;
+
+        let s1 = tc.on_added(&fc_item("fc_1", "call_1", "f", ""), &mut next);
+        assert!(s1.started.is_some(), "added must start the call");
+
+        let s2 = tc.on_args_delta("fc_1", "{}", &mut next);
+        assert!(s2.started.is_none(), "delta must NOT re-start an open call");
+
+        let s3 = tc.on_done(&fc_item("fc_1", "call_1", "f", "{}"), &mut next);
+        assert!(s3.started.is_none(), "done must NOT re-start an open call");
+
+        assert_eq!(next, 1, "exactly one block index consumed");
     }
 
     // OCEAN-158: the Responses API reports cached-prompt tokens under
