@@ -201,7 +201,19 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
                                 }
                             }));
                         }
-                        _ => {}
+                        // OCEAN-140: the Chat Completions API has no input shape
+                        // for assistant reasoning — reasoning is output-only on
+                        // this API, and replaying chain-of-thought across tool
+                        // round-trips is only supported on the Responses API via
+                        // opaque `reasoning.encrypted_content` items (which
+                        // Ocean's Content::Thinking does not carry). An
+                        // Anthropic-style thinking block (text + signature) has no
+                        // valid Chat Completions assistant representation, so it is
+                        // dropped EXPLICITLY here rather than via a silent
+                        // `_ => {}` (kills the OCEAN-101 silent-drop class).
+                        Content::Thinking { .. } => {}
+                        // Images never appear in assistant content on this API.
+                        Content::Image { .. } => {}
                     }
                 }
                 let mut msg = json!({"role": "assistant", "content": text});
@@ -331,7 +343,20 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         body["temperature"] = json!(t);
     }
     if let Some(m) = options.max_tokens {
-        body["max_tokens"] = json!(m);
+        // OCEAN-141: real api.openai.com models (o-series, gpt-5-class) on the
+        // Chat Completions path REJECT `max_tokens` with HTTP 400 "Unsupported
+        // parameter: 'max_tokens'" — it is deprecated there in favor of
+        // `max_completion_tokens` and is outright incompatible with o-series.
+        // The retry layer treats 400 as fatal, so every turn dies on the token
+        // cap. Other openai-compatible backends (DeepSeek/Kimi/MiniMax) still
+        // accept the legacy `max_tokens`, so we gate by `model.provider` — the
+        // SAME per-backend dispatch `apply_reasoning` (OCEAN-134) uses — rather
+        // than blasting one param everywhere.
+        let cap_param = match model.provider.as_str() {
+            "openai" => "max_completion_tokens",
+            _ => "max_tokens",
+        };
+        body[cap_param] = json!(m);
     }
     if let Some(level) = options.reasoning {
         apply_reasoning(&mut body, model, level);
@@ -827,6 +852,58 @@ mod tests {
         assert_eq!(out[0]["content"], "file contents");
     }
 
+    // OCEAN-140: a replayed assistant turn carrying a Content::Thinking block must
+    // be handled by an EXPLICIT match arm, not the old silent `_ => {}`. Chat
+    // Completions has no input shape for assistant reasoning, so the documented
+    // behavior is an intentional drop: the thinking text must NOT leak into the
+    // assistant message content or tool_calls, while the text + tool call survive.
+    #[test]
+    fn assistant_thinking_is_explicitly_dropped() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "secret chain of thought".into(),
+                    thinking_signature: Some("sig-abc".into()),
+                },
+                Content::text("the answer is 42"),
+                Content::ToolCall {
+                    id: "call_1".into(),
+                    name: "calc".into(),
+                    arguments: serde_json::json!({"x": 1}),
+                },
+            ],
+            api: "chat".into(),
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(None, &messages);
+        assert_eq!(out.len(), 1, "expected a single assistant message");
+        let msg = &out[0];
+        assert_eq!(msg["role"], "assistant");
+
+        // Visible text survives; thinking text does NOT leak into it.
+        assert_eq!(msg["content"], "the answer is 42");
+        let serialized = serde_json::to_string(msg).unwrap();
+        assert!(
+            !serialized.contains("secret chain of thought"),
+            "thinking text must not appear anywhere in the encoded message: {serialized}"
+        );
+        assert!(
+            !serialized.contains("sig-abc"),
+            "thinking signature must not appear in the encoded message: {serialized}"
+        );
+
+        // The tool call still rides along.
+        let calls = msg["tool_calls"].as_array().expect("tool_calls present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "calc");
+    }
+
     // OCEAN-101: a mid-stream error frame must decode into `Chunk.error` so the
     // loop can surface it. Previously this frame parsed with empty `choices` and
     // the turn ended as a clean empty success, hiding the failure.
@@ -964,6 +1041,60 @@ mod tests {
             "unknown backend must not receive reasoning_effort: {body}"
         );
         assert!(body.get("thinking").is_none(), "unknown backend must not receive thinking: {body}");
+    }
+
+    // OCEAN-141: token-cap param parity. Real api.openai.com models (o-series,
+    // gpt-5-class) on the Chat Completions path reject the deprecated `max_tokens`
+    // with HTTP 400 and require `max_completion_tokens`. `build_body` must emit
+    // `max_completion_tokens` (NOT `max_tokens`) for the OpenAI-family provider,
+    // gating on `model.provider` the same way `apply_reasoning` does.
+    #[test]
+    fn build_body_emits_max_completion_tokens_for_openai() {
+        let opts = StreamOptions {
+            max_tokens: Some(1024),
+            ..Default::default()
+        };
+        let body = build_body(&openai_model(), &Context::default(), &opts);
+        assert_eq!(
+            body["max_completion_tokens"], 1024,
+            "OpenAI must receive max_completion_tokens: {body}"
+        );
+        // The legacy param must NOT be present — o-series 400s on it.
+        assert!(
+            body.get("max_tokens").is_none(),
+            "OpenAI must not receive the deprecated max_tokens: {body}"
+        );
+    }
+
+    // Other openai-compatible backends (DeepSeek/Kimi/MiniMax) still accept the
+    // legacy `max_tokens`, so build_body must keep emitting it for them — flipping
+    // them to max_completion_tokens would risk breaking those gateways.
+    #[test]
+    fn build_body_keeps_max_tokens_for_openai_compat_backend() {
+        let opts = StreamOptions {
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        assert_eq!(
+            body["max_tokens"], 2048,
+            "openai-compatible backends must keep the legacy max_tokens: {body}"
+        );
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "openai-compatible backends must not receive max_completion_tokens: {body}"
+        );
+    }
+
+    // No token cap set → neither param is emitted.
+    #[test]
+    fn build_body_omits_token_cap_when_unset() {
+        let body = build_body(&openai_model(), &Context::default(), &StreamOptions::default());
+        assert!(body.get("max_tokens").is_none(), "max_tokens must be absent when unset: {body}");
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "max_completion_tokens must be absent when unset: {body}"
+        );
     }
 
     // OCEAN-101: a structured refusal must decode into `ChunkDelta.refusal` so it

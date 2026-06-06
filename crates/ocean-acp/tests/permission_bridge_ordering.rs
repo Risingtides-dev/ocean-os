@@ -26,12 +26,15 @@
 //!      `/v1/permissions/{id}/decision`, exactly like a gated `prompt().await`.
 //!
 //! Against that daemon we exercise the REAL `DaemonClient` (the same HTTP/SSE
-//! client `run_turn`/`spawn_permission_bridge` use) in two orderings:
+//! client `run_turn`/`spawn_permission_bridge` use):
 //!   - `old_order_misses_permission_and_would_hang` — subscribe AFTER submit:
 //!     the `PermissionRequest` is missed and the turn never unblocks (the bug).
 //!   - `new_order_receives_permission_and_turn_completes` — subscribe BEFORE
 //!     submit: the bridge receives the `PermissionRequest`, posts allow, and the
 //!     turn completes. This is the fixed ordering `run_turn` now uses.
+//!   - `synchronous_submit_failure_does_not_hang` — a BAD_REQUEST reject emits
+//!     NO events; the `select!` over (SSE read, submit task) surfaces the failure
+//!     instead of hanging on an event that never comes (OCEAN-146 P2).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -194,6 +197,23 @@ async fn decide(
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// A turn the daemon rejects SYNCHRONOUSLY, before emitting any AgentTurnEvent —
+/// e.g. cwd resolution / workspace-binding guard failures return BAD_REQUEST
+/// straight from the handler. No `SessionCreated`/`TurnStarted` ever hits the
+/// agent stream. This is the precondition for the OCEAN-146 P2 hang: a loop that
+/// only advances on stream events would wait forever. `submit_turn` surfaces it
+/// as an `Err` (non-2xx), which `run_turn`'s `tokio::select!` arm turns into a
+/// failed turn instead of a hang.
+async fn agent_turn_reject() -> (axum::http::StatusCode, Json<Value>) {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "cwd resolves outside the session workspace"
+        })),
+    )
+}
+
 /// Boot the mock gated daemon on an ephemeral port (NEVER :4780). Returns its
 /// base URL and the shared state.
 async fn spawn_mock_daemon() -> (String, Arc<MockState>) {
@@ -225,6 +245,34 @@ async fn spawn_mock_daemon() -> (String, Arc<MockState>) {
     });
 
     (format!("http://{bound}"), state)
+}
+
+/// Boot a mock daemon whose `/v1/agent/turns` rejects synchronously (no events).
+async fn spawn_rejecting_daemon() -> String {
+    let (control, _) = broadcast::channel::<EventEnvelope>(8);
+    let (agent, _) = broadcast::channel::<AgentTurnEvent>(8);
+    let state = Arc::new(MockState {
+        control,
+        agent,
+        decision: Mutex::new(None),
+        session_id: Uuid::new_v4(),
+        turn_id: Uuid::new_v4(),
+        permission_id: Uuid::new_v4(),
+    });
+    let app = Router::new()
+        .route("/v1/events", get(control_sse))
+        .route("/v1/agent/events", get(agent_sse))
+        .route("/v1/agent/turns", post(agent_turn_reject))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let bound = listener.local_addr().unwrap();
+    assert_ne!(bound.port(), 4780, "test daemon must never use :4780");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{bound}")
 }
 
 /// Wait until an SSE control subscriber is actually registered on the broadcast
@@ -353,4 +401,69 @@ async fn new_order_receives_permission_and_turn_completes() {
         .expect("turn response");
     assert!(resp.ok, "allowed gated turn completes successfully");
     assert!(matches!(resp.status, AgentTurnStatus::Completed));
+}
+
+/// OCEAN-146 P2: a synchronously-rejected turn must NOT hang. The daemon returns
+/// BAD_REQUEST from `/v1/agent/turns` without emitting any AgentTurnEvent, so a
+/// loop that only advances on `stream.next_event()` would wait forever. This
+/// reproduces `run_turn`'s `tokio::select!` over (SSE read, submit task): the
+/// submit task resolves with an `Err` while the stream stays silent, and the
+/// select surfaces the failure promptly instead of blocking on a phantom event.
+#[tokio::test]
+async fn synchronous_submit_failure_does_not_hang() {
+    let base = spawn_rejecting_daemon().await;
+    let client = DaemonClient::new(base);
+
+    // Subscribe to the agent stream first, like run_turn — it will stay SILENT
+    // because the rejected turn emits no events.
+    let mut agent = client.event_stream().await.expect("agent stream");
+
+    // Submit off-task, exactly as run_turn does.
+    let mut submit_handle = Some(tokio::spawn({
+        let client = client.clone();
+        async move { client.submit_turn("bad cwd".into(), "/etc".into(), None, None).await }
+    }));
+
+    let turn_id: Option<String> = None; // no turn ever starts
+
+    // This is the shape of run_turn's loop arm. Without the submit-task arm this
+    // `select!` would only ever resolve on `agent.next_event()`, which never
+    // fires → hang. With it, the Err is surfaced. We bound the whole thing in a
+    // timeout so a regression (reverting to event-only) FAILS loudly.
+    let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::select! {
+                biased;
+                ev = agent.next_event() => {
+                    // Should never produce an event for the rejected turn.
+                    match ev.expect("agent stream read") {
+                        Some(_) => panic!("rejected turn must emit no events"),
+                        None => return Err::<(), String>("stream closed".into()),
+                    }
+                }
+                joined = async { submit_handle.as_mut().unwrap().await }, if submit_handle.is_some() => {
+                    submit_handle = None;
+                    match joined.expect("submit task") {
+                        Ok(_resp) => {
+                            // mock returns non-2xx → client yields Err, not Ok.
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            // Turn never started → surface the failure (no hang).
+                            assert!(turn_id.is_none());
+                            return Err(format!("submit failed: {err}"));
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("must NOT hang on a synchronous submit failure");
+
+    let err = outcome.expect_err("a 400 reject must surface as a failed turn");
+    assert!(
+        err.contains("submit failed"),
+        "failure should come from the submit arm, got: {err}"
+    );
 }

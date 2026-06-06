@@ -114,15 +114,29 @@ impl Sessions {
             .and_then(|s| s.daemon_id.clone())
     }
 
-    /// Record the daemon id learned from the first turn.
-    fn set_daemon_id(&self, acp_session_id: &str, daemon_id: String) {
-        if let Some(state) = self
-            .inner
-            .lock()
-            .expect("sessions mutex poisoned")
-            .get_mut(acp_session_id)
-        {
-            state.daemon_id = Some(daemon_id);
+    /// Atomically claim a freshly-minted daemon session id for an ACP session
+    /// (OCEAN-146). On a NEW session the daemon mints the id and announces it via
+    /// `SessionCreated`; the ACP bridge learns it from the global event feed
+    /// rather than from the (gated-and-blocked) submit response. Because two
+    /// editor windows can submit the SAME prompt concurrently, the
+    /// `SessionCreated.title` is NOT unique — so the id, which IS unique, is the
+    /// only safe key. This claims `daemon_id` for `acp_session_id` *iff* no other
+    /// ACP session already holds it, all under one lock so concurrent first-turns
+    /// each bind to a DISTINCT daemon session. Returns `true` if the claim took.
+    fn try_claim_daemon_id(&self, acp_session_id: &str, daemon_id: &str) -> bool {
+        let mut map = self.inner.lock().expect("sessions mutex poisoned");
+        // Already owned by another ACP session → not ours; refuse.
+        let taken = map
+            .iter()
+            .any(|(sid, st)| sid != acp_session_id && st.daemon_id.as_deref() == Some(daemon_id));
+        if taken {
+            return false;
+        }
+        if let Some(state) = map.get_mut(acp_session_id) {
+            state.daemon_id = Some(daemon_id.to_string());
+            true
+        } else {
+            false
         }
     }
 
@@ -437,6 +451,17 @@ async fn main() -> AcpResult<()> {
 /// on a gate — not from `submit_turn`'s response, which would deadlock. The
 /// submit runs concurrently in a spawned task so the permission round-trip can
 /// unblock it.
+///
+/// Correlation is keyed on the daemon's AUTHORITATIVE, unique ids carried by
+/// `TurnStarted` — the per-turn `turn_id` and, for a new session, the
+/// `session_id` claimed atomically via [`Sessions::try_claim_daemon_id`]. We do
+/// NOT key on `SessionCreated.title`, which is just the prompt prefix and is not
+/// unique across concurrent same-prompt sessions.
+///
+/// Synchronous failures: a turn rejected up front (BAD_REQUEST on cwd / binding)
+/// returns from `submit_turn` WITHOUT emitting any `AgentTurnEvent`. The event
+/// loop selects over the SSE read AND the submit task so that immediate failure
+/// surfaces as a failed turn instead of hanging on an event that never comes.
 async fn run_turn(
     client: &DaemonClient,
     sessions: &Sessions,
@@ -488,15 +513,6 @@ async fn run_turn(
         request_id_rx,
     )?;
 
-    // For a NEW session the daemon mints the session id and announces it with a
-    // `SessionCreated` carrying the prompt's first 60 chars as `title` (see
-    // `ocean-daemon::agent_turn`). We match on that title to lock onto OUR
-    // session even if another fresh session is being created concurrently on the
-    // global feed. (We deliberately do NOT match on cwd: the daemon's
-    // SessionCreated reports the *resolved* cwd, which can differ from the raw
-    // path we sent after path normalisation / workspace binding.)
-    let expected_title: String = prompt.chars().take(60).collect();
-
     // Submit the turn OFF this task so a gated `prompt().await` inside the daemon
     // can block without wedging us: we keep reading the agent stream (to learn
     // the turn id) and the bridge keeps servicing permission prompts, which is
@@ -515,30 +531,75 @@ async fn run_turn(
     // filtering uses the daemon's id the events actually carry.
     let acp_session = SessionId::new(acp_session_id.to_string());
 
-    // We learn the turn's identity from the first event the daemon emits for
-    // this turn (`SessionCreated` / `TurnStarted`), which it sends just before
-    // it can block on a gate — so the bridge gets its `request_id` even on a
-    // gated turn where `submit_turn` has not yet returned. Once known we lock
-    // onto that turn id for the rest of the loop.
+    // We learn the turn's identity from the first turn-scoped event the daemon
+    // emits (`TurnStarted`), which it sends just before it can block on a gate —
+    // so the bridge gets its `request_id` even on a gated turn where
+    // `submit_turn` has not yet returned. The daemon's per-turn `request_id` IS
+    // the `turn_id`, which is unique; we key everything off it. For a NEW session
+    // we also learn the authoritative daemon session id from that same event's
+    // `session_id` and claim it atomically (see `try_claim_daemon_id`).
     let mut turn_id: Option<String> = None;
     let mut daemon_session_id: Option<String> = known_daemon_id.clone();
     let mut request_id_tx = Some(request_id_tx);
 
     loop {
-        let event = match stream.next_event().await? {
-            Some(ev) => ev,
-            None => {
-                // Stream closed before the turn finished. Treat as end-of-turn
-                // so the editor isn't left hanging.
-                tracing::warn!(%acp_session_id, "event stream closed before turn_finished");
-                return Ok(StopReason::EndTurn);
+        // Race the SSE read against the submit task. A synchronously-rejected
+        // turn (BAD_REQUEST on cwd resolution / workspace-binding guard) returns
+        // an `Err`/`Failed` from `submit_turn` WITHOUT ever emitting an
+        // `AgentTurnEvent` — so a plain `stream.next_event().await` would block
+        // forever waiting for an event that never comes. Selecting over both
+        // surfaces that immediate failure instead of hanging (OCEAN-146 P2).
+        let event = tokio::select! {
+            // Bias toward draining the stream first so a turn that DID start is
+            // bound before we inspect a late-arriving submit result.
+            biased;
+            ev = stream.next_event() => match ev? {
+                Some(ev) => ev,
+                None => {
+                    // Stream closed before the turn finished. Treat as
+                    // end-of-turn so the editor isn't left hanging.
+                    tracing::warn!(%acp_session_id, "event stream closed before turn_finished");
+                    return Ok(StopReason::EndTurn);
+                }
+            },
+            joined = async { submit_handle.as_mut().unwrap().await }, if submit_handle.is_some() => {
+                submit_handle = None;
+                match joined {
+                    // Submit returned. If the turn already started (we have a
+                    // turn_id), this is the NORMAL completion of a long/gated
+                    // turn — keep pumping the stream for its `TurnFinished`.
+                    Ok(Ok(resp)) => {
+                        if turn_id.is_none() {
+                            // No turn ever started → a synchronous rejection.
+                            // Surface it instead of waiting on a phantom event.
+                            let reason = resp
+                                .error
+                                .unwrap_or_else(|| "daemon rejected the turn".to_string());
+                            anyhow::bail!(reason);
+                        }
+                        continue;
+                    }
+                    Ok(Err(err)) => {
+                        if turn_id.is_none() {
+                            return Err(err.context("submit turn"));
+                        }
+                        // The turn started but the HTTP request errored out
+                        // afterward (e.g. transport drop); the stream still
+                        // carries the authoritative `TurnFinished`, so log and
+                        // keep reading rather than racing the stream to a verdict.
+                        tracing::warn!(%acp_session_id, error = %err, "submit_turn errored after turn started; relying on stream");
+                        continue;
+                    }
+                    Err(join_err) => anyhow::bail!("submit task panicked: {join_err}"),
+                }
             }
         };
 
         // Lock onto OUR daemon session id. For a resumed session it's already
-        // known and we filter strictly. For a fresh session we adopt the id from
-        // the `SessionCreated` whose title matches our prompt — disambiguating
-        // concurrent new sessions on the global feed.
+        // known and we filter strictly. For a fresh session we adopt the
+        // authoritative, UNIQUE session id carried by our turn's `TurnStarted`
+        // and claim it atomically — so two windows submitting the same prompt
+        // concurrently can never bind to the same daemon session.
         let ev_session = event_session_id(&event);
         if let Some(known) = &daemon_session_id {
             // Strict filter once locked: drop everything for other sessions.
@@ -546,31 +607,33 @@ async fn run_turn(
                 continue;
             }
         } else {
-            // Not locked yet: only a matching `SessionCreated` may adopt the id.
-            match &event {
-                ocean_agent_sdk::AgentTurnEvent::SessionCreated {
-                    session_id, title, ..
-                } if *title == expected_title => {
-                    let seen = session_id.0.to_string();
-                    daemon_session_id = Some(seen.clone());
-                    sessions.set_daemon_id(acp_session_id, seen.clone());
-                    tracing::info!(
-                        %acp_session_id,
-                        daemon_session_id = %seen,
-                        "mapped ACP session to daemon session"
-                    );
-                }
-                // Any other event before we've locked our session belongs to a
-                // different session (or is a global SessionCreated for someone
-                // else) — ignore it.
-                _ => continue,
+            // Not locked yet. Only a turn-scoped event (`TurnStarted`) binds us:
+            // it carries BOTH the unique turn id and the authoritative session
+            // id. A bare `SessionCreated` (no turn id) or any other session's
+            // event is ignored until our turn announces itself.
+            let Some(seen_session) = ev_session.as_deref() else {
+                continue;
+            };
+            if event_turn_id(&event).is_none() {
+                // e.g. a `SessionCreated` for some session — not yet our turn.
+                continue;
             }
+            if !sessions.try_claim_daemon_id(acp_session_id, seen_session) {
+                // This session id is already owned by another ACP session (a
+                // concurrent first turn claimed it). Not ours — keep looking.
+                continue;
+            }
+            daemon_session_id = Some(seen_session.to_string());
+            tracing::info!(
+                %acp_session_id,
+                daemon_session_id = %seen_session,
+                "mapped ACP session to daemon session"
+            );
         }
 
         // Learn the turn id (== request id) the first time we see a turn-scoped
         // event for our session, then hand it to the permission bridge and
-        // record the cancel target. The daemon's per-turn request id IS the
-        // turn id (see `ocean-daemon::agent_turn`).
+        // record the cancel target.
         if turn_id.is_none() {
             if let Some(seen_turn) = event_turn_id(&event) {
                 turn_id = Some(seen_turn.clone());
@@ -597,31 +660,6 @@ async fn run_turn(
             }
             // A different turn finished on this session — ignore.
             continue;
-        }
-
-        // If the daemon rejected the turn synchronously (e.g. bad session on
-        // resume), `submit_turn` returns `Failed`/errors and no stream events
-        // will arrive for it. Surface that instead of blocking forever. We only
-        // check the handle opportunistically once it has finished, so a normal
-        // long-running (or gated, still-blocked) turn is never disturbed.
-        if let Some(handle) = submit_handle.as_mut() {
-            if handle.is_finished() {
-                let joined = submit_handle.take().unwrap().await;
-                match joined {
-                    Ok(Ok(resp)) => {
-                        if matches!(resp.status, ocean_agent_sdk::AgentTurnStatus::Failed)
-                            && turn_id.is_none()
-                        {
-                            let reason = resp
-                                .error
-                                .unwrap_or_else(|| "daemon rejected the turn".to_string());
-                            anyhow::bail!(reason);
-                        }
-                    }
-                    Ok(Err(err)) => return Err(err.context("submit turn")),
-                    Err(join_err) => anyhow::bail!("submit task panicked: {join_err}"),
-                }
-            }
         }
 
         if let Some(update) = event_to_update(&event) {
@@ -653,6 +691,13 @@ const OPT_DENY: &str = "deny";
 /// stream — so the caller delivers it over `request_id_rx` the moment it's
 /// learned. We wait for it before forwarding any prompt; our subscription is
 /// already live, so nothing is missed in the interim.
+///
+/// Note: the daemon decides the permission mode per turn via `yolo_enabled()`
+/// (reads `OCEAN_YOLO`, default GATED — OCEAN-51). `AgentTurnRequest` carries no
+/// `yolo` field, so ACP turns DO gate by default: a mutating tool call blocks
+/// inside the daemon's `runtime.prompt(...)` and raises a `PermissionRequest` on
+/// the control stream. The gating is real, and (OCEAN-146) delivery to Zed now
+/// works because we subscribe the control stream before `submit_turn`.
 ///
 /// Lifetime: the task self-terminates when it observes a terminal control
 /// event (`TurnFinished` / `Cancelled` / `Error`) for our `request_id`, when the
@@ -945,6 +990,69 @@ mod tests {
         let sessions = Sessions::default();
         assert!(!sessions.set_model_id("missing", "kimi-k2.6".into()));
         assert_eq!(sessions.model_id("missing"), None);
+    }
+
+    // ---- OCEAN-146: unique daemon-session correlation -------------------------
+    //
+    // Codex P1: correlating a fresh session by `SessionCreated.title` (the prompt
+    // prefix) is unsafe — two windows submitting the SAME prompt concurrently
+    // share a title and would both adopt the SAME daemon session id, so one
+    // session streams/cancels the other's turn. The fix keys on the daemon's
+    // unique session id and claims it atomically. These tests pin that the claim
+    // is mutually exclusive across ACP sessions.
+
+    #[test]
+    fn daemon_session_id_claim_is_unique_across_acp_sessions() {
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj".into());
+        sessions.insert("acp-b".into(), "/proj".into());
+
+        let daemon_sid = "11111111-1111-1111-1111-111111111111";
+
+        // First ACP session claims the daemon id.
+        assert!(sessions.try_claim_daemon_id("acp-a", daemon_sid));
+        assert_eq!(sessions.daemon_id("acp-a").as_deref(), Some(daemon_sid));
+
+        // A SECOND ACP session must NOT be able to claim the same daemon id —
+        // this is the exact same-prompt collision that title-matching allowed.
+        assert!(!sessions.try_claim_daemon_id("acp-b", daemon_sid));
+        assert_eq!(sessions.daemon_id("acp-b"), None);
+    }
+
+    #[test]
+    fn concurrent_same_prompt_sessions_bind_distinct_ids() {
+        // Simulate two fresh windows submitting the same prompt: the daemon
+        // mints two distinct session ids on the global feed. Each ACP session
+        // claims a DIFFERENT one; neither steals the other's.
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj".into());
+        sessions.insert("acp-b".into(), "/proj".into());
+
+        let sid1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let sid2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+        // acp-a sees sid1 first and claims it.
+        assert!(sessions.try_claim_daemon_id("acp-a", sid1));
+        // acp-b sees sid1 too (global feed) but it's taken → must skip it...
+        assert!(!sessions.try_claim_daemon_id("acp-b", sid1));
+        // ...and claim the other one.
+        assert!(sessions.try_claim_daemon_id("acp-b", sid2));
+
+        assert_eq!(sessions.daemon_id("acp-a").as_deref(), Some(sid1));
+        assert_eq!(sessions.daemon_id("acp-b").as_deref(), Some(sid2));
+        assert_ne!(sessions.daemon_id("acp-a"), sessions.daemon_id("acp-b"));
+    }
+
+    #[test]
+    fn reclaiming_own_daemon_id_is_idempotent() {
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj".into());
+        let sid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        assert!(sessions.try_claim_daemon_id("acp-a", sid));
+        // The same ACP session re-claiming the SAME id (e.g. a retried bind)
+        // succeeds — only OTHER sessions are excluded.
+        assert!(sessions.try_claim_daemon_id("acp-a", sid));
+        assert_eq!(sessions.daemon_id("acp-a").as_deref(), Some(sid));
     }
 
     // ---- OCEAN-146: permission-bridge correlation key -------------------------
