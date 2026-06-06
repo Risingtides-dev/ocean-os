@@ -155,19 +155,31 @@ Content::Image (multimodal content — built, partial wiring)
   reaches a non-Anthropic model. The type is defined; the cross-provider feature
   is not complete.
 
-ocean-acp permission forwarding (LIVE, default-gated)
+ocean-acp permission forwarding (wired, not yet functional — subscribe-order race)
   The per-turn ACP permission bridge (`spawn_permission_bridge`) is fully built:
-  it watches the daemon control stream, forwards each `PermissionRequest` to the
-  editor as `session/request_permission`, and POSTs the decision back to
+  it watches the daemon control stream (`/v1/events`), forwards each
+  `PermissionRequest` scoped to our turn to the editor as
+  `session/request_permission`, and POSTs the decision back to
   `POST /v1/permissions/{id}/decision`.
-  STATUS: live. `AgentTurnRequest` has NO `yolo` field — the daemon decides the
+  GATING IS REAL: `AgentTurnRequest` has NO `yolo` field — the daemon decides the
   mode per turn via `yolo_enabled()`, which reads the `OCEAN_YOLO` env and
-  defaults to GATED (OCEAN-51 / #54). So ACP turns gate by default: mutating tool
-  calls raise a `PermissionRequest`, the bridge forwards it to the editor, and the
-  turn waits on the operator's decision. The bridge only goes quiet if an operator
-  explicitly opts into bypass with `OCEAN_YOLO=1`.
-  OPERATOR IMPACT: in Zed today, Ocean tool calls surface an editor-side approval
-  prompt by default — the end-to-end approval plumbing is active, not inert.
+  defaults to GATED (OCEAN-51 / #54). So ACP turns DO gate by default: a mutating
+  tool call blocks inside the daemon's `runtime.prompt(...)` and raises a
+  `PermissionRequest` on the control stream. That part works.
+  STATUS: the bridge delivery is broken by an ordering race (not the gating).
+  `run_turn` (in `crates/ocean-acp/src/main.rs`) awaits `submit_turn(...)` BEFORE
+  calling `spawn_permission_bridge`, but the daemon's `POST /v1/agent/turns`
+  handler only returns its HTTP response AFTER `runtime.prompt(...)` completes —
+  and a gated prompt blocks inside that call waiting for the permission decision.
+  So the daemon emits the `PermissionRequest` while the ACP side is still awaiting
+  `submit_turn`; the bridge subscribes to the control stream only afterward and
+  there is no replay, so it never sees the request. (Note the typed agent stream
+  IS subscribed before submit at the top of `run_turn` — it is specifically the
+  bridge's separate control-stream subscription that arrives too late.)
+  OPERATOR IMPACT: in Zed today, a gated Ocean tool call hangs — no editor-side
+  approval prompt is delivered, because the request fired before the bridge was
+  listening. Fix tracked as OCEAN-146 (subscribe to the control stream before /
+  concurrently with `submit_turn`, on the ACP side).
 ```
 
 The same "library exists vs feature works" gap also covers two items tracked in
