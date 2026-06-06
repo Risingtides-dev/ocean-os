@@ -160,12 +160,23 @@ struct ChunkUsage {
     // value instead of a structural 0.
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    // OCEAN-164: reasoning tokens live under `completion_tokens_details.reasoning_tokens`
+    // on the Chat Completions API. They are already part of `completion_tokens`,
+    // so we decode them only to surface the reasoning subset (never re-add to total).
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Deserialize, Debug, Default)]
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: u64,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 pub struct OpenAiProvider {
@@ -583,6 +594,9 @@ impl Provider for OpenAiProvider {
                     usage.total_tokens = u.total_tokens;
                     if let Some(d) = u.prompt_tokens_details {
                         usage.cache_read = d.cached_tokens;
+                    }
+                    if let Some(d) = u.completion_tokens_details {
+                        usage.reasoning = d.reasoning_tokens;
                     }
                 }
                 for choice in chunk.choices {
@@ -1266,6 +1280,31 @@ mod tests {
             u.prompt_tokens_details.expect("details present").cached_tokens,
             1024,
             "cached_tokens must decode from prompt_tokens_details"
+        );
+    }
+
+    // OCEAN-164: a usage payload carrying
+    // `completion_tokens_details.reasoning_tokens` must decode that count so it
+    // can populate usage.reasoning. Reasoning is already inside completion_tokens,
+    // so this is surfaced only to show the reasoning subset of output.
+    #[test]
+    fn usage_decodes_reasoning_tokens() {
+        let raw = r#"{
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 240,
+                "total_tokens": 1440,
+                "completion_tokens_details": {"reasoning_tokens": 200}
+            }
+        }"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("usage chunk parses");
+        let u = chunk.usage.expect("usage present");
+        assert_eq!(
+            u.completion_tokens_details
+                .expect("details present")
+                .reasoning_tokens,
+            200,
+            "reasoning_tokens must decode from completion_tokens_details"
         );
     }
 }

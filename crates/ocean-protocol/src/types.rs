@@ -58,6 +58,21 @@ pub struct Usage {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_write: u64,
+    /// OCEAN-164: reasoning/thinking tokens billed by the provider on reasoning
+    /// models. This is a SUBSET of `output` (and therefore of `total_tokens`),
+    /// not an additional bucket — every provider already counts reasoning inside
+    /// its output/total figures:
+    ///   - OpenAI Chat Completions: `completion_tokens_details.reasoning_tokens`
+    ///     ⊆ `completion_tokens`
+    ///   - OpenAI/Codex Responses: `output_tokens_details.reasoning_tokens`
+    ///     ⊆ `output_tokens`
+    ///   - Gemini: `thoughtsTokenCount` ⊆ `totalTokenCount`
+    ///   - Anthropic: thinking is billed inside `output_tokens`; there is no
+    ///     separate usage field, so this stays 0 on Anthropic.
+    /// It is surfaced so the HUD can show how much of `output` was reasoning;
+    /// it must NOT be added into `total_tokens` (that would double-count).
+    #[serde(default)]
+    pub reasoning: u64,
     #[serde(default)]
     pub total_tokens: u64,
 }
