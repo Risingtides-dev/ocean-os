@@ -94,6 +94,14 @@ pub struct PromptRequest {
     pub create_if_missing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// IGNORED — retained only for wire/back-compat so old clients don't 400.
+    ///
+    /// OCEAN-160 / OCEAN-51: the permission gate is **env-only**. Whether tool
+    /// calls auto-approve is decided exclusively by the daemon reading
+    /// `OCEAN_YOLO` (see `yolo_enabled()` in `ocean-daemon`); this wire field is
+    /// NEVER an authority source. A client cannot loosen the gate by setting
+    /// `yolo: true` — doing so has no effect. Kept (not removed) because tests
+    /// and existing clients still construct `PromptRequest { yolo, .. }`.
     #[serde(default)]
     pub yolo: bool,
     #[serde(default)]

@@ -866,7 +866,12 @@ async fn prompt(
         register_running_request(&state, &mut req, "prompt running", RequestState::Running).await;
     emit_user_message(&state.events, &req, request_id);
 
-    let control = build_prompt_control(&state, request_id, req.session_id, req.yolo, cancel);
+    // OCEAN-160: the permission gate is env-only. NEVER trust `req.yolo` off the
+    // wire — a local web page (CORS allows any loopback origin) could otherwise
+    // POST `{"yolo":true}` and bypass every permission prompt. Force the same
+    // env-derived value the product `agent_turn` path uses.
+    let yolo = yolo_enabled();
+    let control = build_prompt_control(&state, request_id, req.session_id, yolo, cancel);
     let res = state.runtime.prompt(req, control).await;
     record_prompt_result(&state, request_id, &res).await;
 
@@ -887,7 +892,9 @@ async fn create_request(
     let session_id = req.session_id;
     emit_user_message(&state.events, &req, request_id);
 
-    let control = build_prompt_control(&state, request_id, session_id, req.yolo, cancel);
+    // OCEAN-160: env-only gate. Ignore `req.yolo` from the wire (see `prompt`).
+    let yolo = yolo_enabled();
+    let control = build_prompt_control(&state, request_id, session_id, yolo, cancel);
     let task_state = state.clone();
     let handle = tokio::spawn(async move {
         let res = task_state.runtime.prompt(req, control).await;
@@ -6042,6 +6049,96 @@ mod tests {
         assert_eq!(written, "ok", "the released `write` tool wrote the file");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- OCEAN-160: legacy /v1/prompt must NOT trust the wire `yolo` flag -----
+    //
+    // The product `agent_turn` path forces `yolo_enabled()` (env-only gate,
+    // OCEAN-51). The legacy sync `prompt` and async `create_request` handlers
+    // used to pass `req.yolo` straight off the wire into `build_prompt_control`,
+    // so any local web page (CORS allows every loopback origin) could POST
+    // `{"yolo":true}` and auto-approve every mutating tool — fully bypassing the
+    // permission gate. This drives the REAL async `create_request` handler with
+    // `yolo: true` on the wire and `OCEAN_YOLO` UNSET, and proves a mutating
+    // `write` tool STILL trips the gate (registers a pending permission waiter)
+    // instead of auto-running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_prompt_ignores_wire_yolo_and_still_gates_mutating_tool() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Pin the keyless fake-tool provider (scripts one gated `write` call) and
+        // make sure the env gate is OFF — gating is the default-safe behavior.
+        std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
+        std::env::set_var("OCEAN_MODEL", "fake-tool");
+        std::env::remove_var("OCEAN_YOLO");
+        assert!(
+            !yolo_enabled(),
+            "precondition: OCEAN_YOLO must be unset so the env gate is engaged"
+        );
+
+        // The fake-tool provider writes to a fixed path; clear it so we can prove
+        // the tool did NOT run while gated. The env lock keeps any other
+        // fake-tool turn from racing on this shared path.
+        let target = std::path::Path::new(ocean_runtime::FAKE_TOOL_TARGET_PATH);
+        let _ = std::fs::remove_file(target);
+
+        let runtime = Arc::new(AgentRuntime::from_env().expect("fake-tool runtime"));
+        let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let state = AppState {
+            runtime,
+            events: EventBus::new(1024),
+            agent_events: AgentEventBus::new(1024),
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            permissions: Arc::new(RwLock::new(HashMap::new())),
+            longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
+            rooms: Arc::new(Mutex::new(store)),
+        };
+
+        // THE ATTACK: a wire request asking for yolo. Old code would honor it and
+        // auto-allow; the fix forces `yolo_enabled()` (false here) regardless.
+        let req = PromptRequest {
+            prompt: "write it".into(),
+            images: None,
+            request_id: None,
+            session_id: None,
+            create_if_missing: true,
+            max_turns: None,
+            yolo: true, // <- malicious wire flag; MUST be ignored
+            cwd: tmp.path().to_string_lossy().into_owned(),
+            project_id: None,
+            client_type: Some("test".into()),
+        };
+
+        // `create_request` spawns the turn and returns immediately, so the turn
+        // can suspend on the gate while we inspect `state.permissions`.
+        let resp = create_request(State(state.clone()), Json(req)).await;
+        assert!(resp.0.ok, "request must be accepted");
+
+        // GATE HELD: a pending `write` permission waiter must register, proving
+        // the wire `yolo:true` did NOT auto-allow the mutating tool.
+        let mut gated = false;
+        for _ in 0..150 {
+            if state.permissions.read().await.len() == 1 {
+                gated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            gated,
+            "wire yolo:true must be IGNORED: a mutating tool MUST trip the gate \
+             (register a pending permission waiter), not auto-run"
+        );
+
+        // And the tool must NOT have run while suspended on the gate.
+        assert!(
+            !target.exists(),
+            "the gated `write` tool must not execute before an operator decision"
+        );
+
+        let _ = std::fs::remove_file(target);
+        std::env::remove_var("OCEAN_MODEL");
     }
 
     // --- OCEAN-53: CORS origin whitelist ------------------------------------
