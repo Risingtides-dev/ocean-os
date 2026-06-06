@@ -155,18 +155,19 @@ Content::Image (multimodal content — built, partial wiring)
   reaches a non-Anthropic model. The type is defined; the cross-provider feature
   is not complete.
 
-ocean-acp permission forwarding (wired-but-inert)
+ocean-acp permission forwarding (LIVE, default-gated)
   The per-turn ACP permission bridge (`spawn_permission_bridge`) is fully built:
   it watches the daemon control stream, forwards each `PermissionRequest` to the
   editor as `session/request_permission`, and POSTs the decision back to
   `POST /v1/permissions/{id}/decision`.
-  STATUS: inert. The daemon submits ACP turns with `yolo: true`, so the gate
-  auto-allows and no `PermissionRequest` is ever raised — the bridge never has
-  anything to forward. It activates the instant ACP turns run non-yolo, a
-  daemon-side change (OCEAN-51 / #54).
-  OPERATOR IMPACT: in Zed today, Ocean tool calls run under the daemon's yolo
-  path with NO editor-side approval prompt, even though the approval plumbing
-  exists end-to-end.
+  STATUS: live. `AgentTurnRequest` has NO `yolo` field — the daemon decides the
+  mode per turn via `yolo_enabled()`, which reads the `OCEAN_YOLO` env and
+  defaults to GATED (OCEAN-51 / #54). So ACP turns gate by default: mutating tool
+  calls raise a `PermissionRequest`, the bridge forwards it to the editor, and the
+  turn waits on the operator's decision. The bridge only goes quiet if an operator
+  explicitly opts into bypass with `OCEAN_YOLO=1`.
+  OPERATOR IMPACT: in Zed today, Ocean tool calls surface an editor-side approval
+  prompt by default — the end-to-end approval plumbing is active, not inert.
 ```
 
 The same "library exists vs feature works" gap also covers two items tracked in

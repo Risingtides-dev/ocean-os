@@ -546,10 +546,11 @@ const OPT_DENY: &str = "deny";
 /// event (`TurnFinished` / `Cancelled` / `Error`) for our `request_id`, or when
 /// the control stream closes.
 ///
-/// Note: as of writing, the daemon submits ACP turns with `yolo: true`, so the
-/// gate auto-allows and no `PermissionRequest` is raised. This wiring activates
-/// the moment ACP turns run gated (daemon-side change); it is correct and inert
-/// until then.
+/// Note: the daemon decides the permission mode per turn via `yolo_enabled()`
+/// (reads `OCEAN_YOLO`, default GATED — OCEAN-51). `AgentTurnRequest` carries no
+/// `yolo` field, so ACP turns gate by default: mutating tool calls raise a
+/// `PermissionRequest` and this bridge forwards it to the editor. The bridge only
+/// goes quiet when an operator explicitly opts into bypass with `OCEAN_YOLO=1`.
 fn spawn_permission_bridge(
     client: &DaemonClient,
     conn: &ConnectionTo<Client>,
@@ -567,7 +568,8 @@ fn spawn_permission_bridge(
                 Ok(s) => s,
                 Err(err) => {
                     // Without the control stream we just can't surface prompts;
-                    // the turn still runs (and, under yolo, never gates).
+                    // the turn still runs (and, under `OCEAN_YOLO=1` bypass,
+                    // would not gate anyway).
                     tracing::warn!(%request_id, error = %err, "permission bridge: control stream unavailable");
                     return Ok(());
                 }
