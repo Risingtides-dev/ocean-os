@@ -471,6 +471,135 @@ async fn cancel_after_tool_round_unwinds_clean_no_orphan() {
     );
 }
 
+// ===========================================================================
+// Scenario 5 — Cancellation DURING a long-running tool call (OCEAN-116).
+// Before this fix, once a tool started executing the loop blocked on it until
+// it returned, even if the turn was cancelled — the only cancel checks were at
+// turn-start and between provider stream chunks, never while a tool was in
+// flight. This test fires a tool that sleeps far longer than the test's patience,
+// cancels the run from another task shortly after the tool starts, and asserts:
+//   1. the run unwinds with `Cancelled` PROMPTLY (well under the tool's duration),
+//   2. the slow tool never reached its completion line (it was aborted, not awaited).
+// If the loop awaited the tool to completion, the test would block for the full
+// sleep and the "finished" flag would be set — both of which we reject.
+// ===========================================================================
+#[tokio::test]
+async fn cancel_during_long_tool_aborts_promptly_without_awaiting_completion() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    // How long the fake tool "runs" for. Deliberately huge relative to the
+    // promptness bound below: if cancellation were NOT racing the tool, the run
+    // would block for this entire duration.
+    const TOOL_RUN: Duration = Duration::from_secs(30);
+    // Cancellation is fired this long after the run starts (enough for the tool
+    // to have begun executing).
+    const CANCEL_AFTER: Duration = Duration::from_millis(150);
+    // The run must return within this bound after cancel — far below TOOL_RUN.
+    const PROMPTNESS_BOUND: Duration = Duration::from_secs(5);
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let token = CancellationToken::new();
+
+    // A tool that records when it starts, sleeps for a long time, then records
+    // completion. The cancel must abort it between "started" and "finished".
+    struct SlowTool {
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+        run_for: Duration,
+    }
+    #[async_trait]
+    impl AgentTool for SlowTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn description(&self) -> &str {
+            "sleeps for a long time, simulating a slow bash / network tool"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        // No permission gate, so the loop runs it directly.
+        fn requires_permission(&self) -> bool {
+            false
+        }
+        async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
+            self.started.store(true, Ordering::SeqCst);
+            tokio::time::sleep(self.run_for).await;
+            // Reached ONLY if the tool was awaited to completion — i.e. the bug.
+            self.finished.store(true, Ordering::SeqCst);
+            Ok(AgentToolResult::text("slow tool finished"))
+        }
+    }
+
+    let provider = Arc::new(MockProvider::new(vec![
+        // Round 1: emit the slow tool call.
+        vec![done(
+            vec![tool_call("call-slow", "slow", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        // Round 2 must NEVER run — the tool is aborted mid-flight and the loop
+        // unwinds with Cancelled before requesting another round.
+        vec![done(vec![Content::text("should not happen")], StopReason::Stop)],
+    ]));
+
+    let mut cfg = base_config(provider.clone()).with_tools(vec![Arc::new(SlowTool {
+        started: started.clone(),
+        finished: finished.clone(),
+        run_for: TOOL_RUN,
+    })]);
+    cfg.stream_options.cancel = Some(token.clone());
+
+    // Fire the cancel from a separate task shortly after the run begins, while
+    // the slow tool is mid-sleep.
+    let canceller = {
+        let token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CANCEL_AFTER).await;
+            token.cancel();
+        })
+    };
+
+    let start = Instant::now();
+    let err = ocean_runtime::run_agent(&cfg, user("run the slow tool"), None)
+        .await
+        .err()
+        .expect("cancel during a long tool call must unwind with Err(Cancelled)");
+    let elapsed = start.elapsed();
+    let _ = canceller.await;
+
+    // 1. Unwound with Cancelled.
+    assert!(
+        matches!(err, ocean_runtime::AgentError::Cancelled),
+        "expected AgentError::Cancelled, got {err:?}"
+    );
+    // 2. The tool DID start (so we genuinely tested mid-execution cancel, not a
+    //    between-rounds one).
+    assert!(
+        started.load(Ordering::SeqCst),
+        "the slow tool should have started executing before the cancel"
+    );
+    // 3. The tool was aborted, NOT awaited to completion.
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "the slow tool must have been aborted mid-flight, not run to completion"
+    );
+    // 4. The run returned PROMPTLY — well under the tool's full duration. This is
+    //    the core of OCEAN-116: cancel takes effect without waiting for the tool.
+    assert!(
+        elapsed < PROMPTNESS_BOUND,
+        "run must unwind promptly after cancel ({elapsed:?}), not block for the \
+         tool's full {TOOL_RUN:?}"
+    );
+    // 5. Round 2 was never requested.
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "the loop must not request another round after cancelling a tool"
+    );
+}
+
 // Pre-cancelled before any round: must bail before touching the provider at all.
 #[tokio::test]
 async fn pre_cancelled_run_never_calls_provider() {
