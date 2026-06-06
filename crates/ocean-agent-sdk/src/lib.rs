@@ -28,6 +28,10 @@ use uuid::Uuid;
 /// crate directly.
 pub use ocean_protocol::ThinkingLevel;
 
+/// Surface patch protocol — the shared agent-native canvas mutation contract
+/// (GPUI Masterbuild Slice 1). See [`surface`] for the wire types.
+pub mod surface;
+
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
