@@ -16,8 +16,13 @@ ocean-agent-sdk = { path = "../ocean-agent-sdk" }
 ocean-protocol = { path = "../ocean-protocol" }
 # Credential + model-alias resolution (deepseek / kimi keys from auth.json).
 ocean-providers = { path = "../ocean-providers" }
+# The CapabilityProvider / AgentTool seam, so the council ops can be exposed to
+# agents as tools (LonghouseProvider). We depend UP on ocean-runtime; it never
+# depends back on us, so there is no cycle — same posture as ocean-mcp.
+ocean-runtime = { path = "../ocean-runtime" }
 
 anyhow.workspace = true
+async-trait.workspace = true
 futures = "0.3"
 serde.workspace = true
 serde_json.workspace = true
