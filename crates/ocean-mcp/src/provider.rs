@@ -248,9 +248,75 @@ fn build_tools(
         .collect()
 }
 
+/// How many times to attempt a `tools/list` re-fetch after a
+/// `tools/list_changed` notification before giving up and keeping the previous
+/// snapshot. A server that just changed its tools but briefly errors on re-list
+/// would otherwise leave the agent calling a stale tool table until the next
+/// notification — which may never come (OCEAN-175).
+const REFETCH_MAX_ATTEMPTS: u32 = 4;
+
+/// Base delay for the bounded exponential backoff between re-fetch attempts.
+/// Delays grow `BASE`, `BASE*2`, `BASE*4`, … capped at [`REFETCH_MAX_BACKOFF`].
+const REFETCH_BASE_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Ceiling for the per-attempt backoff delay so a flapping server can't push the
+/// retry spacing arbitrarily high.
+const REFETCH_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Re-fetch the tool list with bounded retry + exponential backoff (OCEAN-175).
+///
+/// Calls `fetch` up to [`REFETCH_MAX_ATTEMPTS`] times, sleeping a capped,
+/// exponentially-growing delay between attempts. Returns the first successful
+/// list, or the last error after exhausting attempts — it never spins forever.
+/// Generic over the fetcher and the sleeper so the retry/backoff policy is
+/// unit-testable without a live MCP server (tests inject a no-op sleep and a
+/// counting fetcher); the real watcher passes `client.list_tools()` and
+/// `tokio::time::sleep`.
+async fn refetch_tools_with_retry<Fetch, Fut, Sleep, SleepFut>(
+    server_name: &str,
+    mut fetch: Fetch,
+    mut sleep: Sleep,
+) -> anyhow::Result<Vec<McpToolDef>>
+where
+    Fetch: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<McpToolDef>>>,
+    Sleep: FnMut(Duration) -> SleepFut,
+    SleepFut: std::future::Future<Output = ()>,
+{
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=REFETCH_MAX_ATTEMPTS {
+        match fetch().await {
+            Ok(defs) => return Ok(defs),
+            Err(e) => {
+                last_err = Some(e);
+                // Don't sleep after the final attempt — give up immediately.
+                if attempt < REFETCH_MAX_ATTEMPTS {
+                    // Exponential backoff, capped: BASE * 2^(attempt-1).
+                    let backoff = REFETCH_BASE_BACKOFF
+                        .saturating_mul(1u32 << (attempt - 1))
+                        .min(REFETCH_MAX_BACKOFF);
+                    tracing::warn!(
+                        server = %server_name,
+                        attempt,
+                        max_attempts = REFETCH_MAX_ATTEMPTS,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %last_err.as_ref().unwrap(),
+                        "MCP tools/list re-fetch failed; retrying after backoff"
+                    );
+                    sleep(backoff).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("MCP tools/list re-fetch failed")))
+}
+
 /// Spawn a background task that, each time the server announces
 /// `tools/list_changed`, re-fetches `tools/list` and atomically swaps the cached
-/// snapshot (OCEAN-32). The task ends when the client is dropped (the `Notify`
+/// snapshot (OCEAN-32). The re-fetch is retried with bounded exponential backoff
+/// (OCEAN-175) so a transient error right after a change doesn't strand the agent
+/// on a stale tool table; only after every attempt fails do we give up and keep
+/// the previous snapshot. The task ends when the client is dropped (the `Notify`
 /// handle's last sender goes away) — i.e. when the provider is torn down.
 fn spawn_tools_changed_watcher(
     server_name: String,
@@ -262,7 +328,9 @@ fn spawn_tools_changed_watcher(
         loop {
             signal.notified().await;
             tracing::info!(server = %server_name, "refreshing MCP tool list after list_changed");
-            let fetched = client.list_tools().await;
+            let fetched =
+                refetch_tools_with_retry(&server_name, || client.list_tools(), tokio::time::sleep)
+                    .await;
             match fetched {
                 Ok(defs) => {
                     let count = defs.len();
@@ -280,8 +348,9 @@ fn spawn_tools_changed_watcher(
                 Err(e) => {
                     tracing::warn!(
                         server = %server_name,
+                        attempts = REFETCH_MAX_ATTEMPTS,
                         error = %e,
-                        "MCP tools/list refresh failed; keeping previous tool list"
+                        "MCP tools/list re-fetch failed after all retries; keeping previous tool list"
                     );
                 }
             }
@@ -371,5 +440,127 @@ fn normalize_schema(schema: Value) -> Value {
         schema
     } else {
         serde_json::json!({ "type": "object" })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn def(name: &str) -> McpToolDef {
+        McpToolDef {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    /// A `sleep` that records each requested delay but never actually waits, so
+    /// the retry/backoff policy can be tested without spending real time.
+    fn noop_sleep(slept: &Cell<u32>) -> impl FnMut(Duration) -> std::future::Ready<()> + '_ {
+        move |_d| {
+            slept.set(slept.get() + 1);
+            std::future::ready(())
+        }
+    }
+
+    // OCEAN-175: a re-fetch that fails N-1 times then succeeds must NOT leave the
+    // cache stale — the helper retries and returns the eventual success.
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        let calls = Cell::new(0u32);
+        let slept = Cell::new(0u32);
+        // Fail on the first (MAX-1) attempts, then succeed on the last one.
+        let fetch = || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                if n < REFETCH_MAX_ATTEMPTS {
+                    Err(anyhow::anyhow!("transient list error #{n}"))
+                } else {
+                    Ok(vec![def("alpha"), def("beta")])
+                }
+            }
+        };
+
+        let result = refetch_tools_with_retry("srv", fetch, noop_sleep(&slept)).await;
+
+        let defs = result.expect("should eventually succeed");
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "alpha");
+        // Exactly MAX attempts were made, with a backoff sleep before each retry.
+        assert_eq!(calls.get(), REFETCH_MAX_ATTEMPTS);
+        assert_eq!(slept.get(), REFETCH_MAX_ATTEMPTS - 1);
+    }
+
+    // OCEAN-175: if every attempt fails, the helper gives up (no infinite spin),
+    // returns the last error, and does not sleep after the final attempt. The
+    // caller (watcher) then keeps the previous snapshot.
+    #[tokio::test]
+    async fn retry_gives_up_after_all_attempts_fail() {
+        let calls = Cell::new(0u32);
+        let slept = Cell::new(0u32);
+        let fetch = || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move { Err::<Vec<McpToolDef>, _>(anyhow::anyhow!("persistent error #{n}")) }
+        };
+
+        let result = refetch_tools_with_retry("srv", fetch, noop_sleep(&slept)).await;
+
+        let err = result.expect_err("should give up and return the last error");
+        // Last error is surfaced, not a generic one.
+        assert!(err.to_string().contains(&format!("#{REFETCH_MAX_ATTEMPTS}")));
+        // Bounded: exactly MAX attempts, capped — never spins forever.
+        assert_eq!(calls.get(), REFETCH_MAX_ATTEMPTS);
+        // No sleep after the final attempt.
+        assert_eq!(slept.get(), REFETCH_MAX_ATTEMPTS - 1);
+    }
+
+    // A first-attempt success short-circuits: no retries, no sleeps.
+    #[tokio::test]
+    async fn retry_first_attempt_success_no_backoff() {
+        let calls = Cell::new(0u32);
+        let slept = Cell::new(0u32);
+        let fetch = || {
+            calls.set(calls.get() + 1);
+            async move { Ok(vec![def("only")]) }
+        };
+
+        let defs = refetch_tools_with_retry("srv", fetch, noop_sleep(&slept))
+            .await
+            .expect("first attempt should succeed");
+
+        assert_eq!(defs.len(), 1);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(slept.get(), 0);
+    }
+
+    // Backoff grows exponentially and is capped at REFETCH_MAX_BACKOFF, so a
+    // flapping server can't push the retry spacing arbitrarily high.
+    #[tokio::test]
+    async fn backoff_is_exponential_and_capped() {
+        let recorded: std::cell::RefCell<Vec<Duration>> = std::cell::RefCell::new(Vec::new());
+        let fetch = || async { Err::<Vec<McpToolDef>, _>(anyhow::anyhow!("always fails")) };
+        let sleep = |d: Duration| {
+            recorded.borrow_mut().push(d);
+            std::future::ready(())
+        };
+
+        let _ = refetch_tools_with_retry("srv", fetch, sleep).await;
+
+        let delays = recorded.borrow();
+        assert_eq!(delays.len() as u32, REFETCH_MAX_ATTEMPTS - 1);
+        // Each successive delay is >= the previous (monotonic), and none exceeds
+        // the cap.
+        for w in delays.windows(2) {
+            assert!(w[1] >= w[0], "backoff should not decrease: {w:?}");
+        }
+        for d in delays.iter() {
+            assert!(*d <= REFETCH_MAX_BACKOFF, "backoff exceeded cap: {d:?}");
+        }
+        // First retry uses the base delay.
+        assert_eq!(delays[0], REFETCH_BASE_BACKOFF);
     }
 }

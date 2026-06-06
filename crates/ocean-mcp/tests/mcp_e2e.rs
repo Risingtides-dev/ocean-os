@@ -177,6 +177,45 @@ async fn list_changed_refreshes_cached_tools() {
 }
 
 #[tokio::test]
+async fn list_changed_refresh_retries_then_updates_when_relist_is_flaky() {
+    // OCEAN-175: when the re-fetch after a tools/list_changed briefly errors, the
+    // watcher must retry with bounded backoff and STILL end up with a fresh
+    // snapshot — not get stranded on the stale tool table. `grow_flaky` announces
+    // the change but fails the next two `tools/list` calls before succeeding.
+    let provider = McpProvider::connect(&server_cfg(), |_| None, Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let before = provider.tools(&SessionContext::default()).await;
+    assert!(
+        !before.iter().any(|t| t.name() == "mcp__fake__grown"),
+        "grown tool should not exist before list_changed"
+    );
+
+    let grow_flaky = before
+        .iter()
+        .find(|t| t.name() == "mcp__fake__grow_flaky")
+        .expect("grow_flaky tool present");
+    grow_flaky.execute("call-grow-flaky", json!({})).await.unwrap();
+
+    // First two re-list attempts fail; the watcher backs off (~200ms + ~400ms)
+    // and the third succeeds. Poll generously past that window.
+    let mut found = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = provider.tools(&SessionContext::default()).await;
+        if now.iter().any(|t| t.name() == "mcp__fake__grown") {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "cached tool list should include `grown` after the watcher retries the flaky re-list"
+    );
+}
+
+#[tokio::test]
 async fn registry_merges_builtins_with_live_mcp_server() {
     // The real payoff: built-ins + a live MCP server, flattened through the
     // same registry, with MCP tools namespaced and built-ins intact.
