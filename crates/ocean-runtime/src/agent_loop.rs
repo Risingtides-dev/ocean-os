@@ -318,20 +318,42 @@ pub async fn run_agent_with_history(
                 },
             );
             let (content, is_error, terminate, side_effects) = match tool_obj {
-                Some(tool) => match tool.execute(&id, args).await {
-                    Ok(AgentToolResult {
-                        content,
-                        details: _,
-                        terminate,
-                        side_effects,
-                    }) => (content, false, terminate, side_effects),
-                    Err(e) => (
-                        vec![Content::text(format!("tool error: {e}"))],
-                        true,
-                        false,
-                        Vec::new(),
-                    ),
-                },
+                // Race tool execution against cancellation (OCEAN-116). A
+                // long-running tool (slow bash, a network call that hangs) would
+                // otherwise block the loop until it completed even if the user
+                // cancelled the turn — the mid-stream check (OCEAN-57) only fires
+                // between provider chunks, never while a tool is in flight. We
+                // select between the tool future and the same `StreamOptions::cancel`
+                // token the rest of the loop reads: if cancellation wins we drop
+                // the tool future (which stops polling it — no task leak) and
+                // unwind the run with `AgentError::Cancelled`.
+                Some(tool) => {
+                    let exec = tool.execute(&id, args);
+                    tokio::select! {
+                        biased;
+                        () = cancelled(config) => {
+                            // Cancellation fired while the tool was running. The
+                            // ToolExecutionStart emitted above has no paired End,
+                            // but the whole turn is being torn down: the caller
+                            // sees a clean `Cancelled` and discards the run.
+                            return Err(AgentError::Cancelled);
+                        }
+                        result = exec => match result {
+                            Ok(AgentToolResult {
+                                content,
+                                details: _,
+                                terminate,
+                                side_effects,
+                            }) => (content, false, terminate, side_effects),
+                            Err(e) => (
+                                vec![Content::text(format!("tool error: {e}"))],
+                                true,
+                                false,
+                                Vec::new(),
+                            ),
+                        },
+                    }
+                }
                 None => (
                     vec![Content::text(format!("unknown tool: {name}"))],
                     true,
@@ -694,6 +716,17 @@ fn is_cancelled(config: &AgentConfig) -> bool {
         .as_ref()
         .map(|c| c.is_cancelled())
         .unwrap_or(false)
+}
+
+/// A future that resolves once this run's cancellation token trips, used to race
+/// in-flight tool execution against a cancel (OCEAN-116). When no token is wired
+/// (ad-hoc/embedded runs), it never resolves — so a `tokio::select!` against it
+/// reduces to just awaiting the tool, preserving the non-cancelled path exactly.
+async fn cancelled(config: &AgentConfig) {
+    match config.stream_options.cancel.as_ref() {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
