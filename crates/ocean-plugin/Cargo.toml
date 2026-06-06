@@ -1,0 +1,27 @@
+[package]
+name = "ocean-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Plugin tools and arguments are JSON values; manifests are TOML. The runtime
+# (tokio) and stdio process plumbing mirror ocean-mcp's proven transport so a
+# plugin subprocess is driven exactly like an MCP server child.
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+# A tiny in-repo stdio plugin lives at src/bin/echo_plugin.rs (auto-discovered).
+# Cargo builds it for tests and sets CARGO_BIN_EXE_echo_plugin, the path the
+# round-trip test spawns as the plugin child. It uses serde_json (a normal dep).
+[[bin]]
+name = "echo_plugin"
+test = false
+doc = false
