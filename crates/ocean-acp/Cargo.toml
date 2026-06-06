@@ -33,3 +33,11 @@ ocean-agent-sdk = { workspace = true }
 # Control-plane wire types: the legacy /v1/events envelope + permission
 # decision request/decision enums, reused so the bridge never drifts.
 ocean-core = { workspace = true }
+
+[dev-dependencies]
+# A mock gated daemon for the OCEAN-146 integration proof: reproduces the real
+# broadcast-channel timing of `/v1/events` and the block-until-decision
+# behaviour of `/v1/agent/turns`, so we can prove the bridge subscribes BEFORE
+# the turn can block — no live LLM provider required.
+axum = { workspace = true }
+tokio-stream = { workspace = true }

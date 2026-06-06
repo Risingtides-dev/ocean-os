@@ -114,15 +114,29 @@ impl Sessions {
             .and_then(|s| s.daemon_id.clone())
     }
 
-    /// Record the daemon id learned from the first turn.
-    fn set_daemon_id(&self, acp_session_id: &str, daemon_id: String) {
-        if let Some(state) = self
-            .inner
-            .lock()
-            .expect("sessions mutex poisoned")
-            .get_mut(acp_session_id)
-        {
-            state.daemon_id = Some(daemon_id);
+    /// Atomically claim a freshly-minted daemon session id for an ACP session
+    /// (OCEAN-146). On a NEW session the daemon mints the id and announces it via
+    /// `SessionCreated`; the ACP bridge learns it from the global event feed
+    /// rather than from the (gated-and-blocked) submit response. Because two
+    /// editor windows can submit the SAME prompt concurrently, the
+    /// `SessionCreated.title` is NOT unique — so the id, which IS unique, is the
+    /// only safe key. This claims `daemon_id` for `acp_session_id` *iff* no other
+    /// ACP session already holds it, all under one lock so concurrent first-turns
+    /// each bind to a DISTINCT daemon session. Returns `true` if the claim took.
+    fn try_claim_daemon_id(&self, acp_session_id: &str, daemon_id: &str) -> bool {
+        let mut map = self.inner.lock().expect("sessions mutex poisoned");
+        // Already owned by another ACP session → not ours; refuse.
+        let taken = map
+            .iter()
+            .any(|(sid, st)| sid != acp_session_id && st.daemon_id.as_deref() == Some(daemon_id));
+        if taken {
+            return false;
+        }
+        if let Some(state) = map.get_mut(acp_session_id) {
+            state.daemon_id = Some(daemon_id.to_string());
+            true
+        } else {
+            false
         }
     }
 
@@ -414,6 +428,40 @@ async fn main() -> AcpResult<()> {
 
 /// Run one turn end-to-end: subscribe to daemon events, submit the turn, pump
 /// matching events to the editor as `session/update`s until the turn finishes.
+///
+/// # The permission race (OCEAN-146)
+///
+/// On a GATED daemon (`OCEAN_YOLO` unset = default) the daemon's
+/// `/v1/agent/turns` handler does **not** return its HTTP response until the
+/// whole turn finishes — `prompt(...).await` blocks INSIDE the handler while a
+/// tool waits for a permission decision. So `submit_turn(...).await` does not
+/// return for the entire duration of a gated turn.
+///
+/// The daemon raises `PermissionRequest` on its `/v1/events` control bus, which
+/// is a `tokio::broadcast` channel: a subscriber only receives events emitted
+/// **after** it subscribed; there is no replay. The old code awaited
+/// `submit_turn` BEFORE spawning the permission bridge, so the bridge's
+/// control-stream subscription was not even established when the daemon fired
+/// the `PermissionRequest` — it never reached Zed and the turn hung forever.
+///
+/// The fix: establish the control-stream subscription (the permission bridge)
+/// BEFORE `submit_turn`, alongside the agent event stream (which was already
+/// subscribed first). We learn the turn's `request_id` (== `turn_id`) from the
+/// agent stream's `TurnStarted`, which the daemon emits just BEFORE it can block
+/// on a gate — not from `submit_turn`'s response, which would deadlock. The
+/// submit runs concurrently in a spawned task so the permission round-trip can
+/// unblock it.
+///
+/// Correlation is keyed on the daemon's AUTHORITATIVE, unique ids carried by
+/// `TurnStarted` — the per-turn `turn_id` and, for a new session, the
+/// `session_id` claimed atomically via [`Sessions::try_claim_daemon_id`]. We do
+/// NOT key on `SessionCreated.title`, which is just the prompt prefix and is not
+/// unique across concurrent same-prompt sessions.
+///
+/// Synchronous failures: a turn rejected up front (BAD_REQUEST on cwd / binding)
+/// returns from `submit_turn` WITHOUT emitting any `AgentTurnEvent`. The event
+/// loop selects over the SSE read AND the submit task so that immediate failure
+/// surfaces as a failed turn instead of hanging on an event that never comes.
 async fn run_turn(
     client: &DaemonClient,
     sessions: &Sessions,
@@ -424,7 +472,7 @@ async fn run_turn(
 ) -> anyhow::Result<StopReason> {
     // Resolve the daemon's session id. The daemon mints it lazily on the FIRST
     // turn (it rejects client-invented ids on resume), so:
-    //   - first turn  → submit with `None`; the response carries the real id.
+    //   - first turn  → submit with `None`; the id arrives via the events.
     //   - later turns → resume with the stored daemon id.
     let known_daemon_id = sessions.daemon_id(acp_session_id);
     // Per-session model override (OCEAN-36): if this session picked a model via
@@ -432,78 +480,170 @@ async fn run_turn(
     // with it — no global swap, no cross-window race.
     let model_id = sessions.model_id(acp_session_id);
 
-    // Subscribe BEFORE submitting so we can't miss early deltas (the daemon
-    // stream is global and live; there's no replay).
+    // Subscribe to the agent event stream BEFORE submitting so we can't miss
+    // early deltas (the daemon stream is global and live; there's no replay).
     let mut stream = client
         .event_stream()
         .await
         .context("open daemon event stream")?;
 
-    let submitted = client
-        .submit_turn(prompt, cwd, known_daemon_id.clone(), model_id)
+    // Subscribe to the control stream BEFORE submitting too (OCEAN-146). On a
+    // gated turn the `PermissionRequest` fires while `submit_turn` is still
+    // blocked; the control bus is a broadcast channel that only delivers to
+    // subscribers connected before the event was emitted. Connecting here
+    // guarantees the bridge is listening. We hand this already-connected stream
+    // straight to the bridge below.
+    let control_stream = client
+        .ocean_event_stream()
         .await
-        .context("submit turn")?;
+        .context("open daemon control stream")?;
 
-    // The daemon's authoritative session id for this turn. On the first turn
-    // this is freshly minted; persist it so later turns resume correctly.
-    let daemon_session_id = submitted.session_id.0.to_string();
-    if known_daemon_id.is_none() {
-        sessions.set_daemon_id(acp_session_id, daemon_session_id.clone());
-        tracing::info!(
-            %acp_session_id,
-            daemon_session_id = %daemon_session_id,
-            "mapped ACP session to daemon session"
-        );
-    }
-
-    let turn_id = submitted.turn_id.0.to_string();
-    tracing::info!(%acp_session_id, %turn_id, status = ?submitted.status, "turn submitted");
-
-    // The daemon's per-turn request id IS the turn id (see
-    // `ocean-daemon::agent_turn`). Record it so a `session/cancel` for this ACP
-    // session can target `POST /v1/requests/{request_id}/cancel`.
-    sessions.set_active_request(acp_session_id, turn_id.clone());
-
-    // If the daemon failed the turn synchronously, there will be no stream
-    // events for it — surface the reason now instead of blocking forever.
-    if matches!(submitted.status, ocean_agent_sdk::AgentTurnStatus::Failed) {
-        let reason = submitted
-            .error
-            .unwrap_or_else(|| "daemon rejected the turn".to_string());
-        anyhow::bail!(reason);
-    }
-
-    // Spawn the permission bridge for this turn. The daemon raises tool-approval
-    // requests on its control stream (`/v1/events`), not the typed agent stream,
-    // so this watcher subscribes there, forwards any `PermissionRequest` scoped
-    // to OUR request to the editor as `session/request_permission`, waits for
-    // Zed's allow/deny, and POSTs the decision back. It self-terminates when the
-    // turn ends (see `spawn_permission_bridge`).
+    // Spawn the permission bridge NOW, on the already-connected control stream.
+    // It doesn't yet know our `request_id` (the daemon mints it server-side and
+    // only reveals it via `TurnStarted` on the agent stream / the submit
+    // response). We deliver the id over a oneshot the moment we learn it; the
+    // bridge waits for it before forwarding any prompt, but its subscription is
+    // already live so no `PermissionRequest` is missed in the meantime.
+    let (request_id_tx, request_id_rx) = tokio::sync::oneshot::channel::<String>();
     spawn_permission_bridge(
         client,
         conn,
         acp_session_id.to_string(),
-        turn_id.clone(),
+        control_stream,
+        request_id_rx,
     )?;
+
+    // Submit the turn OFF this task so a gated `prompt().await` inside the daemon
+    // can block without wedging us: we keep reading the agent stream (to learn
+    // the turn id) and the bridge keeps servicing permission prompts, which is
+    // what releases the daemon's block and lets `submit_turn` finally return.
+    let mut submit_handle = {
+        let client = client.clone();
+        let known_daemon_id = known_daemon_id.clone();
+        Some(tokio::spawn(async move {
+            client
+                .submit_turn(prompt, cwd, known_daemon_id, model_id)
+                .await
+        }))
+    };
 
     // ACP notifications are tagged with the ACP session id Zed knows; SSE
     // filtering uses the daemon's id the events actually carry.
     let acp_session = SessionId::new(acp_session_id.to_string());
 
+    // We learn the turn's identity from the first turn-scoped event the daemon
+    // emits (`TurnStarted`), which it sends just before it can block on a gate —
+    // so the bridge gets its `request_id` even on a gated turn where
+    // `submit_turn` has not yet returned. The daemon's per-turn `request_id` IS
+    // the `turn_id`, which is unique; we key everything off it. For a NEW session
+    // we also learn the authoritative daemon session id from that same event's
+    // `session_id` and claim it atomically (see `try_claim_daemon_id`).
+    let mut turn_id: Option<String> = None;
+    let mut daemon_session_id: Option<String> = known_daemon_id.clone();
+    let mut request_id_tx = Some(request_id_tx);
+
     loop {
-        let event = match stream.next_event().await? {
-            Some(ev) => ev,
-            None => {
-                // Stream closed before the turn finished. Treat as end-of-turn
-                // so the editor isn't left hanging.
-                tracing::warn!(%acp_session_id, "event stream closed before turn_finished");
-                return Ok(StopReason::EndTurn);
+        // Race the SSE read against the submit task. A synchronously-rejected
+        // turn (BAD_REQUEST on cwd resolution / workspace-binding guard) returns
+        // an `Err`/`Failed` from `submit_turn` WITHOUT ever emitting an
+        // `AgentTurnEvent` — so a plain `stream.next_event().await` would block
+        // forever waiting for an event that never comes. Selecting over both
+        // surfaces that immediate failure instead of hanging (OCEAN-146 P2).
+        let event = tokio::select! {
+            // Bias toward draining the stream first so a turn that DID start is
+            // bound before we inspect a late-arriving submit result.
+            biased;
+            ev = stream.next_event() => match ev? {
+                Some(ev) => ev,
+                None => {
+                    // Stream closed before the turn finished. Treat as
+                    // end-of-turn so the editor isn't left hanging.
+                    tracing::warn!(%acp_session_id, "event stream closed before turn_finished");
+                    return Ok(StopReason::EndTurn);
+                }
+            },
+            joined = async { submit_handle.as_mut().unwrap().await }, if submit_handle.is_some() => {
+                submit_handle = None;
+                match joined {
+                    // Submit returned. If the turn already started (we have a
+                    // turn_id), this is the NORMAL completion of a long/gated
+                    // turn — keep pumping the stream for its `TurnFinished`.
+                    Ok(Ok(resp)) => {
+                        if turn_id.is_none() {
+                            // No turn ever started → a synchronous rejection.
+                            // Surface it instead of waiting on a phantom event.
+                            let reason = resp
+                                .error
+                                .unwrap_or_else(|| "daemon rejected the turn".to_string());
+                            anyhow::bail!(reason);
+                        }
+                        continue;
+                    }
+                    Ok(Err(err)) => {
+                        if turn_id.is_none() {
+                            return Err(err.context("submit turn"));
+                        }
+                        // The turn started but the HTTP request errored out
+                        // afterward (e.g. transport drop); the stream still
+                        // carries the authoritative `TurnFinished`, so log and
+                        // keep reading rather than racing the stream to a verdict.
+                        tracing::warn!(%acp_session_id, error = %err, "submit_turn errored after turn started; relying on stream");
+                        continue;
+                    }
+                    Err(join_err) => anyhow::bail!("submit task panicked: {join_err}"),
+                }
             }
         };
 
-        // Filter to OUR session (the daemon feed is global).
-        if event_session_id(&event).is_some_and(|s| s != daemon_session_id) {
-            continue;
+        // Lock onto OUR daemon session id. For a resumed session it's already
+        // known and we filter strictly. For a fresh session we adopt the
+        // authoritative, UNIQUE session id carried by our turn's `TurnStarted`
+        // and claim it atomically — so two windows submitting the same prompt
+        // concurrently can never bind to the same daemon session.
+        let ev_session = event_session_id(&event);
+        if let Some(known) = &daemon_session_id {
+            // Strict filter once locked: drop everything for other sessions.
+            if ev_session.as_deref().is_some_and(|s| s != known) {
+                continue;
+            }
+        } else {
+            // Not locked yet. Only a turn-scoped event (`TurnStarted`) binds us:
+            // it carries BOTH the unique turn id and the authoritative session
+            // id. A bare `SessionCreated` (no turn id) or any other session's
+            // event is ignored until our turn announces itself.
+            let Some(seen_session) = ev_session.as_deref() else {
+                continue;
+            };
+            if event_turn_id(&event).is_none() {
+                // e.g. a `SessionCreated` for some session — not yet our turn.
+                continue;
+            }
+            if !sessions.try_claim_daemon_id(acp_session_id, seen_session) {
+                // This session id is already owned by another ACP session (a
+                // concurrent first turn claimed it). Not ours — keep looking.
+                continue;
+            }
+            daemon_session_id = Some(seen_session.to_string());
+            tracing::info!(
+                %acp_session_id,
+                daemon_session_id = %seen_session,
+                "mapped ACP session to daemon session"
+            );
+        }
+
+        // Learn the turn id (== request id) the first time we see a turn-scoped
+        // event for our session, then hand it to the permission bridge and
+        // record the cancel target.
+        if turn_id.is_none() {
+            if let Some(seen_turn) = event_turn_id(&event) {
+                turn_id = Some(seen_turn.clone());
+                sessions.set_active_request(acp_session_id, seen_turn.clone());
+                if let Some(tx) = request_id_tx.take() {
+                    // Bridge dropped early (e.g. control stream gone) → ignore.
+                    let _ = tx.send(seen_turn.clone());
+                }
+                tracing::info!(%acp_session_id, turn_id = %seen_turn, "turn id learned from stream");
+            }
         }
 
         // Is this the terminal event for our turn?
@@ -513,8 +653,9 @@ async fn run_turn(
             ..
         } = &event
         {
-            if ev_turn.0.to_string() == turn_id {
-                tracing::info!(%acp_session_id, %turn_id, ?status, "turn finished");
+            let ev_turn = ev_turn.0.to_string();
+            if turn_id.as_deref() == Some(ev_turn.as_str()) {
+                tracing::info!(%acp_session_id, turn_id = %ev_turn, ?status, "turn finished");
                 return Ok(stop_reason_for(status));
             }
             // A different turn finished on this session — ignore.
@@ -542,29 +683,32 @@ const OPT_DENY: &str = "deny";
 /// `session/request_permission` request, blocks for Zed's response, and POSTs
 /// the resulting decision to `/v1/permissions/{id}/decision`.
 ///
-/// Lifetime: the task self-terminates when it observes a terminal control
-/// event (`TurnFinished` / `Cancelled` / `Error`) for our `request_id`, or when
-/// the control stream closes.
+/// OCEAN-146: the caller subscribes the control `stream` BEFORE submitting the
+/// turn and hands it to us already connected, so the daemon's broadcast routes
+/// the `PermissionRequest` to us even on a gated turn (where `submit_turn` stays
+/// blocked the whole time). Our `request_id` isn't known yet at spawn — the
+/// daemon mints it server-side and reveals it via `TurnStarted` on the agent
+/// stream — so the caller delivers it over `request_id_rx` the moment it's
+/// learned. We wait for it before forwarding any prompt; our subscription is
+/// already live, so nothing is missed in the interim.
 ///
 /// Note: the daemon decides the permission mode per turn via `yolo_enabled()`
 /// (reads `OCEAN_YOLO`, default GATED — OCEAN-51). `AgentTurnRequest` carries no
 /// `yolo` field, so ACP turns DO gate by default: a mutating tool call blocks
 /// inside the daemon's `runtime.prompt(...)` and raises a `PermissionRequest` on
-/// the control stream. The gating is real; delivery to Zed is not, yet.
+/// the control stream. The gating is real, and (OCEAN-146) delivery to Zed now
+/// works because we subscribe the control stream before `submit_turn`.
 ///
-/// KNOWN RACE (OCEAN-146): `run_turn` awaits `submit_turn(...)` BEFORE calling
-/// this function, but the daemon's `POST /v1/agent/turns` only returns AFTER
-/// `runtime.prompt(...)` finishes — and a gated prompt blocks there waiting for
-/// the decision. So the daemon emits the `PermissionRequest` while we are still
-/// awaiting `submit_turn`; this bridge subscribes to the control stream only
-/// afterward and there is no replay, so it misses the request and the editor
-/// prompt is never delivered. Fix: subscribe before / concurrently with
-/// `submit_turn`. (`OCEAN_YOLO=1` sidesteps the whole path by not gating.)
+/// Lifetime: the task self-terminates when it observes a terminal control
+/// event (`TurnFinished` / `Cancelled` / `Error`) for our `request_id`, when the
+/// control stream closes, or if the caller drops `request_id_rx` (turn never
+/// established).
 fn spawn_permission_bridge(
     client: &DaemonClient,
     conn: &ConnectionTo<Client>,
     acp_session_id: String,
-    request_id: String,
+    mut stream: daemon::OceanEventStream,
+    request_id_rx: tokio::sync::oneshot::Receiver<String>,
 ) -> anyhow::Result<()> {
     use ocean_core::OceanEvent;
 
@@ -573,13 +717,16 @@ fn spawn_permission_bridge(
     conn.spawn({
         let conn = bridge_conn.clone();
         async move {
-            let mut stream = match client.ocean_event_stream().await {
-                Ok(s) => s,
-                Err(err) => {
-                    // Without the control stream we just can't surface prompts;
-                    // the turn still runs (and, under `OCEAN_YOLO=1` bypass,
-                    // would not gate anyway).
-                    tracing::warn!(%request_id, error = %err, "permission bridge: control stream unavailable");
+            // Wait for our turn's request id, learned from the agent stream's
+            // `TurnStarted`. We're already subscribed to the control bus, so any
+            // `PermissionRequest` emitted before this resolves is buffered by the
+            // broadcast receiver and read below once we know what to match.
+            let request_id = match request_id_rx.await {
+                Ok(id) => id,
+                Err(_) => {
+                    // Caller dropped the sender → turn never got a request id
+                    // (e.g. synchronous rejection). Nothing to bridge.
+                    tracing::debug!("permission bridge: turn id never delivered; exiting");
                     return Ok(());
                 }
             };
@@ -723,6 +870,28 @@ fn flatten_prompt(req: &PromptRequest) -> String {
     out
 }
 
+/// Extract the `turn_id` carried by a turn-scoped daemon event, as a String.
+///
+/// The daemon's per-turn `request_id` IS the `turn_id`, so this is also how the
+/// permission bridge learns which `request_id` to match on the control stream
+/// (OCEAN-146) — `TurnStarted` is the first turn-scoped event the daemon emits,
+/// before it can block on a gate. Session-scoped-only events (e.g.
+/// `SessionCreated`) and non-turn events return `None`.
+fn event_turn_id(event: &ocean_agent_sdk::AgentTurnEvent) -> Option<String> {
+    use ocean_agent_sdk::AgentTurnEvent as E;
+    let id = match event {
+        E::TurnStarted { turn_id, .. }
+        | E::AssistantTextDelta { turn_id, .. }
+        | E::ThinkingDelta { turn_id, .. }
+        | E::ToolCallStarted { turn_id, .. }
+        | E::ToolCallChunk { turn_id, .. }
+        | E::ToolCallFinished { turn_id, .. }
+        | E::TurnFinished { turn_id, .. } => turn_id.0.to_string(),
+        _ => return None,
+    };
+    Some(id)
+}
+
 /// Extract the `session_id` carried by any daemon event variant, as a String.
 fn event_session_id(event: &ocean_agent_sdk::AgentTurnEvent) -> Option<String> {
     use ocean_agent_sdk::AgentTurnEvent as E;
@@ -821,5 +990,174 @@ mod tests {
         let sessions = Sessions::default();
         assert!(!sessions.set_model_id("missing", "kimi-k2.6".into()));
         assert_eq!(sessions.model_id("missing"), None);
+    }
+
+    // ---- OCEAN-146: unique daemon-session correlation -------------------------
+    //
+    // Codex P1: correlating a fresh session by `SessionCreated.title` (the prompt
+    // prefix) is unsafe — two windows submitting the SAME prompt concurrently
+    // share a title and would both adopt the SAME daemon session id, so one
+    // session streams/cancels the other's turn. The fix keys on the daemon's
+    // unique session id and claims it atomically. These tests pin that the claim
+    // is mutually exclusive across ACP sessions.
+
+    #[test]
+    fn daemon_session_id_claim_is_unique_across_acp_sessions() {
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj".into());
+        sessions.insert("acp-b".into(), "/proj".into());
+
+        let daemon_sid = "11111111-1111-1111-1111-111111111111";
+
+        // First ACP session claims the daemon id.
+        assert!(sessions.try_claim_daemon_id("acp-a", daemon_sid));
+        assert_eq!(sessions.daemon_id("acp-a").as_deref(), Some(daemon_sid));
+
+        // A SECOND ACP session must NOT be able to claim the same daemon id —
+        // this is the exact same-prompt collision that title-matching allowed.
+        assert!(!sessions.try_claim_daemon_id("acp-b", daemon_sid));
+        assert_eq!(sessions.daemon_id("acp-b"), None);
+    }
+
+    #[test]
+    fn concurrent_same_prompt_sessions_bind_distinct_ids() {
+        // Simulate two fresh windows submitting the same prompt: the daemon
+        // mints two distinct session ids on the global feed. Each ACP session
+        // claims a DIFFERENT one; neither steals the other's.
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj".into());
+        sessions.insert("acp-b".into(), "/proj".into());
+
+        let sid1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let sid2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+        // acp-a sees sid1 first and claims it.
+        assert!(sessions.try_claim_daemon_id("acp-a", sid1));
+        // acp-b sees sid1 too (global feed) but it's taken → must skip it...
+        assert!(!sessions.try_claim_daemon_id("acp-b", sid1));
+        // ...and claim the other one.
+        assert!(sessions.try_claim_daemon_id("acp-b", sid2));
+
+        assert_eq!(sessions.daemon_id("acp-a").as_deref(), Some(sid1));
+        assert_eq!(sessions.daemon_id("acp-b").as_deref(), Some(sid2));
+        assert_ne!(sessions.daemon_id("acp-a"), sessions.daemon_id("acp-b"));
+    }
+
+    #[test]
+    fn reclaiming_own_daemon_id_is_idempotent() {
+        let sessions = Sessions::default();
+        sessions.insert("acp-a".into(), "/proj".into());
+        let sid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        assert!(sessions.try_claim_daemon_id("acp-a", sid));
+        // The same ACP session re-claiming the SAME id (e.g. a retried bind)
+        // succeeds — only OTHER sessions are excluded.
+        assert!(sessions.try_claim_daemon_id("acp-a", sid));
+        assert_eq!(sessions.daemon_id("acp-a").as_deref(), Some(sid));
+    }
+
+    // ---- OCEAN-146: permission-bridge correlation key -------------------------
+    //
+    // The bridge subscribes to the control stream BEFORE submit_turn and learns
+    // its `request_id` from the agent stream's `TurnStarted` (request_id ==
+    // turn_id). These tests pin the helper that extracts that key, so a future
+    // refactor can't silently break the subscribe-before-block fix by dropping a
+    // turn-scoped variant from the correlation set.
+
+    use ocean_agent_sdk::{
+        AgentSessionId, AgentTurnEvent, AgentTurnId, AgentTurnStatus, ToolCall, ToolCallId,
+        ToolResult,
+    };
+
+    fn sid() -> AgentSessionId {
+        AgentSessionId(uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn turn_started_carries_the_correlation_id() {
+        let tid = AgentTurnId(uuid::Uuid::new_v4());
+        let ev = AgentTurnEvent::TurnStarted {
+            turn_id: tid,
+            session_id: sid(),
+            model: None,
+        };
+        // This is THE event the bridge keys off — it must yield the turn id, and
+        // that turn id IS the daemon's per-turn request id.
+        assert_eq!(event_turn_id(&ev).as_deref(), Some(tid.0.to_string().as_str()));
+    }
+
+    #[test]
+    fn all_turn_scoped_events_expose_the_turn_id() {
+        let tid = AgentTurnId(uuid::Uuid::new_v4());
+        let cases = vec![
+            AgentTurnEvent::AssistantTextDelta {
+                session_id: sid(),
+                turn_id: tid,
+                delta: "hi".into(),
+            },
+            AgentTurnEvent::ThinkingDelta {
+                session_id: sid(),
+                turn_id: tid,
+                delta: "...".into(),
+            },
+            AgentTurnEvent::ToolCallStarted {
+                session_id: sid(),
+                turn_id: tid,
+                call: ToolCall {
+                    id: ToolCallId(uuid::Uuid::new_v4()),
+                    name: "fs_write".into(),
+                    args_json: serde_json::json!({}),
+                },
+            },
+            AgentTurnEvent::ToolCallChunk {
+                session_id: sid(),
+                turn_id: tid,
+                call_id: ToolCallId(uuid::Uuid::new_v4()),
+                chunk: "x".into(),
+            },
+            AgentTurnEvent::ToolCallFinished {
+                session_id: sid(),
+                turn_id: tid,
+                call_id: ToolCallId(uuid::Uuid::new_v4()),
+                result: ToolResult {
+                    ok: true,
+                    output: "done".into(),
+                    metadata_json: None,
+                },
+            },
+            AgentTurnEvent::TurnFinished {
+                session_id: sid(),
+                turn_id: tid,
+                status: AgentTurnStatus::Completed,
+                error: None,
+                wall_ms: None,
+                output_tokens: None,
+                input_tokens: None,
+                cache_read_tokens: None,
+                tokens_per_second: None,
+            },
+        ];
+        for ev in cases {
+            assert_eq!(
+                event_turn_id(&ev).as_deref(),
+                Some(tid.0.to_string().as_str()),
+                "turn-scoped event must expose the turn id"
+            );
+        }
+    }
+
+    #[test]
+    fn session_created_has_no_turn_id() {
+        // SessionCreated is session-scoped, not turn-scoped: it announces the
+        // daemon session id (which we lock onto by `title`) but carries no turn
+        // id, so it must NOT be mistaken for the correlation key.
+        let ev = AgentTurnEvent::SessionCreated {
+            session_id: sid(),
+            title: "do the thing".into(),
+            cwd: "/proj".into(),
+        };
+        assert_eq!(event_turn_id(&ev), None);
+        // It IS session-scoped, though — that's how a fresh ACP session adopts
+        // the daemon id.
+        assert!(event_session_id(&ev).is_some());
     }
 }
