@@ -17,6 +17,7 @@ members = [
   "crates/ocean-heartbeat",
   "crates/ocean-call",
   "crates/ocean-store",
+  "crates/ocean-plugin",
 ]
 resolver = "2"
 
@@ -64,3 +65,4 @@ ocean-store = { path = "crates/ocean-store" }
 # Bundled SQLite (no system libsqlite3 dependency). Sync, no async-runtime
 # coupling — matches the daemon's std::sync::Mutex room registry style.
 rusqlite = { version = "0.32", features = ["bundled"] }
+ocean-plugin = { path = "crates/ocean-plugin" }

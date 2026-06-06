@@ -1,0 +1,11 @@
+# A sample plugin manifest, used by the manifest-parse integration test.
+# The `entry` here is illustrative; the round-trip test launches the real
+# echo_plugin test binary by its CARGO_BIN_EXE path, not this entry.
+name = "echo-pack"
+version = "0.1.0"
+entry = "bin/echo-plugin"
+
+[[tool]]
+name = "echo"
+description = "Echo the args back"
+input_schema = { type = "object", properties = { message = { type = "string" } } }
