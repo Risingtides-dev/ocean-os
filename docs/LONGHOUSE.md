@@ -157,3 +157,33 @@ Subagents can be orchestrated by Longhouse, but local side effects still return 
 - replay/tuning support in `replay.rs` and `lh-tune`.
 
 `ocean-daemon` currently embeds Longhouse routes for demo and convene flows. The next step is to let `ocean-longhouse` also run as a local service on `127.0.0.1:4781`, then teach the daemon to consult it dynamically in read-only preparation mode.
+
+## Built vs unbuilt — quorum steps 1–5 are real, steps 6+ are not
+
+Per the build order in `docs/LONGHOUSE_ORCHESTRATION.md` § 8, the `QuorumEngine`
+is shipped through **step 5** and unit-tested (11 passing tests): credential-weighted
+endorse−inhibit tallies, time-decay, cross-inhibition, configurable threshold,
+margin-gated convergence, seeded tie-break, and the termination guardrails
+(deadline timer, token ceiling) that make a topic provably terminate. `convene.rs`
+staffs a real mixed-model council, grants a firekeeper to the winning proposer,
+and emits `Converged`/`Aborted`.
+
+**Steps 6 and beyond are future / unbuilt.** Treat the following as not-yet-real:
+
+- **Escrow trio (step 6).** `TitleRegistry` and `Revoker` as separate daemon
+  principals do not exist. The firekeeper title is bound to the winning proposer
+  inside `convene`, but it is not a separately-escrowed grant/exercise/revoke
+  capability.
+- **Unforgeable `claim_outcome` gate (step 6).** A `claim_outcome` function
+  exists, but the daemon does not yet REJECT a firekeeper's `Converged` claim
+  unless the daemon's own quorum state already agrees. Until that daemon-side
+  check lands, a firekeeper effectively just emits the outcome — the
+  "unforgeable" property is not enforced.
+- **Graduated recall + `Warned` strikes**, **validator process-veto**, and the
+  **subsidiarity escalation predicate** (most things should never convene a
+  council at all) — all stubbed.
+- **Sybil hardening (step 7).** Credential-split on `spawn_worker`,
+  self-renewal block, validator veto — not built.
+
+If you need the authority-split / anti-capture model, it is design, not code,
+today. The convergence engine itself is the part that is real.

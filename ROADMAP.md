@@ -56,3 +56,28 @@
 - [ ] WASM plugins via wasmtime
 - [ ] Skill/prompt packs
 - [ ] Theme/client protocol
+
+## Built, pending daemon integration
+
+These exist in the workspace (crate compiles, unit-tested) but the daemon does
+not yet construct/register them, so the **feature is not live**. See
+`docs/ARCHITECTURE.md` § "Built, pending daemon integration" for operator impact.
+
+- [ ] Wire `ocean-store` (SqliteRoomStore) into the daemon — persistent rooms
+      are currently held in the in-memory `RoomRegistry` and LOST on restart
+      (OCEAN-86 built the store; daemon still uses the in-memory registry)
+- [ ] Register `PluginProvider` in `build_capability_registry` — installed
+      plugins contribute zero tools to a turn until then (OCEAN-95 built the
+      provider; the daemon never constructs it)
+- [ ] Queue a real agent turn on room auto-convene — `room_post_message`
+      evaluates the trigger policy and emits a `room_trigger` notice, but does
+      not yet spawn a turn for the mentioned agent (OCEAN-65; held behind the
+      in-flight `agent_turn` permission PRs)
+- [ ] Activate ACP permission forwarding — the per-turn permission bridge in
+      `ocean-acp` is built but inert because the daemon submits ACP turns with
+      `yolo: true` (it gates the moment ACP turns run non-yolo; OCEAN-51 / #54)
+- [ ] Cross-provider `Content::Image` — produced (browser `perceive`) and wired
+      for Anthropic, but the OpenAI/Gemini encoders drop image content
+- [ ] Longhouse governance layer (escrow trio: TitleRegistry + Revoker +
+      validator escrow + unforgeable `claim_outcome` gate) — quorum steps 1–5
+      are built; steps 6+ are stubbed (see `docs/LONGHOUSE.md`)
