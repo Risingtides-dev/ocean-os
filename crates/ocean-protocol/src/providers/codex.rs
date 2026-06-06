@@ -181,6 +181,29 @@ fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
     }
 }
 
+/// Pull `response.incomplete_details.reason` out of a `response.incomplete` SSE
+/// frame. The Responses API nests it as
+/// `{"response": {"incomplete_details": {"reason": "..."}}}`.
+fn incomplete_reason(value: &Value) -> Option<String> {
+    value
+        .get("response")
+        .and_then(|r| r.get("incomplete_details"))
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// OCEAN-176: is a `response.incomplete` reason a benign output-length cap?
+///
+/// When we emit `max_output_tokens`, the Responses API legitimately ends a
+/// capped turn with `response.incomplete` + reason `"max_output_tokens"`. That
+/// is a successful-but-truncated turn ([`StopReason::Length`]), NOT an error.
+/// Every other incomplete reason (e.g. `content_filter`) stays on the error
+/// path — we only whitelist the length cap.
+fn incomplete_is_length_cap(reason: Option<&str>) -> bool {
+    reason == Some("max_output_tokens")
+}
+
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     // OCEAN-165: do NOT set `parallel_tool_calls`. The Codex backend speaks the
     // OpenAI Responses API, which accepts this param and defaults it to `true`
@@ -220,6 +243,13 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
             body["reasoning"] = json!({"effort": effort, "summary": "auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
+    }
+    // OCEAN-176: Codex speaks the OpenAI Responses API, whose output cap is the
+    // top-level `max_output_tokens` (NOT Chat-Completions `max_tokens` /
+    // `max_completion_tokens`). Without this the operator's output-length cap was
+    // silently dropped while every sibling provider honored it.
+    if let Some(m) = options.max_tokens {
+        body["max_output_tokens"] = json!(m);
     }
     body
 }
@@ -731,7 +761,32 @@ impl Provider for CodexProvider {
                             }
                         }
                     }
-                    "response.failed" | "response.incomplete" => {
+                    // OCEAN-176: `response.incomplete` is NOT inherently an error.
+                    // Now that we emit `max_output_tokens`, the Responses API ends a
+                    // turn that hit the output cap with `response.incomplete` +
+                    // `incomplete_details.reason == "max_output_tokens"`. That is a
+                    // successful-but-capped turn: treat it as `StopReason::Length` and
+                    // `break` to the normal TextEnd/Done path (preserving partial text),
+                    // mirroring `response.completed`. Any OTHER incomplete reason we
+                    // can't cleanly map stays on the error path below.
+                    "response.incomplete" => {
+                        let reason = incomplete_reason(&value);
+                        if incomplete_is_length_cap(reason.as_deref()) {
+                            stop = StopReason::Length;
+                            break;
+                        }
+                        let parsed = serde_json::from_value::<FailedEvent>(value).ok();
+                        let (code, message) = parsed
+                            .and_then(|f| f.response.error)
+                            .map(|e| (e.code, e.message))
+                            .unwrap_or_default();
+                        let reason = reason.as_deref().unwrap_or("unknown");
+                        yield Err(Error::InvalidResponse(format!(
+                            "codex response incomplete ({reason}): {code} {message}"
+                        )));
+                        return;
+                    }
+                    "response.failed" => {
                         let parsed = serde_json::from_value::<FailedEvent>(value).ok();
                         let (code, message) = parsed
                             .and_then(|f| f.response.error)
@@ -1005,6 +1060,103 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
+    }
+
+    // OCEAN-176: Codex (OpenAI Responses API) must emit the operator's output cap
+    // as top-level `max_output_tokens` — the Responses-API field, NOT the
+    // Chat-Completions `max_tokens` / `max_completion_tokens`. It was silently
+    // dropped before, so gpt-5.x turns could run uncapped.
+    #[test]
+    fn build_body_emits_max_output_tokens_when_set() {
+        let model = codex_model();
+        let context = Context::default();
+        let options = StreamOptions {
+            max_tokens: Some(8192),
+            ..StreamOptions::default()
+        };
+
+        let body = build_body(&model, &context, &options);
+
+        assert_eq!(
+            body["max_output_tokens"], 8192,
+            "Codex must emit the Responses-API max_output_tokens cap. Got: {body}"
+        );
+        // It must be the Responses-API field name, not the Chat-Completions ones.
+        assert!(
+            body.get("max_tokens").is_none(),
+            "must not emit Chat-Completions max_tokens: {body}"
+        );
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "must not emit Chat-Completions max_completion_tokens: {body}"
+        );
+    }
+
+    // OCEAN-176: when no cap is set, no output-length field is emitted at all
+    // (rides the Responses API default), matching the sibling providers.
+    #[test]
+    fn build_body_omits_max_output_tokens_when_none() {
+        let model = codex_model();
+        let context = Context::default();
+        let options = StreamOptions {
+            max_tokens: None,
+            ..StreamOptions::default()
+        };
+
+        let body = build_body(&model, &context, &options);
+
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "Codex must omit max_output_tokens when no cap is set. Got: {body}"
+        );
+    }
+
+    // OCEAN-176 (Codex P2 on #111): `response.incomplete` with reason
+    // `max_output_tokens` is a benign output-length cap. The handler must read
+    // the nested reason from the real Responses-API frame shape and classify it
+    // as a length cap, so it `break`s to the normal TextEnd/Done path (preserving
+    // accumulated text, finishing as StopReason::Length) instead of yielding Err.
+    #[test]
+    fn incomplete_max_output_tokens_is_a_length_cap() {
+        // Exact shape the Responses API emits when the output cap is reached.
+        let frame = json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": { "reason": "max_output_tokens" }
+            }
+        });
+
+        let reason = incomplete_reason(&frame);
+        assert_eq!(reason.as_deref(), Some("max_output_tokens"));
+        assert!(
+            incomplete_is_length_cap(reason.as_deref()),
+            "max_output_tokens must classify as a length cap → StopReason::Length, \
+             not an error: {frame}"
+        );
+    }
+
+    // OCEAN-176: a `response.incomplete` for any OTHER reason (e.g. the safety
+    // filter) is NOT a length cap and must stay on the error path — we only
+    // whitelist the output-length cap.
+    #[test]
+    fn incomplete_other_reason_is_not_a_length_cap() {
+        let frame = json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": { "reason": "content_filter" }
+            }
+        });
+        assert_eq!(
+            incomplete_reason(&frame).as_deref(),
+            Some("content_filter")
+        );
+        assert!(
+            !incomplete_is_length_cap(Some("content_filter")),
+            "non-length incomplete reasons must keep erroring"
+        );
+        // A missing reason is also not a length cap.
+        assert!(!incomplete_is_length_cap(None));
+        assert!(incomplete_reason(&json!({"type": "response.failed"})).is_none());
     }
 
     fn fc_item(id: &str, call_id: &str, name: &str, arguments: &str) -> OutputItem {
