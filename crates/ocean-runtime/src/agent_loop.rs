@@ -413,17 +413,18 @@ pub async fn run_agent_with_history(
                         );
                     }
                     ToolSideEffect::SurfacePatch { canvas_id, patches } => {
-                        // The validated patches already ride in the tool result
-                        // (`details.component_ids`, side_effect payload). The
-                        // runtime intentionally does NOT couple to a daemon event
-                        // here — there is no `AgentEvent::SurfacePatch` variant
-                        // yet. Slice 3 wires the daemon to wrap each patch in a
-                        // `SurfacePatchEnvelope` and stream it over
-                        // `/v1/agent/events`.
-                        tracing::debug!(
-                            canvas_id,
-                            patch_count = patches.len(),
-                            "surface_patch side effect (Slice 3 wires the daemon event)"
+                        // Slice 3: forward the validated patches onto the event
+                        // bus stamped with this run's session id. The daemon's
+                        // SSE bridge wraps each patch in a `SurfacePatchEnvelope`
+                        // and relays it as `AgentTurnEvent::SurfacePatch` over
+                        // `/v1/agent/events`, scoped to `session_id`.
+                        emit(
+                            &events,
+                            AgentEvent::SurfacePatch {
+                                session_id: sid.clone(),
+                                canvas_id: canvas_id.clone(),
+                                patches: patches.clone(),
+                            },
                         );
                     }
                 }

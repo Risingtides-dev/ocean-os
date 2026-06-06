@@ -292,6 +292,15 @@ pub enum AgentEvent {
         session_id: Option<String>,
         active: bool,
     },
+    /// The agent applied one or more validated `surface_patch` operations to a
+    /// canvas (GPUI Masterbuild Slice 3). The daemon stamps each patch into a
+    /// `SurfacePatchEnvelope` and relays it onto `/v1/agent/events` as
+    /// `AgentTurnEvent::SurfacePatch`, scoped to this session.
+    SurfacePatch {
+        session_id: Option<String>,
+        canvas_id: String,
+        patches: Vec<ocean_agent_sdk::surface::SurfacePatch>,
+    },
 }
 
 impl AgentEvent {
@@ -311,7 +320,8 @@ impl AgentEvent {
             | AgentEvent::PermissionDenied { session_id, .. }
             | AgentEvent::Render { session_id, .. }
             | AgentEvent::Unmount { session_id, .. }
-            | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_deref(),
+            | AgentEvent::BrowserActivity { session_id, .. }
+            | AgentEvent::SurfacePatch { session_id, .. } => session_id.as_deref(),
         }
     }
 }

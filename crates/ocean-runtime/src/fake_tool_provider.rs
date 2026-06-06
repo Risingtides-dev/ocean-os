@@ -32,6 +32,16 @@ use serde_json::json;
 /// `ocean-providers` so the two stay in lockstep.
 pub const FAKE_TOOL_MODEL: &str = "fake-tool";
 
+/// The model id that selects this provider in `surface_patch` mode (OCEAN-150).
+/// Mirrors the `fake-surface` alias in `ocean-providers`.
+pub const FAKE_SURFACE_MODEL: &str = "fake-surface";
+
+/// Canvas id the scripted `surface_patch` tool call targets.
+pub const FAKE_SURFACE_CANVAS_ID: &str = "canvas:main";
+
+/// Stable id stamped on the scripted `surface_patch` tool call.
+pub const FAKE_SURFACE_CALL_ID: &str = "fake-surface-call-1";
+
 /// Fixed, harmless target the scripted `write` tool call writes to. Deterministic
 /// and side-effect-minimal — a single small file under the OS temp dir.
 pub const FAKE_TOOL_TARGET_PATH: &str = "/tmp/ocean-fake-tool-test.txt";
@@ -53,14 +63,34 @@ pub const FAKE_TOOL_CALL_ID: &str = "fake-tool-call-1";
 ///
 /// Requires no API key and performs no network I/O — the whole point is to
 /// exercise the block→decide→proceed cycle deterministically and offline.
+/// Which built-in tool the scripted first round calls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FakeToolMode {
+    /// Emit a permission-gated `write` tool call (OCEAN-130).
+    Write,
+    /// Emit a `surface_patch` tool call (OCEAN-150).
+    Surface,
+}
+
 pub struct FakeToolProvider {
     calls: AtomicUsize,
+    mode: FakeToolMode,
 }
 
 impl FakeToolProvider {
     pub fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            mode: FakeToolMode::Write,
+        }
+    }
+
+    /// A variant that scripts a `surface_patch` tool call instead of `write`,
+    /// so the daemon's SurfacePatch SSE bridge can be live-tested (OCEAN-150).
+    pub fn surface() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            mode: FakeToolMode::Surface,
         }
     }
 }
@@ -100,14 +130,34 @@ impl Provider for FakeToolProvider {
         let round = self.calls.fetch_add(1, Ordering::SeqCst);
 
         let events: Vec<AssistantMessageEvent> = if round == 0 {
-            // Round 1: one deterministic, permission-gated `write` tool call.
-            let call = Content::ToolCall {
-                id: FAKE_TOOL_CALL_ID.into(),
-                name: "write".into(),
-                arguments: json!({
-                    "path": FAKE_TOOL_TARGET_PATH,
-                    "content": FAKE_TOOL_CONTENT,
-                }),
+            // Round 1: one deterministic tool call. `write` (permission-gated) in
+            // the default mode; `surface_patch` in the surface mode (OCEAN-150).
+            let call = match self.mode {
+                FakeToolMode::Write => Content::ToolCall {
+                    id: FAKE_TOOL_CALL_ID.into(),
+                    name: "write".into(),
+                    arguments: json!({
+                        "path": FAKE_TOOL_TARGET_PATH,
+                        "content": FAKE_TOOL_CONTENT,
+                    }),
+                },
+                FakeToolMode::Surface => Content::ToolCall {
+                    id: FAKE_SURFACE_CALL_ID.into(),
+                    name: "surface_patch".into(),
+                    arguments: json!({
+                        "canvas_id": FAKE_SURFACE_CANVAS_ID,
+                        "patches": [
+                            {
+                                "op": "upsert_component",
+                                "component": {
+                                    "id": "card-1",
+                                    "kind": "card",
+                                    "content": { "title": "hello from fake-surface" }
+                                }
+                            }
+                        ]
+                    }),
+                },
             };
             vec![AssistantMessageEvent::Done {
                 reason: StopReason::ToolUse,

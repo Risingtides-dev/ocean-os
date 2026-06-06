@@ -98,6 +98,7 @@ pub fn event_to_update(event: &AgentTurnEvent) -> Option<SessionUpdate> {
         | AgentTurnEvent::SessionCreated { .. }
         | AgentTurnEvent::ComponentUnmount { .. }
         | AgentTurnEvent::BrowserActivity { .. }
+        | AgentTurnEvent::SurfacePatch { .. }
         | AgentTurnEvent::Extension { .. } => None,
     }
 }

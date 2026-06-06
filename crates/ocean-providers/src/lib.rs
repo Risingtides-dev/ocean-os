@@ -481,6 +481,17 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             1_000,
             1_000,
         )),
+        // OCEAN-150: a keyless Fake variant that deterministically emits ONE
+        // `surface_patch` tool call, so the daemon's SurfacePatch SSE bridge
+        // (runtime side effect → `AgentTurnEvent::SurfacePatch` on
+        // `/v1/agent/events`) can be live-tested over HTTP with no external key.
+        "fake-surface" => Ok(model_selection(
+            ProviderId::Fake,
+            "fake-surface",
+            "fake://local",
+            1_000,
+            1_000,
+        )),
         other if env.get("OCEAN_OPENAI_BASE_URL").is_some() => Ok(model_selection(
             ProviderId::OpenAiCompatible,
             other,

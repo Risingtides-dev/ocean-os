@@ -3435,6 +3435,15 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 "🌊 browser handoff released".to_string()
             });
         }
+        AgentTurnEvent::SurfacePatch {
+            canvas_id, patches, ..
+        } => {
+            // The TUI isn't the canvas surface (that's GPUI); just note it.
+            app.push_transcript(format!(
+                "🎨 surface patch ×{} on `{canvas_id}`",
+                patches.len()
+            ));
+        }
     }
 }
 
@@ -4141,6 +4150,11 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
                 "browser activity: {}",
                 if *active { "active" } else { "idle" }
             )
+        }
+        AgentTurnEvent::SurfacePatch {
+            canvas_id, patches, ..
+        } => {
+            format!("surface patch ×{} on {canvas_id}", patches.len())
         }
     }
 }
