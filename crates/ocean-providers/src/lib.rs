@@ -66,7 +66,13 @@ impl ProviderId {
             Self::Anthropic => &["OCEAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             Self::MiniMax => &["OCEAN_MINIMAX_API_KEY", "MINIMAX_API_KEY"],
             Self::Kimi => &["OCEAN_MOONSHOT_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"],
-            Self::Google => &["OCEAN_GOOGLE_API_KEY", "GOOGLE_API_KEY"],
+            // `GEMINI_API_KEY` is Google's own canonical env var (their SDKs
+            // default to it). The GoogleProvider in ocean-protocol reads both
+            // GOOGLE_API_KEY and GEMINI_API_KEY, so the registry's readiness
+            // check must accept the same set — otherwise an operator who set
+            // only GEMINI_API_KEY fails preflight ("missing credential") and
+            // Gemini is silently unroutable even though the provider could auth.
+            Self::Google => &["OCEAN_GOOGLE_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"],
             Self::Fake => &[],
         }
     }
@@ -765,6 +771,70 @@ mod tests {
         let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", "gemini")])).unwrap();
         assert_eq!(selection.provider, ProviderId::Google);
         assert_eq!(selection.model, "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn explicit_google_provider_routes_to_google() {
+        let selection = resolve_model_selection(&env(&[
+            ("OCEAN_PROVIDER", "google"),
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+        ]))
+        .unwrap();
+        assert_eq!(selection.provider, ProviderId::Google);
+        assert_eq!(selection.base_url, GOOGLE_BASE_URL);
+    }
+
+    #[test]
+    fn gemini_resolves_full_config_with_google_credential() {
+        // A gemini model id (provider="google") must resolve to a ready
+        // ProviderConfig: the Gemini-targeting api host plus a credential drawn
+        // from the Google key env. This is the end-to-end registry guarantee
+        // OCEAN-169 was about — without it, a Gemini turn fails at runtime.
+        let config = resolve_provider_config(&env(&[
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+            ("GOOGLE_API_KEY", "g-secret"),
+        ]))
+        .unwrap();
+        assert_eq!(config.selection.provider, ProviderId::Google);
+        assert_eq!(config.selection.model, "gemini-2.0-flash");
+        assert_eq!(config.selection.base_url, GOOGLE_BASE_URL);
+        let credential = config.credential.as_ref().expect("google key should resolve");
+        assert_eq!(credential.secret.expose(), "g-secret");
+        assert_eq!(
+            credential.source,
+            CredentialSource::Env {
+                name: "GOOGLE_API_KEY".into()
+            }
+        );
+        let readiness = config.readiness();
+        assert!(readiness.ok);
+        assert!(readiness.credential_present);
+        assert_eq!(readiness.base_url_host, "generativelanguage.googleapis.com");
+    }
+
+    #[test]
+    fn gemini_is_ready_with_canonical_gemini_api_key() {
+        // The GoogleProvider (ocean-protocol) reads GEMINI_API_KEY, so the
+        // registry readiness check must accept it too — otherwise an operator
+        // with only GEMINI_API_KEY set fails preflight and Gemini is silently
+        // unroutable despite the provider being able to authenticate.
+        let config = resolve_provider_config(&env(&[
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+            ("GEMINI_API_KEY", "gemini-secret"),
+        ]))
+        .unwrap();
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("GEMINI_API_KEY should resolve");
+        assert_eq!(credential.secret.expose(), "gemini-secret");
+        assert_eq!(
+            credential.source,
+            CredentialSource::Env {
+                name: "GEMINI_API_KEY".into()
+            }
+        );
+        assert!(config.readiness().ok);
     }
 
     #[test]
