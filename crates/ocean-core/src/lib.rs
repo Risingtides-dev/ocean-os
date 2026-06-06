@@ -688,6 +688,11 @@ pub struct PermissionsResponse {
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum PermissionDecision {
     Allow,
+    /// Allow this call and remember the choice for the rest of the run: the same
+    /// tool will not prompt again for the duration of this session/run. Maps to
+    /// the runtime's `AllowSession` decision, which records the tool name in the
+    /// agent loop's per-run `session_allowed` set. Wire tag: `"allow_session"`.
+    AllowSession,
     Deny {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
