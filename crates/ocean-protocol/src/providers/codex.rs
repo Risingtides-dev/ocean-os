@@ -126,6 +126,32 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
                     "call_id": tr.tool_call_id,
                     "output": text,
                 }));
+
+                // OCEAN-133: tool-result images (browser/computer-use screenshots)
+                // can't ride inside `function_call_output.output`, which is a plain
+                // string on the Responses API. To keep vision parity with Anthropic,
+                // follow the function output with a user-role `message` that carries
+                // the screenshot(s) as `input_image` parts (same data-URL shape used
+                // for user-message images in convert_input above). Without this the
+                // image is silently dropped and the model "can't see the screenshot".
+                let images: Vec<Value> = tr
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Image { data, mime_type } => Some(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", mime_type, data),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !images.is_empty() {
+                    out.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": images,
+                    }));
+                }
             }
         }
     }
@@ -600,7 +626,7 @@ impl Provider for CodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::now_ms;
+    use crate::types::{now_ms, ToolResultMessage};
 
     // OCEAN-99: vision parity for the OpenAI Responses API. A user image must
     // serialize as an input_image content part (data-URL), not be dropped.
@@ -633,5 +659,76 @@ mod tests {
             .find(|p| p["type"] == "input_image")
             .expect("input_image part missing — image was dropped");
         assert_eq!(image["image_url"], "data:image/png;base64,AAECAwQ=");
+    }
+
+    // OCEAN-133: tool-result vision parity. A screenshot returned by a tool
+    // (browser/computer-use → Content::Image) must reach the model. The
+    // function_call_output string can't carry an image, so the encoder appends a
+    // user-role message with an input_image part. Assert the image is NOT dropped.
+    #[test]
+    fn tool_result_image_is_appended_as_input_image() {
+        let messages = vec![Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_42".into(),
+            tool_name: "browser_screenshot".into(),
+            content: vec![
+                Content::text("here is the screenshot"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_input(&messages);
+
+        // The text output still rides on the function_call_output, unchanged.
+        let fco = out
+            .iter()
+            .find(|v| v["type"] == "function_call_output")
+            .expect("function_call_output missing");
+        assert_eq!(fco["call_id"], "call_42");
+        assert_eq!(fco["output"], "here is the screenshot");
+
+        // The image is appended as a user-role message with an input_image part.
+        let msg = out
+            .iter()
+            .find(|v| v["type"] == "message" && v["role"] == "user")
+            .expect("input_image follow-up message missing — image was dropped");
+        let parts = msg["content"].as_array().expect("content array missing");
+        let image = parts
+            .iter()
+            .find(|p| p["type"] == "input_image")
+            .expect("input_image part missing — tool-result image was dropped");
+        assert_eq!(image["image_url"], "data:image/png;base64,AAECAwQ=");
+    }
+
+    // OCEAN-133: text-only tool results must stay exactly as before — a single
+    // function_call_output with no trailing image message.
+    #[test]
+    fn text_only_tool_result_stays_text_only() {
+        let messages = vec![Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_7".into(),
+            tool_name: "read_file".into(),
+            content: vec![Content::text("file contents")],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_input(&messages);
+
+        assert_eq!(out.len(), 1, "expected only the function_call_output: {out:?}");
+        assert_eq!(out[0]["type"], "function_call_output");
+        assert_eq!(out[0]["call_id"], "call_7");
+        assert_eq!(out[0]["output"], "file contents");
+        assert!(
+            !out.iter().any(|v| v["type"] == "input_image"
+                || v["content"]
+                    .as_array()
+                    .map(|p| p.iter().any(|x| x["type"] == "input_image"))
+                    .unwrap_or(false)),
+            "no input_image should be emitted for a text-only tool result"
+        );
     }
 }
