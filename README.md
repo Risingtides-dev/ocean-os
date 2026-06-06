@@ -11,12 +11,18 @@ Ocean OS is a local-first agent runtime written in Rust. A long-running daemon o
 | `ocean-core` | Shared protocol types: requests, responses, events, sessions |
 | `ocean-protocol` | Unified multi-provider LLM wire protocol (Anthropic, OpenAI, Google Gemini, OpenAI-compatible). SSE streaming, retry, cancellation |
 | `ocean-runtime` | Agent loop with permission-gated tool execution. Built-in tools: read, write, edit, bash, ls, grep, glob, web_fetch, todo |
+| `ocean-mcp` | Ocean as an MCP **client**: connects to external Model Context Protocol servers and exposes their tools to the agent through the runtime |
+| `ocean-acp` | ACP (Agent Client Protocol) bridge — exposes the daemon to Zed and other ACP editors over stdio |
 | `ocean-providers` | Ocean-owned provider registry: model routing, credential resolution, readiness checks |
+| `ocean-longhouse` | Quorum engine + convening flow behind the longhouse deck (real multi-agent council, not the scripted demo) |
+| `ocean-heartbeat` | Scheduleable Ocean routines: prompt-injection scheduler hooks for daemon routines (`ocean-heartbeat` binary) |
 | `ocean-agent` | Ocean session/history layer wrapping `ocean-runtime` |
 | `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
 | `ocean-daemon` | Long-running HTTP service on `:4780`. Owns runtime authority |
 | `ocean-cli` (`ocean-rs` binary) | CLI client: health, prompt, sessions |
 | `ocean-tui` (`ocean` binary) | Terminal steering cockpit with TIDES-MESH parity views |
+| `ocean-browser` | Typed async handle to a Chrome instance driven over the DevTools Protocol |
+| `ocean-call` | Ocean Call Intelligence: daemon-side PSTN call agent (Twilio SIP → LiveKit room) that Ocean joins as a server-side participant |
 
 ## Quick start
 

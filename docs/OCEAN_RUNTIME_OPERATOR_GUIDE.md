@@ -1,6 +1,6 @@
 # Ocean runtime operator guide
 
-This guide is for operators running the current `ocean-rs` Rust-native Pi-style coding-agent harness/runtime and its clients. It reflects the repo state as validated from source on 2026-05-25.
+This guide is for operators running the current `ocean-rs` Rust-native Pi-style coding-agent harness/runtime and its clients. It reflects the repo state as validated from source on 2026-06-06.
 
 ## Operating model
 

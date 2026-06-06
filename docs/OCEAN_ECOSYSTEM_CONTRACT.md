@@ -32,6 +32,15 @@ Status: active contract for runtime and first-party surfaces.
        delivered to a session-scoped subscriber. This keeps the no-crossing
        guarantee intact: a council never leaks into an unrelated session's
        transcript; it reaches the deck (which subscribes globally) by design.
+   - **Verified against `crates/ocean-daemon/src/main.rs:3453` (`should_emit_agent_event`)
+     on 2026-06-06.** The live SSE filter matches this contract exactly:
+     `(Some(want), Some(sid)) => sid == want` (a scoped subscriber sees only its
+     own session), `(Some(_), None) => false` (a council-wide `scope = None`
+     event is never delivered to a scoped subscriber), and `(None, _) => all`
+     (any session-bearing or council-wide event requires the explicit `?all=1`
+     firehose opt-in). `Extension` scope routing is implemented by
+     `AgentTurnEvent::session_id()` returning `*scope` for `Extension` events
+     (`crates/ocean-agent-sdk/src/lib.rs:487`).
 6. The global `/v1/agent/events` stream (no `session_id`, opt in with `?all=1`)
    is for debug, the Longhouse deck, and legacy clients only. Session-bearing
    events and council-wide extension events are delivered there only when
@@ -105,7 +114,70 @@ POST /v1/agent/turns
 Every field except `prompt` and `cwd` is optional. `thinking_level` and
 `model_id` are per-turn overrides: they never mutate global runtime state, which
 is what lets two ACP/surface windows run different models or reasoning efforts
-against the same daemon concurrently.
+against the same daemon concurrently. (`model_id` is OCEAN-36; source of truth
+`crates/ocean-agent-sdk/src/lib.rs`, `AgentTurnRequest::model_id`.)
+
+### Events of note
+
+Beyond turn lifecycle deltas (`TurnStarted`, `AssistantTextDelta`,
+`ToolCall*`, `TurnFinished`), two event families have surface-facing contracts:
+
+- **`BrowserActivity { session_id, active }`** — emitted so the Chrome
+  extension side panel can auto-focus while Ocean drives the browser and release
+  afterward. Per OCEAN-77 the emission rule is contract-honest: every browser
+  tool that performs a **live browser action** (a CDP round-trip to the running
+  Chrome) emits `BrowserActivity { active: true }`. This includes the
+  read-only-but-live tools `browser_list_tabs` (enumerates tabs over CDP) and
+  `browser_response_body` (issues `Network.getResponseBody`). Two tools are
+  **exempt** because they read a purely in-memory buffer with no CDP round-trip
+  (the live action that populated the buffer already flagged activity):
+  `browser_captured_requests` (netcap snapshot) and `browser_downloads`
+  (download-tracking snapshot). Source of truth:
+  `crates/ocean-runtime/src/tools/browser/mod.rs` (module-level contract comment
+  + `active_result`). `BrowserActivity` is session-bearing and obeys Invariant 5.
+- **`Extension { extension, payload, scope }`** — the catch-all for council /
+  extension events; its `scope`-based delivery is the Invariant 5 exception
+  documented above.
+
+## Persistent Rooms (OCEAN-65)
+
+The **persistent `Room`** is the durable collaboration entity — distinct from
+the Track-0 `RoomSnapshot` projection served by `GET /v1/rooms` and
+`GET /v1/rooms/{room_id}`. A `Room` owns a free-form id (`RoomKey`), a name, a
+participant roster, created/updated timestamps, an append-only transcript, and an
+optional trigger policy. The persistent lifecycle is namespaced under
+`/v1/rooms/persistent` so it never shadows the projection route. Source of truth:
+`crates/ocean-core/src/lib.rs` (`Room`, `RoomKey`, `RoomParticipant`,
+`RoomMessage`, `RoomTriggerPolicy`, `RoomTriggerEvent`, `evaluate_trigger_policy`)
+and `crates/ocean-agent` (`RoomRegistry` store, `RoomStoreError`).
+
+Routes (all in `crates/ocean-daemon/src/main.rs`, typed `{ ok, error }` bodies,
+400 on a bad key, 404 on an unknown room):
+
+```text
+POST /v1/rooms/persistent                                  # create a room
+GET  /v1/rooms/persistent                                  # list rooms
+GET  /v1/rooms/persistent/{key}                            # fetch one room
+POST /v1/rooms/persistent/{key}/participants               # join (add participant)
+DEL  /v1/rooms/persistent/{key}/participants/{participant_id}  # leave
+POST /v1/rooms/persistent/{key}/messages                   # append a transcript entry
+GET  /v1/rooms/persistent/{key}/transcript                 # read transcript (after_seq tail)
+```
+
+**Transcript** is a flat, append-only event log of `RoomMessage` entries, each
+carrying author attribution (`author_id`, `author_kind`), a `kind`
+(`Message` / `ParticipantJoined` / `ParticipantLeft` / `System`), a body, and a
+store-assigned monotonic `seq` so clients can request `after_seq` tails.
+
+**Trigger-policy evaluation** is the pure, I/O-free
+`evaluate_trigger_policy(policy, event) -> TriggerDecision` in `ocean-core`. The
+optional `RoomTriggerPolicy` gates each `RoomTriggerEvent` variant one-for-one:
+`on_mention` ↔ `Mention`, `on_thread_reply` ↔ `ThreadReply`,
+`on_component_event` ↔ `ComponentEvent`, `on_schedule` (cron) ↔ `Schedule`. An
+absent policy (`None`) never convenes. A positive `TriggerDecision`
+(`should_convene: true`, optional `target_participant`, human-readable `reason`)
+is the seed for auto-convene; the daemon evaluates it at the transcript/
+component-event wiring point.
 
 ## Implementation Anchors
 
