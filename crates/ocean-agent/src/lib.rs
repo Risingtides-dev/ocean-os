@@ -318,7 +318,15 @@ impl AgentRuntime {
             };
         }
 
-        let result = if snapshot.provider_config.selection.provider == ProviderId::Fake {
+        // Fake provider dispatch. The default `fake-ok` is a text-only echo that
+        // never touches the runtime loop (`run_fake_prompt`). The OCEAN-130
+        // `fake-tool` variant is different: it must trip the *real* permission
+        // gate and run a *real* tool, so it routes through `run_prompt` like a
+        // real provider — only with a deterministic `FakeToolProvider` injected
+        // (no network, no key) that emits one `write` tool call.
+        let is_fake = snapshot.provider_config.selection.provider == ProviderId::Fake;
+        let is_fake_tool = is_fake && snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL;
+        let result = if is_fake && !is_fake_tool {
             self.run_fake_prompt(req.clone(), control, snapshot).await
         } else {
             self.run_prompt(req.clone(), control, snapshot).await
@@ -694,6 +702,19 @@ impl AgentRuntime {
             cfg.stream_options
                 .headers
                 .insert("chatgpt-account-id".into(), account_id.clone());
+        }
+
+        // OCEAN-130: the keyless `fake-tool` model runs the *real* loop but with
+        // a deterministic provider injected through the same seam the e2e tests
+        // use. It emits one `write` tool call on the first round — tripping the
+        // permission gate when gating is on — then a `done` completion. No
+        // network, no key; production models never set `provider`.
+        if snapshot.provider_config.selection.provider == ProviderId::Fake
+            && snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL
+        {
+            cfg = cfg.with_provider(std::sync::Arc::new(
+                ocean_runtime::FakeToolProvider::new(),
+            ));
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel();

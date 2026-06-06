@@ -5395,6 +5395,150 @@ mod tests {
         }
     }
 
+    // --- OCEAN-130: fake-tool provider drives the full block→decide→proceed
+    //     cycle through the real agent loop + the gating DaemonPermissionPolicy.
+    //
+    // This is the live-cycle coverage the ticket asked for, in-process: the
+    // FakeToolProvider emits one `write` tool call, the gating policy suspends
+    // the loop (blocking half), a separate task releases the waiter with Allow
+    // (release half), and the loop then runs the real `write` tool and finishes.
+    // No network, no key — the whole point of the fake-tool mode.
+    #[tokio::test]
+    async fn fake_tool_provider_blocks_on_gate_then_runs_tool_after_allow() {
+        use ocean_runtime::types::AgentConfig;
+        use ocean_runtime::{run_agent_with_history, tools::write::WriteTool, FakeToolProvider};
+        use ocean_protocol::{Message, Model};
+
+        // A unique temp target so this test never collides with the live-test
+        // file or a parallel run.
+        let dir = std::env::temp_dir().join(format!("ocean-130-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("written.txt");
+
+        // Gating ON (allow_mutating = false) — the default-safe daemon policy.
+        let policy = Arc::new(gating_policy(false));
+        let permissions = policy.permissions.clone();
+
+        // A FakeToolProvider that scripts a `write` to OUR target path, so the
+        // assertion is self-contained (it doesn't depend on the crate-default
+        // constant path that the live HTTP test uses).
+        struct TargetedFakeTool {
+            path: String,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ocean_protocol::Provider for TargetedFakeTool {
+            async fn stream(
+                &self,
+                _m: &Model,
+                _c: &ocean_protocol::Context,
+                _o: &ocean_protocol::StreamOptions,
+            ) -> ocean_protocol::Result<ocean_protocol::AssistantMessageEventStream> {
+                use ocean_protocol::{
+                    AssistantMessage, AssistantMessageEvent, Content, StopReason, Usage,
+                };
+                let round = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let msg = |content: Vec<Content>, stop: StopReason| AssistantMessage {
+                    content,
+                    api: "fake".into(),
+                    provider: "fake".into(),
+                    model: "fake-tool".into(),
+                    usage: Usage::default(),
+                    stop_reason: stop,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                let evs: Vec<AssistantMessageEvent> = if round == 0 {
+                    vec![AssistantMessageEvent::Done {
+                        reason: StopReason::ToolUse,
+                        message: msg(
+                            vec![Content::ToolCall {
+                                id: "fake-tool-call-1".into(),
+                                name: "write".into(),
+                                arguments: json!({"path": self.path, "content": "ok"}),
+                            }],
+                            StopReason::ToolUse,
+                        ),
+                    }]
+                } else {
+                    vec![AssistantMessageEvent::Done {
+                        reason: StopReason::Stop,
+                        message: msg(vec![Content::text("done")], StopReason::Stop),
+                    }]
+                };
+                Ok(Box::pin(futures::stream::iter(
+                    evs.into_iter().map(Ok).collect::<Vec<_>>(),
+                )))
+            }
+        }
+        let _ = FakeToolProvider::new(); // touch the public type the daemon ships
+        let provider = Arc::new(TargetedFakeTool {
+            path: target.to_string_lossy().into_owned(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let cfg = AgentConfig::new(Model::openai_compat("fake", "fake-tool", "fake://local", 1000, 1000), "sys")
+            .with_tools(vec![Arc::new(WriteTool)])
+            .with_permission(policy.clone())
+            .with_provider(provider)
+            .with_max_turns(4);
+
+        // Drive the real loop.
+        let run = tokio::spawn(async move {
+            run_agent_with_history(&cfg, vec![Message::user_text("write it")], None).await
+        });
+
+        // BLOCKING half: a pending permission waiter must appear (the gate
+        // tripped on the `write` tool call), and it must NOT auto-resolve.
+        let mut waited = false;
+        for _ in 0..100 {
+            if permissions.read().await.len() == 1 {
+                waited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            waited,
+            "fake-tool must trip the gate: a pending `write` permission waiter must register"
+        );
+        // The run is still in flight (suspended), not finished.
+        assert!(!run.is_finished(), "the turn must be suspended on the gate");
+
+        // RELEASE half: allow the pending permission, exactly like
+        // POST /v1/permissions/{id}/decision {allow} does.
+        let (pid, sender) = {
+            let mut perms = permissions.write().await;
+            let pid = *perms.keys().next().unwrap();
+            let mut waiter = perms.remove(&pid).unwrap();
+            (pid, waiter.sender.take().unwrap())
+        };
+        assert!(
+            permissions.read().await.get(&pid).is_none(),
+            "the waiter must be consumed on decision"
+        );
+        sender.send(AgentPermissionDecision::Allow).unwrap();
+
+        // PROCEED: the loop resumes, runs the real `write` tool, and completes.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish after the gate is released")
+            .expect("join")
+            .expect("agent run ok");
+        assert!(
+            !result.stopped_at_turn_limit,
+            "the run must complete cleanly, not stall at the turn limit"
+        );
+
+        // The gated tool ACTUALLY RAN — the file exists with the scripted content.
+        let written = std::fs::read_to_string(&target).expect("write tool must have run");
+        assert_eq!(written, "ok", "the released `write` tool wrote the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- OCEAN-53: CORS origin whitelist ------------------------------------
 
     fn origin(s: &str) -> HeaderValue {
