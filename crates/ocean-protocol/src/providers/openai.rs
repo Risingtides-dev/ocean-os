@@ -201,7 +201,19 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
                                 }
                             }));
                         }
-                        _ => {}
+                        // OCEAN-140: the Chat Completions API has no input shape
+                        // for assistant reasoning — reasoning is output-only on
+                        // this API, and replaying chain-of-thought across tool
+                        // round-trips is only supported on the Responses API via
+                        // opaque `reasoning.encrypted_content` items (which
+                        // Ocean's Content::Thinking does not carry). An
+                        // Anthropic-style thinking block (text + signature) has no
+                        // valid Chat Completions assistant representation, so it is
+                        // dropped EXPLICITLY here rather than via a silent
+                        // `_ => {}` (kills the OCEAN-101 silent-drop class).
+                        Content::Thinking { .. } => {}
+                        // Images never appear in assistant content on this API.
+                        Content::Image { .. } => {}
                     }
                 }
                 let mut msg = json!({"role": "assistant", "content": text});
@@ -825,6 +837,58 @@ mod tests {
         assert_eq!(out.len(), 1, "text-only tool result must not add a user message");
         assert_eq!(out[0]["role"], "tool");
         assert_eq!(out[0]["content"], "file contents");
+    }
+
+    // OCEAN-140: a replayed assistant turn carrying a Content::Thinking block must
+    // be handled by an EXPLICIT match arm, not the old silent `_ => {}`. Chat
+    // Completions has no input shape for assistant reasoning, so the documented
+    // behavior is an intentional drop: the thinking text must NOT leak into the
+    // assistant message content or tool_calls, while the text + tool call survive.
+    #[test]
+    fn assistant_thinking_is_explicitly_dropped() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "secret chain of thought".into(),
+                    thinking_signature: Some("sig-abc".into()),
+                },
+                Content::text("the answer is 42"),
+                Content::ToolCall {
+                    id: "call_1".into(),
+                    name: "calc".into(),
+                    arguments: serde_json::json!({"x": 1}),
+                },
+            ],
+            api: "chat".into(),
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(None, &messages);
+        assert_eq!(out.len(), 1, "expected a single assistant message");
+        let msg = &out[0];
+        assert_eq!(msg["role"], "assistant");
+
+        // Visible text survives; thinking text does NOT leak into it.
+        assert_eq!(msg["content"], "the answer is 42");
+        let serialized = serde_json::to_string(msg).unwrap();
+        assert!(
+            !serialized.contains("secret chain of thought"),
+            "thinking text must not appear anywhere in the encoded message: {serialized}"
+        );
+        assert!(
+            !serialized.contains("sig-abc"),
+            "thinking signature must not appear in the encoded message: {serialized}"
+        );
+
+        // The tool call still rides along.
+        let calls = msg["tool_calls"].as_array().expect("tool_calls present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "calc");
     }
 
     // OCEAN-101: a mid-stream error frame must decode into `Chunk.error` so the

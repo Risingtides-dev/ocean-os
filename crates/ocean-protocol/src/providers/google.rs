@@ -128,7 +128,18 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                                 "functionCall": {"name": name, "args": arguments}
                             }));
                         }
-                        _ => {}
+                        // OCEAN-140: Gemini only replays model thinking via opaque
+                        // `thoughtSignature` blobs attached to the original parts —
+                        // it does not accept free-form thinking text as a model
+                        // input part, and a raw `text` part would corrupt the
+                        // transcript rather than restore the thought. Ocean's
+                        // Content::Thinking carries an Anthropic-style signature,
+                        // not a Gemini thoughtSignature, so there is nothing valid
+                        // to re-encode. Drop it EXPLICITLY here instead of a silent
+                        // `_ => {}` (kills the OCEAN-101 silent-drop class).
+                        Content::Thinking { .. } => {}
+                        // Images never appear in model (assistant) content.
+                        Content::Image { .. } => {}
                     }
                 }
                 out.push(json!({"role": "model", "parts": parts}));
@@ -612,6 +623,56 @@ mod tests {
             .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
             .any(|p| p.get("inlineData").is_some());
         assert!(!has_inline, "text-only result must not emit inlineData");
+    }
+
+    // OCEAN-140: a replayed model turn carrying a Content::Thinking block must hit
+    // an EXPLICIT match arm, not the old silent `_ => {}`. Gemini replays thinking
+    // only via opaque thoughtSignature blobs (which Ocean does not carry), so the
+    // documented behavior is an intentional drop: the thinking text must NOT appear
+    // as a model part, while text and functionCall parts survive in order.
+    #[test]
+    fn model_thinking_is_explicitly_dropped() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "secret chain of thought".into(),
+                    thinking_signature: Some("sig-abc".into()),
+                },
+                Content::text("visible answer"),
+                Content::ToolCall {
+                    id: "call_1".into(),
+                    name: "calc".into(),
+                    arguments: serde_json::json!({"x": 1}),
+                },
+            ],
+            api: "generateContent".into(),
+            provider: "google".into(),
+            model: "gemini-2.5-flash".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        assert_eq!(out.len(), 1, "expected a single model content");
+        assert_eq!(out[0]["role"], "model");
+
+        let serialized = serde_json::to_string(&out[0]).unwrap();
+        assert!(
+            !serialized.contains("secret chain of thought"),
+            "thinking text must not appear in encoded model content: {serialized}"
+        );
+        assert!(
+            !serialized.contains("sig-abc"),
+            "thinking signature must not appear in encoded model content: {serialized}"
+        );
+
+        let parts = out[0]["parts"].as_array().expect("parts array");
+        // Exactly the text part + the functionCall part — thinking produced none.
+        assert_eq!(parts.len(), 2, "thinking must not add a part: {parts:?}");
+        assert_eq!(parts[0]["text"], "visible answer");
+        assert_eq!(parts[1]["functionCall"]["name"], "calc");
     }
 
     // OCEAN-101: a content-filter / abnormal finishReason must NOT map to a clean
