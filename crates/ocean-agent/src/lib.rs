@@ -880,7 +880,7 @@ impl PermissionPolicy for StaticPermissionPolicy {
             PermissionDecision::Allow
         } else {
             PermissionDecision::Deny {
-                reason: "daemon approval flow is not implemented yet; retry with yolo only if you intend to allow mutating tools".into(),
+                reason: "this static policy denies all mutating tools and has no interactive approval path; it is only reached by SDK embedders that constructed the agent with PromptControl::yolo(false). The daemon does NOT use this policy — live daemon turns gate through DaemonPermissionPolicy, which prompts the operator. To allow mutating tools here, build the embedder with PromptControl::yolo(true).".into(),
             }
         }
     }

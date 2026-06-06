@@ -546,10 +546,20 @@ const OPT_DENY: &str = "deny";
 /// event (`TurnFinished` / `Cancelled` / `Error`) for our `request_id`, or when
 /// the control stream closes.
 ///
-/// Note: as of writing, the daemon submits ACP turns with `yolo: true`, so the
-/// gate auto-allows and no `PermissionRequest` is raised. This wiring activates
-/// the moment ACP turns run gated (daemon-side change); it is correct and inert
-/// until then.
+/// Note: the daemon decides the permission mode per turn via `yolo_enabled()`
+/// (reads `OCEAN_YOLO`, default GATED — OCEAN-51). `AgentTurnRequest` carries no
+/// `yolo` field, so ACP turns DO gate by default: a mutating tool call blocks
+/// inside the daemon's `runtime.prompt(...)` and raises a `PermissionRequest` on
+/// the control stream. The gating is real; delivery to Zed is not, yet.
+///
+/// KNOWN RACE (OCEAN-146): `run_turn` awaits `submit_turn(...)` BEFORE calling
+/// this function, but the daemon's `POST /v1/agent/turns` only returns AFTER
+/// `runtime.prompt(...)` finishes — and a gated prompt blocks there waiting for
+/// the decision. So the daemon emits the `PermissionRequest` while we are still
+/// awaiting `submit_turn`; this bridge subscribes to the control stream only
+/// afterward and there is no replay, so it misses the request and the editor
+/// prompt is never delivered. Fix: subscribe before / concurrently with
+/// `submit_turn`. (`OCEAN_YOLO=1` sidesteps the whole path by not gating.)
 fn spawn_permission_bridge(
     client: &DaemonClient,
     conn: &ConnectionTo<Client>,
@@ -567,7 +577,8 @@ fn spawn_permission_bridge(
                 Ok(s) => s,
                 Err(err) => {
                     // Without the control stream we just can't surface prompts;
-                    // the turn still runs (and, under yolo, never gates).
+                    // the turn still runs (and, under `OCEAN_YOLO=1` bypass,
+                    // would not gate anyway).
                     tracing::warn!(%request_id, error = %err, "permission bridge: control stream unavailable");
                     return Ok(());
                 }
