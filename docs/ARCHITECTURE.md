@@ -1,6 +1,8 @@
 # Ocean OS architecture
 
-> Last validated against source: 2026-06-05.
+> Last validated against source: 2026-06-06 (post Epoch 6 / M1: durable rooms,
+> plugin tools, cross-provider vision, and room auto-convene have all shipped —
+> see "Shipped since the original integration list" below).
 
 Ocean OS is a Rust-native coding-agent runtime and daemon. The daemon owns runtime authority; `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that runtime.
 
@@ -118,89 +120,92 @@ ocean-tui
   - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
 ```
 
-## Built, pending daemon integration
+## Shipped since the original integration list
 
-These crates and types **exist and are tested** in the workspace, but the daemon
-does not yet construct or register them — so the *library exists* while the
-*feature does not yet work* live. This section is operator honesty: it names the
-gap so nobody assumes a capability is on just because the crate compiles.
+This section used to read "Built, pending daemon integration" and listed a set of
+crates and types as existing-but-not-wired. **As of Epoch 6 / M1 nearly all of
+them are now constructed and live in the daemon path.** They are recorded here so
+the history is clear and so the one genuinely remaining gap (a display-only
+transcript flattener) is not lost in the noise.
 
 ```text
-ocean-store
-  SQLite-backed durable Room store (SqliteRoomStore). Mirrors the in-memory
-  RoomRegistry API method-for-method behind a `dyn RoomStore` trait, with its
-  own unit tests (including a reopen-survives-restart test).
-  STATUS: NOT wired. The daemon still constructs the in-memory
-  `ocean_agent::RoomRegistry` (crates/ocean-daemon/src/main.rs) and does not
-  even depend on `ocean-store`. The crate's own top-level docs say so: "the
-  daemon is not wired to use this store — that is a separate follow-up ticket."
-  OPERATOR IMPACT: persistent rooms, their rosters, and their transcripts live
-  in process memory and are LOST on every daemon restart. Durable rooms only
-  take effect once the daemon swaps its `Mutex<RoomRegistry>` for the SQLite
-  store (the method names/signatures already match, so it is a field-type swap).
+ocean-store — WIRED (durable rooms).
+  SQLite-backed durable Room store (`SqliteRoomStore`) behind the `RoomStore`
+  trait. The daemon depends on it (`crates/ocean-daemon/Cargo.toml:25
+  ocean-store.workspace = true`) and constructs it at startup
+  (`crates/ocean-daemon/src/main.rs:565 ocean_store::SqliteRoomStore::open(...)`),
+  holding it as `Arc<Mutex<ocean_store::SqliteRoomStore>>` (main.rs:85) instead of
+  the old in-memory `RoomRegistry`. Every persistent-room handler routes through
+  it via `with_rooms(...)` and `RoomStore` (main.rs:45, 1900) (OCEAN-86 / 107).
+  OPERATOR IMPACT: rooms, rosters, and transcripts now PERSIST across daemon
+  restarts — they live in the rooms SQLite db, not process memory.
 
-ocean-plugin
-  Subprocess plugin runtime + a `PluginProvider` that implements the runtime's
-  `CapabilityProvider` seam (the same seam `ocean-mcp` uses), exposing plugin
-  tools to the agent as `plugin__<plugin>__<tool>` (OCEAN-95).
-  STATUS: NOT wired. The daemon's capability registry is built by
-  `build_capability_registry` (in ocean-agent), which registers only
-  BuiltinProvider, BrowserProvider, and any configured McpProviders. No
-  `PluginProvider` is constructed, and neither the daemon nor ocean-agent
-  depends on `ocean-plugin`.
-  OPERATOR IMPACT: installed plugins contribute ZERO tools to a turn. The
-  plugin transport runs in isolation; nothing in the live agent path loads,
-  lists, or calls it yet.
+ocean-plugin — WIRED (plugin tools reach the agent).
+  Subprocess plugin runtime + a `PluginProvider` implementing the runtime's
+  `CapabilityProvider` seam, exposing plugin tools as `plugin__<plugin>__<tool>`
+  (OCEAN-95). `ocean-agent` depends on it (`crates/ocean-agent/Cargo.toml:17
+  ocean-plugin.workspace = true`). `build_capability_registry` now calls
+  `discover_plugin_providers(config_dir)` and registers each returned
+  `ocean_plugin::PluginProvider` (`crates/ocean-agent/src/lib.rs:978`,
+  constructed at lib.rs:1060). PluginProvider tools report
+  `requires_permission == true`, so they gate like any mutating tool.
+  OPERATOR IMPACT: installed plugins now contribute their tools to a turn; the
+  live agent path discovers, lists, and calls them.
 
-Content::Image (multimodal content — built, partial wiring)
-  The protocol type `Content::Image { data, mime_type }` exists and is PRODUCED
-  today — the browser `perceive` tool captures screenshots as image content,
-  and the Anthropic provider serializes it correctly, so screenshots reach
-  Claude models end-to-end.
-  STATUS: cross-provider wiring incomplete. The OpenAI provider's user-message
-  encoder filters content to text only (`filter_map(as_text)`) and Gemini has
-  no Image arm; the daemon's transcript flattener also ignores Image (text-only
-  view).
-  OPERATOR IMPACT: vision/browser turns are first-class on Anthropic models but
-  silently text-only on OpenAI/Gemini — a screenshot taken mid-turn never
-  reaches a non-Anthropic model. The type is defined; the cross-provider feature
-  is not complete.
+Content::Image (cross-provider vision) — WIRED on the model wire path; one
+  display-only flattener remains.
+  The protocol type `Content::Image { data, mime_type }` is produced by the
+  browser/computer-use tools and now encoded by ALL FOUR providers on the way to
+  the model:
+    - Anthropic — `crates/ocean-protocol/src/providers/anthropic.rs:158,193`
+    - OpenAI    — `crates/ocean-protocol/src/providers/openai.rs:198,286,813,864`
+                  (OCEAN-99 user-message vision, OCEAN-131 tool-result images)
+    - Gemini    — `crates/ocean-protocol/src/providers/google.rs:131,235,617,654`
+                  (OCEAN-99 / OCEAN-132)
+    - Codex     — `crates/ocean-protocol/src/providers/codex.rs:66,154,651,688`
+                  (OCEAN-133)
+  The old "OpenAI text-only / Gemini has no Image arm" claim is OBSOLETE — a
+  screenshot taken mid-turn now reaches every provider's model.
+  REMAINING GAP (LOW sev, display-only): the daemon's transcript flattener
+  `text_from_content` (`crates/ocean-agent/src/lib.rs:1762-1772`) still drops
+  `Content::Image` — it keeps only `Text`/`Thinking`. This affects ONLY the
+  human-readable transcript returned by `GET /v1/sessions/{id}`, NOT the model
+  wire path. So a session-detail view shows an image-bearing turn as text-only,
+  even though the model itself received the image. Cosmetic, not a capability gap.
 
-ocean-acp permission forwarding (wired, not yet functional — subscribe-order race)
-  The per-turn ACP permission bridge (`spawn_permission_bridge`) is fully built:
-  it watches the daemon control stream (`/v1/events`), forwards each
-  `PermissionRequest` scoped to our turn to the editor as
-  `session/request_permission`, and POSTs the decision back to
-  `POST /v1/permissions/{id}/decision`.
-  GATING IS REAL: `AgentTurnRequest` has NO `yolo` field — the daemon decides the
-  mode per turn via `yolo_enabled()`, which reads the `OCEAN_YOLO` env and
-  defaults to GATED (OCEAN-51 / #54). So ACP turns DO gate by default: a mutating
-  tool call blocks inside the daemon's `runtime.prompt(...)` and raises a
-  `PermissionRequest` on the control stream. That part works.
-  STATUS: the bridge delivery is broken by an ordering race (not the gating).
-  `run_turn` (in `crates/ocean-acp/src/main.rs`) awaits `submit_turn(...)` BEFORE
-  calling `spawn_permission_bridge`, but the daemon's `POST /v1/agent/turns`
-  handler only returns its HTTP response AFTER `runtime.prompt(...)` completes —
-  and a gated prompt blocks inside that call waiting for the permission decision.
-  So the daemon emits the `PermissionRequest` while the ACP side is still awaiting
-  `submit_turn`; the bridge subscribes to the control stream only afterward and
-  there is no replay, so it never sees the request. (Note the typed agent stream
-  IS subscribed before submit at the top of `run_turn` — it is specifically the
-  bridge's separate control-stream subscription that arrives too late.)
-  OPERATOR IMPACT: in Zed today, a gated Ocean tool call hangs — no editor-side
-  approval prompt is delivered, because the request fired before the bridge was
-  listening. Fix tracked as OCEAN-146 (subscribe to the control stream before /
-  concurrently with `submit_turn`, on the ACP side).
+ocean-acp permission forwarding — WIRED and functional (race fixed, OCEAN-146).
+  The per-turn ACP permission bridge (`spawn_permission_bridge`) watches the
+  daemon control stream, forwards each scoped `PermissionRequest` to the editor as
+  `session/request_permission`, and POSTs the decision back. Gating is real: the
+  daemon decides the mode per turn (`yolo_enabled()`, default GATED, OCEAN-51).
+  The old subscribe-order race is FIXED. `run_turn`
+  (`crates/ocean-acp/src/main.rs`) now subscribes the control stream BEFORE
+  submitting the turn (main.rs:490-508, then `submit_turn` at ~525), so the
+  bridge is listening before the daemon can emit the gated `PermissionRequest`.
+  Because the broadcast channel has no replay, this ordering is what makes
+  delivery work. The turn's `request_id` is learned from the event stream, not
+  from `submit_turn`'s (deadlock-prone) response.
+  OPERATOR IMPACT: in Zed today a gated Ocean tool call surfaces an editor-side
+  approval prompt — it no longer hangs.
+
+Room auto-convene — WIRED (a resolved mention now wakes the agent).
+  `room_post_message` evaluates the stored trigger policy
+  (`evaluate_trigger_policy`, `crates/ocean-daemon/src/main.rs:2114`) on an
+  `@mention`. When the policy says convene AND the mentioned id resolves to a real
+  `Agent` in the roster, the handler emits the `room_trigger` notice (main.rs:2148),
+  writes an `auto-convene:` audit line, and — crucially — calls
+  `spawn_room_agent_turn(...)` (main.rs:2181, defined at main.rs:2302), which
+  spawns an actual agent turn for the mentioned participant (resumes the
+  deterministic room+agent session, builds a transcript-tail prompt, runs it).
+  Note OCEAN-128: the `room_trigger` event and audit line only fire once an Agent
+  is actually resolved, so a mention of a non-agent id no longer claims a convene
+  that never happened. (OCEAN-111 / OCEAN-128.)
+  OPERATOR IMPACT: mentioning a room agent now actually wakes it; no agent-turn is
+  queued for human/bot/system or unknown mentions.
 ```
 
-The same "library exists vs feature works" gap also covers two items tracked in
-their own docs:
+One related item is still partial and tracked in its own doc:
 
-- **Room auto-convene** — the trigger policy is stored and evaluated
-  (`evaluate_trigger_policy`), and `room_post_message` emits a `room_trigger`
-  notice + audit line on a matching `@mention`, but it does NOT yet queue an
-  agent turn for the mentioned participant, so no agent actually wakes up. See
-  `docs/OCEAN_ROOMS_COLLABORATION_MODEL.md` § "Mentions and triggers".
 - **Longhouse governance (quorum steps 6+)** — the convergence engine (steps
   1–5) is built and tested; the escrow trio (TitleRegistry + Revoker +
   validator escrow) and the unforgeable `claim_outcome` gate are stubbed. See
