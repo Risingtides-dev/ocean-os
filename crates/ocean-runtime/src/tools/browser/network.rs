@@ -81,6 +81,9 @@ impl AgentTool for BrowserCapturedRequestsTool {
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
         let reqs = self.ctx.lazy.get().await?.captured_requests().await;
         let json = serde_json::to_string(&reqs).map_err(|e| e.to_string())?;
+        // Exempt from BrowserActivity: this reads the in-memory netcap buffer
+        // (no CDP round-trip). The capture that populated it already flagged
+        // activity, so listing the buffer is bookkeeping, not browser work.
         Ok(AgentToolResult::text(json))
     }
 }
@@ -125,6 +128,9 @@ impl AgentTool for BrowserResponseBodyTool {
             .response_body(request_id)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(AgentToolResult::text(body))
+        // Live browser action: fetching a body issues a CDP
+        // `Network.getResponseBody` against the active page, so it engages the
+        // live browser and must flag activity for the side-panel handoff.
+        Ok(active_result(body))
     }
 }

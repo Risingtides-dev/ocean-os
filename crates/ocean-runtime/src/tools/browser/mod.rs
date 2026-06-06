@@ -1,7 +1,20 @@
 //! Agent-facing browser tools. Thin wrappers over `ocean_browser::BrowserHandle`.
-//! Every tool is permission-gated (except read-only perception/inspect) and
-//! emits a `BrowserActivity { active: true }` side-effect so the daemon can
-//! drive the side-panel handoff.
+//!
+//! **Permission contract:** actuation tools (navigate, click, type, key, eval_js,
+//! tab open/switch/close, capture start, enable-downloads) are permission-gated.
+//! Read-only perception/inspect (read_page, screenshot, console, network, scroll)
+//! and the read-only shell listers are permission-free.
+//!
+//! **BrowserActivity contract:** every tool that performs a *live browser action*
+//! (a CDP round-trip to the running Chrome) emits a `BrowserActivity { active: true }`
+//! side-effect so the daemon can drive the side-panel handoff. This includes the
+//! read-only-but-live tools `browser_list_tabs` (enumerates tabs over CDP) and
+//! `browser_response_body` (issues `Network.getResponseBody`).
+//!
+//! Two tools are *exempt* because they read a purely in-memory buffer with no CDP
+//! round-trip — the live action that populated the buffer already flagged activity:
+//!   - `browser_captured_requests` (reads the netcap snapshot)
+//!   - `browser_downloads` (reads the download-tracking snapshot)
 
 pub mod downloads;
 pub mod input;

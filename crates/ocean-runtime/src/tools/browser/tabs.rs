@@ -14,7 +14,9 @@ use crate::types::{AgentTool, AgentToolResult};
 /// the agent's "what's open across the whole browser right now" — no permission
 /// needed, and it doesn't launch Chrome unless one is already running… (it does
 /// `.get()` which launches; listing tabs is a real browser action, unlike
-/// listing *tools*). Returns the structured BrowserContext as JSON.
+/// listing *tools*). Returns the structured BrowserContext as JSON. Because it
+/// round-trips to the live browser (CDP) it emits `BrowserActivity` for the
+/// side-panel handoff, even though it's read-only and permission-free.
 pub struct BrowserListTabsTool {
     pub ctx: BrowserToolCtx,
 }
@@ -45,7 +47,10 @@ impl AgentTool for BrowserListTabsTool {
             .await
             .map_err(|e| e.to_string())?;
         let json = serde_json::to_string(&ctx).map_err(|e| e.to_string())?;
-        Ok(AgentToolResult::text(json))
+        // Live browser action: enumerating tabs round-trips to CDP
+        // (snapshot_pages + per-page url/title), so it engages the live browser
+        // and must flag activity for the side-panel handoff.
+        Ok(active_result(json))
     }
 }
 

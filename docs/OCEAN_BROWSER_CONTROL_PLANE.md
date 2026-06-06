@@ -184,10 +184,14 @@ defer each until the phase that needs it:
 | `scripting` | Phase 5 | inject content scripts for direct DOM access |
 | `debugger` | driving the user's *real* Chrome | CDP attach to the user's logged-in browser |
 
-**Audit.** Browser tools already emit a `ToolSideEffect::BrowserActivity { active: true }`
-side-effect (`tools/browser/mod.rs:66`, `perceive.rs:66`) — but that is a *handoff/active flag*,
-not a record of what the agent did. As the plane gains power, extend this into a real per-action
-audit trail (which action, which tab, when).
+**Audit.** Every browser tool that performs a *live browser action* (a CDP round-trip)
+emits a `ToolSideEffect::BrowserActivity { active: true }` side-effect via the
+`active_result` helper in `tools/browser/mod.rs`. Two tools are deliberately exempt —
+`browser_captured_requests` and `browser_downloads` — because they read a purely in-memory
+buffer with no CDP round-trip (the live action that populated the buffer already flagged
+activity). Note this side-effect is a *handoff/active flag*, not a record of what the agent
+did. As the plane gains power, extend this into a real per-action audit trail (which action,
+which tab, when).
 
 **The daemon-Chrome vs. user-Chrome boundary is itself a security feature.** Driving an isolated
 Chrome-for-Testing profile means the agent never touches the user's logged-in real Chrome — small

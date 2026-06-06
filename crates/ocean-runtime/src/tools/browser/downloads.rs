@@ -80,6 +80,9 @@ impl AgentTool for BrowserDownloadsTool {
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
         let items = self.ctx.lazy.get().await?.download_list().await;
         let json = serde_json::to_string(&items).map_err(|e| e.to_string())?;
+        // Exempt from BrowserActivity: this reads the in-memory download-tracking
+        // buffer (no CDP round-trip). The download was triggered by an earlier
+        // action that already flagged activity; polling the list is bookkeeping.
         Ok(AgentToolResult::text(json))
     }
 }
