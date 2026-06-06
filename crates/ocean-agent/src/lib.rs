@@ -2974,6 +2974,55 @@ You are speaking through the Ocean TUI. The user sees a terminal interface with 
 Do not use `component_render`, `component_wait`, web widgets, Leptos component assumptions, maps, dashboards, forms, or HTML-oriented UI unless the user explicitly asks for a protocol test. Prefer short markdown, file paths, command output summaries, and state updates that fit a terminal transcript.
 "#;
 
+    const SLACK_SURFACE_PROMPT: &str = r#"
+## Ocean Slack surface UX
+
+You are an Ocean assistant living **inside** a Slack workspace. You were mentioned in a thread, DMed, or addressed in a channel, and you reply back in that same place. Slack is the room you're standing in — behave like a sharp, present teammate in that room, not a bot pasting output into it.
+
+**Where you reply:** every turn arrives from a thread, a DM, or a channel mention. Always reply in the *same context* — a threaded message stays in its thread, a DM stays in the DM; never break a threaded conversation out into the channel root. Treat the thread as the unit of memory: one thread = one ongoing task; don't restate what's already established in it. Assume you're often read on a phone, in passing — lead with the answer.
+
+**Style — Slack-native:** be concise. Slack is chat, not a document. A good reply is one to four short paragraphs or a tight list, not an essay with headings. Front-load the takeaway: first line is the answer or the status; caveats and next steps come after, only if they earn their place. Compose the whole reply and send it once — don't dribble out five messages. Match the room's register (relaxed in an internal channel, tighter in a client-facing one). Emoji are punctuation, not decoration — a ✅ for done, 👀 for "on it", ⚠️ for a risk, used sparingly.
+
+**Format — Slack mrkdwn, NOT Markdown.** Slack does not render standard Markdown:
+- **Bold** is `*single asterisks*`, _italic_ is `_underscores_`, strikethrough is `~tildes~`. Never use `**double asterisks**` — Slack shows the literal stars.
+- No Markdown headings (`#`, `##`) — they render as literal hashes. Use a **bold lead-in line** instead.
+- No Markdown tables — pipe-and-dash renders as raw text. Use a short bulleted or `key: value` list, or render a canvas for anything tabular/large.
+- Lists: plain `•` or `-`, kept shallow (mobile flattens deep nesting). Inline `code` and triple-backtick fences are fine; don't dump long logs inline.
+- Links: prefer `<https://url|readable label>` over naked URLs. @-mention a person only when you genuinely need their eyes; never @-here/@-channel unless explicitly asked.
+
+When in doubt about rendering, prefer plain text with a bold lead-in over rich syntax that might leak literal characters into the channel.
+
+**When to use a Slack Canvas:** render into a canvas (the `surface-canvas` surface) instead of a message when the content is too big or structured to read inline — a gallery, a status/queue board, a multi-row table, a long structured summary, or anything the operator will want to revisit or share. Keep it inline for direct answers, short status, confirmations, or a link or two. When you create or update a canvas, also post a short one-line message in-thread pointing at it — never drop a canvas silently. Prefer appending to an existing canvas over overwriting one someone may be mid-review on.
+
+**Safety on Slack:** act only on inbound turns — never auto-post on startup, connect, or a schedule of your own. Confirm before anything irreversible or wide-reach (posting into a new channel, @-channel/@-here, deleting a canvas or message, anything client-visible); routine in-thread replies need no confirmation, so be fast there. Stay in your lane — use only the tools your profile grants, and say so plainly if a request needs a capability you don't have. Never paste secrets, tokens, raw credentials, or internal IDs into a channel.
+"#;
+
+    const CANVAS_SURFACE_PROMPT: &str = r#"
+## Ocean canvas surface UX
+
+You are rendering onto a **canvas** — a rich, persistent surface (a Slack Canvas or equivalent) meant to hold an *artifact*, not a conversation. The canvas is for output someone will scroll, revisit, and share; the chat thread is for the conversation around it.
+
+**Reach for the canvas when** the content is a gallery of generated media, a status/queue board, a multi-row table, a long structured summary, or anything large or structured enough that it reads badly inline. **Keep it in the message** when it's a direct answer, a short status, a confirmation, or a link or two — don't canvas a one-liner.
+
+**Always pair the canvas with a message.** When you create or update a canvas, post a short one-line note in the originating thread — context plus the canvas reference ("Updated the gallery canvas 👆 — 6 new clips."). Never drop or mutate a canvas silently; the thread must stay readable on its own.
+
+**Prefer append over overwrite.** For an ongoing task, update or extend the existing canvas rather than blowing it away — someone may be mid-review on it. Append-only is the safer default; destructive rewrites need a reason and usually a confirmation.
+
+**Structure for scanning.** Canvases tolerate more structure than a Slack message — headings, sections, and tables are appropriate here. Organize so the most important state is at the top and the artifact stays self-explanatory when revisited later out of context. Drive canvas create/update through the surface's tools, not by hand; never leak secrets or internal IDs into a shared canvas.
+"#;
+
+    const MOBILE_SURFACE_PROMPT: &str = r#"
+## Ocean mobile surface UX
+
+You are speaking through the **Ocean mobile app** — a compact, on-the-go screen. Assume the reply is read on a phone, one-handed, in passing, and possibly half-listened-to or read aloud.
+
+**Be short and answer-first.** Lead with the answer or the status in the first line; one to three short sentences is the default. Detail, caveats, and next steps come only if they earn their place — offer to expand rather than dumping everything. No long preambles, no thinking out loud.
+
+**Keep it readable on a small screen.** Short paragraphs and shallow bullet lists only; avoid wide tables, dense code blocks, long file paths, and anything that forces horizontal scrolling. Speak plainly — favor wording that survives being read aloud, since mobile is often a hands-busy context adjacent to voice. Don't lean on heavy visual components or rich widgets the compact surface can't show well.
+
+**Confirm consequential actions in one line.** Real or irreversible actions still get a quick read-back before you act, but keep it tight — a single confirming sentence, not a form. Routine answers need no ceremony; be fast. Never paste secrets or internal IDs into the reply.
+"#;
+
     fn web_surface_prompt(prompt: &str, client_label: &str) -> String {
         format!(
             "{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**. Responses render as HTML with rich interactive Leptos components, inline images, and live UI.\n\n{WEB_SURFACE_COMPONENT_PROMPT}\n"
@@ -3132,23 +3181,41 @@ is the user's real, signed-in browser session.\n\n\
             Some("surface-native") => gpui_surface_prompt(prompt, "Ocean native surface"),
             Some("cli") => cli_surface_prompt(prompt),
             Some("leo-voice") => voice_surface_prompt(prompt),
-            // Slack / Canvas / Mobile are first-class now (ocean-agents R3): the
-            // Slack assistant is being built downstream, so the runtime arms
-            // exist ahead of the inbound path. Content is a stub today (base
-            // prompt + surface label); it evolves into a file-loaded profile.
-            Some("surface-slack") => stub_surface_prompt(prompt, "Slack (Ocean assistant in a Slack workspace)"),
-            Some("surface-canvas") => stub_surface_prompt(prompt, "a Slack Canvas surface"),
-            Some("surface-mobile") => stub_surface_prompt(prompt, "the Ocean mobile app"),
+            // Slack / Canvas / Mobile are first-class now (ocean-agents R3).
+            // These are the daemon-side compiled fallbacks — real, surface-aware
+            // profiles, not bare-label stubs. A file-loaded `assistants/<DIR>`
+            // profile (resolved above) overrides them when present; this is what
+            // the runtime falls back to when no on-disk profile exists. They
+            // mirror the shape and intent of the authored ocean-agents profiles
+            // (`assistants/SLACK/system.md` et al.).
+            Some("surface-slack") => slack_surface_prompt(prompt),
+            Some("surface-canvas") => canvas_surface_prompt(prompt),
+            Some("surface-mobile") => mobile_surface_prompt(prompt),
             Some(other) => format!("{prompt}\n\n## Current client\n\nYou are speaking through an unknown client: `{other}`.\n"),
             None => prompt.to_string(),
         }
     }
 
-    /// Minimal per-surface prompt for surfaces whose full profile hasn't been
-    /// authored yet. Seed only — replaced by a file-loaded `assistants/<DIR>`
-    /// profile when Fix 5's file path lands.
-    fn stub_surface_prompt(prompt: &str, client_label: &str) -> String {
-        format!("{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**.\n")
+    /// Slack surface — an Ocean assistant living *inside* a Slack workspace,
+    /// replying in threads/DMs/channels. Compiled fallback mirroring the
+    /// authored `assistants/SLACK/system.md` house profile (R3): concise,
+    /// thread-aware, Slack-mrkdwn-aware, canvas-aware. Overridden by a
+    /// file-loaded SLACK profile when one exists on disk.
+    fn slack_surface_prompt(prompt: &str) -> String {
+        format!("{prompt}\n\n## Current client\n\n{SLACK_SURFACE_PROMPT}\n")
+    }
+
+    /// Canvas surface — rich, persistent artifact rendering (a Slack Canvas or
+    /// equivalent canvas surface) paired with an in-thread message. Compiled
+    /// fallback; overridden by a file-loaded CNVS profile when present.
+    fn canvas_surface_prompt(prompt: &str) -> String {
+        format!("{prompt}\n\n## Current client\n\n{CANVAS_SURFACE_PROMPT}\n")
+    }
+
+    /// Mobile surface — a compact, on-the-go screen read in passing. Compiled
+    /// fallback; overridden by a file-loaded MOBL profile when present.
+    fn mobile_surface_prompt(prompt: &str) -> String {
+        format!("{prompt}\n\n## Current client\n\n{MOBILE_SURFACE_PROMPT}\n")
     }
 
     #[cfg(test)]
@@ -3157,6 +3224,33 @@ is the user's real, signed-in browser session.\n\n\
             build_system_prompt, load_surface_profile_from, surface_dir, surface_flag,
         };
         use std::path::Path;
+
+        /// RAII guard that pins a process-global env var for the duration of a
+        /// test and restores the prior value on drop. Used to isolate
+        /// `build_system_prompt` from on-disk surface-profile overrides
+        /// (`OCEAN_ASSISTANTS_DIR`) so the compiled fallback is the path under
+        /// test, without leaking the override into other tests.
+        struct EnvVarGuard {
+            key: &'static str,
+            prior: Option<std::ffi::OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prior = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, prior }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match self.prior.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
 
         #[test]
         fn file_loaded_surface_profile_wins_over_const() {
@@ -3223,6 +3317,68 @@ is the user's real, signed-in browser session.\n\n\
                     "{ct} must have a real surface arm, not the fallthrough"
                 );
                 assert!(prompt.contains("## Current client"));
+            }
+        }
+
+        /// OCEAN-173: slack / canvas / mobile must get *real* surface-aware
+        /// profiles, not the old bare-label stub (base prompt + "You are
+        /// speaking through **<label>**."). Each must carry genuine,
+        /// surface-specific guidance, and must not bleed another surface's UX.
+        #[test]
+        fn slack_canvas_mobile_get_real_profiles_not_stub() {
+            // This test asserts against the COMPILED FALLBACK profiles
+            // (SLACK/CNVS/MOBL consts). But `build_system_prompt` resolves an
+            // on-disk `assistants/<DIR>/system.md` first via
+            // `load_surface_profile` → `assistants_root()`, which honors
+            // `OCEAN_ASSISTANTS_DIR` (else ~/.config/ocean-rs/assistants). In
+            // any dev/CI env that has a real SLACK/CNVS/MOBL profile on disk
+            // (or with OCEAN_ASSISTANTS_DIR pointed at temp profiles), that
+            // file would shadow the consts under test and these assertions
+            // would check external content instead — wrong/flaky. Pin
+            // OCEAN_ASSISTANTS_DIR to a guaranteed-nonexistent root so
+            // `load_surface_profile` finds nothing and the const fallback is
+            // the path actually exercised — the same nonexistent-root idiom as
+            // `missing_profile_root_falls_back_to_const`.
+            let _guard = EnvVarGuard::set(
+                "OCEAN_ASSISTANTS_DIR",
+                "/nonexistent/ocean/assistants/root",
+            );
+
+            let slack = build_system_prompt(None, Some("surface-slack"));
+            // Slack-native: thread-aware, concise, mrkdwn-not-Markdown, canvas-aware.
+            assert!(slack.contains("Slack surface UX"));
+            assert!(slack.contains("thread"));
+            assert!(slack.contains("Slack mrkdwn"));
+            assert!(slack.contains("single asterisks"));
+            assert!(slack.contains("Slack Canvas"));
+            assert!(slack.contains("act only on inbound turns"));
+            // Not the old stub one-liner, and not a web/HTML surface.
+            assert!(!slack.contains("Responses render as HTML"));
+
+            let canvas = build_system_prompt(None, Some("surface-canvas"));
+            assert!(canvas.contains("canvas surface UX"));
+            assert!(canvas.contains("artifact"));
+            assert!(canvas.contains("append over overwrite"));
+            assert!(canvas.contains("pair the canvas with a message"));
+
+            let mobile = build_system_prompt(None, Some("surface-mobile"));
+            assert!(mobile.contains("mobile surface UX"));
+            assert!(mobile.contains("phone"));
+            assert!(mobile.contains("answer-first"));
+            assert!(mobile.contains("small screen"));
+
+            // None of the three may be the bare-label stub: the stub had no
+            // surface-specific "UX" section beyond the `## Current client`
+            // header, so a real profile must add a dedicated guidance section.
+            for (ct, p) in [
+                ("surface-slack", &slack),
+                ("surface-canvas", &canvas),
+                ("surface-mobile", &mobile),
+            ] {
+                assert!(
+                    p.contains("surface UX"),
+                    "{ct} must carry a real surface-UX section, not a bare label"
+                );
             }
         }
 
