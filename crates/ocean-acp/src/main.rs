@@ -906,7 +906,8 @@ fn event_session_id(event: &ocean_agent_sdk::AgentTurnEvent) -> Option<String> {
         | E::SessionCreated { session_id, .. }
         | E::ComponentRender { session_id, .. }
         | E::ComponentUnmount { session_id, .. }
-        | E::BrowserActivity { session_id, .. } => session_id.0.to_string(),
+        | E::BrowserActivity { session_id, .. }
+        | E::SurfacePatch { session_id, .. } => session_id.0.to_string(),
         E::Extension { .. } => return None,
     };
     Some(id)

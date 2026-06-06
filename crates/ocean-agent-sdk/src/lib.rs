@@ -465,6 +465,24 @@ pub enum AgentTurnEvent {
         session_id: AgentSessionId,
         active: bool,
     },
+    /// The agent applied one or more validated patches to a canvas surface
+    /// (GPUI Masterbuild Slice 3). Each patch is carried as a fully-stamped
+    /// [`SurfacePatchEnvelope`] (session/surface/canvas/actor/timestamp) so the
+    /// GPUI canvas (Slice 6) can apply it to the active session's ledger without
+    /// re-deriving routing context. Scoped to `session_id` like every other
+    /// session-bearing event, so a second session never receives another
+    /// session's patches.
+    ///
+    /// [`SurfacePatchEnvelope`]: crate::surface::SurfacePatchEnvelope
+    SurfacePatch {
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+        /// The canvas these patches target. Mirrors each envelope's
+        /// `canvas_id`; surfaced at the top level for cheap routing.
+        canvas_id: crate::surface::CanvasId,
+        /// The applied patches, each stamped into a routing/persistence envelope.
+        patches: Vec<crate::surface::SurfacePatchEnvelope>,
+    },
     /// Catch-all for unexpected or extension events (e.g. Longhouse council
     /// events). Includes the raw payload and an optional session scope.
     ///
@@ -509,7 +527,8 @@ impl AgentTurnEvent {
             | AgentTurnEvent::SessionCreated { session_id, .. }
             | AgentTurnEvent::ComponentRender { session_id, .. }
             | AgentTurnEvent::ComponentUnmount { session_id, .. }
-            | AgentTurnEvent::BrowserActivity { session_id, .. } => Some(*session_id),
+            | AgentTurnEvent::BrowserActivity { session_id, .. }
+            | AgentTurnEvent::SurfacePatch { session_id, .. } => Some(*session_id),
             AgentTurnEvent::Extension { scope, .. } => *scope,
         }
     }
@@ -1007,6 +1026,22 @@ mod tests {
                 session_id: sid,
                 active: true,
             },
+            AgentTurnEvent::SurfacePatch {
+                session_id: sid,
+                turn_id: tid,
+                canvas_id: crate::surface::CanvasId::new("canvas:main"),
+                patches: vec![crate::surface::SurfacePatchEnvelope {
+                    patch_id: crate::surface::PatchId::new("patch-1"),
+                    session_id: sid,
+                    surface_id: crate::surface::SurfaceId::new("gpui:local"),
+                    canvas_id: crate::surface::CanvasId::new("canvas:main"),
+                    actor: crate::surface::ActorRef::agent(None),
+                    created_at_ms: 1234,
+                    patch: crate::surface::SurfacePatch::Select {
+                        ids: vec![crate::surface::ComponentId::new("c-1")],
+                    },
+                }],
+            },
             // Session-scoped Extension: behaves like any session-bearing event.
             AgentTurnEvent::Extension {
                 extension: "longhouse".into(),
@@ -1031,6 +1066,7 @@ mod tests {
                 | AgentTurnEvent::ComponentRender { .. }
                 | AgentTurnEvent::ComponentUnmount { .. }
                 | AgentTurnEvent::BrowserActivity { .. }
+                | AgentTurnEvent::SurfacePatch { .. }
                 | AgentTurnEvent::Extension { .. } => {}
             }
         }

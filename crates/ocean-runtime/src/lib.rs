@@ -15,7 +15,8 @@ pub mod types;
 
 pub use agent_loop::{run_agent, run_agent_with_history, AgentRun};
 pub use fake_tool_provider::{
-    FakeToolProvider, FAKE_TOOL_CALL_ID, FAKE_TOOL_CONTENT, FAKE_TOOL_MODEL, FAKE_TOOL_TARGET_PATH,
+    FakeToolProvider, FAKE_SURFACE_CALL_ID, FAKE_SURFACE_CANVAS_ID, FAKE_SURFACE_MODEL,
+    FAKE_TOOL_CALL_ID, FAKE_TOOL_CONTENT, FAKE_TOOL_MODEL, FAKE_TOOL_TARGET_PATH,
 };
 pub use capability::{
     BuiltinProvider, CapabilityProvider, CapabilityRegistry, ProviderHealth, SessionContext,

@@ -324,9 +324,14 @@ impl AgentRuntime {
         // gate and run a *real* tool, so it routes through `run_prompt` like a
         // real provider — only with a deterministic `FakeToolProvider` injected
         // (no network, no key) that emits one `write` tool call.
+        // The OCEAN-150 `fake-surface` variant likewise drives the real loop (it
+        // emits a `surface_patch` tool call so the daemon's SurfacePatch SSE
+        // bridge can be exercised end to end), so it routes through `run_prompt`.
         let is_fake = snapshot.provider_config.selection.provider == ProviderId::Fake;
-        let is_fake_tool = is_fake && snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL;
-        let result = if is_fake && !is_fake_tool {
+        let is_fake_real_loop = is_fake
+            && (snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL
+                || snapshot.model.id == ocean_runtime::FAKE_SURFACE_MODEL);
+        let result = if is_fake && !is_fake_real_loop {
             self.run_fake_prompt(req.clone(), control, snapshot).await
         } else {
             self.run_prompt(req.clone(), control, snapshot).await
@@ -714,6 +719,16 @@ impl AgentRuntime {
         {
             cfg = cfg.with_provider(std::sync::Arc::new(
                 ocean_runtime::FakeToolProvider::new(),
+            ));
+        }
+        // OCEAN-150: the keyless `fake-surface` model scripts one `surface_patch`
+        // tool call through the same seam, so the daemon SurfacePatch SSE bridge
+        // can be live-tested over HTTP with no key.
+        if snapshot.provider_config.selection.provider == ProviderId::Fake
+            && snapshot.model.id == ocean_runtime::FAKE_SURFACE_MODEL
+        {
+            cfg = cfg.with_provider(std::sync::Arc::new(
+                ocean_runtime::FakeToolProvider::surface(),
             ));
         }
 

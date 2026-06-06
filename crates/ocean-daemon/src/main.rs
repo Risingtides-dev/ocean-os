@@ -3925,6 +3925,39 @@ async fn agent_turn(
                         active,
                     });
                 }
+                AgentEvent::SurfacePatch {
+                    canvas_id, patches, ..
+                } => {
+                    // Slice 3: stamp each validated patch into a
+                    // `SurfacePatchEnvelope` carrying the routing/persistence
+                    // context (session/surface/canvas/actor/timestamp), then
+                    // relay onto `/v1/agent/events`. The event carries this
+                    // turn's `bridge_session_id`, so the SSE filter scopes it to
+                    // the originating session — a second session never sees it.
+                    use ocean_agent_sdk::surface::{
+                        ActorRef, CanvasId, PatchId, SurfaceId, SurfacePatchEnvelope,
+                    };
+                    let canvas = CanvasId::new(canvas_id);
+                    let created_at_ms = ocean_protocol::now_ms();
+                    let envelopes: Vec<SurfacePatchEnvelope> = patches
+                        .into_iter()
+                        .map(|patch| SurfacePatchEnvelope {
+                            patch_id: PatchId::new(Uuid::new_v4().to_string()),
+                            session_id: bridge_session_id,
+                            surface_id: SurfaceId::new("gpui:local"),
+                            canvas_id: canvas.clone(),
+                            actor: ActorRef::agent(None),
+                            created_at_ms,
+                            patch,
+                        })
+                        .collect();
+                    bridge_bus.emit(AgentTurnEvent::SurfacePatch {
+                        session_id: bridge_session_id,
+                        turn_id: bridge_turn_id,
+                        canvas_id: canvas,
+                        patches: envelopes,
+                    });
+                }
                 _ => {}
             }
         }
@@ -4580,6 +4613,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
         AgentTurnEvent::ComponentRender { .. } => None,
         AgentTurnEvent::ComponentUnmount { .. } => None,
         AgentTurnEvent::BrowserActivity { .. } => None,
+        AgentTurnEvent::SurfacePatch { .. } => None,
     }
 }
 
@@ -4597,6 +4631,7 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
         AgentTurnEvent::ComponentRender { .. } => "component_render",
         AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
         AgentTurnEvent::BrowserActivity { .. } => "browser_activity",
+        AgentTurnEvent::SurfacePatch { .. } => "surface_patch",
     }
 }
 
@@ -4789,6 +4824,113 @@ mod tests {
                 .any(|env| should_emit_agent_event(Some(mine), false, &env.event)
                     && matches!(&env.event, AgentTurnEvent::AssistantTextDelta { delta, .. } if delta == "other-secret")),
             "other session's event must never pass the scope filter on replay"
+        );
+    }
+
+    // ---- OCEAN-150 (Gate B): surface_patch is session-scoped ----
+
+    fn surface_patch_event(session_id: AgentSessionId, canvas: &str) -> AgentTurnEvent {
+        use ocean_agent_sdk::surface::{
+            ActorRef, CanvasComponentPatch, CanvasId, ComponentId, PatchId, SurfaceId, SurfacePatch,
+            SurfacePatchEnvelope,
+        };
+        let canvas_id = CanvasId::new(canvas);
+        let patch = SurfacePatch::UpsertComponent {
+            component: CanvasComponentPatch {
+                id: ComponentId::new("card-1"),
+                kind: "card".into(),
+                rect: None,
+                z_index: None,
+                content: json!({"title": "secret"}),
+                metadata: Value::Null,
+            },
+        };
+        AgentTurnEvent::SurfacePatch {
+            session_id,
+            turn_id: AgentTurnId::new_v4(),
+            canvas_id: canvas_id.clone(),
+            patches: vec![SurfacePatchEnvelope {
+                patch_id: PatchId::new(Uuid::new_v4().to_string()),
+                session_id,
+                surface_id: SurfaceId::new("gpui:local"),
+                canvas_id,
+                actor: ActorRef::agent(None),
+                created_at_ms: 0,
+                patch,
+            }],
+        }
+    }
+
+    #[test]
+    fn surface_patch_event_reports_its_session() {
+        // The new variant must carry its session id so the SSE filter can scope
+        // it — a None here would make it leak to `?all=1` only (or nowhere).
+        let sid = AgentSessionId::new_v4();
+        let ev = surface_patch_event(sid, "canvas:main");
+        assert_eq!(
+            ev.session_id(),
+            Some(sid),
+            "SurfacePatch must be session-scoped, not global"
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_patch_is_scoped_to_its_session() {
+        // Gate B: a surface_patch emitted for session A must reach A's scoped
+        // stream and MUST NOT reach an unrelated session B's scoped stream
+        // (cross-session isolation hardened by OCEAN-129 must not regress).
+        let a = AgentSessionId::new_v4();
+        let b = AgentSessionId::new_v4();
+        let ev = surface_patch_event(a, "canvas:main");
+
+        // A's scoped subscriber receives it.
+        assert!(
+            should_emit_agent_event(Some(a), false, &ev),
+            "the originating session must receive its own surface_patch"
+        );
+        // B's scoped subscriber does NOT.
+        assert!(
+            !should_emit_agent_event(Some(b), false, &ev),
+            "an unrelated session must NOT receive another session's surface_patch"
+        );
+        // A session-less (non-`?all=1`) subscriber does NOT (session-bearing
+        // event requires the firehose opt-in).
+        assert!(
+            !should_emit_agent_event(None, false, &ev),
+            "session-bearing surface_patch needs ?all=1 to reach the firehose"
+        );
+        // The `?all=1` firehose does receive it.
+        assert!(
+            should_emit_agent_event(None, true, &ev),
+            "the ?all=1 firehose receives session-bearing events"
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_patch_replay_respects_session_scope() {
+        // The replay path must apply the same scope filter so a reconnecting
+        // session B can never be handed A's buffered surface_patch.
+        let bus = AgentEventBus::new(64);
+        let a = AgentSessionId::new_v4();
+        let b = AgentSessionId::new_v4();
+
+        bus.emit(delta_event(b, "b-anchor"));
+        let anchor = {
+            let h = bus.history.lock().unwrap();
+            h.back().unwrap().id
+        };
+        bus.emit(surface_patch_event(a, "canvas:main"));
+        bus.emit(delta_event(b, "b-after"));
+
+        let (replay, _rx) = bus.subscribe_with_replay(Some(anchor));
+        // B's scoped replay sees only B's text, never A's surface_patch.
+        let leaked_patch = replay
+            .iter()
+            .any(|env| should_emit_agent_event(Some(b), false, &env.event)
+                && matches!(&env.event, AgentTurnEvent::SurfacePatch { .. }));
+        assert!(
+            !leaked_patch,
+            "session B's replay must never include session A's surface_patch"
         );
     }
 
