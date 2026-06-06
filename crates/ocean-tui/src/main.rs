@@ -34,7 +34,7 @@ use ocean_core::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -1036,8 +1036,8 @@ impl DaemonApp {
     fn room_lines(&self, width: usize) -> Vec<Line<'static>> {
         if self.active_room.runtime_room_id().is_none() {
             return vec![
-                Line::from(format!("{} placeholder", self.active_room.label())),
-                Line::from("runtime projection available for F1-F4 only"),
+                Line::from(format!("{} — coming soon", self.active_room.label())),
+                Line::from("runtime projection available for Orchestrator / Writers / Rev / PM"),
             ];
         }
 
@@ -1135,10 +1135,10 @@ impl DaemonApp {
             }
             WorkspaceRoom::TideDash | WorkspaceRoom::WorkOps | WorkspaceRoom::WorldMap => vec![
                 Line::from(format!(
-                    "{} intentionally read-only placeholder",
+                    "{} — coming soon (read-only placeholder)",
                     self.active_room.label()
                 )),
-                Line::from("runtime projection defined only for F1-F4"),
+                Line::from("runtime projection lands with the room's dedicated primitives"),
             ],
         }
     }
@@ -1545,15 +1545,16 @@ enum WorkspaceRoom {
 }
 
 impl WorkspaceRoom {
+    /// Tab/room label. Matches the mockup tab bar in docs/OCEAN_TUI_MOCKUPS.md §1.
     fn label(self) -> &'static str {
         match self {
-            Self::PM => "PM",
-            Self::Writers => "Writers Room",
-            Self::Orchestrator => "ORCH + MESH",
-            Self::Rev => "Review Room",
+            Self::Orchestrator => "Orchestrator",
+            Self::Writers => "Writers",
+            Self::Rev => "Rev",
             Self::TideDash => "TideDash",
             Self::WorkOps => "WorkOps",
             Self::WorldMap => "WorldMap",
+            Self::PM => "PM",
         }
     }
 
@@ -1576,51 +1577,53 @@ impl WorkspaceRoom {
         })
     }
 
+    // Room/tab order follows docs/OCEAN_TUI_MOCKUPS.md §1:
+    // F1 Orchestrator · F2 Writers · F3 Rev · F4 TideDash · F5 WorkOps · F6 WorldMap · F7 PM
     fn all() -> [Self; 7] {
         [
-            Self::PM,
-            Self::Writers,
             Self::Orchestrator,
+            Self::Writers,
             Self::Rev,
             Self::TideDash,
             Self::WorkOps,
             Self::WorldMap,
+            Self::PM,
         ]
     }
 
     fn next(self) -> Self {
         match self {
-            Self::PM => Self::Writers,
-            Self::Writers => Self::Orchestrator,
-            Self::Orchestrator => Self::Rev,
+            Self::Orchestrator => Self::Writers,
+            Self::Writers => Self::Rev,
             Self::Rev => Self::TideDash,
             Self::TideDash => Self::WorkOps,
             Self::WorkOps => Self::WorldMap,
             Self::WorldMap => Self::PM,
+            Self::PM => Self::Orchestrator,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::PM => Self::WorldMap,
-            Self::Writers => Self::PM,
-            Self::Orchestrator => Self::Writers,
-            Self::Rev => Self::Orchestrator,
+            Self::Orchestrator => Self::PM,
+            Self::Writers => Self::Orchestrator,
+            Self::Rev => Self::Writers,
             Self::TideDash => Self::Rev,
             Self::WorkOps => Self::TideDash,
             Self::WorldMap => Self::WorkOps,
+            Self::PM => Self::WorldMap,
         }
     }
 
     fn from_function_key(code: KeyCode) -> Option<Self> {
         match code {
-            KeyCode::F(1) => Some(Self::PM),
+            KeyCode::F(1) => Some(Self::Orchestrator),
             KeyCode::F(2) => Some(Self::Writers),
-            KeyCode::F(3) => Some(Self::Orchestrator),
-            KeyCode::F(4) => Some(Self::Rev),
-            KeyCode::F(5) => Some(Self::TideDash),
-            KeyCode::F(6) => Some(Self::WorkOps),
-            KeyCode::F(7) => Some(Self::WorldMap),
+            KeyCode::F(3) => Some(Self::Rev),
+            KeyCode::F(4) => Some(Self::TideDash),
+            KeyCode::F(5) => Some(Self::WorkOps),
+            KeyCode::F(6) => Some(Self::WorldMap),
+            KeyCode::F(7) => Some(Self::PM),
             _ => None,
         }
     }
@@ -4609,7 +4612,7 @@ fn count_agents(agents: &[AgentView]) -> AgentCounts {
 fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     let area = frame.area();
     let outer = Block::default()
-        .title("F1 PM")
+        .title("F7 PM")
         .borders(Borders::ALL)
         .border_style(
             Style::default()
@@ -4635,7 +4638,22 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     if approvals_h > 0 {
         draw_approvals_panel(frame, layout[0], app);
     }
-    let transcript_area = layout[1];
+
+    // Per docs/OCEAN_TUI_MOCKUPS.md §1, the PM workspace shows the structured
+    // Tool Timeline / Diffs / Event Rail alongside the transcript. On wide
+    // terminals we split a support column off the right; on narrow terminals the
+    // transcript keeps the full width and the inline tool blocks carry the load.
+    let body_area = layout[1];
+    let transcript_area = if body_area.width >= 110 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(60), Constraint::Length(38)])
+            .split(body_area);
+        draw_pm_support_column(frame, cols[1], app);
+        cols[0]
+    } else {
+        body_area
+    };
     // Inset 2 cols on each side for breathing room.
     let inset = ratatui::layout::Rect {
         x: transcript_area.x + 2,
@@ -4687,6 +4705,57 @@ fn draw_pm_agent_ui(frame: &mut ratatui::Frame<'_>, app: &DaemonApp) {
     frame.render_widget(
         Paragraph::new(pm_agent_input_lines(app, input_height as usize)).wrap(Wrap { trim: false }),
         layout[3],
+    );
+}
+
+/// PM-room support column: Tool Timeline / Diffs / Event Rail stacked as their
+/// own bordered panes alongside the transcript, mirroring docs/OCEAN_TUI_MOCKUPS.md
+/// §1. These render the same SSE-fed data the inline tool blocks draw from, but
+/// in the structured, scan-at-a-glance form the mockup specifies.
+fn draw_pm_support_column(frame: &mut ratatui::Frame<'_>, area: Rect, app: &DaemonApp) {
+    frame.render_widget(Clear, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ])
+        .split(area);
+
+    let pane = |frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'static>>| {
+        let inner_rows = area.height.saturating_sub(2) as usize;
+        let shown: Vec<Line<'static>> = lines.into_iter().take(inner_rows.max(1)).collect();
+        frame.render_widget(
+            Paragraph::new(shown)
+                .block(
+                    Block::default()
+                        .title(title.to_string())
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                )
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+    };
+
+    pane(
+        frame,
+        rows[0],
+        "Tool Timeline",
+        app.tool_timeline_lines(rows[0].height.saturating_sub(2).max(1) as usize),
+    );
+    pane(
+        frame,
+        rows[1],
+        "Diffs / Edits",
+        app.diff_lines(rows[1].height.saturating_sub(2).max(1) as usize),
+    );
+    pane(
+        frame,
+        rows[2],
+        "Event Rail",
+        app.event_lines(rows[2].height.saturating_sub(2).max(1) as usize),
     );
 }
 
@@ -5348,8 +5417,16 @@ fn workspace_status_lines(app: &DaemonApp, limit: usize) -> Vec<Line<'static>> {
 }
 
 fn daemon_footer(app: &DaemonApp) -> Paragraph<'static> {
+    // Derive the F-key legend from the single source of truth (WorkspaceRoom::all)
+    // so the footer can never drift from the actual tab order / key bindings.
+    let keys = WorkspaceRoom::all()
+        .iter()
+        .enumerate()
+        .map(|(idx, room)| format!("F{} {}", idx + 1, room.label()))
+        .collect::<Vec<_>>()
+        .join(" · ");
     Paragraph::new(format!(
-        "F1 PM · F2 Writers Room · F3 ORCH + MESH · F4 Review Room · F5 TideDash · F6 WorkOps · F7 WorldMap | Tab/Shift-Tab rooms | type anywhere | Ctrl-Q quit | Ctrl-R refresh | {}",
+        "{keys} | Tab/Shift-Tab rooms | type anywhere | Ctrl-Q quit | Ctrl-R refresh | {}",
         app.status
     ))
     .alignment(Alignment::Center)
@@ -6697,10 +6774,13 @@ mod tests {
 
     #[test]
     fn workspace_room_tabs_mark_active_room() {
+        // Tab order follows docs/OCEAN_TUI_MOCKUPS.md §1:
+        // F1 Orchestrator · F2 Writers · F3 Rev · F4 TideDash · F5 WorkOps · F6 WorldMap · F7 PM
         let line = workspace_room_tabs_line(WorkspaceRoom::Rev);
-        assert!(line.contains("[F4 Review Room]"));
-        assert!(line.contains("F1 PM"));
-        assert!(line.contains("F3 ORCH + MESH"));
+        assert!(line.contains("[F3 Rev]"));
+        assert!(line.contains("F1 Orchestrator"));
+        assert!(line.contains("F2 Writers"));
+        assert!(line.contains("F7 PM"));
     }
 
     #[test]
@@ -6708,17 +6788,28 @@ mod tests {
         let app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
         assert_eq!(app.active_room, WorkspaceRoom::PM);
 
-        let f3 = daemon_key_action(
+        // F1 now lands on the Orchestrator / mesh floor per the mockup tab order.
+        let f1 = daemon_key_action(
             &app,
             Event::Key(crossterm::event::KeyEvent::new(
-                KeyCode::F(3),
+                KeyCode::F(1),
                 KeyModifiers::NONE,
             )),
         );
         assert!(matches!(
-            f3,
+            f1,
             Some(Action::SelectRoom(WorkspaceRoom::Orchestrator))
         ));
+
+        // F7 jumps to the PM workspace.
+        let f7 = daemon_key_action(
+            &app,
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::F(7),
+                KeyModifiers::NONE,
+            )),
+        );
+        assert!(matches!(f7, Some(Action::SelectRoom(WorkspaceRoom::PM))));
     }
 
     #[test]
@@ -6798,11 +6889,13 @@ mod tests {
             action_tx,
         );
 
+        // Default lands on PM (F7); cycling forward wraps to Orchestrator (F1)
+        // under the mockup tab order.
         assert!(handle_daemon_action(&client, &mut state, Action::NextRoom));
         let UiMode::Daemon(app) = &state.mode else {
             panic!("expected daemon mode");
         };
-        assert_eq!(app.active_room, WorkspaceRoom::Writers);
+        assert_eq!(app.active_room, WorkspaceRoom::Orchestrator);
         assert_eq!(app.focus, FocusPane::Composer);
     }
 

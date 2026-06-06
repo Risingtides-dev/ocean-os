@@ -96,9 +96,9 @@ fn draw_room_tidedash(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
     draw_lines_pane(
         frame,
         area,
-        "TideDash",
+        "TideDash — coming soon",
         vec![
-            Line::from("TideDash python dashboard (provisional)"),
+            Line::from("TideDash campaign dashboard (placeholder · coming soon)"),
             Line::from("Campaigns        3 active"),
             Line::from("Deals            2 in progress"),
             Line::from("Pipeline         $48K"),
@@ -126,9 +126,9 @@ fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
     draw_lines_pane(
         frame,
         cols[0],
-        "python / ops board",
+        "WorkOps board — coming soon",
         vec![
-            Line::from("WorkOps board (provisional)"),
+            Line::from("WorkOps board (placeholder · coming soon)"),
             Line::from(crate::value_summary_line(
                 &unified.summary,
                 "ops_attention",
@@ -155,7 +155,7 @@ fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
 fn draw_room_worldmap(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
     let mesh = &app.support.mesh;
     let mut lines = vec![
-        Line::from("WorldMap python pane (provisional)"),
+        Line::from("WorldMap presence pane (placeholder · coming soon)"),
         Line::from(""),
         Line::from("UTC  14:32  ● Orchestrator  ● KNOX  ● BRICK"),
         Line::from("PST  06:32  ○ Charlotte     ○ Henry"),
@@ -181,7 +181,7 @@ fn draw_room_worldmap(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
             ))
         }));
     }
-    draw_lines_pane(frame, area, "WorldMap", lines);
+    draw_lines_pane(frame, area, "WorldMap — coming soon", lines);
 }
 
 fn draw_lines_pane(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'static>>) {

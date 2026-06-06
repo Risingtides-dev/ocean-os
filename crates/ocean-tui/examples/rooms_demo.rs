@@ -32,51 +32,52 @@ enum Room {
 }
 
 impl Room {
+    // Order matches docs/OCEAN_TUI_MOCKUPS.md §1 and the live TUI tab bar.
     fn label(self) -> &'static str {
         match self {
-            Self::PM => "PM",
-            Self::Writers => "Writers Room",
-            Self::Orchestrator => "ORCH + MESH",
-            Self::Rev => "Review Room",
+            Self::Orchestrator => "Orchestrator",
+            Self::Writers => "Writers",
+            Self::Rev => "Rev",
             Self::TideDash => "TideDash",
             Self::WorkOps => "WorkOps",
             Self::WorldMap => "WorldMap",
+            Self::PM => "PM",
         }
     }
 
     fn all() -> [Self; 7] {
         [
-            Self::PM,
-            Self::Writers,
             Self::Orchestrator,
+            Self::Writers,
             Self::Rev,
             Self::TideDash,
             Self::WorkOps,
             Self::WorldMap,
+            Self::PM,
         ]
     }
 
     fn next(self) -> Self {
         match self {
-            Self::PM => Self::Writers,
-            Self::Writers => Self::Orchestrator,
-            Self::Orchestrator => Self::Rev,
+            Self::Orchestrator => Self::Writers,
+            Self::Writers => Self::Rev,
             Self::Rev => Self::TideDash,
             Self::TideDash => Self::WorkOps,
             Self::WorkOps => Self::WorldMap,
             Self::WorldMap => Self::PM,
+            Self::PM => Self::Orchestrator,
         }
     }
 
     fn from_f(key: KeyCode) -> Option<Self> {
         match key {
-            KeyCode::F(1) => Some(Self::PM),
+            KeyCode::F(1) => Some(Self::Orchestrator),
             KeyCode::F(2) => Some(Self::Writers),
-            KeyCode::F(3) => Some(Self::Orchestrator),
-            KeyCode::F(4) => Some(Self::Rev),
-            KeyCode::F(5) => Some(Self::TideDash),
-            KeyCode::F(6) => Some(Self::WorkOps),
-            KeyCode::F(7) => Some(Self::WorldMap),
+            KeyCode::F(3) => Some(Self::Rev),
+            KeyCode::F(4) => Some(Self::TideDash),
+            KeyCode::F(5) => Some(Self::WorkOps),
+            KeyCode::F(6) => Some(Self::WorldMap),
+            KeyCode::F(7) => Some(Self::PM),
             _ => None,
         }
     }
