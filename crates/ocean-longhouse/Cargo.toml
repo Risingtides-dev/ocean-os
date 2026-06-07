@@ -32,6 +32,10 @@ uuid.workspace = true
 axum.workspace = true
 clap.workspace = true
 tracing-subscriber.workspace = true
+# Recursive directory scan for the skill index loader (prepare.rs). Already in
+# the dependency tree transitively; pinned here as a direct, intentional dep.
+walkdir = "2"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"
