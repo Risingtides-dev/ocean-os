@@ -156,6 +156,9 @@ impl AgentRuntime {
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         runtime.migrate_legacy_sessions();
+        // Bound on-disk session growth: prune session files past the TTL once
+        // at startup, off the hot turn path (OCEAN-209).
+        runtime.session_file_gc();
         Ok(runtime)
     }
 
@@ -486,6 +489,14 @@ impl AgentRuntime {
     /// One-shot legacy migration — safe to call repeatedly.
     pub fn migrate_legacy_sessions(&self) {
         session::migrate_legacy_sessions(&self.config_dir);
+    }
+
+    /// Prune on-disk session files older than `OCEAN_SESSION_TTL_DAYS` (default
+    /// 90; `0` disables). Run opportunistically at startup, off the hot turn
+    /// path, to bound disk growth on long-lived daemons (OCEAN-209). Returns
+    /// the number of files pruned.
+    pub fn session_file_gc(&self) -> usize {
+        session::session_file_gc(&self.config_dir)
     }
 
     pub fn session_detail(&self, id: SessionId) -> anyhow::Result<SessionDetail> {
@@ -1568,6 +1579,107 @@ mod session {
         }
     }
 
+    /// Env knob for the session-file TTL, in days. Default 90; `0` disables
+    /// pruning entirely. Read once per GC pass.
+    const SESSION_TTL_ENV: &str = "OCEAN_SESSION_TTL_DAYS";
+    const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
+
+    fn session_ttl_days() -> u64 {
+        match std::env::var(SESSION_TTL_ENV) {
+            Ok(v) => v.trim().parse().unwrap_or(DEFAULT_SESSION_TTL_DAYS),
+            Err(_) => DEFAULT_SESSION_TTL_DAYS,
+        }
+    }
+
+    /// Prune on-disk session files older than the configured TTL.
+    ///
+    /// Background: the store caps message *count* per session
+    /// (`MAX_SESSION_MESSAGES`) but never deleted old session *files*, so a
+    /// long-lived daemon accumulated `sessions/<workspace>/*.json` unbounded —
+    /// and [`list`] deserializes every one of them on each call, so the dir's
+    /// growth slows listing too. This is distinct from OCEAN-182's in-memory
+    /// per-session *lock* prune (that's the registry; this is the files).
+    ///
+    /// Age signal: file **mtime** via `metadata()`, not the persisted
+    /// `updated_ms`. mtime is cheaper (no read + JSON parse per file) and the
+    /// save path rewrites the file on every turn, so mtime tracks last-touch
+    /// faithfully. GC is opportunistic, but there's no reason to deserialize
+    /// thousands of files when a stat suffices.
+    ///
+    /// Safety: a file whose mtime is older than the TTL (default 90d) cannot
+    /// belong to an active session — an in-flight turn rewrites the file on
+    /// save, refreshing its mtime — so the TTL gate alone protects live
+    /// sessions. No need to consult the in-memory session/lock map.
+    ///
+    /// Returns the number of files pruned. Logs a single info summary when it
+    /// prunes anything; silent otherwise. Best-effort: I/O errors on individual
+    /// entries are skipped, never fatal — GC must never wedge startup.
+    pub fn session_file_gc(config_dir: &Path) -> usize {
+        let ttl_days = session_ttl_days();
+        if ttl_days == 0 {
+            return 0; // disabled
+        }
+        let ttl = std::time::Duration::from_secs(ttl_days * 24 * 60 * 60);
+        let now = std::time::SystemTime::now();
+        let root = sessions_dir(config_dir);
+
+        let mut pruned = 0usize;
+        let mut oldest_age: Option<std::time::Duration> = None;
+
+        // Walk one level of workspace buckets plus any loose top-level files.
+        let mut json_files: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Ok(bucket) = std::fs::read_dir(&path) {
+                        for f in bucket.flatten() {
+                            json_files.push(f.path());
+                        }
+                    }
+                } else {
+                    json_files.push(path);
+                }
+            }
+        }
+
+        for path in json_files {
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(mtime) else {
+                continue; // mtime in the future — leave it alone
+            };
+            if age > ttl {
+                if std::fs::remove_file(&path).is_ok() {
+                    pruned += 1;
+                    if oldest_age.map_or(true, |o| age > o) {
+                        oldest_age = Some(age);
+                    }
+                }
+            }
+        }
+
+        if pruned > 0 {
+            let oldest_days = oldest_age
+                .map(|d| d.as_secs() / (24 * 60 * 60))
+                .unwrap_or(0);
+            tracing::info!(
+                pruned,
+                oldest_age_days = oldest_days,
+                ttl_days,
+                "session_file_gc: pruned old session files"
+            );
+        }
+        pruned
+    }
+
     pub fn save(config_dir: &Path, session: &Session) -> anyhow::Result<PathBuf> {
         let dir = match session.workspace_root.as_deref() {
             Some(root) => workspace_dir(config_dir, root),
@@ -1854,6 +1966,92 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&path);
         path
+    }
+
+    /// RAII guard pinning a process-global env var for a test, restoring the
+    /// prior value on drop (OCEAN-173 idiom). Used here to isolate the
+    /// `OCEAN_SESSION_TTL_DAYS` reads in the session-GC tests so they don't
+    /// leak the override into other tests sharing the process env.
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Backdate a file's mtime by `days` so the GC sees it as aged.
+    fn backdate(path: &Path, days: u64) {
+        let when = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn session_file_gc_prunes_aged_files_keeps_recent() {
+        let config_dir = temp_config_dir("session-gc-prune");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+
+        // Two aged sessions, one fresh — all in real workspace buckets.
+        let mut old_a = session::Session::new(&model);
+        old_a.bind_workspace(Path::new("."));
+        let old_a_path = session::save(&config_dir, &old_a).unwrap();
+
+        let mut old_b = session::Session::new(&model);
+        old_b.bind_workspace(Path::new("."));
+        let old_b_path = session::save(&config_dir, &old_b).unwrap();
+
+        let mut recent = session::Session::new(&model);
+        recent.bind_workspace(Path::new("."));
+        let recent_path = session::save(&config_dir, &recent).unwrap();
+
+        // Backdate the two "old" files well past a 30-day TTL.
+        backdate(&old_a_path, 100);
+        backdate(&old_b_path, 45);
+
+        let _guard = EnvVarGuard::set("OCEAN_SESSION_TTL_DAYS", "30");
+        let pruned = session::session_file_gc(&config_dir);
+
+        assert_eq!(pruned, 2, "both aged files pruned");
+        assert!(!old_a_path.exists(), "100-day file deleted");
+        assert!(!old_b_path.exists(), "45-day file deleted");
+        assert!(recent_path.exists(), "fresh file kept");
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn session_file_gc_disabled_prunes_nothing() {
+        let config_dir = temp_config_dir("session-gc-disabled");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+
+        let mut ancient = session::Session::new(&model);
+        ancient.bind_workspace(Path::new("."));
+        let ancient_path = session::save(&config_dir, &ancient).unwrap();
+        backdate(&ancient_path, 10_000); // way past any default
+
+        let _guard = EnvVarGuard::set("OCEAN_SESSION_TTL_DAYS", "0");
+        let pruned = session::session_file_gc(&config_dir);
+
+        assert_eq!(pruned, 0, "TTL=0 disables pruning");
+        assert!(ancient_path.exists(), "nothing deleted when disabled");
+
+        let _ = std::fs::remove_dir_all(config_dir);
     }
 
     // OCEAN-115: an image attached to a turn must reach the FIRST user message
