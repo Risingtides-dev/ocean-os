@@ -444,15 +444,54 @@ fn parse_last_event_id(headers: &HeaderMap) -> Option<Uuid> {
 ///
 /// Read fresh on each turn (not cached) so an operator can flip it by restarting
 /// with a different env without code changes, and so tests can scope it.
+///
+/// This is ONLY the env layer. The effective per-turn posture is resolved by
+/// [`effective_yolo`], which layers the persisted operator default (OCEAN-YOLO)
+/// underneath the env — every live call site now uses `effective_yolo`, so this
+/// remains as the focused env-layer assertion target for tests.
+#[cfg(test)]
 fn yolo_enabled() -> bool {
-    matches!(
-        env::var("OCEAN_YOLO")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    yolo_env_pref().unwrap_or(false)
+}
+
+/// Parse the `OCEAN_YOLO` env var into an explicit preference: `Some(true)` /
+/// `Some(false)` for a recognized spelling, `None` when unset or unrecognized
+/// (so the caller falls through to the persisted setting). Recognizing the
+/// "off" spellings explicitly (not just "absent") is what lets `OCEAN_YOLO=0`
+/// OVERRIDE a persisted `true` for a session — the documented precedence.
+fn yolo_env_pref() -> Option<bool> {
+    match env::var("OCEAN_YOLO")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolve the effective YOLO posture for a turn, in precedence order:
+///
+///   1. `OCEAN_YOLO` env, if set to a recognized value (operator/CI override),
+///   2. the persisted operator default (OCEAN-YOLO — set once via
+///      `POST /v1/settings/yolo`, survives restarts),
+///   3. the built-in default: **off** (permission gating ON).
+///
+/// The per-request `req.yolo` flag (a client opting INTO yolo for one turn)
+/// sits ABOVE this whole chain and is applied at the call site (`req.yolo ||
+/// effective_yolo()`), so an explicit per-request opt-in always wins while
+/// absence falls through to env → persisted → off.
+///
+/// Default-off is the safety invariant: nothing configured ⇒ gated. This
+/// function only decides whether tools auto-approve; it does NOT touch the
+/// permission decision-token binding (OCEAN-185), which stays orthogonal.
+fn effective_yolo() -> bool {
+    if let Some(env_pref) = yolo_env_pref() {
+        return env_pref;
+    }
+    ocean_agent::load_yolo_pref(&ocean_agent::config_dir_from_env()).unwrap_or(false)
 }
 
 /// HTTP methods advertised in the CORS preflight (`Access-Control-Allow-Methods`).
@@ -696,6 +735,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
+        .route("/v1/settings/yolo", get(yolo_setting_get).post(yolo_setting_set))
         .route("/v1/component/event", post(component_event))
         .route("/v1/longhouse/demo", post(longhouse_demo))
         .route("/v1/longhouse/convene", post(longhouse_convene))
@@ -862,6 +902,8 @@ async fn root() -> Json<serde_json::Value> {
             "GET /v1/model",
             "POST /v1/model",
             "GET /v1/models",
+            "GET /v1/settings/yolo",
+            "POST /v1/settings/yolo",
             "POST /v1/component/event",
             "POST /v1/longhouse/demo",
             "POST /v1/longhouse/convene",
@@ -965,6 +1007,9 @@ async fn prompt(
 ) -> Json<ocean_core::PromptResponse> {
     let (request_id, cancel) =
         register_running_request(&state, &mut req, "prompt running", RequestState::Running).await;
+    // Precedence: an explicit per-request `yolo: true` forces the bypass on for
+    // this turn; otherwise fall through to env → persisted default → off.
+    req.yolo = req.yolo || effective_yolo();
     emit_user_message(&state.events, &req, request_id);
 
     let control = build_prompt_control(&state, request_id, req.session_id, req.yolo, cancel);
@@ -986,6 +1031,8 @@ async fn create_request(
     )
     .await;
     let session_id = req.session_id;
+    // Precedence: explicit per-request `yolo: true` wins; else env → persisted → off.
+    req.yolo = req.yolo || effective_yolo();
     emit_user_message(&state.events, &req, request_id);
 
     let control = build_prompt_control(&state, request_id, session_id, req.yolo, cancel);
@@ -1370,6 +1417,55 @@ async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
         "ok": true,
         "current": { "provider": provider, "model": model },
         "models": ocean_agent::known_models(),
+    }))
+}
+
+// ---- YOLO setting (OCEAN-YOLO) ---------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct YoloSetRequest {
+    /// The new persisted default. `true` opts into the permission-gating bypass
+    /// (tools auto-approve); `false` restores gated/safe.
+    enabled: bool,
+}
+
+/// `GET /v1/settings/yolo` — report the operator's persisted YOLO default and
+/// the *effective* posture (after env override), so a client can show both
+/// "your saved default" and "what's actually in force right now".
+///
+/// Mirrors `model_get`'s shape: `{ ok, persisted, effective, env_override }`.
+/// `persisted` is the saved personal default (null on first run); `effective`
+/// is what a turn would actually use via [`effective_yolo`]; `env_override`
+/// flags when `OCEAN_YOLO` is masking the persisted value.
+async fn yolo_setting_get() -> Json<serde_json::Value> {
+    let persisted = ocean_agent::load_yolo_pref(&ocean_agent::config_dir_from_env());
+    let env_override = yolo_env_pref();
+    Json(json!({
+        "ok": true,
+        "persisted": persisted,
+        "effective": effective_yolo(),
+        "env_override": env_override,
+    }))
+}
+
+/// `POST /v1/settings/yolo` — set + persist the operator's YOLO default. Writes
+/// the preference under the config dir (same mechanism as the persisted model
+/// selection) so it survives restarts. Mirrors `model_set`'s response shape and
+/// returns the freshly resolved `effective` value so the caller sees whether an
+/// env override is still masking their new default.
+///
+/// Persisting `enabled` does NOT weaken the permission decision-token binding
+/// (OCEAN-185); it only sets the default for whether tools auto-approve.
+async fn yolo_setting_set(Json(req): Json<YoloSetRequest>) -> Json<serde_json::Value> {
+    let config_dir = ocean_agent::config_dir_from_env();
+    ocean_agent::persist_yolo_pref(&config_dir, req.enabled);
+    let env_override = yolo_env_pref();
+    tracing::info!(persisted = req.enabled, ?env_override, "yolo default persisted");
+    Json(json!({
+        "ok": true,
+        "persisted": req.enabled,
+        "effective": effective_yolo(),
+        "env_override": env_override,
     }))
 }
 
@@ -2473,7 +2569,9 @@ fn spawn_room_agent_turn(
             .is_err();
 
         let request_id = Uuid::new_v4();
-        let yolo = yolo_enabled();
+        // Auto-convene has no per-request flag, so the effective posture is the
+        // operator's resolved default: env → persisted setting → off.
+        let yolo = effective_yolo();
         let mut prompt_req = PromptRequest {
             prompt,
             images: None,
@@ -3924,9 +4022,11 @@ async fn agent_turn(
     // OCEAN-51: permission gating is ON by default. Previously this path
     // hardcoded `yolo: true`, auto-approving every tool call and making the
     // entire per-tool permission machinery dead code for the shipped product
-    // surfaces. Now the mode is operator-controlled via `OCEAN_YOLO` (default
-    // off → real gating). The bypass is opt-in, not the silent default.
-    let yolo = yolo_enabled();
+    // surfaces. Now the mode is operator-controlled. `AgentTurnRequest` carries
+    // no per-request yolo flag, so the effective posture is the operator's
+    // resolved default: OCEAN_YOLO env → persisted setting (OCEAN-YOLO) → off.
+    // The bypass is opt-in, never the silent default.
+    let yolo = effective_yolo();
 
     let guided_prompt = apply_room_guidance(room_id, &prompt);
     let mut prompt_req = PromptRequest {
@@ -4891,6 +4991,18 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test that mutates the process-global env this module
+    /// reads for the YOLO resolution (`OCEAN_YOLO`, `OCEAN_CONFIG_DIR`). Rust
+    /// runs unit tests on parallel threads sharing one process env, so without
+    /// this lock two env-touching yolo tests can interleave and read each
+    /// other's writes. Poison is swallowed — a panicking test should not cascade
+    /// into spurious failures here.
+    static YOLO_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn yolo_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        YOLO_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn status(request_id: RequestId, state: RequestState) -> RequestControl {
         RequestControl {
@@ -6313,6 +6425,7 @@ mod tests {
     /// switch; it must default safe.
     #[test]
     fn ocean_yolo_env_defaults_off_and_opts_in_explicitly() {
+        let _guard = yolo_env_guard();
         // Serialize env mutation within this test; restore the prior value.
         let prior = env::var("OCEAN_YOLO").ok();
 
@@ -6332,6 +6445,100 @@ mod tests {
             Some(v) => env::set_var("OCEAN_YOLO", v),
             None => env::remove_var("OCEAN_YOLO"),
         }
+    }
+
+    /// OCEAN-YOLO persistence round-trip: writing the preference under a config
+    /// dir and reading it back (simulating a daemon restart, which re-reads the
+    /// file from scratch) returns the saved value. Default-on-first-run is
+    /// `None` ⇒ the caller treats it as off.
+    #[test]
+    fn yolo_pref_persists_and_roundtrips() {
+        let tmp = std::env::temp_dir().join(format!("ocean-yolo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // First run: nothing persisted.
+        assert_eq!(
+            ocean_agent::load_yolo_pref(&tmp),
+            None,
+            "no file ⇒ no persisted default"
+        );
+
+        // Persist true, then a fresh read (no in-memory cache) returns true.
+        ocean_agent::persist_yolo_pref(&tmp, true);
+        assert_eq!(
+            ocean_agent::load_yolo_pref(&tmp),
+            Some(true),
+            "persisted true must survive a fresh read (restart)"
+        );
+
+        // Overwrite with false; the new value wins.
+        ocean_agent::persist_yolo_pref(&tmp, false);
+        assert_eq!(
+            ocean_agent::load_yolo_pref(&tmp),
+            Some(false),
+            "persisted false must overwrite the prior true"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// OCEAN-YOLO precedence: `effective_yolo()` resolves env → persisted → off.
+    /// - persisted=true + no env ⇒ effective true (the personal default sticks);
+    /// - `OCEAN_YOLO=0` overrides persisted=true ⇒ effective off (env wins);
+    /// - `OCEAN_YOLO=1` ⇒ effective true even with persisted=false;
+    /// - nothing set (no env, no file) ⇒ effective off (the safety default).
+    #[test]
+    fn effective_yolo_precedence_env_over_persisted_over_off() {
+        let _guard = yolo_env_guard();
+        // Also serialize against the auto-convene tests, the other suite that
+        // mutates `OCEAN_CONFIG_DIR`/`OCEAN_YOLO` process-globally. Acquire it
+        // AFTER the yolo lock; no path takes these in the reverse order, so this
+        // can't deadlock.
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior_yolo = env::var("OCEAN_YOLO").ok();
+        let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
+
+        let tmp = std::env::temp_dir().join(format!("ocean-yolo-prec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", &tmp);
+
+        // Nothing set anywhere ⇒ off (safety default).
+        env::remove_var("OCEAN_YOLO");
+        assert!(!effective_yolo(), "no env + no persisted ⇒ off");
+
+        // Persisted true, no env ⇒ the personal default takes effect.
+        ocean_agent::persist_yolo_pref(&tmp, true);
+        env::remove_var("OCEAN_YOLO");
+        assert!(effective_yolo(), "persisted true + no env ⇒ on");
+
+        // OCEAN_YOLO=0 overrides persisted true ⇒ env wins, gated.
+        env::set_var("OCEAN_YOLO", "0");
+        assert!(!effective_yolo(), "OCEAN_YOLO=0 must override persisted true");
+
+        // OCEAN_YOLO=1 overrides persisted false ⇒ env wins, bypass.
+        ocean_agent::persist_yolo_pref(&tmp, false);
+        env::set_var("OCEAN_YOLO", "1");
+        assert!(effective_yolo(), "OCEAN_YOLO=1 must override persisted false");
+
+        // Unrecognized env ⇒ falls through to persisted (false here).
+        env::set_var("OCEAN_YOLO", "maybe");
+        assert!(
+            !effective_yolo(),
+            "garbage env falls through to persisted false"
+        );
+
+        // Restore env.
+        match prior_yolo {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+        match prior_cfg {
+            Some(v) => env::set_var("OCEAN_CONFIG_DIR", v),
+            None => env::remove_var("OCEAN_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // --- OCEAN-130: fake-tool provider drives the full block→decide→proceed
