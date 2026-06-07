@@ -37,6 +37,15 @@ pub enum ToolSideEffect {
         canvas_id: String,
         patches: Vec<ocean_agent_sdk::surface::SurfacePatch>,
     },
+    /// A validated `slack_canvas` operation the agent emitted (OCEAN-214 ph2).
+    /// The agent loop forwards this onto the event bus; the Slack canvas bridge
+    /// (`ocean-agents`, a later phase) round-trips the op to the real Slack Canvas
+    /// API (`canvases.create`/`canvases.edit`/`canvases.read`) and, for `read`,
+    /// populates the agent-facing contents. The runtime only emits the validated,
+    /// contracted op here — it does not itself call Slack.
+    SlackCanvas {
+        op: ocean_agent_sdk::slack_canvas::SlackCanvasOp,
+    },
 }
 
 /// A live result returned from a tool execution.
@@ -305,6 +314,14 @@ pub enum AgentEvent {
         canvas_id: String,
         patches: Vec<ocean_agent_sdk::surface::SurfacePatch>,
     },
+    /// The agent emitted a validated `slack_canvas` op (OCEAN-214 ph2). The agent
+    /// loop forwards it onto the event bus scoped to this session; the Slack canvas
+    /// bridge (`ocean-agents`, a later phase) consumes it and round-trips to the
+    /// Slack Canvas API. Mirrors [`AgentEvent::SurfacePatch`].
+    SlackCanvas {
+        session_id: Option<String>,
+        op: ocean_agent_sdk::slack_canvas::SlackCanvasOp,
+    },
 }
 
 impl AgentEvent {
@@ -325,7 +342,8 @@ impl AgentEvent {
             | AgentEvent::Render { session_id, .. }
             | AgentEvent::Unmount { session_id, .. }
             | AgentEvent::BrowserActivity { session_id, .. }
-            | AgentEvent::SurfacePatch { session_id, .. } => session_id.as_deref(),
+            | AgentEvent::SurfacePatch { session_id, .. }
+            | AgentEvent::SlackCanvas { session_id, .. } => session_id.as_deref(),
         }
     }
 }

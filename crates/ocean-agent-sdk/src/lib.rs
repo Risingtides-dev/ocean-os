@@ -32,6 +32,10 @@ pub use ocean_protocol::ThinkingLevel;
 /// (GPUI Masterbuild Slice 1). See [`surface`] for the wire types.
 pub mod surface;
 
+/// Slack canvas protocol — the shared contract for the agent's Slack-canvas-as-
+/// playground tool (OCEAN-214). See [`slack_canvas`] for the op/result wire types.
+pub mod slack_canvas;
+
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
