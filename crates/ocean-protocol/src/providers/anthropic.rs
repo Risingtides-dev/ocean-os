@@ -231,6 +231,20 @@ fn total_tokens(u: &crate::types::Usage) -> u64 {
     u.input + u.output + u.cache_write + u.cache_read
 }
 
+/// Map an Anthropic `stop_reason` string to our internal [`StopReason`],
+/// mirroring `map_finish_reason` in `openai.rs`. `tool_use` means the model
+/// wants a tool call; `max_tokens` is a length truncation; `end_turn` and
+/// `stop_sequence` are clean stops. Anything else (e.g. `pause_turn`,
+/// `refusal`, or an unrecognized value) falls through to a clean `Stop`.
+fn map_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::Length,
+        "end_turn" | "stop_sequence" => StopReason::Stop,
+        _ => StopReason::Stop,
+    }
+}
+
 /// True for the Anthropic Messages family. Prompt caching via `cache_control`
 /// breakpoints is an Anthropic-only feature, so we gate emission on the model's
 /// API string. Any non-Anthropic backend routed through this provider (none
@@ -581,12 +595,7 @@ impl Provider for AnthropicProvider {
                             usage.output += u.output_tokens;
                         }
                         if let Some(reason) = delta.stop_reason {
-                            stop = match reason.as_str() {
-                                "tool_use" => StopReason::ToolUse,
-                                "max_tokens" => StopReason::Length,
-                                "end_turn" | "stop_sequence" => StopReason::Stop,
-                                _ => StopReason::Stop,
-                            };
+                            stop = map_stop_reason(reason.as_str());
                         }
                     }
                     SseEvent::MessageStop => {}
@@ -799,20 +808,10 @@ mod tests {
         );
     }
 
-    // OCEAN-198: the stop_reason mapper lives inline in the stream loop
-    // (lines ~583), so it isn't a free function. This helper mirrors that exact
-    // match so the mapping is unit-testable; if the inline arm ever drifts from
-    // this, the test guarding it here will need to be updated in lockstep — which
-    // is the point of pinning every documented variant.
-    fn map_stop_reason(reason: &str) -> StopReason {
-        match reason {
-            "tool_use" => StopReason::ToolUse,
-            "max_tokens" => StopReason::Length,
-            "end_turn" | "stop_sequence" => StopReason::Stop,
-            _ => StopReason::Stop,
-        }
-    }
-
+    // OCEAN-199: these assertions exercise the REAL module-level
+    // `map_stop_reason` (in scope via `use super::*`) — the production path the
+    // stream loop calls — rather than a test-only mirror that could drift.
+    //
     // OCEAN-198: every stop_reason Anthropic can send maps to the right
     // StopReason, and an unknown/unexpected value falls back to a sane Stop
     // rather than panicking. `pause_turn` (a newer server-tool reason) and a
