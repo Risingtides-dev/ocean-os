@@ -705,8 +705,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/calls/place", post(call_place))
         .route("/v1/calls/webhook", post(call_webhook))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .layer(TraceLayer::new_for_http());
+
+    // Drain the registry of in-flight turn tasks AFTER axum finishes draining
+    // open connections (OCEAN-184). `with_graceful_shutdown` only waits for live
+    // HTTP connections, but `create_request` returns immediately after
+    // `tokio::spawn`-ing the actual turn and registering its `JoinHandle`, so the
+    // turn keeps running in a detached task. Without the drain below those tasks
+    // would be aborted the instant `main()` returns and the Tokio runtime drops.
+    // Clone the registry handle BEFORE `state` is consumed by `with_state`.
+    let drain_requests = state.requests.clone();
+    let app = app.with_state(state);
 
     let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
     tracing::info!(%addr, "ocean-daemon listening");
@@ -714,7 +723,68 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    drain_request_tasks(&drain_requests, shutdown_grace()).await;
     Ok(())
+}
+
+/// Total wall-clock budget for draining in-flight turn tasks on shutdown.
+/// Overridable via `OCEAN_SHUTDOWN_GRACE_SECS` (default 20s). A value of `0`
+/// disables waiting entirely (exit as soon as connections are drained).
+fn shutdown_grace() -> std::time::Duration {
+    let secs = env::var("OCEAN_SHUTDOWN_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(20);
+    std::time::Duration::from_secs(secs)
+}
+
+/// After axum has drained open connections, wait (up to `grace`) for the
+/// detached turn tasks registered in `requests` to finish on their own. We do
+/// NOT abort them — the whole point is to let active turns complete rather than
+/// die mid-stream. Only the timeout path gives up, logging a warning, so a stuck
+/// turn can never hang shutdown forever. (OCEAN-184)
+///
+/// Lock discipline: the registry is a tokio `RwLock`, so taking the handles is
+/// itself an `.await`. We take the write lock, `take()` every live `JoinHandle`
+/// out of its `RequestControl`, then drop the guard BEFORE awaiting any handle —
+/// the awaits never run while the lock is held.
+async fn drain_request_tasks(requests: &RequestRegistry, grace: std::time::Duration) {
+    let handles: Vec<JoinHandle<()>> = {
+        let mut reqs = requests.write().await;
+        reqs.values_mut()
+            .filter_map(|ctl| ctl.handle.take())
+            .collect()
+    };
+
+    if handles.is_empty() {
+        return;
+    }
+
+    let count = handles.len();
+    tracing::info!(
+        in_flight = count,
+        grace_secs = grace.as_secs(),
+        "draining in-flight turn tasks before exit"
+    );
+
+    let drained = tokio::time::timeout(grace, async {
+        for handle in handles {
+            // A task that already finished resolves immediately; a JoinError
+            // (panic/abort) is fine to ignore — we only care that it's no longer
+            // running.
+            let _ = handle.await;
+        }
+    })
+    .await;
+
+    match drained {
+        Ok(()) => tracing::info!(in_flight = count, "in-flight turn tasks drained; exiting"),
+        Err(_) => tracing::warn!(
+            in_flight = count,
+            grace_secs = grace.as_secs(),
+            "shutdown grace elapsed with turns still running; exiting anyway"
+        ),
+    }
 }
 
 /// Completes when the process receives SIGTERM or SIGINT (Ctrl-C), letting axum
@@ -5535,6 +5605,82 @@ mod tests {
         let first = ranked.into_iter().take(overflow).next().unwrap();
         assert!(first.1, "terminal entry ranked first for eviction");
         assert_eq!(first.0, term);
+    }
+
+    // ---- OCEAN-184: graceful shutdown drains in-flight turn tasks ----
+
+    /// Build a Running `RequestControl` carrying a real spawned task handle, so
+    /// the drain path has something to await.
+    fn running_with_handle(handle: JoinHandle<()>) -> RequestControl {
+        let id = RequestId::new_v4();
+        let mut ctl = status(id, RequestState::Running);
+        ctl.handle = Some(handle);
+        ctl
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_task_to_finish() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_w = done.clone();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            done_w.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let id = RequestId::new_v4();
+        requests
+            .write()
+            .await
+            .insert(id, running_with_handle(handle));
+
+        // Generous grace: the drain must wait for the 50ms task to complete.
+        drain_request_tasks(&requests, std::time::Duration::from_secs(5)).await;
+
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "drain awaited the in-flight task to completion"
+        );
+        // Handle was taken out of the registry during drain.
+        assert!(requests.read().await.get(&id).unwrap().handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_returns_bounded_when_grace_elapses() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        // A task that runs far longer than the grace window. The drain must NOT
+        // hang on it — it returns once the bounded timeout fires.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let id = RequestId::new_v4();
+        requests
+            .write()
+            .await
+            .insert(id, running_with_handle(handle));
+
+        let start = std::time::Instant::now();
+        drain_request_tasks(&requests, std::time::Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "drain returned promptly on timeout instead of hanging (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_is_a_noop_with_no_registered_handles() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let id = RequestId::new_v4();
+        // Entry exists but its handle is None (e.g. already drained / never
+        // attached) — drain should skip it and return immediately.
+        requests
+            .write()
+            .await
+            .insert(id, status(id, RequestState::Running));
+        drain_request_tasks(&requests, std::time::Duration::from_secs(5)).await;
+        // Nothing to assert beyond "it returned"; the test passing IS the assert.
     }
 
     #[test]

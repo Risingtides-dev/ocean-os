@@ -282,14 +282,29 @@ launchctl kickstart -k gui/$(id -u)/ocean-daemon-preview
 
 ### Graceful shutdown
 
-The daemon traps `SIGTERM` and `SIGINT` (Ctrl-C) and **drains in-flight HTTP
-requests and active agent turns** before exiting, instead of dropping them
-mid-stream. Both clients depend on this daemon, so prefer signal-based stops:
-`launchctl kickstart -k` (sends `SIGTERM`) or Ctrl-C in the foreground. Avoid
-`kill -9` / `SIGKILL`, which still hard-kills the process and aborts whatever
-turn is in flight. Note that draining waits for open connections — a long SSE
-event stream or a running turn will delay exit until it finishes or the client
-disconnects.
+The daemon traps `SIGTERM` and `SIGINT` (Ctrl-C) and **drains in-flight work**
+before exiting, in two stages, instead of dropping it mid-stream:
+
+1. **Open HTTP connections** are drained by axum's `with_graceful_shutdown`.
+2. **Detached turn tasks.** A turn submitted via `POST /v1/requests` runs in a
+   background task — the HTTP call returns immediately while the turn keeps
+   running. After connections drain, the daemon waits for these registered turn
+   tasks to finish before exiting (it does **not** abort them).
+
+The wait in stage 2 is bounded by `OCEAN_SHUTDOWN_GRACE_SECS` (default **20s**;
+set `0` to skip waiting). If the budget elapses with turns still running, the
+daemon logs a warning and exits anyway, so a stuck turn can't hang shutdown.
+
+Both clients depend on this daemon, so prefer signal-based stops: `launchctl
+kickstart -k` (sends `SIGTERM`) or Ctrl-C in the foreground. Avoid `kill -9` /
+`SIGKILL`, which still hard-kills the process and aborts whatever turn is in
+flight. Note that a long SSE event stream or a running turn will delay exit
+until it finishes, disconnects, or the grace budget elapses.
+
+> Known limitation: turns spawned by the room auto-convene path (an `@mention`
+> reply) are registered in the request registry but currently do not attach
+> their task handle, so stage 2 does not wait on them. The primary
+> `POST /v1/requests` turn path is fully drained. (OCEAN-184)
 
 ### Sessions
 
