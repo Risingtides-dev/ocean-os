@@ -218,6 +218,19 @@ fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
     }
 }
 
+/// Total token footprint for an Anthropic turn (OCEAN-188).
+///
+/// Anthropic reports cache tokens SEPARATELY from `input_tokens`:
+/// `input_tokens` is the non-cached input only, while
+/// `cache_creation_input_tokens` (cache_write) and `cache_read_input_tokens`
+/// (cache_read) are reported alongside it and are NOT included in it. The full
+/// footprint that hit the model is therefore input + output + cache_write +
+/// cache_read. This keeps Anthropic consistent with the other providers, whose
+/// reported totals already fold cache-read tokens into the prompt/input figure.
+fn total_tokens(u: &crate::types::Usage) -> u64 {
+    u.input + u.output + u.cache_write + u.cache_read
+}
+
 /// True for the Anthropic Messages family. Prompt caching via `cache_control`
 /// breakpoints is an Anthropic-only feature, so we gate emission on the model's
 /// API string. Any non-Anthropic backend routed through this provider (none
@@ -595,7 +608,17 @@ impl Provider for AnthropicProvider {
                 }
             }
 
-            usage.total_tokens = usage.input + usage.output;
+            // OCEAN-188: Anthropic reports `cache_creation_input_tokens` (->
+            // cache_write) and `cache_read_input_tokens` (-> cache_read) as
+            // fields SEPARATE from `input_tokens` — `input_tokens` counts only
+            // the non-cached input. So input + output alone under-counts the
+            // total whenever prompt caching is active (the cache footprint goes
+            // invisible in the HUD). The true model footprint includes both
+            // cache buckets. This also matches every other provider's
+            // convention, where cache-read tokens are already folded into the
+            // provider-reported total (OpenAI/Gemini: cached_tokens ⊆
+            // prompt/total; Codex: cached ⊆ input ⊆ total).
+            usage.total_tokens = total_tokens(&usage);
             let mut out_content = Vec::with_capacity(order.len());
             for idx in &order {
                 if let Some(st) = blocks.get(idx) {
@@ -641,7 +664,7 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Context, Message, Tool};
+    use crate::types::{Context, Message, Tool, Usage};
 
     fn anthropic_model() -> Model {
         Model::anthropic_claude_sonnet_4_6()
@@ -674,6 +697,38 @@ mod tests {
             ],
             tools: vec![tool("read_file"), tool("write_file")],
         }
+    }
+
+    // OCEAN-188: Anthropic reports cache_creation/cache_read separately from
+    // input_tokens, so the total footprint must add both cache buckets on top
+    // of input + output. With input=100, output=50, cache_write=512,
+    // cache_read=200 the total is 862, not the 150 that input+output alone gave.
+    #[test]
+    fn anthropic_total_tokens_includes_both_cache_buckets() {
+        let usage = Usage {
+            input: 100,
+            output: 50,
+            cache_write: 512,
+            cache_read: 200,
+            ..Default::default()
+        };
+        assert_eq!(
+            total_tokens(&usage),
+            862,
+            "total must be input + output + cache_write + cache_read"
+        );
+    }
+
+    // No caching active: cache buckets are zero, so the total collapses back to
+    // input + output — no regression for the non-cached path.
+    #[test]
+    fn anthropic_total_tokens_without_cache_is_input_plus_output() {
+        let usage = Usage {
+            input: 377,
+            output: 65,
+            ..Default::default()
+        };
+        assert_eq!(total_tokens(&usage), 442);
     }
 
     // OCEAN-159: on the Anthropic family, build_body must attach an ephemeral
