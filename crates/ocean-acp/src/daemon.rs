@@ -97,6 +97,38 @@ impl DaemonClient {
         ))
     }
 
+    /// Fetch a session's recorded working directory from the daemon.
+    /// Mirrors `GET /v1/agent/sessions/{id}`, whose `AgentSession.cwd` the
+    /// daemon resolves from the bound workspace root (falling back to the
+    /// recorded cwd). Used by `session/load` to repopulate the bridge's
+    /// per-session cwd after a bridge restart, instead of guessing with
+    /// `env::current_dir()`. Returns `Ok(None)` if the session is unknown or
+    /// carries no cwd.
+    pub async fn session_cwd(&self, session_id: &str) -> Result<Option<String>> {
+        let url = format!("{}/v1/agent/sessions/{}", self.base_url, session_id);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        // A missing session is not an error here — the caller can fall back to
+        // the cwd the editor supplied on the load request.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp
+            .error_for_status()
+            .context("daemon rejected session detail read")?
+            .json::<AgentSessionResponse>()
+            .await
+            .context("decode session detail response")?;
+        Ok(resp
+            .session
+            .map(|s| s.cwd)
+            .filter(|cwd| !cwd.trim().is_empty()))
+    }
+
     /// Submit a turn. The daemon creates a session lazily when `session_id`
     /// is `None`; in that case the real id arrives via the SSE
     /// `session_created` / `turn_started` events and in the response body.
@@ -333,6 +365,26 @@ impl OceanEventStream {
 
 fn parse_session_id(s: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(s).with_context(|| format!("invalid session id: {s:?}"))
+}
+
+// --- session detail types (subset of the daemon's /v1/agent/sessions/{id}) --
+
+/// Just the `cwd` we need off `GET /v1/agent/sessions/{id}`'s `session`
+/// object. Deliberately a partial mirror: the real payload carries title,
+/// timestamps, turns, etc., but the ACP bridge only needs the working dir to
+/// repopulate a resumed session, so we decode the one field and let serde
+/// ignore the rest.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDetailSlice {
+    #[serde(default)]
+    cwd: String,
+}
+
+/// Subset of `GET /v1/agent/sessions/{id}`'s response body.
+#[derive(Debug, Clone, Deserialize)]
+struct AgentSessionResponse {
+    #[serde(default)]
+    session: Option<SessionDetailSlice>,
 }
 
 // --- model roster types (mirror of the daemon's /v1/models payload) ---------

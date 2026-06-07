@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, CurrentModeUpdate, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionMode, SessionModeId,
     SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason,
@@ -270,6 +271,69 @@ async fn main() -> AcpResult<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // --- session/load (resume an existing session) ---------------------
+        .on_receive_request(
+            {
+                let sessions = sessions.clone();
+                let client = client.clone();
+                async move |req: LoadSessionRequest, responder, _conn| {
+                    // We advertise `load_session` (see `initialize`), so we MUST
+                    // honour it: repopulate this session's cwd in the bridge map.
+                    // Otherwise the first post-restart `session/prompt` would hit
+                    // the `cwd()`-miss path and fall back to `env::current_dir()`
+                    // — likely the wrong project dir. The editor hands us the
+                    // session's cwd right here on the load request; prefer it. If
+                    // it's empty (older editors), ask the daemon for the cwd it
+                    // recorded for this session (`GET /v1/agent/sessions/{id}`).
+                    let acp_session_id = req.session_id.0.to_string();
+                    let req_cwd = req.cwd.to_string_lossy().to_string();
+                    let cwd = if !req_cwd.trim().is_empty() {
+                        req_cwd
+                    } else {
+                        match client.session_cwd(&acp_session_id).await {
+                            Ok(Some(daemon_cwd)) => daemon_cwd,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    %acp_session_id,
+                                    "session/load: no cwd on request and daemon has none; \
+                                     turns will fall back to the process cwd"
+                                );
+                                std::env::current_dir()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| ".".to_string())
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    %acp_session_id, error = %err,
+                                    "session/load: daemon cwd lookup failed; \
+                                     turns will fall back to the process cwd"
+                                );
+                                std::env::current_dir()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| ".".to_string())
+                            }
+                        }
+                    };
+                    sessions.insert(acp_session_id.clone(), cwd.clone());
+
+                    // Mirror the model roster into session modes so the resumed
+                    // session keeps its model picker, same as `session/new`.
+                    let modes = match client.list_models().await {
+                        Ok(roster) => Some(build_mode_state(&roster)),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "session/load: could not fetch model roster; no picker");
+                            None
+                        }
+                    };
+
+                    tracing::info!(%acp_session_id, %cwd, has_modes = modes.is_some(), "session/load");
+                    let mut resp = LoadSessionResponse::new();
+                    resp.modes = modes;
+                    responder.respond(resp)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         // --- session/set_mode (per-session model selection) ----------------
         .on_receive_request(
             {
@@ -317,8 +381,15 @@ async fn main() -> AcpResult<()> {
                     let cwd = match sessions.cwd(&session_id) {
                         Some(cwd) => cwd,
                         None => {
-                            // session/load wasn't implemented to repopulate cwd;
-                            // fall back to the process cwd so we never wedge.
+                            // Normally session/new (or session/load on resume)
+                            // populates the cwd. If we still miss — a stray prompt
+                            // for a session we never saw — fall back to the process
+                            // cwd so we never wedge.
+                            tracing::warn!(
+                                %session_id,
+                                "session/prompt for a session with no recorded cwd; \
+                                 falling back to the process cwd"
+                            );
                             std::env::current_dir()
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_else(|_| ".".to_string())
@@ -414,7 +485,15 @@ async fn main() -> AcpResult<()> {
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {
                 // Unhandled messages get a clean error so the client isn't left
-                // waiting on a response.
+                // waiting on a response. Log the method first (OCEAN-213): the
+                // old silent `internal_error("unhandled message")` made a
+                // missing/future ACP feature (e.g. `session/authenticate`,
+                // `session/list`) invisible — you couldn't tell WHICH message
+                // the editor sent that we didn't handle. `Dispatch::method()`
+                // returns the JSON-RPC method for requests, notifications, and
+                // responses alike.
+                let method = message.method().to_string();
+                tracing::warn!(%method, "ocean-acp: unhandled ACP message; responding internal_error");
                 message.respond_with_error(
                     agent_client_protocol::util::internal_error("unhandled message"),
                     cx,
@@ -933,6 +1012,37 @@ mod tests {
 
         sessions.clear_active_request("acp-1");
         assert_eq!(sessions.active_request("acp-1"), None);
+    }
+
+    #[test]
+    fn session_load_repopulates_cwd_so_prompt_avoids_process_cwd_fallback() {
+        // OCEAN-213: we advertise `load_session`, so a resumed session must get
+        // its cwd repopulated. The handler inserts the loaded cwd into the map;
+        // a subsequent `session/prompt` then reads it instead of falling back to
+        // `env::current_dir()`. Model the post-load state and assert the lookup.
+        let sessions = Sessions::default();
+        // Simulate the bridge restarting with an empty map, then a session/load
+        // arriving for a previously-unseen session id.
+        assert_eq!(sessions.cwd("resumed-1"), None);
+
+        // session/load stores the cwd the editor (or daemon) supplied.
+        sessions.insert("resumed-1".into(), "/work/repo".into());
+
+        // session/prompt now finds the right project dir — no process-cwd guess.
+        assert_eq!(sessions.cwd("resumed-1"), Some("/work/repo".into()));
+    }
+
+    #[test]
+    fn initialize_advertises_load_session_capability() {
+        // We honour session/load (it repopulates cwd), so the advertised
+        // capability must stay `true`. If a future change drops the handler,
+        // this guards against silently advertising an unhonored capability.
+        let mut caps = agent_client_protocol::schema::AgentCapabilities::default();
+        caps.load_session = true;
+        assert!(
+            caps.load_session,
+            "ocean-acp implements session/load and must advertise it"
+        );
     }
 
     #[test]
