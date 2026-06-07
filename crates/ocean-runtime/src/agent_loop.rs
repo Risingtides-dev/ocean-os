@@ -317,7 +317,7 @@ pub async fn run_agent_with_history(
                     args: args.clone(),
                 },
             );
-            let (content, is_error, terminate, side_effects) = match tool_obj {
+            let (content, is_error, terminate, side_effects, details) = match tool_obj {
                 // Race tool execution against cancellation (OCEAN-116). A
                 // long-running tool (slow bash, a network call that hangs) would
                 // otherwise block the loop until it completed even if the user
@@ -341,15 +341,16 @@ pub async fn run_agent_with_history(
                         result = exec => match result {
                             Ok(AgentToolResult {
                                 content,
-                                details: _,
+                                details,
                                 terminate,
                                 side_effects,
-                            }) => (content, false, terminate, side_effects),
+                            }) => (content, false, terminate, side_effects, details),
                             Err(e) => (
                                 vec![Content::text(format!("tool error: {e}"))],
                                 true,
                                 false,
                                 Vec::new(),
+                                Value::Null,
                             ),
                         },
                     }
@@ -359,6 +360,7 @@ pub async fn run_agent_with_history(
                     true,
                     false,
                     Vec::new(),
+                    Value::Null,
                 ),
             };
             if !terminate {
@@ -372,6 +374,7 @@ pub async fn run_agent_with_history(
                     tool_name: name.clone(),
                     is_error,
                     content: content.clone(),
+                    details: details.clone(),
                 },
             );
             // Emit any side-effect events the tool requested (render, unmount, etc.)
