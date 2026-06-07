@@ -32,10 +32,21 @@ pub struct DownloadInfo {
     pub url: String,
     pub suggested_filename: String,
     pub state: DownloadState,
-    /// Resolved absolute path once known (set as progress/completion lands).
+    /// Resolved absolute path. This is validated against disk in
+    /// [`DownloadTracker::snapshot`]: it points at a file that actually exists
+    /// (the CDP/derived path if present, otherwise the real browser-renamed
+    /// collision variant), or is `None` when no matching file is on disk.
     pub file_path: Option<String>,
+    /// Whether `file_path` was confirmed to exist on disk at snapshot time. When
+    /// `false`, `file_path` is `None` and the agent should not try to read it.
+    pub exists: bool,
     pub received_bytes: u64,
     pub total_bytes: u64,
+    /// Wall-clock time we observed this download reach a terminal state. Used
+    /// internally to disambiguate same-name collisions by file mtime; not part
+    /// of the agent-facing contract, so it's skipped during serialization.
+    #[serde(skip)]
+    completed_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone)]
@@ -61,8 +72,10 @@ impl DownloadTracker {
                 suggested_filename,
                 state: DownloadState::InProgress,
                 file_path: None,
+                exists: false,
                 received_bytes: 0,
                 total_bytes: 0,
+                completed_at: None,
             },
         );
     }
@@ -77,22 +90,186 @@ impl DownloadTracker {
     ) {
         let mut items = self.items.lock().await;
         if let Some(info) = items.get_mut(guid) {
+            let terminal = matches!(state, DownloadState::Completed | DownloadState::Canceled);
             info.state = state;
             info.received_bytes = received;
             info.total_bytes = total;
-            // CDP gives an explicit path on completion; otherwise derive it from
-            // the download dir + suggested name so the agent has a path to use.
+            // Stamp the moment we saw the download finish, so resolution can pick
+            // the file whose mtime sits closest to it when names collide.
+            if terminal && info.completed_at.is_none() {
+                info.completed_at = Some(std::time::SystemTime::now());
+            }
+            // Store CDP's explicit path verbatim as a *hint*. We deliberately do
+            // NOT touch the filesystem here — this runs in the CDP event handler
+            // while holding the items lock, so resolution/stat happens lazily in
+            // `snapshot()` instead. A `None` from CDP leaves any prior hint alone.
             if let Some(p) = file_path {
                 info.file_path = Some(p);
-            } else if info.file_path.is_none() {
-                info.file_path = Some(self.dir.join(&info.suggested_filename).to_string_lossy().into_owned());
             }
         }
     }
 
+    /// Clone out every tracked download, validating each one's `file_path`
+    /// against disk so the agent gets a path it can actually read.
+    ///
+    /// Resolution rule, applied per item (cheap `read_dir`, no lock held):
+    /// 1. CDP gave an explicit path that exists → use it (it names *this*
+    ///    download's file directly, so it's unambiguous even under collision).
+    /// 2. No CDP path. Collect every on-disk candidate for the suggested name:
+    ///    the exact `<dir>/<suggested>` plus all `(N)` rename variants. Then,
+    ///    **crucially**, do NOT blindly take the exact name — a pre-existing
+    ///    `report.pdf` from a PRIOR download is a trap. Disambiguate:
+    ///    a. If we stamped a completion time, pick the candidate whose mtime is
+    ///    closest to it (this download's file is the freshest match).
+    ///    b. Else, if any `(N)` variant exists, Chrome only creates those when the
+    ///    base name was taken → the base is an older/other download, so the
+    ///    highest-N variant is the most recent and wins.
+    ///    c. Else only the exact name exists → use it (the no-collision case).
+    /// 3. No candidate on disk → `file_path = None`, `exists = false`.
     async fn snapshot(&self) -> Vec<DownloadInfo> {
-        self.items.lock().await.values().cloned().collect()
+        // Clone under the lock, resolve after releasing it: filesystem work
+        // never happens while the items mutex is held.
+        let mut items: Vec<DownloadInfo> = self.items.lock().await.values().cloned().collect();
+        for info in &mut items {
+            let (resolved, exists) = self.resolve_path(info);
+            info.file_path = resolved;
+            info.exists = exists;
+        }
+        items
     }
+
+    /// Resolve an item's file path against disk. Returns `(path, exists)`.
+    fn resolve_path(&self, info: &DownloadInfo) -> (Option<String>, bool) {
+        // 1. An explicit CDP path that exists is authoritative — it's THIS
+        //    download's real file, collision or not.
+        if let Some(hint) = &info.file_path {
+            if std::path::Path::new(hint).is_file() {
+                return (Some(hint.clone()), true);
+            }
+        }
+        // 2. Gather on-disk candidates: exact suggested name + `(N)` variants.
+        let candidates = self.candidate_files(&info.suggested_filename);
+        match self.pick_candidate(candidates, info.completed_at) {
+            Some(p) => (Some(p.to_string_lossy().into_owned()), true),
+            None => (None, false),
+        }
+    }
+
+    /// All existing files in the download dir that could be this download's
+    /// output for `suggested`: the exact name (`index` = 0) plus every Chrome
+    /// collision variant `stem (N).ext` (`index` = N). Empty if none exist.
+    fn candidate_files(&self, suggested: &str) -> Vec<Candidate> {
+        let mut out = Vec::new();
+
+        let suggested_path = std::path::Path::new(suggested);
+        let (stem, ext) = match suggested_path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) => {
+                let ext = suggested_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!(".{e}"))
+                    .unwrap_or_default();
+                (stem.to_string(), ext)
+            }
+            None => return out,
+        };
+
+        // Exact suggested name (collision index 0).
+        let exact = self.dir.join(suggested);
+        if exact.is_file() {
+            out.push(Candidate {
+                index: 0,
+                path: exact,
+            });
+        }
+
+        // Numbered variants from a single dir scan.
+        if let Ok(read) = std::fs::read_dir(&self.dir) {
+            for entry in read.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if let Some(n) = collision_index(name, &stem, &ext) {
+                    out.push(Candidate { index: n, path });
+                }
+            }
+        }
+        out
+    }
+
+    /// Choose THIS download's file from the candidate set.
+    /// - With a completion timestamp: the candidate whose mtime is closest to it.
+    /// - Otherwise: highest collision index (a numbered variant beats the base
+    ///   name, since variants only exist because the base was already taken).
+    fn pick_candidate(
+        &self,
+        candidates: Vec<Candidate>,
+        completed_at: Option<std::time::SystemTime>,
+    ) -> Option<PathBuf> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        if let Some(done) = completed_at {
+            // Pick the candidate with the smallest |mtime - completed_at|.
+            let mut best: Option<(std::time::Duration, u64, PathBuf)> = None;
+            for c in &candidates {
+                let mtime = match std::fs::metadata(&c.path).and_then(|m| m.modified()) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let delta = mtime
+                    .duration_since(done)
+                    .unwrap_or_else(|e| e.duration())
+                    .max(done.duration_since(mtime).unwrap_or_default());
+                let better = match &best {
+                    // Closer mtime wins; ties break toward the higher index.
+                    Some((bd, bi, _)) => delta < *bd || (delta == *bd && c.index > *bi),
+                    None => true,
+                };
+                if better {
+                    best = Some((delta, c.index, c.path.clone()));
+                }
+            }
+            if let Some((_, _, p)) = best {
+                return Some(p);
+            }
+            // mtime unreadable on every candidate → fall through to index rule.
+        }
+
+        // No usable timestamp: highest collision index wins.
+        candidates
+            .into_iter()
+            .max_by_key(|c| c.index)
+            .map(|c| c.path)
+    }
+}
+
+/// A file in the download dir that matches a suggested name. `index` is 0 for
+/// the exact name and N for a `stem (N).ext` collision variant.
+struct Candidate {
+    index: u64,
+    path: PathBuf,
+}
+
+/// Parse Chrome's collision-rename convention: given a directory entry `name`,
+/// the base `stem`, and the `ext` (with leading dot, or empty), return `Some(N)`
+/// if `name == "<stem> (N)<ext>"` for a positive integer N. The exact name
+/// (`"<stem><ext>"`) is intentionally NOT matched here — callers check it first.
+fn collision_index(name: &str, stem: &str, ext: &str) -> Option<u64> {
+    let rest = name.strip_prefix(stem)?;
+    let rest = rest.strip_prefix(" (")?;
+    let rest = rest.strip_suffix(ext)?;
+    let num = rest.strip_suffix(')')?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse::<u64>().ok()
 }
 
 impl BrowserHandle {
@@ -180,4 +357,251 @@ impl BrowserHandle {
 /// Ocean-owned dir under the OS temp root.
 fn default_download_dir() -> PathBuf {
     std::env::temp_dir().join("ocean-downloads")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch download dir under the OS temp root, created on demand.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ocean-dl-test-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a file with an explicit modified time so mtime-based resolution is
+    /// deterministic in tests (no reliance on wall-clock write ordering).
+    fn write_at(path: &std::path::Path, bytes: &[u8], mtime: std::time::SystemTime) {
+        std::fs::write(path, bytes).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn collision_index_parses_chrome_renames() {
+        // "report (1).pdf" → 1, against stem "report" / ext ".pdf".
+        assert_eq!(collision_index("report (1).pdf", "report", ".pdf"), Some(1));
+        assert_eq!(collision_index("report (12).pdf", "report", ".pdf"), Some(12));
+        // The exact name is not a collision variant.
+        assert_eq!(collision_index("report.pdf", "report", ".pdf"), None);
+        // Non-numeric / malformed.
+        assert_eq!(collision_index("report (x).pdf", "report", ".pdf"), None);
+        assert_eq!(collision_index("report (1).txt", "report", ".pdf"), None);
+        assert_eq!(collision_index("other (1).pdf", "report", ".pdf"), None);
+        // Extensionless suggested name.
+        assert_eq!(collision_index("data (3)", "data", ""), Some(3));
+    }
+
+    #[tokio::test]
+    async fn snapshot_resolves_collision_variant_when_exact_name_missing() {
+        let dir = scratch_dir("collision");
+        // The browser renamed the collision: only "report (1).pdf" is on disk,
+        // NOT the suggested "report.pdf".
+        std::fs::write(dir.join("report (1).pdf"), b"pdf-bytes").unwrap();
+
+        let tracker = DownloadTracker::new(dir.clone());
+        tracker
+            .begin(
+                "guid-1".into(),
+                "https://example.com/report.pdf".into(),
+                "report.pdf".into(),
+            )
+            .await;
+        // Completion with NO explicit CDP path → only the suggested name is known.
+        tracker
+            .progress("guid-1", DownloadState::Completed, None, 9, 9)
+            .await;
+
+        let snap = tracker.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        let info = &snap[0];
+        assert!(info.exists, "resolved file should exist");
+        let resolved = info.file_path.as_ref().expect("file_path resolved");
+        assert_eq!(
+            std::path::Path::new(resolved),
+            dir.join("report (1).pdf"),
+            "should resolve to the (1) collision variant that actually exists"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_picks_highest_numbered_variant() {
+        let dir = scratch_dir("highest");
+        let now = std::time::SystemTime::now();
+        // (2) is the fresher file; (1) is older. mtime resolution should land on
+        // (2) regardless, and the index tiebreak agrees.
+        write_at(&dir.join("data (1).csv"), b"a", now - std::time::Duration::from_secs(60));
+        write_at(&dir.join("data (2).csv"), b"b", now);
+
+        let tracker = DownloadTracker::new(dir.clone());
+        tracker
+            .begin("g".into(), "https://x/data.csv".into(), "data.csv".into())
+            .await;
+        tracker
+            .progress("g", DownloadState::Completed, None, 1, 1)
+            .await;
+
+        let snap = tracker.snapshot().await;
+        let info = &snap[0];
+        assert!(info.exists);
+        assert_eq!(
+            std::path::Path::new(info.file_path.as_ref().unwrap()),
+            dir.join("data (2).csv"),
+            "should resolve to the highest-N variant"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_exact_name_when_no_collision() {
+        // No-collision case: only the exact suggested name exists, no variants.
+        // It must resolve to that file.
+        let dir = scratch_dir("exact");
+        std::fs::write(dir.join("file.txt"), b"x").unwrap();
+
+        let tracker = DownloadTracker::new(dir.clone());
+        tracker
+            .begin("g".into(), "https://x/file.txt".into(), "file.txt".into())
+            .await;
+        tracker
+            .progress("g", DownloadState::Completed, None, 1, 1)
+            .await;
+
+        let snap = tracker.snapshot().await;
+        let info = &snap[0];
+        assert!(info.exists);
+        assert_eq!(
+            std::path::Path::new(info.file_path.as_ref().unwrap()),
+            dir.join("file.txt"),
+            "with no collision, the exact suggested name resolves"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_skips_stale_prior_file_for_collided_download() {
+        // The Codex P1 regression: a PRIOR download already left `report.pdf` on
+        // disk. THIS download collided, so Chrome saved it as `report (1).pdf`.
+        // Resolution must NOT return the stale `report.pdf` — it must return the
+        // fresh `report (1).pdf`, the file this download actually produced.
+        let dir = scratch_dir("stale");
+        let now = std::time::SystemTime::now();
+        let old = now - std::time::Duration::from_secs(3600); // an hour ago
+        // Stale prior download — old mtime, base name.
+        write_at(&dir.join("report.pdf"), b"OLD-stale-content", old);
+        // This download — fresh mtime, collision variant.
+        write_at(&dir.join("report (1).pdf"), b"NEW-this-download", now);
+
+        let tracker = DownloadTracker::new(dir.clone());
+        tracker
+            .begin(
+                "g".into(),
+                "https://example.com/report.pdf".into(),
+                "report.pdf".into(),
+            )
+            .await;
+        // No explicit CDP path — only the suggested name is known.
+        tracker
+            .progress("g", DownloadState::Completed, None, 17, 17)
+            .await;
+
+        let snap = tracker.snapshot().await;
+        let info = &snap[0];
+        assert!(info.exists);
+        assert_eq!(
+            std::path::Path::new(info.file_path.as_ref().unwrap()),
+            dir.join("report (1).pdf"),
+            "must resolve to THIS download's (1) variant, not the stale base name"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pick_candidate_index_rule_prefers_variant_over_base_without_timestamp() {
+        // With no completion timestamp, the highest collision index wins, and a
+        // numbered variant (index >= 1) beats the base name (index 0) — because
+        // Chrome only creates variants when the base was already taken.
+        let dir = scratch_dir("index-rule");
+        let base = dir.join("doc.pdf");
+        let v1 = dir.join("doc (1).pdf");
+        let v2 = dir.join("doc (2).pdf");
+        std::fs::write(&base, b"a").unwrap();
+        std::fs::write(&v1, b"b").unwrap();
+        std::fs::write(&v2, b"c").unwrap();
+
+        let tracker = DownloadTracker::new(dir.clone());
+        let candidates = tracker.candidate_files("doc.pdf");
+        assert_eq!(candidates.len(), 3, "base + two variants");
+        // No timestamp → index rule → highest variant.
+        let picked = tracker.pick_candidate(candidates, None).unwrap();
+        assert_eq!(picked, v2, "highest-N variant wins under the index rule");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_missing_when_nothing_on_disk() {
+        let dir = scratch_dir("missing");
+        // Nothing written to dir.
+
+        let tracker = DownloadTracker::new(dir.clone());
+        tracker
+            .begin("g".into(), "https://x/gone.bin".into(), "gone.bin".into())
+            .await;
+        tracker
+            .progress("g", DownloadState::Completed, None, 0, 0)
+            .await;
+
+        let snap = tracker.snapshot().await;
+        let info = &snap[0];
+        assert!(!info.exists, "no file on disk → exists:false");
+        assert!(
+            info.file_path.is_none(),
+            "file_path must be None when nothing is found, not a guess"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_trusts_explicit_cdp_path_that_exists() {
+        let dir = scratch_dir("explicit");
+        let real = dir.join("explicit.bin");
+        std::fs::write(&real, b"z").unwrap();
+
+        let tracker = DownloadTracker::new(dir.clone());
+        tracker
+            .begin("g".into(), "https://x/explicit.bin".into(), "explicit.bin".into())
+            .await;
+        // CDP handed us the exact final path.
+        tracker
+            .progress(
+                "g",
+                DownloadState::Completed,
+                Some(real.to_string_lossy().into_owned()),
+                1,
+                1,
+            )
+            .await;
+
+        let snap = tracker.snapshot().await;
+        let info = &snap[0];
+        assert!(info.exists);
+        assert_eq!(
+            std::path::Path::new(info.file_path.as_ref().unwrap()),
+            real
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

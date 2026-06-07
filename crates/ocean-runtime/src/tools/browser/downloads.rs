@@ -67,9 +67,11 @@ impl AgentTool for BrowserDownloadsTool {
     }
     fn description(&self) -> &str {
         "List downloads since browser_enable_downloads — each with its state \
-         (InProgress/Completed/Canceled), the source url, and the resolved local \
-         file path. Use the path of a Completed download to read or process the \
-         file."
+         (InProgress/Completed/Canceled), the source url, the resolved local \
+         file_path, and an `exists` flag. file_path is validated against disk \
+         (resolving browser collision renames like `name (1).pdf`); read or \
+         process it only when `exists` is true. If `exists` is false the file \
+         isn't on disk yet (still downloading) or couldn't be located."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })
