@@ -268,10 +268,20 @@ async fn http_transport_provider_yields_tools() {
                 let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
                 let id = parsed.get("id").cloned();
 
-                // Notification → 202, no body.
+                // Notification → 202, no body. `Connection: close` is load-bearing:
+                // this mock serves exactly one request per accepted socket, so it
+                // must tell the client not to pool/reuse this connection. Without it,
+                // reqwest keeps the (server-closed) socket in its keep-alive pool and,
+                // under the parallel test suite, reuses it for the next handshake
+                // request — racing the server's FIN. That POST then fails, folds into
+                // the provider's non-fatal path, and the provider comes up
+                // `Unavailable` with zero tools ("silently toolless"). Forcing a fresh
+                // connection per request makes the handshake deterministic.
                 if id.is_none() {
                     let _ = sock
-                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
                         .await;
                     return;
                 }
@@ -292,8 +302,12 @@ async fn http_transport_provider_yields_tools() {
                     _ => json!({}),
                 };
                 let payload = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+                // `Connection: close` — see the note on the 202 branch above. One
+                // request per socket means we must opt out of keep-alive so the
+                // client opens a fresh connection for each handshake step instead of
+                // reusing a server-closed one under parallel load.
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
                     payload.len()
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;

@@ -417,9 +417,15 @@ mod tests {
                     let id = parsed.get("id").cloned();
 
                     // Notifications (no id) → 202 with no body, per spec.
+                    // `Connection: close`: this mock serves one request per accepted
+                    // socket, so it must opt out of keep-alive — otherwise reqwest
+                    // pools the server-closed connection and reuses it for the next
+                    // request, racing the FIN under parallel test load.
                     if id.is_none() {
                         let _ = sock
-                            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                            .write_all(
+                                b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                            )
                             .await;
                         return;
                     }
@@ -453,8 +459,11 @@ mod tests {
                     } else {
                         ""
                     };
+                    // `Connection: close` — one request per socket, so opt out of
+                    // keep-alive to avoid the client reusing a server-closed
+                    // connection (see the 202 branch above).
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session_hdr}Content-Length: {}\r\n\r\n{payload}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n{session_hdr}Content-Length: {}\r\n\r\n{payload}",
                         payload.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
