@@ -118,21 +118,36 @@ cargo run -p ocean-cli -- --url http://127.0.0.1:4781 health
 
 ### Model selection
 
-`ocean-agent` reads model config in this order:
+The daemon resolves model selection in this order (`resolve_model_selection` in `crates/ocean-providers/src/lib.rs`):
 
-1. `OCEAN_MODEL`
-2. default `deepseek-chat`
+1. `OCEAN_MODEL` — the explicit choice. The persisted last-used selection is injected here on startup, so a machine that has picked a model before carries it forward as `OCEAN_MODEL`.
+2. `OCEAN_DEFAULT_MODEL` — a cold-machine fallback for a box that has never selected anything.
+3. **Error.** There is **no** hardcoded default model. With neither variable set (and no persisted selection), the daemon returns `ProviderConfigError::NoModelSelected`:
 
-Currently mapped model IDs include:
+   > `no model selected — set OCEAN_MODEL or pick one via POST /v1/model (the daemon never defaults to a model for you)`
+
+So a cold start with no model anywhere fails fast rather than silently picking one. Set `OCEAN_MODEL`, or pick a model via `POST /v1/model` (which persists the selection so it flows back in as `OCEAN_MODEL` next time).
+
+Currently mapped model IDs and their aliases (from `resolve_model_selection`; `known_models()` lists the headline set surfaced to clients):
 
 - `deepseek` / `deepseek-chat`
 - `deepseek-v4-flash`
-- `deepseek-v4-pro` (`deepseek-v4`, `deepseek-pro`, and `DeepSeek V4 Pro` normalize here)
+- `deepseek-v4-pro` (`deepseek-v4`, `deepseek-pro`, `v4-pro`, and `DeepSeek V4 Pro` normalize here)
 - `deepseek-reasoner` / `deepseek-r1`
 - `gpt-4o`
 - `gpt-4o-mini`
+- `gpt-5.5` / `gpt-5-5` (Codex)
+- `gpt-5.4` / `gpt-5-4` (Codex)
+- `gpt-5.4-mini` / `gpt-5-4-mini` (Codex)
+- `gpt-5.3-codex-spark` / `gpt-5-3-codex-spark` (Codex)
 - `claude-sonnet-4-6` / `claude-sonnet` / `sonnet`
 - `claude-opus-4-7` / `claude-opus` / `opus`
+- `minimax` / `minimax-m2` (maps to `MiniMax-M2`)
+- `minimax-m2.7` / `minimax-m2-7` (maps to `MiniMax-M2.7`)
+- `kimi` / `kimi-k2.6` / `kimi-k2-6`
+- `kimi-k2` / `moonshot-v1`
+- `gemini` / `gemini-2.0-flash` / `gemini-2-0-flash`
+- `fake` / `fake-ok`, `fake-tool`, `fake-surface` (keyless test providers)
 
 Any other model ID uses the OpenAI-compatible provider only when `OCEAN_OPENAI_BASE_URL` is set; otherwise it is rejected as unknown.
 
@@ -140,10 +155,20 @@ Historical note: earlier audits found `deepseek-v4-flash` falling through to the
 
 ### API keys
 
-For DeepSeek models, `ocean-agent` looks for:
+For DeepSeek models, the daemon looks for a credential in this order (`credential_env_names` in `crates/ocean-providers/src/lib.rs`):
 
-1. `DEEPSEEK_API_KEY`
-2. `~/.pi/agent/auth.json` at JSON pointer `/deepseek/key`
+1. `OCEAN_DEEPSEEK_API_KEY` (preferred)
+2. `DEEPSEEK_API_KEY`
+3. The Ocean auth file, resolved as `$OCEAN_CONFIG_DIR/auth.json` → `$XDG_CONFIG_HOME/ocean-rs/auth.json` → `$HOME/.config/ocean-rs/auth.json`. The DeepSeek key is read at JSON pointer `/providers/deepseek/api_key`, falling back to `/deepseek/api_key` then `/deepseek/key`. (There is no `~/.pi/agent/auth.json` — that path is never used.)
+
+The same `OCEAN_`-prefixed-first precedence holds for the other providers:
+
+- OpenAI / OpenAI-compatible: `OCEAN_OPENAI_API_KEY` → `OPENAI_API_KEY`
+- Anthropic: `OCEAN_ANTHROPIC_API_KEY` → `ANTHROPIC_API_KEY`
+- MiniMax: `OCEAN_MINIMAX_API_KEY` → `MINIMAX_API_KEY`
+- Kimi / Moonshot: `OCEAN_MOONSHOT_API_KEY` → `MOONSHOT_API_KEY` → `KIMI_API_KEY`
+- Google / Gemini: `OCEAN_GOOGLE_API_KEY` → `GOOGLE_API_KEY` → `GEMINI_API_KEY`
+- OpenAI Codex: no env API key — uses the OAuth token from the `openai-codex` block of the auth file
 
 The current health endpoint reports daemon availability and backend name; it does not fully prove provider credential readiness. Run a prompt smoke test before declaring the runtime healthy.
 

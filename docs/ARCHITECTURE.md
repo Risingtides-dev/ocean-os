@@ -167,7 +167,7 @@ Content::Image (cross-provider vision) — WIRED on the model wire path; one
   The old "OpenAI text-only / Gemini has no Image arm" claim is OBSOLETE — a
   screenshot taken mid-turn now reaches every provider's model.
   REMAINING GAP (LOW sev, display-only): the daemon's transcript flattener
-  `text_from_content` (`crates/ocean-agent/src/lib.rs:1762-1772`) still drops
+  `text_from_content` (`crates/ocean-agent/src/lib.rs:1806-1816`) still drops
   `Content::Image` — it keeps only `Text`/`Thinking`. This affects ONLY the
   human-readable transcript returned by `GET /v1/sessions/{id}`, NOT the model
   wire path. So a session-detail view shows an image-bearing turn as text-only,
