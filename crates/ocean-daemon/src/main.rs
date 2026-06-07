@@ -3967,6 +3967,7 @@ async fn agent_turn(
                     tool_name: _,
                     is_error,
                     content,
+                    details,
                     ..
                 } => {
                     let call_id = tool_call_ids
@@ -3980,7 +3981,12 @@ async fn agent_turn(
                         result: ToolResult {
                             ok: !is_error,
                             output,
-                            metadata_json: None,
+                            // Forward the runtime's structured tool-result
+                            // details (exit codes, counts, perf, …) to clients.
+                            // The runtime uses `Value::Null` to mean "no
+                            // metadata"; collapse that to `None` so the SDK
+                            // field stays absent rather than carrying a null.
+                            metadata_json: metadata_from_details(details),
                         },
                     });
                 }
@@ -4733,6 +4739,18 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
         AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
         AgentTurnEvent::BrowserActivity { .. } => "browser_activity",
         AgentTurnEvent::SurfacePatch { .. } => "surface_patch",
+    }
+}
+
+/// Map a runtime tool result's `details` (`serde_json::Value`) onto the SDK
+/// `ToolResult.metadata_json` (`Option<Value>`). The runtime represents "no
+/// structured metadata" as `Value::Null`; the SDK represents it as `None`, so
+/// collapse `Null` to `None` and forward any real value as `Some(..)`.
+fn metadata_from_details(details: Value) -> Option<Value> {
+    if details.is_null() {
+        None
+    } else {
+        Some(details)
     }
 }
 
@@ -6578,5 +6596,56 @@ mod tests {
         );
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    // ---- Tool-result metadata forwarding (OCEAN-203) -----------------------
+
+    /// A runtime tool result carrying structured `details` must round-trip into
+    /// the SDK `ToolResult.metadata_json` — not be dropped to `None`. This is
+    /// the exact mapping the `ToolExecutionEnd` bridge applies.
+    #[test]
+    fn tool_details_forward_into_metadata_json() {
+        // Stand in for `AgentEvent::ToolExecutionEnd.details` (serde_json Value).
+        let details = json!({ "exit_code": 0, "files": 3 });
+
+        let result = ToolResult {
+            ok: true,
+            output: "done".into(),
+            metadata_json: metadata_from_details(details.clone()),
+        };
+
+        assert_eq!(
+            result.metadata_json,
+            Some(details),
+            "runtime tool-result details must reach the SDK ToolResult.metadata_json"
+        );
+    }
+
+    /// A tool result with no structured detail (`Value::Null`) must yield
+    /// `None` — no spurious/null metadata leaking to clients.
+    #[test]
+    fn tool_null_details_yield_none_metadata() {
+        let result = ToolResult {
+            ok: true,
+            output: "done".into(),
+            metadata_json: metadata_from_details(Value::Null),
+        };
+
+        assert_eq!(
+            result.metadata_json, None,
+            "absent runtime details (Value::Null) must stay None, not Some(null)"
+        );
+    }
+
+    /// The `PermissionDenied` bridge site has no runtime details to forward, so
+    /// it legitimately emits `None`. Lock that in so it isn't mistaken for a bug.
+    #[test]
+    fn permission_denied_result_has_no_metadata() {
+        let result = ToolResult {
+            ok: false,
+            output: "permission denied for bash: not allowed".into(),
+            metadata_json: None,
+        };
+        assert_eq!(result.metadata_json, None);
     }
 }

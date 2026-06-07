@@ -265,6 +265,10 @@ pub enum AgentEvent {
         tool_name: String,
         is_error: bool,
         content: Vec<Content>,
+        /// Structured tool-result metadata produced by the tool
+        /// (`AgentToolResult.details`): exit codes, counts, perf, etc.
+        /// `Value::Null` when the tool produced no structured detail.
+        details: Value,
     },
     /// Permission denied for a tool call (the loop appended an error tool result).
     PermissionDenied {
