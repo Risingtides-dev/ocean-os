@@ -430,6 +430,19 @@ pub async fn run_agent_with_history(
                             },
                         );
                     }
+                    ToolSideEffect::SlackCanvas { op } => {
+                        // OCEAN-214 ph2: forward the validated slack_canvas op onto
+                        // the event bus stamped with this run's session id. The
+                        // Slack canvas bridge (a later phase) consumes it and
+                        // round-trips to the Slack Canvas API.
+                        emit(
+                            &events,
+                            AgentEvent::SlackCanvas {
+                                session_id: sid.clone(),
+                                op: op.clone(),
+                            },
+                        );
+                    }
                 }
             }
             // The live SSE display (ToolExecutionEnd above) got the FULL output.
