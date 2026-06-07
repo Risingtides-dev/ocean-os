@@ -1,6 +1,67 @@
 use anyhow::Context;
-use clap::{Parser, Subcommand};
-use ocean_core::{HealthResponse, PromptRequest, PromptResponse, SessionId, SessionResponse};
+use clap::{Parser, Subcommand, ValueEnum};
+use ocean_core::{
+    EventEnvelope, HealthResponse, OceanEvent, PermissionDecision, PermissionDecisionRequest,
+    PromptRequest, PromptResponse, SessionId, SessionResponse,
+};
+use std::io::{IsTerminal, Write};
+
+/// How the CLI answers a daemon `PermissionRequest` when it is NOT attached to
+/// an interactive terminal (piped / CI). In a TTY the operator is prompted
+/// directly and this mode is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[value(rename_all = "lower")]
+enum PermissionMode {
+    /// Prompt interactively if a TTY is present; otherwise DENY (safe default).
+    #[default]
+    Prompt,
+    /// Auto-allow every gated tool call for the rest of the run (allow_session).
+    Allow,
+    /// Auto-deny every gated tool call.
+    Deny,
+}
+
+/// Parse `OCEAN_CLI_PERMISSION` into a [`PermissionMode`]. Unknown values fall
+/// back to `Prompt` (the safe interactive-or-deny default).
+fn permission_mode_from_env() -> Option<PermissionMode> {
+    let raw = std::env::var("OCEAN_CLI_PERMISSION").ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "prompt" => Some(PermissionMode::Prompt),
+        "allow" => Some(PermissionMode::Allow),
+        "deny" => Some(PermissionMode::Deny),
+        _ => None,
+    }
+}
+
+/// The pure policy core (unit-tested): given the configured mode and whether
+/// stdin is an interactive TTY, decide how a gated tool call resolves WITHOUT
+/// any interactive prompt.
+///
+/// Returns `None` only for `Prompt` + TTY, which means "ask the operator"
+/// (handled by the caller, which reads stdin). Every non-interactive path
+/// resolves deterministically here:
+/// - `Prompt` + no TTY  -> Deny   (never silent-allow)
+/// - `Allow`            -> AllowSession
+/// - `Deny`             -> Deny
+fn resolve_permission(mode: PermissionMode, is_tty: bool) -> Option<PermissionDecision> {
+    match mode {
+        PermissionMode::Allow => Some(PermissionDecision::AllowSession),
+        PermissionMode::Deny => Some(PermissionDecision::Deny {
+            reason: Some("denied by --permission-mode deny".into()),
+        }),
+        PermissionMode::Prompt => {
+            if is_tty {
+                None
+            } else {
+                Some(PermissionDecision::Deny {
+                    reason: Some(
+                        "no approval path in non-interactive mode; pass --permission-mode allow or run interactively".into(),
+                    ),
+                })
+            }
+        }
+    }
+}
 
 fn resolve_cwd(project: Option<&str>) -> String {
     // OCEAN_PROJECT env var takes lowest precedence among explicit overrides
@@ -40,8 +101,19 @@ enum Cmd {
     Health,
     Prompt {
         prompt: Vec<String>,
+        /// Auto-approve all tool calls daemon-side (sets the legacy `yolo` bit on
+        /// the turn). Must be EXPLICIT — equivalent to `--permission-mode allow`
+        /// but skips the gate entirely in the daemon rather than answering each
+        /// prompt. Never silent: you have to ask for it.
         #[arg(long)]
         yolo: bool,
+        /// How to answer gated tool calls when NOT attached to a TTY (piped/CI).
+        /// In an interactive terminal you are prompted regardless. Falls back to
+        /// the `OCEAN_CLI_PERMISSION` env var, then defaults to `prompt`
+        /// (interactive-or-deny). Non-interactive default is DENY — never a
+        /// silent allow.
+        #[arg(long, value_enum)]
+        permission_mode: Option<PermissionMode>,
         #[arg(long)]
         max_turns: Option<u32>,
     },
@@ -88,6 +160,148 @@ fn urlencoding(s: &str) -> String {
     out
 }
 
+/// POST a decision to the daemon's `/v1/permissions/{id}/decision` endpoint,
+/// releasing the runtime waiter the gated tool call is blocked on.
+async fn post_decision(
+    client: &reqwest::Client,
+    base_url: &str,
+    permission_id: uuid::Uuid,
+    decision: PermissionDecision,
+) -> anyhow::Result<()> {
+    let body = PermissionDecisionRequest {
+        permission_id,
+        decision,
+    };
+    let url = format!(
+        "{}/v1/permissions/{}/decision",
+        base_url.trim_end_matches('/'),
+        permission_id
+    );
+    client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?
+        .error_for_status()
+        .context("daemon rejected the permission decision")?;
+    Ok(())
+}
+
+/// Interactively ask the operator how to resolve a gated tool call. Reads a
+/// single line from stdin; `[a]llow once / allow [s]ession / [d]eny` (default
+/// deny on EOF/empty/unknown). Blocking stdin is fine here — the SSE task is a
+/// separate tokio task and the main turn is just awaiting the HTTP response.
+fn prompt_operator(tool: &str, reason: &str) -> PermissionDecision {
+    eprint!(
+        "\n[ocean-rs] tool '{tool}' wants to run: {reason}\n  [a]llow once / allow [s]ession / [d]eny (default: deny) > "
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return PermissionDecision::Deny {
+            reason: Some("operator input unavailable".into()),
+        };
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "a" | "allow" | "y" | "yes" => PermissionDecision::Allow,
+        "s" | "session" => PermissionDecision::AllowSession,
+        _ => PermissionDecision::Deny {
+            reason: Some("denied by operator".into()),
+        },
+    }
+}
+
+/// Watch the daemon's `/v1/events` SSE feed for `PermissionRequest`s scoped to
+/// our turn's `request_id` and resolve each one (TTY prompt or policy default),
+/// POSTing the decision so the blocked turn unblocks.
+///
+/// Mirrors the ACP permission bridge (OCEAN-146): subscribe BEFORE the turn is
+/// submitted so a gated tool call's `PermissionRequest` is never missed even
+/// though `/v1/prompt` stays blocked the whole time. Because the CLI mints its
+/// own `request_id` and sets it on the request, we already know what to match —
+/// no need to wait for a `TurnStarted` to learn it.
+///
+/// Runs until the daemon emits a terminal event (`TurnFinished` / `Cancelled` /
+/// `Error`) for our turn or the stream closes; the caller also aborts it once
+/// the HTTP turn returns.
+async fn permission_bridge(
+    client: reqwest::Client,
+    base_url: String,
+    request_id: uuid::Uuid,
+    mode: PermissionMode,
+    is_tty: bool,
+    resp: reqwest::Response,
+) {
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => return, // stream closed
+            Err(err) => {
+                eprintln!("[ocean-rs] permission event stream error: {err}");
+                return;
+            }
+        };
+        buf.extend_from_slice(&chunk);
+
+        // Drain complete lines from the buffer; SSE frames are newline-delimited
+        // `field: value` lines and we only care about `data:` payloads (each is
+        // a fully self-describing EventEnvelope).
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let line = String::from_utf8_lossy(&line);
+            let Some(rest) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = rest.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            let envelope: EventEnvelope = match serde_json::from_str(payload) {
+                Ok(ev) => ev,
+                // Keep-alives / unknown frames (`{"type":"error",...}`) — skip.
+                Err(_) => continue,
+            };
+
+            // The control feed is global; scope to OUR turn.
+            if envelope.request_id != Some(request_id) {
+                continue;
+            }
+
+            match &envelope.event {
+                OceanEvent::PermissionRequest { tool, reason, .. } => {
+                    let Some(permission_id) = envelope.permission_id else {
+                        continue;
+                    };
+                    let decision = match resolve_permission(mode, is_tty) {
+                        Some(d) => d,
+                        // Prompt + TTY: ask the operator.
+                        None => prompt_operator(tool, reason),
+                    };
+                    if matches!(decision, PermissionDecision::Deny { .. }) && !is_tty {
+                        eprintln!(
+                            "[ocean-rs] tool '{tool}' denied: no approval path in non-interactive mode; pass --permission-mode allow or run interactively"
+                        );
+                    }
+                    if let Err(err) =
+                        post_decision(&client, &base_url, permission_id, decision).await
+                    {
+                        eprintln!("[ocean-rs] failed to POST permission decision: {err}");
+                    }
+                }
+                OceanEvent::TurnFinished { .. }
+                | OceanEvent::Cancelled { .. }
+                | OceanEvent::Error { .. } => {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -111,12 +325,58 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Prompt {
             prompt,
             yolo,
+            permission_mode,
             max_turns,
         } => {
             let prompt = prompt.join(" ");
             anyhow::ensure!(!prompt.trim().is_empty(), "prompt required");
+
+            // CLI mints the turn's request_id so the permission bridge knows
+            // exactly which `PermissionRequest`s on the global control feed are
+            // ours — no need to wait for a `TurnStarted` to learn it.
+            let request_id = uuid::Uuid::new_v4();
+            let mode = permission_mode
+                .or_else(permission_mode_from_env)
+                .unwrap_or_default();
+            // stdin TTY drives interactivity: a piped/CI invocation can't answer
+            // a prompt, so it falls back to the policy default (DENY unless an
+            // explicit allow mode / --yolo was given).
+            let is_tty = std::io::stdin().is_terminal();
+
+            // Subscribe to the control event stream BEFORE submitting the turn so
+            // a gated tool call's PermissionRequest is never missed while
+            // /v1/prompt blocks (yolo turns never gate, but the subscription is
+            // harmless and self-terminates on TurnFinished). Skipped under
+            // --yolo: the daemon auto-approves, so there's nothing to bridge.
+            let bridge = if yolo {
+                None
+            } else {
+                match client
+                    .get(format!("{}/v1/events", cli.url.trim_end_matches('/')))
+                    .header("Accept", "text/event-stream")
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status())
+                {
+                    Ok(resp) => Some(tokio::spawn(permission_bridge(
+                        client.clone(),
+                        cli.url.clone(),
+                        request_id,
+                        mode,
+                        is_tty,
+                        resp,
+                    ))),
+                    Err(err) => {
+                        eprintln!(
+                            "[ocean-rs] warning: could not subscribe to permission events ({err}); gated tool calls may hang"
+                        );
+                        None
+                    }
+                }
+            };
+
             let req = PromptRequest {
-                request_id: None,
+                request_id: Some(request_id),
                 prompt,
                 images: None,
                 session_id: None,
@@ -127,14 +387,24 @@ async fn main() -> anyhow::Result<()> {
                 project_id: None,
                 client_type: Some("cli".into()),
             };
-            let res: PromptResponse = client
-                .post(format!("{}/v1/prompt", cli.url))
-                .json(&req)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+            let res: anyhow::Result<PromptResponse> = async {
+                Ok(client
+                    .post(format!("{}/v1/prompt", cli.url))
+                    .json(&req)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?)
+            }
+            .await;
+
+            // The turn returned (or failed): tear the bridge down regardless.
+            if let Some(handle) = bridge {
+                handle.abort();
+            }
+            let res = res?;
+
             if !res.stderr.trim().is_empty() {
                 eprintln!("{}", res.stderr.trim_end());
             }
@@ -228,5 +498,93 @@ mod tests {
         assert!(footer.contains("cache_read=5"));
         assert!(footer.contains("cache_write=3"));
         assert!(footer.contains("total=38"));
+    }
+
+    // --- permission policy core (OCEAN-212) --------------------------------
+    //
+    // `resolve_permission` is the testable heart of the approval path: it must
+    // NEVER silent-allow a gated tool call in a non-interactive context. These
+    // assertions pin that contract.
+
+    #[test]
+    fn non_interactive_no_flag_denies() {
+        // Default mode (Prompt) without a TTY must DENY, never silent-allow.
+        let d = resolve_permission(PermissionMode::Prompt, false)
+            .expect("non-interactive prompt mode must resolve to a decision, not ask");
+        assert!(matches!(d, PermissionDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn interactive_prompt_defers_to_operator() {
+        // Prompt + TTY returns None: caller must ask the operator via stdin.
+        assert!(resolve_permission(PermissionMode::Prompt, true).is_none());
+    }
+
+    #[test]
+    fn allow_mode_allows_session_regardless_of_tty() {
+        for tty in [true, false] {
+            let d = resolve_permission(PermissionMode::Allow, tty)
+                .expect("allow mode resolves without asking");
+            assert!(matches!(d, PermissionDecision::AllowSession));
+        }
+    }
+
+    #[test]
+    fn deny_mode_denies_regardless_of_tty() {
+        for tty in [true, false] {
+            let d = resolve_permission(PermissionMode::Deny, tty)
+                .expect("deny mode resolves without asking");
+            assert!(matches!(d, PermissionDecision::Deny { .. }));
+        }
+    }
+
+    #[test]
+    fn env_parses_known_values_and_rejects_garbage() {
+        std::env::set_var("OCEAN_CLI_PERMISSION", "allow");
+        assert_eq!(permission_mode_from_env(), Some(PermissionMode::Allow));
+        std::env::set_var("OCEAN_CLI_PERMISSION", "DENY");
+        assert_eq!(permission_mode_from_env(), Some(PermissionMode::Deny));
+        std::env::set_var("OCEAN_CLI_PERMISSION", "prompt");
+        assert_eq!(permission_mode_from_env(), Some(PermissionMode::Prompt));
+        std::env::set_var("OCEAN_CLI_PERMISSION", "bananas");
+        assert_eq!(permission_mode_from_env(), None);
+        std::env::remove_var("OCEAN_CLI_PERMISSION");
+        assert_eq!(permission_mode_from_env(), None);
+    }
+
+    #[test]
+    fn permission_request_envelope_scoped_to_our_turn_decodes() {
+        // Integration-shaped check: a real PermissionRequest envelope (the exact
+        // shape the bridge filters on) must decode, carry our request_id, and a
+        // scripted "allow" decision must produce the AllowSession wire body that
+        // unblocks the daemon waiter.
+        let request_id = uuid::Uuid::new_v4();
+        let permission_id = uuid::Uuid::new_v4();
+        let raw = serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "at": "2026-06-07T00:00:00Z",
+            "request_id": request_id,
+            "permission_id": permission_id,
+            "type": "permission_request",
+            "tool": "write_file",
+            "reason": "modify /etc/hosts",
+            "args": {"path": "/etc/hosts"}
+        });
+        let env: EventEnvelope = serde_json::from_value(raw).expect("decode envelope");
+        assert_eq!(env.request_id, Some(request_id));
+        assert_eq!(env.permission_id, Some(permission_id));
+        assert!(matches!(env.event, OceanEvent::PermissionRequest { .. }));
+
+        // Scripted allow (operator chose allow-session) → wire body the daemon
+        // decision endpoint expects.
+        let decision = resolve_permission(PermissionMode::Allow, true)
+            .expect("allow resolves without asking");
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision,
+        };
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire["decision"], "allow_session");
+        assert_eq!(wire["permission_id"], permission_id.to_string());
     }
 }
