@@ -211,7 +211,7 @@ A healthy prompt path should return assistant text plus a stderr footer like:
 [ocean-rs: ok=true wall=<ms>ms rss=daemon]
 ```
 
-Current CLI caveat: the CLI can print `ok=false` from the daemon yet still exit successfully. Operators must inspect the footer until CLI exit-code behavior is hardened.
+CLI exit-code behavior (fixed, OCEAN-189): the CLI now exits non-zero when the daemon returns `ok=false` (stdout is still printed first, so output isn't lost). The footer also reports per-turn token usage.
 
 ### Health & readiness — which probe to use
 
@@ -575,7 +575,7 @@ If the prompt reports a missing OpenAI key while you expected DeepSeek, check `O
 
 ### CLI reports `ok=false`
 
-Inspect stderr/stdout and the footer. Current CLI behavior may still exit with status 0 for an `ok=false` daemon response, so scripts should parse the JSON API or footer until fixed.
+Inspect stderr/stdout and the footer. As of OCEAN-189 the CLI exits non-zero on an `ok=false` daemon response (after printing stdout), so scripts can rely on the exit code; the footer also surfaces token usage for cost visibility.
 
 ### Permission/tool action stalls
 
