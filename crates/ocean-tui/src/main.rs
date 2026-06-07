@@ -3633,6 +3633,24 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
     }
 }
 
+/// Attach the SSE `Last-Event-ID` request header when we have a last-seen id,
+/// so the daemon replays buffered events newer than that id on reconnect
+/// (OCEAN-129 / OCEAN-190). On the FIRST connect there is no id yet, so the
+/// header is omitted and the daemon streams from the current position.
+///
+/// The id we carry is the raw SSE `id:` string the daemon emitted (a UUID
+/// string); the daemon matches `Last-Event-ID` by `Uuid::parse_str`, so passing
+/// the unmodified string back is exactly what its replay path expects.
+fn with_last_event_id(
+    builder: reqwest::blocking::RequestBuilder,
+    last_event_id: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match last_event_id {
+        Some(id) if !id.is_empty() => builder.header("Last-Event-ID", id),
+        _ => builder,
+    }
+}
+
 fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
     thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder().build() {
@@ -3648,6 +3666,12 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
 
         let events_url = format!("{}/v1/events", url.trim_end_matches('/'));
 
+        // The SSE `id:` of the last event we successfully handed off. Owned by the
+        // spawn loop so it survives reconnects: on reconnect we replay it as
+        // `Last-Event-ID` and the daemon resends everything dropped in the gap
+        // (OCEAN-190). `None` on first connect — no replay, stream from current.
+        let mut last_event_id: Option<String> = None;
+
         loop {
             if tx
                 .send(Action::StreamStatus("connecting /v1/events".to_string()))
@@ -3656,9 +3680,12 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
                 break;
             }
 
-            let response = match client
-                .get(&events_url)
-                .header("Accept", "text/event-stream")
+            let response = match with_last_event_id(
+                client
+                    .get(&events_url)
+                    .header("Accept", "text/event-stream"),
+                last_event_id.as_deref(),
+            )
                 .send()
                 .and_then(|res| res.error_for_status())
             {
@@ -3689,6 +3716,8 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
             let mut line = String::new();
             let mut event_name = String::new();
             let mut data_lines: Vec<String> = Vec::new();
+            // The `id:` of the frame currently being assembled, if any.
+            let mut frame_id: Option<String> = None;
 
             loop {
                 line.clear();
@@ -3697,6 +3726,12 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
                     Ok(_) => {
                         let line = line.trim_end_matches(['\r', '\n']);
                         if line.is_empty() {
+                            // Per SSE, the last `id:` seen becomes the stream's
+                            // last-event-id at dispatch — persist it across
+                            // reconnects so the next connect replays from here.
+                            if let Some(id) = frame_id.take() {
+                                last_event_id = Some(id);
+                            }
                             if !data_lines.is_empty() {
                                 let payload = data_lines.join("\n");
                                 match parse_event_envelope(&payload) {
@@ -3730,6 +3765,11 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
                         }
 
                         if line.starts_with(':') {
+                            continue;
+                        }
+
+                        if let Some(rest) = line.strip_prefix("id:") {
+                            frame_id = Some(rest.trim().to_string());
                             continue;
                         }
 
@@ -3817,6 +3857,13 @@ fn spawn_daemon_agent_event_stream(
 
         let base_url = format!("{}/v1/agent/events", url.trim_end_matches('/'));
 
+        // SSE `id:` of the last agent event we handed off, persisted across
+        // reconnects so a network blip replays the gap via `Last-Event-ID`
+        // (OCEAN-190). Reset to `None` on a deliberate session switch below: the
+        // new `?session_id=` scope is a different event space, so the previous
+        // session's id must not leak into its replay request.
+        let mut last_event_id: Option<String> = None;
+
         loop {
             // Re-read the active session on each (re)connect and pin THIS
             // connection to that scope. The read loop below watches for the
@@ -3829,9 +3876,12 @@ fn spawn_daemon_agent_event_stream(
                 None => base_url.clone(),
             };
 
-            let response = match client
-                .get(&events_url)
-                .header("Accept", "text/event-stream")
+            let response = match with_last_event_id(
+                client
+                    .get(&events_url)
+                    .header("Accept", "text/event-stream"),
+                last_event_id.as_deref(),
+            )
                 .send()
                 .and_then(|res| res.error_for_status())
             {
@@ -3855,6 +3905,8 @@ fn spawn_daemon_agent_event_stream(
             let mut line = String::new();
             let mut event_name = String::new();
             let mut data_lines: Vec<String> = Vec::new();
+            // The `id:` of the frame currently being assembled, if any.
+            let mut frame_id: Option<String> = None;
             // True when we tore the stream down because the active session
             // changed (not an error/EOF). A deliberate switch reconnects
             // immediately; only error/EOF backs off before retrying.
@@ -3878,6 +3930,12 @@ fn spawn_daemon_agent_event_stream(
                     Ok(_) => {
                         let trimmed = line.trim_end_matches(['\r', '\n']);
                         if trimmed.is_empty() {
+                            // Per SSE, the last `id:` seen becomes the stream's
+                            // last-event-id at dispatch — persist it across
+                            // reconnects so the next connect replays from here.
+                            if let Some(id) = frame_id.take() {
+                                last_event_id = Some(id);
+                            }
                             if !data_lines.is_empty() {
                                 let payload = data_lines.join("\n");
                                 match parse_agent_turn_event(&payload) {
@@ -3929,6 +3987,11 @@ fn spawn_daemon_agent_event_stream(
                             continue;
                         }
 
+                        if let Some(rest) = trimmed.strip_prefix("id:") {
+                            frame_id = Some(rest.trim().to_string());
+                            continue;
+                        }
+
                         if let Some(rest) = trimmed.strip_prefix("event:") {
                             event_name = rest.trim().to_string();
                             continue;
@@ -3944,7 +4007,12 @@ fn spawn_daemon_agent_event_stream(
 
             // A deliberate session switch reconnects right away (re-scope now);
             // an error/EOF backs off to avoid hammering the daemon.
-            if !scope_changed {
+            if scope_changed {
+                // New `?session_id=` scope is a different event space; the old
+                // session's last-event-id would replay the wrong stream, so drop
+                // it and let the reconnect start fresh for the new scope.
+                last_event_id = None;
+            } else {
                 thread::sleep(Duration::from_secs(2));
             }
         }
@@ -6434,6 +6502,50 @@ mod tests {
                 .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
         });
         assert!(any_bold, "no bold spans emitted from markdown");
+    }
+
+    #[test]
+    fn last_event_id_header_present_when_id_known() {
+        // OCEAN-190: a reconnect with a known last-seen id must carry
+        // `Last-Event-ID` so the daemon replays the events dropped in the gap.
+        let client = reqwest::blocking::Client::new();
+        let builder = client
+            .get("http://127.0.0.1:4780/v1/events")
+            .header("Accept", "text/event-stream");
+        let req = with_last_event_id(builder, Some("550e8400-e29b-41d4-a716-446655440000"))
+            .build()
+            .expect("build request");
+        assert_eq!(
+            req.headers()
+                .get("Last-Event-ID")
+                .and_then(|v| v.to_str().ok()),
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+        );
+    }
+
+    #[test]
+    fn last_event_id_header_absent_on_first_connect() {
+        // First connect has no id yet — omit the header so the daemon streams
+        // from the current position instead of attempting a (no-op) replay.
+        let client = reqwest::blocking::Client::new();
+        let builder = client
+            .get("http://127.0.0.1:4780/v1/events")
+            .header("Accept", "text/event-stream");
+        let req = with_last_event_id(builder, None)
+            .build()
+            .expect("build request");
+        assert!(req.headers().get("Last-Event-ID").is_none());
+    }
+
+    #[test]
+    fn last_event_id_header_absent_for_empty_id() {
+        // Defensive: an empty id string is treated as "no id".
+        let client = reqwest::blocking::Client::new();
+        let builder = client.get("http://127.0.0.1:4780/v1/events");
+        let req = with_last_event_id(builder, Some(""))
+            .build()
+            .expect("build request");
+        assert!(req.headers().get("Last-Event-ID").is_none());
     }
 
     #[test]
