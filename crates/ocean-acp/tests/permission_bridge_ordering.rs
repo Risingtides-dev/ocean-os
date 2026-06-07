@@ -431,6 +431,13 @@ async fn synchronous_submit_failure_does_not_hang() {
     // fires → hang. With it, the Err is surfaced. We bound the whole thing in a
     // timeout so a regression (reverting to event-only) FAILS loudly.
     let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+        // Deliberately mirrors `run_turn`'s `loop { select! { ... } }` shape so a
+        // regression (reverting to event-only) hangs and fails the timeout. Each
+        // arm returns on its first resolution, so clippy's deny-by-default
+        // `never_loop` fires; that's the intended shape, not a bug. (OCEAN-191:
+        // this `#[allow]` lets the new `cargo clippy --all-targets` CI gate pass,
+        // since the lint is deny-by-default and would hard-error the job.)
+        #[allow(clippy::never_loop)]
         loop {
             tokio::select! {
                 biased;
