@@ -1223,4 +1223,122 @@ mod tests {
             (StopReason::Length, false)
         );
     }
+
+    // OCEAN-198: a functionCall WITHOUT a wire id (older Gemini models omit it)
+    // must decode with `id: None`. The stream loop then synthesizes a
+    // deterministic `call_<n>` so ordering is preserved — this guards the decode
+    // half of that fallback (the loop computes the id from tool_blocks.len()).
+    #[test]
+    fn function_call_without_id_decodes_to_none() {
+        let wire = r#"{"name": "get_temp", "args": {"city": "Paris"}}"#;
+        let fc: FunctionCall = serde_json::from_str(wire).expect("idless functionCall decodes");
+        assert!(fc.id.is_none(), "an absent functionCall.id must decode to None");
+        assert_eq!(fc.name, "get_temp");
+        assert_eq!(fc.args["city"], "Paris");
+
+        // Mirror the loop's exact synthesis for the first idless call: the loop
+        // uses `tool_blocks.len() + 1`, which is 1 for the first (zero existing).
+        let existing_calls = 0usize; // == tool_blocks.len() for the first call
+        let synthesized = fc
+            .id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("call_{}", existing_calls + 1));
+        assert_eq!(synthesized, "call_1", "idless call must synthesize a deterministic ordered id");
+    }
+
+    // OCEAN-198: an empty-string functionCall.id must ALSO fall back to the
+    // synthesized id — the loop filters on `!s.is_empty()`, so a present-but-empty
+    // id is treated the same as absent. Guards against an empty id silently
+    // breaking parallel same-tool disambiguation.
+    #[test]
+    fn function_call_empty_id_falls_back_to_synthesized() {
+        let wire = r#"{"id": "", "name": "f", "args": {}}"#;
+        let fc: FunctionCall = serde_json::from_str(wire).expect("decodes");
+        // Pretend two calls already streamed, so the synthesized id is call_3.
+        let existing_calls = 2usize; // == tool_blocks.len()
+        let id = fc
+            .id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("call_{}", existing_calls + 1));
+        assert_eq!(id, "call_3", "an empty id must be replaced by the synthesized ordered id");
+    }
+
+    // OCEAN-198: a functionCall with NO `args` key decodes `args` to JSON null
+    // (serde default for Value), and the loop forwards it as-is. The decode must
+    // not fail or panic on a zero-arg tool call.
+    #[test]
+    fn function_call_without_args_decodes_to_null() {
+        let wire = r#"{"name": "ping"}"#;
+        let fc: FunctionCall = serde_json::from_str(wire).expect("argless functionCall decodes");
+        assert_eq!(fc.name, "ping");
+        assert!(fc.args.is_null(), "a missing args field defaults to JSON null");
+    }
+
+    // OCEAN-198: usageMetadata that OMITS the cache + thoughts fields decodes them
+    // to zero (serde defaults), not a parse error — a turn with no cache/reasoning
+    // must not panic the decode or report garbage.
+    #[test]
+    fn usage_metadata_missing_optional_fields_defaults_to_zero() {
+        let wire = r#"{"promptTokenCount": 50, "candidatesTokenCount": 10, "totalTokenCount": 60}"#;
+        let u: UsageMetadata = serde_json::from_str(wire).expect("minimal usageMetadata decodes");
+        assert_eq!(u.prompt_token_count, 50);
+        assert_eq!(u.candidates_token_count, 10);
+        assert_eq!(u.total_token_count, 60);
+        assert_eq!(u.cached_content_token_count, 0, "missing cache count → 0");
+        assert_eq!(u.thoughts_token_count, 0, "missing thoughts count → 0");
+    }
+
+    // OCEAN-198: an entirely empty usageMetadata object decodes to all zeros —
+    // the loop must never panic on a usage frame that omits everything.
+    #[test]
+    fn usage_metadata_empty_object_is_all_zeros() {
+        let u: UsageMetadata = serde_json::from_str("{}").expect("empty usageMetadata decodes");
+        assert_eq!(u.prompt_token_count, 0);
+        assert_eq!(u.total_token_count, 0);
+        assert_eq!(u.cached_content_token_count, 0);
+    }
+
+    // OCEAN-198: a chunk that is missing candidates entirely (e.g. a usage-only
+    // tail chunk, or a prompt-feedback-only chunk) decodes to a Chunk with an
+    // empty candidates Vec — the loop iterates zero candidates and moves on, no
+    // panic, no unwrap.
+    #[test]
+    fn chunk_without_candidates_decodes_to_empty_vec() {
+        let wire = r#"{"usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5}}"#;
+        let chunk: Chunk = serde_json::from_str(wire).expect("candidate-less chunk decodes");
+        assert!(chunk.candidates.is_empty(), "absent candidates → empty Vec, not error");
+        assert!(chunk.usage_metadata.is_some(), "usage-only tail chunk still carries usage");
+    }
+
+    // OCEAN-198: a malformed/garbage SSE frame must surface as a decode Err so the
+    // loop's `Err(e) => { debug!; continue }` skip path fires — a single bad frame
+    // must NOT be parseable into a bogus Chunk that would corrupt state.
+    #[test]
+    fn malformed_chunk_surfaces_as_decode_error() {
+        assert!(
+            serde_json::from_str::<Chunk>("not json at all").is_err(),
+            "a non-JSON Gemini frame must error so the loop skips it"
+        );
+        // A candidate missing its `content` is still valid (content is optional) —
+        // it must decode, not error, so a finish-reason-only chunk works.
+        let wire = r#"{"candidates": [{"finishReason": "STOP"}]}"#;
+        let chunk: Chunk = serde_json::from_str(wire).expect("content-less candidate decodes");
+        assert!(chunk.candidates[0].content.is_none(), "content is optional");
+        assert_eq!(chunk.candidates[0].finish_reason.as_deref(), Some("STOP"));
+    }
+
+    // OCEAN-198: the thinking_budget mapper covers every ThinkingLevel, with Off
+    // → None (omit thinkingConfig) and the ascending budgets pinned. Guards the
+    // free function build_body relies on.
+    #[test]
+    fn thinking_budget_maps_every_level() {
+        assert_eq!(thinking_budget(ThinkingLevel::Off), None);
+        assert_eq!(thinking_budget(ThinkingLevel::Minimal), Some(1024));
+        assert_eq!(thinking_budget(ThinkingLevel::Low), Some(2048));
+        assert_eq!(thinking_budget(ThinkingLevel::Medium), Some(8192));
+        assert_eq!(thinking_budget(ThinkingLevel::High), Some(16384));
+        assert_eq!(thinking_budget(ThinkingLevel::Xhigh), Some(24576));
+    }
 }

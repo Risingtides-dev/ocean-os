@@ -1307,4 +1307,190 @@ mod tests {
             "reasoning_tokens must decode from completion_tokens_details"
         );
     }
+
+    // OCEAN-198: the finish_reason mapper must be exhaustive over OpenAI's wire
+    // values AND fall back to a clean Stop for unknown/empty values, never
+    // panicking. An unexpected string the API might add later must default to Stop.
+    #[test]
+    fn map_finish_reason_handles_unknown_and_empty() {
+        // Every documented value.
+        assert_eq!(map_finish_reason("stop"), StopReason::Stop);
+        assert_eq!(map_finish_reason("tool_calls"), StopReason::ToolUse);
+        assert_eq!(map_finish_reason("length"), StopReason::Length);
+        assert_eq!(map_finish_reason("content_filter"), StopReason::Error);
+        // Unknown / future / empty values must NOT panic — default to Stop.
+        assert_eq!(map_finish_reason("function_call"), StopReason::Stop);
+        assert_eq!(map_finish_reason(""), StopReason::Stop);
+        assert_eq!(map_finish_reason("🤖"), StopReason::Stop);
+    }
+
+    // OCEAN-198: a single tool call delivered across several `delta.tool_calls`
+    // fragments (id+name on the first, argument JSON split across the rest) must
+    // assemble — by upstream `index` — into one complete call. This is the exact
+    // accumulation the stream loop does into `PartialToolCall`, exercised through
+    // the real wire decode of each chunk.
+    #[test]
+    fn tool_call_assembles_across_multiple_deltas() {
+        // Frame 1: id + name, empty args. Frames 2-4: argument fragments.
+        let frames = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"rust"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}}]}"#,
+        ];
+
+        let mut acc: std::collections::BTreeMap<usize, PartialToolCall> = Default::default();
+        for raw in frames {
+            let chunk: Chunk = serde_json::from_str(raw).expect("tool-call chunk parses");
+            let delta = chunk.choices[0].delta.as_ref().expect("delta present");
+            for tc in &delta.tool_calls {
+                let entry = acc.entry(tc.index).or_default();
+                if let Some(id) = &tc.id {
+                    entry.id = id.clone();
+                }
+                if let Some(f) = &tc.function {
+                    if let Some(n) = &f.name {
+                        entry.name = n.clone();
+                    }
+                    if let Some(a) = &f.arguments {
+                        entry.args.push_str(a);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(acc.len(), 1, "all fragments belong to one call");
+        let call = &acc[&0];
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.name, "search");
+        let parsed: Value = serde_json::from_str(&call.args).expect("assembled args must parse");
+        assert_eq!(parsed["q"], "rust");
+    }
+
+    // OCEAN-198: parallel tool calls arrive INTERLEAVED across frames and must
+    // stay separated by their upstream `index` — call 0's args never leak into
+    // call 1. This guards the BTreeMap keying that makes OpenAI parallel tool
+    // calls correct.
+    #[test]
+    fn parallel_tool_calls_keyed_by_index_do_not_collide() {
+        let frames = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_A","function":{"name":"get_weather","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_B","function":{"name":"get_time","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"SF\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"tz\":\"UTC\"}"}}]}}]}"#,
+        ];
+        let mut acc: std::collections::BTreeMap<usize, PartialToolCall> = Default::default();
+        for raw in frames {
+            let chunk: Chunk = serde_json::from_str(raw).expect("chunk parses");
+            let delta = chunk.choices[0].delta.as_ref().expect("delta present");
+            for tc in &delta.tool_calls {
+                let entry = acc.entry(tc.index).or_default();
+                if let Some(id) = &tc.id {
+                    entry.id = id.clone();
+                }
+                if let Some(f) = &tc.function {
+                    if let Some(n) = &f.name {
+                        entry.name = n.clone();
+                    }
+                    if let Some(a) = &f.arguments {
+                        entry.args.push_str(a);
+                    }
+                }
+            }
+        }
+        assert_eq!(acc.len(), 2, "two distinct parallel calls");
+        assert_eq!(acc[&0].id, "call_A");
+        assert_eq!(acc[&0].name, "get_weather");
+        assert_eq!(acc[&0].args, "{\"city\":\"SF\"}");
+        assert_eq!(acc[&1].id, "call_B");
+        assert_eq!(acc[&1].name, "get_time");
+        assert_eq!(acc[&1].args, "{\"tz\":\"UTC\"}");
+    }
+
+    // OCEAN-198: a tool call whose args never streamed must finalize to `{}`, and
+    // a malformed/truncated arg buffer must degrade to `{}` via unwrap_or — never
+    // panic the turn. This mirrors the loop's finalize-args fallback.
+    #[test]
+    fn tool_call_empty_and_malformed_args_default_to_empty_object() {
+        let empty = String::new();
+        let args: Value = if empty.is_empty() {
+            Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&empty).unwrap_or(Value::Object(Default::default()))
+        };
+        assert_eq!(args, json!({}), "empty args finalize to an empty object");
+
+        let truncated = "{\"q\": \"ru".to_string();
+        let args2: Value = serde_json::from_str(&truncated).unwrap_or(Value::Object(Default::default()));
+        assert_eq!(args2, json!({}), "malformed args fall back to an empty object, not panic");
+    }
+
+    // OCEAN-198: a chunk with NO usage field decodes cleanly to `None` (not an
+    // error), so the loop leaves usage at its zero default instead of panicking.
+    // A frame carrying only choices is the common case and must not require usage.
+    #[test]
+    fn chunk_without_usage_decodes_to_none() {
+        let raw = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("usage-less chunk parses");
+        assert!(chunk.usage.is_none(), "absent usage must decode to None, not error");
+    }
+
+    // OCEAN-198: a usage object with no detail sub-objects decodes with both
+    // details None — cache_read / reasoning then stay at the zero default instead
+    // of the loop unwrapping a missing field.
+    #[test]
+    fn usage_without_details_leaves_cache_and_reasoning_zero() {
+        let raw = r#"{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("usage chunk parses");
+        let u = chunk.usage.expect("usage present");
+        assert_eq!(u.prompt_tokens, 10);
+        assert!(u.prompt_tokens_details.is_none(), "no cached-token detail → None");
+        assert!(u.completion_tokens_details.is_none(), "no reasoning detail → None");
+    }
+
+    // OCEAN-101 / OCEAN-198: StreamError.describe must produce a useful string
+    // across the field-presence matrix — full (type+message+code), message-only,
+    // and the fully-empty frame (must still say *something*, never an empty
+    // string or a panic).
+    #[test]
+    fn stream_error_describe_handles_partial_and_empty() {
+        // Fully populated.
+        let raw = r#"{"error":{"message":"boom","type":"server_error","code":"e_500"}}"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("parses");
+        let d = chunk.error.unwrap().describe();
+        assert!(d.contains("server_error") && d.contains("boom") && d.contains("e_500"), "full: {d}");
+
+        // Message only — no type, no code.
+        let raw = r#"{"error":{"message":"just a message"}}"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("parses");
+        let d = chunk.error.unwrap().describe();
+        assert_eq!(d, "just a message", "message-only must be exactly the message: {d}");
+
+        // Completely empty error object — must still produce a non-empty,
+        // human-readable fallback, not "".
+        let raw = r#"{"error":{}}"#;
+        let chunk: Chunk = serde_json::from_str(raw).expect("parses");
+        let d = chunk.error.unwrap().describe();
+        assert!(!d.is_empty(), "empty error must still describe itself");
+        assert!(d.contains("in-stream error"), "empty error falls back to a generic message: {d}");
+    }
+
+    // OCEAN-198: a structurally unexpected/garbage frame is NOT a hard failure —
+    // the loop's `serde_json::from_str(...)` skip path relies on a malformed frame
+    // returning Err so it can be logged-and-skipped rather than aborting the
+    // stream. Assert both: a junk frame errors (→ skipped), and an empty `{}`
+    // chunk decodes to an all-empty Chunk (→ harmless no-op), neither panics.
+    #[test]
+    fn malformed_frame_errors_and_empty_object_is_harmless() {
+        // Not even JSON → Err, which the loop turns into a debug-log + skip.
+        assert!(
+            serde_json::from_str::<Chunk>("this is not json").is_err(),
+            "a non-JSON frame must surface as a decode error so the loop skips it"
+        );
+        // A valid-but-empty object decodes to a Chunk with no choices/usage/error.
+        let chunk: Chunk = serde_json::from_str("{}").expect("empty object decodes");
+        assert!(chunk.choices.is_empty());
+        assert!(chunk.usage.is_none());
+        assert!(chunk.error.is_none());
+    }
 }

@@ -1297,4 +1297,147 @@ mod tests {
             "reasoning_tokens must decode from output_tokens_details"
         );
     }
+
+    // OCEAN-198: the reasoning-effort mapper covers every ThinkingLevel — Off →
+    // None (omit the param), and Xhigh folds into "high" since the Responses API
+    // has no distinct level above it.
+    #[test]
+    fn reasoning_effort_maps_every_level() {
+        assert_eq!(reasoning_effort(ThinkingLevel::Off), None);
+        assert_eq!(reasoning_effort(ThinkingLevel::Minimal), Some("minimal"));
+        assert_eq!(reasoning_effort(ThinkingLevel::Low), Some("low"));
+        assert_eq!(reasoning_effort(ThinkingLevel::Medium), Some("medium"));
+        assert_eq!(reasoning_effort(ThinkingLevel::High), Some("high"));
+        assert_eq!(
+            reasoning_effort(ThinkingLevel::Xhigh),
+            Some("high"),
+            "Xhigh has no distinct Responses level; it folds into high"
+        );
+    }
+
+    // OCEAN-198: incomplete_reason must return None — never panic — when the
+    // nested {response.incomplete_details.reason} path is missing at any level
+    // (no response, no incomplete_details, no reason, or reason not a string).
+    // This guards the optional-chaining the handler relies on.
+    #[test]
+    fn incomplete_reason_handles_missing_nesting_gracefully() {
+        // No `response` key at all.
+        assert!(incomplete_reason(&json!({"type": "response.incomplete"})).is_none());
+        // `response` present but no `incomplete_details`.
+        assert!(incomplete_reason(&json!({"response": {}})).is_none());
+        // `incomplete_details` present but no `reason`.
+        assert!(incomplete_reason(&json!({"response": {"incomplete_details": {}}})).is_none());
+        // `reason` present but not a string → None (as_str fails), no panic.
+        assert!(
+            incomplete_reason(&json!({"response": {"incomplete_details": {"reason": 42}}})).is_none()
+        );
+        // A wholly empty value is fine too.
+        assert!(incomplete_reason(&json!({})).is_none());
+    }
+
+    // OCEAN-198: a function call whose arguments stream across SEVERAL delta
+    // frames (the single-call case, distinct from the interleaved-parallel test)
+    // must concatenate in order into one parseable JSON object, started exactly
+    // once by the first delta when no `added` frame preceded it.
+    #[test]
+    fn single_tool_call_args_assemble_across_sequential_deltas() {
+        let mut tc = ToolCalls::default();
+        let mut next: usize = 0;
+
+        let s1 = tc.on_args_delta("fc_1", "{\"path\":", &mut next);
+        assert!(s1.started.is_some(), "first delta with no prior `added` must start the call");
+        let s2 = tc.on_args_delta("fc_1", "\"/etc/hosts\",", &mut next);
+        assert!(s2.started.is_none(), "subsequent deltas must not re-start");
+        tc.on_args_delta("fc_1", "\"mode\":", &mut next);
+        tc.on_args_delta("fc_1", "\"r\"}", &mut next);
+
+        let finals = tc.finalize();
+        assert_eq!(finals.len(), 1);
+        let parsed: Value = serde_json::from_str(&finals[0].args).expect("assembled args parse");
+        assert_eq!(parsed["path"], "/etc/hosts");
+        assert_eq!(parsed["mode"], "r");
+        assert_eq!(next, 1, "exactly one block index consumed");
+    }
+
+    // OCEAN-198: a tool call whose args are empty (never streamed and no done
+    // payload args) finalizes with an empty arg string; the loop's downstream
+    // `if args.is_empty() { {} }` then yields an empty object — no panic. And a
+    // malformed buffer degrades to `{}` via the loop's unwrap_or.
+    #[test]
+    fn tool_call_empty_and_malformed_args_default_to_empty_object() {
+        // Empty args path: an `added` with no args, no delta, a done with empty args.
+        let mut tc = ToolCalls::default();
+        let mut next: usize = 0;
+        tc.on_added(&fc_item("fc_e", "call_e", "noop", ""), &mut next);
+        tc.on_done(&fc_item("fc_e", "call_e", "noop", ""), &mut next);
+        let finals = tc.finalize();
+        assert_eq!(finals.len(), 1);
+        assert!(finals[0].args.is_empty(), "no streamed args → empty arg buffer");
+        let args: Value = if finals[0].args.is_empty() {
+            Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&finals[0].args).unwrap_or(Value::Object(Default::default()))
+        };
+        assert_eq!(args, json!({}), "empty args finalize to an empty object");
+
+        // Malformed buffer → {} via unwrap_or, no panic.
+        let bad = "{\"path\": \"/tmp".to_string();
+        let args2: Value = serde_json::from_str(&bad).unwrap_or(Value::Object(Default::default()));
+        assert_eq!(args2, json!({}), "malformed args fall back to an empty object");
+    }
+
+    // OCEAN-198: the completed-event usage decode must tolerate a usage object
+    // with NONE of the detail sub-objects — input/output/total decode, and the
+    // optional cached/reasoning details are None (→ stay zero), never an unwrap.
+    #[test]
+    fn responses_usage_without_details_leaves_cache_and_reasoning_zero() {
+        let raw = r#"{"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}"#;
+        let u: ResponsesUsage = serde_json::from_str(raw).expect("bare usage decodes");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 20);
+        assert_eq!(u.total_tokens, 120);
+        assert!(u.input_tokens_details.is_none(), "no cached detail → None");
+        assert!(u.output_tokens_details.is_none(), "no reasoning detail → None");
+    }
+
+    // OCEAN-198: the completed event reports total_tokens=0 on some backends; the
+    // loop falls back to input+output in that case. Prove the decode preserves the
+    // zero so that fallback fires (rather than reporting a bogus 0 total).
+    #[test]
+    fn responses_usage_zero_total_is_preserved_for_fallback() {
+        let raw = r#"{"input_tokens": 7, "output_tokens": 3, "total_tokens": 0}"#;
+        let u: ResponsesUsage = serde_json::from_str(raw).expect("decodes");
+        assert_eq!(u.total_tokens, 0, "zero total must survive so the loop can fall back to input+output");
+        let effective = if u.total_tokens > 0 { u.total_tokens } else { u.input_tokens + u.output_tokens };
+        assert_eq!(effective, 10, "loop fallback must yield input+output when total is 0");
+    }
+
+    // OCEAN-198: the failed/incomplete error envelope must decode even when the
+    // nested `response.error` is absent — the handler does
+    // `.and_then(|f| f.response.error)` and must get None (→ empty code/message),
+    // not a deserialize failure, for a `response.failed` frame with no error body.
+    #[test]
+    fn failed_event_without_error_body_decodes_to_none() {
+        let frame = json!({"type": "response.failed", "response": {}});
+        let parsed: Option<FailedEvent> = serde_json::from_value(frame).ok();
+        let err = parsed.and_then(|f| f.response.error);
+        assert!(err.is_none(), "a failed frame with no error body must yield None, not panic");
+    }
+
+    // OCEAN-198: an `output_item.done` for a NON-function item (e.g. a message or
+    // reasoning item) must be ignored by the tool-call accumulator — only
+    // function_call items are gated into ToolCalls in the loop. Decoding such an
+    // envelope must still succeed; the loop's `r#type == "function_call"` guard
+    // is what filters it. Assert the type field decodes so the guard can run.
+    #[test]
+    fn non_function_output_item_decodes_with_its_type() {
+        let frame = json!({
+            "type": "response.output_item.done",
+            "item": {"id": "msg_1", "type": "message", "role": "assistant"}
+        });
+        let env: OutputItemEnvelope =
+            serde_json::from_value(frame).expect("non-function item envelope decodes");
+        assert_eq!(env.item.r#type, "message", "the loop's function_call guard reads this type");
+        assert_ne!(env.item.r#type, "function_call");
+    }
 }
