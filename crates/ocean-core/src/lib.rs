@@ -999,6 +999,7 @@ mod tests {
             decision: PermissionDecision::Deny {
                 reason: Some("not now".into()),
             },
+            decision_token: None,
         };
 
         let json = serde_json::to_value(&decision).unwrap();

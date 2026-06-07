@@ -1138,6 +1138,7 @@ mod tests {
             thinking_level: Some(ThinkingLevel::High),
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
@@ -1166,6 +1167,7 @@ mod tests {
             thinking_level: None,
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("thinking_level"));
