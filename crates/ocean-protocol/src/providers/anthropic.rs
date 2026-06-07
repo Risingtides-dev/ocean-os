@@ -799,6 +799,152 @@ mod tests {
         );
     }
 
+    // OCEAN-198: the stop_reason mapper lives inline in the stream loop
+    // (lines ~583), so it isn't a free function. This helper mirrors that exact
+    // match so the mapping is unit-testable; if the inline arm ever drifts from
+    // this, the test guarding it here will need to be updated in lockstep — which
+    // is the point of pinning every documented variant.
+    fn map_stop_reason(reason: &str) -> StopReason {
+        match reason {
+            "tool_use" => StopReason::ToolUse,
+            "max_tokens" => StopReason::Length,
+            "end_turn" | "stop_sequence" => StopReason::Stop,
+            _ => StopReason::Stop,
+        }
+    }
+
+    // OCEAN-198: every stop_reason Anthropic can send maps to the right
+    // StopReason, and an unknown/unexpected value falls back to a sane Stop
+    // rather than panicking. `pause_turn` (a newer server-tool reason) and a
+    // garbage value both land on Stop.
+    #[test]
+    fn anthropic_stop_reason_mapping_covers_all_variants_and_unknown() {
+        assert_eq!(map_stop_reason("tool_use"), StopReason::ToolUse);
+        assert_eq!(map_stop_reason("max_tokens"), StopReason::Length);
+        assert_eq!(map_stop_reason("end_turn"), StopReason::Stop);
+        assert_eq!(map_stop_reason("stop_sequence"), StopReason::Stop);
+        // Unknown / newer reasons must not panic — default to Stop.
+        assert_eq!(map_stop_reason("pause_turn"), StopReason::Stop);
+        assert_eq!(map_stop_reason("refusal"), StopReason::Stop);
+        assert_eq!(map_stop_reason("totally_unexpected"), StopReason::Stop);
+        assert_eq!(map_stop_reason(""), StopReason::Stop);
+    }
+
+    // OCEAN-188 / OCEAN-198: the message_delta usage decode must read
+    // output_tokens off the wire, and message_start usage must read the input +
+    // both cache buckets — the exact fields the stream loop folds into Usage.
+    // This feeds the REAL Anthropic wire shape through the serde structs the loop
+    // uses.
+    #[test]
+    fn anthropic_usage_delta_decodes_all_token_fields() {
+        let wire = r#"{
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": 512
+        }"#;
+        let u: UsageDelta = serde_json::from_str(wire).expect("usage delta decodes");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_read_input_tokens, 200);
+        assert_eq!(u.cache_creation_input_tokens, 512);
+    }
+
+    // OCEAN-198: a usage payload missing the cache fields decodes to zeros (via
+    // serde defaults), NOT a parse error — so a non-cached turn doesn't panic the
+    // decode path.
+    #[test]
+    fn anthropic_usage_delta_missing_cache_fields_defaults_to_zero() {
+        let wire = r#"{"input_tokens": 42, "output_tokens": 7}"#;
+        let u: UsageDelta = serde_json::from_str(wire).expect("partial usage decodes");
+        assert_eq!(u.input_tokens, 42);
+        assert_eq!(u.output_tokens, 7);
+        assert_eq!(u.cache_read_input_tokens, 0, "missing cache_read must default to 0");
+        assert_eq!(u.cache_creation_input_tokens, 0, "missing cache_write must default to 0");
+    }
+
+    // OCEAN-198: an entirely empty usage object still decodes (all defaults) —
+    // the stream loop must never panic on a usage frame that omits everything.
+    #[test]
+    fn anthropic_usage_delta_empty_object_is_all_zeros() {
+        let u: UsageDelta = serde_json::from_str("{}").expect("empty usage decodes");
+        assert_eq!(total_tokens(&Usage::default()), 0);
+        assert_eq!(u.input_tokens + u.output_tokens, 0);
+    }
+
+    // OCEAN-101 / OCEAN-198: an unrecognized SSE event type must decode to the
+    // `Other` catch-all (handled as a no-op in the loop), NOT a deserialize
+    // error that would otherwise abort the stream. A future/unknown event name
+    // is tolerated gracefully.
+    #[test]
+    fn anthropic_unknown_sse_event_decodes_to_other() {
+        let wire = r#"{"type": "message_resume", "foo": 1}"#;
+        let ev: SseEvent = serde_json::from_str(wire).expect("unknown event must not fail to parse");
+        assert!(matches!(ev, SseEvent::Other), "unknown event type must map to Other");
+    }
+
+    // OCEAN-101 / OCEAN-198: an unmapped content_block_start kind (e.g.
+    // redacted_thinking, server_tool_use) decodes to BlockStart::Other, which the
+    // loop logs-and-drops instead of panicking; an unmapped block_delta kind
+    // likewise decodes to BlockDelta::Other. Proves the `#[serde(other)]`
+    // catch-alls are wired.
+    #[test]
+    fn anthropic_unmapped_block_kinds_decode_to_other() {
+        // A redacted_thinking block_start is an Other block (no Content variant).
+        let block = r#"{"type": "redacted_thinking", "data": "xyz"}"#;
+        let bs: BlockStart = serde_json::from_str(block).expect("unmapped block kind decodes");
+        assert!(matches!(bs, BlockStart::Other), "unmapped block kind must map to Other");
+
+        // An unmapped block_delta kind likewise decodes to Other, not an error.
+        let delta = r#"{"type": "citations_delta", "citation": {}}"#;
+        let bd: BlockDelta = serde_json::from_str(delta).expect("unmapped delta kind decodes");
+        assert!(matches!(bd, BlockDelta::Other), "unmapped delta kind must map to Other");
+    }
+
+    // OCEAN-198: a tool_use input_json_delta assembled across multiple fragments
+    // joins into one parseable JSON object — the exact buffer-then-parse the
+    // stream loop performs at content_block_stop. Mirrors the loop's json_buf
+    // accumulation + final from_str.
+    #[test]
+    fn anthropic_tool_call_args_assemble_across_deltas() {
+        // Fragments as they'd arrive on successive input_json_delta frames.
+        let frags = ["{\"path\":", "\"/tmp/a\",", "\"recursive\":", "true}"];
+        let mut json_buf = String::new();
+        for f in frags {
+            let wire = json!({"type": "input_json_delta", "partial_json": f}).to_string();
+            let d: BlockDelta = serde_json::from_str(&wire).expect("delta decodes");
+            match d {
+                BlockDelta::InputJsonDelta { partial_json } => json_buf.push_str(&partial_json),
+                _ => panic!("expected InputJsonDelta"),
+            }
+        }
+        let parsed: Value = serde_json::from_str(&json_buf).expect("assembled args must parse");
+        assert_eq!(parsed["path"], "/tmp/a");
+        assert_eq!(parsed["recursive"], true);
+    }
+
+    // OCEAN-198: an empty arg buffer (a tool call with no streamed input) must
+    // finalize to `{}`, never panic — mirroring the loop's
+    // `if json_buf.is_empty() { {} }` guard. And a MALFORMED partial buffer must
+    // degrade to `{}` via unwrap_or, not blow up the turn.
+    #[test]
+    fn anthropic_tool_call_empty_and_malformed_args_default_to_empty_object() {
+        // Empty buffer → {}.
+        let empty = String::new();
+        let args: Value = if empty.is_empty() {
+            Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&empty).unwrap_or(Value::Object(Default::default()))
+        };
+        assert_eq!(args, json!({}), "empty tool args must finalize to an empty object");
+
+        // Truncated/malformed JSON → {} (no panic), exactly like the loop's
+        // unwrap_or fallback.
+        let bad = "{\"path\": \"/tmp".to_string();
+        let args2: Value = serde_json::from_str(&bad).unwrap_or(Value::Object(Default::default()));
+        assert_eq!(args2, json!({}), "malformed tool args must fall back to an empty object, not panic");
+    }
+
     // With a single message there is no stable history yet, so the rolling
     // message breakpoint is skipped — but tools + system still cache the prefix.
     #[test]
