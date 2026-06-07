@@ -1096,6 +1096,338 @@ mod tests {
         ));
     }
 
+    // ---- OCEAN-200: rollback-on-failure + FK cascade coverage ---------------
+
+    /// Count rows in a table for a room (test helper that reaches into the
+    /// store's connection so assertions can inspect raw persisted state).
+    fn count(s: &SqliteRoomStore, table: &str, room: &RoomKey) -> i64 {
+        s.conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE room_id = ?1"),
+                params![room.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn create_collision_leaves_store_unchanged() {
+        // A duplicate `create` must fail AND leave the existing room's rows
+        // exactly as they were — no partial overwrite, no extra room row.
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "Original", None, now()).unwrap();
+        s.append_message(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "hello",
+            now(),
+        )
+        .unwrap();
+
+        let rooms_before: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0))
+            .unwrap();
+        let msgs_before = count(&s, "messages", &key);
+
+        // Colliding create with a different name + policy must NOT mutate the row.
+        let err = s.create(
+            key.clone(),
+            "Hijacked",
+            Some(RoomTriggerPolicy {
+                on_mention: true,
+                ..Default::default()
+            }),
+            now(),
+        );
+        assert!(matches!(err, Err(RoomStoreError::AlreadyExists(_))));
+
+        let rooms_after: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rooms_before, rooms_after, "no extra/leaked room row");
+        assert_eq!(msgs_before, count(&s, "messages", &key), "transcript intact");
+
+        // The name + (absent) policy of the original survive untouched.
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.name, "Original");
+        assert!(rec.room.trigger_policy.is_none());
+        assert_eq!(rec.transcript.len(), 1);
+        assert_eq!(rec.transcript[0].body, "hello");
+    }
+
+    #[test]
+    fn failed_remove_of_unknown_participant_is_a_clean_noop() {
+        // remove_participant on a non-member must error BEFORE any write — no
+        // stray ParticipantLeft marker, no seq advance, roster unchanged.
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("john", "John"), now()).unwrap(); // seq 0
+
+        let msgs_before = count(&s, "messages", &key);
+        let parts_before = count(&s, "participants", &key);
+
+        let err = s.remove_participant(&key, "ghost", now());
+        assert!(matches!(err, Err(RoomStoreError::UnknownParticipant { .. })));
+
+        assert_eq!(msgs_before, count(&s, "messages", &key), "no leaked marker");
+        assert_eq!(parts_before, count(&s, "participants", &key), "roster intact");
+        // seq did not skip: next real append is seq 1, not 2.
+        let m = s
+            .append_message(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "still here",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(m.seq, 1, "failed op must not consume a seq");
+    }
+
+    #[test]
+    fn append_to_closed_room_does_not_torn_write() {
+        // append/add/remove on a soft-closed room must fail with UnknownRoom and
+        // write nothing — the closed transcript stays frozen.
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.append_message(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "bye",
+            now(),
+        )
+        .unwrap();
+        s.close(&key).unwrap();
+
+        let msgs_before = count(&s, "messages", &key);
+
+        assert!(matches!(
+            s.append_message(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "after close",
+                now(),
+            ),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        assert!(matches!(
+            s.add_participant(&key, human("late", "Late"), now()),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+
+        assert_eq!(
+            msgs_before,
+            count(&s, "messages", &key),
+            "closed transcript must stay frozen"
+        );
+        // The single original message is still all there is, via audit view.
+        let rec = s.get_including_closed(&key).unwrap().unwrap();
+        assert_eq!(rec.transcript.len(), 1);
+        assert_eq!(rec.transcript[0].body, "bye");
+    }
+
+    #[test]
+    fn pragma_foreign_keys_is_enabled_on_the_live_connection() {
+        // SQLite enforces FOREIGN KEY clauses ONLY when this per-connection
+        // pragma is ON. migrate() sets it; assert it actually stuck on the
+        // connection the store keeps and uses for every query.
+        let s = store();
+        let fk_on: i64 = s
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1, "foreign_keys pragma must be ON or FK clauses are inert");
+    }
+
+    #[test]
+    fn fk_cascade_deletes_children_when_a_room_row_is_deleted() {
+        // The schema declares participants/messages with
+        // `REFERENCES rooms(id) ON DELETE CASCADE`. With the pragma ON, deleting
+        // the parent room row must cascade-delete its roster + transcript.
+        //
+        // NOTE: the public API never hard-deletes a room (`close` is a soft
+        // UPDATE), so this exercises the cascade directly to prove the schema +
+        // pragma are wired correctly — i.e. that the ON DELETE CASCADE is real
+        // and not silently inert.
+        let s = store();
+        let key = RoomKey::new("r1");
+
+        // Build a room with roster + transcript directly (mut not needed: raw SQL).
+        s.conn
+            .execute(
+                "INSERT INTO rooms (id, name, created_at, updated_at) VALUES (?1, 'R1', ?2, ?2)",
+                params![key.as_str(), fmt_ts(now())],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO participants (room_id, id, kind, display_name, position)
+                 VALUES (?1, 'john', 'human', 'John', 0)",
+                params![key.as_str()],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
+                 VALUES (?1, 0, 'john', 'human', 'message', 'hi', ?2)",
+                params![key.as_str(), fmt_ts(now())],
+            )
+            .unwrap();
+        assert_eq!(count(&s, "participants", &key), 1);
+        assert_eq!(count(&s, "messages", &key), 1);
+
+        // Hard-delete the parent room row.
+        s.conn
+            .execute("DELETE FROM rooms WHERE id = ?1", params![key.as_str()])
+            .unwrap();
+
+        // Children must be gone — proving the cascade fired (only true with the
+        // pragma ON; this test fails loudly if FK enforcement regresses).
+        assert_eq!(count(&s, "participants", &key), 0, "participants must cascade");
+        assert_eq!(count(&s, "messages", &key), 0, "messages must cascade");
+    }
+
+    #[test]
+    fn orphan_message_insert_is_rejected_by_fk() {
+        // A message referencing a non-existent room must be rejected by the FK
+        // (again, only with the pragma ON). This is the "referencing a
+        // nonexistent room id" failure mode — proving the constraint enforces.
+        let s = store();
+        let res = s.conn.execute(
+            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
+             VALUES ('ghost-room', 0, 'a', 'human', 'message', 'x', ?1)",
+            params![fmt_ts(now())],
+        );
+        assert!(res.is_err(), "FK must reject a message with no parent room");
+    }
+
+    #[test]
+    fn close_is_soft_and_retains_all_rows() {
+        // close() is a soft-close (UPDATE closed_at), NOT a delete: roster and
+        // transcript rows must be retained for audit, not cascaded away.
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("john", "John"), now()).unwrap();
+        s.append_message(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "hi",
+            now(),
+        )
+        .unwrap();
+
+        let parts_before = count(&s, "participants", &key);
+        let msgs_before = count(&s, "messages", &key);
+        assert!(parts_before > 0 && msgs_before > 0);
+
+        s.close(&key).unwrap();
+
+        // Hidden from the open view...
+        assert!(s.get(&key).unwrap().is_none());
+        // ...but every row is retained (soft-close, no cascade).
+        assert_eq!(count(&s, "participants", &key), parts_before, "roster retained");
+        assert_eq!(count(&s, "messages", &key), msgs_before, "transcript retained");
+        // closed_at is set.
+        let closed_at: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT closed_at FROM rooms WHERE id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(closed_at.is_some(), "closed_at must be set on soft-close");
+    }
+
+    /// KNOWN BUG (OCEAN-200 finding): the multi-statement write paths
+    /// (`add_participant`, `remove_participant`) are NOT wrapped in a SQLite
+    /// transaction. Each `INSERT`/`UPDATE` auto-commits independently, so a
+    /// failure on a later statement (e.g. a `(room_id, seq)` PK collision from a
+    /// concurrent writer on the same DB file) leaves the earlier participant
+    /// INSERT committed — a torn row: a roster entry with no matching join
+    /// marker, or a seq gap.
+    ///
+    /// This test reproduces the torn row by interleaving a second connection's
+    /// commit between `add_participant`'s participant-insert and its
+    /// message-insert (replicating the exact statement order of the method). It
+    /// is `#[ignore]`d so the suite stays green while the bug is open; once the
+    /// write paths are transaction-wrapped, this should be inverted to assert
+    /// the rollback (participant count returns to its prior value) and un-ignored.
+    #[test]
+    #[ignore = "documents OCEAN-200 torn-row bug: multi-step writes are not transaction-wrapped"]
+    fn torn_row_on_concurrent_seq_collision_is_a_known_bug() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("r1");
+
+        let mut s1 = SqliteRoomStore::open(&path).unwrap();
+        s1.create(key.clone(), "R1", None, now()).unwrap();
+        let s2 = SqliteRoomStore::open(&path).unwrap();
+
+        // Replicate add_participant's statement order on s2, with s1 stealing the
+        // seq mid-operation:
+        // 1. s2 computes next_seq (= 0, no messages yet)
+        let s2_next_seq: i64 = s2
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE room_id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // 2. s2 inserts the participant (auto-commits — the torn-row risk)
+        s2.conn
+            .execute(
+                "INSERT INTO participants (room_id, id, kind, display_name, position)
+                 VALUES (?1, 'p', 'human', 'P', 0)",
+                params![key.as_str()],
+            )
+            .unwrap();
+        // 3. s1 commits a message at the same seq
+        s1.conn
+            .execute(
+                "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
+                 VALUES (?1, ?2, 'a', 'human', 'message', 'x', ?3)",
+                params![key.as_str(), s2_next_seq, fmt_ts(now())],
+            )
+            .unwrap();
+        // 4. s2's message insert now fails the (room_id, seq) PK
+        let s2_msg = s2.conn.execute(
+            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
+             VALUES (?1, ?2, 'p', 'human', 'participant_joined', 'P joined', ?3)",
+            params![key.as_str(), s2_next_seq, fmt_ts(now())],
+        );
+        assert!(s2_msg.is_err(), "expected seq PK collision");
+
+        // BUG: the participant insert leaked through with no join marker.
+        let parts = count(&s2, "participants", &key);
+        let markers: i64 = s2
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE room_id = ?1 AND kind = 'participant_joined'",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parts, 1, "participant leaked (committed)");
+        assert_eq!(markers, 0, "but its join marker did not — torn row");
+    }
+
     #[test]
     fn trigger_policy_round_trips_and_evaluates() {
         let mut s = store();
