@@ -671,12 +671,20 @@ async fn run_turn(
     // bridge waits for it before forwarding any prompt, but its subscription is
     // already live so no `PermissionRequest` is missed in the meantime.
     let (request_id_tx, request_id_rx) = tokio::sync::oneshot::channel::<String>();
+
+    // OCEAN-185 (P0): mint the per-turn permission secret. It rides the turn body
+    // (authenticated submit path) and is replayed by the bridge on each decision
+    // POST. The daemon binds the gate to it and never broadcasts it on
+    // /v1/events, so a localhost page that sniffs the permission_id off the SSE
+    // can't approve this turn's gated tools.
+    let decision_token = ocean_core::mint_decision_token();
     spawn_permission_bridge(
         client,
         conn,
         acp_session_id.to_string(),
         control_stream,
         request_id_rx,
+        decision_token.clone(),
     )?;
 
     // Submit the turn OFF this task so a gated `prompt().await` inside the daemon
@@ -686,9 +694,10 @@ async fn run_turn(
     let mut submit_handle = {
         let client = client.clone();
         let known_daemon_id = known_daemon_id.clone();
+        let decision_token = decision_token.clone();
         Some(tokio::spawn(async move {
             client
-                .submit_turn(prompt, cwd, known_daemon_id, model_id)
+                .submit_turn(prompt, cwd, known_daemon_id, model_id, Some(decision_token))
                 .await
         }))
     };
@@ -875,6 +884,9 @@ fn spawn_permission_bridge(
     acp_session_id: String,
     mut stream: daemon::OceanEventStream,
     request_id_rx: tokio::sync::oneshot::Receiver<String>,
+    // OCEAN-185: the turn's per-turn secret, replayed on every decision POST so
+    // the daemon binds the approval to this submitter.
+    decision_token: String,
 ) -> anyhow::Result<()> {
     use ocean_core::OceanEvent;
 
@@ -976,7 +988,12 @@ fn spawn_permission_bridge(
                         };
 
                         if let Err(err) = client
-                            .decide_permission(permission_id, allow, deny_reason)
+                            .decide_permission(
+                                permission_id,
+                                allow,
+                                deny_reason,
+                                Some(decision_token.clone()),
+                            )
                             .await
                         {
                             tracing::warn!(%permission_id, error = %err, "permission decision POST failed");
@@ -1195,14 +1212,17 @@ mod tests {
 
         let id = uuid::Uuid::new_v4();
 
-        // Allow → flat `{ permission_id, decision: "allow" }`.
+        // Allow → flat `{ permission_id, decision: "allow", decision_token }`.
         let allow = PermissionDecisionRequest {
             permission_id: id,
             decision: PermissionDecision::Allow,
+            decision_token: Some("secret-token".into()),
         };
         let v = serde_json::to_value(&allow).unwrap();
         assert_eq!(v["permission_id"], id.to_string());
         assert_eq!(v["decision"], "allow");
+        // OCEAN-185: the per-turn secret travels on the decision body.
+        assert_eq!(v["decision_token"], "secret-token");
 
         // Deny carries the reason inline (flattened).
         let deny = PermissionDecisionRequest {
@@ -1210,6 +1230,7 @@ mod tests {
             decision: PermissionDecision::Deny {
                 reason: Some("nope".into()),
             },
+            decision_token: None,
         };
         let v = serde_json::to_value(&deny).unwrap();
         assert_eq!(v["decision"], "deny");

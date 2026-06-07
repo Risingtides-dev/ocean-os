@@ -91,11 +91,25 @@ struct RequestControl {
     status: RequestStatus,
     cancel: CancellationToken,
     handle: Option<JoinHandle<()>>,
+    /// Per-turn secret bound to the submitter (OCEAN-185, P0). Set from the
+    /// turn's `decision_token`; the gating policy copies it into every
+    /// `PermissionWaiter` this turn raises, and the decision POST must present
+    /// it. `None` = the turn was submitted without binding (a legacy/internal
+    /// turn). Never serialized onto the public `/v1/events` SSE. Held here so the
+    /// turn record owns the secret; the enforcement read is on the waiter.
+    #[allow(dead_code)]
+    decision_token: Option<String>,
 }
 
 struct PermissionWaiter {
     status: PermissionStatus,
     sender: Option<oneshot::Sender<AgentPermissionDecision>>,
+    /// The turn's `decision_token` (OCEAN-185), copied from the owning
+    /// `RequestControl` when the waiter is registered. The decision handler
+    /// constant-time-compares the POSTed token against this; a missing/wrong
+    /// token is rejected 403. `None` = the gated turn was submitted unbound
+    /// (legacy client). NEVER placed in `status` or any SSE payload.
+    decision_token: Option<String>,
 }
 
 // --- Registry garbage collection (OCEAN-12) ---------------------------------
@@ -229,6 +243,11 @@ struct DaemonPermissionPolicy {
     /// one, so the same approval doesn't surface twice in the UI. Keyed on the
     /// tool name plus a stable hash of the canonical args JSON.
     seen_permissions: Arc<Mutex<HashMap<(String, u64), PermissionId>>>,
+    /// Per-turn permission secret (OCEAN-185, P0). Copied from the submitting
+    /// turn's `decision_token` into every `PermissionWaiter` this policy mints,
+    /// so the decision POST can be bound to the original submitter. `None` = the
+    /// turn was submitted without binding (legacy client). Never emitted on SSE.
+    decision_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1012,7 +1031,14 @@ async fn prompt(
     req.yolo = req.yolo || effective_yolo();
     emit_user_message(&state.events, &req, request_id);
 
-    let control = build_prompt_control(&state, request_id, req.session_id, req.yolo, cancel);
+    let control = build_prompt_control(
+        &state,
+        request_id,
+        req.session_id,
+        req.yolo,
+        cancel,
+        req.decision_token.clone(),
+    );
     let res = state.runtime.prompt(req, control).await;
     record_prompt_result(&state, request_id, &res).await;
 
@@ -1035,7 +1061,14 @@ async fn create_request(
     req.yolo = req.yolo || effective_yolo();
     emit_user_message(&state.events, &req, request_id);
 
-    let control = build_prompt_control(&state, request_id, session_id, req.yolo, cancel);
+    let control = build_prompt_control(
+        &state,
+        request_id,
+        session_id,
+        req.yolo,
+        cancel,
+        req.decision_token.clone(),
+    );
     let task_state = state.clone();
     let handle = tokio::spawn(async move {
         let res = task_state.runtime.prompt(req, control).await;
@@ -1112,13 +1145,65 @@ async fn permission_decision(
     State(state): State<AppState>,
     Path(permission_id): Path<PermissionId>,
     Json(decision): Json<PermissionDecisionRequest>,
-) -> Json<PermissionControlResponse> {
+) -> (StatusCode, Json<PermissionControlResponse>) {
     if decision.permission_id != permission_id {
-        return Json(PermissionControlResponse {
-            ok: false,
-            permission_id,
-            message: "permission id mismatch between path and body".into(),
-        });
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(PermissionControlResponse {
+                ok: false,
+                permission_id,
+                message: "permission id mismatch between path and body".into(),
+            }),
+        );
+    }
+
+    // OCEAN-185 (P0): verify the per-turn secret BEFORE consuming the waiter, so
+    // an attacker who sniffed the broadcast `permission_id` off /v1/events but
+    // doesn't hold the token can neither approve the tool nor burn the pending
+    // waiter. We peek under a read lock, constant-time-compare, and only remove
+    // the waiter once the token is proven. A waiter bound to a token
+    // (`Some`, the safe default for any client-submitted turn) REQUIRES a
+    // matching token; an unbound waiter (`None`, legacy/daemon-internal turn)
+    // skips the check so existing internal flows keep working.
+    {
+        let permissions = state.permissions.read().await;
+        match permissions.get(&permission_id) {
+            None => {
+                drop(permissions);
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(PermissionControlResponse {
+                        ok: false,
+                        permission_id,
+                        message: "permission request not found or already handled".into(),
+                    }),
+                );
+            }
+            Some(waiter) => {
+                if let Some(expected) = waiter.decision_token.as_deref() {
+                    if !ocean_core::decision_token_matches(
+                        Some(expected),
+                        decision.decision_token.as_deref(),
+                    ) {
+                        drop(permissions);
+                        tracing::warn!(
+                            %permission_id,
+                            "rejected permission decision: missing/invalid decision_token (OCEAN-185)"
+                        );
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(PermissionControlResponse {
+                                ok: false,
+                                permission_id,
+                                message: "forbidden: missing or invalid decision token; this \
+                                    decision was not authorized by the turn's submitter"
+                                    .into(),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     let waiter = {
@@ -1127,11 +1212,16 @@ async fn permission_decision(
     };
 
     let Some(mut waiter) = waiter else {
-        return Json(PermissionControlResponse {
-            ok: false,
-            permission_id,
-            message: "permission request not found or already handled".into(),
-        });
+        // Lost a race: the waiter was resolved/cancelled between our verify and
+        // our remove. Treat as already-handled.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(PermissionControlResponse {
+                ok: false,
+                permission_id,
+                message: "permission request not found or already handled".into(),
+            }),
+        );
     };
 
     let agent_decision = match decision.decision {
@@ -1180,11 +1270,14 @@ async fn permission_decision(
         },
     );
 
-    Json(PermissionControlResponse {
-        ok: true,
-        permission_id,
-        message: "permission decision recorded and waiter released".into(),
-    })
+    (
+        StatusCode::OK,
+        Json(PermissionControlResponse {
+            ok: true,
+            permission_id,
+            message: "permission decision recorded and waiter released".into(),
+        }),
+    )
 }
 
 fn build_prompt_control(
@@ -1193,6 +1286,7 @@ fn build_prompt_control(
     session_id: Option<SessionId>,
     allow_mutating: bool,
     cancel: CancellationToken,
+    decision_token: Option<String>,
 ) -> PromptControl {
     let control: Arc<dyn PermissionPolicy> = if allow_mutating {
         Arc::new(DaemonPermissionPolicy {
@@ -1204,6 +1298,7 @@ fn build_prompt_control(
             requests: state.requests.clone(),
             cancel: cancel.clone(),
             seen_permissions: Arc::new(Mutex::new(HashMap::new())),
+            decision_token,
         })
     } else {
         Arc::new(DaemonPermissionPolicy {
@@ -1215,6 +1310,7 @@ fn build_prompt_control(
             requests: state.requests.clone(),
             cancel: cancel.clone(),
             seen_permissions: Arc::new(Mutex::new(HashMap::new())),
+            decision_token,
         })
     };
 
@@ -1272,6 +1368,11 @@ impl PermissionPolicy for DaemonPermissionPolicy {
                 PermissionWaiter {
                     status: status.clone(),
                     sender: Some(tx),
+                    // OCEAN-185: bind this waiter to the submitter's per-turn
+                    // secret. The decision POST must replay it (constant-time
+                    // verify) or be rejected 403. NOT placed in `status`, so it
+                    // never reaches the public /v1/events SSE below.
+                    decision_token: self.decision_token.clone(),
                 },
             );
         }
@@ -2583,6 +2684,9 @@ fn spawn_room_agent_turn(
             cwd,
             project_id: None,
             client_type: Some("room".to_string()),
+            // Daemon-internal auto-convene: no external submitter, so no
+            // decision_token. Permission gating here defers to OCEAN_YOLO.
+            decision_token: None,
         };
 
         let (_request_id, cancel) = register_running_request(
@@ -2593,8 +2697,14 @@ fn spawn_room_agent_turn(
         )
         .await;
 
-        let control =
-            build_prompt_control(&state, request_id, Some(core_sid(session_id)), yolo, cancel);
+        let control = build_prompt_control(
+            &state,
+            request_id,
+            Some(core_sid(session_id)),
+            yolo,
+            cancel,
+            None,
+        );
 
         let res = state.runtime.prompt(prompt_req, control).await;
         record_prompt_result(&state, request_id, &res).await;
@@ -3468,6 +3578,11 @@ async fn register_running_request(
             },
             cancel: cancel.clone(),
             handle: None,
+            // OCEAN-185: bind the turn's permission gate to the submitter. The
+            // token rides the request body (authenticated submit path) and is
+            // copied into every PermissionWaiter; it is NEVER emitted on the
+            // public /v1/events SSE.
+            decision_token: req.decision_token.clone(),
         },
     );
 
@@ -3707,6 +3822,10 @@ async fn agent_voice(
         model_id: None,
         // Voice turns carry no images.
         images: None,
+        // OCEAN-185: the voice endpoint is a daemon-side wrapper; the surface
+        // does not yet mint a per-turn decision_token. Left unbound here — the
+        // surface-side follow-up must thread one through if it approves perms.
+        decision_token: None,
     };
     agent_turn(State(state), Json(turn)).await
 }
@@ -3880,6 +3999,7 @@ async fn agent_turn(
         thinking_level,
         model_id,
         images,
+        decision_token,
     } = req;
 
     // OCEAN-115: map the wire-level `TurnImage`s onto `ocean-core`'s `PromptImage`
@@ -4043,6 +4163,9 @@ async fn agent_turn(
         cwd,
         project_id,
         client_type,
+        // OCEAN-185: carry the submitter's per-turn secret onto the internal
+        // PromptRequest so register_running_request binds the gate to it.
+        decision_token: decision_token.clone(),
     };
 
     // Register the turn in the request map so it's cancellable via
@@ -4227,9 +4350,15 @@ async fn agent_turn(
 
     // Same `yolo` flag drives the permission policy: `false` (default) builds a
     // gating `DaemonPermissionPolicy`; `true` builds the auto-allow policy.
-    let control =
-        build_prompt_control(&state, request_id, Some(core_sid(session_id)), yolo, cancel)
-            .with_event_sink(event_tx)
+    let control = build_prompt_control(
+        &state,
+        request_id,
+        Some(core_sid(session_id)),
+        yolo,
+        cancel,
+        decision_token,
+    )
+    .with_event_sink(event_tx)
             // Per-turn reasoning override (OCEAN-28/41): threads the optional
             // request `thinking_level` into this turn's config only, leaving the
             // runtime's global thinking_level untouched.
@@ -5018,6 +5147,7 @@ mod tests {
             },
             cancel: CancellationToken::new(),
             handle: None,
+            decision_token: None,
         }
     }
 
@@ -5037,6 +5167,7 @@ mod tests {
             },
             cancel: CancellationToken::new(),
             handle: None,
+            decision_token: None,
         }
     }
 
@@ -5119,6 +5250,7 @@ mod tests {
                 created_at,
             },
             sender: None,
+            decision_token: None,
         }
     }
 
@@ -5462,6 +5594,7 @@ mod tests {
             PermissionWaiter {
                 status: permission_status(permission_id, request_id),
                 sender: None,
+                decision_token: None,
             },
         )])));
 
@@ -5552,6 +5685,7 @@ mod tests {
             PermissionWaiter {
                 status: permission_status(permission_id, request_id),
                 sender: Some(tx),
+                decision_token: None,
             },
         )])));
 
@@ -5927,6 +6061,7 @@ mod tests {
                 PermissionWaiter {
                     status: leaked_status,
                     sender: None,
+                    decision_token: None,
                 },
             ),
             // still pending (Some) => never reaped by age
@@ -5935,6 +6070,7 @@ mod tests {
                 PermissionWaiter {
                     status: pending_status,
                     sender: Some(tx),
+                    decision_token: None,
                 },
             ),
         ])));
@@ -6361,6 +6497,16 @@ mod tests {
     // --- OCEAN-51: permission gating on by default, opt-in yolo --------------
 
     fn gating_policy(allow_mutating: bool) -> DaemonPermissionPolicy {
+        gating_policy_with_token(allow_mutating, None)
+    }
+
+    /// Like [`gating_policy`] but binds the policy to a per-turn `decision_token`
+    /// (OCEAN-185), so the waiter it mints carries the secret a decision POST
+    /// must replay.
+    fn gating_policy_with_token(
+        allow_mutating: bool,
+        decision_token: Option<String>,
+    ) -> DaemonPermissionPolicy {
         DaemonPermissionPolicy {
             allow_mutating,
             request_id: RequestId::new_v4(),
@@ -6370,6 +6516,7 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             cancel: CancellationToken::new(),
             seen_permissions: Arc::new(Mutex::new(HashMap::new())),
+            decision_token,
         }
     }
 
@@ -6418,6 +6565,238 @@ mod tests {
             0,
             "yolo mode registers no permission waiter"
         );
+    }
+
+    // --- OCEAN-185 (P0): permission decisions bound to the turn submitter -----
+    //
+    // The decision endpoint validated only the `permission_id`, which is
+    // broadcast on the unauthenticated /v1/events SSE — so any localhost page
+    // could sniff it and approve a gated tool. These tests prove the per-turn
+    // `decision_token` binding closes that hole: the token is required on the
+    // decision POST, verified constant-time, and is ABSENT from the SSE payload.
+
+    /// Build a minimal AppState carrying real `requests`/`permissions`/`events`
+    /// registries for direct handler-level tests. No runtime turn is run.
+    fn permission_test_state() -> AppState {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
+        std::env::set_var("OCEAN_MODEL", "fake-ok");
+        let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
+        let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        AppState {
+            runtime,
+            events: EventBus::new(64),
+            agent_events: AgentEventBus::new(64),
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            permissions: Arc::new(RwLock::new(HashMap::new())),
+            longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
+            rooms: Arc::new(Mutex::new(store)),
+        }
+    }
+
+    /// Register a pending permission waiter bound to `token`, returning the
+    /// permission id plus the decision receiver the "agent loop" would await.
+    async fn register_bound_waiter(
+        state: &AppState,
+        token: Option<String>,
+    ) -> (PermissionId, oneshot::Receiver<AgentPermissionDecision>) {
+        let permission_id = PermissionId::new_v4();
+        let request_id = RequestId::new_v4();
+        let (tx, rx) = oneshot::channel();
+        state.permissions.write().await.insert(
+            permission_id,
+            PermissionWaiter {
+                status: PermissionStatus {
+                    permission_id,
+                    request_id,
+                    session_id: None,
+                    tool: "write".into(),
+                    reason: "permission required for write".into(),
+                    args: json!({"path": "src/lib.rs"}),
+                    created_at: Utc::now(),
+                },
+                sender: Some(tx),
+                decision_token: token,
+            },
+        );
+        (permission_id, rx)
+    }
+
+    /// THE ATTACKER CASE: a decision POST that knows only the broadcast
+    /// `permission_id` but presents NO token must be rejected 403, the waiter
+    /// must survive (not be burned), and no decision must reach the agent loop.
+    #[tokio::test]
+    async fn decision_without_token_is_rejected_403_and_tool_not_run() {
+        let state = permission_test_state();
+        let token = ocean_core::mint_decision_token();
+        let (permission_id, mut rx) =
+            register_bound_waiter(&state, Some(token.clone())).await;
+
+        // Attacker forges an Allow with only the sniffed permission_id.
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision: PermissionDecisionBody::Allow,
+            decision_token: None,
+        };
+        let (status, resp) = permission_decision(
+            State(state.clone()),
+            Path(permission_id),
+            Json(body),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a token-less decision must be forbidden"
+        );
+        assert!(!resp.0.ok, "forbidden decision must report ok=false");
+
+        // The waiter must still be pending — the attacker can't even burn it.
+        assert_eq!(
+            state.permissions.read().await.len(),
+            1,
+            "rejected decision must leave the pending waiter intact"
+        );
+        // And no decision reached the agent loop (the gated tool never runs).
+        assert!(
+            rx.try_recv().is_err(),
+            "no decision must be delivered to the runtime waiter"
+        );
+    }
+
+    /// A wrong token (attacker guesses) is likewise rejected 403.
+    #[tokio::test]
+    async fn decision_with_wrong_token_is_rejected_403() {
+        let state = permission_test_state();
+        let (permission_id, mut rx) =
+            register_bound_waiter(&state, Some(ocean_core::mint_decision_token())).await;
+
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision: PermissionDecisionBody::Allow,
+            decision_token: Some(ocean_core::mint_decision_token()), // different secret
+        };
+        let (status, _resp) =
+            permission_decision(State(state.clone()), Path(permission_id), Json(body)).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "a wrong token must be forbidden");
+        assert_eq!(state.permissions.read().await.len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// THE LEGIT CASE: the submitter replays the exact token it sent on the turn;
+    /// the decision is accepted (200), the waiter resolves, and Allow reaches the
+    /// agent loop so the tool runs.
+    #[tokio::test]
+    async fn decision_with_correct_token_is_accepted_and_tool_runs() {
+        let state = permission_test_state();
+        let token = ocean_core::mint_decision_token();
+        let (permission_id, rx) = register_bound_waiter(&state, Some(token.clone())).await;
+
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision: PermissionDecisionBody::Allow,
+            decision_token: Some(token),
+        };
+        let (status, resp) =
+            permission_decision(State(state.clone()), Path(permission_id), Json(body)).await;
+
+        assert_eq!(status, StatusCode::OK, "the correct token must be accepted");
+        assert!(resp.0.ok);
+        // Waiter consumed, decision delivered to the runtime as Allow.
+        assert_eq!(state.permissions.read().await.len(), 0);
+        let delivered = rx.await.expect("a decision must reach the runtime waiter");
+        assert!(
+            matches!(delivered, AgentPermissionDecision::Allow),
+            "the submitter's Allow must reach the agent loop"
+        );
+    }
+
+    /// The per-turn token must NEVER appear on the public /v1/events SSE payload
+    /// — that is the whole point (the broadcast carries permission_id, not the
+    /// secret). Drive the real gating policy `check`, snapshot the emitted
+    /// `PermissionRequest` envelope, and assert the token string is absent from
+    /// its serialized JSON while the waiter privately holds it.
+    #[tokio::test]
+    async fn decision_token_is_absent_from_the_sse_permission_request_payload() {
+        let token = ocean_core::mint_decision_token();
+        let policy = gating_policy_with_token(false, Some(token.clone()));
+        let mut rx = policy.events.subscribe();
+
+        // `check` blocks awaiting a decision; run it bounded so we only need the
+        // emitted PermissionRequest envelope, then drop the future.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            policy.check("write", &json!({"path": "src/lib.rs"})),
+        )
+        .await;
+
+        // The waiter must privately carry the token (binding is live)...
+        let waiter_token = {
+            let perms = policy.permissions.read().await;
+            perms
+                .values()
+                .next()
+                .expect("a waiter must be registered")
+                .decision_token
+                .clone()
+        };
+        assert_eq!(
+            waiter_token.as_deref(),
+            Some(token.as_str()),
+            "the waiter must hold the per-turn token for verification"
+        );
+
+        // ...but the broadcast envelope must NOT leak it.
+        let envelope = rx.try_recv().expect("a PermissionRequest must be broadcast");
+        assert!(
+            matches!(envelope.event, OceanEvent::PermissionRequest { .. }),
+            "first broadcast event is the PermissionRequest"
+        );
+        let serialized = serde_json::to_string(&envelope).expect("serialize envelope");
+        assert!(
+            !serialized.contains(&token),
+            "the decision_token must NEVER appear on the public /v1/events SSE payload; got: {serialized}"
+        );
+    }
+
+    /// Backward-compatibility / phased rollout: a waiter bound to NO token (a
+    /// legacy/daemon-internal turn) accepts a token-less decision, so existing
+    /// internal flows (auto-convene, voice) keep working. The hole is closed for
+    /// the clients that DO bind (cli/acp/tui) without breaking unbound callers.
+    #[tokio::test]
+    async fn unbound_waiter_accepts_token_less_decision() {
+        let state = permission_test_state();
+        let (permission_id, rx) = register_bound_waiter(&state, None).await;
+
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision: PermissionDecisionBody::Allow,
+            decision_token: None,
+        };
+        let (status, resp) =
+            permission_decision(State(state.clone()), Path(permission_id), Json(body)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp.0.ok);
+        assert!(matches!(
+            rx.await.expect("decision delivered"),
+            AgentPermissionDecision::Allow
+        ));
+    }
+
+    /// Constant-time token compare semantics (the verify primitive).
+    #[test]
+    fn decision_token_matches_semantics() {
+        let t = ocean_core::mint_decision_token();
+        assert!(ocean_core::decision_token_matches(Some(&t), Some(&t)));
+        assert!(!ocean_core::decision_token_matches(Some(&t), Some("nope")));
+        assert!(!ocean_core::decision_token_matches(Some(&t), None));
+        assert!(!ocean_core::decision_token_matches(None, Some(&t)));
+        assert!(!ocean_core::decision_token_matches(None, None));
+        // Differing lengths must not match and must not panic.
+        assert!(!ocean_core::decision_token_matches(Some("abc"), Some("abcd")));
     }
 
     /// `OCEAN_YOLO` parsing: default/empty/garbage = gated (false); the
@@ -7157,6 +7536,7 @@ mod tests {
                         let (tx, _rx) = oneshot::channel();
                         Some(tx)
                     },
+                    decision_token: None,
                 },
             );
         }

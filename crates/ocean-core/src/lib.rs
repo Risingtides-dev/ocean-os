@@ -108,6 +108,18 @@ pub struct PromptRequest {
     /// Known values: "tui", "surface-web", "surface-gpui", "surface-native", "cli", "leo-voice"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+    /// Per-turn secret binding the permission gate to THIS submitter (OCEAN-185,
+    /// P0). The client mints a high-entropy token and sends it here; the daemon
+    /// stores it on the turn and on every `PermissionRequest` the turn raises, but
+    /// NEVER echoes it on the unauthenticated `/v1/events` SSE broadcast. The
+    /// decision POST (`/v1/permissions/{id}/decision`) must present the same token
+    /// or the daemon returns 403. This closes the permission-gate bypass where any
+    /// localhost page could sniff the broadcast `permission_id` and approve a gated
+    /// tool. `None` (legacy clients) leaves the turn's gate unbound — see the
+    /// daemon's decision handler for the enforcement policy. Use
+    /// [`mint_decision_token`] to generate one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_token: Option<String>,
 }
 
 /// Stable id for a [`Project`].
@@ -736,6 +748,53 @@ pub struct PermissionDecisionRequest {
     pub permission_id: PermissionId,
     #[serde(flatten)]
     pub decision: PermissionDecision,
+    /// The per-turn secret the submitter sent on the turn (OCEAN-185, P0). The
+    /// daemon constant-time-compares this against the token bound to the gated
+    /// turn; a missing or wrong token is rejected with 403 so a localhost page
+    /// that only sniffed the broadcast `permission_id` cannot approve the tool.
+    /// See [`PromptRequest::decision_token`] and [`mint_decision_token`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_token: Option<String>,
+}
+
+/// Mint a fresh high-entropy per-turn permission `decision_token` (OCEAN-185).
+///
+/// Two v4 UUIDs (~244 bits of OS-seeded randomness), concatenated as hex. A
+/// client calls this once per turn, sends the value on the turn submission
+/// (`decision_token`), and replays the SAME value on any
+/// `/v1/permissions/{id}/decision` POST for that turn. The value travels only on
+/// the authenticated submit/decision request path the submitter holds — it is
+/// NEVER placed on the public `/v1/events` SSE — so an attacker who only sniffed
+/// the broadcast `permission_id` cannot forge an approval. Built on `uuid` (an
+/// existing dependency) to avoid pulling a fresh RNG crate; `Uuid::new_v4` draws
+/// from the OS CSPRNG via `getrandom`.
+pub fn mint_decision_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// Constant-time equality for permission decision tokens (OCEAN-185).
+///
+/// Compares the `expected` token bound to a gated turn against the `presented`
+/// token on a decision POST without leaking length or content via timing. A
+/// `None` expected token means the turn was submitted WITHOUT binding (legacy
+/// client) — callers decide that policy separately; this only answers "do these
+/// two present tokens match". Returns `false` if either side is absent.
+pub fn decision_token_matches(expected: Option<&str>, presented: Option<&str>) -> bool {
+    let (Some(expected), Some(presented)) = (expected, presented) else {
+        return false;
+    };
+    let a = expected.as_bytes();
+    let b = presented.as_bytes();
+    // Fold the length difference into the accumulator so mismatched lengths
+    // still run a full constant-time-ish compare and never early-return.
+    let mut diff = (a.len() ^ b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Body for `POST /v1/requests/{id}/cancel`.
