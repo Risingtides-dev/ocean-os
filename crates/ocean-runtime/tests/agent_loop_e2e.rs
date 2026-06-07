@@ -23,7 +23,9 @@ use ocean_protocol::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Content, Context, Error,
     Message, Model, Provider, StopReason, StreamOptions, Usage,
 };
-use ocean_runtime::types::{AgentConfig, AgentEvent, AgentTool, AgentToolResult};
+use ocean_runtime::types::{
+    AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, PermissionPolicy,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -147,6 +149,72 @@ impl AgentTool for EchoTool {
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
         self.ran.fetch_add(1, Ordering::SeqCst);
         Ok(AgentToolResult::text(format!("echo: {args}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A permission-requiring tool — same as EchoTool but `requires_permission()`
+// is true, so the loop consults `config.permission.check(...)` before running
+// it. This is the seam that exercises the Allow / AllowSession / Deny gate arms.
+// ---------------------------------------------------------------------------
+
+struct GatedTool {
+    ran: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AgentTool for GatedTool {
+    fn name(&self) -> &str {
+        "gated"
+    }
+    fn description(&self) -> &str {
+        "a tool that requires permission before running"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    // The crux: this forces the loop through the permission gate.
+    fn requires_permission(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        Ok(AgentToolResult::text(format!("gated ran: {args}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A scriptable mock permission policy. Returns a pre-set decision and counts
+// how many times `check` was consulted, so a test can assert the session cache
+// (AllowSession) means the policy is NOT re-consulted on the second call.
+//
+// Implemented entirely in the test crate against the public `PermissionPolicy`
+// trait + `PermissionDecision` enum — no production permission code is touched.
+// ---------------------------------------------------------------------------
+
+struct ScriptedPolicy {
+    decision: PermissionDecision,
+    checks: Arc<AtomicUsize>,
+}
+
+impl ScriptedPolicy {
+    fn new(decision: PermissionDecision) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let checks = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                decision,
+                checks: checks.clone(),
+            }),
+            checks,
+        )
+    }
+}
+
+#[async_trait]
+impl PermissionPolicy for ScriptedPolicy {
+    async fn check(&self, _tool_name: &str, _args: &Value) -> PermissionDecision {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        self.decision.clone()
     }
 }
 
@@ -623,5 +691,203 @@ async fn pre_cancelled_run_never_calls_provider() {
         provider.call_count(),
         0,
         "pre-cancelled run must never call the provider"
+    );
+}
+
+// ===========================================================================
+// Scenario 6 — Permission gate: Deny arm + OCEAN-60 orphan invariant (OCEAN-197).
+//
+// The model calls a permission-requiring tool; the policy returns `Deny`. The
+// gate must:
+//   1. NOT execute the tool (no side effect — `ran` stays 0),
+//   2. emit a `PermissionDenied` event and append an is_error tool_result so the
+//      transcript stays provider-valid (the call has a matching result),
+//   3. NEVER emit a `ToolExecutionStart` for that tool_call_id — the Deny arm's
+//      `continue` fires *before* the Start emit (OCEAN-60: no Start-without-End
+//      orphan on the event stream for a denied call).
+//
+// This proves no-execution (ran == 0, no Start) and the orphan invariant: if the
+// gate were broken (Deny fell through to execution or emitted Start), `ran` would
+// be 1 and/or a ToolExecutionStart for "gated" would appear — both rejected here.
+// ===========================================================================
+#[tokio::test]
+async fn denied_tool_does_not_run_and_emits_no_execution_start() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (policy, checks) = ScriptedPolicy::new(PermissionDecision::Deny {
+        reason: "operator denied".into(),
+    });
+
+    let provider = Arc::new(MockProvider::new(vec![
+        // Round 1: the model calls the gated tool.
+        vec![done(
+            vec![tool_call("call-deny", "gated", serde_json::json!({ "x": 1 }))],
+            StopReason::ToolUse,
+        )],
+        // Round 2: after the denial result is fed back, the model wraps up. (The
+        // loop continues the turn — denial is not a hard stop — so it needs a
+        // final round to terminate cleanly.)
+        vec![done(vec![Content::text("understood, stopping")], StopReason::Stop)],
+    ]));
+
+    let cfg = base_config(provider.clone())
+        .with_tools(vec![Arc::new(GatedTool { ran: ran.clone() })])
+        .with_permission(policy);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run = ocean_runtime::run_agent(&cfg, user("call the gated tool"), Some(tx))
+        .await
+        .expect("a denied tool does not error the run — it pairs a denial result");
+
+    // 1. The policy WAS consulted for the gated call.
+    assert_eq!(checks.load(Ordering::SeqCst), 1, "the Deny gate must be consulted once");
+    // 2. The tool was NEVER executed — no side effect.
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a denied tool must not execute");
+    // 3. Transcript is provider-valid: the tool_use got a matching (error) result.
+    assert_no_orphan_tool_use(&run.messages);
+    let denial = run
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            Message::ToolResult(tr) if tr.tool_call_id == "call-deny" => Some(tr),
+            _ => None,
+        })
+        .expect("the denied call must have a paired tool_result");
+    assert!(denial.is_error, "the denial tool_result must be flagged is_error");
+
+    let events = collect_events(&mut rx);
+    // 4. A PermissionDenied event was emitted for the gated tool.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PermissionDenied { tool_name, reason, .. }
+                if tool_name == "gated" && reason == "operator denied"
+        )),
+        "expected a PermissionDenied event for the gated tool"
+    );
+    // 5. OCEAN-60 orphan invariant: NO ToolExecutionStart for the denied call.
+    //    The Deny arm `continue`s before the Start emit, so a denied call must
+    //    never appear on the stream as a Start (which would then have no End).
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "call-deny"
+        )),
+        "a denied tool must NOT emit ToolExecutionStart (OCEAN-60 orphan invariant)"
+    );
+    // And, symmetrically, no End either (nothing ran).
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolExecutionEnd { tool_name, .. } if tool_name == "gated"
+        )),
+        "a denied tool must not emit ToolExecutionEnd"
+    );
+}
+
+// ===========================================================================
+// Scenario 7 — Permission gate: AllowSession caches across calls (OCEAN-197).
+//
+// The policy returns `AllowSession` on first check. The model calls the same
+// gated tool twice in one session/run. The gate must consult the policy only
+// ONCE — the first AllowSession records the tool name in the run's session
+// allow-set, and the second call skips the gate entirely (`needs_perm` is false
+// once the name is cached). Both calls execute.
+//
+// Verified by the policy's check counter: `checks == 1` despite two executions.
+// If the cache were broken, the policy would be consulted twice (checks == 2).
+// ===========================================================================
+#[tokio::test]
+async fn allow_session_caches_decision_across_calls() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (policy, checks) = ScriptedPolicy::new(PermissionDecision::AllowSession);
+
+    let provider = Arc::new(MockProvider::new(vec![
+        // Round 1: first call to the gated tool — gate is consulted, returns
+        // AllowSession, caches the name.
+        vec![done(
+            vec![tool_call("call-a", "gated", serde_json::json!({ "n": 1 }))],
+            StopReason::ToolUse,
+        )],
+        // Round 2: second call to the SAME tool — must run WITHOUT consulting the
+        // policy again (session cache hit).
+        vec![done(
+            vec![tool_call("call-b", "gated", serde_json::json!({ "n": 2 }))],
+            StopReason::ToolUse,
+        )],
+        // Round 3: wrap up.
+        vec![done(vec![Content::text("both done")], StopReason::Stop)],
+    ]));
+
+    let cfg = base_config(provider.clone())
+        .with_tools(vec![Arc::new(GatedTool { ran: ran.clone() })])
+        .with_permission(policy);
+
+    let run = ocean_runtime::run_agent(&cfg, user("call gated twice"), None)
+        .await
+        .expect("AllowSession run must complete cleanly");
+
+    // Both calls executed.
+    assert_eq!(ran.load(Ordering::SeqCst), 2, "both gated calls should have run");
+    // The cache works: the policy was consulted exactly ONCE across two calls.
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        1,
+        "AllowSession must cache — the policy is consulted once, not per call"
+    );
+    // Transcript stays provider-valid.
+    assert_no_orphan_tool_use(&run.messages);
+    assert_eq!(provider.call_count(), 3);
+}
+
+// ===========================================================================
+// Scenario 8 — Permission gate: Allow arm (OCEAN-197 sanity/contrast).
+//
+// The policy returns `Allow`. The gated tool runs normally and emits a
+// Start/End pair. Allow does NOT cache (unlike AllowSession), so a second call
+// would consult the policy again — but here one call suffices to confirm the
+// happy path: gate consulted, tool runs, Start+End emitted.
+// ===========================================================================
+#[tokio::test]
+async fn allow_lets_gated_tool_run_normally() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (policy, checks) = ScriptedPolicy::new(PermissionDecision::Allow);
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call("call-ok", "gated", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("done")], StopReason::Stop)],
+    ]));
+
+    let cfg = base_config(provider.clone())
+        .with_tools(vec![Arc::new(GatedTool { ran: ran.clone() })])
+        .with_permission(policy);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run = ocean_runtime::run_agent(&cfg, user("call gated once"), Some(tx))
+        .await
+        .expect("Allow run must complete cleanly");
+
+    assert_eq!(checks.load(Ordering::SeqCst), 1, "the Allow gate must be consulted once");
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "an allowed gated tool must run");
+    assert_no_orphan_tool_use(&run.messages);
+
+    let events = collect_events(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolExecutionStart { tool_call_id, tool_name, .. }
+                if tool_call_id == "call-ok" && tool_name == "gated"
+        )),
+        "an allowed gated tool must emit ToolExecutionStart"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolExecutionEnd { tool_name, is_error, .. }
+                if tool_name == "gated" && !is_error
+        )),
+        "an allowed gated tool must emit a non-error ToolExecutionEnd"
     );
 }
