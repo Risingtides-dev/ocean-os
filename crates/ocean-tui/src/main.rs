@@ -3651,6 +3651,31 @@ fn with_last_event_id(
     }
 }
 
+/// Decide whether a buffered agent-stream `Last-Event-ID` is still valid for the
+/// scope we're about to (re)connect under (OCEAN-190 cross-scope guard).
+///
+/// The daemon's `/v1/agent/events` replay buffer is a single GLOBAL UUID history
+/// that applies `?session_id=` filtering AFTER the replay lookup, so an id
+/// captured under scope A is meaningless against scope B — it would replay/skip
+/// from the wrong point in the global history. The id is valid ONLY for the exact
+/// scope it came from.
+///
+/// Given the scope `last_event_id` was captured under (`id_scope`) and the scope
+/// we're connecting with now (`connect_scope`), returns the id to actually send:
+/// the same id when the scopes match, or `None` when they differ (including the
+/// offline-switch case, where the live read loop never ran to notice the change).
+fn agent_last_event_id_for_scope<'a>(
+    last_event_id: Option<&'a str>,
+    id_scope: Option<AgentSessionId>,
+    connect_scope: Option<AgentSessionId>,
+) -> Option<&'a str> {
+    if id_scope == connect_scope {
+        last_event_id
+    } else {
+        None
+    }
+}
+
 fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
     thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder().build() {
@@ -3859,10 +3884,19 @@ fn spawn_daemon_agent_event_stream(
 
         // SSE `id:` of the last agent event we handed off, persisted across
         // reconnects so a network blip replays the gap via `Last-Event-ID`
-        // (OCEAN-190). Reset to `None` on a deliberate session switch below: the
-        // new `?session_id=` scope is a different event space, so the previous
-        // session's id must not leak into its replay request.
+        // (OCEAN-190) — plus the session scope that id was captured under.
+        //
+        // The daemon's `/v1/agent/events` replay buffer is a SINGLE GLOBAL UUID
+        // history that applies `?session_id=` filtering AFTER the replay lookup.
+        // So a last-event-id from scope A is meaningless against scope B: it would
+        // make B's stream replay/skip relative to the wrong point in the global
+        // history. The id is therefore only valid for the exact scope it came
+        // from. `agent_scope_for_last_event_id` records that scope so the connect
+        // path below can drop the id the moment the scope changes — covering BOTH
+        // a live switch (read loop notices) and an OFFLINE switch (read loop never
+        // ran, switch happened during the post-EOF backoff). See OCEAN-190.
         let mut last_event_id: Option<String> = None;
+        let mut agent_scope_for_last_event_id: Option<AgentSessionId> = None;
 
         loop {
             // Re-read the active session on each (re)connect and pin THIS
@@ -3871,11 +3905,34 @@ fn spawn_daemon_agent_event_stream(
             // reconnect when it does, so a live session switch actually re-scopes
             // the stream instead of waiting for an incidental disconnect.
             let connection_scope = scoped_session_id.lock().ok().and_then(|g| *g);
+
+            // Connect-time scope guard: only send `last_event_id` if it was
+            // captured under the SAME scope we're connecting with now; otherwise
+            // it's invalid for this stream (see the note above) and is dropped so
+            // the new scope starts fresh. This is the authoritative check — it
+            // fires even when the switch happened while we were disconnected,
+            // which the in-read-loop `scope_changed` reset cannot observe.
+            let id_valid_for_scope = agent_last_event_id_for_scope(
+                last_event_id.as_deref(),
+                agent_scope_for_last_event_id,
+                connection_scope,
+            )
+            .is_some();
+            if !id_valid_for_scope {
+                // Either no id yet, or a stale cross-scope id — in both cases the
+                // buffer is reset and re-bound to the scope we're connecting with,
+                // so the next captured id is recorded under the correct scope.
+                last_event_id = None;
+                agent_scope_for_last_event_id = connection_scope;
+            }
+
             let events_url = match connection_scope {
                 Some(sid) => format!("{base_url}?session_id={sid}"),
                 None => base_url.clone(),
             };
 
+            // After the guard, `last_event_id` is either an id valid for this
+            // scope or `None`, so it can be sent directly.
             let response = match with_last_event_id(
                 client
                     .get(&events_url)
@@ -4006,13 +4063,11 @@ fn spawn_daemon_agent_event_stream(
             }
 
             // A deliberate session switch reconnects right away (re-scope now);
-            // an error/EOF backs off to avoid hammering the daemon.
-            if scope_changed {
-                // New `?session_id=` scope is a different event space; the old
-                // session's last-event-id would replay the wrong stream, so drop
-                // it and let the reconnect start fresh for the new scope.
-                last_event_id = None;
-            } else {
+            // an error/EOF backs off to avoid hammering the daemon. We do NOT
+            // clear `last_event_id` here — the connect-time scope guard at the top
+            // of the loop owns that, and it correctly handles both this live
+            // switch AND an offline switch (where this read loop never ran).
+            if !scope_changed {
                 thread::sleep(Duration::from_secs(2));
             }
         }
@@ -6546,6 +6601,48 @@ mod tests {
             .build()
             .expect("build request");
         assert!(req.headers().get("Last-Event-ID").is_none());
+    }
+
+    #[test]
+    fn agent_last_event_id_sent_only_for_matching_scope() {
+        // OCEAN-190 cross-scope guard (Codex P2 on #120): an id captured under
+        // scope A must NEVER be replayed against scope B — the daemon's replay
+        // buffer is a single global UUID history filtered post-lookup, so a stale
+        // cross-scope id replays from the wrong point. Locks the offline-switch
+        // regression: switch happens while disconnected, reconnect targets B.
+        let scope_a = AgentSessionId::new_v4();
+        let scope_b = AgentSessionId::new_v4();
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+
+        // Captured under A, reconnecting under B → id is dropped.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), Some(scope_a), Some(scope_b)),
+            None,
+        );
+
+        // Captured under A, reconnecting under A again → id is sent.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), Some(scope_a), Some(scope_a)),
+            Some(id),
+        );
+
+        // Unscoped on both sides (no session selected) → id persists.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), None, None),
+            Some(id),
+        );
+
+        // Scoped id but reconnecting unscoped (session cleared) → dropped.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), Some(scope_a), None),
+            None,
+        );
+
+        // Previously unscoped id, now reconnecting under a scope → dropped.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), None, Some(scope_a)),
+            None,
+        );
     }
 
     #[test]
