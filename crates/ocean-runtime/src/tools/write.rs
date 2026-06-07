@@ -38,7 +38,9 @@ impl AgentTool for WriteTool {
             .ok_or("missing 'content'")?;
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).await.ok();
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    format!("could not create parent directory {}: {e}", parent.display())
+                })?;
             }
         }
         fs::write(path, content)
@@ -49,5 +51,56 @@ impl AgentTool for WriteTool {
             content.len(),
             path
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When the would-be parent directory is actually a regular file,
+    /// `create_dir_all` fails. The write tool must surface that dir-creation
+    /// failure (naming the directory + underlying cause) rather than letting
+    /// the later `fs::write` mask it as a confusing not-found.
+    #[tokio::test]
+    async fn write_surfaces_create_dir_all_failure_when_parent_is_a_file() {
+        // Create a temp file that we'll then treat as a directory.
+        let mut blocker = std::env::temp_dir();
+        blocker.push(format!("ocean187-parent-{}", std::process::id()));
+        // Ensure a clean slate, then create it as a FILE.
+        let _ = fs::remove_file(&blocker).await;
+        let _ = fs::remove_dir_all(&blocker).await;
+        fs::write(&blocker, b"i am a file, not a dir")
+            .await
+            .expect("create blocker file");
+
+        // Target lives "under" the file → create_dir_all(blocker) must fail.
+        let target = blocker.join("child.txt");
+
+        let tool = WriteTool;
+        let args = json!({
+            "path": target.to_str().unwrap(),
+            "content": "hello",
+        });
+
+        let err = tool
+            .execute("call-1", args)
+            .await
+            .expect_err("writing under a file path must fail");
+
+        // The error names the offending directory and is the dir-creation
+        // error, not a generic not-found from the later file write.
+        assert!(
+            err.contains("could not create parent directory"),
+            "expected a parent-directory creation error, got: {err}"
+        );
+        assert!(
+            err.contains(&blocker.display().to_string()),
+            "error should name the directory {}, got: {err}",
+            blocker.display()
+        );
+
+        // cleanup
+        let _ = fs::remove_file(&blocker).await;
     }
 }
