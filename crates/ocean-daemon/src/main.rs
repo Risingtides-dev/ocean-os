@@ -1802,6 +1802,35 @@ async fn call_place(
     }
 }
 
+/// Map a decided [`ocean_call::WebhookAction`] to the lifecycle event (if any)
+/// the daemon must emit. Split out from the handler so the mapping is unit
+/// testable without LiveKit signatures or `AppState`:
+///   - `JoinCall`  → `CallStarted` (room appeared; pipeline should attach)
+///   - `EndCall`   → `CallEnded`   (room finished — clean hangup, crash, or
+///                                   partition — so the call lifecycle MUST
+///                                   close or the TUI/surface shows a phantom
+///                                   "in progress" call forever; OCEAN-207)
+///   - `Ignore`    → `None`        (non-call room / non-lifecycle event)
+///
+/// The room name is threaded through as the `call_id` so subscribers correlate
+/// the end with the start. Emitting `CallEnded` for a `call_*`/`call:` room that
+/// ended is always correct and idempotent; non-call rooms never reach here
+/// because `decide` already returns `Ignore` for them.
+fn webhook_action_to_event(action: ocean_call::WebhookAction) -> Option<ocean_core::OceanEvent> {
+    match action {
+        ocean_call::WebhookAction::JoinCall { room } => Some(ocean_core::OceanEvent::CallStarted {
+            call_id: room.clone(),
+            room_id: room,
+            participants: vec![],
+        }),
+        ocean_call::WebhookAction::EndCall { room } => Some(ocean_core::OceanEvent::CallEnded {
+            call_id: room,
+            duration_ms: 0,
+        }),
+        ocean_call::WebhookAction::Ignore => None,
+    }
+}
+
 /// LiveKit webhook receiver. LiveKit POSTs room lifecycle events here; we
 /// verify the signature, and on a `room_started` for a `call_` room emit
 /// CallStarted (and CallEnded on `room_finished`) onto the SSE rail. This is
@@ -1831,24 +1860,26 @@ async fn call_webhook(
         .unwrap_or_default();
 
     match ocean_call::verify_and_decide(&api_key, &api_secret, &body, auth) {
-        Ok(ocean_call::WebhookAction::JoinCall { room }) => {
-            state.events.emit(ocean_core::EventEnvelope::new(
-                ocean_core::OceanEvent::CallStarted {
-                    call_id: room.clone(),
-                    room_id: room.clone(),
-                    participants: vec![],
-                },
-            ));
+        Ok(action @ ocean_call::WebhookAction::JoinCall { .. }) => {
+            let room = match &action {
+                ocean_call::WebhookAction::JoinCall { room } => room.clone(),
+                _ => unreachable!(),
+            };
+            if let Some(event) = webhook_action_to_event(action) {
+                state.events.emit(ocean_core::EventEnvelope::new(event));
+            }
             tracing::info!(%room, "inbound call room started");
             (StatusCode::OK, Json(json!({ "ok": true, "action": "join", "room": room })))
         }
-        Ok(ocean_call::WebhookAction::EndCall { room }) => {
-            state.events.emit(ocean_core::EventEnvelope::new(
-                ocean_core::OceanEvent::CallEnded {
-                    call_id: room.clone(),
-                    duration_ms: 0,
-                },
-            ));
+        Ok(action @ ocean_call::WebhookAction::EndCall { .. }) => {
+            let room = match &action {
+                ocean_call::WebhookAction::EndCall { room } => room.clone(),
+                _ => unreachable!(),
+            };
+            if let Some(event) = webhook_action_to_event(action) {
+                state.events.emit(ocean_core::EventEnvelope::new(event));
+            }
+            tracing::info!(%room, "call room finished — emitting CallEnded");
             (StatusCode::OK, Json(json!({ "ok": true, "action": "end", "room": room })))
         }
         Ok(ocean_call::WebhookAction::Ignore) => {
@@ -4894,6 +4925,71 @@ mod tests {
             },
             cancel: CancellationToken::new(),
             handle: None,
+        }
+    }
+
+    /// OCEAN-207: a `room_finished` webhook for a `call_*` room must decide
+    /// `EndCall` and the daemon must map that to a `CallEnded` event (with the
+    /// room threaded through as `call_id`). Without this the call lifecycle
+    /// never closes and the TUI/surface shows a phantom "in progress" call
+    /// forever. We assert the full decide → emit mapping the handler relies on.
+    #[test]
+    fn room_finished_on_call_room_maps_to_call_ended() {
+        // Inbound: SIP-routed `call_<caller>_<random>` hangup.
+        let inbound = "call_+17035551234_aB3x";
+        let action = ocean_call::decide_webhook("room_finished", inbound);
+        assert_eq!(
+            action,
+            ocean_call::WebhookAction::EndCall {
+                room: inbound.to_string()
+            }
+        );
+        match webhook_action_to_event(action) {
+            Some(OceanEvent::CallEnded { call_id, .. }) => assert_eq!(call_id, inbound),
+            other => panic!("expected CallEnded for inbound room_finished, got {other:?}"),
+        }
+
+        // Outbound: `/v1/calls/place` rooms are `call:<uuid>`; a normal hangup
+        // fires room_finished on them too and must also close the lifecycle.
+        let outbound = "call:3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+        let action = ocean_call::decide_webhook("room_finished", outbound);
+        assert_eq!(
+            action,
+            ocean_call::WebhookAction::EndCall {
+                room: outbound.to_string()
+            }
+        );
+        match webhook_action_to_event(action) {
+            Some(OceanEvent::CallEnded { call_id, .. }) => assert_eq!(call_id, outbound),
+            other => panic!("expected CallEnded for outbound room_finished, got {other:?}"),
+        }
+    }
+
+    /// A `room_finished` for a NON-call room must NOT emit CallEnded: `decide`
+    /// returns `Ignore` and the daemon maps that to no event at all, so regular
+    /// app rooms (e.g. `pm`, `writers`) never produce phantom call lifecycle.
+    #[test]
+    fn room_finished_on_non_call_room_emits_no_event() {
+        let action = ocean_call::decide_webhook("room_finished", "pm");
+        assert_eq!(action, ocean_call::WebhookAction::Ignore);
+        assert!(
+            webhook_action_to_event(action).is_none(),
+            "non-call room_finished must not emit a lifecycle event"
+        );
+    }
+
+    /// Symmetry guard: a `room_started` on a call room maps to CallStarted, so
+    /// the start/end pair stays balanced and correlated by the same `call_id`.
+    #[test]
+    fn room_started_on_call_room_maps_to_call_started() {
+        let room = "call_anon_xyz";
+        let action = ocean_call::decide_webhook("room_started", room);
+        match webhook_action_to_event(action) {
+            Some(OceanEvent::CallStarted { call_id, room_id, .. }) => {
+                assert_eq!(call_id, room);
+                assert_eq!(room_id, room);
+            }
+            other => panic!("expected CallStarted for room_started, got {other:?}"),
         }
     }
 
