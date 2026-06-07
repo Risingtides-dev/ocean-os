@@ -496,7 +496,9 @@ impl AgentRuntime {
     /// path, to bound disk growth on long-lived daemons (OCEAN-209). Returns
     /// the number of files pruned.
     pub fn session_file_gc(&self) -> usize {
-        session::session_file_gc(&self.config_dir)
+        // Read OCEAN_SESSION_TTL_DAYS once, overflow-safely, here at the edge —
+        // the GC function itself takes the resolved TTL as a parameter (OCEAN-211).
+        session::session_file_gc(&self.config_dir, session::ttl_from_env())
     }
 
     pub fn session_detail(&self, id: SessionId) -> anyhow::Result<SessionDetail> {
@@ -1584,11 +1586,52 @@ mod session {
     const SESSION_TTL_ENV: &str = "OCEAN_SESSION_TTL_DAYS";
     const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
 
-    fn session_ttl_days() -> u64 {
+    /// Resolve the session-file TTL from `OCEAN_SESSION_TTL_DAYS` into the
+    /// `Option<Duration>` that [`session_file_gc`] consumes. Read ONCE here, off
+    /// the GC function itself, so the GC stays a pure function of its arguments
+    /// (no process-global env reads — that keeps its tests free of env races).
+    ///
+    /// Semantics:
+    /// - unset / unparseable → default 90 days
+    /// - `0` → `None` (pruning disabled)
+    /// - any other `n` → `Some(n days)`
+    ///
+    /// Overflow safety (the OCEAN-211 bug): `days * 86_400` can overflow `u64`
+    /// for huge inputs — debug builds panicked at startup (GC runs in
+    /// `from_env`), release wrapped to a tiny TTL that would delete sessions the
+    /// operator meant to keep. See [`ttl_from_days`] for the overflow-safe
+    /// conversion.
+    pub(crate) fn ttl_from_env() -> Option<std::time::Duration> {
+        ttl_from_days(ttl_days_from_env())
+    }
+
+    /// The raw day count from the env, before conversion. Split out so the
+    /// conversion logic (the overflow-prone part, [`ttl_from_days`]) is
+    /// unit-testable without touching the process-global env.
+    fn ttl_days_from_env() -> u64 {
         match std::env::var(SESSION_TTL_ENV) {
             Ok(v) => v.trim().parse().unwrap_or(DEFAULT_SESSION_TTL_DAYS),
             Err(_) => DEFAULT_SESSION_TTL_DAYS,
         }
+    }
+
+    /// Convert a TTL in days to a `Duration`, overflow-safely.
+    ///
+    /// - `0` → `None` (pruning disabled).
+    /// - overflow on `days * 86_400` → SATURATE to `Duration::MAX`
+    ///   ("never prune") rather than panicking (debug) or wrapping down to a
+    ///   tiny TTL (release) that would delete sessions the operator meant to
+    ///   keep. A TTL that large can't be exceeded by any real file age, so
+    ///   nothing is pruned — the safe direction for an absurd input.
+    /// - otherwise → `Some(days as a Duration)`.
+    pub(crate) fn ttl_from_days(days: u64) -> Option<std::time::Duration> {
+        if days == 0 {
+            return None; // disabled
+        }
+        let ttl = days
+            .checked_mul(24 * 60 * 60)
+            .map_or(std::time::Duration::MAX, std::time::Duration::from_secs);
+        Some(ttl)
     }
 
     /// Prune on-disk session files older than the configured TTL.
@@ -1611,15 +1654,20 @@ mod session {
     /// save, refreshing its mtime — so the TTL gate alone protects live
     /// sessions. No need to consult the in-memory session/lock map.
     ///
+    /// `ttl` is the resolved age threshold (`None` = pruning disabled / never
+    /// prune); the caller reads `OCEAN_SESSION_TTL_DAYS` once via [`ttl_from_env`]
+    /// and passes the result in. Keeping the env OUT of this function makes it a
+    /// pure function of its arguments — its tests pass an explicit `ttl` and
+    /// never mutate the process-global env, so they can't race each other
+    /// (OCEAN-211).
+    ///
     /// Returns the number of files pruned. Logs a single info summary when it
     /// prunes anything; silent otherwise. Best-effort: I/O errors on individual
     /// entries are skipped, never fatal — GC must never wedge startup.
-    pub fn session_file_gc(config_dir: &Path) -> usize {
-        let ttl_days = session_ttl_days();
-        if ttl_days == 0 {
+    pub fn session_file_gc(config_dir: &Path, ttl: Option<std::time::Duration>) -> usize {
+        let Some(ttl) = ttl else {
             return 0; // disabled
-        }
-        let ttl = std::time::Duration::from_secs(ttl_days * 24 * 60 * 60);
+        };
         let now = std::time::SystemTime::now();
         let root = sessions_dir(config_dir);
 
@@ -1670,6 +1718,7 @@ mod session {
             let oldest_days = oldest_age
                 .map(|d| d.as_secs() / (24 * 60 * 60))
                 .unwrap_or(0);
+            let ttl_days = ttl.as_secs() / (24 * 60 * 60);
             tracing::info!(
                 pruned,
                 oldest_age_days = oldest_days,
@@ -1968,30 +2017,11 @@ mod tests {
         path
     }
 
-    /// RAII guard pinning a process-global env var for a test, restoring the
-    /// prior value on drop (OCEAN-173 idiom). Used here to isolate the
-    /// `OCEAN_SESSION_TTL_DAYS` reads in the session-GC tests so they don't
-    /// leak the override into other tests sharing the process env.
-    struct EnvVarGuard {
-        key: &'static str,
-        prior: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prior = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, prior }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
+    /// Build a `Some(ttl)` from a day count for the GC tests. The GC takes its
+    /// TTL as a parameter now (OCEAN-211), so tests pass it explicitly and never
+    /// touch the process-global env — no env races, no EnvVarGuard needed.
+    fn ttl_days(days: u64) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(days * 24 * 60 * 60))
     }
 
     /// Backdate a file's mtime by `days` so the GC sees it as aged.
@@ -2024,8 +2054,7 @@ mod tests {
         backdate(&old_a_path, 100);
         backdate(&old_b_path, 45);
 
-        let _guard = EnvVarGuard::set("OCEAN_SESSION_TTL_DAYS", "30");
-        let pruned = session::session_file_gc(&config_dir);
+        let pruned = session::session_file_gc(&config_dir, ttl_days(30));
 
         assert_eq!(pruned, 2, "both aged files pruned");
         assert!(!old_a_path.exists(), "100-day file deleted");
@@ -2045,11 +2074,63 @@ mod tests {
         let ancient_path = session::save(&config_dir, &ancient).unwrap();
         backdate(&ancient_path, 10_000); // way past any default
 
-        let _guard = EnvVarGuard::set("OCEAN_SESSION_TTL_DAYS", "0");
-        let pruned = session::session_file_gc(&config_dir);
+        // None = disabled (the `0` days case, resolved at the env edge).
+        let pruned = session::session_file_gc(&config_dir, None);
 
-        assert_eq!(pruned, 0, "TTL=0 disables pruning");
+        assert_eq!(pruned, 0, "TTL=None disables pruning");
         assert!(ancient_path.exists(), "nothing deleted when disabled");
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn ttl_from_days_zero_is_disabled() {
+        assert_eq!(session::ttl_from_days(0), None, "0 days disables pruning");
+    }
+
+    #[test]
+    fn ttl_from_days_normal_value() {
+        assert_eq!(
+            session::ttl_from_days(30),
+            Some(std::time::Duration::from_secs(30 * 24 * 60 * 60)),
+            "30 days resolves to 30 * 86_400 seconds"
+        );
+    }
+
+    /// OCEAN-211 bug 1: a huge OCEAN_SESSION_TTL_DAYS overflows `days * 86_400`.
+    /// Before the fix that panicked in debug (GC runs in from_env) / wrapped to a
+    /// tiny TTL in release (deleting sessions the operator wanted kept). The
+    /// conversion must now SATURATE to a never-prune TTL instead of panicking or
+    /// wrapping.
+    #[test]
+    fn ttl_from_days_overflow_saturates_to_never_prune() {
+        let ttl = session::ttl_from_days(u64::MAX);
+        assert_eq!(
+            ttl,
+            Some(std::time::Duration::MAX),
+            "overflow saturates to Duration::MAX, not a wrapped tiny value"
+        );
+    }
+
+    /// End-to-end of the overflow path: a never-prune TTL must leave even an
+    /// aged file untouched — i.e. the saturated value really does behave as
+    /// "never prune", never deleting wanted sessions.
+    #[test]
+    fn session_file_gc_overflow_ttl_keeps_everything() {
+        let config_dir = temp_config_dir("session-gc-overflow");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+
+        let mut aged = session::Session::new(&model);
+        aged.bind_workspace(Path::new("."));
+        let aged_path = session::save(&config_dir, &aged).unwrap();
+        backdate(&aged_path, 10_000); // way past any sane TTL
+
+        // Feed the overflow-resolved TTL (u64::MAX days) into the GC.
+        let ttl = session::ttl_from_days(u64::MAX);
+        let pruned = session::session_file_gc(&config_dir, ttl);
+
+        assert_eq!(pruned, 0, "never-prune TTL deletes nothing");
+        assert!(aged_path.exists(), "aged file survives an overflow TTL");
 
         let _ = std::fs::remove_dir_all(config_dir);
     }
