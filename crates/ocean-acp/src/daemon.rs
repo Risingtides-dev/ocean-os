@@ -12,7 +12,10 @@
 
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
-use ocean_agent_sdk::{AgentTurnEvent, AgentTurnRequest, AgentTurnResponse};
+use ocean_agent_sdk::{
+    AgentSessionCreateRequest, AgentSessionCreateResponse, AgentTurnEvent, AgentTurnRequest,
+    AgentTurnResponse,
+};
 use ocean_core::{EventEnvelope, PermissionDecision, PermissionDecisionRequest};
 use serde::Deserialize;
 use std::pin::Pin;
@@ -95,6 +98,50 @@ impl DaemonClient {
             resp.provider.unwrap_or_default(),
             resp.model.unwrap_or_else(|| model.to_string()),
         ))
+    }
+
+    /// Create (mint + persist) a daemon session up front, binding it to `cwd`.
+    /// Mirrors `POST /v1/agent/sessions`. Returns the daemon's freshly-minted
+    /// session id and the workspace-bound cwd.
+    ///
+    /// OCEAN-213: the ACP bridge calls this at `session/new` so the ACP session
+    /// id IT returns to the editor IS the daemon's id. Unifying the two id
+    /// spaces is what makes `session/load` actually resume after a bridge
+    /// restart — the id the editor replays is the daemon id, so the cwd lookup
+    /// hits the right key and the next turn resumes the persisted transcript
+    /// instead of silently forking a fresh one. Without this, the bridge minted
+    /// a *local* id the daemon never knew, and the daemon→ACP mapping (learned
+    /// lazily, held only in memory) was lost on restart.
+    pub async fn create_session(
+        &self,
+        cwd: &str,
+    ) -> Result<AgentSessionCreateResponse> {
+        let url = format!("{}/v1/agent/sessions", self.base_url);
+        let body = AgentSessionCreateRequest {
+            workspace_root: cwd.to_string(),
+            project_id: None,
+            client_type: Some(CLIENT_TYPE.to_string()),
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("daemon rejected session create")?
+            .json::<AgentSessionCreateResponse>()
+            .await
+            .context("decode session-create response")?;
+        // The daemon returns an empty cwd + new id on a failed bind (it never
+        // 4xxs the create on a bad cwd). Treat an empty cwd as a failure so the
+        // caller falls back to its local id instead of binding to nothing.
+        anyhow::ensure!(
+            !resp.cwd.trim().is_empty(),
+            "daemon session create returned an empty cwd (bind failed)"
+        );
+        Ok(resp)
     }
 
     /// Fetch a session's recorded working directory from the daemon.

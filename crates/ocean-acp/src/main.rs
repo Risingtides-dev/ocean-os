@@ -60,10 +60,13 @@ struct Cli {
 /// doesn't hand us up front:
 ///  - `cwd` — ACP supplies it once at `session/new`, but the daemon wants it on
 ///    every turn.
-///  - `daemon_id` — the daemon mints its real session id lazily on the FIRST
-///    turn (it rejects client-invented ids on resume). So the ACP session id we
-///    return at `session/new` is ours; we map it to the daemon's id once the
-///    first turn establishes it. `None` until then.
+///  - `daemon_id` — the daemon's real session id. OCEAN-213: `session/new` mints
+///    the daemon session up front and returns its id AS the ACP id, so the two
+///    are unified and `daemon_id` is set immediately (and restored on
+///    `session/load` — which is what lets a resumed session actually resume the
+///    persisted transcript). Legacy fallback: if up-front creation failed, the
+///    ACP id is a local UUID and the daemon's id is learned lazily from the
+///    first turn's event stream and claimed here; `None` until then.
 #[derive(Clone, Default)]
 struct Sessions {
     inner: Arc<Mutex<HashMap<String, SessionState>>>,
@@ -72,7 +75,9 @@ struct Sessions {
 #[derive(Clone)]
 struct SessionState {
     cwd: String,
-    /// The daemon's real session id, learned from the first turn's response.
+    /// The daemon's real session id. Set up front at `session/new` (unified with
+    /// the ACP id, OCEAN-213), restored at `session/load`, or — in the legacy
+    /// fallback — learned from the first turn's event stream.
     daemon_id: Option<String>,
     /// The in-flight turn's daemon request id (== the turn id). Set while a turn
     /// is running so `session/cancel` can target `POST /v1/requests/{id}/cancel`,
@@ -87,11 +92,27 @@ struct SessionState {
 
 impl Sessions {
     fn insert(&self, acp_session_id: String, cwd: String) {
+        self.insert_with_daemon_id(acp_session_id, cwd, None);
+    }
+
+    /// Insert a session, optionally pre-binding its daemon id.
+    ///
+    /// OCEAN-213: when the bridge mints the daemon session up front (at
+    /// `session/new`) or restores it (at `session/load`), the ACP id and daemon
+    /// id are the SAME value, so we record `daemon_id` immediately. That makes
+    /// the very first `run_turn` submit the daemon id — resuming the persisted
+    /// session — instead of `None`, which would have forked a fresh transcript.
+    fn insert_with_daemon_id(
+        &self,
+        acp_session_id: String,
+        cwd: String,
+        daemon_id: Option<String>,
+    ) {
         self.inner.lock().expect("sessions mutex poisoned").insert(
             acp_session_id,
             SessionState {
                 cwd,
-                daemon_id: None,
+                daemon_id,
                 active_request_id: None,
                 model_id: None,
             },
@@ -244,12 +265,42 @@ async fn main() -> AcpResult<()> {
                 let sessions = sessions.clone();
                 let client = client.clone();
                 async move |req: NewSessionRequest, responder, _conn| {
-                    // The daemon creates sessions lazily on first turn, but ACP
-                    // needs a session id NOW. Generate one and reuse it as the
-                    // daemon session_id on the first (and every) turn.
-                    let session_id = uuid::Uuid::new_v4().to_string();
-                    let cwd = req.cwd.to_string_lossy().to_string();
-                    sessions.insert(session_id.clone(), cwd);
+                    // ACP needs a session id NOW. OCEAN-213: mint the DAEMON
+                    // session up front (`POST /v1/agent/sessions`) and return the
+                    // daemon's id AS the ACP session id, so the two id spaces are
+                    // unified. This is what makes `session/load` actually resume
+                    // after a bridge restart: the id the editor persists and
+                    // replays IS the daemon id, so the cwd lookup hits the right
+                    // key and the next turn resumes the persisted transcript.
+                    //
+                    // Pre-binding `daemon_id` here also means the first
+                    // `run_turn` submits the real id (resume), not `None` (which
+                    // would fork a fresh transcript). If the daemon is
+                    // unreachable we fall back to a local id + lazy claim — the
+                    // pre-OCEAN-213 behaviour — so `session/new` never wedges, at
+                    // the cost of losing cross-restart resume for that session.
+                    let req_cwd = req.cwd.to_string_lossy().to_string();
+                    let (session_id, cwd) = match client.create_session(&req_cwd).await {
+                        Ok(created) => {
+                            let id = created.session_id.0.to_string();
+                            sessions.insert_with_daemon_id(
+                                id.clone(),
+                                created.cwd.clone(),
+                                Some(id.clone()),
+                            );
+                            (id, created.cwd)
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "session/new: up-front daemon session create failed; \
+                                 falling back to a local id (no cross-restart resume)"
+                            );
+                            let id = uuid::Uuid::new_v4().to_string();
+                            sessions.insert(id.clone(), req_cwd.clone());
+                            (id, req_cwd)
+                        }
+                    };
 
                     // Mirror the daemon's live model roster into ACP "session
                     // modes" so Zed renders a model picker. Same source the TUI
@@ -263,7 +314,7 @@ async fn main() -> AcpResult<()> {
                         }
                     };
 
-                    tracing::info!(%session_id, has_modes = modes.is_some(), "session/new");
+                    tracing::info!(%session_id, %cwd, has_modes = modes.is_some(), "session/new");
                     let mut resp = NewSessionResponse::new(SessionId::new(session_id));
                     resp.modes = modes;
                     responder.respond(resp)
@@ -277,44 +328,70 @@ async fn main() -> AcpResult<()> {
                 let sessions = sessions.clone();
                 let client = client.clone();
                 async move |req: LoadSessionRequest, responder, _conn| {
-                    // We advertise `load_session` (see `initialize`), so we MUST
-                    // honour it: repopulate this session's cwd in the bridge map.
-                    // Otherwise the first post-restart `session/prompt` would hit
-                    // the `cwd()`-miss path and fall back to `env::current_dir()`
-                    // — likely the wrong project dir. The editor hands us the
-                    // session's cwd right here on the load request; prefer it. If
-                    // it's empty (older editors), ask the daemon for the cwd it
-                    // recorded for this session (`GET /v1/agent/sessions/{id}`).
+                    // OCEAN-213: a real resume, not just a cwd restore. Because
+                    // `session/new` now mints the daemon session up front and
+                    // returns the daemon id AS the ACP id, the id the editor
+                    // replays here IS the daemon id. So loading a session means:
+                    //   1. confirm the daemon still has it (and get its bound cwd)
+                    //   2. record `daemon_id = Some(acp_session_id)` so the next
+                    //      `run_turn` submits that id and the daemon RESUMES the
+                    //      persisted transcript — instead of submitting `None` and
+                    //      forking a brand-new conversation.
+                    // Codex P1 (#137): the earlier version restored cwd but left
+                    // `daemon_id` None, so load silently started a fresh session.
                     let acp_session_id = req.session_id.0.to_string();
                     let req_cwd = req.cwd.to_string_lossy().to_string();
-                    let cwd = if !req_cwd.trim().is_empty() {
-                        req_cwd
-                    } else {
-                        match client.session_cwd(&acp_session_id).await {
-                            Ok(Some(daemon_cwd)) => daemon_cwd,
-                            Ok(None) => {
-                                tracing::warn!(
-                                    %acp_session_id,
-                                    "session/load: no cwd on request and daemon has none; \
-                                     turns will fall back to the process cwd"
-                                );
-                                std::env::current_dir()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|_| ".".to_string())
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    %acp_session_id, error = %err,
-                                    "session/load: daemon cwd lookup failed; \
-                                     turns will fall back to the process cwd"
-                                );
-                                std::env::current_dir()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|_| ".".to_string())
-                            }
+
+                    // Ask the daemon whether it knows this session, and for the
+                    // workspace it bound. `Some(cwd)` ⇒ the session exists ⇒ we
+                    // can resume it; `None` (404) ⇒ unknown to the daemon.
+                    let daemon_cwd = match client.session_cwd(&acp_session_id).await {
+                        Ok(found) => found,
+                        Err(err) => {
+                            tracing::warn!(
+                                %acp_session_id, error = %err,
+                                "session/load: daemon session lookup failed; \
+                                 will restore cwd but cannot guarantee resume"
+                            );
+                            None
                         }
                     };
-                    sessions.insert(acp_session_id.clone(), cwd.clone());
+
+                    // cwd precedence: the daemon's bound workspace is
+                    // authoritative; else the editor-supplied cwd; else the
+                    // process cwd so turns never wedge.
+                    let cwd = daemon_cwd.clone().unwrap_or_else(|| {
+                        if !req_cwd.trim().is_empty() {
+                            req_cwd.clone()
+                        } else {
+                            std::env::current_dir()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| ".".to_string())
+                        }
+                    });
+
+                    // Only claim the daemon id when the daemon actually has the
+                    // session. If it doesn't (legacy local-id session minted
+                    // before OCEAN-213, or a session pruned off disk), we cannot
+                    // honestly resume the transcript — leave `daemon_id` None so
+                    // the next turn starts a fresh session rather than 404ing,
+                    // and say so loudly.
+                    let daemon_id = if daemon_cwd.is_some() {
+                        Some(acp_session_id.clone())
+                    } else {
+                        tracing::warn!(
+                            %acp_session_id,
+                            "session/load: daemon has no such session; restoring cwd only — \
+                             the next turn will start a FRESH session (no transcript resume). \
+                             Likely a pre-OCEAN-213 local-id session or one pruned off disk."
+                        );
+                        None
+                    };
+                    sessions.insert_with_daemon_id(
+                        acp_session_id.clone(),
+                        cwd.clone(),
+                        daemon_id.clone(),
+                    );
 
                     // Mirror the model roster into session modes so the resumed
                     // session keeps its model picker, same as `session/new`.
@@ -326,7 +403,12 @@ async fn main() -> AcpResult<()> {
                         }
                     };
 
-                    tracing::info!(%acp_session_id, %cwd, has_modes = modes.is_some(), "session/load");
+                    tracing::info!(
+                        %acp_session_id, %cwd,
+                        resumes = daemon_id.is_some(),
+                        has_modes = modes.is_some(),
+                        "session/load"
+                    );
                     let mut resp = LoadSessionResponse::new();
                     resp.modes = modes;
                     responder.respond(resp)
@@ -549,10 +631,15 @@ async fn run_turn(
     prompt: String,
     cwd: String,
 ) -> anyhow::Result<StopReason> {
-    // Resolve the daemon's session id. The daemon mints it lazily on the FIRST
-    // turn (it rejects client-invented ids on resume), so:
-    //   - first turn  → submit with `None`; the id arrives via the events.
-    //   - later turns → resume with the stored daemon id.
+    // Resolve the daemon's session id to submit with.
+    //
+    // OCEAN-213: `session/new` now mints the daemon session up front (via
+    // `POST /v1/agent/sessions`) and records its id, so `daemon_id` is normally
+    // `Some` from the very first turn — every turn (including the first) resumes
+    // the already-persisted session. The legacy lazy path still applies as a
+    // fallback: if up-front creation failed (daemon was unreachable at
+    // `session/new`), `daemon_id` is `None`, we submit `None`, the daemon mints
+    // an id, and we learn+claim it from the event stream below.
     let known_daemon_id = sessions.daemon_id(acp_session_id);
     // Per-session model override (OCEAN-36): if this session picked a model via
     // session/set_mode, ride it on the turn so the daemon drives just this turn
@@ -1015,21 +1102,78 @@ mod tests {
     }
 
     #[test]
-    fn session_load_repopulates_cwd_so_prompt_avoids_process_cwd_fallback() {
-        // OCEAN-213: we advertise `load_session`, so a resumed session must get
-        // its cwd repopulated. The handler inserts the loaded cwd into the map;
-        // a subsequent `session/prompt` then reads it instead of falling back to
-        // `env::current_dir()`. Model the post-load state and assert the lookup.
+    fn session_new_unifies_acp_and_daemon_ids_so_first_turn_resumes() {
+        // OCEAN-213: `session/new` mints the daemon session up front and uses the
+        // daemon id AS the ACP id, recording it as `daemon_id` immediately. The
+        // VERY FIRST `run_turn` then submits that id (resume an existing
+        // zero-turn session) rather than `None` (fork). Model the post-new state.
         let sessions = Sessions::default();
-        // Simulate the bridge restarting with an empty map, then a session/load
-        // arriving for a previously-unseen session id.
-        assert_eq!(sessions.cwd("resumed-1"), None);
+        // The daemon minted this id via POST /v1/agent/sessions; the bridge
+        // returns it to the editor AND records it as the daemon id.
+        let daemon_id = "11111111-1111-4111-8111-111111111111";
+        sessions.insert_with_daemon_id(
+            daemon_id.into(),
+            "/work/repo".into(),
+            Some(daemon_id.into()),
+        );
 
-        // session/load stores the cwd the editor (or daemon) supplied.
-        sessions.insert("resumed-1".into(), "/work/repo".into());
+        // run_turn submits `sessions.daemon_id(acp_id)` — it must be Some(the id)
+        // so the daemon resumes instead of creating a fresh session.
+        assert_eq!(
+            sessions.daemon_id(daemon_id).as_deref(),
+            Some(daemon_id),
+            "first turn must submit the daemon id, not None"
+        );
+        assert_eq!(sessions.cwd(daemon_id), Some("/work/repo".into()));
+    }
 
-        // session/prompt now finds the right project dir — no process-cwd guess.
-        assert_eq!(sessions.cwd("resumed-1"), Some("/work/repo".into()));
+    #[test]
+    fn session_load_restores_daemon_id_so_resume_actually_resumes() {
+        // Codex P1 (#137): the earlier load handler restored cwd but left
+        // `daemon_id` None — so the next turn forked a FRESH daemon session,
+        // losing the loaded transcript. With unified ids, a session the daemon
+        // still knows must come back with `daemon_id = Some(acp_id)`.
+        let sessions = Sessions::default();
+        // Bridge restarted: empty map, then session/load arrives. The ACP id IS
+        // the daemon id (OCEAN-213 unification), and the daemon confirmed it has
+        // the session (session_cwd returned Some), so the handler claims it.
+        let acp_id = "22222222-2222-4222-8222-222222222222";
+        assert_eq!(sessions.daemon_id(acp_id), None);
+
+        sessions.insert_with_daemon_id(
+            acp_id.into(),
+            "/work/repo".into(),
+            Some(acp_id.into()),
+        );
+
+        // daemon_id is restored → run_turn submits it → daemon RESUMES.
+        assert_eq!(
+            sessions.daemon_id(acp_id).as_deref(),
+            Some(acp_id),
+            "session/load must restore daemon_id so the next turn resumes"
+        );
+        // …and the cwd lookup uses the same (correct) id space.
+        assert_eq!(sessions.cwd(acp_id), Some("/work/repo".into()));
+    }
+
+    #[test]
+    fn session_load_for_session_daemon_forgot_leaves_daemon_id_none() {
+        // When the daemon has NO such session (legacy local-id session, or one
+        // pruned off disk), the load handler honestly restores cwd only and
+        // leaves `daemon_id` None — the next turn starts fresh rather than 404ing
+        // on a resume of a session that no longer exists.
+        let sessions = Sessions::default();
+        let acp_id = "33333333-3333-4333-8333-333333333333";
+
+        // session_cwd returned None ⇒ daemon doesn't know it ⇒ cwd-only restore.
+        sessions.insert_with_daemon_id(acp_id.into(), "/work/repo".into(), None);
+
+        assert_eq!(sessions.cwd(acp_id), Some("/work/repo".into()));
+        assert_eq!(
+            sessions.daemon_id(acp_id),
+            None,
+            "a session the daemon forgot must not claim a daemon id"
+        );
     }
 
     #[test]
