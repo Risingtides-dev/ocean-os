@@ -64,8 +64,40 @@ cargo run -p ocean-daemon
 OCEAN_YOLO=1 cargo run -p ocean-daemon
 ```
 
-Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Anything
-else (including unset) keeps gating **on**.
+Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Falsey:
+`0`, `false`, `no`, `off`. Unrecognized/unset falls through to the persisted
+default (below).
+
+##### Persisted YOLO default (OCEAN-YOLO)
+
+YOLO is also a **persisted personal default** you set once, so it survives daemon
+restarts without needing the env var on every launch (mirrors the persisted
+model selection — a tiny `yolo_pref` file in `$OCEAN_CONFIG_DIR`).
+
+```bash
+# Read current persisted + effective posture.
+curl -s http://127.0.0.1:4780/v1/settings/yolo
+# {"ok":true,"persisted":null,"effective":false,"env_override":null}
+
+# Set your personal default ON (persists across restarts).
+curl -s -X POST http://127.0.0.1:4780/v1/settings/yolo \
+  -H 'content-type: application/json' -d '{"enabled":true}'
+# {"ok":true,"persisted":true,"effective":true,"env_override":null}
+```
+
+- `persisted` — your saved default (`null` on first run ⇒ off).
+- `effective` — what a turn actually uses right now (after env override).
+- `env_override` — non-null when `OCEAN_YOLO` is masking your persisted default.
+
+**Precedence (highest wins):** explicit per-request `yolo: true` on a turn →
+`OCEAN_YOLO` env (if set to a recognized value) → **persisted setting** → built-in
+default (**off**). So you set it once as your default, and env / per-request can
+still override for a session (e.g. `OCEAN_YOLO=0` forces gating even if your
+persisted default is on).
+
+Default stays **OFF** (gating on) — the persisted setting is opt-in and never
+silently flips. It only controls whether tools auto-approve; it does **not**
+weaken the permission decision-token binding (OCEAN-185).
 
 > ⚠️ **Behavior change.** Before this fix, `/v1/agent/turns` hardcoded yolo mode,
 > so the permission machinery was dead for every shipped surface. Now it is live

@@ -1306,6 +1306,39 @@ fn load_last_model(config_dir: &std::path::Path) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// File under `config_dir` that remembers the operator's persisted YOLO default
+/// (OCEAN-YOLO), so the daemon resumes the chosen permission-gating posture
+/// across restarts instead of always falling back to the safe default. Mirrors
+/// [`LAST_MODEL_FILE`]: a tiny plaintext file holding `true`/`false`.
+const YOLO_PREF_FILE: &str = "yolo_pref";
+
+/// Persist the operator's YOLO preference (best-effort; a write failure is
+/// logged, never fatal — losing the hint just falls back to the safe default
+/// of gated/off). Mirrors [`persist_last_model`].
+pub fn persist_yolo_pref(config_dir: &std::path::Path, enabled: bool) {
+    let path = config_dir.join(YOLO_PREF_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, if enabled { "true" } else { "false" }) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to persist yolo preference");
+    }
+}
+
+/// Read the persisted YOLO preference, if any. `None` on first run / unreadable
+/// / unrecognized content — the caller treats `None` as "no persisted default"
+/// and falls through to the built-in safe default (off). Mirrors
+/// [`load_last_model`]; accepts the same truthy/falsey spellings as the
+/// `OCEAN_YOLO` env parse so the two sources stay consistent.
+pub fn load_yolo_pref(config_dir: &std::path::Path) -> Option<bool> {
+    let raw = std::fs::read_to_string(config_dir.join(YOLO_PREF_FILE)).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// The directory the daemon uses for its on-disk state (sessions, projects, and
 /// the persistent-rooms SQLite DB). Resolved from `OCEAN_CONFIG_DIR`, then
 /// `XDG_CONFIG_HOME/ocean-rs`, then `~/.config/ocean-rs`, falling back to
