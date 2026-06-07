@@ -12,7 +12,10 @@
 
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
-use ocean_agent_sdk::{AgentTurnEvent, AgentTurnRequest, AgentTurnResponse};
+use ocean_agent_sdk::{
+    AgentSessionCreateRequest, AgentSessionCreateResponse, AgentTurnEvent, AgentTurnRequest,
+    AgentTurnResponse,
+};
 use ocean_core::{EventEnvelope, PermissionDecision, PermissionDecisionRequest};
 use serde::Deserialize;
 use std::pin::Pin;
@@ -95,6 +98,82 @@ impl DaemonClient {
             resp.provider.unwrap_or_default(),
             resp.model.unwrap_or_else(|| model.to_string()),
         ))
+    }
+
+    /// Create (mint + persist) a daemon session up front, binding it to `cwd`.
+    /// Mirrors `POST /v1/agent/sessions`. Returns the daemon's freshly-minted
+    /// session id and the workspace-bound cwd.
+    ///
+    /// OCEAN-213: the ACP bridge calls this at `session/new` so the ACP session
+    /// id IT returns to the editor IS the daemon's id. Unifying the two id
+    /// spaces is what makes `session/load` actually resume after a bridge
+    /// restart — the id the editor replays is the daemon id, so the cwd lookup
+    /// hits the right key and the next turn resumes the persisted transcript
+    /// instead of silently forking a fresh one. Without this, the bridge minted
+    /// a *local* id the daemon never knew, and the daemon→ACP mapping (learned
+    /// lazily, held only in memory) was lost on restart.
+    pub async fn create_session(
+        &self,
+        cwd: &str,
+    ) -> Result<AgentSessionCreateResponse> {
+        let url = format!("{}/v1/agent/sessions", self.base_url);
+        let body = AgentSessionCreateRequest {
+            workspace_root: cwd.to_string(),
+            project_id: None,
+            client_type: Some(CLIENT_TYPE.to_string()),
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("daemon rejected session create")?
+            .json::<AgentSessionCreateResponse>()
+            .await
+            .context("decode session-create response")?;
+        // The daemon returns an empty cwd + new id on a failed bind (it never
+        // 4xxs the create on a bad cwd). Treat an empty cwd as a failure so the
+        // caller falls back to its local id instead of binding to nothing.
+        anyhow::ensure!(
+            !resp.cwd.trim().is_empty(),
+            "daemon session create returned an empty cwd (bind failed)"
+        );
+        Ok(resp)
+    }
+
+    /// Fetch a session's recorded working directory from the daemon.
+    /// Mirrors `GET /v1/agent/sessions/{id}`, whose `AgentSession.cwd` the
+    /// daemon resolves from the bound workspace root (falling back to the
+    /// recorded cwd). Used by `session/load` to repopulate the bridge's
+    /// per-session cwd after a bridge restart, instead of guessing with
+    /// `env::current_dir()`. Returns `Ok(None)` if the session is unknown or
+    /// carries no cwd.
+    pub async fn session_cwd(&self, session_id: &str) -> Result<Option<String>> {
+        let url = format!("{}/v1/agent/sessions/{}", self.base_url, session_id);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        // A missing session is not an error here — the caller can fall back to
+        // the cwd the editor supplied on the load request.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp
+            .error_for_status()
+            .context("daemon rejected session detail read")?
+            .json::<AgentSessionResponse>()
+            .await
+            .context("decode session detail response")?;
+        Ok(resp
+            .session
+            .map(|s| s.cwd)
+            .filter(|cwd| !cwd.trim().is_empty()))
     }
 
     /// Submit a turn. The daemon creates a session lazily when `session_id`
@@ -333,6 +412,26 @@ impl OceanEventStream {
 
 fn parse_session_id(s: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(s).with_context(|| format!("invalid session id: {s:?}"))
+}
+
+// --- session detail types (subset of the daemon's /v1/agent/sessions/{id}) --
+
+/// Just the `cwd` we need off `GET /v1/agent/sessions/{id}`'s `session`
+/// object. Deliberately a partial mirror: the real payload carries title,
+/// timestamps, turns, etc., but the ACP bridge only needs the working dir to
+/// repopulate a resumed session, so we decode the one field and let serde
+/// ignore the rest.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDetailSlice {
+    #[serde(default)]
+    cwd: String,
+}
+
+/// Subset of `GET /v1/agent/sessions/{id}`'s response body.
+#[derive(Debug, Clone, Deserialize)]
+struct AgentSessionResponse {
+    #[serde(default)]
+    session: Option<SessionDetailSlice>,
 }
 
 // --- model roster types (mirror of the daemon's /v1/models payload) ---------
