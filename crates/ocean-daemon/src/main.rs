@@ -3244,6 +3244,30 @@ fn session_run_state(state: RequestState) -> SessionRunState {
     }
 }
 
+/// The active (in-flight) turn for a session, if any.
+///
+/// Single source of truth shared by the session LIST and DETAIL endpoints so
+/// the two can't drift (OCEAN-205). A session's "active turn" is the request
+/// the runtime is currently driving for it: the first non-terminal request
+/// keyed to that session in the live request registry. Its `request_id` is a
+/// stable id (unlike the ephemeral ids `turns_from_detail` mints per response),
+/// so it's a meaningful handle a client can correlate against `/v1/requests`.
+///
+/// Returns `None` when the session has no live request — i.e. all its turns are
+/// finished (or it has never run). Driven off the in-memory registry, this is a
+/// cheap status peek: it never loads a transcript, so the LIST endpoint can call
+/// it per session without an N-session full-history read.
+fn active_turn_for_session(
+    requests: &[RequestStatus],
+    session_id: SessionId,
+) -> Option<AgentTurnId> {
+    requests
+        .iter()
+        .filter(|status| status.session_id == Some(session_id))
+        .find(|status| !status.state.is_terminal())
+        .map(|status| AgentTurnId(status.request_id))
+}
+
 fn is_not_found(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -4392,6 +4416,13 @@ async fn agent_sessions(
         .runtime
         .list_sessions(scope.as_deref())
         .unwrap_or_default();
+    // Snapshot the live request registry once, then derive each summary's
+    // active_turn from it via the same helper the detail endpoint uses
+    // (OCEAN-205). This is a cheap status peek — no per-session transcript load.
+    let requests: Vec<RequestStatus> = {
+        let guard = state.requests.read().await;
+        guard.values().map(|ctl| ctl.status.clone()).collect()
+    };
     let summaries: Vec<AgentSessionSummary> = core_sessions
         .into_iter()
         .map(|s| AgentSessionSummary {
@@ -4404,7 +4435,7 @@ async fn agent_sessions(
                 .updated_ms
                 .map(ms_to_datetime)
                 .unwrap_or_else(Utc::now),
-            active_turn: None,
+            active_turn: active_turn_for_session(&requests, s.id),
             turn_count: s.turns,
         })
         .collect();
@@ -4539,9 +4570,13 @@ async fn agent_session(
 
             let turns = turns_from_detail(&session);
             // A still-running session surfaces its in-flight turn as active.
-            let active_turn = turns.first().and_then(|t| {
-                matches!(t.status, AgentTurnStatus::Running).then_some(t.id)
-            });
+            // Derive it from the live request registry via the shared helper so
+            // the LIST and DETAIL endpoints can't drift (OCEAN-205).
+            let requests: Vec<RequestStatus> = {
+                let guard = state.requests.read().await;
+                guard.values().map(|ctl| ctl.status.clone()).collect()
+            };
+            let active_turn = active_turn_for_session(&requests, core_id);
             (
                 StatusCode::OK,
                 Json(AgentSessionResponse {
@@ -5543,6 +5578,77 @@ mod tests {
         assert_eq!(turns[0].status, AgentTurnStatus::Running);
         assert!(turns[0].finished_at.is_none());
         assert_eq!(turns[1].status, AgentTurnStatus::Completed);
+    }
+
+    // --- OCEAN-205: active_turn shared between LIST and DETAIL ----------------
+
+    fn request_status_for(
+        session_id: Option<SessionId>,
+        state: RequestState,
+    ) -> RequestStatus {
+        RequestStatus {
+            request_id: RequestId::new_v4(),
+            session_id,
+            state,
+            permission_id: None,
+            message: None,
+            started_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn active_turn_for_session_returns_running_request_id() {
+        let session = SessionId::new_v4();
+        let running = request_status_for(Some(session), RequestState::Running);
+        let want = AgentTurnId(running.request_id);
+        // Mix in noise: another session's running request + a finished one for
+        // this session. Only this session's live request should be reported.
+        let other = request_status_for(Some(SessionId::new_v4()), RequestState::Running);
+        let done = request_status_for(Some(session), RequestState::Completed);
+        let registry = vec![done, other, running];
+
+        assert_eq!(active_turn_for_session(&registry, session), Some(want));
+    }
+
+    #[test]
+    fn active_turn_for_session_is_none_when_all_finished() {
+        let session = SessionId::new_v4();
+        // Only terminal requests for this session => no active turn. The LIST
+        // endpoint must report None here, matching the DETAIL endpoint.
+        let registry = vec![
+            request_status_for(Some(session), RequestState::Completed),
+            request_status_for(Some(session), RequestState::Cancelled),
+            request_status_for(Some(session), RequestState::Errored),
+        ];
+
+        assert_eq!(active_turn_for_session(&registry, session), None);
+    }
+
+    #[test]
+    fn active_turn_for_session_is_none_for_unknown_session() {
+        // A session with no requests in the registry at all (e.g. a stored
+        // session that has never run this process) reports no active turn.
+        let registry = vec![request_status_for(
+            Some(SessionId::new_v4()),
+            RequestState::Running,
+        )];
+        assert_eq!(active_turn_for_session(&registry, SessionId::new_v4()), None);
+    }
+
+    #[test]
+    fn active_turn_for_session_treats_waiting_permission_as_active() {
+        // A turn paused on a permission gate is still in-flight, so it must
+        // surface as the active turn (parity with enrich_session_detail).
+        let session = SessionId::new_v4();
+        let waiting =
+            request_status_for(Some(session), RequestState::WaitingForPermission);
+        let want = AgentTurnId(waiting.request_id);
+        assert_eq!(
+            active_turn_for_session(&[waiting], session),
+            Some(want)
+        );
     }
 
     // --- OCEAN-12: registry GC ----------------------------------------------
