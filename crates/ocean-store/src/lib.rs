@@ -39,9 +39,17 @@
 //!
 //! Transcript messages are keyed by `(room, seq)` where `seq` is a per-room
 //! monotonically increasing counter assigned by the store, identical to the
-//! in-memory registry. The counter is derived as `MAX(seq) + 1` within a
-//! transaction, so it survives restarts (it is recomputed from stored rows)
-//! and never reuses a value.
+//! in-memory registry. The counter is derived as `MAX(seq) + 1` recomputed from
+//! stored rows, so it survives restarts and never reuses a value.
+//!
+//! Every write path that allocates a seq (`add_participant`, `remove_participant`,
+//! `append_message`) runs the `SELECT MAX(seq) + 1` and its dependent `INSERT`
+//! inside a single `IMMEDIATE` SQLite transaction (OCEAN-201). IMMEDIATE takes the
+//! write lock at `BEGIN`, so a second connection on the same DB file cannot
+//! interleave a commit between the seq read and the message insert — that race
+//! used to tear the transcript (a roster row with no join marker, or a seq gap).
+//! On any failure the transaction rolls back as a unit, so a partial write is
+//! never observable.
 //!
 //! # How the daemon would adopt this (deferred follow-up)
 //!
@@ -74,7 +82,7 @@ use ocean_core::{
     Room, RoomKey, RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind,
     RoomTriggerPolicy,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 /// A persistent room plus its transcript. Mirror of `ocean_agent::rooms::RoomRecord`
 /// so callers can move between the in-memory and SQLite stores without changing
@@ -389,8 +397,16 @@ impl SqliteRoomStore {
 
     /// Assign the next per-room seq and insert a message in one go. Caller must
     /// ensure the room exists.
-    fn insert_message(
-        &self,
+    ///
+    /// Takes the connection explicitly (rather than `self.conn`) so it can run on
+    /// a [`rusqlite::Transaction`], which derefs to `&Connection`. The
+    /// `SELECT MAX(seq)+1` and the dependent `INSERT` are two statements that MUST
+    /// run inside the same transaction as the caller's other writes — otherwise a
+    /// concurrent writer can steal the seq between them and tear the row
+    /// (OCEAN-201). The IMMEDIATE transaction the callers open also serializes the
+    /// seq allocation across connections.
+    fn insert_message_on(
+        conn: &Connection,
         key: &RoomKey,
         author_id: &str,
         author_kind: RoomParticipantKind,
@@ -399,12 +415,12 @@ impl SqliteRoomStore {
         now: DateTime<Utc>,
     ) -> Result<RoomMessage> {
         // MAX(seq)+1, recomputed from stored rows so it survives restarts.
-        let next_seq: i64 = self.conn.query_row(
+        let next_seq: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE room_id = ?1",
             params![key.as_str()],
             |r| r.get(0),
         )?;
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -427,8 +443,10 @@ impl SqliteRoomStore {
         })
     }
 
-    fn touch(&self, key: &RoomKey, now: DateTime<Utc>) -> Result<()> {
-        self.conn.execute(
+    /// Bump `updated_at`. Takes the connection explicitly so it can run on a
+    /// transaction alongside the caller's other writes.
+    fn touch_on(conn: &Connection, key: &RoomKey, now: DateTime<Utc>) -> Result<()> {
+        conn.execute(
             "UPDATE rooms SET updated_at = ?2 WHERE id = ?1",
             params![key.as_str(), fmt_ts(now)],
         )?;
@@ -447,10 +465,17 @@ impl RoomStore for SqliteRoomStore {
         if key.as_str().trim().is_empty() {
             return Err(RoomStoreError::BadKey(key.0));
         }
+        // The existence check and the INSERT are a check-then-act pair. Run them in
+        // an IMMEDIATE transaction so two concurrent creates of the same key can't
+        // both pass the SELECT and race the INSERT — IMMEDIATE serializes the
+        // writers, so the loser sees the winner's committed row and reports
+        // AlreadyExists cleanly instead of a raw PK violation (OCEAN-201).
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Treat an existing row (open or closed) as a collision, matching the
         // in-memory store's "key already taken".
-        let exists: Option<i64> = self
-            .conn
+        let exists: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM rooms WHERE id = ?1",
                 params![key.as_str()],
@@ -460,7 +485,7 @@ impl RoomStore for SqliteRoomStore {
         if exists.is_some() {
             return Err(RoomStoreError::AlreadyExists(key));
         }
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO rooms (id, name, trigger_policy, created_at, updated_at, closed_at)
              VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
             params![
@@ -470,6 +495,7 @@ impl RoomStore for SqliteRoomStore {
                 fmt_ts(now),
             ],
         )?;
+        tx.commit()?;
         Ok(self
             .load_record(&key, false)?
             .expect("just inserted the room"))
@@ -508,19 +534,26 @@ impl RoomStore for SqliteRoomStore {
         if !self.room_is_open(key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
+        // name/policy/touch are separate UPDATEs to the same room row; wrap them so
+        // a partial failure can't leave the row half-updated (e.g. new name but
+        // stale policy) (OCEAN-201).
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(name) = name {
-            self.conn.execute(
+            tx.execute(
                 "UPDATE rooms SET name = ?2 WHERE id = ?1",
                 params![key.as_str(), name],
             )?;
         }
         if let Some(policy) = trigger_policy {
-            self.conn.execute(
+            tx.execute(
                 "UPDATE rooms SET trigger_policy = ?2 WHERE id = ?1",
                 params![key.as_str(), encode_policy(policy.as_ref())?],
             )?;
         }
-        self.touch(key, now)?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
         Ok(self.load_record(key, false)?.expect("room exists"))
     }
 
@@ -546,18 +579,27 @@ impl RoomStore for SqliteRoomStore {
         if !self.room_is_open(key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
+        // All four statements (delete-existing, MAX(position)+1, insert
+        // participant, insert join marker via insert_message_on) are dependent and
+        // MUST be atomic. IMMEDIATE takes the write lock at BEGIN so a concurrent
+        // writer on the same DB file can't steal the seq between the
+        // SELECT MAX(seq)+1 and the message INSERT (the torn-row bug, OCEAN-201).
+        // Any `?` failure drops `tx` → rollback → no orphan participant row.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Idempotent on id: replace any existing entry, appending at the end of
         // the roster ordering (MAX(position)+1) to mirror the Vec push.
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM participants WHERE room_id = ?1 AND id = ?2",
             params![key.as_str(), participant.id],
         )?;
-        let next_pos: i64 = self.conn.query_row(
+        let next_pos: i64 = tx.query_row(
             "SELECT COALESCE(MAX(position) + 1, 0) FROM participants WHERE room_id = ?1",
             params![key.as_str()],
             |r| r.get(0),
         )?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO participants (room_id, id, kind, display_name, position)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -568,7 +610,8 @@ impl RoomStore for SqliteRoomStore {
                 next_pos,
             ],
         )?;
-        self.insert_message(
+        Self::insert_message_on(
+            &tx,
             key,
             &participant.id,
             participant.kind,
@@ -576,7 +619,8 @@ impl RoomStore for SqliteRoomStore {
             &format!("{} joined", participant.display_name),
             now,
         )?;
-        self.touch(key, now)?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
         Ok(self.load_record(key, false)?.expect("room exists"))
     }
 
@@ -603,11 +647,20 @@ impl RoomStore for SqliteRoomStore {
                 participant: participant_id.to_string(),
             });
         };
-        self.conn.execute(
+        // Delete + join-marker insert (which itself does SELECT MAX(seq)+1 then
+        // INSERT) are dependent and must be atomic. IMMEDIATE serializes seq
+        // allocation across connections; any `?` failure rolls the whole thing
+        // back, so we never leave a removed-roster row without its ParticipantLeft
+        // marker — or vice versa (OCEAN-201).
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "DELETE FROM participants WHERE room_id = ?1 AND id = ?2",
             params![key.as_str(), participant_id],
         )?;
-        self.insert_message(
+        Self::insert_message_on(
+            &tx,
             key,
             participant_id,
             decode_participant_kind(&kind)?,
@@ -615,7 +668,8 @@ impl RoomStore for SqliteRoomStore {
             &format!("{display_name} left"),
             now,
         )?;
-        self.touch(key, now)?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
         Ok(self.load_record(key, false)?.expect("room exists"))
     }
 
@@ -631,8 +685,17 @@ impl RoomStore for SqliteRoomStore {
         if !self.room_is_open(key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        let msg = self.insert_message(key, author_id, author_kind, kind, body, now)?;
-        self.touch(key, now)?;
+        // SELECT MAX(seq)+1, the message INSERT, and the updated_at touch are
+        // dependent statements. Wrap them in an IMMEDIATE transaction so a
+        // concurrent writer can't interleave a commit at the same seq and tear the
+        // transcript (OCEAN-201). On a PK collision the `?` rolls the whole thing
+        // back rather than leaving a half-written row.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let msg = Self::insert_message_on(&tx, key, author_id, author_kind, kind, body, now)?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
         Ok(msg)
     }
 
@@ -1354,69 +1417,12 @@ mod tests {
         assert!(closed_at.is_some(), "closed_at must be set on soft-close");
     }
 
-    /// KNOWN BUG (OCEAN-200 finding): the multi-statement write paths
-    /// (`add_participant`, `remove_participant`) are NOT wrapped in a SQLite
-    /// transaction. Each `INSERT`/`UPDATE` auto-commits independently, so a
-    /// failure on a later statement (e.g. a `(room_id, seq)` PK collision from a
-    /// concurrent writer on the same DB file) leaves the earlier participant
-    /// INSERT committed — a torn row: a roster entry with no matching join
-    /// marker, or a seq gap.
-    ///
-    /// This test reproduces the torn row by interleaving a second connection's
-    /// commit between `add_participant`'s participant-insert and its
-    /// message-insert (replicating the exact statement order of the method). It
-    /// is `#[ignore]`d so the suite stays green while the bug is open; once the
-    /// write paths are transaction-wrapped, this should be inverted to assert
-    /// the rollback (participant count returns to its prior value) and un-ignored.
-    #[test]
-    #[ignore = "documents OCEAN-200 torn-row bug: multi-step writes are not transaction-wrapped"]
-    fn torn_row_on_concurrent_seq_collision_is_a_known_bug() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rooms.db");
-        let key = RoomKey::new("r1");
-
-        let mut s1 = SqliteRoomStore::open(&path).unwrap();
-        s1.create(key.clone(), "R1", None, now()).unwrap();
-        let s2 = SqliteRoomStore::open(&path).unwrap();
-
-        // Replicate add_participant's statement order on s2, with s1 stealing the
-        // seq mid-operation:
-        // 1. s2 computes next_seq (= 0, no messages yet)
-        let s2_next_seq: i64 = s2
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE room_id = ?1",
-                params![key.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        // 2. s2 inserts the participant (auto-commits — the torn-row risk)
-        s2.conn
-            .execute(
-                "INSERT INTO participants (room_id, id, kind, display_name, position)
-                 VALUES (?1, 'p', 'human', 'P', 0)",
-                params![key.as_str()],
-            )
-            .unwrap();
-        // 3. s1 commits a message at the same seq
-        s1.conn
-            .execute(
-                "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
-                 VALUES (?1, ?2, 'a', 'human', 'message', 'x', ?3)",
-                params![key.as_str(), s2_next_seq, fmt_ts(now())],
-            )
-            .unwrap();
-        // 4. s2's message insert now fails the (room_id, seq) PK
-        let s2_msg = s2.conn.execute(
-            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
-             VALUES (?1, ?2, 'p', 'human', 'participant_joined', 'P joined', ?3)",
-            params![key.as_str(), s2_next_seq, fmt_ts(now())],
-        );
-        assert!(s2_msg.is_err(), "expected seq PK collision");
-
-        // BUG: the participant insert leaked through with no join marker.
-        let parts = count(&s2, "participants", &key);
-        let markers: i64 = s2
+    /// Assert the room invariant on a connection: every participant has exactly
+    /// one `participant_joined` marker, and the transcript seqs are a dense
+    /// `0..N` range (no gaps, no duplicates). A torn row violates one of these.
+    fn assert_no_torn_row(s: &SqliteRoomStore, key: &RoomKey) {
+        let parts = count(s, "participants", key);
+        let join_markers: i64 = s
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE room_id = ?1 AND kind = 'participant_joined'",
@@ -1424,8 +1430,159 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(parts, 1, "participant leaked (committed)");
-        assert_eq!(markers, 0, "but its join marker did not — torn row");
+        assert_eq!(
+            parts, join_markers,
+            "every roster row must have its join marker (no torn row)"
+        );
+
+        // Seqs must be a dense 0..N range — no gaps and no duplicates.
+        let mut stmt = s
+            .conn
+            .prepare("SELECT seq FROM messages WHERE room_id = ?1 ORDER BY seq")
+            .unwrap();
+        let seqs: Vec<i64> = stmt
+            .query_map(params![key.as_str()], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        for (i, seq) in seqs.iter().enumerate() {
+            assert_eq!(*seq, i as i64, "seq gap/dup detected: {seqs:?}");
+        }
+    }
+
+    /// REGRESSION (OCEAN-201, inverts OCEAN-200's `#[ignore]`d repro): the
+    /// multi-statement write paths (`add_participant`, `remove_participant`,
+    /// `append_message`) are now wrapped in an `IMMEDIATE` SQLite transaction. The
+    /// old un-wrapped code auto-committed each statement independently, so a
+    /// concurrent writer on the same DB file could steal the seq between the
+    /// participant INSERT and the join-marker INSERT — leaving a roster row with
+    /// no matching marker (a torn row) once the marker hit the `(room_id, seq)` PK.
+    ///
+    /// This replays OCEAN-200's exact interleave, but with `s2` running
+    /// `add_participant`'s statements on an `IMMEDIATE` transaction (mirroring the
+    /// fix). IMMEDIATE takes the write lock at `BEGIN`, so `s1` can no longer steal
+    /// the seq mid-operation: its colliding commit fails with `SQLITE_BUSY` while
+    /// `s2` holds the lock. `s2` then commits a consistent, paired
+    /// (participant, join-marker) at a fresh seq. Even if `s2`'s marker insert
+    /// *had* failed, dropping the transaction rolls back the participant insert too
+    /// — no orphan. Under the OLD auto-commit code the participant insert would
+    /// commit independently and the marker collide, tearing the row; that path is
+    /// what `assert_no_torn_row` would have caught.
+    #[test]
+    fn concurrent_seq_collision_rolls_back_with_no_torn_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("r1");
+
+        let mut s1 = SqliteRoomStore::open(&path).unwrap();
+        s1.create(key.clone(), "R1", None, now()).unwrap();
+        let mut s2 = SqliteRoomStore::open(&path).unwrap();
+
+        // Drive add_participant's statement sequence on s2 through an IMMEDIATE
+        // transaction (exactly what the fixed method does), pausing mid-op to let
+        // s1 attempt the OCEAN-200 seq steal.
+        {
+            let tx = s2
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+
+            // 1. s2 inserts the participant — now INSIDE the uncommitted tx, not
+            //    auto-committed. (The torn-row leak point under the old code.)
+            tx.execute(
+                "INSERT INTO participants (room_id, id, kind, display_name, position)
+                 VALUES (?1, 'p', 'human', 'P', 0)",
+                params![key.as_str()],
+            )
+            .unwrap();
+
+            // 2. s1 tries to commit a message at seq 0 — the steal that tore the
+            //    row in OCEAN-200. With s2 holding the IMMEDIATE write lock, this
+            //    MUST be refused (SQLITE_BUSY), so the seq can't be stolen.
+            let s1_steal = s1.conn.execute(
+                "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
+                 VALUES (?1, 0, 'a', 'human', 'message', 'x', ?2)",
+                params![key.as_str(), fmt_ts(now())],
+            );
+            assert!(
+                s1_steal.is_err(),
+                "IMMEDIATE lock must block the concurrent seq steal (got {s1_steal:?})"
+            );
+
+            // 3. s2 allocates its seq (MAX(seq)+1) and writes the paired join
+            //    marker — no collision, because the steal was blocked. Inlined
+            //    (rather than calling the private helper) so this test pins the
+            //    behaviour independent of internal refactors.
+            let next_seq: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE room_id = ?1",
+                    params![key.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            tx.execute(
+                "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
+                 VALUES (?1, ?2, 'p', 'human', 'participant_joined', 'P joined', ?3)",
+                params![key.as_str(), next_seq, fmt_ts(now())],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Invariant: the participant committed WITH its join marker, and seqs are a
+        // dense range — no torn row, no gap. This is the inversion of the old
+        // assertion (which asserted parts==1 but markers==0).
+        assert_eq!(count(&s2, "participants", &key), 1, "participant committed");
+        assert_no_torn_row(&s2, &key);
+    }
+
+    /// REGRESSION (OCEAN-201) — method-level inversion through the REAL
+    /// `add_participant` API. Forces the join-marker INSERT to fail mid-method via
+    /// a temporary trigger that ABORTs message inserts, then asserts the whole
+    /// operation rolled back: NO orphan participant row, NO seq advance.
+    ///
+    /// Under the OLD auto-commit code the participant DELETE/INSERT committed
+    /// independently before the marker insert ran, so a marker failure left a
+    /// roster row with no join marker — the exact torn row. Under the fix the
+    /// participant insert lives in the same transaction as the failing marker
+    /// insert, so the `?` drops the tx and rolls both back. This test FAILS on the
+    /// old code (orphan participant remains) and PASSES on the fix.
+    #[test]
+    fn marker_insert_failure_rolls_back_participant_insert() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+
+        // Trigger: abort any INSERT of a participant_joined marker, simulating the
+        // (room_id, seq) PK collision the concurrent-writer race would cause —
+        // deterministically, without needing a second connection.
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_join_marker
+                 BEFORE INSERT ON messages
+                 WHEN NEW.kind = 'participant_joined'
+                 BEGIN SELECT RAISE(ABORT, 'forced marker failure'); END;",
+            )
+            .unwrap();
+
+        let res = s.add_participant(&key, human("p", "P"), now());
+        assert!(res.is_err(), "marker insert must fail (trigger aborts it)");
+
+        // The whole op rolled back: no orphan participant, no leaked marker.
+        assert_eq!(
+            count(&s, "participants", &key),
+            0,
+            "participant insert must roll back with the failed marker (no orphan/torn row)"
+        );
+        assert_no_torn_row(&s, &key);
+
+        // And no seq was consumed: drop the trigger, a real add now starts at seq 0.
+        s.conn
+            .execute_batch("DROP TRIGGER fail_join_marker;")
+            .unwrap();
+        let rec = s.add_participant(&key, human("p", "P"), now()).unwrap();
+        assert_eq!(rec.transcript[0].seq, 0, "rolled-back op must not consume a seq");
+        assert_no_torn_row(&s, &key);
     }
 
     #[test]
