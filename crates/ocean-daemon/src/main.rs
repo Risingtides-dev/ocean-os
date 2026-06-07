@@ -4843,6 +4843,42 @@ mod tests {
         }
     }
 
+    /// Build a `RequestControl` with an explicit `finished_at` so the GC sweep's
+    /// age comparison (`terminal_at()` reads `finished_at` first) is deterministic.
+    fn request_control_at(state: RequestState, finished_at: DateTime<Utc>) -> RequestControl {
+        RequestControl {
+            status: RequestStatus {
+                request_id: RequestId::new_v4(),
+                session_id: None,
+                state,
+                permission_id: None,
+                message: None,
+                started_at: Some(finished_at),
+                updated_at: Some(finished_at),
+                finished_at: Some(finished_at),
+            },
+            cancel: CancellationToken::new(),
+            handle: None,
+        }
+    }
+
+    /// Build a terminal `PermissionWaiter` (sender consumed => `is_terminal`) with
+    /// an explicit `created_at`, which is what its `terminal_at()` reads.
+    fn terminal_waiter_at(created_at: DateTime<Utc>) -> PermissionWaiter {
+        PermissionWaiter {
+            status: PermissionStatus {
+                permission_id: PermissionId::new_v4(),
+                request_id: RequestId::new_v4(),
+                session_id: None,
+                tool: "write".into(),
+                reason: "permission required for write".into(),
+                args: json!({"path": "src/lib.rs"}),
+                created_at,
+            },
+            sender: None,
+        }
+    }
+
     fn permission_status(permission_id: PermissionId, request_id: RequestId) -> PermissionStatus {
         PermissionStatus {
             permission_id,
@@ -6647,5 +6683,149 @@ mod tests {
             metadata_json: None,
         };
         assert_eq!(result.metadata_json, None);
+    }
+
+    // ---- OCEAN-204: registry GC eviction (memory-leak guard) ----
+    //
+    // `gc_registries` is the only thing standing between a long-lived daemon and
+    // unbounded request/permission registry growth. A regressed TTL comparison
+    // (e.g. `<` instead of `>`, or dropping the `is_terminal` guard) would leak
+    // silently until OOM. These tests pin the behavior: old terminal entries are
+    // evicted, recent-terminal and still-in-flight entries are retained, and the
+    // hard cap bounds growth by evicting oldest-terminal first.
+
+    #[tokio::test]
+    async fn gc_evicts_old_terminal_but_keeps_recent_and_inflight() {
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(2); // past the 1h TTL
+        let recent = now - chrono::Duration::minutes(5); // inside the TTL
+
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        // request entries
+        let old_terminal = RequestId::new_v4();
+        let recent_terminal = RequestId::new_v4();
+        let old_running = RequestId::new_v4();
+        {
+            let mut reqs = requests.write().await;
+            reqs.insert(
+                old_terminal,
+                request_control_at(RequestState::Completed, old),
+            );
+            reqs.insert(
+                recent_terminal,
+                request_control_at(RequestState::Completed, recent),
+            );
+            // Non-terminal (still running) but OLD — must NOT be reaped; evicting
+            // an in-flight turn would drop a live cancel handle.
+            reqs.insert(old_running, request_control_at(RequestState::Running, old));
+        }
+
+        // permission entries (terminal == sender consumed)
+        let old_perm = PermissionId::new_v4();
+        let recent_perm = PermissionId::new_v4();
+        let pending_perm = PermissionId::new_v4();
+        {
+            let mut perms = permissions.write().await;
+            perms.insert(old_perm, terminal_waiter_at(old));
+            perms.insert(recent_perm, terminal_waiter_at(recent));
+            // A pending waiter (Some sender) is never terminal => never reaped by
+            // age, even when old.
+            perms.insert(
+                pending_perm,
+                PermissionWaiter {
+                    status: PermissionStatus {
+                        permission_id: pending_perm,
+                        request_id: RequestId::new_v4(),
+                        session_id: None,
+                        tool: "write".into(),
+                        reason: "permission required for write".into(),
+                        args: json!({"path": "src/lib.rs"}),
+                        created_at: old,
+                    },
+                    sender: {
+                        let (tx, _rx) = oneshot::channel();
+                        Some(tx)
+                    },
+                },
+            );
+        }
+
+        gc_registries(&requests, &permissions, now).await;
+
+        let reqs = requests.read().await;
+        assert!(
+            !reqs.contains_key(&old_terminal),
+            "old terminal request must be evicted"
+        );
+        assert!(
+            reqs.contains_key(&recent_terminal),
+            "recent terminal request must be retained (inside TTL)"
+        );
+        assert!(
+            reqs.contains_key(&old_running),
+            "old in-flight (non-terminal) request must NOT be evicted"
+        );
+
+        let perms = permissions.read().await;
+        assert!(
+            !perms.contains_key(&old_perm),
+            "old terminal permission waiter must be evicted"
+        );
+        assert!(
+            perms.contains_key(&recent_perm),
+            "recent terminal permission waiter must be retained"
+        );
+        assert!(
+            perms.contains_key(&pending_perm),
+            "old PENDING permission waiter must NOT be evicted (never terminal)"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_max_entries_cap_bounds_growth_evicting_oldest_terminal_first() {
+        // All entries are terminal but RECENT (inside TTL), so the TTL pass keeps
+        // every one — only the hard cap can trim them. Insert > the cap and assert
+        // the count is bounded to exactly REGISTRY_MAX_ENTRIES, and that the very
+        // oldest terminal entries are the ones dropped.
+        let now = Utc::now();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let overflow = 5usize;
+        let total = REGISTRY_MAX_ENTRIES + overflow;
+
+        // Track the `overflow` oldest ids — these should be the ones evicted.
+        let mut oldest_ids = Vec::new();
+        {
+            let mut reqs = requests.write().await;
+            for i in 0..total {
+                // Larger i => more recent (closer to `now`). Use millisecond spacing
+                // so even the oldest entry stays well inside the 1h TTL — the TTL
+                // pass must keep them all, leaving only the hard cap to trim.
+                let ts = now - chrono::Duration::milliseconds((total - i) as i64);
+                let id = RequestId::new_v4();
+                if i < overflow {
+                    oldest_ids.push(id);
+                }
+                reqs.insert(id, request_control_at(RequestState::Completed, ts));
+            }
+        }
+
+        gc_registries(&requests, &permissions, now).await;
+
+        let reqs = requests.read().await;
+        assert_eq!(
+            reqs.len(),
+            REGISTRY_MAX_ENTRIES,
+            "max-entries cap must bound the registry to REGISTRY_MAX_ENTRIES"
+        );
+        for id in &oldest_ids {
+            assert!(
+                !reqs.contains_key(id),
+                "the oldest terminal entries must be the ones evicted by the cap"
+            );
+        }
     }
 }
