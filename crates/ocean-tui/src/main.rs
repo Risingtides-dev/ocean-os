@@ -3633,6 +3633,49 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
     }
 }
 
+/// Attach the SSE `Last-Event-ID` request header when we have a last-seen id,
+/// so the daemon replays buffered events newer than that id on reconnect
+/// (OCEAN-129 / OCEAN-190). On the FIRST connect there is no id yet, so the
+/// header is omitted and the daemon streams from the current position.
+///
+/// The id we carry is the raw SSE `id:` string the daemon emitted (a UUID
+/// string); the daemon matches `Last-Event-ID` by `Uuid::parse_str`, so passing
+/// the unmodified string back is exactly what its replay path expects.
+fn with_last_event_id(
+    builder: reqwest::blocking::RequestBuilder,
+    last_event_id: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match last_event_id {
+        Some(id) if !id.is_empty() => builder.header("Last-Event-ID", id),
+        _ => builder,
+    }
+}
+
+/// Decide whether a buffered agent-stream `Last-Event-ID` is still valid for the
+/// scope we're about to (re)connect under (OCEAN-190 cross-scope guard).
+///
+/// The daemon's `/v1/agent/events` replay buffer is a single GLOBAL UUID history
+/// that applies `?session_id=` filtering AFTER the replay lookup, so an id
+/// captured under scope A is meaningless against scope B — it would replay/skip
+/// from the wrong point in the global history. The id is valid ONLY for the exact
+/// scope it came from.
+///
+/// Given the scope `last_event_id` was captured under (`id_scope`) and the scope
+/// we're connecting with now (`connect_scope`), returns the id to actually send:
+/// the same id when the scopes match, or `None` when they differ (including the
+/// offline-switch case, where the live read loop never ran to notice the change).
+fn agent_last_event_id_for_scope<'a>(
+    last_event_id: Option<&'a str>,
+    id_scope: Option<AgentSessionId>,
+    connect_scope: Option<AgentSessionId>,
+) -> Option<&'a str> {
+    if id_scope == connect_scope {
+        last_event_id
+    } else {
+        None
+    }
+}
+
 fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
     thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder().build() {
@@ -3648,6 +3691,12 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
 
         let events_url = format!("{}/v1/events", url.trim_end_matches('/'));
 
+        // The SSE `id:` of the last event we successfully handed off. Owned by the
+        // spawn loop so it survives reconnects: on reconnect we replay it as
+        // `Last-Event-ID` and the daemon resends everything dropped in the gap
+        // (OCEAN-190). `None` on first connect — no replay, stream from current.
+        let mut last_event_id: Option<String> = None;
+
         loop {
             if tx
                 .send(Action::StreamStatus("connecting /v1/events".to_string()))
@@ -3656,9 +3705,12 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
                 break;
             }
 
-            let response = match client
-                .get(&events_url)
-                .header("Accept", "text/event-stream")
+            let response = match with_last_event_id(
+                client
+                    .get(&events_url)
+                    .header("Accept", "text/event-stream"),
+                last_event_id.as_deref(),
+            )
                 .send()
                 .and_then(|res| res.error_for_status())
             {
@@ -3689,6 +3741,8 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
             let mut line = String::new();
             let mut event_name = String::new();
             let mut data_lines: Vec<String> = Vec::new();
+            // The `id:` of the frame currently being assembled, if any.
+            let mut frame_id: Option<String> = None;
 
             loop {
                 line.clear();
@@ -3697,6 +3751,12 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
                     Ok(_) => {
                         let line = line.trim_end_matches(['\r', '\n']);
                         if line.is_empty() {
+                            // Per SSE, the last `id:` seen becomes the stream's
+                            // last-event-id at dispatch — persist it across
+                            // reconnects so the next connect replays from here.
+                            if let Some(id) = frame_id.take() {
+                                last_event_id = Some(id);
+                            }
                             if !data_lines.is_empty() {
                                 let payload = data_lines.join("\n");
                                 match parse_event_envelope(&payload) {
@@ -3730,6 +3790,11 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
                         }
 
                         if line.starts_with(':') {
+                            continue;
+                        }
+
+                        if let Some(rest) = line.strip_prefix("id:") {
+                            frame_id = Some(rest.trim().to_string());
                             continue;
                         }
 
@@ -3817,6 +3882,22 @@ fn spawn_daemon_agent_event_stream(
 
         let base_url = format!("{}/v1/agent/events", url.trim_end_matches('/'));
 
+        // SSE `id:` of the last agent event we handed off, persisted across
+        // reconnects so a network blip replays the gap via `Last-Event-ID`
+        // (OCEAN-190) — plus the session scope that id was captured under.
+        //
+        // The daemon's `/v1/agent/events` replay buffer is a SINGLE GLOBAL UUID
+        // history that applies `?session_id=` filtering AFTER the replay lookup.
+        // So a last-event-id from scope A is meaningless against scope B: it would
+        // make B's stream replay/skip relative to the wrong point in the global
+        // history. The id is therefore only valid for the exact scope it came
+        // from. `agent_scope_for_last_event_id` records that scope so the connect
+        // path below can drop the id the moment the scope changes — covering BOTH
+        // a live switch (read loop notices) and an OFFLINE switch (read loop never
+        // ran, switch happened during the post-EOF backoff). See OCEAN-190.
+        let mut last_event_id: Option<String> = None;
+        let mut agent_scope_for_last_event_id: Option<AgentSessionId> = None;
+
         loop {
             // Re-read the active session on each (re)connect and pin THIS
             // connection to that scope. The read loop below watches for the
@@ -3824,14 +3905,40 @@ fn spawn_daemon_agent_event_stream(
             // reconnect when it does, so a live session switch actually re-scopes
             // the stream instead of waiting for an incidental disconnect.
             let connection_scope = scoped_session_id.lock().ok().and_then(|g| *g);
+
+            // Connect-time scope guard: only send `last_event_id` if it was
+            // captured under the SAME scope we're connecting with now; otherwise
+            // it's invalid for this stream (see the note above) and is dropped so
+            // the new scope starts fresh. This is the authoritative check — it
+            // fires even when the switch happened while we were disconnected,
+            // which the in-read-loop `scope_changed` reset cannot observe.
+            let id_valid_for_scope = agent_last_event_id_for_scope(
+                last_event_id.as_deref(),
+                agent_scope_for_last_event_id,
+                connection_scope,
+            )
+            .is_some();
+            if !id_valid_for_scope {
+                // Either no id yet, or a stale cross-scope id — in both cases the
+                // buffer is reset and re-bound to the scope we're connecting with,
+                // so the next captured id is recorded under the correct scope.
+                last_event_id = None;
+                agent_scope_for_last_event_id = connection_scope;
+            }
+
             let events_url = match connection_scope {
                 Some(sid) => format!("{base_url}?session_id={sid}"),
                 None => base_url.clone(),
             };
 
-            let response = match client
-                .get(&events_url)
-                .header("Accept", "text/event-stream")
+            // After the guard, `last_event_id` is either an id valid for this
+            // scope or `None`, so it can be sent directly.
+            let response = match with_last_event_id(
+                client
+                    .get(&events_url)
+                    .header("Accept", "text/event-stream"),
+                last_event_id.as_deref(),
+            )
                 .send()
                 .and_then(|res| res.error_for_status())
             {
@@ -3855,6 +3962,8 @@ fn spawn_daemon_agent_event_stream(
             let mut line = String::new();
             let mut event_name = String::new();
             let mut data_lines: Vec<String> = Vec::new();
+            // The `id:` of the frame currently being assembled, if any.
+            let mut frame_id: Option<String> = None;
             // True when we tore the stream down because the active session
             // changed (not an error/EOF). A deliberate switch reconnects
             // immediately; only error/EOF backs off before retrying.
@@ -3878,6 +3987,12 @@ fn spawn_daemon_agent_event_stream(
                     Ok(_) => {
                         let trimmed = line.trim_end_matches(['\r', '\n']);
                         if trimmed.is_empty() {
+                            // Per SSE, the last `id:` seen becomes the stream's
+                            // last-event-id at dispatch — persist it across
+                            // reconnects so the next connect replays from here.
+                            if let Some(id) = frame_id.take() {
+                                last_event_id = Some(id);
+                            }
                             if !data_lines.is_empty() {
                                 let payload = data_lines.join("\n");
                                 match parse_agent_turn_event(&payload) {
@@ -3929,6 +4044,11 @@ fn spawn_daemon_agent_event_stream(
                             continue;
                         }
 
+                        if let Some(rest) = trimmed.strip_prefix("id:") {
+                            frame_id = Some(rest.trim().to_string());
+                            continue;
+                        }
+
                         if let Some(rest) = trimmed.strip_prefix("event:") {
                             event_name = rest.trim().to_string();
                             continue;
@@ -3943,7 +4063,10 @@ fn spawn_daemon_agent_event_stream(
             }
 
             // A deliberate session switch reconnects right away (re-scope now);
-            // an error/EOF backs off to avoid hammering the daemon.
+            // an error/EOF backs off to avoid hammering the daemon. We do NOT
+            // clear `last_event_id` here — the connect-time scope guard at the top
+            // of the loop owns that, and it correctly handles both this live
+            // switch AND an offline switch (where this read loop never ran).
             if !scope_changed {
                 thread::sleep(Duration::from_secs(2));
             }
@@ -6434,6 +6557,92 @@ mod tests {
                 .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
         });
         assert!(any_bold, "no bold spans emitted from markdown");
+    }
+
+    #[test]
+    fn last_event_id_header_present_when_id_known() {
+        // OCEAN-190: a reconnect with a known last-seen id must carry
+        // `Last-Event-ID` so the daemon replays the events dropped in the gap.
+        let client = reqwest::blocking::Client::new();
+        let builder = client
+            .get("http://127.0.0.1:4780/v1/events")
+            .header("Accept", "text/event-stream");
+        let req = with_last_event_id(builder, Some("550e8400-e29b-41d4-a716-446655440000"))
+            .build()
+            .expect("build request");
+        assert_eq!(
+            req.headers()
+                .get("Last-Event-ID")
+                .and_then(|v| v.to_str().ok()),
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+        );
+    }
+
+    #[test]
+    fn last_event_id_header_absent_on_first_connect() {
+        // First connect has no id yet — omit the header so the daemon streams
+        // from the current position instead of attempting a (no-op) replay.
+        let client = reqwest::blocking::Client::new();
+        let builder = client
+            .get("http://127.0.0.1:4780/v1/events")
+            .header("Accept", "text/event-stream");
+        let req = with_last_event_id(builder, None)
+            .build()
+            .expect("build request");
+        assert!(req.headers().get("Last-Event-ID").is_none());
+    }
+
+    #[test]
+    fn last_event_id_header_absent_for_empty_id() {
+        // Defensive: an empty id string is treated as "no id".
+        let client = reqwest::blocking::Client::new();
+        let builder = client.get("http://127.0.0.1:4780/v1/events");
+        let req = with_last_event_id(builder, Some(""))
+            .build()
+            .expect("build request");
+        assert!(req.headers().get("Last-Event-ID").is_none());
+    }
+
+    #[test]
+    fn agent_last_event_id_sent_only_for_matching_scope() {
+        // OCEAN-190 cross-scope guard (Codex P2 on #120): an id captured under
+        // scope A must NEVER be replayed against scope B — the daemon's replay
+        // buffer is a single global UUID history filtered post-lookup, so a stale
+        // cross-scope id replays from the wrong point. Locks the offline-switch
+        // regression: switch happens while disconnected, reconnect targets B.
+        let scope_a = AgentSessionId::new_v4();
+        let scope_b = AgentSessionId::new_v4();
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+
+        // Captured under A, reconnecting under B → id is dropped.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), Some(scope_a), Some(scope_b)),
+            None,
+        );
+
+        // Captured under A, reconnecting under A again → id is sent.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), Some(scope_a), Some(scope_a)),
+            Some(id),
+        );
+
+        // Unscoped on both sides (no session selected) → id persists.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), None, None),
+            Some(id),
+        );
+
+        // Scoped id but reconnecting unscoped (session cleared) → dropped.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), Some(scope_a), None),
+            None,
+        );
+
+        // Previously unscoped id, now reconnecting under a scope → dropped.
+        assert_eq!(
+            agent_last_event_id_for_scope(Some(id), None, Some(scope_a)),
+            None,
+        );
     }
 
     #[test]
