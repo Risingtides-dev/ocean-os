@@ -711,8 +711,39 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
     tracing::info!(%addr, "ocean-daemon listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Completes when the process receives SIGTERM or SIGINT (Ctrl-C), letting axum
+/// drain in-flight HTTP requests / agent turns before the daemon exits instead
+/// of being hard-killed mid-stream. (OCEAN-184)
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl_c handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
 async fn root() -> Json<serde_json::Value> {

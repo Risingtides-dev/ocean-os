@@ -280,6 +280,17 @@ so only restart when intended, not to clear a transient `/ready` blip):
 launchctl kickstart -k gui/$(id -u)/ocean-daemon-preview
 ```
 
+### Graceful shutdown
+
+The daemon traps `SIGTERM` and `SIGINT` (Ctrl-C) and **drains in-flight HTTP
+requests and active agent turns** before exiting, instead of dropping them
+mid-stream. Both clients depend on this daemon, so prefer signal-based stops:
+`launchctl kickstart -k` (sends `SIGTERM`) or Ctrl-C in the foreground. Avoid
+`kill -9` / `SIGKILL`, which still hard-kills the process and aborts whatever
+turn is in flight. Note that draining waits for open connections — a long SSE
+event stream or a running turn will delay exit until it finishes or the client
+disconnects.
+
 ### Sessions
 
 ```bash
