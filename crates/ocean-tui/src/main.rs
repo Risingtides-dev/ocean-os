@@ -365,6 +365,17 @@ struct DaemonApp {
     model_config: ModelConfig,
     requests: Vec<RequestStatus>,
     pending_permissions: Vec<PendingPermission>,
+    /// OCEAN-185 (P0): per-turn permission secrets this TUI minted, keyed by the
+    /// turn's `request_id` (== `turn_id`). Sent on the `AgentTurnRequest` and
+    /// replayed on the decision POST so the daemon binds the approval to us; a
+    /// localhost page that sniffs the broadcast `permission_id` lacks the token
+    /// and is rejected 403. Pruned when a request reaches a terminal state.
+    decision_tokens: HashMap<RequestId, String>,
+    /// The per-turn secret minted for the most recently submitted turn, held
+    /// until the daemon reveals that turn's `request_id` (the TUI mints the token
+    /// before the server mints the id). Bound into `decision_tokens` keyed by
+    /// `request_id` the first time a turn-scoped event for it arrives.
+    pending_submit_token: Option<String>,
     active_request_id: Option<RequestId>,
     streaming_request_id: Option<RequestId>,
     active_agent_session_id: Option<AgentSessionId>,
@@ -417,6 +428,8 @@ impl DaemonApp {
             model_config: ModelConfig::unknown(),
             requests: Vec::new(),
             pending_permissions: Vec::new(),
+            decision_tokens: HashMap::new(),
+            pending_submit_token: None,
             active_request_id: None,
             streaming_request_id: None,
             active_agent_session_id: None,
@@ -2037,6 +2050,9 @@ impl DaemonClient {
         base_url: &str,
         permission_id: PermissionId,
         decision: CorePermissionDecision,
+        // OCEAN-185: the per-turn secret minted at submit time. Replayed here so
+        // the daemon binds this decision to us; a missing/wrong token is 403'd.
+        decision_token: Option<String>,
     ) -> Result<PermissionControlResponse, String> {
         let url = format!(
             "{}/v1/permissions/{permission_id}/decision",
@@ -2045,6 +2061,7 @@ impl DaemonClient {
         let body = PermissionDecisionRequest {
             permission_id,
             decision,
+            decision_token,
         };
         self.http
             .post(url)
@@ -2821,6 +2838,13 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
         app.pm_push_user_prompt(instruction.clone());
         let action_tx = state.action_tx.clone();
         let url = app.url.clone();
+        // OCEAN-185 (P0): mint this turn's permission secret. It rides the turn
+        // body and is replayed on the decision POST; the daemon binds the gate to
+        // it and never broadcasts it on /v1/events, so a localhost page that
+        // sniffs the permission_id can't approve our gated tools. Held in
+        // `pending_submit_token` until the turn's request_id is revealed by SSE.
+        let decision_token = ocean_core::mint_decision_token();
+        app.pending_submit_token = Some(decision_token.clone());
         let request = AgentTurnRequest {
             session_id: app.selected_agent_session_id(),
             prompt: instruction.clone(),
@@ -2841,6 +2865,7 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             model_id: None,
             // The TUI does not attach images to turns.
             images: None,
+            decision_token: Some(decision_token),
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(
@@ -3172,7 +3197,13 @@ fn daemon_decide_latest_permission(client: &DaemonClient, app: &mut DaemonApp, a
             reason: Some("operator denied from ocean-tui".to_string()),
         }
     };
-    match client.permission_decision(&app.url, pending.permission_id, decision) {
+    // OCEAN-185: look up the per-turn secret we minted for this turn so the
+    // daemon binds the decision to us. Absent only for permissions whose turn we
+    // didn't submit (then the daemon 403s, as intended).
+    let decision_token = pending
+        .request_id
+        .and_then(|rid| app.decision_tokens.get(&rid).cloned());
+    match client.permission_decision(&app.url, pending.permission_id, decision, decision_token) {
         Ok(res) if res.ok => {
             app.remove_pending_permission(res.permission_id);
             app.status = format!(
@@ -3529,6 +3560,18 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
         }
         OceanEvent::PermissionRequest { tool, reason, args } => {
             app.streaming_request_id = None;
+            // OCEAN-185: bind the secret we minted at submit time to this turn's
+            // now-known request_id, so the decision POST can replay it. The first
+            // permission for a turn claims the pending token.
+            if let Some(request_id) = request_id {
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    app.decision_tokens.entry(request_id)
+                {
+                    if let Some(token) = app.pending_submit_token.take() {
+                        slot.insert(token);
+                    }
+                }
+            }
             if let Some(permission_id) = permission_id {
                 app.upsert_pending_permission(PendingPermission {
                     permission_id,
@@ -3579,6 +3622,11 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
             if app.active_request_id == request_id {
                 app.active_request_id = None;
             }
+            // OCEAN-185: the turn is done — drop its per-turn secret.
+            if let Some(rid) = request_id {
+                app.decision_tokens.remove(&rid);
+            }
+            app.pending_submit_token = None;
             app.push_transcript(format!(
                 "{} request {} finished in {}ms",
                 if *ok { "✓" } else { "✗" },
@@ -3593,6 +3641,11 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
             if app.active_request_id == request_id {
                 app.active_request_id = None;
             }
+            // OCEAN-185: the turn is done — drop its per-turn secret.
+            if let Some(rid) = request_id {
+                app.decision_tokens.remove(&rid);
+            }
+            app.pending_submit_token = None;
             app.push_transcript(format!(
                 "✗ cancelled {}",
                 compact_text(reason.as_deref().unwrap_or("request cancelled"), 56)

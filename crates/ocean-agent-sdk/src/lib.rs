@@ -251,6 +251,16 @@ pub struct AgentTurnRequest {
     /// that don't send this are unaffected (`#[serde(default)]` → `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<TurnImage>>,
+    /// Per-turn secret binding the permission gate to THIS submitter (OCEAN-185,
+    /// P0). The client mints a high-entropy token (see
+    /// `ocean_core::mint_decision_token`) and sends it here; the daemon binds it
+    /// to the turn and every `PermissionRequest` the turn raises, but NEVER echoes
+    /// it on the unauthenticated `/v1/events` SSE. The decision POST must replay
+    /// the same token or the daemon returns 403 — closing the bypass where a
+    /// localhost page sniffs the broadcast `permission_id` and approves a gated
+    /// tool. `None` (legacy clients) leaves the turn's gate unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_token: Option<String>,
 }
 
 /// Response payload for `POST /v1/agent/turns`.
@@ -1128,6 +1138,7 @@ mod tests {
             thinking_level: Some(ThinkingLevel::High),
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
@@ -1156,6 +1167,7 @@ mod tests {
             thinking_level: None,
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("thinking_level"));

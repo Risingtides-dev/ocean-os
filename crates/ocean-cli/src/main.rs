@@ -167,10 +167,14 @@ async fn post_decision(
     base_url: &str,
     permission_id: uuid::Uuid,
     decision: PermissionDecision,
+    decision_token: Option<String>,
 ) -> anyhow::Result<()> {
     let body = PermissionDecisionRequest {
         permission_id,
         decision,
+        // OCEAN-185: replay the per-turn secret we minted at submit time, proving
+        // this decision came from the turn's submitter (the daemon 403s otherwise).
+        decision_token,
     };
     let url = format!(
         "{}/v1/permissions/{}/decision",
@@ -229,6 +233,9 @@ async fn permission_bridge(
     client: reqwest::Client,
     base_url: String,
     request_id: uuid::Uuid,
+    // OCEAN-185: the per-turn secret this CLI minted and sent on the turn. Each
+    // decision POST must replay it or the daemon rejects it 403.
+    decision_token: String,
     mode: PermissionMode,
     is_tty: bool,
     resp: reqwest::Response,
@@ -285,8 +292,14 @@ async fn permission_bridge(
                             "[ocean-rs] tool '{tool}' denied: no approval path in non-interactive mode; pass --permission-mode allow or run interactively"
                         );
                     }
-                    if let Err(err) =
-                        post_decision(&client, &base_url, permission_id, decision).await
+                    if let Err(err) = post_decision(
+                        &client,
+                        &base_url,
+                        permission_id,
+                        decision,
+                        Some(decision_token.clone()),
+                    )
+                    .await
                     {
                         eprintln!("[ocean-rs] failed to POST permission decision: {err}");
                     }
@@ -335,6 +348,11 @@ async fn main() -> anyhow::Result<()> {
             // exactly which `PermissionRequest`s on the global control feed are
             // ours — no need to wait for a `TurnStarted` to learn it.
             let request_id = uuid::Uuid::new_v4();
+            // OCEAN-185 (P0): mint the per-turn permission secret. It rides the
+            // turn body and is replayed on every decision POST; the daemon binds
+            // the gate to it and never broadcasts it on /v1/events, so a localhost
+            // page that sniffs the permission_id can't approve our gated tools.
+            let decision_token = ocean_core::mint_decision_token();
             let mode = permission_mode
                 .or_else(permission_mode_from_env)
                 .unwrap_or_default();
@@ -362,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
                         client.clone(),
                         cli.url.clone(),
                         request_id,
+                        decision_token.clone(),
                         mode,
                         is_tty,
                         resp,
@@ -386,6 +405,9 @@ async fn main() -> anyhow::Result<()> {
                 cwd: resolve_cwd(cli.project.as_deref()),
                 project_id: None,
                 client_type: Some("cli".into()),
+                // OCEAN-185: bind this turn's permission gate to us. Sent even
+                // under yolo (harmless — no gate fires); required when gated.
+                decision_token: Some(decision_token.clone()),
             };
             let res: anyhow::Result<PromptResponse> = async {
                 Ok(client
@@ -579,12 +601,16 @@ mod tests {
         // decision endpoint expects.
         let decision = resolve_permission(PermissionMode::Allow, true)
             .expect("allow resolves without asking");
+        let token = ocean_core::mint_decision_token();
         let body = PermissionDecisionRequest {
             permission_id,
             decision,
+            decision_token: Some(token.clone()),
         };
         let wire = serde_json::to_value(&body).unwrap();
         assert_eq!(wire["decision"], "allow_session");
         assert_eq!(wire["permission_id"], permission_id.to_string());
+        // OCEAN-185: the decision body carries the per-turn secret on the wire.
+        assert_eq!(wire["decision_token"], token);
     }
 }

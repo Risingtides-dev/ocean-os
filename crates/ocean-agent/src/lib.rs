@@ -2834,6 +2834,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -2906,6 +2907,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -2936,6 +2938,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -2989,6 +2992,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 control,
             )
@@ -3042,6 +3046,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -3070,6 +3075,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -3109,6 +3115,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -3128,6 +3135,7 @@ done
             cwd: ".".into(),
             project_id: None,
             client_type: None,
+            decision_token: None,
         };
         let (a, b) = tokio::join!(
             runtime.prompt(mk("alpha"), PromptControl::yolo(false)),
@@ -3188,6 +3196,7 @@ done
                     cwd: ".".into(),
                     project_id: None,
                     client_type: None,
+                    decision_token: None,
                 },
                 PromptControl::yolo(false),
             )
@@ -3213,6 +3222,7 @@ done
                         cwd: ".".into(),
                         project_id: None,
                         client_type: None,
+                        decision_token: None,
                     },
                     PromptControl::yolo(false),
                 )

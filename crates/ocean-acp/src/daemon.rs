@@ -185,6 +185,10 @@ impl DaemonClient {
         cwd: String,
         session_id: Option<String>,
         model_id: Option<String>,
+        // OCEAN-185 (P0): per-turn permission secret minted by the bridge. The
+        // daemon binds the gate to it and never broadcasts it; the bridge replays
+        // it on each decision POST so the decision is bound to this submitter.
+        decision_token: Option<String>,
     ) -> Result<AgentTurnResponse> {
         let body = AgentTurnRequest {
             session_id: session_id
@@ -205,6 +209,7 @@ impl DaemonClient {
             model_id,
             // ACP bridge does not attach images to turns (yet).
             images: None,
+            decision_token,
         };
 
         let url = format!("{}/v1/agent/turns", self.base_url);
@@ -298,6 +303,10 @@ impl DaemonClient {
         permission_id: uuid::Uuid,
         allow: bool,
         reason: Option<String>,
+        // OCEAN-185: the per-turn secret minted at submit time. Replayed here so
+        // the daemon can bind this decision to the turn's submitter; a missing or
+        // wrong token is rejected 403.
+        decision_token: Option<String>,
     ) -> Result<()> {
         let decision = if allow {
             PermissionDecision::Allow
@@ -307,6 +316,7 @@ impl DaemonClient {
         let body = PermissionDecisionRequest {
             permission_id,
             decision,
+            decision_token,
         };
         let url = format!("{}/v1/permissions/{}/decision", self.base_url, permission_id);
         self.http

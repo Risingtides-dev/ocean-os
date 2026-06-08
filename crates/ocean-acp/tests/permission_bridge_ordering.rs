@@ -300,7 +300,7 @@ async fn old_order_misses_permission_and_would_hang() {
     let submit = {
         let client = client.clone();
         tokio::spawn(
-            async move { client.submit_turn("mutate a file".into(), "/proj".into(), None, None).await },
+            async move { client.submit_turn("mutate a file".into(), "/proj".into(), None, None, Some(ocean_core::mint_decision_token())).await },
         )
     };
 
@@ -347,7 +347,7 @@ async fn new_order_receives_permission_and_turn_completes() {
     let submit = {
         let client = client.clone();
         tokio::spawn(
-            async move { client.submit_turn("mutate a file".into(), "/proj".into(), None, None).await },
+            async move { client.submit_turn("mutate a file".into(), "/proj".into(), None, None, Some(ocean_core::mint_decision_token())).await },
         )
     };
 
@@ -389,7 +389,9 @@ async fn new_order_receives_permission_and_turn_completes() {
 
     // 5) Post the allow decision back — this releases the daemon's block.
     client
-        .decide_permission(permission_id, true, None)
+        // OCEAN-185: the mock daemon does not enforce the token; `None` keeps
+        // this ordering test focused on the subscribe-before-submit behaviour.
+        .decide_permission(permission_id, true, None, None)
         .await
         .expect("decision POST");
 
@@ -421,7 +423,7 @@ async fn synchronous_submit_failure_does_not_hang() {
     // Submit off-task, exactly as run_turn does.
     let mut submit_handle = Some(tokio::spawn({
         let client = client.clone();
-        async move { client.submit_turn("bad cwd".into(), "/etc".into(), None, None).await }
+        async move { client.submit_turn("bad cwd".into(), "/etc".into(), None, None, Some(ocean_core::mint_decision_token())).await }
     }));
 
     let turn_id: Option<String> = None; // no turn ever starts
