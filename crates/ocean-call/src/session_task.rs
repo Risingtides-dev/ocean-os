@@ -472,15 +472,57 @@ pub mod live {
         }
     }
 
-    /// Turns reply text into TTS PCM to push into the call. This is the one seam
-    /// that has no verified provider in-repo yet (the active-lane TTS leg is the
-    /// last thing gated on a provider choice), so it stays a trait: wire a real
-    /// synthesizer (xAI/ElevenLabs/Cartesia → 16kHz mono PCM) behind it and the
-    /// [`LiveKitVoice`] below speaks for real, no other change.
+    /// Turns reply text into TTS PCM to push into the call. The verified provider
+    /// is [`crate::tts_xai`] (xAI TTS → WAV → 16kHz mono PCM), wired in via
+    /// [`default_tts_synth`] when the `xai-tts` feature is on; swap in any other
+    /// synthesizer (ElevenLabs/Cartesia → 16kHz mono PCM) behind this trait and
+    /// the [`LiveKitVoice`] below speaks it, no other change.
     #[async_trait]
     pub trait TtsSynth: Send {
         /// Synthesize `text` to a single 16kHz-mono PCM utterance.
         async fn synth(&mut self, text: &str) -> anyhow::Result<PcmFrame>;
+    }
+
+    /// Lets a boxed synth satisfy the trait, so [`default_tts_synth`] can return
+    /// either the live xAI synth or the silence fallback as one `Box<dyn TtsSynth>`
+    /// without the caller naming the concrete type.
+    #[async_trait]
+    impl TtsSynth for Box<dyn TtsSynth> {
+        async fn synth(&mut self, text: &str) -> anyhow::Result<PcmFrame> {
+            (**self).synth(text).await
+        }
+    }
+
+    /// The no-provider fallback: logs the reply and yields a short silence so the
+    /// publish path is still exercised end-to-end (and `CallAgentSpoke` still
+    /// fires) without fabricating speech. Used when the `xai-tts` feature is off.
+    pub struct SilenceTts;
+
+    #[async_trait]
+    impl TtsSynth for SilenceTts {
+        async fn synth(&mut self, text: &str) -> anyhow::Result<PcmFrame> {
+            tracing::warn!(
+                reply = %text,
+                "call TTS synth not wired (xai-tts feature off) — emitting silence; \
+                 CallAgentSpoke still fires"
+            );
+            // 200ms of 16kHz mono silence as a benign placeholder utterance.
+            Ok(PcmFrame::new(vec![0i16; 3_200], 16_000, 1))
+        }
+    }
+
+    /// Pick the active-lane TTS synth: the live xAI synth when the `xai-tts`
+    /// feature is compiled in (using `api_key`), otherwise [`SilenceTts`]. Boxed
+    /// so both arms share one return type, letting the daemon wire TTS without a
+    /// `cfg` at the call site — the default build stays silent and credential-free.
+    pub fn default_tts_synth(api_key: &str) -> Box<dyn TtsSynth> {
+        let _ = api_key;
+        #[cfg(feature = "xai-tts")]
+        let synth: Box<dyn TtsSynth> =
+            Box::new(crate::tts_xai::live::XaiTtsSynth::new(api_key.to_string()));
+        #[cfg(not(feature = "xai-tts"))]
+        let synth: Box<dyn TtsSynth> = Box::new(SilenceTts);
+        synth
     }
 
     /// [`Voice`] that publishes a local voice track into the call room and pushes

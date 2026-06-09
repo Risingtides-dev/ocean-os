@@ -43,3 +43,9 @@ livekit-tap = ["dep:livekit", "dep:futures-util"]
 # Enables stt_xai::live — the real HTTP transcription call (needs reqwest
 # multipart + a runtime XAI key). The request-building logic is always built.
 xai-stt = ["reqwest/multipart"]
+# Enables tts_xai::live — the real xAI TTS HTTP call that renders Ocean's reply
+# to 16kHz mono PCM for the active lane. The `TtsSynth` trait it implements lives
+# in `session_task::live`, which is `livekit-tap`-gated, so this implies it. The
+# decode/resample/request-shaping logic in `tts_xai` is always built and tested
+# without this feature, a network call, or an xAI key.
+xai-tts = ["livekit-tap"]
