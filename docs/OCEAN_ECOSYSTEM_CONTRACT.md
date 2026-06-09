@@ -8,7 +8,9 @@ Status: active contract for runtime and first-party surfaces.
 - `Workspace`: one concrete checkout/worktree/local directory on disk. A workspace has a path and may belong to a project.
 - `Session`: one agent/human work thread rooted in exactly one workspace.
 - `Surface`: a UI/client attached to a session, such as GPUI, the Chrome extension, web, TUI, ACP, CLI, or voice.
-- `Canvas`: a tldraw/CRDT document visible from a surface.
+- `Canvas`: a tldraw/CRDT document visible from a surface. Concurrent
+  operator+agent edits converge via the per-component version-vector merge
+  (OCEAN-258); see `docs/OCEAN_CANVAS_CONVERGENT_MERGE.md`.
 - `LiveKit room`: the real-time audio/video/data collaboration container.
 - `Longhouse`: the reasoning/federation plane.
 

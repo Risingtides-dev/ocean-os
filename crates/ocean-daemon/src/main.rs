@@ -6001,6 +6001,16 @@ async fn agent_turn(
                             actor: ActorRef::agent(None),
                             created_at_ms,
                             patch,
+                            // OCEAN-258: the daemon is a transport, not the merge
+                            // authority — the ledger is where the operator's local
+                            // edits and the agent's streamed patches actually meet,
+                            // so the *surface ledger* stamps the convergent-merge
+                            // `version` (from its per-canvas Lamport clock) when it
+                            // applies this patch. Stamping an authoritative rev here
+                            // would split-brain the clock across daemon + ledger and
+                            // violate masterbuild §4 ("no daemon table is the source
+                            // of truth for the canvas"). Left None on the wire.
+                            version: None,
                         })
                         .collect();
                     bridge_bus.emit(AgentTurnEvent::SurfacePatch {
@@ -7304,6 +7314,7 @@ mod tests {
                 actor: ActorRef::agent(None),
                 created_at_ms: 0,
                 patch,
+                version: None,
             }],
         }
     }

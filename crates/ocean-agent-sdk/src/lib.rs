@@ -32,6 +32,11 @@ pub use ocean_protocol::ThinkingLevel;
 /// (GPUI Masterbuild Slice 1). See [`surface`] for the wire types.
 pub mod surface;
 
+/// Surface convergent-merge layer — the CRDT-lite that lets the operator and an
+/// agent edit the same canvas concurrently without clobbering (OCEAN-258, E10-P3).
+/// See [`surface_merge`] for the version-vector / Lamport-clock merge types.
+pub mod surface_merge;
+
 /// Slack canvas protocol — the shared contract for the agent's Slack-canvas-as-
 /// playground tool (OCEAN-214). See [`slack_canvas`] for the op/result wire types.
 pub mod slack_canvas;
@@ -1087,6 +1092,9 @@ mod tests {
                     patch: crate::surface::SurfacePatch::Select {
                         ids: vec![crate::surface::ComponentId::new("c-1")],
                     },
+                    // Select is not a per-component LWW op (target_component()==None),
+                    // so it carries no merge version.
+                    version: None,
                 }],
             },
             // Session-scoped SlackCanvas: a pending `read` (OCEAN-235) carrying its
