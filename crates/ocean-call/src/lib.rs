@@ -42,10 +42,11 @@ pub use frame::{FrameChunker, PcmFrame};
 pub use orchestrator::{ActiveOutcome, CallSession, CapturingSink, EventSink, SegmentOutcome};
 pub use room_tap::TapLifecycle;
 pub use session_task::{
-    run_call_session, FrameSource, SourceEnd, Transcriber, TurnRunner, UtterancePolicy, Voice,
+    run_call_session, run_call_session_streaming, ActivitySink, FrameSource, NoopActivitySink,
+    SourceEnd, Transcriber, TurnRunner, UtterancePolicy, Voice,
 };
 pub use sip_bridge::{normalize_e164, CallBridge, LiveKitSipBridge, PlacedCall, SipConfig};
-pub use stt::{SegmentAssembler, SegmentUpdate, SttProvider, TranscriptSegment};
+pub use stt::{SegmentAssembler, SegmentUpdate, StreamEvent, SttProvider, TranscriptSegment};
 pub use stt_deepgram::{
     build_ws_url, parse_results, pcm_to_le_bytes, DeepgramConfig, SpeechActivity,
     SpeechActivityTracker, CLOSE_STREAM_MSG, DEEPGRAM_WS_URL,

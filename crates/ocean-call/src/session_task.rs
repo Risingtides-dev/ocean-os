@@ -36,13 +36,17 @@
 //! adapters live behind the `livekit-tap` feature — this module's contract is
 //! feature-free, so it always compiles.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::frame::PcmFrame;
 use crate::orchestrator::{ActiveOutcome, CallSession, EventSink};
-use crate::stt::TranscriptSegment;
+use crate::stt::{SegmentUpdate, SttProvider, StreamEvent, TranscriptSegment};
+use crate::stt_deepgram::SpeechActivity;
 use crate::stt_xai::UtteranceBuffer;
 
 /// A source of call audio as [`PcmFrame`]s, plus an end-of-call signal.
@@ -441,6 +445,339 @@ where
         summary,
         as_of_ms,
     });
+}
+
+// ===========================================================================
+// Streaming STT path (OCEAN-242)
+//
+// The batch loop above buffers an utterance then POSTs a WAV and only learns
+// the transcript *after* the speaker pauses. A streaming provider
+// ([`SttProvider`], e.g. Deepgram) instead keeps a live socket open: frames are
+// pushed in as they arrive and classified [`StreamEvent`]s flow back out in
+// real time — interim hypotheses for liveness, finals as the transcript of
+// record, and a [`SpeechActivity::Onset`] edge the instant the human starts
+// talking. That onset is the **barge-in** signal (OCEAN-243): exposed here so a
+// follow-up can cut Ocean's TTS, but not consumed yet.
+//
+// Rather than bend the batch xAI adapter into the push/stream-out shape (which
+// would force the loop's clean size/gap flush policy down into the adapter and
+// can't emit interims at all), the streaming path is a *sibling* loop. The batch
+// loop is unchanged — every existing test passes verbatim — and the daemon picks
+// which to spawn by which provider is configured.
+// ===========================================================================
+
+/// Where the loop routes [`SpeechActivity`] edges derived from the live STT
+/// stream — the **barge-in seam** lifted out of the session loop.
+///
+/// OCEAN-242 makes the onset *reachable*; OCEAN-243 wires a real consumer that
+/// stops Ocean's in-flight TTS the moment `Onset` fires. Until then the daemon
+/// passes [`NoopActivitySink`] and the edge is simply observable (and asserted
+/// in tests). Kept as a trait, not a channel, so the consumer can be swapped
+/// (log, TTS-canceller, metrics) without touching the loop.
+pub trait ActivitySink: Send {
+    /// Called for each speech-activity edge the stream produced. `Onset` means
+    /// the human just started talking (cut TTS); `Settled` means they paused.
+    fn on_activity(&mut self, activity: SpeechActivity);
+}
+
+/// Forward through a `&mut` so a caller can lend an [`ActivitySink`] to the loop
+/// without giving up ownership (mirrors the blanket impl for [`EventSink`]).
+impl<T: ActivitySink + ?Sized> ActivitySink for &mut T {
+    fn on_activity(&mut self, activity: SpeechActivity) {
+        (**self).on_activity(activity)
+    }
+}
+
+/// The default barge-in consumer: drops every edge. Used by the daemon until
+/// OCEAN-243 lands a real TTS-stop, and by tests that don't assert on activity.
+/// The streaming loop still *derives* and forwards edges to it, so swapping in a
+/// real sink later is a one-line change at the call site, not a loop change.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopActivitySink;
+
+impl ActivitySink for NoopActivitySink {
+    fn on_activity(&mut self, _activity: SpeechActivity) {}
+}
+
+/// A capturing [`ActivitySink`] that records every edge — handy for asserting
+/// the barge-in onset reached the loop boundary. Shared (`Arc<Mutex<_>>`) so a
+/// test can hold a handle while the loop owns the sink.
+#[derive(Debug, Clone, Default)]
+pub struct CapturingActivitySink {
+    /// Every [`SpeechActivity`] edge the loop forwarded, in order.
+    pub edges: Arc<std::sync::Mutex<Vec<SpeechActivity>>>,
+}
+
+impl ActivitySink for CapturingActivitySink {
+    fn on_activity(&mut self, activity: SpeechActivity) {
+        self.edges.lock().expect("activity edges lock").push(activity);
+    }
+}
+
+/// The streaming counterpart to [`run_call_session`]: drives a live call through
+/// a push/stream-out [`SttProvider`] instead of buffer-then-POST batch STT.
+///
+/// `stt` is the provider's push side (frames in); `stt_events` is the receiver
+/// of classified [`StreamEvent`]s its read pump emits (interim/final segments +
+/// barge-in edges). For the live Deepgram provider both come from
+/// `DeepgramStt::connect(...) -> (provider, events_rx)`; a test supplies a mock
+/// provider whose `push_frame` drives a scripted `events_rx`.
+///
+/// Contract (matches the batch loop where it overlaps):
+/// - emits `CallStarted` up front and `CallEnded` (measured) once `source` ends,
+///   so no phantom in-progress call can linger;
+/// - pushes every [`PcmFrame`] into `stt` as it arrives (a push error is logged
+///   and the frame dropped — a transient socket hiccup never drops the call);
+/// - consumes `stt_events`: **final** segments go through
+///   [`CallSession::on_segment`] exactly as batch finals do (driving the
+///   transcript, task, summary, and wake/answer lanes); **interim** segments are
+///   emitted as live `CallTranscriptSegment{is_final:false}` for the surface but
+///   never commit to the summary/task lanes;
+/// - forwards every [`SpeechActivity`] edge to `activity` — the barge-in onset is
+///   thereby reachable for OCEAN-243 (not consumed here);
+/// - on source end, calls `stt.finish()` to flush the trailing final, drains the
+///   remaining `stt_events`, then closes the call.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_call_session_streaming<S, R, V, K, A>(
+    mut session: CallSession,
+    mut source: S,
+    stt: Arc<dyn SttProvider>,
+    mut stt_events: UnboundedReceiver<StreamEvent>,
+    mut runner: R,
+    mut voice: V,
+    mut sink: K,
+    mut activity: A,
+    room_id: String,
+    participants: Vec<String>,
+    policy: UtterancePolicy,
+    clock: impl Fn() -> u64 + Send,
+) where
+    S: FrameSource,
+    R: TurnRunner,
+    V: Voice,
+    K: EventSink,
+    A: ActivitySink,
+{
+    let started_ms = clock();
+    session.start(&mut sink, &room_id, participants);
+
+    let mut tick = tokio::time::interval(Duration::from_millis(policy.tick_interval_ms.max(1)));
+    // Consume the immediate first tick so it can't pre-empt the first frame.
+    tick.tick().await;
+
+    // Tracks whether the provider's read pump is still alive. Once its channel
+    // closes, we stop selecting on it — a closed `recv()` resolves to `None`
+    // instantly, so with `biased` it would spin hot and starve the audio arm.
+    let mut stream_open = true;
+
+    // Phase 1 — live: multiplex the audio source, the STT event stream, and the
+    // summary tick until the audio source ends.
+    let end = loop {
+        tokio::select! {
+            // Bias toward draining transcript events first so a backlog of finals
+            // is committed before a tick fires a (likely premature) summary.
+            biased;
+
+            // Only poll the transcript stream while it's open (see `stream_open`).
+            maybe_event = stt_events.recv(), if stream_open => {
+                match maybe_event {
+                    Some(event) => {
+                        handle_stream_event(
+                            event,
+                            &mut session,
+                            &mut runner,
+                            &mut voice,
+                            &mut sink,
+                            &mut activity,
+                            started_ms,
+                            &clock,
+                        )
+                        .await;
+                    }
+                    // The provider's read pump ended (socket closed) before the
+                    // audio source did. Latch it closed so this arm is no longer
+                    // selected; the audio `None` below still drives termination.
+                    None => stream_open = false,
+                }
+            }
+
+            maybe_frame = source.next_frame() => {
+                match maybe_frame {
+                    Some(frame) => {
+                        // Push the frame into the live provider. A push failure is
+                        // a transient transport error: log + drop the frame, never
+                        // the call (mirrors the batch loop dropping one utterance).
+                        if let Err(e) = stt.push_frame(frame).await {
+                            tracing::warn!(error = %e, provider = stt.name(), "streaming STT push_frame failed; dropping frame");
+                        }
+                    }
+                    None => break source.lifecycle(), // audio ended — call is over
+                }
+            }
+
+            _ = tick.tick() => {
+                let now = clock().saturating_sub(started_ms);
+                if let Some(transcript) = session.on_tick(now) {
+                    run_summary(transcript, &mut runner, &mut sink, now).await;
+                }
+            }
+        }
+    };
+
+    // Phase 2 — flush: tell the provider the audio ended so it emits the trailing
+    // final, then drain whatever the read pump still hands back so the last words
+    // (and their lanes) aren't lost. A `finish` error is logged, not fatal.
+    if let Err(e) = stt.finish().await {
+        tracing::warn!(error = %e, provider = stt.name(), "streaming STT finish failed; draining anyway");
+    }
+    drain_stream_events(
+        &mut stt_events,
+        &mut session,
+        &mut runner,
+        &mut voice,
+        &mut sink,
+        &mut activity,
+        started_ms,
+        &clock,
+    )
+    .await;
+
+    match &end {
+        SourceEnd::Ended => tracing::info!(%room_id, "call tap ended cleanly"),
+        SourceEnd::Dropped { reason } => {
+            tracing::warn!(%room_id, %reason, "call tap dropped mid-call");
+        }
+    }
+    let duration_ms = clock().saturating_sub(started_ms);
+    session.end(&mut sink, duration_ms);
+}
+
+/// How long Phase 2 waits for the provider's trailing final (flushed in
+/// response to `finish()`/CloseStream) before giving up. The trailing utterance
+/// is a sub-second event after the socket flush; this is the *upper bound* so a
+/// provider that never closes its event sender can't hang the call's teardown.
+const TRAILING_FLUSH_GRACE_MS: u64 = 2_000;
+
+/// Drain the STT event stream after `finish()`: first everything already
+/// buffered (non-blocking), then — bounded by [`TRAILING_FLUSH_GRACE_MS`] — the
+/// provider's trailing final once it arrives.
+///
+/// Why bounded rather than `while let Some = recv().await`: the session loop
+/// holds the provider for its whole lifetime, so a provider that keeps its event
+/// sender alive (e.g. a mock, or a real one that doesn't drop the channel on
+/// close) would make a blind `recv().await` block forever after the last event.
+/// The real Deepgram pump *does* drop its sender when the socket closes, so this
+/// loop exits the instant the channel disconnects; the deadline only guards the
+/// degenerate case so call teardown is always finite.
+#[allow(clippy::too_many_arguments)]
+async fn drain_stream_events<R, V, K, A>(
+    stt_events: &mut UnboundedReceiver<StreamEvent>,
+    session: &mut CallSession,
+    runner: &mut R,
+    voice: &mut V,
+    sink: &mut K,
+    activity: &mut A,
+    started_ms: u64,
+    clock: &(impl Fn() -> u64 + Send),
+) where
+    R: TurnRunner,
+    V: Voice,
+    K: EventSink,
+    A: ActivitySink,
+{
+    // (a) Everything already queued — process synchronously, no waiting.
+    loop {
+        match stt_events.try_recv() {
+            Ok(event) => {
+                handle_stream_event(event, session, runner, voice, sink, activity, started_ms, clock)
+                    .await;
+            }
+            // Nothing buffered right now, but the stream is still open — fall
+            // through to the bounded wait for the trailing final.
+            Err(TryRecvError::Empty) => break,
+            // Sender dropped (real provider closed the socket) — fully drained.
+            Err(TryRecvError::Disconnected) => return,
+        }
+    }
+
+    // (b) Bounded wait for the trailing final the provider flushes on finish().
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(TRAILING_FLUSH_GRACE_MS);
+    loop {
+        match tokio::time::timeout_at(deadline, stt_events.recv()).await {
+            // A trailing event arrived in time — process it and keep draining
+            // (more may follow within the same grace window).
+            Ok(Some(event)) => {
+                handle_stream_event(event, session, runner, voice, sink, activity, started_ms, clock)
+                    .await;
+            }
+            // Channel disconnected — provider finished cleanly, we're done.
+            Ok(None) => return,
+            // Grace elapsed — stop waiting so teardown stays finite.
+            Err(_) => {
+                tracing::debug!("streaming STT trailing-flush grace elapsed; closing call");
+                return;
+            }
+        }
+    }
+}
+
+/// Route one classified [`StreamEvent`] from the live STT stream:
+/// - forward any [`SpeechActivity`] edge to the barge-in sink (reachable for
+///   OCEAN-243; not consumed here);
+/// - a **final** segment runs the full orchestrator path (transcript + task +
+///   summary + wake/answer lanes), exactly as a batch final does;
+/// - an **interim** segment is emitted as a live, non-final
+///   `CallTranscriptSegment` for the surface — never committed to summary/task.
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_event<R, V, K, A>(
+    event: StreamEvent,
+    session: &mut CallSession,
+    runner: &mut R,
+    voice: &mut V,
+    sink: &mut K,
+    activity: &mut A,
+    started_ms: u64,
+    clock: &(impl Fn() -> u64 + Send),
+) where
+    R: TurnRunner,
+    V: Voice,
+    K: EventSink,
+    A: ActivitySink,
+{
+    // Barge-in seam first: forward the edge even if the segment itself is an
+    // ignored duplicate, so an Onset is never swallowed (the provider already
+    // derives the edge from the raw, pre-dedup segment).
+    if let Some(edge) = event.activity {
+        activity.on_activity(edge);
+    }
+
+    match event.update {
+        SegmentUpdate::Final(seg) => {
+            // A settled final is the transcript of record — run the same lanes a
+            // batch transcript would, including the wake answer and the summary
+            // turn the orchestrator decides is due.
+            let now = clock().saturating_sub(started_ms);
+            let outcome = session.on_segment(seg, now, sink);
+            if let Some(transcript) = outcome.summary_due {
+                run_summary(transcript, runner, sink, now).await;
+            }
+            if let ActiveOutcome::Answer(command) = outcome.active {
+                run_answer(command, session, runner, voice, sink, started_ms, clock).await;
+            }
+        }
+        SegmentUpdate::Interim(seg) => {
+            // Liveness only: surface the interim as a non-final transcript line.
+            // It must NOT feed the summary/task/wake lanes (those act on finals),
+            // so we emit the event directly rather than going through on_segment.
+            sink.emit(ocean_core::OceanEvent::CallTranscriptSegment {
+                speaker: seg.speaker,
+                text: seg.text,
+                start_ms: seg.start_ms,
+                is_final: false,
+            });
+        }
+        SegmentUpdate::Ignore => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,5 +1932,382 @@ mod tests {
         let err = bad.ensure().await;
         assert!(err.is_err(), "a publish failure must surface as Err, not a panic");
         assert!(bad.source.is_none(), "a failed init must leave the source unset");
+    }
+
+    // =======================================================================
+    // Streaming STT path (OCEAN-242).
+    //
+    // `run_call_session_streaming` drives a call through a push/stream-out
+    // `SttProvider` instead of buffer-then-POST batch STT. These tests prove,
+    // with a mock provider (no socket), that:
+    //   - **final** segments off the stream reach `CallSession::on_segment` and
+    //     drive the full passive + active lanes (transcript, task, summary,
+    //     wake/answer) exactly as batch finals do;
+    //   - **interim** segments surface as non-final transcript lines but never
+    //     feed the summary/task/wake lanes;
+    //   - the `SpeechActivity::Onset` **barge-in** edge is forwarded out of the
+    //     loop to the `ActivitySink` (reachable for OCEAN-243), even though no
+    //     consumer acts on it yet;
+    //   - the call still brackets cleanly with CallStarted/CallEnded, including
+    //     when the stream closes early or the source drops.
+    // =======================================================================
+
+    /// A mock streaming [`SttProvider`]. On the first `push_frame` it flushes a
+    /// scripted batch of [`StreamEvent`]s onto the channel the loop drains; on
+    /// `finish()` it flushes a scripted trailing batch (the provider's "trailing
+    /// final" on CloseStream) and then **drops its sender** — exactly mirroring
+    /// the real Deepgram pump, whose `events_tx` dies when the socket closes
+    /// after CloseStream. Dropping the sender disconnects the channel, so the
+    /// loop's bounded Phase-2 drain returns the instant it's done (no real-time
+    /// grace wait in tests). Because the channel is unbounded and the loop drains
+    /// it both live and post-`finish`, every scripted event is processed before
+    /// `CallEnded` regardless of select ordering — fully deterministic.
+    struct MockStreamingStt {
+        /// `Option` so `finish()` can drop the sender (close the stream). Behind a
+        /// `std::sync::Mutex` because `SttProvider` is `&self`.
+        tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>>,
+        /// Emitted on the first `push_frame` (interims + finals during the call).
+        on_first_frame: std::sync::Mutex<Option<Vec<StreamEvent>>>,
+        /// Emitted on `finish()` (the trailing final flushed on CloseStream).
+        on_finish: std::sync::Mutex<Option<Vec<StreamEvent>>>,
+        pushes: Arc<AtomicU64>,
+        finished: Arc<AtomicU64>,
+    }
+
+    impl MockStreamingStt {
+        /// Build the provider + the receiver the loop consumes. `during` is sent
+        /// on the first frame; `trailing` is sent on `finish()`.
+        fn new(
+            during: Vec<StreamEvent>,
+            trailing: Vec<StreamEvent>,
+        ) -> (Arc<Self>, UnboundedReceiver<StreamEvent>, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let pushes = Arc::new(AtomicU64::new(0));
+            let finished = Arc::new(AtomicU64::new(0));
+            let me = Arc::new(Self {
+                tx: std::sync::Mutex::new(Some(tx)),
+                on_first_frame: std::sync::Mutex::new(Some(during)),
+                on_finish: std::sync::Mutex::new(Some(trailing)),
+                pushes: pushes.clone(),
+                finished: finished.clone(),
+            });
+            (me, rx, pushes, finished)
+        }
+
+        /// Send a batch through the (still-open) sender. A closed receiver just
+        /// means the loop already ended; ignore the send error.
+        fn emit(&self, batch: Vec<StreamEvent>) {
+            if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                for ev in batch {
+                    let _ = tx.send(ev);
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SttProvider for MockStreamingStt {
+        async fn push_frame(&self, _frame: PcmFrame) -> anyhow::Result<()> {
+            self.pushes.fetch_add(1, Ordering::SeqCst);
+            // Flush the scripted in-call events exactly once, on the first frame.
+            if let Some(batch) = self.on_first_frame.lock().unwrap().take() {
+                self.emit(batch);
+            }
+            Ok(())
+        }
+
+        async fn finish(&self) -> anyhow::Result<()> {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            if let Some(batch) = self.on_finish.lock().unwrap().take() {
+                self.emit(batch);
+            }
+            // Drop the sender so the channel disconnects — models the real pump's
+            // sender dying when the socket closes after CloseStream.
+            *self.tx.lock().unwrap() = None;
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-streaming"
+        }
+    }
+
+    /// Convenience: a `StreamEvent` carrying a final segment, no activity edge.
+    fn final_event(text: &str, start_ms: u64) -> StreamEvent {
+        StreamEvent {
+            update: SegmentUpdate::Final(TranscriptSegment::final_("caller", text, start_ms)),
+            activity: None,
+        }
+    }
+
+    /// Convenience: a `StreamEvent` carrying an interim segment + a barge-in
+    /// Onset edge — exactly what the provider emits at the leading edge of a
+    /// talk-spurt (first non-empty interim after silence).
+    fn interim_onset_event(text: &str, start_ms: u64) -> StreamEvent {
+        StreamEvent {
+            update: SegmentUpdate::Interim(TranscriptSegment::interim("caller", text, start_ms)),
+            activity: Some(SpeechActivity::Onset),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_finals_reach_session_and_onset_is_exposed() {
+        // The headline OCEAN-242 test. A talk-spurt's leading interim carries the
+        // barge-in Onset; a final settles it (carrying Settled); a second final
+        // crosses the every_n_segments=2 threshold so the summary lane fires; and
+        // a wake command drives the active lane. Asserts: interim surfaced as a
+        // non-final segment, BOTH finals reached the orchestrator (transcript +
+        // task + summary + wake/answer), and the Onset edge reached the loop's
+        // ActivitySink (the barge-in signal exposed for OCEAN-243).
+        let during = vec![
+            // Leading interim of a spurt → Onset (barge-in seam) + live render.
+            interim_onset_event("I'll send the", 0),
+            // The spurt settles into a final: a task commitment. Settled edge too.
+            StreamEvent {
+                update: SegmentUpdate::Final(TranscriptSegment::final_(
+                    "caller",
+                    "I'll send the master to Atlantic tonight",
+                    0,
+                )),
+                activity: Some(SpeechActivity::Settled),
+            },
+            // A second final crosses the summary threshold (every_n_segments=2).
+            final_event("the release is locked for friday", 1_000),
+            // A wake command drives the active lane (answer → speak → spoke).
+            final_event("hey Ocean what did we agree to", 2_000),
+        ];
+
+        let (stt, rx, pushes, finished) = MockStreamingStt::new(during, vec![]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let activity = CapturingActivitySink::default();
+        let edges = activity.edges.clone();
+        let mut out = CapturingSink::default();
+
+        run_call_session_streaming(
+            session(false),
+            // One frame is enough to trigger the scripted in-call flush; the
+            // source then ends, driving finish() + the trailing drain.
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("You agreed to send the master.", seen.clone())
+                .with_summary("Caller will send the master; release locked for Friday."),
+            voice,
+            &mut out,
+            activity,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        // The provider was actually driven: frames pushed in, finish() called once.
+        assert!(pushes.load(Ordering::SeqCst) >= 1, "frames must be pushed to the provider");
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() must be called exactly once on source end");
+
+        let types = ev_types(&out);
+        // Lifecycle brackets the call.
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"));
+        // Finals drove the passive lanes: transcript(s), the detected task, summary.
+        assert!(types.contains(&"segment"), "got {types:?}");
+        assert!(types.contains(&"task"), "got {types:?}");
+        assert!(types.contains(&"summary"), "got {types:?}");
+        // Active lane: wake fired off a final, the agent answered, Ocean spoke.
+        assert!(types.contains(&"wake"), "got {types:?}");
+        assert!(types.contains(&"spoke"), "got {types:?}");
+
+        // The interim surfaced as a NON-final transcript line (liveness), and the
+        // task-commitment final surfaced as a FINAL line — proving finals reach
+        // CallSession::on_segment (which is what emits the transcript segments).
+        let interim_rendered = out.events.iter().any(|e| matches!(
+            e,
+            OceanEvent::CallTranscriptSegment { text, is_final: false, .. } if text == "I'll send the"
+        ));
+        assert!(interim_rendered, "interim must surface as a non-final transcript line");
+        let final_rendered = out.events.iter().any(|e| matches!(
+            e,
+            OceanEvent::CallTranscriptSegment { text, is_final: true, .. }
+                if text == "I'll send the master to Atlantic tonight"
+        ));
+        assert!(final_rendered, "the final segment must reach the orchestrator and render as final");
+
+        // The summary turn ran over the JOINED FINALS (not the interim), and the
+        // wake command ran — proving finals (only) fed the summary + wake lanes.
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "runner drives summary + answer; got {seen:?}");
+        assert!(seen[0].starts_with(SUMMARY_INSTRUCTION), "first turn is the summary turn");
+        assert!(
+            seen[0].contains("I'll send the master to Atlantic tonight")
+                && seen[0].contains("the release is locked for friday"),
+            "summary turn must carry the joined FINAL transcript; got {:?}",
+            seen[0]
+        );
+        // The summarizer joins FINALS only: exactly the two final texts, in order,
+        // with nothing from the interim committed as its own line. (The interim
+        // string "I'll send the" is necessarily a prefix-substring of the first
+        // final, so we assert on the committed shape, not substring absence.)
+        assert_eq!(
+            seen[0],
+            format!(
+                "{SUMMARY_INSTRUCTION}\n\nTranscript:\nI'll send the master to Atlantic tonight \
+                 the release is locked for friday"
+            ),
+            "summary transcript must be exactly the two joined finals — no interim line",
+        );
+        assert_eq!(seen[1], "what did we agree to", "second turn is the wake command, stripped");
+        assert_eq!(
+            spoken.lock().unwrap().as_slice(),
+            &["You agreed to send the master.".to_string()],
+            "the wake answer is spoken; the summary is not"
+        );
+
+        // The load-bearing OCEAN-242 assertion: the barge-in Onset edge reached
+        // the loop boundary (the ActivitySink), so OCEAN-243 can consume it. The
+        // Settled edge that closed the spurt is forwarded too.
+        let edges = edges.lock().unwrap().clone();
+        assert!(
+            edges.contains(&SpeechActivity::Onset),
+            "the barge-in Onset edge must be exposed to the ActivitySink; got {edges:?}"
+        );
+        assert_eq!(
+            edges.first(),
+            Some(&SpeechActivity::Onset),
+            "Onset is the leading edge of the spurt; got {edges:?}"
+        );
+        assert!(
+            edges.contains(&SpeechActivity::Settled),
+            "the Settled edge that closed the spurt should also be forwarded; got {edges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_trailing_final_on_finish_is_drained() {
+        // The provider holds back its last final until CloseStream (`finish()`) —
+        // exactly how Deepgram flushes the trailing utterance. The loop must drain
+        // that post-finish event so the last words still reach the orchestrator
+        // and aren't lost when the audio source ends.
+        let (stt, rx, _pushes, finished) =
+            MockStreamingStt::new(vec![], vec![final_event("just a closing thought", 500)]);
+        let mut out = CapturingSink::default();
+
+        run_call_session_streaming(
+            session(false),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("x", Default::default()),
+            CapturingVoice::default(),
+            &mut out,
+            NoopActivitySink,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() must run on source end");
+        let seg = out.events.iter().find_map(|e| match e {
+            OceanEvent::CallTranscriptSegment { text, is_final: true, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            seg.as_deref(),
+            Some("just a closing thought"),
+            "the trailing final flushed on finish() must be drained into the orchestrator"
+        );
+        assert!(ev_types(&out).contains(&"ended"), "the call must still close");
+    }
+
+    #[tokio::test]
+    async fn streaming_empty_call_brackets_cleanly() {
+        // No frames, no events: the streaming loop must still emit CallStarted and
+        // CallEnded — no phantom in-progress call, same contract as the batch loop.
+        let (stt, rx, _p, _f) = MockStreamingStt::new(vec![], vec![]);
+        let mut out = CapturingSink::default();
+
+        run_call_session_streaming(
+            session(false),
+            VecFrames::new(vec![]),
+            stt,
+            rx,
+            CannedRunner::new("hi", Default::default()),
+            CapturingVoice::default(),
+            &mut out,
+            NoopActivitySink,
+            "call:room".into(),
+            vec!["sip:+1700".into()],
+            UtterancePolicy::default(),
+            step_clock(1_000, 10),
+        )
+        .await;
+
+        assert_eq!(ev_types(&out), vec!["started", "ended"]);
+    }
+
+    #[tokio::test]
+    async fn streaming_muted_call_renders_transcript_but_never_speaks() {
+        // Muted: the passive transcript lane still flows off the stream, but a wake
+        // command must NOT run a turn or speak — the active lane is gated, same as
+        // the batch loop's muted contract.
+        let during = vec![final_event("hey Ocean summarize the call", 0)];
+        let (stt, rx, _p, _f) = MockStreamingStt::new(during, vec![]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        run_call_session_streaming(
+            session(true), // muted
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("should not be spoken", seen.clone()),
+            voice,
+            &mut out,
+            NoopActivitySink,
+            "call:sensitive".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        assert!(types.contains(&"segment"), "transcript flows even when muted; got {types:?}");
+        assert!(!types.contains(&"wake"), "muted call must not trigger wake; got {types:?}");
+        assert!(!types.contains(&"spoke"), "muted call must not speak; got {types:?}");
+        assert!(seen.lock().unwrap().is_empty(), "muted call must not run a turn");
+        assert!(spoken.lock().unwrap().is_empty(), "muted call must not speak");
+    }
+
+    #[tokio::test]
+    async fn streaming_dropped_source_still_closes_the_call() {
+        // A mid-call transport drop must still emit CallEnded on the streaming path
+        // (no phantom in-progress call), mirroring the batch loop's guarantee.
+        let (stt, rx, _p, _f) = MockStreamingStt::new(vec![], vec![]);
+        let mut out = CapturingSink::default();
+
+        run_call_session_streaming(
+            session(false),
+            VecFrames::dropped(vec![], "PeerConnectionFailed"),
+            stt,
+            rx,
+            CannedRunner::new("x", Default::default()),
+            CapturingVoice::default(),
+            &mut out,
+            NoopActivitySink,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(1_000, 50),
+        )
+        .await;
+
+        assert!(ev_types(&out).contains(&"ended"), "dropped streaming call must close");
     }
 }

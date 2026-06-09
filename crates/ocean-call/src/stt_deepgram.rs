@@ -268,16 +268,7 @@ pub mod live {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
 
-    use crate::stt::{SegmentAssembler, SegmentUpdate, SttProvider};
-
-    /// A classified transcript update plus any barge-in edge it produced. This
-    /// is what the read pump hands the active lane: render the segment, and if
-    /// `activity` is `Some(Onset)`, stop Ocean's TTS.
-    #[derive(Debug, Clone)]
-    pub struct StreamEvent {
-        pub update: SegmentUpdate,
-        pub activity: Option<SpeechActivity>,
-    }
+    use crate::stt::{SegmentAssembler, SegmentUpdate, StreamEvent, SttProvider};
 
     /// Live Deepgram streaming provider. Owns the write half of the socket (to
     /// push PCM) behind a mutex; a spawned read pump turns incoming `Results`

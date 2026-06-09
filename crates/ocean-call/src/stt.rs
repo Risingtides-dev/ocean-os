@@ -64,8 +64,32 @@ pub enum SegmentUpdate {
     Ignore,
 }
 
+/// One classified transcript update off a streaming provider, plus any barge-in
+/// edge it produced. This is the unit the streaming session loop consumes: the
+/// provider's read side hands these out, the loop commits `Final`s to the
+/// orchestrator, surfaces `Interim`s, and routes `activity` to the active lane.
+///
+/// Lives here (always compiled) rather than inside the `deepgram-stt`-gated
+/// `live` module so [`crate::session_task::run_call_session_streaming`] can be
+/// provider-agnostic and unit-tested against a mock provider with no socket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamEvent {
+    /// The assembler-classified segment (interim / final / ignore).
+    pub update: SegmentUpdate,
+    /// The speech-activity edge this segment produced, if any. `Some(Onset)` is
+    /// the **barge-in** signal — the human just started talking, cut Ocean's TTS.
+    pub activity: Option<crate::stt_deepgram::SpeechActivity>,
+}
+
 /// A streaming STT provider. Implemented by the Deepgram / xAI adapters; the
 /// trait keeps the rest of the crate provider-agnostic and testable with fakes.
+///
+/// The provider is **push-in / stream-out**: audio frames go in via
+/// [`push_frame`](SttProvider::push_frame); classified [`StreamEvent`]s come
+/// back out of a channel the constructor returns alongside the provider (e.g.
+/// `DeepgramStt::connect` → `(provider, UnboundedReceiver<StreamEvent>)`). The
+/// session loop multiplexes the frame source into `push_frame` and that receiver
+/// into the orchestrator — see [`crate::session_task::run_call_session_streaming`].
 #[async_trait]
 pub trait SttProvider: Send + Sync {
     /// Push one PCM frame into the provider's stream.
