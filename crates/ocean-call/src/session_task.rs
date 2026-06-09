@@ -36,12 +36,14 @@
 //! adapters live behind the `livekit-tap` feature — this module's contract is
 //! feature-free, so it always compiles.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::Notify;
 
 use crate::frame::PcmFrame;
 use crate::orchestrator::{ActiveOutcome, CallSession, EventSink};
@@ -514,6 +516,166 @@ impl ActivitySink for CapturingActivitySink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Barge-in (OCEAN-243): human speech cancels Ocean's in-flight TTS.
+//
+// OCEAN-242 made the [`SpeechActivity::Onset`] edge reachable at the loop
+// boundary via [`ActivitySink`], but routed it to [`NoopActivitySink`]. This is
+// the real consumer: a shared [`BargeInSignal`] held by BOTH a [`BargeInCanceller`]
+// (the active-lane `ActivitySink`) and a [`BargeInVoice`] (a `Voice` decorator).
+//
+// - The canceller `trigger()`s the signal on `Onset` (human started talking) and
+//   `rearm()`s it on `Settled` (they paused), so the *next* answer can speak.
+// - `BargeInVoice::speak` races the inner TTS playback against the signal: the
+//   instant it fires, the in-flight `speak` is dropped (cancelled) and returns.
+//
+// The streaming loop forwards every edge to the canceller *as events arrive*,
+// and the active-lane answer is run concurrently with continued event draining
+// (see `run_answer_barge_in` / `handle_stream_event`), so an `Onset` that lands
+// while Ocean is mid-utterance trips the signal and cuts the speak immediately —
+// the whole point of OCEAN-243. The `select!` loop body itself is unchanged; the
+// call site just swaps `NoopActivitySink` for `BargeInCanceller` and wraps the
+// voice in `BargeInVoice` (the "one line" #173 promised).
+// ---------------------------------------------------------------------------
+
+/// A one-shot-style cancellation flag shared between the barge-in [`ActivitySink`]
+/// and the active-lane [`Voice`]. Cheap to clone (`Arc`); `trigger` is edge-y
+/// (idempotent within a spurt) and `rearm` resets it for the next utterance.
+///
+/// Implemented as an [`AtomicBool`] (so a late speak can see "already barged" the
+/// moment it starts) plus a [`Notify`] (so an in-flight speak parked in `await`
+/// wakes the instant the human speaks, not on the next polled frame).
+#[derive(Clone, Default)]
+pub struct BargeInSignal {
+    inner: Arc<BargeInInner>,
+}
+
+#[derive(Default)]
+struct BargeInInner {
+    barged: AtomicBool,
+    notify: Notify,
+}
+
+impl BargeInSignal {
+    /// A fresh, un-triggered signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Trip the signal: the human started talking — cut Ocean's TTS now. Wakes any
+    /// `speak` currently parked on [`barged`](Self::barged). Idempotent: repeated
+    /// onsets within one talk-spurt are harmless.
+    pub fn trigger(&self) {
+        self.inner.barged.store(true, Ordering::SeqCst);
+        // Wake every waiter (there is at most one in-flight speak, but be safe).
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Clear the signal so the next answer can speak. Called when the spurt settles
+    /// (the human paused) and at the start of each `speak` so a stale onset from a
+    /// previous utterance can't pre-cancel a fresh reply.
+    pub fn rearm(&self) {
+        self.inner.barged.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the signal is currently tripped (a barge-in is in effect).
+    pub fn is_barged(&self) -> bool {
+        self.inner.barged.load(Ordering::SeqCst)
+    }
+
+    /// Resolve as soon as the signal is (or becomes) tripped. Used as the cancel
+    /// arm of `BargeInVoice::speak`'s race. Returns immediately if already barged;
+    /// otherwise parks until [`trigger`](Self::trigger) fires — no polling.
+    pub async fn barged(&self) {
+        // Register for notification *before* the load so a `trigger` that races in
+        // between can't be missed (notify_waiters only wakes current waiters).
+        let notified = self.inner.notify.notified();
+        if self.inner.barged.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// The real barge-in [`ActivitySink`]: routes [`SpeechActivity`] edges to a shared
+/// [`BargeInSignal`]. Swapped in for [`NoopActivitySink`] at the call site to make
+/// `Onset` actually stop Ocean's TTS (OCEAN-243).
+///
+/// - `Onset`  → `trigger()`: the human started talking → cut the in-flight speak.
+/// - `Settled`→ `rearm()`: the spurt closed → allow the next answer to speak.
+#[derive(Clone, Default)]
+pub struct BargeInCanceller {
+    signal: BargeInSignal,
+}
+
+impl BargeInCanceller {
+    /// Build a canceller plus the [`BargeInSignal`] to hand the [`BargeInVoice`] so
+    /// the two share one flag. Both are cheap clones of the same `Arc`.
+    pub fn new() -> (Self, BargeInSignal) {
+        let signal = BargeInSignal::new();
+        (
+            Self {
+                signal: signal.clone(),
+            },
+            signal,
+        )
+    }
+}
+
+impl ActivitySink for BargeInCanceller {
+    fn on_activity(&mut self, activity: SpeechActivity) {
+        match activity {
+            SpeechActivity::Onset => self.signal.trigger(),
+            SpeechActivity::Settled => self.signal.rearm(),
+        }
+    }
+}
+
+/// A [`Voice`] decorator that makes the inner TTS playback cancellable by a
+/// [`BargeInSignal`]. `speak` races the inner `speak` against the signal: if the
+/// human starts talking mid-utterance the inner future is dropped (cancelled) and
+/// `speak` returns `Ok(())` — Ocean stops talking. Wrap the active-lane voice in
+/// this and share its signal with a [`BargeInCanceller`].
+///
+/// Cancellation here means *dropping the inner `speak` future*: for the live
+/// [`live::LiveKitVoice`] that stops the `capture_frame` push loop in
+/// [`crate::speaker`] between 10ms frames, so no further audio is published — the
+/// in-flight utterance is cut, not played to completion.
+pub struct BargeInVoice<V> {
+    inner: V,
+    signal: BargeInSignal,
+}
+
+impl<V> BargeInVoice<V> {
+    /// Wrap `inner`, cancelling its `speak` whenever `signal` fires. Pass the same
+    /// `signal` the [`BargeInCanceller`] holds (from [`BargeInCanceller::new`]).
+    pub fn new(inner: V, signal: BargeInSignal) -> Self {
+        Self { inner, signal }
+    }
+}
+
+#[async_trait]
+impl<V: Voice> Voice for BargeInVoice<V> {
+    async fn speak(&mut self, text: &str) -> anyhow::Result<()> {
+        // Clear any stale onset from a prior spurt so a fresh reply isn't
+        // pre-cancelled before it utters a single frame.
+        self.signal.rearm();
+        let signal = self.signal.clone();
+        tokio::select! {
+            // Bias toward the cancel arm: if the human is already talking when this
+            // answer starts, cut it before publishing audio.
+            biased;
+            _ = signal.barged() => {
+                // Human spoke (or is speaking) — abandon the inner speak. Dropping
+                // the future here stops the live capture-frame loop mid-utterance.
+                tracing::info!("barge-in: human speech cancelled Ocean's TTS mid-utterance");
+                Ok(())
+            }
+            res = self.inner.speak(text) => res,
+        }
+    }
+}
+
 /// The streaming counterpart to [`run_call_session`]: drives a live call through
 /// a push/stream-out [`SttProvider`] instead of buffer-then-POST batch STT.
 ///
@@ -584,6 +746,7 @@ pub async fn run_call_session_streaming<S, R, V, K, A>(
                     Some(event) => {
                         handle_stream_event(
                             event,
+                            &mut stt_events,
                             &mut session,
                             &mut runner,
                             &mut voice,
@@ -689,8 +852,10 @@ async fn drain_stream_events<R, V, K, A>(
     loop {
         match stt_events.try_recv() {
             Ok(event) => {
-                handle_stream_event(event, session, runner, voice, sink, activity, started_ms, clock)
-                    .await;
+                handle_stream_event(
+                    event, stt_events, session, runner, voice, sink, activity, started_ms, clock,
+                )
+                .await;
             }
             // Nothing buffered right now, but the stream is still open — fall
             // through to the bounded wait for the trailing final.
@@ -707,8 +872,10 @@ async fn drain_stream_events<R, V, K, A>(
             // A trailing event arrived in time — process it and keep draining
             // (more may follow within the same grace window).
             Ok(Some(event)) => {
-                handle_stream_event(event, session, runner, voice, sink, activity, started_ms, clock)
-                    .await;
+                handle_stream_event(
+                    event, stt_events, session, runner, voice, sink, activity, started_ms, clock,
+                )
+                .await;
             }
             // Channel disconnected — provider finished cleanly, we're done.
             Ok(None) => return,
@@ -722,15 +889,23 @@ async fn drain_stream_events<R, V, K, A>(
 }
 
 /// Route one classified [`StreamEvent`] from the live STT stream:
-/// - forward any [`SpeechActivity`] edge to the barge-in sink (reachable for
-///   OCEAN-243; not consumed here);
+/// - forward any [`SpeechActivity`] edge to the barge-in sink — for the real
+///   [`BargeInCanceller`] this trips/rearms the TTS-cancel signal (OCEAN-243);
 /// - a **final** segment runs the full orchestrator path (transcript + task +
 ///   summary + wake/answer lanes), exactly as a batch final does;
 /// - an **interim** segment is emitted as a live, non-final
 ///   `CallTranscriptSegment` for the surface — never committed to summary/task.
+///
+/// `stt_events` is borrowed so the wake-answer lane can keep draining the stream
+/// **while Ocean is speaking** (see [`run_answer_barge_in`]): a barge-in `Onset`
+/// arrives as its *own* later event, so the answer must concurrently pump the
+/// channel to observe it and cut the TTS. (The `select!` loop holds the receiver
+/// between events; while parked in an answer here it would otherwise never see
+/// the onset.)
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream_event<R, V, K, A>(
     event: StreamEvent,
+    stt_events: &mut UnboundedReceiver<StreamEvent>,
     session: &mut CallSession,
     runner: &mut R,
     voice: &mut V,
@@ -762,13 +937,166 @@ async fn handle_stream_event<R, V, K, A>(
                 run_summary(transcript, runner, sink, now).await;
             }
             if let ActiveOutcome::Answer(command) = outcome.active {
-                run_answer(command, session, runner, voice, sink, started_ms, clock).await;
+                // Run the answer concurrently with continued event draining so a
+                // mid-utterance Onset reaches the canceller and cuts the TTS.
+                run_answer_barge_in(
+                    command, stt_events, session, runner, voice, sink, activity, started_ms,
+                    clock,
+                )
+                .await;
             }
         }
         SegmentUpdate::Interim(seg) => {
             // Liveness only: surface the interim as a non-final transcript line.
             // It must NOT feed the summary/task/wake lanes (those act on finals),
             // so we emit the event directly rather than going through on_segment.
+            sink.emit(ocean_core::OceanEvent::CallTranscriptSegment {
+                speaker: seg.speaker,
+                text: seg.text,
+                start_ms: seg.start_ms,
+                is_final: false,
+            });
+        }
+        SegmentUpdate::Ignore => {}
+    }
+}
+
+/// Run a wake answer on the **streaming** path while keeping the barge-in seam
+/// live: the agent turn → speak → `CallAgentSpoke` → cooldown runs concurrently
+/// with a pump that keeps reading `stt_events` and forwarding each event's
+/// [`SpeechActivity`] edge to `activity`. With the real [`BargeInCanceller`] +
+/// [`BargeInVoice`], an `Onset` that lands while Ocean is speaking trips the
+/// shared signal, which cancels the in-flight `voice.speak`, so Ocean stops
+/// talking the instant the human does.
+///
+/// Why a dedicated pump rather than running [`run_answer`] bare: the main
+/// `select!` loop owns `stt_events` and is *parked here* for the whole answer, so
+/// without this it would never dequeue the onset event until speak already
+/// finished — exactly the OCEAN-243 bug. The interim/final *segments* that arrive
+/// during the answer are intentionally **not** re-fed to the orchestrator (they
+/// are the human's barge-in speech; re-entrant `on_segment` mid-answer would be
+/// wrong) — they're rendered as live transcript lines and their barge-in edge is
+/// honoured, which is all the cancel decision needs. Once the answer completes
+/// (or is cancelled), the main loop resumes normal full-fat draining.
+///
+/// State consistency: `run_answer` is unchanged and still calls
+/// [`CallSession::mark_replied`] at the end — whether the speak finished or was
+/// cut short — so the wake echo-cooldown always starts and the session never
+/// thinks it is still speaking after a barge-in.
+///
+/// No lost transcripts: while the answer holds `session`/`sink`/`runner`/`voice`,
+/// the concurrent pump can't run them, so any event it pulls off `stt_events` is
+/// **stashed** (its edge forwarded live for the cancel decision) and then, once
+/// the answer resolves and those borrows free, **replayed in order** through the
+/// normal segment path. So a `Final` that happens to arrive during the speak
+/// window is still committed — never dropped — and a single writer for `sink` is
+/// preserved throughout.
+#[allow(clippy::too_many_arguments)]
+async fn run_answer_barge_in<R, V, K, A>(
+    command: String,
+    stt_events: &mut UnboundedReceiver<StreamEvent>,
+    session: &mut CallSession,
+    runner: &mut R,
+    voice: &mut V,
+    sink: &mut K,
+    activity: &mut A,
+    started_ms: u64,
+    clock: &(impl Fn() -> u64 + Send),
+) where
+    R: TurnRunner,
+    V: Voice,
+    K: EventSink,
+    A: ActivitySink,
+{
+    // Events the pump consumed while the answer was in flight, to replay (segment
+    // side only) once the answer resolves and the borrows are free.
+    let mut pending: Vec<StreamEvent> = Vec::new();
+
+    {
+        // The answer future (turn → speak → spoke → cooldown). With a `BargeInVoice`
+        // the `speak` inside races the shared signal, so this resolves early if the
+        // pump below trips it. Scoped so its borrows of session/sink/runner/voice
+        // end before we replay `pending`.
+        let answer = run_answer(command, session, runner, voice, sink, started_ms, clock);
+        tokio::pin!(answer);
+
+        loop {
+            tokio::select! {
+                // Bias toward the answer so it makes progress / completes promptly;
+                // the pump only needs to win when the answer is parked in `speak`.
+                biased;
+
+                // The answer finished (spoke fully, was cancelled by barge-in, or
+                // failed) — stop pumping; replay anything we stashed below.
+                _ = &mut answer => break,
+
+                // Keep the barge-in seam alive while Ocean speaks: forward each
+                // arriving event's activity edge to the canceller. An `Onset` here
+                // trips the signal the `BargeInVoice` is racing → speak cancels.
+                // Stash the whole event so its segment isn't lost (replayed below).
+                maybe_event = stt_events.recv() => {
+                    match maybe_event {
+                        Some(event) => {
+                            if let Some(edge) = event.activity {
+                                activity.on_activity(edge);
+                            }
+                            pending.push(event);
+                        }
+                        // Stream closed mid-answer: stop pumping but let the answer
+                        // run to completion first (its arm wins the next turn).
+                        None => {
+                            (&mut answer).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Answer is done; borrows are free. Replay the stashed events' **segment side**
+    // (the edges were already forwarded live above, so don't re-forward them) so a
+    // `Final` that arrived during the speak window is still committed in order.
+    for event in pending {
+        handle_segment_update(event.update, session, runner, voice, sink, started_ms, clock).await;
+    }
+}
+
+/// Apply just the [`SegmentUpdate`] side of a stream event (no activity edge): a
+/// `Final` runs the full orchestrator path (transcript + task + summary + wake/
+/// answer), an `Interim` renders a live non-final line, `Ignore` is dropped.
+///
+/// Factored out of [`handle_stream_event`] so [`run_answer_barge_in`] can replay
+/// events it stashed during a barge-in **without** re-forwarding their (already
+/// handled) activity edge. The wake/answer here uses the plain [`run_answer`] —
+/// a replayed final answered after the barge-in doesn't itself need the
+/// concurrent pump (the human already settled), and nesting the pump would
+/// needlessly re-borrow `stt_events`.
+async fn handle_segment_update<R, V, K>(
+    update: SegmentUpdate,
+    session: &mut CallSession,
+    runner: &mut R,
+    voice: &mut V,
+    sink: &mut K,
+    started_ms: u64,
+    clock: &(impl Fn() -> u64 + Send),
+) where
+    R: TurnRunner,
+    V: Voice,
+    K: EventSink,
+{
+    match update {
+        SegmentUpdate::Final(seg) => {
+            let now = clock().saturating_sub(started_ms);
+            let outcome = session.on_segment(seg, now, sink);
+            if let Some(transcript) = outcome.summary_due {
+                run_summary(transcript, runner, sink, now).await;
+            }
+            if let ActiveOutcome::Answer(command) = outcome.active {
+                run_answer(command, session, runner, voice, sink, started_ms, clock).await;
+            }
+        }
+        SegmentUpdate::Interim(seg) => {
             sink.emit(ocean_core::OceanEvent::CallTranscriptSegment {
                 speaker: seg.speaker,
                 text: seg.text,
@@ -1211,13 +1539,22 @@ mod tests {
     }
 
     fn session(muted: bool) -> CallSession {
+        session_cooldown(muted, 2_000)
+    }
+
+    /// Like [`session`] but with an explicit wake echo-cooldown. The barge-in
+    /// end-to-end test fires two wake answers back-to-back on a fake clock that
+    /// barely advances, so it needs a near-zero cooldown to keep the second from
+    /// being suppressed as Ocean's own echo (the cooldown is correct, just larger
+    /// than the test's compressed timeline).
+    fn session_cooldown(muted: bool, cooldown_ms: u64) -> CallSession {
         CallSession::new(
             "call-test",
             Summarizer::new(SummaryPolicy {
                 every_n_segments: 2,
                 silence_ms: 5_000,
             }),
-            WakeGate::new(muted, 2_000),
+            WakeGate::new(muted, cooldown_ms),
         )
     }
 
@@ -2309,5 +2646,299 @@ mod tests {
         .await;
 
         assert!(ev_types(&out).contains(&"ended"), "dropped streaming call must close");
+    }
+
+    // =======================================================================
+    // Barge-in (OCEAN-243): human speech cancels Ocean's in-flight TTS.
+    //
+    // OCEAN-242 exposed the `SpeechActivity::Onset` edge at the loop boundary;
+    // here we prove the real consumer works. A `BargeInCanceller` (the active-
+    // lane ActivitySink) and a `BargeInVoice` (a Voice decorator) share one
+    // `BargeInSignal`: the canceller trips it on `Onset`, and `BargeInVoice::speak`
+    // races the inner TTS playback against it so the speak is cut the instant the
+    // human talks. These tests drive that two ways:
+    //   1. directly on the primitives (deterministic, no loop), and
+    //   2. through `run_call_session_streaming` end-to-end, where a wake answer is
+    //      mid-`speak` when an Onset event arrives off the stream.
+    // =======================================================================
+
+    /// A [`Voice`] whose `speak` **parks** the configured number of times before
+    /// completing promptly — modelling a long TTS utterance still playing into the
+    /// room. It records, via shared counters, how many speaks *started* vs
+    /// *finished*, so a test can prove a speak was **cancelled** (started but never
+    /// finished) when barge-in drops the future.
+    ///
+    /// `park_first` parks exactly the first N speaks (each on a `release` Notify
+    /// that the barge-in tests never fire — so the only exit is cancellation);
+    /// later speaks return immediately, letting a *subsequent* answer complete to
+    /// completion after a barge-in. This is counter-based (not a flippable flag) so
+    /// there is no driver/voice race: the first answer always parks, the second
+    /// never does, deterministically.
+    #[derive(Clone)]
+    struct GatedVoice {
+        started: Arc<AtomicU64>,
+        finished: Arc<AtomicU64>,
+        /// Number of leading speaks that should park (await `release`). The barge-in
+        /// tests set this to 1 and never release, so the first speak only exits by
+        /// being cancelled.
+        park_first: Arc<AtomicU64>,
+        /// Released to let a *parked* speak run to completion. Unused by the barge-in
+        /// tests (which cancel instead), but lets the same mock model a normal
+        /// completed utterance if a future test wants one.
+        release: Arc<Notify>,
+    }
+
+    impl GatedVoice {
+        /// Park the first `park_first` speaks; complete the rest immediately.
+        fn new(park_first: u64) -> Self {
+            Self {
+                started: Arc::new(AtomicU64::new(0)),
+                finished: Arc::new(AtomicU64::new(0)),
+                park_first: Arc::new(AtomicU64::new(park_first)),
+                release: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Voice for GatedVoice {
+        async fn speak(&mut self, _text: &str) -> anyhow::Result<()> {
+            let n = self.started.fetch_add(1, Ordering::SeqCst); // 0-based index
+            if n < self.park_first.load(Ordering::SeqCst) {
+                // Park until released. If barge-in cancels us, this future is
+                // dropped here and `finished` is never bumped — that's the
+                // observable "the speak was cut mid-utterance".
+                self.release.notified().await;
+            }
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn barge_in_signal_cancels_in_flight_speak() {
+        // Unit-level proof of the cancel primitive, no session loop. A `BargeInVoice`
+        // wrapping a parked `GatedVoice` is cut the instant the shared signal trips —
+        // `speak` returns Ok without the inner speak ever finishing.
+        let (mut canceller, signal) = BargeInCanceller::new();
+        let inner = GatedVoice::new(1); // first (only) speak parks
+        let started = inner.started.clone();
+        let finished = inner.finished.clone();
+        let mut voice = BargeInVoice::new(inner, signal);
+
+        // Drive the parking speak on its own task so this test can observe it park
+        // (started, not finished) and then trip the barge-in.
+        let speak = tokio::spawn(async move {
+            voice.speak("a long sentence Ocean is saying").await.unwrap();
+        });
+
+        // Let the speak reach its park point. `started` is bumped synchronously at
+        // the top of `speak`, before the await, so once it reads 1 the speak is
+        // parked. Yield until then (bounded by the outer #[tokio::test] watchdog).
+        while started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 1, "speak must have started");
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "speak must not have finished yet");
+        assert!(!speak.is_finished(), "the parked speak must not have returned");
+
+        // Human starts talking → Onset → canceller trips the signal.
+        canceller.on_activity(SpeechActivity::Onset);
+
+        // The speak now resolves via the cancel arm — bounded so a regression
+        // (no cancellation) fails fast instead of hanging the suite.
+        tokio::time::timeout(Duration::from_secs(5), speak)
+            .await
+            .expect("barge-in must cancel the parked speak (it would otherwise hang)")
+            .expect("speak task should not panic");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            0,
+            "the inner speak must have been cut mid-utterance, never completing"
+        );
+    }
+
+    #[tokio::test]
+    async fn barge_in_rearms_so_next_answer_speaks() {
+        // After a barge-in cancels one utterance, a `Settled` (the human paused)
+        // rearms the signal so the *next* answer speaks normally — the cancel is
+        // per-utterance, it doesn't wedge the voice shut.
+        let (mut canceller, signal) = BargeInCanceller::new();
+        let inner = GatedVoice::new(0); // never parks — model the human having finished
+        let started = inner.started.clone();
+        let finished = inner.finished.clone();
+        let mut voice = BargeInVoice::new(inner, signal.clone());
+
+        // Onset already standing (human talking) → the (ungated) speak still races,
+        // but since the voice never parks the inner completes immediately. To
+        // exercise the rearm path, trip then settle, then speak.
+        canceller.on_activity(SpeechActivity::Onset);
+        assert!(signal.is_barged(), "Onset must trip the signal");
+        canceller.on_activity(SpeechActivity::Settled);
+        assert!(!signal.is_barged(), "Settled must rearm (clear) the signal");
+
+        voice
+            .speak("the next thing Ocean says")
+            .await
+            .expect("a rearmed voice must speak");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the next answer started");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "the next answer ran to completion after rearm"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_onset_cuts_ocean_mid_utterance_and_next_answer_speaks() {
+        // End-to-end through the streaming loop. Script: a wake final starts an
+        // answer whose `speak` parks (Ocean is talking); then an interim carrying
+        // an Onset arrives — the human barged in — and must cut that speak. Then a
+        // second wake final (after the human settles) must answer + speak normally.
+        //
+        // The driver wraps the real `BargeInCanceller`/`BargeInVoice`. The gated
+        // voice parks the first speak; the loop's concurrent pump dequeues the
+        // Onset while parked and trips the shared signal, cancelling it. A timeout
+        // guards the whole run so a missing cancellation fails fast (the parked
+        // speak would otherwise hang the call forever).
+        let during = vec![
+            // 1) Wake command → answer → speak (parks: Ocean talking).
+            final_event("hey Ocean give me the long version", 0),
+            // 2) Human barges in: leading interim of a new spurt carries Onset.
+            interim_onset_event("wait actually", 1_000),
+            // 3) Human settles that spurt (rearm), then a second wake command that
+            //    must answer + speak normally now the voice is rearmed.
+            StreamEvent {
+                update: SegmentUpdate::Final(TranscriptSegment::final_(
+                    "caller",
+                    "wait actually never mind",
+                    1_000,
+                )),
+                activity: Some(SpeechActivity::Settled),
+            },
+            final_event("hey Ocean what's next", 2_000),
+        ];
+
+        let (stt, rx, _pushes, finished_calls) = MockStreamingStt::new(during, vec![]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+
+        // The gated voice parks ONLY the first speak (so the Onset can cut it);
+        // answer #2 never parks, so it speaks to completion. Counter-based, so no
+        // driver/voice race. Wrapped in BargeInVoice + a BargeInCanceller sharing
+        // one signal — the real OCEAN-243 wiring.
+        let gated = GatedVoice::new(1);
+        let started = gated.started.clone();
+        let finished = gated.finished.clone();
+        let (canceller, signal) = BargeInCanceller::new();
+        let voice = BargeInVoice::new(gated, signal);
+        let mut out = CapturingSink::default();
+
+        let run = run_call_session_streaming(
+            // Near-zero echo-cooldown so the SECOND wake answer isn't suppressed as
+            // Ocean's own echo on this compressed fake-clock timeline (the cooldown
+            // itself is exercised elsewhere; here we want both answers to run).
+            session_cooldown(false, 0),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("Here is the long version you asked for.", seen.clone()),
+            voice,
+            &mut out,
+            canceller,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        );
+
+        // Whole call bounded: a broken barge-in would leave answer #1 parked
+        // forever, so a hang *is* the failure signal — surface it as a timeout.
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("barge-in must cut the parked speak so the call can finish (else it hangs)");
+
+        // The call bracketed cleanly despite the mid-utterance cancellation.
+        let types = ev_types(&out);
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"));
+
+        // Both wake answers ran. (A summary turn may also fire when the finals
+        // cross the every_n_segments threshold, so filter to the wake commands —
+        // the non-summary turns — and assert exactly those two, in order.)
+        let seen = seen.lock().unwrap().clone();
+        let wake_turns: Vec<String> = seen
+            .iter()
+            .filter(|p| !p.starts_with(SUMMARY_INSTRUCTION))
+            .cloned()
+            .collect();
+        // (The wake matcher normalizes the stripped command — e.g. punctuation —
+        // so assert on the normalized forms it actually produces.)
+        assert_eq!(
+            wake_turns,
+            vec!["give me the long version".to_string(), "what s next".to_string()],
+            "both wake commands drove a turn, in order; got {seen:?}"
+        );
+
+        // Two speaks STARTED (one per answer), but the first was CUT — only the
+        // second ran to completion. started=2, finished=1 is the load-bearing
+        // proof that barge-in cancelled the first utterance mid-stream.
+        assert_eq!(started.load(Ordering::SeqCst), 2, "both answers began speaking");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "exactly one speak completed — the first was cut by barge-in, the second spoke"
+        );
+
+        // Both answers still emitted CallAgentSpoke (the rail shows what Ocean said
+        // even when the audio leg was cut), and the call closed.
+        let spoke_count = out
+            .events
+            .iter()
+            .filter(|e| matches!(e, OceanEvent::CallAgentSpoke { .. }))
+            .count();
+        assert_eq!(spoke_count, 2, "each answer emits CallAgentSpoke; got {types:?}");
+        assert_eq!(finished_calls.load(Ordering::SeqCst), 1, "finish() runs once on source end");
+    }
+
+    #[tokio::test]
+    async fn streaming_no_onset_lets_ocean_finish_speaking() {
+        // Control: with NO barge-in, a `BargeInVoice` answer speaks to completion —
+        // the cancel path must not fire spuriously. A normal (ungated) gated voice
+        // completes; finished==started==1.
+        let during = vec![final_event("hey Ocean summarize that", 0)];
+        let (stt, rx, _p, _f) = MockStreamingStt::new(during, vec![]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+
+        let gated = GatedVoice::new(0); // never parks: a quick utterance
+        let started = gated.started.clone();
+        let finished = gated.finished.clone();
+        let (canceller, signal) = BargeInCanceller::new();
+        let voice = BargeInVoice::new(gated, signal);
+        let mut out = CapturingSink::default();
+
+        run_call_session_streaming(
+            session(false),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("Here is the summary.", seen.clone()),
+            voice,
+            &mut out,
+            canceller,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        assert!(types.contains(&"spoke"), "Ocean must speak when not barged; got {types:?}");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the answer spoke once");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "with no barge-in the speak must run to completion (no spurious cancel)"
+        );
     }
 }
