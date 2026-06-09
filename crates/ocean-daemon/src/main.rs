@@ -102,6 +102,14 @@ struct AppState {
     /// even with the correct token. Decide ≠ execute: this only *executes*. See
     /// [`RevokerHandle`].
     revoker: RevokerHandle,
+    /// Open quorum-of-recall tallies, keyed by the firekeeper `title_id` under
+    /// recall (OCEAN-302). Each [`ocean_longhouse::RecallVote`] counts *distinct*
+    /// credentialed no-confidence votes; when one carries, the daemon presents its
+    /// own [`AppState::revoker`] key and pulls the title. A single forged vote is
+    /// one credential and never carries — the recall is unforgeable. Held behind a
+    /// std `Mutex` like the other longhouse stores (the guard is always dropped
+    /// before any `await`). See [`RecallRegistryHandle`].
+    recalls: RecallRegistryHandle,
     /// Daemon-wide count of call-transcript writes ultimately DROPPED after the
     /// bounded persistence retry (OCEAN-255). Shared (by clone of the `Arc`) into
     /// every per-call [`BusSink`] via [`BusSink::with_persistence_counter`], and
@@ -245,6 +253,12 @@ type TitleRegistryHandle = Arc<Mutex<ocean_longhouse::SqliteTitleRegistry>>;
 /// `Arc` (no `Mutex`: `Revoker` is immutable — it mutates the registry it is
 /// handed, under that registry's own lock).
 type RevokerHandle = Arc<ocean_longhouse::Revoker>;
+/// Open quorum-of-recall tallies keyed by the firekeeper `title_id` under recall
+/// (OCEAN-302). Each value is the pure [`ocean_longhouse::RecallVote`] counting
+/// distinct credentialed no-confidence votes. Held behind a std `Mutex` like the
+/// other longhouse stores: every access is a quick synchronous read/insert and
+/// the guard is dropped before any `await`, so it never blocks the scheduler.
+type RecallRegistryHandle = Arc<Mutex<HashMap<Uuid, ocean_longhouse::RecallVote>>>;
 
 type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
 type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
@@ -1221,6 +1235,7 @@ async fn main() -> anyhow::Result<()> {
         rooms: Arc::new(Mutex::new(room_store)),
         titles: Arc::new(Mutex::new(title_registry)),
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
+        recalls: Arc::new(Mutex::new(HashMap::new())),
         persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         room_canvas: Arc::new(Mutex::new(HashMap::new())),
@@ -1574,6 +1589,8 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/longhouse/claim",
             "POST /v1/longhouse/board",
             "POST /v1/longhouse/revoke",
+            "POST /v1/longhouse/recall",
+            "POST /v1/longhouse/breach",
             "POST /v1/calls/demo",
             "POST /v1/calls/place",
             "POST /v1/calls/webhook"
@@ -2296,6 +2313,12 @@ fn longhouse_routes() -> Router<AppState> {
         // The Revoker's execute side: the daemon presents its own server-minted
         // key to pull a title (decide≠execute, unforgeable — #246).
         .route("/v1/longhouse/revoke", post(longhouse_revoke))
+        // OCEAN-302: automated Revoker triggers. `recall` tallies distinct
+        // credentialed no-confidence votes and pulls the title on a carried quorum
+        // (unforgeable: a lone vote is one credential); `breach` accrues graduated
+        // strikes via `warn` and escalates to a hard `revoke` at the threshold.
+        .route("/v1/longhouse/recall", post(longhouse_recall))
+        .route("/v1/longhouse/breach", post(longhouse_breach))
 }
 
 /// Emit a scripted-but-real Longhouse deliberation onto the agent event bus so
@@ -4755,6 +4778,315 @@ async fn longhouse_revoke(
         Err(ocean_longhouse::RevokeError::Storage(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "ok": false, "error": format!("revoke storage error: {e}") })),
+        ),
+    }
+}
+
+// ---- OCEAN-302: automated Revoker triggers (quorum-of-recall + policy-breach) -
+//
+// The operator-initiated `POST /v1/longhouse/revoke` above is the *manual* path.
+// These two routes are the *automated decision-triggers* documented on
+// `escrow.rs`'s `RevokeAuthorization`, which were dead until now: nothing computed
+// the condition that drives the graduated `warn`/`revoke`. Both still go through
+// the daemon's single `Revoker` (which alone holds the server-minted `RevokerKey`,
+// held on `AppState` and never on the wire), so the unforgeable-revocation
+// property is preserved — a caller who merely names a title cannot depose a
+// firekeeper.
+//
+//   * **recall**: a council member casts a no-confidence vote against a seated
+//     firekeeper. The daemon counts *distinct credentialed* votes in a pure
+//     `RecallVote`; only when the tally CARRIES (≥ threshold distinct voters) does
+//     it present its key and pull the title. A single forged vote is one
+//     credential and never carries — recall is unforgeable.
+//   * **breach**: a *detected* policy breach (a firekeeper acting outside its
+//     bound decision; a claim that fails verification) accrues a graduated strike
+//     via `warn`; the daemon escalates to a hard `revoke` once the strike count
+//     reaches the threshold — the existing graduated model, now actually driven.
+
+/// Run a closure with the locked recall registry, recovering a poisoned lock the
+/// same way the other longhouse handlers do. Synchronous: the guard drops before
+/// this returns, so no `await` is held across it.
+fn with_recalls<T>(
+    state: &AppState,
+    f: impl FnOnce(&mut HashMap<Uuid, ocean_longhouse::RecallVote>) -> T,
+) -> T {
+    let mut guard = match state.recalls.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut guard)
+}
+
+/// The strike count at which the daemon escalates a graduated policy-breach to a
+/// hard recall. Three strikes is the documented graduated default ("warn twice,
+/// pull on the third"); a true zero-tolerance breach uses `revoke` directly.
+const POLICY_BREACH_STRIKE_THRESHOLD: u8 = 3;
+
+/// Request body for `POST /v1/longhouse/recall`.
+#[derive(Debug, serde::Deserialize)]
+struct LonghouseRecallRequest {
+    /// The topic whose seated firekeeper is under recall.
+    topic_id: String,
+    /// The firekeeper (public agent id) the council moves no confidence in. The
+    /// daemon resolves this + `topic_id` to the live firekeeper title to pull.
+    firekeeper_id: String,
+    /// The council member casting this no-confidence vote (public agent id). One
+    /// credential per voter, latest wins: the same voter casting twice counts
+    /// once, so a lone caller cannot manufacture a recall.
+    voter_id: String,
+    /// Distinct credentialed votes required to carry the recall. Recorded when the
+    /// recall is FIRST opened for a title and immutable thereafter — a later voter
+    /// cannot lower the bar to force a premature carry. Absent/zero ⇒ clamped to a
+    /// safe minimum of 1 by the engine (an empty tally can never carry).
+    #[serde(default)]
+    threshold: Option<usize>,
+}
+
+/// `POST /v1/longhouse/recall` — cast a no-confidence vote in a seated firekeeper
+/// (OCEAN-302, quorum-of-recall). The daemon tallies *distinct credentialed*
+/// votes per title in a pure `RecallVote`; when the tally carries (≥ threshold
+/// distinct voters) the daemon presents its own `RevokerKey` and hard-pulls the
+/// title via the same `Revoker` the manual route uses. A revoked title then fails
+/// `claim_outcome` even with the correct token (#246/#272).
+///
+/// Unforgeability: a single voter is one credential no matter how often it casts,
+/// so a lone forged vote never carries; the threshold is fixed when the recall is
+/// opened and cannot be lowered by a later voter; and the actual pull is still
+/// key-gated by the Revoker, so even a carried recall cannot deauthorize a
+/// firekeeper without the daemon's key.
+///
+/// Status: 200 with `{ carried: false, votes, threshold }` while the recall is
+/// still pending; 200 with `{ carried: true, revocation }` when it carries and
+/// the title is pulled; 404 if no live firekeeper title exists for
+/// `(topic_id, firekeeper_id)`; 400 on a malformed UUID.
+async fn longhouse_recall(
+    State(state): State<AppState>,
+    Json(req): Json<LonghouseRecallRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let parse = |label: &str, raw: &str| {
+        Uuid::parse_str(raw.trim()).map_err(|_| format!("`{label}` is not a valid UUID: {raw:?}"))
+    };
+    let (topic_id, firekeeper_id, voter_id) = match (
+        parse("topic_id", &req.topic_id),
+        parse("firekeeper_id", &req.firekeeper_id),
+        parse("voter_id", &req.voter_id),
+    ) {
+        (Ok(t), Ok(f), Ok(v)) => (t, f, v),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    // Resolve the firekeeper's LIVE title from public coordinates. No live title
+    // (never seated, or already revoked/released) ⇒ nothing to recall. We do this
+    // first so a recall against a non-existent/closed title is a clean 404 rather
+    // than opening an orphan tally.
+    let title = match with_titles(&state, |reg| {
+        reg.find_live(topic_id, firekeeper_id, AgentRole::Firekeeper)
+    }) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "no live firekeeper title for topic '{topic_id}' held by '{firekeeper_id}'"
+                    ),
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": format!("title lookup failed: {e}") })),
+            );
+        }
+    };
+
+    // Cast the vote into the per-title tally (creating it on the first vote with
+    // the threshold fixed there). The threshold on later requests is ignored — it
+    // cannot be lowered to forge a quick carry.
+    let threshold = req.threshold.unwrap_or(0); // RecallVote clamps 0 → 1
+    let outcome = with_recalls(&state, |recalls| {
+        let recall = recalls
+            .entry(title.title_id)
+            .or_insert_with(|| ocean_longhouse::RecallVote::new(title.title_id, threshold));
+        recall.cast(voter_id)
+    });
+
+    // Pending → report the running count. Not carried: the title is untouched.
+    if let ocean_longhouse::RecallOutcome::Pending { votes, threshold } = outcome {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "carried": false,
+                "title_id": title.title_id,
+                "votes": votes,
+                "threshold": threshold,
+            })),
+        );
+    }
+
+    // Carried → the daemon (holding its key) executes the deposition. The pull is
+    // still key-gated by the Revoker, so this is the only thing that can revoke,
+    // and only on a genuinely-carried tally.
+    let revoker = state.revoker.clone();
+    let key = revoker.key();
+    let now = ocean_protocol::now_ms();
+    let result = with_titles(&state, |reg| {
+        ocean_longhouse::recall_to_revocation(&revoker, reg, Some(key.secret()), &outcome, now)
+    });
+
+    match result {
+        Ok(revocation) => {
+            // Drop the now-spent tally so a re-opened recall on a fresh title is
+            // not shadowed by a carried one.
+            with_recalls(&state, |recalls| recalls.remove(&title.title_id));
+            tracing::info!(
+                topic = %topic_id,
+                title = %revocation.title_id,
+                firekeeper = %revocation.agent_id,
+                "quorum-of-recall carried: firekeeper title revoked (OCEAN-302)"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "carried": true,
+                    "title_id": revocation.title_id,
+                    "topic_id": revocation.topic_id,
+                    "agent_id": revocation.agent_id,
+                    "reason": revocation.reason,
+                })),
+            )
+        }
+        // The tally carried but the title was already pulled (a race with another
+        // trigger). Treat as a benign already-revoked outcome.
+        Err(ocean_longhouse::TriggerRefused::Revoke(ocean_longhouse::RevokeError::NotLive(id))) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": format!("title '{id}' is already revoked/released"),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": format!("recall execution failed: {e}") })),
+        ),
+    }
+}
+
+/// Request body for `POST /v1/longhouse/breach`.
+#[derive(Debug, serde::Deserialize)]
+struct LonghouseBreachRequest {
+    /// The seated title that breached policy (the firekeeper's persisted title id).
+    title_id: String,
+    /// Short human-facing description of the breach (recorded on the audit row,
+    /// e.g. "acted outside bound decision", "claim failed verification N times").
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// `POST /v1/longhouse/breach` — report a detected policy breach against a seated
+/// title (OCEAN-302, policy-breach trigger). Each report accrues a graduated
+/// strike via the Revoker's `warn`; the daemon escalates to a hard `revoke` once
+/// the strike count reaches [`POLICY_BREACH_STRIKE_THRESHOLD`]. This is the
+/// existing graduated model — `warn` increments, `revoke` hard-pulls — now driven
+/// by a real trigger.
+///
+/// Unforgeability: the strike accrual and the pull both go through the daemon's
+/// `Revoker` (key held on `AppState`, never on the wire), so a forged breach
+/// report cannot grind a firekeeper toward recall. A revoked title then fails
+/// `claim_outcome` even with the correct token (#246/#272).
+///
+/// Status: 200 with `{ revoked: false, strikes, threshold }` while below
+/// threshold; 200 with `{ revoked: true, revocation }` when the breach tips the
+/// gradient and the title is pulled; 404 if the title is unknown; 409 if the
+/// title was already revoked/released; 400 on a malformed UUID.
+async fn longhouse_breach(
+    State(state): State<AppState>,
+    Json(req): Json<LonghouseBreachRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let title_id = match Uuid::parse_str(req.title_id.trim()) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("`title_id` is not a valid UUID: {:?}", req.title_id),
+                })),
+            );
+        }
+    };
+    let detail = req
+        .detail
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("policy breach")
+        .to_string();
+
+    let revoker = state.revoker.clone();
+    let key = revoker.key();
+    let now = ocean_protocol::now_ms();
+    let ledger = ocean_longhouse::PolicyBreachLedger::new(POLICY_BREACH_STRIKE_THRESHOLD);
+    let result = with_titles(&state, |reg| {
+        ledger.report(&revoker, reg, Some(key.secret()), title_id, &detail, now)
+    });
+
+    match result {
+        Ok(ocean_longhouse::BreachAction::Warned { strikes, threshold }) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "revoked": false,
+                "title_id": title_id,
+                "strikes": strikes,
+                "threshold": threshold,
+            })),
+        ),
+        Ok(ocean_longhouse::BreachAction::Revoked(revocation)) => {
+            tracing::info!(
+                title = %revocation.title_id,
+                firekeeper = %revocation.agent_id,
+                "policy-breach threshold reached: firekeeper title revoked (OCEAN-302)"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "revoked": true,
+                    "title_id": revocation.title_id,
+                    "topic_id": revocation.topic_id,
+                    "agent_id": revocation.agent_id,
+                    "reason": revocation.reason,
+                })),
+            )
+        }
+        Err(ocean_longhouse::RevokeError::UnknownTitle(id)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("no title with id '{id}'") })),
+        ),
+        Err(ocean_longhouse::RevokeError::NotLive(id)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": format!("title '{id}' is not live (already revoked/released)"),
+            })),
+        ),
+        Err(ocean_longhouse::RevokeError::Unauthorized) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "breach refused: missing Revoker capability" })),
+        ),
+        Err(ocean_longhouse::RevokeError::Storage(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": format!("breach storage error: {e}") })),
         ),
     }
 }
@@ -11954,6 +12286,7 @@ mod tests {
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
+            recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
@@ -12815,6 +13148,7 @@ mod tests {
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
+            recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
@@ -13313,6 +13647,7 @@ mod tests {
             rooms: Arc::new(Mutex::new(store)),
             titles: Arc::new(Mutex::new(titles)),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
+            recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
