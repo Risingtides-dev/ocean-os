@@ -87,6 +87,41 @@ struct AppState {
     /// problem that's silently losing transcripts becomes observable instead of
     /// only living in the logs.
     persist_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Fulfilled `slack_canvas` awareness results the `ocean-agents` Slack bridge
+    /// has POSTed back (OCEAN-262). Keyed by `(session_id, canvas key)` so a
+    /// fulfilled `read`/`list`/`create` is queryable per session via
+    /// `GET /v1/agent/canvas/fulfill`. This is the receiving end of the bridge's
+    /// `POST /v1/agent/canvas/fulfill {session_id, op, result}`: the daemon emits
+    /// `AgentTurnEvent::SlackCanvas` with the honest *pending* result (OCEAN-235),
+    /// the bridge round-trips the op to the real Slack Canvas API, and stamps the
+    /// live content back here. Held behind a std `Mutex` (the guard is always
+    /// dropped before any `await`).
+    canvas_fulfillments: CanvasFulfillmentStore,
+}
+
+/// Per-`(session, canvas)` store of bridge-fulfilled `slack_canvas` results
+/// (OCEAN-262). The value is the bridge's POSTed `result` body verbatim — a
+/// superset of the SDK [`ocean_agent_sdk::slack_canvas::SlackCanvasResult`]
+/// (it adds `bridged: true`, an optional `error`, and a raw passthrough) — so we
+/// preserve exactly what the bridge sent for the `GET` query, and separately
+/// derive a typed `SlackCanvasResult` for the SSE re-emit.
+type CanvasFulfillmentStore = Arc<Mutex<HashMap<CanvasFulfillmentKey, CanvasFulfillment>>>;
+
+/// Key into [`CanvasFulfillmentStore`]: a fulfilled result is addressable by the
+/// session it belongs to plus a stable per-canvas key. For `read`/`update`/
+/// `append` the canvas key is the real Slack `canvas_id`; for `list` (which has
+/// no single canvas) and `create` (no id yet) it's a synthetic key derived from
+/// the op (see [`canvas_fulfillment_key_for_op`]).
+type CanvasFulfillmentKey = (AgentSessionId, String);
+
+/// One stored bridge fulfillment (OCEAN-262): the raw `result` body the bridge
+/// POSTed plus the wall-clock time we received it (for observability/GC later).
+#[derive(Clone)]
+struct CanvasFulfillment {
+    /// The bridge's `result` JSON verbatim (SDK-result-shaped superset).
+    result: Value,
+    /// When the daemon received this fulfillment.
+    received_at: DateTime<Utc>,
 }
 
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
@@ -696,6 +731,7 @@ async fn main() -> anyhow::Result<()> {
         longhouse,
         rooms: Arc::new(Mutex::new(room_store)),
         persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Background GC: the request/permission registries are otherwise unbounded
@@ -764,6 +800,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agent/turns", post(agent_turn))
         .route("/v1/agent/voice", post(agent_voice))
         .route("/v1/agent/events", get(agent_events))
+        // OCEAN-262: the Slack canvas bridge (`ocean-agents`) POSTs a fulfilled
+        // awareness result here after round-tripping a `read`/`list`/`create` to
+        // the live Slack Canvas API; a `GET` queries the stored fulfillment per
+        // `(session_id, canvas_id)`. Closes the `slack_canvas` loop opened by the
+        // OCEAN-235 SSE relay.
+        .route(
+            "/v1/agent/canvas/fulfill",
+            get(canvas_fulfillment_get).post(canvas_fulfillment_post),
+        )
         .route(
             "/v1/agent/sessions",
             get(agent_sessions).post(agent_sessions_create),
@@ -967,6 +1012,8 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/agent/turns",
             "POST /v1/agent/voice",
             "GET /v1/agent/events",
+            "POST /v1/agent/canvas/fulfill",
+            "GET /v1/agent/canvas/fulfill",
             "POST /v1/agent/sessions",
             "GET /v1/agent/sessions",
             "GET /v1/agent/sessions/{id}",
@@ -6396,6 +6443,316 @@ async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_lo
     }
 }
 
+// ---------------------------------------------------------------------------
+// OCEAN-262: slack_canvas bridge fulfillment seam
+//
+// Closes the loop opened by the OCEAN-235 SSE relay. The agent's `slack_canvas`
+// tool emits a `read`/`list`/`create`; the daemon relays it as
+// `AgentTurnEvent::SlackCanvas` carrying the honest *pending* result (no content,
+// `fetch_status: pending_bridge`). The `ocean-agents` Slack bridge consumes that
+// event, round-trips the op to the real Slack Canvas API, and POSTs the fulfilled
+// result back here as `{session_id, op, result}`.
+//
+// DELIVERY SEMANTICS (why this shape, given the runtime can't reach AppState):
+// the `slack_canvas` runtime tool is a stateless unit struct in the separate
+// `ocean-runtime` crate (built via `default_tools()`); it holds no handle to this
+// daemon's `AppState`, so it CANNOT itself check a fulfillment store on a later
+// `read`. Threading daemon state into the runtime crate would invert the layering
+// (runtime is a dependency of the daemon, not vice-versa). So fulfillment is
+// delivered the two ways that don't require that inversion:
+//
+//   1. STORE + QUERY — the result is stored in `AppState.canvas_fulfillments`
+//      keyed by `(session_id, canvas key)` and is queryable via
+//      `GET /v1/agent/canvas/fulfill?session_id=&canvas_id=`. (Last-write-wins per
+//      key — a fresh `read` of the same canvas overwrites a stale fulfillment.)
+//
+//   2. SSE RE-EMIT — the daemon re-emits `AgentTurnEvent::SlackCanvas` for the
+//      same session carrying a *fulfilled* `SlackCanvasResult` (content stamped in,
+//      `fetch_status: fetched`, `bridged: true`). This is symmetric with the
+//      pending event the loop opened with: it goes back out on the very channel the
+//      agent's clients already watch, so the canvas resolves pending → fulfilled in
+//      real time without the runtime tool needing daemon state.
+// ---------------------------------------------------------------------------
+
+/// The store key for a fulfilled `slack_canvas` op (OCEAN-262). `read`/`update`/
+/// `append` key on the real Slack `canvas_id`; `list` has no single canvas so it
+/// keys on `list:{channel_id}`; `create` has no id yet so it keys on
+/// `create:{title}` (or `create:` when untitled). Stable across the pending event
+/// and the fulfillment POST as long as the op is the same.
+fn canvas_fulfillment_key_for_op(op: &ocean_agent_sdk::slack_canvas::SlackCanvasOp) -> String {
+    use ocean_agent_sdk::slack_canvas::SlackCanvasOp;
+    match op {
+        SlackCanvasOp::Read { canvas_id } => canvas_id.as_str().to_string(),
+        SlackCanvasOp::Update { canvas_id, .. } | SlackCanvasOp::Append { canvas_id, .. } => {
+            canvas_id.as_str().to_string()
+        }
+        SlackCanvasOp::List { channel_id } => format!("list:{channel_id}"),
+        SlackCanvasOp::Create { title, .. } => {
+            format!("create:{}", title.as_deref().unwrap_or(""))
+        }
+    }
+}
+
+/// Build the typed [`SlackCanvasResult`](ocean_agent_sdk::slack_canvas::SlackCanvasResult)
+/// the daemon re-emits onto the SSE bus from the bridge's POSTed `result` body
+/// (OCEAN-262). The bridge result is a superset of the SDK type (it adds
+/// `bridged`, `error`, `raw` and omits `fetch_status`), so:
+///
+/// - a `read` with `contents` present → [`SlackCanvasResult::fulfilled_read`]
+///   (content stamped, `fetch_status: fetched`);
+/// - a `list` with `canvases` present → [`SlackCanvasResult::fulfilled_list`];
+/// - anything else (mutating op, or an awareness op the bridge reported `ok:false`
+///   for) → a best-effort lenient deserialize, falling back to the matching
+///   pending result so the re-emit is always a well-formed `SlackCanvasResult`.
+fn fulfilled_result_from_bridge(
+    op: &ocean_agent_sdk::slack_canvas::SlackCanvasOp,
+    result: &Value,
+) -> ocean_agent_sdk::slack_canvas::SlackCanvasResult {
+    use ocean_agent_sdk::slack_canvas::{SlackCanvasOp, SlackCanvasResult, SlackCanvasSummary};
+
+    let bridge_ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match op {
+        SlackCanvasOp::Read { canvas_id } => {
+            match result.get("contents").and_then(|v| v.as_str()) {
+                Some(contents) if bridge_ok => SlackCanvasResult::fulfilled_read(
+                    canvas_id.clone(),
+                    contents,
+                    result.get("raw").cloned().unwrap_or(Value::Null),
+                ),
+                // Bridge couldn't fetch (ok:false) or sent no contents: stay honest —
+                // re-emit the pending shape rather than fabricate empty content.
+                _ => SlackCanvasResult::pending_read(canvas_id.clone()),
+            }
+        }
+        SlackCanvasOp::List { .. } => {
+            match result.get("canvases") {
+                Some(canvases) if bridge_ok => {
+                    let summaries: Vec<SlackCanvasSummary> =
+                        serde_json::from_value(canvases.clone()).unwrap_or_default();
+                    SlackCanvasResult::fulfilled_list(
+                        summaries,
+                        result.get("raw").cloned().unwrap_or(Value::Null),
+                    )
+                }
+                _ => SlackCanvasResult::pending_list(),
+            }
+        }
+        // Mutating ops: the bridge's effect is already live in Slack. Re-emit a
+        // `bridged: true` result, carrying the real `canvas_id` the bridge minted
+        // for `create` (the agent's create had none until now).
+        SlackCanvasOp::Create { .. }
+        | SlackCanvasOp::Update { .. }
+        | SlackCanvasOp::Append { .. } => {
+            let canvas_id = result
+                .get("canvas_id")
+                .and_then(|v| v.as_str())
+                .map(ocean_agent_sdk::slack_canvas::SlackCanvasId::new);
+            SlackCanvasResult {
+                ok: bridge_ok,
+                op: op.op_name().to_string(),
+                canvas_id,
+                contents: None,
+                canvases: None,
+                fetch_status: ocean_agent_sdk::slack_canvas::CanvasFetchStatus::NotApplicable,
+                bridged: true,
+                metadata: result.get("raw").cloned().unwrap_or(Value::Null),
+            }
+        }
+    }
+}
+
+/// `POST /v1/agent/canvas/fulfill` — receive a bridge-fulfilled `slack_canvas`
+/// result (OCEAN-262).
+///
+/// Body (sent by `ocean-agents` `canvas_consumer.deliver_fulfillment`):
+/// ```json
+/// {
+///   "session_id": "uuid-of-session",
+///   "op": { "op": "read", "canvas_id": "F0123ABCD" },
+///   "result": { "ok": true, "op": "read", "canvas_id": "F0123ABCD",
+///               "contents": "# live body", "bridged": true, "raw": { ... } }
+/// }
+/// ```
+///
+/// Stores the raw `result` keyed by `(session_id, canvas key)` for the `GET`
+/// query, and re-emits `AgentTurnEvent::SlackCanvas` with a typed *fulfilled*
+/// result so the originating session's SSE subscribers see the canvas resolve.
+/// `op` is validated against the SDK [`SlackCanvasOp`] vocabulary; an unknown /
+/// malformed op or a missing `session_id`/`result` is a `400`.
+async fn canvas_fulfillment_post(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    use ocean_agent_sdk::slack_canvas::SlackCanvasOp;
+
+    // --- session_id: present and parseable ---
+    let session_raw = match body.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing or empty 'session_id'" })),
+            );
+        }
+    };
+    let session_id: AgentSessionId = match serde_json::from_value(json!(session_raw)) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid 'session_id': {e}") })),
+            );
+        }
+    };
+
+    // --- op: present and a valid SlackCanvasOp ---
+    let op_value = match body.get("op") {
+        Some(v) => v.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'op'" })),
+            );
+        }
+    };
+    let op: SlackCanvasOp = match serde_json::from_value(op_value) {
+        Ok(op) => op,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid 'op': {e}") })),
+            );
+        }
+    };
+
+    // --- result: present (object) ---
+    let result = match body.get("result") {
+        Some(v) if v.is_object() => v.clone(),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "'result' must be an object" })),
+            );
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'result'" })),
+            );
+        }
+    };
+
+    let canvas_key = canvas_fulfillment_key_for_op(&op);
+
+    // 1. STORE (last-write-wins per (session, canvas key)).
+    {
+        let mut store = state
+            .canvas_fulfillments
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        store.insert(
+            (session_id, canvas_key.clone()),
+            CanvasFulfillment {
+                result: result.clone(),
+                received_at: Utc::now(),
+            },
+        );
+    }
+
+    // 2. SSE RE-EMIT — fulfilled result back to the originating session.
+    let fulfilled = fulfilled_result_from_bridge(&op, &result);
+    state.agent_events.emit(AgentTurnEvent::SlackCanvas {
+        session_id,
+        // The fulfillment is a standalone relay, not part of a live turn; mint a
+        // fresh turn id (the SSE filter routes on `session_id`, not `turn_id`).
+        turn_id: AgentTurnId::new_v4(),
+        op,
+        result: fulfilled,
+    });
+
+    tracing::info!(
+        session = %session_raw,
+        canvas_key = %canvas_key,
+        "stored + re-emitted slack_canvas bridge fulfillment"
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "stored": true,
+            "session_id": session_raw,
+            "canvas_key": canvas_key,
+        })),
+    )
+}
+
+/// Query string for `GET /v1/agent/canvas/fulfill` (OCEAN-262).
+#[derive(Debug, serde::Deserialize)]
+struct CanvasFulfillmentQuery {
+    /// The session the fulfillment belongs to (required).
+    session_id: AgentSessionId,
+    /// The canvas key to look up. For `read`/`update`/`append` this is the Slack
+    /// `canvas_id`; for `list`/`create` use the synthetic key
+    /// (`list:{channel_id}` / `create:{title}`). Either `canvas_id` or `key` is
+    /// accepted (alias) — `canvas_id` is the common case the agent knows.
+    #[serde(default, alias = "key")]
+    canvas_id: Option<String>,
+}
+
+/// `GET /v1/agent/canvas/fulfill?session_id=&canvas_id=` — read back a stored
+/// bridge fulfillment (OCEAN-262).
+///
+/// Returns the bridge's `result` body verbatim when a fulfillment is stored for
+/// `(session_id, canvas_id)`, or `404` when none has arrived yet (the awareness
+/// op is still `pending_bridge`). This is the pull-side companion to the SSE
+/// re-emit — useful for a client/agent-adjacent poll or for tests.
+async fn canvas_fulfillment_get(
+    State(state): State<AppState>,
+    Query(q): Query<CanvasFulfillmentQuery>,
+) -> (StatusCode, Json<Value>) {
+    let canvas_id = match q.canvas_id {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'canvas_id' (or 'key') query param" })),
+            );
+        }
+    };
+
+    let found = {
+        let store = state
+            .canvas_fulfillments
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        store.get(&(q.session_id, canvas_id.clone())).cloned()
+    };
+
+    match found {
+        Some(f) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "fulfilled": true,
+                "canvas_id": canvas_id,
+                "received_at": f.received_at.to_rfc3339(),
+                "result": f.result,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": true,
+                "fulfilled": false,
+                "canvas_id": canvas_id,
+                "reason": "no bridge fulfillment stored for this (session, canvas) yet",
+            })),
+        ),
+    }
+}
+
 /// Receive a user interaction event for a rendered component and deliver it
 /// to the waiting `component_wait` tool call.
 ///
@@ -7459,6 +7816,276 @@ mod tests {
             should_emit_agent_event(None, true, &ev),
             "the ?all=1 firehose receives session-bearing slack_canvas events"
         );
+    }
+
+    // ---- OCEAN-262: slack_canvas bridge fulfillment seam -------------------
+
+    /// The store key is the real `canvas_id` for the canvas-targeted ops and a
+    /// stable synthetic key for `list`/`create`, so a fulfillment is addressable
+    /// for every op shape.
+    #[test]
+    fn canvas_fulfillment_key_covers_every_op() {
+        use ocean_agent_sdk::slack_canvas::{
+            CanvasEditMode, SlackCanvasId, SlackCanvasOp, SlackChannelId,
+        };
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Read {
+                canvas_id: SlackCanvasId::new("F0123ABCD"),
+            }),
+            "F0123ABCD"
+        );
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Update {
+                canvas_id: SlackCanvasId::new("F1"),
+                markdown: "x".into(),
+                mode: CanvasEditMode::Replace,
+            }),
+            "F1"
+        );
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Append {
+                canvas_id: SlackCanvasId::new("F2"),
+                markdown: "x".into(),
+            }),
+            "F2"
+        );
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::List {
+                channel_id: SlackChannelId::new("C9"),
+            }),
+            "list:C9"
+        );
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Create {
+                title: Some("Plan".into()),
+                markdown: None,
+                channel_id: None,
+            }),
+            "create:Plan"
+        );
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Create {
+                title: None,
+                markdown: None,
+                channel_id: None,
+            }),
+            "create:"
+        );
+    }
+
+    /// A `read` the bridge fetched (ok + contents) maps to a *fulfilled* result:
+    /// content stamped in, `fetch_status: fetched`, `bridged: true` — the marker
+    /// the agent reads to know the awareness op resolved.
+    #[test]
+    fn fulfilled_from_bridge_read_with_contents_is_fetched() {
+        use ocean_agent_sdk::slack_canvas::{CanvasFetchStatus, SlackCanvasId, SlackCanvasOp};
+        let op = SlackCanvasOp::Read {
+            canvas_id: SlackCanvasId::new("F1"),
+        };
+        let bridge_result = json!({
+            "ok": true, "op": "read", "canvas_id": "F1",
+            "contents": "# Live body\n- fetched from Slack",
+            "bridged": true, "raw": { "slack_file_id": "F1" }
+        });
+        let res = fulfilled_result_from_bridge(&op, &bridge_result);
+        assert_eq!(res.fetch_status, CanvasFetchStatus::Fetched);
+        assert!(res.bridged);
+        assert_eq!(
+            res.contents.as_deref(),
+            Some("# Live body\n- fetched from Slack")
+        );
+        assert_eq!(res.metadata["slack_file_id"], "F1");
+    }
+
+    /// A `read` the bridge could NOT fetch (`ok:false`, no contents) must stay
+    /// honest: the re-emit is the pending shape, never a fabricated empty body.
+    #[test]
+    fn fulfilled_from_bridge_failed_read_stays_pending() {
+        use ocean_agent_sdk::slack_canvas::{CanvasFetchStatus, SlackCanvasId, SlackCanvasOp};
+        let op = SlackCanvasOp::Read {
+            canvas_id: SlackCanvasId::new("F1"),
+        };
+        let bridge_result = json!({ "ok": false, "op": "read", "error": "slack 404" });
+        let res = fulfilled_result_from_bridge(&op, &bridge_result);
+        assert_eq!(res.fetch_status, CanvasFetchStatus::PendingBridge);
+        assert!(res.contents.is_none(), "a failed read must not fabricate contents");
+    }
+
+    /// A fulfilled `list` carries the resolved canvases.
+    #[test]
+    fn fulfilled_from_bridge_list_carries_canvases() {
+        use ocean_agent_sdk::slack_canvas::{CanvasFetchStatus, SlackCanvasOp, SlackChannelId};
+        let op = SlackCanvasOp::List {
+            channel_id: SlackChannelId::new("C1"),
+        };
+        let bridge_result = json!({
+            "ok": true, "op": "list",
+            "canvases": [{ "canvas_id": "F9", "title": "Plan" }],
+            "bridged": true
+        });
+        let res = fulfilled_result_from_bridge(&op, &bridge_result);
+        assert_eq!(res.fetch_status, CanvasFetchStatus::Fetched);
+        let canvases = res.canvases.expect("list fulfillment carries canvases");
+        assert_eq!(canvases.len(), 1);
+        assert_eq!(canvases[0].canvas_id.as_str(), "F9");
+    }
+
+    /// A `create` fulfillment carries the real `canvas_id` the bridge minted —
+    /// the agent's `create` had none until the bridge resolved it.
+    #[test]
+    fn fulfilled_from_bridge_create_carries_minted_id() {
+        use ocean_agent_sdk::slack_canvas::SlackCanvasOp;
+        let op = SlackCanvasOp::Create {
+            title: Some("Plan".into()),
+            markdown: None,
+            channel_id: None,
+        };
+        let bridge_result = json!({ "ok": true, "op": "create", "canvas_id": "Fnew", "bridged": true });
+        let res = fulfilled_result_from_bridge(&op, &bridge_result);
+        assert!(res.bridged);
+        assert_eq!(res.canvas_id.map(|c| c.into_inner()), Some("Fnew".to_string()));
+    }
+
+    /// END TO END: the bridge POSTs a fulfilled `read`; the daemon stores it and
+    /// the subsequent `GET` returns the REAL content (not `pending_bridge`). An
+    /// un-fulfilled canvas `GET`s 404 — the awareness op is still pending. This is
+    /// the core OCEAN-262 delivery: the fulfilled content is queryable per session.
+    #[tokio::test]
+    async fn fulfillment_post_then_get_returns_real_content() {
+        let state = permission_test_state();
+        let session = AgentSessionId::new_v4();
+
+        let body = json!({
+            "session_id": session.to_string(),
+            "op": { "op": "read", "canvas_id": "F0123ABCD" },
+            "result": {
+                "ok": true, "op": "read", "canvas_id": "F0123ABCD",
+                "contents": "# Real canvas body",
+                "bridged": true, "raw": { "revision": 7 }
+            }
+        });
+
+        let (status, resp) =
+            canvas_fulfillment_post(State(state.clone()), Json(body)).await;
+        assert_eq!(status, StatusCode::OK, "valid fulfillment must be accepted");
+        assert_eq!(resp.0["stored"], true);
+        assert_eq!(resp.0["canvas_key"], "F0123ABCD");
+
+        // GET the fulfilled canvas → real content, not pending_bridge.
+        let (gstatus, gresp) = canvas_fulfillment_get(
+            State(state.clone()),
+            Query(CanvasFulfillmentQuery {
+                session_id: session,
+                canvas_id: Some("F0123ABCD".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(gstatus, StatusCode::OK);
+        assert_eq!(gresp.0["fulfilled"], true);
+        assert_eq!(gresp.0["result"]["contents"], "# Real canvas body");
+        assert_eq!(gresp.0["result"]["bridged"], true);
+
+        // An un-fulfilled canvas in the same session is a 404 (still pending).
+        let (nstatus, nresp) = canvas_fulfillment_get(
+            State(state.clone()),
+            Query(CanvasFulfillmentQuery {
+                session_id: session,
+                canvas_id: Some("Funknown".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(nstatus, StatusCode::NOT_FOUND);
+        assert_eq!(nresp.0["fulfilled"], false);
+    }
+
+    /// A fulfillment for session A must not be visible when querying session B —
+    /// fulfillments are session-scoped like every other slack_canvas artifact.
+    #[tokio::test]
+    async fn fulfillment_is_session_scoped() {
+        let state = permission_test_state();
+        let a = AgentSessionId::new_v4();
+        let b = AgentSessionId::new_v4();
+
+        let body = json!({
+            "session_id": a.to_string(),
+            "op": { "op": "read", "canvas_id": "F1" },
+            "result": { "ok": true, "op": "read", "canvas_id": "F1", "contents": "body", "bridged": true }
+        });
+        let (status, _) = canvas_fulfillment_post(State(state.clone()), Json(body)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Same canvas id, different session => not found.
+        let (gstatus, _) = canvas_fulfillment_get(
+            State(state.clone()),
+            Query(CanvasFulfillmentQuery {
+                session_id: b,
+                canvas_id: Some("F1".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            gstatus,
+            StatusCode::NOT_FOUND,
+            "a fulfillment must not leak across sessions"
+        );
+    }
+
+    /// The fulfillment POST re-emits `AgentTurnEvent::SlackCanvas` for the
+    /// originating session carrying the FULFILLED result, so SSE subscribers see
+    /// the canvas resolve pending → fetched in real time.
+    #[tokio::test]
+    async fn fulfillment_post_reemits_fulfilled_sse_event() {
+        use ocean_agent_sdk::slack_canvas::CanvasFetchStatus;
+        let state = permission_test_state();
+        let session = AgentSessionId::new_v4();
+        // Subscribe BEFORE the POST so the live broadcast carries the re-emit.
+        let (_replay, mut rx) = state.agent_events.subscribe_with_replay(None);
+
+        let body = json!({
+            "session_id": session.to_string(),
+            "op": { "op": "read", "canvas_id": "F1" },
+            "result": { "ok": true, "op": "read", "canvas_id": "F1", "contents": "live", "bridged": true }
+        });
+        let (status, _) = canvas_fulfillment_post(State(state.clone()), Json(body)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let envelope = rx.try_recv().expect("a slack_canvas event must be emitted");
+        match envelope.event {
+            AgentTurnEvent::SlackCanvas {
+                session_id, result, ..
+            } => {
+                assert_eq!(session_id, session, "re-emit is scoped to the session");
+                assert_eq!(result.fetch_status, CanvasFetchStatus::Fetched);
+                assert!(result.bridged);
+                assert_eq!(result.contents.as_deref(), Some("live"));
+            }
+            other => panic!("expected a fulfilled SlackCanvas event, got {other:?}"),
+        }
+    }
+
+    /// Malformed fulfillments are rejected with 400 (missing session_id, missing
+    /// op, invalid op, missing/non-object result).
+    #[tokio::test]
+    async fn fulfillment_post_rejects_malformed_bodies() {
+        let state = permission_test_state();
+        let sid = AgentSessionId::new_v4().to_string();
+
+        let bad_bodies = vec![
+            json!({ "op": { "op": "read", "canvas_id": "F1" }, "result": {} }), // no session_id
+            json!({ "session_id": sid, "result": {} }),                          // no op
+            json!({ "session_id": sid, "op": { "op": "obliterate" }, "result": {} }), // bad op
+            json!({ "session_id": sid, "op": { "op": "read", "canvas_id": "F1" } }),   // no result
+            json!({ "session_id": sid, "op": { "op": "read", "canvas_id": "F1" }, "result": "nope" }), // result not object
+        ];
+        for body in bad_bodies {
+            let (status, _) =
+                canvas_fulfillment_post(State(state.clone()), Json(body.clone())).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "malformed fulfillment must be rejected: {body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9051,6 +9678,7 @@ mod tests {
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -9906,6 +10534,7 @@ mod tests {
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
