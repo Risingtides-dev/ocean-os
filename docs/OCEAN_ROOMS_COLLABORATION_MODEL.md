@@ -317,11 +317,56 @@ Promotion to main checkout requires explicit confirmation.
 
 Switching rooms must load full state, not just subscribe to future events.
 
+### Shipped: persistent-room hydration (OCEAN-232)
+
+Persistent rooms (created via `POST /v1/rooms/persistent`, keyed by `{key}`) are
+backed by the SQLite room store, so they hydrate in one read today:
+
 ```http
-GET /v1/rooms/{room_id}/snapshot
+GET /v1/rooms/persistent/{key}/snapshot
 ```
 
-Returns:
+Returns the room entity, its roster, the full transcript, and `last_seq` — the
+seq of the final transcript entry (`null` if the transcript is empty):
+
+```json
+{
+  "ok": true,
+  "room": { "id": "...", "name": "...", "participants": [...], "created_at": "...", "updated_at": "..." },
+  "participants": [...],
+  "transcript": [{ "seq": 1, "author_id": "...", "author_kind": "human", "kind": "message", "body": "...", "created_at": "..." }],
+  "last_seq": 1842
+}
+```
+
+The client then tails new entries (the transcript IS the room's event log — chat
+lines plus join/leave/system markers, each with a monotonic `seq`):
+
+```http
+GET /v1/rooms/persistent/{key}/events?after_seq=1842
+```
+
+```json
+{ "ok": true, "events": [...], "last_seq": 1850 }
+```
+
+`events` returns only entries with `seq > after_seq` (omit `after_seq` for the
+full log); `last_seq` is the final returned seq, or `null` when the tail is
+empty. Both endpoints fall back to the soft-closed audit view, so a finished
+call's frozen room stays hydratable. Two-step: snapshot first, then live tail.
+Client guards against stale loads via a requested-vs-current room check.
+
+### Planned: Track-0 projection snapshot
+
+The richer projection rooms (`pm` / `writers` / `orch_mesh` / `review`, served by
+`GET /v1/rooms/{room_id}`) are computed from live runtime state rather than the
+store. A hydration snapshot for them that also carries per-room **turns**,
+rendered **components**, and the **active_turn** is **planned — not yet
+implemented**; that data is not persisted per room yet. The intended shape:
+
+```http
+GET /v1/rooms/{room_id}/snapshot   # (planned — not yet implemented)
+```
 
 ```json
 {
@@ -335,13 +380,11 @@ Returns:
 }
 ```
 
-Client then subscribes:
-
 ```http
-GET /v1/rooms/{room_id}/events?after_seq=1842
+GET /v1/rooms/{room_id}/events?after_seq=1842   # (planned — not yet implemented)
 ```
 
-Two-step: snapshot first, then live tail.
+Until then, use the shipped persistent-room hydration above.
 
 Client guards against stale loads via requested-vs-current room check.
 

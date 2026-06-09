@@ -768,6 +768,18 @@ async fn main() -> anyhow::Result<()> {
             "/v1/rooms/persistent/{key}/transcript",
             get(room_transcript),
         )
+        // OCEAN-232: store-backed room hydration. `snapshot` is the one-read
+        // "load full state on room switch" the collaboration model calls for;
+        // `events` is its live-tail companion (`?after_seq=`). Both sit in the
+        // persistent block beside `transcript` since they read the same store.
+        .route(
+            "/v1/rooms/persistent/{key}/snapshot",
+            get(room_snapshot),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/events",
+            get(room_events),
+        )
         .route("/v1/rooms/{room_id}", get(room))
         // OCEAN-137: mint a LiveKit join token for a room. The proxy + web
         // surface already POST to this path; the daemon honors it here so
@@ -943,6 +955,8 @@ async fn root() -> Json<serde_json::Value> {
             "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
             "POST /v1/rooms/persistent/{key}/messages",
             "GET /v1/rooms/persistent/{key}/transcript",
+            "GET /v1/rooms/persistent/{key}/snapshot",
+            "GET /v1/rooms/persistent/{key}/events",
             "GET /v1/sessions",
             "GET /v1/sessions/{id}",
             "GET /v1/projects",
@@ -3545,6 +3559,110 @@ async fn room_transcript(
             StatusCode::OK,
             Json(json!({ "ok": true, "transcript": transcript })),
         ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `GET /v1/rooms/persistent/{key}/snapshot` — full room hydration in one read:
+/// the room entity (id, name, roster, timestamps, trigger policy), its complete
+/// transcript, and `last_seq` so the caller can immediately tail live updates via
+/// `GET /v1/rooms/persistent/{key}/events?after_seq=last_seq`.
+///
+/// This is the store-backed realization of the collaboration model's "Room
+/// hydration / snapshot" step (OCEAN-232): switching into a room must load full
+/// state, not just subscribe to future events. The richer Track-0 projection
+/// snapshot (per-room turns / rendered components / active_turn) stays a planned
+/// follow-up — that data isn't persisted yet — but persistent rooms carry
+/// everything hydration needs today, so we serve it rather than 404.
+///
+/// Like `room_get`/`room_transcript`, falls back to the soft-closed audit view so
+/// a finished call's frozen room (closed on `CallEnded`, OCEAN-170) stays
+/// hydratable for replay.
+async fn room_snapshot(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
+        );
+    }
+    let key = RoomKey::new(trimmed);
+    // Prefer the live room; fall back to the audit view for a soft-closed room so
+    // its frozen transcript is still hydratable. The std mutex guard is dropped
+    // inside `with_rooms`; it is never held across an `.await`.
+    let record = with_rooms(&state, |reg| match reg.get(&key) {
+        Ok(Some(rec)) => Ok(Some(rec)),
+        Ok(None) => reg.get_including_closed(&key),
+        Err(e) => Err(e),
+    });
+    match record {
+        Ok(Some(rec)) => {
+            let last_seq = rec.transcript.last().map(|m| m.seq);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "room": rec.room.clone(),
+                    "participants": rec.room.participants,
+                    "transcript": rec.transcript,
+                    "last_seq": last_seq,
+                })),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("no room with key '{key}'") })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `GET /v1/rooms/persistent/{key}/events?after_seq=N` — the live-tail half of the
+/// hydrate-then-subscribe pattern: return transcript entries with `seq > N` (omit
+/// `after_seq` for the full log). The transcript IS the room's event log — chat
+/// lines plus join/leave/system markers, each carrying a monotonic `seq` — so
+/// this is a thin alias over the same read `room_transcript` serves, shaped as
+/// `events` for the client that just snapshotted at `last_seq` and wants only what
+/// happened since.
+///
+/// Mirrors `room_transcript`'s soft-closed audit fallback so a finished call's
+/// frozen room keeps replaying.
+async fn room_events(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(q): Query<TranscriptQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    let result = with_rooms(&state, |reg| match reg.transcript(&key, q.after_seq) {
+        // Open room (the live case): serve it directly.
+        Ok(events) => Ok(events),
+        // Closed room: a finished call's frozen transcript. Read the audit view
+        // and apply the same `after_seq` tail filter the open path would.
+        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+            match reg.get_including_closed(&key) {
+                Ok(Some(rec)) => Ok(rec
+                    .transcript
+                    .into_iter()
+                    .filter(|m| q.after_seq.map_or(true, |after| m.seq > after))
+                    .collect()),
+                // Genuinely no such room (never created): preserve the 404.
+                Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    });
+    match result {
+        Ok(events) => {
+            let last_seq = events.last().map(|m| m.seq);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "events": events, "last_seq": last_seq })),
+            )
+        }
         Err(e) => room_store_error_response(e),
     }
 }
@@ -8908,6 +9026,153 @@ mod tests {
             state.requests.read().await.is_empty(),
             "a mention that resolves to a non-agent must queue no turn"
         );
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    // ---- Room hydration: snapshot + events (OCEAN-232) ---------------------
+
+    /// `GET /v1/rooms/persistent/{key}/snapshot` and `.../events` are the
+    /// store-backed hydrate-then-tail pair the collaboration model documents.
+    /// These were documented but never registered (clients 404'd); this proves
+    /// the round-trip end-to-end through the real handlers against a real store:
+    /// a snapshot returns the room, roster, full transcript, and `last_seq`; the
+    /// events feed returns the same log and honors `after_seq` as a live tail;
+    /// and an unknown room 404s rather than panics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_snapshot_and_events_hydrate_persistent_room() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // Author a room with one human participant and two transcript lines.
+        let key = RoomKey::new("hydrate-me");
+        with_rooms(&state, |reg| {
+            reg.create(key.clone(), "Hydrate Me", None, Utc::now()).unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "amy".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Amy".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+            reg.append_message(
+                &key,
+                "amy",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "first",
+                Utc::now(),
+            )
+            .unwrap();
+            reg.append_message(
+                &key,
+                "amy",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "second",
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        // --- snapshot: full hydration in one read. ---
+        let (status, Json(snap)) =
+            room_snapshot(State(state.clone()), Path("hydrate-me".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(snap["ok"], json!(true));
+        assert_eq!(snap["room"]["id"], json!("hydrate-me"));
+        // Roster surfaced both on the room and at the top level for the client.
+        assert_eq!(snap["participants"].as_array().unwrap().len(), 1);
+        assert_eq!(snap["participants"][0]["id"], json!("amy"));
+        // Transcript carries the join marker + two messages, in seq order.
+        let transcript = snap["transcript"].as_array().unwrap();
+        assert!(
+            transcript.len() >= 3,
+            "join marker + 2 messages expected, got {}",
+            transcript.len()
+        );
+        let last_seq = snap["last_seq"].as_u64().unwrap();
+        assert_eq!(
+            last_seq,
+            transcript.last().unwrap()["seq"].as_u64().unwrap(),
+            "last_seq must equal the final transcript entry's seq"
+        );
+
+        // --- events (no after_seq): the same log, shaped as `events`. ---
+        let (status, Json(all)) = room_events(
+            State(state.clone()),
+            Path("hydrate-me".to_string()),
+            Query(TranscriptQuery { after_seq: None }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(all["ok"], json!(true));
+        assert_eq!(
+            all["events"].as_array().unwrap().len(),
+            transcript.len(),
+            "events with no after_seq returns the full transcript"
+        );
+        assert_eq!(all["last_seq"].as_u64().unwrap(), last_seq);
+
+        // --- events (after_seq = last_seq): the live tail is empty until more
+        // happens — exactly what a client that just snapshotted should see. ---
+        let (status, Json(tail)) = room_events(
+            State(state.clone()),
+            Path("hydrate-me".to_string()),
+            Query(TranscriptQuery {
+                after_seq: Some(last_seq),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            tail["events"].as_array().unwrap().is_empty(),
+            "after_seq at the head returns no entries"
+        );
+        assert!(
+            tail["last_seq"].is_null(),
+            "empty tail reports no last_seq"
+        );
+
+        // Append once more, then tail from the prior head: only the new line.
+        with_rooms(&state, |reg| {
+            reg.append_message(
+                &key,
+                "amy",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "third",
+                Utc::now(),
+            )
+            .unwrap();
+        });
+        let (_status, Json(tail2)) = room_events(
+            State(state.clone()),
+            Path("hydrate-me".to_string()),
+            Query(TranscriptQuery {
+                after_seq: Some(last_seq),
+            }),
+        )
+        .await;
+        let tail2_events = tail2["events"].as_array().unwrap();
+        assert_eq!(tail2_events.len(), 1, "exactly one new entry since last_seq");
+        assert_eq!(tail2_events[0]["body"], json!("third"));
+
+        // --- unknown room: 404, not a panic, on both endpoints. ---
+        let (status, _) =
+            room_snapshot(State(state.clone()), Path("no-such-room".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = room_events(
+            State(state.clone()),
+            Path("no-such-room".to_string()),
+            Query(TranscriptQuery { after_seq: None }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         std::env::remove_var("OCEAN_YOLO");
     }
