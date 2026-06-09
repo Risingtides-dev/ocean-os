@@ -2499,7 +2499,7 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
             if use_streaming {
                 use ocean_call::stt_deepgram::live::DeepgramStt;
                 use ocean_call::stt_deepgram::DeepgramConfig;
-                use ocean_call::{run_call_session_streaming, NoopActivitySink};
+                use ocean_call::{run_call_session_streaming, BargeInCanceller, BargeInVoice};
                 use std::sync::Arc;
 
                 // Safe: `use_streaming` is only true when `deepgram_key.is_some()`.
@@ -2519,6 +2519,16 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                         }
                     };
                 tracing::info!(room = %room_owned, "call-session: streaming STT (deepgram) active");
+                // Barge-in (OCEAN-243): a `BargeInCanceller` (the ActivitySink) and
+                // a `BargeInVoice` wrapping the TTS share one signal. When Deepgram
+                // raises `SpeechActivity::Onset` (the human started talking) the
+                // canceller trips the signal, which cancels the in-flight
+                // `voice.speak` — Ocean stops talking mid-utterance. A `Settled`
+                // rearms it for the next answer. This is the one-line swap #173
+                // designed for: `NoopActivitySink` → `BargeInCanceller`, plus the
+                // voice wrap that makes its `speak` cancellable.
+                let (canceller, signal) = BargeInCanceller::new();
+                let voice = BargeInVoice::new(voice, signal);
                 run_call_session_streaming(
                     session,
                     source,
@@ -2527,9 +2537,7 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                     runner,
                     voice,
                     sink,
-                    // Barge-in onset is exposed but not yet consumed — OCEAN-243
-                    // swaps this for a TTS-stop sink. Until then, drop the edges.
-                    NoopActivitySink,
+                    canceller,
                     room_owned,
                     participants,
                     UtterancePolicy::default(),

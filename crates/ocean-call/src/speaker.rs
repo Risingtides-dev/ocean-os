@@ -111,6 +111,14 @@ pub mod live {
     }
 
     /// Push a full TTS PCM utterance into the room, paced into 10ms frames.
+    ///
+    /// **Barge-in cancellation (OCEAN-243):** this future is *cancel-safe* — the
+    /// utterance is published one 10ms `capture_frame` at a time, awaiting each, so
+    /// dropping the future between frames simply stops publishing. No partial-frame
+    /// corruption is possible (each `capture_frame` is atomic) and there is no
+    /// shared state left half-written. `BargeInVoice` relies on exactly this: when
+    /// a barge-in `Onset` fires it drops the in-flight `speak` future, cutting
+    /// Ocean off mid-utterance with no further audio reaching the room.
     pub async fn speak_pcm(
         source: &NativeAudioSource,
         pcm: PcmFrame,
