@@ -557,11 +557,22 @@ pub struct Room {
     /// automatic triggers configured yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_policy: Option<RoomTriggerPolicy>,
+    /// Optional workspace directory this room belongs to (OCEAN-260).
+    ///
+    /// This is the room's binding into project scoping: when set, a room-bound
+    /// agent turn resolves its owning project from this `workspace_root` (the
+    /// reverse map `AgentRuntime::project_for_workspace`, wired in OCEAN-228) and
+    /// uses it as the turn's `cwd`. `None` ⇒ the room has no project binding and
+    /// agent turns fall back to room+agent session keying with the daemon's
+    /// launch dir, exactly as before this field existed. Additive and defaulted
+    /// so rooms persisted before this field deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 impl Room {
     /// Create a new, empty persistent room with `created_at == updated_at` set to
-    /// `now`. Roster starts empty and no trigger policy is configured.
+    /// `now`. Roster starts empty, no trigger policy, and no workspace binding.
     pub fn new(id: RoomKey, name: impl Into<String>, now: DateTime<Utc>) -> Self {
         Self {
             id,
@@ -570,6 +581,7 @@ impl Room {
             created_at: now,
             updated_at: now,
             trigger_policy: None,
+            workspace_root: None,
         }
     }
 }

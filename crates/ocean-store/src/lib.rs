@@ -249,6 +249,28 @@ pub trait RoomStore {
         now: DateTime<Utc>,
     ) -> Result<RoomRecord>;
 
+    /// Create a new persistent room bound to a workspace directory (OCEAN-260).
+    ///
+    /// Identical to [`create`](Self::create) but persists `workspace_root` on the
+    /// room so a room-bound agent turn can resolve its owning project (via the
+    /// reverse map `AgentRuntime::project_for_workspace`, OCEAN-228) and set the
+    /// turn's `cwd`. `None` is equivalent to plain `create` — the room has no
+    /// project binding. A blanket provided impl forwards to `create` for stores
+    /// that have no workspace column yet, so this is additive for implementors.
+    fn create_in_workspace(
+        &mut self,
+        key: RoomKey,
+        name: &str,
+        workspace_root: Option<String>,
+        trigger_policy: Option<RoomTriggerPolicy>,
+        now: DateTime<Utc>,
+    ) -> Result<RoomRecord> {
+        // Default: ignore the binding and fall back to the unbound create. The
+        // SQLite store overrides this to actually persist `workspace_root`.
+        let _ = workspace_root;
+        self.create(key, name, trigger_policy, now)
+    }
+
     /// One room record (room + transcript) by key.
     fn get(&self, key: &RoomKey) -> Result<Option<RoomRecord>>;
 
@@ -379,6 +401,7 @@ impl SqliteRoomStore {
                 id             TEXT PRIMARY KEY,
                 name           TEXT NOT NULL,
                 trigger_policy TEXT,                -- JSON RoomTriggerPolicy, NULL = none
+                workspace_root TEXT,                -- OCEAN-260 bound workspace dir, NULL = unbound
                 created_at     TEXT NOT NULL,       -- RFC3339
                 updated_at     TEXT NOT NULL,       -- RFC3339
                 closed_at      TEXT                 -- RFC3339, NULL = open
@@ -408,6 +431,21 @@ impl SqliteRoomStore {
             CREATE INDEX IF NOT EXISTS idx_participants_room ON participants(room_id, position);
             "#,
         )?;
+        // Backfill the OCEAN-260 workspace_root column on DBs created before it
+        // existed. `CREATE TABLE IF NOT EXISTS` above is a no-op on an existing
+        // `rooms` table, so a separate ADD COLUMN is the only way older stores
+        // gain the column. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a
+        // duplicate-column error here just means the column is already present
+        // (fresh DB) — swallow exactly that and propagate anything else.
+        match self
+            .conn
+            .execute("ALTER TABLE rooms ADD COLUMN workspace_root TEXT", [])
+        {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
 
@@ -435,9 +473,9 @@ impl SqliteRoomStore {
     /// whether soft-closed rooms are visible.
     fn load_record(&self, key: &RoomKey, include_closed: bool) -> Result<Option<RoomRecord>> {
         let sql = if include_closed {
-            "SELECT id, name, trigger_policy, created_at, updated_at FROM rooms WHERE id = ?1"
+            "SELECT id, name, trigger_policy, workspace_root, created_at, updated_at FROM rooms WHERE id = ?1"
         } else {
-            "SELECT id, name, trigger_policy, created_at, updated_at FROM rooms WHERE id = ?1 AND closed_at IS NULL"
+            "SELECT id, name, trigger_policy, workspace_root, created_at, updated_at FROM rooms WHERE id = ?1 AND closed_at IS NULL"
         };
         let room = self
             .conn
@@ -445,12 +483,13 @@ impl SqliteRoomStore {
                 let id: String = row.get(0)?;
                 let name: String = row.get(1)?;
                 let policy_json: Option<String> = row.get(2)?;
-                let created_at: String = row.get(3)?;
-                let updated_at: String = row.get(4)?;
-                Ok((id, name, policy_json, created_at, updated_at))
+                let workspace_root: Option<String> = row.get(3)?;
+                let created_at: String = row.get(4)?;
+                let updated_at: String = row.get(5)?;
+                Ok((id, name, policy_json, workspace_root, created_at, updated_at))
             })
             .optional()?;
-        let Some((id, name, policy_json, created_at, updated_at)) = room else {
+        let Some((id, name, policy_json, workspace_root, created_at, updated_at)) = room else {
             return Ok(None);
         };
 
@@ -472,6 +511,7 @@ impl SqliteRoomStore {
             created_at: parse_ts(&created_at)?,
             updated_at: parse_ts(&updated_at)?,
             trigger_policy,
+            workspace_root,
         };
         Ok(Some(RoomRecord { room, transcript }))
     }
@@ -626,6 +666,18 @@ impl RoomStore for SqliteRoomStore {
         trigger_policy: Option<RoomTriggerPolicy>,
         now: DateTime<Utc>,
     ) -> Result<RoomRecord> {
+        // Unbound create == workspace create with no binding. Single insert path.
+        self.create_in_workspace(key, name, None, trigger_policy, now)
+    }
+
+    fn create_in_workspace(
+        &mut self,
+        key: RoomKey,
+        name: &str,
+        workspace_root: Option<String>,
+        trigger_policy: Option<RoomTriggerPolicy>,
+        now: DateTime<Utc>,
+    ) -> Result<RoomRecord> {
         if key.as_str().trim().is_empty() {
             return Err(RoomStoreError::BadKey(key.0));
         }
@@ -650,12 +702,13 @@ impl RoomStore for SqliteRoomStore {
             return Err(RoomStoreError::AlreadyExists(key));
         }
         tx.execute(
-            "INSERT INTO rooms (id, name, trigger_policy, created_at, updated_at, closed_at)
-             VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
+            "INSERT INTO rooms (id, name, trigger_policy, workspace_root, created_at, updated_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)",
             params![
                 key.as_str(),
                 name,
                 encode_policy(trigger_policy.as_ref())?,
+                workspace_root,
                 fmt_ts(now),
             ],
         )?;
@@ -1188,6 +1241,104 @@ mod tests {
         assert_eq!(rec.room.name, "Persisted");
         assert_eq!(rec.transcript.len(), 1);
         assert_eq!(rec.transcript[0].body, "hello");
+    }
+
+    #[test]
+    fn create_in_workspace_persists_and_returns_binding() {
+        // OCEAN-260: a room created WITH a workspace_root carries it on the
+        // returned record and on subsequent reads.
+        let mut s = store();
+        let key = RoomKey::new("bound-room");
+        let rec = s
+            .create_in_workspace(
+                key.clone(),
+                "Bound",
+                Some("/dev/ocean-os".into()),
+                None,
+                now(),
+            )
+            .unwrap();
+        assert_eq!(rec.room.workspace_root.as_deref(), Some("/dev/ocean-os"));
+        // And a fresh read sees the same binding.
+        let got = s.get(&key).unwrap().unwrap();
+        assert_eq!(got.room.workspace_root.as_deref(), Some("/dev/ocean-os"));
+    }
+
+    #[test]
+    fn plain_create_leaves_workspace_unbound() {
+        // OCEAN-260 backward-compat: the legacy `create` path binds no workspace,
+        // so existing room creators keep their None semantics unchanged.
+        let mut s = store();
+        let key = RoomKey::new("unbound-room");
+        let rec = s.create(key.clone(), "Unbound", None, now()).unwrap();
+        assert_eq!(rec.room.workspace_root, None);
+        assert_eq!(s.get(&key).unwrap().unwrap().room.workspace_root, None);
+    }
+
+    #[test]
+    fn workspace_binding_survives_reopen() {
+        // The binding is durable: it survives dropping and re-opening the store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("durable-bound");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create_in_workspace(
+                key.clone(),
+                "Durable",
+                Some("/work/repo".into()),
+                None,
+                now(),
+            )
+            .unwrap();
+        }
+        let s = SqliteRoomStore::open(&path).unwrap();
+        assert_eq!(
+            s.get(&key).unwrap().unwrap().room.workspace_root.as_deref(),
+            Some("/work/repo")
+        );
+    }
+
+    #[test]
+    fn migrate_backfills_workspace_root_on_preexisting_db() {
+        // OCEAN-260 migration: a DB whose `rooms` table predates the
+        // workspace_root column must gain the column on the next open, with old
+        // rows reading back as unbound (None) — not a hard error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-rooms.db");
+        let key = RoomKey::new("legacy");
+        {
+            // Build the OLD schema by hand (no workspace_root column) and seed a
+            // room the pre-OCEAN-260 way.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE rooms (
+                    id             TEXT PRIMARY KEY,
+                    name           TEXT NOT NULL,
+                    trigger_policy TEXT,
+                    created_at     TEXT NOT NULL,
+                    updated_at     TEXT NOT NULL,
+                    closed_at      TEXT
+                );
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rooms (id, name, trigger_policy, created_at, updated_at, closed_at)
+                 VALUES (?1, ?2, NULL, ?3, ?3, NULL)",
+                params![key.as_str(), "Legacy", fmt_ts(now())],
+            )
+            .unwrap();
+        }
+        // Opening with the current store runs migrate(), which ALTERs in the new
+        // column. The legacy room reads back cleanly as unbound.
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.name, "Legacy");
+        assert_eq!(rec.room.workspace_root, None);
+        // Re-opening again must be a no-op (ADD COLUMN swallowed as duplicate).
+        let _ = SqliteRoomStore::open(&path).unwrap();
     }
 
     #[test]
