@@ -126,6 +126,15 @@ struct AppState {
     /// [`build_room_projection`]. Bounded by [`gc_room_canvas`]. See
     /// [`RoomCanvasStore`].
     room_canvas: RoomCanvasStore,
+    /// Daemon-wide shutdown signal (OCEAN-300). Fired once when the process
+    /// receives SIGTERM/SIGINT. The infinite SSE handlers (`/v1/events`,
+    /// `/v1/agent/events`) clone this and `take_until` it, so their otherwise
+    /// never-ending `BroadcastStream` *terminates* the moment shutdown begins.
+    /// Without it, `axum::serve(...).with_graceful_shutdown(...)` would block
+    /// forever waiting for those streams' HTTP connections to close, and the
+    /// in-flight turn drain would never run. Clients reconnect via the
+    /// self-healing service worker, so dropping the stream on shutdown is safe.
+    shutdown: CancellationToken,
 }
 
 /// Per-`(session, canvas)` store of bridge-fulfilled `slack_canvas` results
@@ -1224,6 +1233,9 @@ async fn main() -> anyhow::Result<()> {
         persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         room_canvas: Arc::new(Mutex::new(HashMap::new())),
+        // OCEAN-300: a single daemon-wide shutdown token, cloned into the SSE
+        // handlers and fired by the signal handler so live streams terminate.
+        shutdown: CancellationToken::new(),
     };
 
     // Background GC: the request/permission/canvas-fulfillment registries are
@@ -1406,15 +1418,42 @@ async fn main() -> anyhow::Result<()> {
     // would be aborted the instant `main()` returns and the Tokio runtime drops.
     // Clone the registry handle BEFORE `state` is consumed by `with_state`.
     let drain_requests = state.requests.clone();
+    // OCEAN-300: clone the daemon-wide shutdown token too, BEFORE `state` is
+    // consumed, so the graceful-shutdown future can fire it. Firing it is what
+    // terminates the live SSE streams (`/v1/events`, `/v1/agent/events`) and lets
+    // `with_graceful_shutdown` actually complete instead of hanging forever.
+    let shutdown_token = state.shutdown.clone();
     let app = app.with_state(state);
 
     let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
     tracing::info!(%addr, "ocean-daemon listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // The graceful-shutdown future: wait for the first SIGTERM/SIGINT, then fire
+    // the shutdown token so every live SSE stream ends (OCEAN-300). Only after
+    // that can axum finish draining HTTP connections and return from `.await`.
+    let serve_shutdown = {
+        let shutdown_token = shutdown_token.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received; terminating live SSE streams and draining");
+            // Terminating the streams here is the crux of OCEAN-300: without it,
+            // the never-ending broadcast streams keep their connections open and
+            // graceful shutdown blocks indefinitely.
+            shutdown_token.cancel();
+        }
+    };
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(serve_shutdown)
         .await?;
-    drain_request_tasks(&drain_requests, shutdown_grace()).await;
+
+    // OCEAN-301: the drain is now supervised. A wedged, non-cancellable turn
+    // handle must never hang the process past a hard ceiling, and a SECOND
+    // signal arriving mid-drain must escalate to an immediate exit instead of
+    // being ignored. `supervised_drain` enforces both; on the happy path it just
+    // awaits `drain_request_tasks` and returns.
+    supervised_drain(&drain_requests, shutdown_grace(), shutdown_hard_ceiling()).await;
     Ok(())
 }
 
@@ -1427,6 +1466,86 @@ fn shutdown_grace() -> std::time::Duration {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(20);
     std::time::Duration::from_secs(secs)
+}
+
+/// Hard wall-clock ceiling for the ENTIRE shutdown drain (OCEAN-301). If the
+/// supervised drain has not returned by this point — e.g. a turn handle is
+/// wedged in non-cancellable native/FFI work and `tokio::time::timeout` itself
+/// can't preempt it — a watchdog calls `std::process::exit` to guarantee the
+/// process dies instead of hanging forever (the live-incident failure mode).
+///
+/// Overridable via `OCEAN_SHUTDOWN_HARD_CEILING_SECS`. The default is `grace +
+/// 5s` so the ceiling always sits strictly *after* the normal grace window and
+/// only fires when the graceful path itself failed to terminate. A value of `0`
+/// disables the watchdog (the drain then relies solely on `grace`).
+fn shutdown_hard_ceiling() -> std::time::Duration {
+    match env::var("OCEAN_SHUTDOWN_HARD_CEILING_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(secs) => std::time::Duration::from_secs(secs),
+        None => shutdown_grace() + std::time::Duration::from_secs(5),
+    }
+}
+
+/// Exit code used when the shutdown watchdog or a second signal force-terminates
+/// the process (OCEAN-301). Non-zero so a supervisor (launchd) can tell a
+/// force-exit apart from a clean `0`.
+const SHUTDOWN_FORCE_EXIT_CODE: i32 = 75;
+
+/// Supervise [`drain_request_tasks`] so a stuck drain can never hang the process
+/// (OCEAN-301). On the happy path this simply awaits the drain. But it races the
+/// drain against two escape hatches:
+///
+/// 1. **Hard ceiling watchdog.** If `ceiling` is non-zero and the drain has not
+///    finished by then, `std::process::exit` is called. This covers the case a
+///    turn handle is wedged in work `tokio::time::timeout` cannot preempt (the
+///    `grace` timeout inside `drain_request_tasks` only fires between `.await`
+///    points; native/blocking work blows through it).
+/// 2. **Second signal.** A SECOND SIGTERM/SIGINT arriving mid-drain is the
+///    operator (or supervisor) saying "stop now". We honor it by force-exiting
+///    immediately rather than waiting out the rest of the grace window.
+///
+/// `ceiling` is expected to be >= `grace`; if the watchdog wins the race it
+/// means the bounded grace inside the drain failed to bound it, which is exactly
+/// the non-cancellable-handle case OCEAN-301 guards against.
+async fn supervised_drain(
+    requests: &RequestRegistry,
+    grace: std::time::Duration,
+    ceiling: std::time::Duration,
+) {
+    tokio::select! {
+        // Happy path: the drain completes (or hits its own bounded `grace`).
+        _ = drain_request_tasks(requests, grace) => {}
+
+        // Escape hatch 1: total shutdown exceeded the hard ceiling. Only armed
+        // when ceiling > 0; a zero ceiling yields a future that never resolves,
+        // so the watchdog effectively disabled.
+        _ = sleep_or_never(ceiling) => {
+            tracing::error!(
+                ceiling_secs = ceiling.as_secs(),
+                "shutdown exceeded hard ceiling; force-exiting (a turn task is wedged)"
+            );
+            std::process::exit(SHUTDOWN_FORCE_EXIT_CODE);
+        }
+
+        // Escape hatch 2: a second signal mid-drain escalates to immediate exit.
+        _ = wait_for_signal() => {
+            tracing::warn!("second shutdown signal during drain; force-exiting now");
+            std::process::exit(SHUTDOWN_FORCE_EXIT_CODE);
+        }
+    }
+}
+
+/// A timer that fires after `dur`, or — when `dur` is zero — never fires. Used
+/// to make the hard-ceiling watchdog opt-out cleanly via `OCEAN_SHUTDOWN_*=0`
+/// without special-casing the `select!` arm (OCEAN-301).
+async fn sleep_or_never(dur: std::time::Duration) {
+    if dur.is_zero() {
+        std::future::pending::<()>().await
+    } else {
+        tokio::time::sleep(dur).await
+    }
 }
 
 /// After axum has drained open connections, wait (up to `grace`) for the
@@ -1478,10 +1597,17 @@ async fn drain_request_tasks(requests: &RequestRegistry, grace: std::time::Durat
     }
 }
 
-/// Completes when the process receives SIGTERM or SIGINT (Ctrl-C), letting axum
-/// drain in-flight HTTP requests / agent turns before the daemon exits instead
-/// of being hard-killed mid-stream. (OCEAN-184)
-async fn shutdown_signal() {
+/// Completes when the process receives ONE SIGTERM or SIGINT (Ctrl-C).
+///
+/// This is the shared primitive behind both shutdown phases (OCEAN-184 /
+/// OCEAN-300 / OCEAN-301): the graceful-shutdown future awaits it for the FIRST
+/// signal (then fires the SSE-terminating token), and [`supervised_drain`]
+/// awaits a fresh instance of it during the drain so a SECOND signal can
+/// escalate to an immediate force-exit. It deliberately does NOT log — each
+/// caller logs the phase-appropriate message, and a second installed
+/// `SignalKind::terminate()` listener correctly receives subsequent signals
+/// (tokio's signal registry is process-global and reference-counted).
+async fn wait_for_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -1503,8 +1629,6 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-
-    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
 async fn root() -> Json<serde_json::Value> {
@@ -1620,6 +1744,62 @@ async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(body)
 }
 
+/// A [`Stream`] adapter that ends as soon as the daemon-wide shutdown token
+/// fires (OCEAN-300). It wraps an inner item-stream and the token's owned
+/// "cancelled" future, polling the cancel future FIRST on every `poll_next`:
+/// once shutdown has begun the stream reports `Poll::Ready(None)` (completed)
+/// and stops yielding, regardless of the inner stream still being live.
+///
+/// Why this exists: the two live SSE rails (`/v1/events`, `/v1/agent/events`)
+/// run over a `BroadcastStream` that never completes on its own, so their HTTP
+/// connections stay open forever. While such a connection is open,
+/// `axum::serve(...).with_graceful_shutdown(...)` blocks indefinitely waiting
+/// for it to close, and the in-flight turn drain (`drain_request_tasks`) never
+/// runs — the exact hang OCEAN-300 reproduces. Completing the stream on the
+/// shutdown signal lets axum close the connection and the drain proceed. The
+/// surface reconnects through the self-healing service worker (replaying
+/// `Last-Event-ID`), so a terminated stream is transparent to clients.
+///
+/// Both fields are `Box::pin`-ned so the adapter is itself `Unpin` and needs no
+/// `unsafe`/`pin_project`; this stream is constructed once per SSE connection,
+/// so the single boxing cost is irrelevant next to a long-lived HTTP stream.
+struct ShutdownStream<S> {
+    inner: std::pin::Pin<Box<S>>,
+    cancelled: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+}
+
+impl<S> Stream for ShutdownStream<S>
+where
+    S: Stream<Item = Result<Event, Infallible>>,
+{
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::{future::Future, task::Poll};
+        // Shutdown wins: the moment the token is cancelled, end the stream so the
+        // connection can close and graceful shutdown can complete (OCEAN-300).
+        if self.cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Wrap an infinite SSE item-stream so it terminates when `shutdown` fires.
+/// See [`ShutdownStream`] for the why (OCEAN-300).
+fn sse_until_shutdown<S>(stream: S, shutdown: CancellationToken) -> ShutdownStream<S>
+where
+    S: Stream<Item = Result<Event, Infallible>>,
+{
+    ShutdownStream {
+        inner: Box::pin(stream),
+        cancelled: Box::pin(shutdown.cancelled_owned()),
+    }
+}
+
 fn legacy_event_to_sse(envelope: &EventEnvelope) -> Event {
     let event_type = event_type_name(&envelope.event);
     let id = envelope.id.to_string();
@@ -1677,8 +1857,11 @@ async fn events(
         }
     });
 
-    // Replay first (in emission order), then the live broadcast.
+    // Replay first (in emission order), then the live broadcast. Terminate the
+    // whole stream when the daemon shuts down so this connection can't pin
+    // graceful shutdown open (OCEAN-300).
     let stream = tokio_stream::iter(replay_events).chain(live);
+    let stream = sse_until_shutdown(stream, state.shutdown.clone());
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -8649,8 +8832,11 @@ async fn agent_events(
         }
     });
 
-    // Replay first (in emission order), then the live broadcast.
+    // Replay first (in emission order), then the live broadcast. Terminate the
+    // whole stream when the daemon shuts down so this connection can't pin
+    // graceful shutdown open (OCEAN-300).
     let stream = tokio_stream::iter(replay_events).chain(live);
+    let stream = sse_until_shutdown(stream, state.shutdown.clone());
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -11142,6 +11328,437 @@ mod tests {
         // Nothing to assert beyond "it returned"; the test passing IS the assert.
     }
 
+    // ---- OCEAN-300: live SSE streams terminate on the shutdown signal --------
+
+    /// Build a never-ending SSE-shaped stream exactly as the production handlers
+    /// do: a live `BroadcastStream` whose sender is held open and never sends.
+    /// On its own it pends forever (this is what pins graceful shutdown open).
+    /// Returns the wrapped stream plus the sender (kept alive by the caller so
+    /// the broadcast channel never closes) and the shutdown token.
+    fn never_ending_sse_stream() -> (
+        impl Stream<Item = Result<Event, Infallible>>,
+        broadcast::Sender<EventEnvelope>,
+        CancellationToken,
+    ) {
+        let (tx, rx) = broadcast::channel::<EventEnvelope>(16);
+        // Map the broadcast onto SSE `Event`s, mirroring the real handler shape.
+        let live = BroadcastStream::new(rx).filter_map(|ev| match ev {
+            Ok(envelope) => Some(Ok(legacy_event_to_sse(&envelope))),
+            Err(_) => None,
+        });
+        let token = CancellationToken::new();
+        let wrapped = sse_until_shutdown(live, token.clone());
+        (wrapped, tx, token)
+    }
+
+    /// OCEAN-300 core: an infinite SSE stream must NOT terminate on its own (it
+    /// would otherwise pin `with_graceful_shutdown` open), but it MUST terminate
+    /// promptly once the shutdown token fires. Bounded timeouts on both arms so a
+    /// regression (stream that never ends, or ends too eagerly) fails fast.
+    #[tokio::test]
+    async fn sse_stream_terminates_on_shutdown_signal() {
+        let (stream, _tx, token) = never_ending_sse_stream();
+        tokio::pin!(stream);
+
+        // Before shutdown: the stream is live and yields nothing, so `next()`
+        // must still be pending. A short timeout proves it has not ended.
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.next(),
+        )
+        .await;
+        assert!(
+            pending.is_err(),
+            "stream ended or yielded before shutdown — it must stay open while live"
+        );
+
+        // Fire shutdown. The stream must now complete (`None`) promptly. Without
+        // the OCEAN-300 fix this `next()` would pend forever and the timeout
+        // would fire — which is exactly the daemon hang we are guarding against.
+        token.cancel();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.next(),
+        )
+        .await;
+        assert!(
+            matches!(ended, Ok(None)),
+            "stream did not terminate within 2s of the shutdown signal (got {ended:?}) — \
+             this is the OCEAN-300 hang"
+        );
+    }
+
+    /// A stream whose token is ALREADY cancelled before the first poll must end
+    /// immediately — covers a client that connects during shutdown.
+    #[tokio::test]
+    async fn sse_stream_ends_immediately_when_already_shutting_down() {
+        let (tx, rx) = broadcast::channel::<EventEnvelope>(16);
+        let live = BroadcastStream::new(rx).filter_map(|ev| match ev {
+            Ok(envelope) => Some(Ok::<_, Infallible>(legacy_event_to_sse(&envelope))),
+            Err(_) => None,
+        });
+        let token = CancellationToken::new();
+        token.cancel(); // already shutting down
+        let stream = sse_until_shutdown(live, token);
+        tokio::pin!(stream);
+
+        let ended =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await;
+        assert!(
+            matches!(ended, Ok(None)),
+            "already-cancelled stream must end immediately (got {ended:?})"
+        );
+        drop(tx);
+    }
+
+    /// OCEAN-300 end-to-end: prove the LIVE INCIDENT is fixed against real axum.
+    /// A real `axum::serve(...).with_graceful_shutdown(...)` over a real socket,
+    /// with a real client holding the `/v1/agent/events` SSE connection OPEN,
+    /// must still complete graceful shutdown the moment the shutdown token fires.
+    /// Before the fix, the never-ending broadcast stream kept the connection (and
+    /// thus `serve`) alive forever; `serve().await` would never return. We assert
+    /// it returns within a tight bound after cancelling the token.
+    #[tokio::test]
+    async fn graceful_shutdown_completes_with_live_sse_connection() {
+        // `permission_test_state` mutates process env (`OCEAN_CONFIG_DIR`,
+        // `OCEAN_MODEL`); hold the env lock ONLY across that build, then drop it
+        // before any `.await` so we don't hold a std `MutexGuard` across awaits.
+        let state = {
+            let _g = yolo_env_guard();
+            permission_test_state()
+        };
+        let shutdown = state.shutdown.clone();
+
+        // A minimal router carrying the two REAL infinite SSE handlers, wired to
+        // a real AppState — the same handlers `main` mounts at these paths.
+        let app = Router::new()
+            .route("/v1/agent/events", get(agent_events))
+            .route("/v1/events", get(events))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Serve with the EXACT graceful-shutdown wiring `main` uses: the shutdown
+        // future resolves (here, on token cancel — standing in for the signal)
+        // and the SSE streams must then terminate so `serve` can return.
+        let serve_shutdown = {
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(serve_shutdown)
+                .await
+        });
+
+        // Open a real client connection and start the never-ending SSE stream.
+        let mut sock = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("client connect");
+        let req = format!(
+            "GET /v1/agent/events?all=1 HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n\r\n"
+        );
+        {
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(req.as_bytes()).await.expect("write request");
+            sock.flush().await.expect("flush");
+        }
+
+        // Read until we have the response head — proves the SSE connection is
+        // open and the handler is streaming (the connection axum must now drain).
+        {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 1024];
+            let mut seen = Vec::new();
+            loop {
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    sock.read(&mut buf),
+                )
+                .await
+                .expect("timed out reading SSE response head")
+                .expect("read SSE response");
+                assert!(read > 0, "server closed before sending response head");
+                seen.extend_from_slice(&buf[..read]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break; // got status line + headers
+                }
+            }
+            let head = String::from_utf8_lossy(&seen);
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "expected 200 SSE response, got: {head:?}"
+            );
+        }
+
+        // The connection is open and held by our client. Fire shutdown. With the
+        // OCEAN-300 fix the stream ends, axum closes the connection, and `serve`
+        // returns. Without it, this `serve` task would hang forever and the
+        // timeout below would fire — the exact live-incident hang.
+        shutdown.cancel();
+        let served = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect(
+                "graceful shutdown did NOT complete within 5s while an SSE connection was open \
+                 — this is the OCEAN-300 daemon hang",
+            )
+            .expect("serve task panicked");
+        served.expect("axum::serve returned an error");
+
+        // Keep the client socket alive until after shutdown so the connection was
+        // genuinely open across the drain (not closed early by a dropped client).
+        drop(sock);
+    }
+
+    // ---- OCEAN-301: shutdown watchdog + second-signal force-exit -------------
+
+    /// Env sentinel: when set, `watchdog_force_exit_child` runs the wedged-drain
+    /// scenario in a child process and lets the hard-ceiling watchdog force-exit.
+    const WATCHDOG_CHILD_ENV: &str = "OCEAN_TEST_WATCHDOG_CHILD";
+
+    /// The child half of the watchdog subprocess test. A no-op when run normally
+    /// (the env sentinel is unset, so every normal `cargo test` invocation skips
+    /// it). When the parent re-spawns this same test binary with the sentinel
+    /// set, it registers a turn handle that sleeps far longer than any window,
+    /// then runs `supervised_drain` with a tiny grace and a tiny hard ceiling.
+    /// The wedged handle outlives both, so the watchdog MUST call
+    /// `std::process::exit(SHUTDOWN_FORCE_EXIT_CODE)` — which is the whole point.
+    /// If the watchdog were broken, the child would hang on the 3600s handle and
+    /// the parent's bounded wait would catch it as a failure.
+    #[tokio::test]
+    async fn watchdog_force_exit_child() {
+        if std::env::var(WATCHDOG_CHILD_ENV).is_err() {
+            return; // normal run: this test is inert
+        }
+
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        // A non-cancellable-by-timeout wedge: a task that effectively never ends.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let id = RequestId::new_v4();
+        requests
+            .write()
+            .await
+            .insert(id, running_with_handle(handle));
+
+        // Faithful model of OCEAN-301: the drain's own grace is LONG (so the
+        // wedged 3600s handle would keep `drain_request_tasks` blocked far past
+        // any acceptable shutdown), and the hard ceiling is SHORT. The ceiling is
+        // therefore the binding deadline — the watchdog arm of `supervised_drain`
+        // must win the race and force-exit. Grace=1h ensures the drain itself
+        // cannot return first.
+        supervised_drain(
+            &requests,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        // If we got here the watchdog did NOT fire (it should have force-exited
+        // above). Exit 0 so the parent's assertion on the force-exit code fails
+        // loudly instead of silently passing.
+        std::process::exit(0);
+    }
+
+    /// Env sentinel for the second-signal escalation child scenario.
+    const SECOND_SIGNAL_CHILD_ENV: &str = "OCEAN_TEST_SECOND_SIGNAL_CHILD";
+
+    /// Child half of the second-signal escalation test (OCEAN-301). Inert unless
+    /// its sentinel is set. When driven, it wedges a turn handle and enters
+    /// `supervised_drain` with a LONG grace AND a LONG ceiling — so neither the
+    /// drain nor the watchdog can fire on their own. The ONLY way out is the
+    /// second-signal arm: when the parent sends SIGTERM, `supervised_drain` must
+    /// catch it and force-exit immediately. (In this isolated scenario that one
+    /// SIGTERM is the signal the drain's `wait_for_signal()` arm observes.)
+    #[tokio::test]
+    async fn second_signal_force_exit_child() {
+        if std::env::var(SECOND_SIGNAL_CHILD_ENV).is_err() {
+            return; // normal run: inert
+        }
+
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let id = RequestId::new_v4();
+        requests
+            .write()
+            .await
+            .insert(id, running_with_handle(handle));
+
+        // Long grace AND long ceiling: only an incoming signal can end this.
+        supervised_drain(
+            &requests,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        )
+        .await;
+
+        // Reached only if the second-signal arm did NOT fire. Exit 0 so the
+        // parent's force-exit assertion fails loudly.
+        std::process::exit(0);
+    }
+
+    /// OCEAN-301: a SECOND shutdown signal arriving mid-drain must escalate to an
+    /// immediate force-exit rather than being ignored until the grace window
+    /// elapses. Drives `second_signal_force_exit_child`, lets it settle into the
+    /// drain, sends it a real SIGTERM, and asserts a prompt force-exit (code 75).
+    #[cfg(unix)]
+    #[test]
+    fn second_signal_force_exits_mid_drain() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "tests::second_signal_force_exit_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SECOND_SIGNAL_CHILD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn second-signal child");
+
+        // Let the child install its signal handler and enter the drain before we
+        // signal it. The drain's `wait_for_signal()` arm must be polling first,
+        // else the SIGTERM hits default disposition and kills the child with a
+        // signal (no exit code) instead of our clean force-exit.
+        std::thread::sleep(std::time::Duration::from_millis(750));
+
+        // Send a single SIGTERM via `kill` (no new crate dep). This is the
+        // "second signal" from `supervised_drain`'s perspective.
+        let killed = std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("invoke kill");
+        assert!(killed.success(), "failed to SIGTERM the child");
+
+        let budget = std::time::Duration::from_secs(15);
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => break status,
+                None => {
+                    if start.elapsed() > budget {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!(
+                            "second-signal child hung past {budget:?} — supervised_drain failed \
+                             to escalate on a second signal (OCEAN-301 regression)"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        };
+
+        assert_eq!(
+            status.code(),
+            Some(SHUTDOWN_FORCE_EXIT_CODE),
+            "second-signal child exited with {:?} (signal={:?}), expected clean force-exit {}",
+            status.code(),
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            SHUTDOWN_FORCE_EXIT_CODE
+        );
+    }
+
+    /// OCEAN-301: the shutdown watchdog must force-exit the process when a drain
+    /// is wedged past the hard ceiling, instead of hanging forever (the live
+    /// incident's manual-kill failure mode). Drives `watchdog_force_exit_child`
+    /// in a child process and asserts it exits with `SHUTDOWN_FORCE_EXIT_CODE`
+    /// well within a bounded wall-clock budget.
+    #[test]
+    fn watchdog_force_exits_a_wedged_drain() {
+        // Re-invoke THIS test binary, running only the child test, with the
+        // sentinel env set so the child runs the wedged-drain scenario.
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "tests::watchdog_force_exit_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WATCHDOG_CHILD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn watchdog child");
+
+        // Bounded wait: poll for exit, hard-killing (and failing) if the child
+        // hangs past the budget — a hung child IS the regression.
+        let budget = std::time::Duration::from_secs(15);
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => break status,
+                None => {
+                    if start.elapsed() > budget {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!(
+                            "watchdog child hung past {budget:?} — supervised_drain failed to \
+                             force-exit a wedged drain (OCEAN-301 regression)"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        };
+
+        assert_eq!(
+            status.code(),
+            Some(SHUTDOWN_FORCE_EXIT_CODE),
+            "watchdog child exited with {:?}, expected force-exit code {} \
+             (drain should have been force-terminated, not exited cleanly or killed)",
+            status.code(),
+            SHUTDOWN_FORCE_EXIT_CODE
+        );
+        // And it must have happened quickly — comfortably under the parent budget.
+        assert!(
+            start.elapsed() < budget,
+            "watchdog force-exit took too long ({:?})",
+            start.elapsed()
+        );
+    }
+
+    /// OCEAN-301 unit guard: the hard ceiling defaults to strictly AFTER the
+    /// grace window so the watchdog only ever fires once the graceful path has
+    /// already failed to terminate — never racing a healthy drain.
+    #[test]
+    fn hard_ceiling_defaults_past_grace() {
+        let _g = yolo_env_guard();
+        // Clear overrides so we read the documented defaults.
+        std::env::remove_var("OCEAN_SHUTDOWN_GRACE_SECS");
+        std::env::remove_var("OCEAN_SHUTDOWN_HARD_CEILING_SECS");
+        assert!(
+            shutdown_hard_ceiling() > shutdown_grace(),
+            "hard ceiling must sit strictly past the grace window"
+        );
+    }
+
+    /// OCEAN-301 unit guard: a zero hard-ceiling override disables the watchdog
+    /// (its timer never fires), so the drain relies solely on `grace`.
+    #[tokio::test]
+    async fn zero_ceiling_disables_watchdog() {
+        // `sleep_or_never(0)` must pend forever rather than fire instantly; if it
+        // fired, `supervised_drain` would force-exit on a zero ceiling.
+        let fired = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sleep_or_never(std::time::Duration::ZERO),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "zero ceiling must never fire (watchdog disabled), but the timer resolved"
+        );
+    }
+
     #[test]
     fn permission_args_hash_is_stable_for_equal_args() {
         let a = json!({"path": "src/lib.rs", "content": "x"});
@@ -11957,6 +12574,7 @@ mod tests {
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -12818,6 +13436,7 @@ mod tests {
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -13316,6 +13935,7 @@ mod tests {
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
         }
     }
 
