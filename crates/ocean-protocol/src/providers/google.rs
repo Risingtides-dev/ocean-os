@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::providers::Provider;
-use crate::retry::{classify_status, parse_retry_after, with_retry, Attempt, RetryConfig};
+use crate::retry::{classify_status, parse_retry_after, retry_config, with_retry, Attempt};
 use crate::stream::AssistantMessageEventStream;
 use crate::types::{
     now_ms, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, StopReason,
@@ -394,7 +394,7 @@ impl Provider for GoogleProvider {
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
 
-        let resp = with_retry(&RetryConfig::default(), cancel.as_ref(), |_| {
+        let resp = with_retry(retry_config(), cancel.as_ref(), |_| {
             let client = self.client.clone();
             let url = url.clone();
             let body = body.clone();
