@@ -27,3 +27,10 @@ tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Isolated, auto-cleaned temp roots for the system_prompt tests so they never
+# read (or mutate) the operator's real ~/.config/ocean-rs/assistants (OCEAN-285).
+# Unique per test, dropped on scope exit — no shared process env, no save/restore
+# race under `cargo test`'s parallel threads.
+tempfile = "3"
