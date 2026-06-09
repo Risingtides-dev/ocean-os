@@ -1192,9 +1192,14 @@ impl DaemonApp {
                             age
                         )),
                         Line::from(format!("  {}", compact_text(&pending.reason, 56))),
+                        // Generous budget: for write/edit approvals the tail of
+                        // this line is the payload being approved (path ⇐ content
+                        // / old → new) — clamping it to the path's length would
+                        // make destructive approvals blind. The pane clips at
+                        // its own width anyway.
                         Line::from(format!(
                             "  args {}",
-                            compact_text(&pending.args_preview, 52)
+                            compact_text(&pending.args_preview, 160)
                         )),
                     ]
                 }),
@@ -1488,11 +1493,12 @@ impl PendingPermission {
         Self {
             permission_id: status.permission_id,
             request_id: Some(status.request_id),
+            // Humanized so the approval card leads with what the operator is
+            // actually approving (the bash command, the write payload), not
+            // JSON. Kept long here — each render site sets its own budget.
+            args_preview: compact_text(&humanize_tool_args(&status.tool, &status.args), 200),
             tool: status.tool,
             reason: status.reason,
-            args_preview: serde_json::to_string(&status.args)
-                .map(|json| compact_text(&json, 56))
-                .unwrap_or_else(|_| "{}".to_string()),
             updated_at: Some(status.created_at),
         }
     }
@@ -3331,8 +3337,7 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
         } => {
             app.set_active_agent_session_id(Some(session_id));
             app.active_agent_turn_id = Some(turn_id);
-            let args_text =
-                serde_json::to_string(&call.args_json).unwrap_or_else(|_| "{}".to_string());
+            let args_text = humanize_tool_args(&call.name, &call.args_json);
             app.push_agent_tool_timeline(
                 turn_id,
                 &call.name,
@@ -3350,7 +3355,11 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 call.name.clone(),
                 compact_text(&args_text, 60),
             );
-            app.capture_diff_excerpt(&args_text);
+            // The diff sniffer wants the raw args (it looks for diff/patch
+            // payloads), not the humanized header line.
+            app.capture_diff_excerpt(
+                &serde_json::to_string(&call.args_json).unwrap_or_else(|_| "{}".to_string()),
+            );
         }
         AgentTurnEvent::ToolCallChunk {
             turn_id,
@@ -4254,10 +4263,10 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             compact_text(delta, 72)
         ),
         AgentTurnEvent::ToolCallStarted { turn_id, call, .. } => format!(
-            "agent tool_started [{}] {} args={}",
+            "agent tool_started [{}] {} · {}",
             short_id(turn_id),
             compact_text(&call.name, 20),
-            compact_text(&call.args_json.to_string(), 48)
+            compact_text(&humanize_tool_args(&call.name, &call.args_json), 48)
         ),
         AgentTurnEvent::ToolCallChunk {
             turn_id,
@@ -4357,11 +4366,8 @@ fn summarize_event(envelope: &EventEnvelope) -> String {
             format!("{request}assistant_delta: {}", compact_text(text, 72))
         }
         OceanEvent::ToolStarted { tool, args } => format!(
-            "{request}tool_started: {tool} args={}",
-            compact_text(
-                &serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
-                48
-            )
+            "{request}tool_started: {tool} · {}",
+            compact_text(&humanize_tool_args(tool, args), 48)
         ),
         OceanEvent::ToolOutput {
             tool,
@@ -4377,12 +4383,9 @@ fn summarize_event(envelope: &EventEnvelope) -> String {
             if *is_error { " error" } else { "" }
         ),
         OceanEvent::PermissionRequest { tool, reason, args } => format!(
-            "{request}permission_request: {tool} reason={} args={}",
+            "{request}permission_request: {tool} reason={} · {}",
             compact_text(reason, 40),
-            compact_text(
-                &serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
-                40
-            )
+            compact_text(&humanize_tool_args(tool, args), 40)
         ),
         OceanEvent::PermissionDecision { allowed, reason } => {
             let state = if *allowed { "allowed" } else { "denied" };
@@ -5298,10 +5301,14 @@ fn render_pm_block(lines: &mut Vec<Line<'static>>, block: &PmBlock, focused: boo
                 ToolStatus::Ok => ("done", Color::Green),
                 ToolStatus::Err => ("error", Color::Red),
             };
-            let header_text = format!(
-                "  {} tool · {}({}) · {}",
-                arrow, name, args_preview, status_label
-            );
+            // `bash · pwd && git status · done` — the humanized salient arg,
+            // not the raw JSON blob (that still lives in the expanded view's
+            // output and the events feed for debugging).
+            let header_text = if args_preview.is_empty() {
+                format!("  {} {} · {}", arrow, name, status_label)
+            } else {
+                format!("  {} {} · {} · {}", arrow, name, args_preview, status_label)
+            };
             lines.push(Line::from(Span::styled(
                 header_text,
                 focus_style(Style::default().fg(status_color)),
@@ -6319,6 +6326,93 @@ fn quorum_meter(fraction: f32, width: usize) -> String {
     bar
 }
 
+/// One-line, human-first summary of a tool call's arguments for the collapsed
+/// tool header. Raw JSON (`bash({"command":"pwd && …","timeout_ms":30…})`) is
+/// operator-hostile; this pulls the one salient argument per tool — the
+/// command for bash, the pattern for glob/grep, the path for file tools — and
+/// shows it bare. Tools this map doesn't know (MCP tools arrive with arbitrary
+/// names) fall back to `key: value` pairs of the scalar args, which still
+/// reads better than serialized JSON. The caller truncates.
+fn humanize_tool_args(name: &str, args: &serde_json::Value) -> String {
+    let str_arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let joined = |parts: Vec<&str>| {
+        parts
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let summary = match name {
+        "bash" => str_arg("command").to_string(),
+        "glob" | "grep" => joined(vec![str_arg("pattern"), str_arg("path")]),
+        "read" | "ls" => str_arg("path").to_string(),
+        // Mutating file tools keep their payload in the preview: the same
+        // string feeds the permission-approval card, and an operator approving
+        // a write/edit must see WHAT lands in the file, not just where
+        // (Codex review of PR #201). The caller's truncation sets the budget.
+        "write" => {
+            let path = str_arg("path");
+            // Key-presence, not is_empty(): `content: ""` is a real payload
+            // (it truncates the file) and the approval card must say so
+            // (Codex P2 on PR #201). Only a genuinely absent key degrades to
+            // the bare path.
+            match args.get("content").and_then(|v| v.as_str()) {
+                None => path.to_string(),
+                Some("") => format!("{path} ⇐ (empty file)"),
+                Some(content) => format!("{path} ⇐ {content}"),
+            }
+        }
+        "edit" => {
+            let path = str_arg("path");
+            let old = args.get("old_string").and_then(|v| v.as_str());
+            let new = args.get("new_string").and_then(|v| v.as_str());
+            if old.is_none() && new.is_none() {
+                path.to_string()
+            } else {
+                format!(
+                    "{path}: {} → {}",
+                    old.unwrap_or_default(),
+                    new.unwrap_or_default()
+                )
+            }
+        }
+        "todo" => joined(vec![str_arg("action"), str_arg("text")]),
+        "web_fetch" | "browser_navigate" => str_arg("url").to_string(),
+        "browser_eval_js" => str_arg("js").to_string(),
+        "browser_click" | "browser_type" | "browser_key" => {
+            joined(vec![str_arg("selector"), str_arg("text"), str_arg("key")])
+        }
+        "slack_canvas" => joined(vec![str_arg("action"), str_arg("title")]),
+        _ => String::new(),
+    };
+    if !summary.is_empty() {
+        return summary;
+    }
+    // Fallback for unknown/MCP tools and known tools whose salient arg came
+    // through empty: render the scalar args as `key: value` pairs.
+    let pairs = args
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(key, value)| match value {
+                    serde_json::Value::String(s) if !s.is_empty() => {
+                        Some(format!("{key}: {s}"))
+                    }
+                    serde_json::Value::Number(n) => Some(format!("{key}: {n}")),
+                    serde_json::Value::Bool(b) => Some(format!("{key}: {b}")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .unwrap_or_default();
+    if pairs.is_empty() {
+        serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        pairs
+    }
+}
+
 fn compact_text(text: &str, limit: usize) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
@@ -6703,6 +6797,85 @@ mod tests {
             agent_last_event_id_for_scope(Some(id), None, Some(scope_a)),
             None,
         );
+    }
+
+    /// The collapsed tool header shows the salient argument bare — the bash
+    /// command, the glob pattern, the file path — never raw JSON for the
+    /// tools we ship; unknown (MCP) tools fall back to `key: value` pairs.
+    #[test]
+    fn humanize_tool_args_pulls_the_salient_field() {
+        use serde_json::json;
+
+        assert_eq!(
+            humanize_tool_args("bash", &json!({"command": "pwd && git status", "timeout_ms": 30000})),
+            "pwd && git status"
+        );
+        assert_eq!(
+            humanize_tool_args("glob", &json!({"pattern": "**/AGENTS.md", "max": 20})),
+            "**/AGENTS.md"
+        );
+        assert_eq!(
+            humanize_tool_args("grep", &json!({"pattern": "TODO", "path": "crates/"})),
+            "TODO crates/"
+        );
+        assert_eq!(
+            humanize_tool_args("read", &json!({"path": "docs/ARCHITECTURE.md"})),
+            "docs/ARCHITECTURE.md"
+        );
+        // Mutating file tools surface the payload, not just the target path —
+        // the permission-approval card renders this same preview, and approving
+        // a write/edit blind defeats the gate (Codex review of PR #201).
+        assert_eq!(
+            humanize_tool_args("write", &json!({"path": "a.txt", "content": "hello world"})),
+            "a.txt ⇐ hello world"
+        );
+        assert_eq!(
+            humanize_tool_args(
+                "edit",
+                &json!({"path": "a.rs", "old_string": "foo()", "new_string": "bar()"})
+            ),
+            "a.rs: foo() → bar()"
+        );
+        // Payload KEY absent → degrade to the path alone, not a dangling arrow.
+        assert_eq!(humanize_tool_args("write", &json!({"path": "a.txt"})), "a.txt");
+        // But an explicit empty string is a real payload — it truncates the
+        // file — and the approval card must say so, not hide it (Codex P2).
+        assert_eq!(
+            humanize_tool_args("write", &json!({"path": "a.txt", "content": ""})),
+            "a.txt ⇐ (empty file)"
+        );
+        assert_eq!(
+            humanize_tool_args("todo", &json!({"action": "add", "index": 0, "text": "Run tests"})),
+            "add Run tests"
+        );
+        assert_eq!(
+            humanize_tool_args("web_fetch", &json!({"url": "https://example.com"})),
+            "https://example.com"
+        );
+    }
+
+    /// Unknown tool names (MCP tools arrive with arbitrary names) and known
+    /// tools whose salient arg is missing degrade to scalar `key: value`
+    /// pairs, and only bottom out at raw JSON when there are no scalars.
+    #[test]
+    fn humanize_tool_args_falls_back_readably() {
+        use serde_json::json;
+
+        assert_eq!(
+            humanize_tool_args("mcp_linear_create", &json!({"title": "Ship it", "priority": 2})),
+            "priority: 2 · title: Ship it"
+        );
+        // A known tool with its salient key absent still gets the pair fallback.
+        assert_eq!(
+            humanize_tool_args("bash", &json!({"timeout_ms": 30000})),
+            "timeout_ms: 30000"
+        );
+        // No scalar args at all → compact JSON, never a panic.
+        assert_eq!(
+            humanize_tool_args("mystery", &json!({"nested": {"deep": true}})),
+            "{\"nested\":{\"deep\":true}}"
+        );
+        assert_eq!(humanize_tool_args("bash", &json!(null)), "null");
     }
 
     #[test]
