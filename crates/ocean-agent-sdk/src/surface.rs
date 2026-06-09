@@ -321,6 +321,43 @@ pub enum SurfacePatch {
     },
 }
 
+impl SurfacePatch {
+    /// The single component this patch *contends on* for the convergent merge
+    /// (OCEAN-258), if any. This is the key a ledger's `CanvasMergeState` merges
+    /// the patch's version under, so that two concurrent writes to the **same**
+    /// component are resolved deterministically while writes to **different**
+    /// components both land.
+    ///
+    /// Returns `Some(id)` for the per-component mutations — `UpsertComponent`,
+    /// `MoveComponent`, `ResizeComponent`, `DeleteComponent`. Returns `None` for
+    /// ops that don't last-write-wins a single component:
+    ///
+    /// - `Connect` / `Disconnect` mutate an *edge*, not a component register;
+    /// - `Select` / `Focus` / `SetViewport` are view state, not durable component
+    ///   state — they intentionally don't participate in component LWW;
+    /// - `Layout` / `Group` touch *many* components at once (a layout is applied
+    ///   as a unit, not merged per-component).
+    ///
+    /// A `None` here means the patch is not gated by the per-component merge and
+    /// is applied directly (its effect is either idempotent or naturally
+    /// last-writer-wins on a different axis).
+    pub fn target_component(&self) -> Option<&ComponentId> {
+        match self {
+            SurfacePatch::UpsertComponent { component } => Some(&component.id),
+            SurfacePatch::MoveComponent { component_id, .. }
+            | SurfacePatch::ResizeComponent { component_id, .. }
+            | SurfacePatch::DeleteComponent { component_id } => Some(component_id),
+            SurfacePatch::Connect { .. }
+            | SurfacePatch::Disconnect { .. }
+            | SurfacePatch::Focus { .. }
+            | SurfacePatch::Select { .. }
+            | SurfacePatch::SetViewport { .. }
+            | SurfacePatch::Layout { .. }
+            | SurfacePatch::Group { .. } => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Envelope + tool result
 // ---------------------------------------------------------------------------
@@ -337,6 +374,23 @@ pub struct SurfacePatchEnvelope {
     pub actor: ActorRef,
     pub created_at_ms: i64,
     pub patch: SurfacePatch,
+    /// Logical version stamp for the **convergent merge** (OCEAN-258). When two
+    /// writers (operator + agent) mutate the *same* component, this `(rev, actor)`
+    /// [`ComponentVersion`] — not the wall-clock `created_at_ms` — is what a
+    /// ledger's [`CanvasMergeState`] uses to pick a deterministic winner
+    /// regardless of arrival order.
+    ///
+    /// **Additive / optional.** Producers that predate the merge layer (and the
+    /// `ocean-surface` mirror until it adopts versioning) omit it, so it is
+    /// `skip_serializing_if = None` and absent on the wire for them. A `None`
+    /// envelope is treated by a merging ledger as "unversioned" — it may fall back
+    /// to legacy arrival-order application. Mutations that don't target a single
+    /// component (e.g. `Select`, `SetViewport`, `Layout`) leave this `None`.
+    ///
+    /// [`ComponentVersion`]: crate::surface_merge::ComponentVersion
+    /// [`CanvasMergeState`]: crate::surface_merge::CanvasMergeState
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<crate::surface_merge::ComponentVersion>,
 }
 
 /// Structured result returned by the `surface_patch` tool (§7). Mirrors the
@@ -576,9 +630,14 @@ mod tests {
                     }),
                 },
             },
+            // Legacy / unversioned producer: `version` absent on the wire.
+            version: None,
         };
 
         let s = serde_json::to_string(&env).unwrap();
+        // The optional merge `version` must be omitted entirely when None, so
+        // pre-OCEAN-258 consumers and the ocean-surface mirror still parse it.
+        assert!(!s.contains("version"), "unversioned envelope must not emit a version field");
         let back: SurfacePatchEnvelope = serde_json::from_str(&s).unwrap();
         assert_eq!(back, env);
 
