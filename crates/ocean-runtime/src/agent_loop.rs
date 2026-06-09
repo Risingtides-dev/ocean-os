@@ -12,7 +12,7 @@ use ocean_protocol::{
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use crate::error::{AgentError, Result};
 use crate::types::{
@@ -27,7 +27,6 @@ pub struct AgentRun {
     pub usage: ocean_protocol::Usage,
 }
 
-#[instrument(skip(config, initial_prompt, events), fields(model = %config.model.id))]
 pub async fn run_agent(
     config: &AgentConfig,
     initial_prompt: Message,
@@ -37,6 +36,21 @@ pub async fn run_agent(
 }
 
 /// Continue a run with an existing transcript. Use this for `pi --resume`.
+///
+/// Instrumented as the `agent_loop` span (OCEAN-274). This — not `run_agent` —
+/// is the real entry the daemon drives per turn (the session layer spawns it
+/// directly), so the loop span lives here and becomes the parent of the
+/// per-round `provider_stream` / `tool_exec` child spans. Stamping `session_id`
+/// onto the span (alongside the daemon's `turn_id`/`request_id` root span, into
+/// which this future is `.instrument()`-ed) makes every log line emitted while
+/// the loop runs attributable to one turn even under concurrent turns. The
+/// transcript and event sink are skipped — `messages` carries prompt/tool text
+/// that must never land in a span field.
+#[instrument(
+    name = "agent_loop",
+    skip(config, messages, events),
+    fields(session_id = config.session_id.as_deref().unwrap_or("-"), model = %config.model.id)
+)]
 pub async fn run_agent_with_history(
     config: &AgentConfig,
     mut messages: Vec<Message>,
@@ -89,6 +103,13 @@ pub async fn run_agent_with_history(
         }
 
         turn += 1;
+        // Per-round span (OCEAN-274): one `round` under the `agent_loop` span per
+        // provider→tools iteration of the turn. The provider call and each tool
+        // execution below are entered as children of this span, so the logs read
+        // as turn → round → provider_stream / tool_exec. `round` is the loop's
+        // 1-based iteration counter (renamed from `turn` to avoid colliding with
+        // the agent_loop-level notion of a turn).
+        let round_span = tracing::info_span!("round", round = turn);
         emit(
             &events,
             AgentEvent::TurnStart {
@@ -194,10 +215,13 @@ pub async fn run_agent_with_history(
             Ok::<(), AgentError>(())
         };
 
+        // Drive the provider stream inside the round span so `provider_stream`
+        // (emitted by `stream_simple`) nests under `round` → `agent_loop`.
         match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs as u64),
             stream_work,
         )
+        .instrument(round_span.clone())
         .await
         {
             Ok(result) => result?,
@@ -328,7 +352,20 @@ pub async fn run_agent_with_history(
                 // the tool future (which stops polling it — no task leak) and
                 // unwind the run with `AgentError::Cancelled`.
                 Some(tool) => {
-                    let exec = tool.execute(&id, args);
+                    // Per-tool span (OCEAN-274): a `tool_exec` child of this
+                    // round's span, tagging the tool name and call id so a tool
+                    // hop is followable as turn → round → tool_exec. Parented
+                    // explicitly to `round_span` (the ambient span here is the
+                    // `agent_loop`, not the round). Only the name and id are
+                    // recorded — `args` are deliberately NOT a span field (they
+                    // can carry file contents, prompts, or secrets).
+                    let tool_span = tracing::info_span!(
+                        parent: &round_span,
+                        "tool_exec",
+                        tool_name = %name,
+                        tool_call_id = %id
+                    );
+                    let exec = tool.execute(&id, args).instrument(tool_span);
                     tokio::select! {
                         biased;
                         () = cancelled(config) => {

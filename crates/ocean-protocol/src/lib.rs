@@ -29,6 +29,18 @@ pub use types::{
 /// `openai-completions` covers OpenAI and every OpenAI-compatible passthrough
 /// (OpenRouter, Together, Groq, Cerebras, DeepSeek, Fireworks, xAI, etc.) —
 /// just set `Model::base_url` (or `StreamOptions::base_url`) accordingly.
+///
+/// Instrumented as the `provider_stream` span (OCEAN-274): when called from
+/// within a turn's span tree it nests under the agent-loop round, tagging the
+/// provider/model/api of the call so a turn's provider hop is followable in the
+/// logs. `context` and `options` are skipped — they carry the full prompt, tool
+/// schemas, request headers and the api key, none of which belong in span
+/// fields (no secrets in spans).
+#[tracing::instrument(
+    name = "provider_stream",
+    skip(context, options),
+    fields(provider = %model.provider, model = %model.id, api = %model.api)
+)]
 pub async fn stream_simple(
     model: &Model,
     context: &Context,
