@@ -517,6 +517,7 @@ POST   /v1/component/event                surface component interaction event
 # Longhouse (council / quorum)
 POST   /v1/longhouse/demo                 scripted demo harness (fake events)
 POST   /v1/longhouse/convene              convene a real council; events on /v1/agent/events
+POST   /v1/council/convene                alias of /v1/longhouse/convene (same handler)
 GET    /v1/longhouse/topics               list longhouse topics
 GET    /v1/longhouse/topics/{id}          longhouse topic detail
 

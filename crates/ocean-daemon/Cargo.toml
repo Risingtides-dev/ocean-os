@@ -50,3 +50,9 @@ tempfile = "3"
 # OCEAN-130: the fake-tool block→decide→proceed test scripts a provider stream
 # via `futures::stream::iter`. Test-only; the production daemon never builds one.
 futures = "0.3"
+# OCEAN-227: drive the real router via `ServiceExt::oneshot` to prove the
+# `/v1/council/convene` alias is wired (and reads the response body). Both crates
+# are already in the workspace lock as transitive deps of axum, so this adds no
+# new downloads. Versions match axum 0.8's `http`/`http-body` stack.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
