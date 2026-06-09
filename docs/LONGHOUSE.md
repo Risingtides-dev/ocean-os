@@ -193,18 +193,48 @@ and emits `Converged`/`Aborted`.
   `WrongDecision` otherwise). This is the same trust-boundary discipline as
   OCEAN-185 (public id, secret token) and OCEAN-220 (the right is server-decided
   and minted, not claimant-asserted).
-- **Escrow trio (step 6) — partial.** The unforgeable title is minted and
-  verified per the gate above, but it lives in the `convene` stack frame for one
-  council. `TitleRegistry` (a persisted, daemon-held store of live titles across
-  turns) and `Revoker` (graduated recall / revocation as a separate daemon
-  principal) do not yet exist; the title is not a separately-escrowed
-  grant/exercise/revoke capability spanning multiple turns. This is the natural
-  follow-up to OCEAN-229.
-- **Graduated recall + `Warned` strikes**, **validator process-veto**, and the
-  **subsidiarity escalation predicate** (most things should never convene a
-  council at all) — all stubbed.
+- **Escrow trio (step 6).** BUILT (OCEAN-246), in
+  [`escrow.rs`](../crates/ocean-longhouse/src/escrow.rs). The three principals of
+  §2.3 now exist as durable, daemon-held code:
+  - **`SqliteTitleRegistry` — authority at rest.** A `rusqlite`-backed store
+    (the same bundled-SQLite pattern as `ocean-store`'s `SqliteRoomStore`) that
+    issues/holds/reclaims titles. Crucially the title now **survives across
+    turns**: a title minted when a council converges is looked up and verified in
+    a *later* turn, which is exactly what lets `claim_outcome` become a
+    daemon-held op (the limitation `longhouse_provider.rs` flagged). Persistence
+    is **secret-free**: the registry stores a *verifier* — a per-title random salt
+    plus `SHA-256(salt || token)` — and **never the raw token**, so a full DB dump
+    cannot recover the token or forge a claim (password-storage discipline).
+  - **`Revoker` — the War Chief who executes deposition.** A separate principal
+    (distinct from the registry and from every worker) that runs graduated recall:
+    `warn()` accrues `Warned` strikes, `revoke()` hard-pulls the title
+    (`RoleRevoked`). A revoked title fails `claim_outcome_persisted` **even with
+    the correct token**. Revocation is itself unforgeable — the Revoker holds a
+    server-minted capability key, so a forged recall (no/wrong key) is refused;
+    *decide ≠ execute* is preserved (the trigger is daemon-computed; the Revoker
+    only executes).
+  - **Validator escrow.** An escrow ledger where validators stake a bond per
+    topic; the bond is **held**, **released** on a successful firekeeper claim
+    (`claim_outcome_persisted` releases the topic's escrow), or **forfeited** on
+    abort/veto.
+  - **`claim_outcome_persisted`** is the daemon-held analog of the in-frame gate:
+    it verifies the persisted title (constant-time, rejecting revoked/released
+    titles) **then** the engine's agreement, then releases escrow.
+
+  **Scope-noted follow-ups (deliberately not in OCEAN-246):** (1) *daemon wiring*
+  — like `ocean-store` when it landed, this is an additive library; the daemon
+  holds no `SqliteTitleRegistry` on `AppState` yet, and `convene` still mints the
+  ephemeral in-frame `FirekeeperTitle`. Wiring the persisted registry into the
+  daemon + exposing `claim_outcome`/`board_post` as the tools
+  `longhouse_provider.rs` defers is the next ticket. (2) *staking economics* —
+  the escrow data structure + release/forfeit hooks are built, but where bond
+  amounts come from, slashing curves, and sybil-cost calibration are policy and
+  remain future work.
+- **Validator process-veto** and the **subsidiarity escalation predicate** (most
+  things should never convene a council at all) — still stubbed.
 - **Sybil hardening (step 7).** Credential-split on `spawn_worker`,
   self-renewal block, validator veto — not built.
 
-If you need the authority-split / anti-capture model, it is design, not code,
-today. The convergence engine itself is the part that is real.
+The convergence engine, the unforgeable `claim_outcome` gate (OCEAN-229), and now
+the persisted escrow trio (OCEAN-246) are real code. The remaining anti-capture
+predicates and the daemon wiring are the documented follow-ups.
