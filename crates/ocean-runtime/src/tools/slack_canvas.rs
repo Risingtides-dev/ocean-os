@@ -18,14 +18,26 @@
 //! On success the tool returns a structured
 //! [`SlackCanvasResult`](ocean_agent_sdk::slack_canvas::SlackCanvasResult) and
 //! emits a [`ToolSideEffect::SlackCanvas`] carrying the validated op. The agent
-//! loop forwards that side effect onto the event bus; the **Slack canvas bridge**
-//! (`ocean-agents`, a later phase) round-trips the op to the real Slack Canvas API
-//! and, for `read`/`list`, fills in live contents. THIS phase is the tool layer
-//! only: the runtime emits a well-formed, contracted result (`bridged: false`) so
-//! the agent loop + tests work end-to-end; no Slack call happens here.
+//! loop forwards that side effect onto the event bus, and the daemon relays it as
+//! `AgentTurnEvent::SlackCanvas` over `/v1/agent/events`; the **Slack canvas
+//! bridge** (`ocean-agents`) consumes it, round-trips the op to the real Slack
+//! Canvas API, and for `read`/`list` fetches the live content.
+//!
+//! # Why the awareness ops return *pending*, not fake content (OCEAN-235)
+//!
+//! The runtime **cannot** fetch live canvas content itself: it holds no Slack
+//! token and no Slack API client — all Slack I/O is owned by the `ocean-agents`
+//! bridge transport by design. So for `read`/`list` the runtime returns an
+//! **honest** result via [`SlackCanvasResult::pending_read`] /
+//! [`SlackCanvasResult::pending_list`]: `contents`/`canvases` are absent (never a
+//! fabricated empty string) and the result is stamped
+//! [`CanvasFetchStatus::PendingBridge`]. The bridge fetches the real body and
+//! stamps it back through [`SlackCanvasResult::fulfilled_read`] /
+//! [`SlackCanvasResult::fulfilled_list`] — the typed fulfillment seam this runtime
+//! defines so content flows through the moment the bridge provides it.
 
 use async_trait::async_trait;
-use ocean_agent_sdk::slack_canvas::{SlackCanvasOp, SlackCanvasResult};
+use ocean_agent_sdk::slack_canvas::{CanvasFetchStatus, SlackCanvasOp, SlackCanvasResult};
 use serde_json::{json, Value};
 
 use crate::types::{AgentTool, AgentToolResult, ToolSideEffect};
@@ -133,32 +145,46 @@ impl AgentTool for SlackCanvasTool {
             _ => {}
         }
 
-        // --- build the contracted result. The bridge (later phase) fills the
-        // awareness/list payloads with live Slack data and flips `bridged`. ---
-        let (canvas_id, contents, canvases) = match &op {
-            SlackCanvasOp::Create { .. } => (None, None, None),
-            SlackCanvasOp::Read { canvas_id } => (
-                Some(canvas_id.clone()),
-                // Contracted awareness placeholder until the bridge fetches the
-                // real canvas body. Shape is stable so the agent + tests can rely
-                // on `contents` being the read-back channel.
-                Some(String::new()),
-                None,
-            ),
-            SlackCanvasOp::Update { canvas_id, .. } | SlackCanvasOp::Append { canvas_id, .. } => {
-                (Some(canvas_id.clone()), None, None)
+        // --- build the contracted result.
+        //
+        // OCEAN-235: the runtime cannot itself fetch live Slack canvas content —
+        // it holds no Slack token and no Slack API client (by design: all Slack
+        // I/O lives in the `ocean-agents` Python bridge transport). So for the
+        // awareness ops (`read`/`list`) the runtime emits an **honest** pending
+        // result and forwards the op onto the event bus; the Slack bridge fetches
+        // the live content and stamps it back through
+        // `SlackCanvasResult::fulfilled_read` / `fulfilled_list`.
+        //
+        // Crucially, a pending `read` carries **no** `contents` (not an empty
+        // string) and is marked `CanvasFetchStatus::PendingBridge`, so the agent
+        // can never mistake an un-fulfilled read for a genuinely empty canvas.
+        let result = match &op {
+            SlackCanvasOp::Create { .. } => SlackCanvasResult {
+                ok: true,
+                op: op_name.to_string(),
+                canvas_id: None,
+                contents: None,
+                canvases: None,
+                fetch_status: CanvasFetchStatus::NotApplicable,
+                bridged: false,
+                metadata: Value::Null,
+            },
+            SlackCanvasOp::Read { canvas_id } => {
+                SlackCanvasResult::pending_read(canvas_id.clone())
             }
-            SlackCanvasOp::List { .. } => (None, None, Some(Vec::new())),
-        };
-
-        let result = SlackCanvasResult {
-            ok: true,
-            op: op_name.to_string(),
-            canvas_id,
-            contents,
-            canvases,
-            bridged: false,
-            metadata: Value::Null,
+            SlackCanvasOp::Update { canvas_id, .. } | SlackCanvasOp::Append { canvas_id, .. } => {
+                SlackCanvasResult {
+                    ok: true,
+                    op: op_name.to_string(),
+                    canvas_id: Some(canvas_id.clone()),
+                    contents: None,
+                    canvases: None,
+                    fetch_status: CanvasFetchStatus::NotApplicable,
+                    bridged: false,
+                    metadata: Value::Null,
+                }
+            }
+            SlackCanvasOp::List { .. } => SlackCanvasResult::pending_list(),
         };
 
         let summary = match &op {
@@ -245,23 +271,31 @@ mod tests {
         assert_eq!(res.details["op"], "create");
     }
 
-    /// `read` is the awareness op: the result carries the canvas_id and a
-    /// `contents` field (the read-back channel) the agent reasons over.
+    /// `read` is the awareness op. OCEAN-235: until the bridge fetches live
+    /// content the runtime returns an **honest pending** result — it carries the
+    /// canvas_id and is marked `fetch_status: "pending_bridge"` with `bridged:
+    /// false`, and it does **not** fabricate a `contents` value (the key is
+    /// absent), so the agent can't mistake an un-fulfilled read for an empty
+    /// canvas. The read op is forwarded as a side effect for the bridge to fulfill.
     #[tokio::test]
-    async fn slack_canvas_read_returns_contents_field() {
+    async fn slack_canvas_read_is_honest_pending_not_fake_empty() {
         let tool = SlackCanvasTool;
         let args = json!({ "op": "read", "canvas_id": "F0123ABCD" });
         let res = tool.execute("call-3", args).await.expect("valid read");
         assert_eq!(res.details["op"], "read");
         assert_eq!(res.details["canvas_id"], "F0123ABCD");
-        // `contents` is present (the awareness channel), even if empty until the
-        // bridge populates live data.
+        // Honesty marker: pending, not fetched, not bridged.
+        assert_eq!(res.details["fetch_status"], "pending_bridge");
+        assert_eq!(res.details["bridged"], false);
+        // The `contents` key must be ABSENT — never an empty string masquerading
+        // as a genuinely empty canvas body.
         assert!(
-            res.details.get("contents").is_some(),
-            "read result must carry a contents field: {}",
+            res.details.get("contents").is_none(),
+            "pending read must not fabricate a contents value: {}",
             res.details
         );
 
+        // The op is forwarded so the bridge can fetch and fulfill it.
         match &res.side_effects[0] {
             ToolSideEffect::SlackCanvas {
                 op: SlackCanvasOp::Read { canvas_id },
@@ -303,14 +337,42 @@ mod tests {
         assert_eq!(res.details["canvas_id"], "F1");
     }
 
-    /// A valid `list` is accepted and carries a `canvases` array.
+    /// A valid `list` is accepted. OCEAN-235: like `read`, it returns an honest
+    /// pending result — `fetch_status: "pending_bridge"`, no fabricated `canvases`
+    /// array — until the bridge resolves the channel's real canvases.
     #[tokio::test]
-    async fn slack_canvas_accepts_list() {
+    async fn slack_canvas_list_is_honest_pending() {
         let tool = SlackCanvasTool;
         let args = json!({ "op": "list", "channel_id": "C1" });
         let res = tool.execute("call-6", args).await.expect("valid list");
         assert_eq!(res.details["op"], "list");
-        assert!(res.details["canvases"].is_array());
+        assert_eq!(res.details["fetch_status"], "pending_bridge");
+        assert_eq!(res.details["bridged"], false);
+        assert!(
+            res.details.get("canvases").is_none(),
+            "pending list must not fabricate a canvases array: {}",
+            res.details
+        );
+    }
+
+    /// Mutating ops carry `fetch_status: "not_applicable"` — they are complete on
+    /// their own and don't await any bridge fetch.
+    #[tokio::test]
+    async fn slack_canvas_mutating_ops_are_not_applicable() {
+        let tool = SlackCanvasTool;
+        for args in [
+            json!({ "op": "create", "title": "T" }),
+            json!({ "op": "update", "canvas_id": "F1", "markdown": "x" }),
+            json!({ "op": "append", "canvas_id": "F1", "markdown": "x" }),
+        ] {
+            let op = args["op"].as_str().unwrap().to_string();
+            let res = tool.execute("call-na", args).await.expect("valid mutating op");
+            assert_eq!(
+                res.details["fetch_status"], "not_applicable",
+                "{op} should be not_applicable: {}",
+                res.details
+            );
+        }
     }
 
     /// Missing `op` is rejected.

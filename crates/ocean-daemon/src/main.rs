@@ -5339,6 +5339,54 @@ async fn agent_turn(
                         patches: envelopes,
                     });
                 }
+                AgentEvent::SlackCanvas { op, .. } => {
+                    // OCEAN-235: relay the validated slack_canvas op onto
+                    // `/v1/agent/events` scoped to this session, so the Slack
+                    // canvas bridge (`ocean-agents`) can consume it and round-trip
+                    // to the Slack Canvas API. Before this, the event hit the
+                    // `_ => {}` catch-all below and was silently dropped — the
+                    // bridge could never see a `read` request to fulfill.
+                    //
+                    // We attach the runtime's contracted result for the op (the
+                    // honest *pending* shape for `read`/`list`) so a bridge has
+                    // both the op to fulfill and the result shape to stamp live
+                    // content into via
+                    // `SlackCanvasResult::fulfilled_read`/`fulfilled_list`.
+                    use ocean_agent_sdk::slack_canvas::{SlackCanvasOp, SlackCanvasResult};
+                    let result = match &op {
+                        SlackCanvasOp::Read { canvas_id } => {
+                            SlackCanvasResult::pending_read(canvas_id.clone())
+                        }
+                        SlackCanvasOp::List { .. } => SlackCanvasResult::pending_list(),
+                        SlackCanvasOp::Create { .. } => SlackCanvasResult {
+                            ok: true,
+                            op: "create".to_string(),
+                            canvas_id: None,
+                            contents: None,
+                            canvases: None,
+                            fetch_status: Default::default(),
+                            bridged: false,
+                            metadata: serde_json::Value::Null,
+                        },
+                        SlackCanvasOp::Update { canvas_id, .. }
+                        | SlackCanvasOp::Append { canvas_id, .. } => SlackCanvasResult {
+                            ok: true,
+                            op: op.op_name().to_string(),
+                            canvas_id: Some(canvas_id.clone()),
+                            contents: None,
+                            canvases: None,
+                            fetch_status: Default::default(),
+                            bridged: false,
+                            metadata: serde_json::Value::Null,
+                        },
+                    };
+                    bridge_bus.emit(AgentTurnEvent::SlackCanvas {
+                        session_id: bridge_session_id,
+                        turn_id: bridge_turn_id,
+                        op,
+                        result,
+                    });
+                }
                 _ => {}
             }
         }
@@ -6058,6 +6106,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
         AgentTurnEvent::ComponentUnmount { .. } => None,
         AgentTurnEvent::BrowserActivity { .. } => None,
         AgentTurnEvent::SurfacePatch { .. } => None,
+        AgentTurnEvent::SlackCanvas { .. } => None,
     }
 }
 
@@ -6076,6 +6125,7 @@ fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
         AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
         AgentTurnEvent::BrowserActivity { .. } => "browser_activity",
         AgentTurnEvent::SurfacePatch { .. } => "surface_patch",
+        AgentTurnEvent::SlackCanvas { .. } => "slack_canvas",
     }
 }
 
@@ -6503,6 +6553,75 @@ mod tests {
         assert!(
             !leaked_patch,
             "session B's replay must never include session A's surface_patch"
+        );
+    }
+
+    // ---- OCEAN-235: slack_canvas events are relayed + session-scoped ----
+
+    /// A pending-read `slack_canvas` event, as the daemon relay (OCEAN-235) emits
+    /// it for an agent `read`: the validated op plus the runtime's honest pending
+    /// result the bridge fulfills.
+    fn slack_canvas_read_event(session_id: AgentSessionId, canvas: &str) -> AgentTurnEvent {
+        use ocean_agent_sdk::slack_canvas::{SlackCanvasId, SlackCanvasOp, SlackCanvasResult};
+        let id = SlackCanvasId::new(canvas);
+        AgentTurnEvent::SlackCanvas {
+            session_id,
+            turn_id: AgentTurnId::new_v4(),
+            op: SlackCanvasOp::Read {
+                canvas_id: id.clone(),
+            },
+            result: SlackCanvasResult::pending_read(id),
+        }
+    }
+
+    #[test]
+    fn slack_canvas_event_reports_its_session_and_carries_honest_pending() {
+        // The relayed event must carry its session id (so the SSE filter can scope
+        // it) and the honest pending result (no fabricated contents) the bridge
+        // fulfills downstream.
+        use ocean_agent_sdk::slack_canvas::CanvasFetchStatus;
+        let sid = AgentSessionId::new_v4();
+        let ev = slack_canvas_read_event(sid, "F0123ABCD");
+        assert_eq!(
+            ev.session_id(),
+            Some(sid),
+            "SlackCanvas must be session-scoped, not global"
+        );
+        let AgentTurnEvent::SlackCanvas { result, .. } = &ev else {
+            panic!("expected SlackCanvas event");
+        };
+        assert_eq!(result.fetch_status, CanvasFetchStatus::PendingBridge);
+        assert!(!result.bridged, "runtime-emitted read is not yet bridged");
+        assert!(
+            result.contents.is_none(),
+            "a pending read must not fabricate contents on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_canvas_event_is_scoped_to_its_session() {
+        // OCEAN-235 wires the relay so the bridge can see read requests; that
+        // relay must respect the same cross-session isolation as every other
+        // session-bearing event (it previously hit `_ => {}` and was dropped).
+        let a = AgentSessionId::new_v4();
+        let b = AgentSessionId::new_v4();
+        let ev = slack_canvas_read_event(a, "F0123ABCD");
+
+        assert!(
+            should_emit_agent_event(Some(a), false, &ev),
+            "the originating session must receive its own slack_canvas event"
+        );
+        assert!(
+            !should_emit_agent_event(Some(b), false, &ev),
+            "an unrelated session must NOT receive another session's slack_canvas event"
+        );
+        assert!(
+            !should_emit_agent_event(None, false, &ev),
+            "session-bearing slack_canvas needs ?all=1 to reach the firehose"
+        );
+        assert!(
+            should_emit_agent_event(None, true, &ev),
+            "the ?all=1 firehose receives session-bearing slack_canvas events"
         );
     }
 

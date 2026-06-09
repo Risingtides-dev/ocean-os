@@ -99,6 +99,7 @@ pub fn event_to_update(event: &AgentTurnEvent) -> Option<SessionUpdate> {
         | AgentTurnEvent::ComponentUnmount { .. }
         | AgentTurnEvent::BrowserActivity { .. }
         | AgentTurnEvent::SurfacePatch { .. }
+        | AgentTurnEvent::SlackCanvas { .. }
         | AgentTurnEvent::Extension { .. } => None,
     }
 }

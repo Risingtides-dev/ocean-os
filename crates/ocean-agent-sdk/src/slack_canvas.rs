@@ -32,6 +32,31 @@
 //!   directly.
 //! - Free-form fields use `serde_json::Value` so richer producers' unknown fields
 //!   survive a roundtrip untouched.
+//!
+//! # Bridge fetch contract (OCEAN-235) — what each side owns
+//!
+//! Reading a canvas's live contents spans **two repos**, because all Slack I/O
+//! (and the Slack token) lives in the `ocean-agents` Python bridge, not in this
+//! runtime. The split:
+//!
+//! - **This runtime (ocean-os) owns the seam.** The `slack_canvas` tool returns an
+//!   honest *pending* result for `read`/`list` ([`SlackCanvasResult::pending_read`]
+//!   / [`SlackCanvasResult::pending_list`]) — `fetch_status: pending_bridge`, no
+//!   fabricated content — and emits the op as a `ToolSideEffect`. The daemon relays
+//!   it as `AgentTurnEvent::SlackCanvas` over `/v1/agent/events`, scoped to the
+//!   session. The typed fulfillment constructors
+//!   ([`SlackCanvasResult::fulfilled_read`] / [`SlackCanvasResult::fulfilled_list`])
+//!   are the entry points the bridge stamps live content into.
+//!
+//! - **The `ocean-agents` bridge must still provide the fetch.** To complete a
+//!   `read`/`list` it must: (1) consume the `slack_canvas` event from the daemon
+//!   SSE stream, (2) call the Slack API for the live canvas body — note the
+//!   transport (`couriers/transport/slack.py`) currently has only `create_canvas`,
+//!   so a **read method is new work there** (resolve the canvas file via
+//!   `files.info`/lookup and pull its markdown), and (3) surface the fetched
+//!   content back to the agent as a fulfilled [`SlackCanvasResult`]. Until the
+//!   bridge ships that, the agent correctly sees `pending_bridge`, never a fake
+//!   empty canvas.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -206,14 +231,53 @@ pub struct SlackCanvasSummary {
     pub title: Option<String>,
 }
 
+/// Fulfillment state of a `read`/`list` awareness op — whether the Slack bridge
+/// has actually fetched live content yet.
+///
+/// This is the **honesty marker** the agent reasons over. The critical case is a
+/// `read` whose bridge fetch has not completed: the result must *not* hand the
+/// agent an empty string (indistinguishable from "the canvas is genuinely
+/// empty"). Instead [`SlackCanvasResult::contents`] is left `None` and the status
+/// is [`CanvasFetchStatus::PendingBridge`], so the agent knows it is looking at an
+/// un-fulfilled awareness op rather than real, empty content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasFetchStatus {
+    /// Not an awareness op (`create`/`update`/`append`) — fetch status is N/A.
+    #[default]
+    NotApplicable,
+    /// An awareness op (`read`/`list`) whose live fetch the Slack bridge has not
+    /// fulfilled yet. The runtime emits the op onto the event bus and returns this
+    /// status synchronously; `contents`/`canvases` carry **no** live data. The
+    /// agent must treat the awareness payload as *unknown*, not as empty.
+    PendingBridge,
+    /// The bridge fetched live Slack content and stamped it into this result.
+    /// `contents` (for `read`) / `canvases` (for `list`) are authoritative.
+    Fetched,
+}
+
+impl CanvasFetchStatus {
+    /// Whether live content has actually been fetched. `false` for both
+    /// [`Self::NotApplicable`] and [`Self::PendingBridge`].
+    pub fn is_fetched(&self) -> bool {
+        matches!(self, CanvasFetchStatus::Fetched)
+    }
+}
+
 /// Structured result returned by the `slack_canvas` tool, echoing which op ran and
 /// carrying the data the agent reasons over.
 ///
-/// In Phase 2 the runtime emits a **well-formed contract** result so the agent
-/// loop and tests work end-to-end; the bridge (a later phase) is what fills
-/// [`contents`](Self::contents) (for `read`) and [`canvases`](Self::canvases)
-/// (for `list`) with real Slack data and stamps the authoritative `canvas_id` for
-/// `create`.
+/// The runtime emits a **well-formed contract** result so the agent loop and tests
+/// work end-to-end. For the mutating ops (`create`/`update`/`append`) that result
+/// is complete on its own. For the **awareness** ops (`read`/`list`) the live
+/// Slack content is fetched by the Slack bridge (`ocean-agents`), which round-trips
+/// the op to the Slack Canvas API and stamps the content back in via
+/// [`SlackCanvasResult::fulfilled_read`] / [`SlackCanvasResult::fulfilled_list`].
+///
+/// Until that fetch lands, an awareness result is marked
+/// [`CanvasFetchStatus::PendingBridge`] and carries **no** fabricated content —
+/// the agent is told plainly that the read is not yet fulfilled rather than being
+/// handed an empty string that looks like a genuinely empty canvas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlackCanvasResult {
     pub ok: bool,
@@ -223,22 +287,110 @@ pub struct SlackCanvasResult {
     /// `list`, and for `create` until the bridge mints the real id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canvas_id: Option<SlackCanvasId>,
-    /// **Awareness payload** for `read`: the current markdown contents of the
-    /// canvas the agent can reason over. `None` for non-read ops, and a contracted
-    /// placeholder until the bridge populates live contents.
+    /// **Awareness payload** for `read`: the live markdown contents of the canvas
+    /// the agent reasons over. `None` for non-read ops **and** for a `read` whose
+    /// bridge fetch is still [`CanvasFetchStatus::PendingBridge`] — absence here is
+    /// deliberate, so an unfulfilled read is never mistaken for an empty canvas.
+    /// `Some(..)` only once the bridge has fetched real content
+    /// ([`CanvasFetchStatus::Fetched`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contents: Option<String>,
-    /// Result of a `list` op: the canvases visible in the channel. Empty/`None`
-    /// for non-list ops.
+    /// Result of a `list` op: the canvases visible in the channel. `None` for
+    /// non-list ops and for a `list` still pending the bridge fetch; `Some(..)`
+    /// (possibly empty) once the bridge has resolved the channel listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canvases: Option<Vec<SlackCanvasSummary>>,
-    /// Whether the bridge round-trip to the Slack API has happened yet. `false`
-    /// in Phase 2 (the tool emits a contracted op the bridge has not yet fulfilled
-    /// against the live Slack Canvas API). The bridge flips this to `true`.
+    /// Fetch state of an awareness op — the honesty marker the agent reads.
+    /// [`CanvasFetchStatus::PendingBridge`] for an un-fulfilled `read`/`list`,
+    /// [`CanvasFetchStatus::Fetched`] once the bridge stamps live content, and
+    /// [`CanvasFetchStatus::NotApplicable`] for the mutating ops.
+    #[serde(default)]
+    pub fetch_status: CanvasFetchStatus,
+    /// Whether the bridge round-trip to the Slack API has happened for this result.
+    /// `false` when the runtime emits the contracted op the bridge has not yet
+    /// fulfilled; the bridge flips it to `true` when it stamps live content back in.
     pub bridged: bool,
     /// Free-form passthrough metadata, reserved for the bridge.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
+}
+
+impl SlackCanvasResult {
+    /// The contracted result the **runtime** returns for an awareness `read` before
+    /// the bridge has fetched anything: `contents` is `None`, the fetch is marked
+    /// [`CanvasFetchStatus::PendingBridge`], and `bridged` is `false`. This is the
+    /// honest placeholder — the agent sees an explicitly *unfulfilled* read, not an
+    /// empty canvas.
+    pub fn pending_read(canvas_id: SlackCanvasId) -> Self {
+        Self {
+            ok: true,
+            op: "read".to_string(),
+            canvas_id: Some(canvas_id),
+            contents: None,
+            canvases: None,
+            fetch_status: CanvasFetchStatus::PendingBridge,
+            bridged: false,
+            metadata: Value::Null,
+        }
+    }
+
+    /// The contracted result the **runtime** returns for a `list` before the bridge
+    /// has resolved the channel's canvases: `canvases` is `None`, the fetch is
+    /// [`CanvasFetchStatus::PendingBridge`], and `bridged` is `false`.
+    pub fn pending_list() -> Self {
+        Self {
+            ok: true,
+            op: "list".to_string(),
+            canvas_id: None,
+            contents: None,
+            canvases: None,
+            fetch_status: CanvasFetchStatus::PendingBridge,
+            bridged: false,
+            metadata: Value::Null,
+        }
+    }
+
+    /// The fulfillment seam for a `read`: the **bridge** calls this with the live
+    /// markdown it fetched from Slack to turn a [`Self::pending_read`] into an
+    /// authoritative awareness result — `contents` populated,
+    /// [`CanvasFetchStatus::Fetched`], `bridged: true`.
+    ///
+    /// This is the typed entry point the `ocean-agents` Slack bridge fills; the
+    /// runtime defines it so the seam is real and the content flows through the
+    /// moment the bridge provides it. `metadata` carries any bridge passthrough
+    /// (e.g. Slack file/revision ids); pass [`Value::Null`] for none.
+    pub fn fulfilled_read(
+        canvas_id: SlackCanvasId,
+        contents: impl Into<String>,
+        metadata: Value,
+    ) -> Self {
+        Self {
+            ok: true,
+            op: "read".to_string(),
+            canvas_id: Some(canvas_id),
+            contents: Some(contents.into()),
+            canvases: None,
+            fetch_status: CanvasFetchStatus::Fetched,
+            bridged: true,
+            metadata,
+        }
+    }
+
+    /// The fulfillment seam for a `list`: the **bridge** calls this with the
+    /// canvases it resolved for the channel, turning a [`Self::pending_list`] into
+    /// an authoritative listing — [`CanvasFetchStatus::Fetched`], `bridged: true`.
+    pub fn fulfilled_list(canvases: Vec<SlackCanvasSummary>, metadata: Value) -> Self {
+        Self {
+            ok: true,
+            op: "list".to_string(),
+            canvas_id: None,
+            contents: None,
+            canvases: Some(canvases),
+            fetch_status: CanvasFetchStatus::Fetched,
+            bridged: true,
+            metadata,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +550,7 @@ mod tests {
     }
 
     /// The result serializes to the contracted shape; `None` fields are omitted.
+    /// `fetch_status` is always present (the honesty marker is never dropped).
     #[test]
     fn result_omits_empty_optionals() {
         let res = SlackCanvasResult {
@@ -406,7 +559,8 @@ mod tests {
             canvas_id: Some(SlackCanvasId::new("F1")),
             contents: Some("# current".into()),
             canvases: None,
-            bridged: false,
+            fetch_status: CanvasFetchStatus::Fetched,
+            bridged: true,
             metadata: Value::Null,
         };
         let v = serde_json::to_value(&res).unwrap();
@@ -417,8 +571,86 @@ mod tests {
                 "op": "read",
                 "canvas_id": "F1",
                 "contents": "# current",
-                "bridged": false
+                "fetch_status": "fetched",
+                "bridged": true
             })
         );
+    }
+
+    /// A pending `read` is **honest**: no `contents` key at all (not an empty
+    /// string), `fetch_status: "pending_bridge"`, `bridged: false`. This is the
+    /// core OCEAN-235 guarantee — an un-fulfilled read can't be mistaken for an
+    /// empty canvas.
+    #[test]
+    fn pending_read_carries_no_contents_and_is_marked_pending() {
+        let res = SlackCanvasResult::pending_read(SlackCanvasId::new("F0123ABCD"));
+        assert!(res.ok);
+        assert_eq!(res.op, "read");
+        assert_eq!(res.fetch_status, CanvasFetchStatus::PendingBridge);
+        assert!(!res.bridged);
+        assert!(res.contents.is_none(), "pending read must not fabricate contents");
+        assert!(!res.fetch_status.is_fetched());
+
+        let v = serde_json::to_value(&res).unwrap();
+        assert!(
+            v.get("contents").is_none(),
+            "the `contents` key must be ABSENT for a pending read, not empty: {v}"
+        );
+        assert_eq!(v["fetch_status"], "pending_bridge");
+        assert_eq!(v["bridged"], false);
+    }
+
+    /// The bridge fulfillment seam stamps live content and flips the markers.
+    #[test]
+    fn fulfilled_read_carries_live_contents() {
+        let res = SlackCanvasResult::fulfilled_read(
+            SlackCanvasId::new("F1"),
+            "# Real canvas body\n- fetched from Slack",
+            json!({ "slack_file_id": "F1", "revision": 7 }),
+        );
+        assert_eq!(res.fetch_status, CanvasFetchStatus::Fetched);
+        assert!(res.fetch_status.is_fetched());
+        assert!(res.bridged);
+        assert_eq!(
+            res.contents.as_deref(),
+            Some("# Real canvas body\n- fetched from Slack")
+        );
+        assert_eq!(res.metadata["slack_file_id"], "F1");
+    }
+
+    /// A pending `list` carries no `canvases` and is marked pending; the
+    /// fulfillment seam stamps the resolved listing.
+    #[test]
+    fn list_pending_then_fulfilled() {
+        let pending = SlackCanvasResult::pending_list();
+        assert_eq!(pending.op, "list");
+        assert_eq!(pending.fetch_status, CanvasFetchStatus::PendingBridge);
+        assert!(pending.canvases.is_none());
+        assert!(!pending.bridged);
+
+        let fulfilled = SlackCanvasResult::fulfilled_list(
+            vec![SlackCanvasSummary {
+                canvas_id: SlackCanvasId::new("F9"),
+                title: Some("Plan".into()),
+            }],
+            Value::Null,
+        );
+        assert_eq!(fulfilled.fetch_status, CanvasFetchStatus::Fetched);
+        assert!(fulfilled.bridged);
+        assert_eq!(fulfilled.canvases.as_ref().unwrap().len(), 1);
+    }
+
+    /// `fetch_status` defaults to `not_applicable` when absent on the wire, so a
+    /// mutating-op result (or an older producer) deserializes cleanly.
+    #[test]
+    fn fetch_status_defaults_to_not_applicable() {
+        let res: SlackCanvasResult = serde_json::from_value(json!({
+            "ok": true,
+            "op": "create",
+            "bridged": false
+        }))
+        .expect("result without fetch_status deserializes");
+        assert_eq!(res.fetch_status, CanvasFetchStatus::NotApplicable);
+        assert!(!res.fetch_status.is_fetched());
     }
 }
