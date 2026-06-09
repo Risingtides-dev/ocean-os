@@ -41,6 +41,7 @@ pub mod prepare;
 pub mod quorum;
 pub mod registry;
 pub mod replay;
+pub mod subagent;
 
 pub use agent::ModelHandle;
 pub use longhouse_provider::{LonghouseProvider, LonghouseRegistryHandle};
@@ -61,6 +62,10 @@ pub use escrow::{
 pub use quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
 pub use registry::{LonghouseRegistry, TopicSnapshot, TopicState};
 pub use replay::{replay, sweep, RecordedMark, RecordedMarkKind, Recording, ReplayResult};
+pub use subagent::{
+    assemble_spec, ModelPolicy, SubagentRequest, SubagentSpec, DEFAULT_BUDGET_TOKENS,
+    DEFAULT_MAX_TURNS, DEFAULT_SKILL_COUNT,
+};
 
 // Re-export the SDK event vocabulary so daemon callers can `use
 // ocean_longhouse::{LonghouseEvent, Federation, ...}` from one place.

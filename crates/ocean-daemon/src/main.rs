@@ -1552,6 +1552,7 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/longhouse/prepare",
             "POST /v1/skills/query",
             "POST /v1/skills/fetch",
+            "POST /v1/subagents/spec",
             "GET /v1/longhouse/topics",
             "GET /v1/longhouse/topics/{topic_id}",
             "POST /v1/longhouse/claim",
@@ -2263,6 +2264,11 @@ fn longhouse_routes() -> Router<AppState> {
         // ranks, `fetch` returns one skill's full body. Advisory + read-only.
         .route("/v1/skills/query", post(skills_query))
         .route("/v1/skills/fetch", post(skills_fetch))
+        // Subagent-spec assembler (OCEAN-282): composes a SubagentSpec (role,
+        // model policy, skill ids, allowed tools, memory namespace, output
+        // schema, max turns, budget) from the same SkillIndex + defaults.
+        // Advisory + read-only — RETURNS a spec, spawns nothing.
+        .route("/v1/subagents/spec", post(subagent_spec))
         .route("/v1/longhouse/topics", get(longhouse_topics))
         .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
         // OCEAN-272: the persisted-escrow ops `longhouse_provider.rs` deferred.
@@ -2981,6 +2987,140 @@ enum SkillFetchOutcome {
     Unknown,
     /// Id matched, but the file could not be read (TOCTOU race) → `500`.
     Unreadable { error: String },
+}
+
+// --- Subagent-spec API: /v1/subagents/spec (OCEAN-282, builds on OCEAN-281) ----
+//
+// `docs/LONGHOUSE.md` §"Subagent future" (lines 138-154): Longhouse should
+// assemble a *subagent spec* — role, objective, model policy, skill ids, allowed
+// tools, memory namespace, output schema, max turns, budget — "from skills +
+// routines + token scopes + memory + model/tool policy". This endpoint exposes
+// that assembler. Given a desired role/intent (plus optional constraint
+// overrides), it returns a fully-formed `SubagentSpec`.
+//
+// The skill-id half **reuses OCEAN-281's `SkillIndex`** verbatim — the exact
+// indexer `skills_query` / `longhouse_prepare` rank with — so the `skill_ids` on
+// the returned spec are the same fetchable `source_path` ids the
+// `POST /v1/skills/fetch` endpoint resolves to full bodies. Spec → fetch each
+// listed skill → assemble the subagent prompt is a coherent downstream flow.
+//
+// **Advisory + read-only + fail-open** (the repo's Longhouse rule + line 154):
+// it loads the index, ranks, composes defaults, and RETURNS a spec. It does NOT
+// spawn anything and does NOT bypass a permission gate — a spawned subagent's
+// own local side effects would still route through the daemon. The disk scan
+// runs on `spawn_blocking`, exactly like `skills_query` / `skills_fetch`. An
+// empty/garbled role yields a minimal valid spec (generic assistant), never an
+// error. The whole composition lives in `ocean_longhouse::assemble_spec`; this
+// handler is just the HTTP shell that loads the index off disk and serializes.
+
+/// Request body for `POST /v1/subagents/spec` — describe a subagent to spec.
+///
+/// Only `role` carries weight; everything else overrides an assembler default,
+/// so the minimal request is `{ "role": "..." }`. Mirrors the librarian's `cwd`
+/// scoping so repo-local `./skills` rank alongside the home libraries.
+#[derive(serde::Deserialize)]
+struct SubagentSpecRequest {
+    /// The desired role / intent. Empty → a minimal generic spec (fail-open).
+    #[serde(default)]
+    role: String,
+    /// What the subagent is for, if distinct from the role (drives skill
+    /// ranking when present; falls back to the role).
+    #[serde(default)]
+    objective: Option<String>,
+    /// Model-policy override: `"cheap"` | `"standard"` | `"frontier"` (+ a few
+    /// synonyms). Unrecognized/omitted → inferred from the role.
+    #[serde(default)]
+    model_policy: Option<String>,
+    /// Working directory to scope repo-local `./skills` into the scan, on top of
+    /// the documented home libraries (`SkillRoots::for_cwd`).
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Cap on how many skill ids the spec carries. Defaults to
+    /// [`ocean_longhouse::DEFAULT_SKILL_COUNT`].
+    #[serde(default)]
+    skill_count: Option<usize>,
+    /// Output-schema hint carried onto the spec. Defaults to `"text"`.
+    #[serde(default)]
+    output_schema: Option<String>,
+    /// Hard turn-ceiling override. Defaults per model policy.
+    #[serde(default)]
+    max_turns: Option<u32>,
+    /// Token-budget override. Defaults per model policy.
+    #[serde(default)]
+    budget: Option<u64>,
+    /// Extra tools to allow on top of the role-derived set (deliberate widen).
+    #[serde(default)]
+    extra_tools: Vec<String>,
+}
+
+/// `POST /v1/subagents/spec` — assemble a subagent spec from skills + defaults
+/// (OCEAN-282).
+///
+/// Runs `ocean_longhouse::assemble_spec` over the shared
+/// [`ocean_longhouse::SkillIndex`] (the OCEAN-281 indexer): ranks the documented
+/// skill dirs against the role/objective to pick the spec's `skill_ids`, infers
+/// or honors a model policy, derives a conservative read-leaning allowed-tool
+/// set (widened by the role's capability keywords + any `extra_tools`), and
+/// fills the memory namespace / output schema / max turns / budget. Returns the
+/// assembled [`ocean_longhouse::SubagentSpec`] as JSON under `spec`.
+///
+/// **Advisory + read-only + fail-open** (matches `skills_query`): no execution,
+/// no permission gate, no spawn. An empty/garbled role yields a minimal valid
+/// spec rather than an error. The disk walk runs on `spawn_blocking`; a task
+/// failure collapses to a spec assembled against an empty index (still valid).
+async fn subagent_spec(Json(req): Json<SubagentSpecRequest>) -> Json<serde_json::Value> {
+    let SubagentSpecRequest {
+        role,
+        objective,
+        model_policy,
+        cwd,
+        skill_count,
+        output_schema,
+        max_turns,
+        budget,
+        extra_tools,
+    } = req;
+
+    let request = ocean_longhouse::SubagentRequest {
+        role,
+        objective,
+        model_policy,
+        cwd: cwd.clone(),
+        skill_count,
+        output_schema,
+        max_turns,
+        budget,
+        extra_tools,
+    };
+
+    // Load the index + assemble on a blocking thread — same rationale as
+    // `skills_query`: the loader walks the skill dirs (filesystem I/O) and must
+    // stay off the async scheduler. Fail-open: a JoinError collapses to a spec
+    // assembled against an empty index, which is still a valid minimal spec.
+    let spec = tokio::task::spawn_blocking(move || {
+        let roots = match request.cwd.as_deref() {
+            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
+            _ => ocean_longhouse::SkillRoots::default(),
+        };
+        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        ocean_longhouse::assemble_spec(&request, &index)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "subagent spec task failed; assembling against empty index");
+        ocean_longhouse::assemble_spec(
+            &ocean_longhouse::SubagentRequest::default(),
+            &ocean_longhouse::SkillIndex::default(),
+        )
+    });
+
+    Json(json!({
+        "ok": true,
+        // Advisory: the assembler only composes + returns. No gate, no spawn.
+        "advisory": true,
+        // The assembled spec — `skill_ids` are fetchable via POST /v1/skills/fetch.
+        "spec": spec,
+    }))
 }
 
 // --- Call-transcript persistence: bounded retry + drop accounting (OCEAN-255) -
@@ -14888,6 +15028,185 @@ mod tests {
         // not a wildcard swallowing the /v1/skills namespace.
         let (miss, _) = post_json(app, "/v1/skills/nope", json!({})).await;
         assert_eq!(miss, StatusCode::NOT_FOUND);
+    }
+
+    // ---- OCEAN-282: subagent-spec /v1/subagents/spec ---------------------------
+    //
+    // The endpoint that assembles a `SubagentSpec` from the SAME `SkillIndex` the
+    // librarian (above) uses. Same hermetic trick: plant a uniquely-named
+    // repo-local skill under a temp `cwd` and a role that hits its nonce token, so
+    // the resolved `skill_ids` are deterministic regardless of the host's real
+    // libraries. These assert (a) a role returns a well-formed spec with the
+    // relevant skill ids resolved as fetchable source_paths + sensible defaults,
+    // (b) request overrides win, (c) the advisory/read-only contract on the wire,
+    // (d) an empty/garbled role is fail-open (a minimal valid spec, not an error),
+    // and (e) wiring through the REAL `longhouse_routes()` table.
+
+    #[tokio::test]
+    async fn subagent_spec_returns_well_formed_spec_with_resolved_skill_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        // Nonce token no real host skill carries → the match is unambiguously ours.
+        plant_repo_skill(
+            cwd,
+            "blorpsec",
+            "Blorpsec Audit",
+            "Use when auditing a blorpsec deployment for review",
+        );
+
+        let req = SubagentSpecRequest {
+            role: "review and audit the blorpsec deployment".to_string(),
+            objective: None,
+            model_policy: None,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            skill_count: None,
+            output_schema: None,
+            max_turns: None,
+            budget: None,
+            extra_tools: Vec::new(),
+        };
+        let Json(body) = subagent_spec(Json(req)).await;
+
+        assert_eq!(body["ok"], json!(true));
+        // Advisory contract asserted on the wire: assembler only composes + returns.
+        assert_eq!(
+            body["advisory"],
+            json!(true),
+            "spec endpoint must advertise itself advisory (no spawn / no gate bypass)"
+        );
+
+        let spec = &body["spec"];
+        assert_eq!(spec["role"], json!("review and audit the blorpsec deployment"));
+        // The planted skill must surface in skill_ids as a fetchable source_path.
+        let skill_ids = spec["skill_ids"].as_array().expect("skill_ids array");
+        assert!(
+            skill_ids
+                .iter()
+                .any(|id| id.as_str().unwrap().ends_with("skills/blorpsec/skill.yaml")),
+            "the planted skill must be resolved into skill_ids, got {skill_ids:?}"
+        );
+        // A review/audit role infers the Standard tier (no explicit override).
+        assert_eq!(spec["model_policy"], json!("standard"));
+        // Sensible defaults for the rest of the fields.
+        assert_eq!(spec["output_schema"], json!("text"));
+        assert_eq!(
+            spec["memory_namespace"],
+            json!("subagent/review-and-audit-the-blorpsec-deployment")
+        );
+        assert!(spec["max_turns"].as_u64().unwrap() > 0, "a finite turn ceiling");
+        assert!(spec["budget"].as_u64().unwrap() > 0, "a token budget");
+        // A pure review role keeps the read-leaning baseline (no write).
+        let tools = spec["allowed_tools"].as_array().expect("allowed_tools array");
+        assert!(
+            tools.iter().any(|t| t == "read_file"),
+            "baseline read tool present"
+        );
+        assert!(
+            !tools.iter().any(|t| t == "write_file"),
+            "review role must not unlock write_file, got {tools:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_spec_honors_request_overrides() {
+        let req = SubagentSpecRequest {
+            role: "anything".to_string(),
+            objective: Some("a very specific objective".to_string()),
+            model_policy: Some("frontier".to_string()),
+            cwd: None,
+            skill_count: Some(0),
+            output_schema: Some("json".to_string()),
+            max_turns: Some(3),
+            budget: Some(42),
+            extra_tools: vec!["custom_tool".to_string()],
+        };
+        let Json(body) = subagent_spec(Json(req)).await;
+        let spec = &body["spec"];
+        assert_eq!(spec["model_policy"], json!("frontier"));
+        assert_eq!(spec["objective"], json!("a very specific objective"));
+        assert_eq!(spec["output_schema"], json!("json"));
+        assert_eq!(spec["max_turns"], json!(3));
+        assert_eq!(spec["budget"], json!(42));
+        // skill_count: 0 means no skills regardless of library contents.
+        assert!(
+            spec["skill_ids"].as_array().unwrap().is_empty(),
+            "skill_count=0 yields no skill ids"
+        );
+        assert!(spec["allowed_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "custom_tool"));
+    }
+
+    #[tokio::test]
+    async fn subagent_spec_empty_role_is_fail_open() {
+        // A blank/garbled role yields a minimal VALID spec, never an error.
+        let req = SubagentSpecRequest {
+            role: "   ".to_string(),
+            objective: None,
+            model_policy: None,
+            cwd: None,
+            skill_count: None,
+            output_schema: None,
+            max_turns: None,
+            budget: None,
+            extra_tools: Vec::new(),
+        };
+        let Json(body) = subagent_spec(Json(req)).await;
+        assert_eq!(body["ok"], json!(true), "fail-open: ok with no error");
+        assert_eq!(body["advisory"], json!(true));
+        let spec = &body["spec"];
+        assert_eq!(spec["role"], json!("assistant"), "generic fallback role");
+        assert_eq!(spec["memory_namespace"], json!("subagent/assistant"));
+        assert_eq!(spec["model_policy"], json!("cheap"));
+        // Still a usable spec: baseline tools + a finite ceiling.
+        assert!(spec["allowed_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "read_file"));
+        assert!(spec["max_turns"].as_u64().unwrap() > 0);
+    }
+
+    /// The endpoint is reachable through the REAL `longhouse_routes()` table —
+    /// proves it's wired into the router `main()` mounts, not just callable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_spec_is_wired_into_longhouse_routes() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let app = longhouse_routes().with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/subagents/spec")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({ "role": "build a thing", "cwd": tmp.path().to_string_lossy() })
+                    .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "POST /v1/subagents/spec must be wired"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["advisory"], json!(true));
+        assert_eq!(body["spec"]["role"], json!("build a thing"));
+        // A "build" role unlocks write/exec through the real route.
+        assert!(body["spec"]["allowed_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "write_file"));
     }
 
     // ---- OCEAN-245: opt-in Longhouse pre-turn consult turn-hook ----------------

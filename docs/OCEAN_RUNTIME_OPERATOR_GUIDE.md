@@ -532,6 +532,9 @@ POST   /v1/longhouse/demo                 scripted demo harness (fake events)
 POST   /v1/longhouse/convene              convene a real council; events on /v1/agent/events
 POST   /v1/council/convene                alias of /v1/longhouse/convene (same handler)
 POST   /v1/longhouse/prepare              read-only pre-turn prep: compact skill briefs (advisory, no gate bypass)
+POST   /v1/skills/query                   skill-librarian prefilter: rank skills for an intent (advisory, read-only)
+POST   /v1/skills/fetch                   skill-librarian fetch: one skill's full body by id (advisory, read-only)
+POST   /v1/subagents/spec                 assemble a subagent spec from skills + defaults (advisory, returns a spec; no spawn)
 GET    /v1/longhouse/topics               list longhouse topics
 GET    /v1/longhouse/topics/{id}          longhouse topic detail
 
