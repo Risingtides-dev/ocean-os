@@ -12,7 +12,8 @@
 //! for one method — `create` / `get` / `list` / `update` / `close`,
 //! `add_participant` / `remove_participant` (with the same auto join/leave
 //! transcript markers the in-memory store writes), `append_message`,
-//! `transcript` (with `after_seq` tailing), and `trigger_policy`. The
+//! `transcript` / `transcript_page` (bounded `after_seq` tailing with a
+//! `LIMIT` + cursor, OCEAN-249), and `trigger_policy`. The
 //! [`RoomStore`] trait captures that shared shape so the in-memory registry and
 //! this SQLite store are interchangeable behind a `dyn RoomStore`.
 //!
@@ -91,8 +92,50 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub struct RoomRecord {
     /// The persistent room entity (id, name, roster, timestamps, trigger policy).
     pub room: Room,
-    /// Append-only transcript of room events, in `seq` order.
+    /// Append-only transcript of room events, in `seq` order. Bounded by
+    /// [`MAX_TRANSCRIPT_LIMIT`] — a record never hydrates an unbounded transcript
+    /// (OCEAN-249). For a transcript longer than that cap, page with
+    /// [`RoomStore::transcript_page`].
     pub transcript: Vec<RoomMessage>,
+}
+
+/// Default number of transcript rows returned when a caller does not specify a
+/// limit (OCEAN-249). Transcript reads used to be unbounded — a long-lived call
+/// room would re-read its entire log on every hydration (O(n) per poll, O(n²)
+/// over a session). This cap makes the default read bounded; callers that need
+/// more page through with the returned cursor.
+pub const DEFAULT_TRANSCRIPT_LIMIT: usize = 200;
+
+/// Hard ceiling on a single transcript page (OCEAN-249). A caller-supplied limit
+/// is clamped to this so no single query can be coerced into a full-table scan.
+pub const MAX_TRANSCRIPT_LIMIT: usize = 1000;
+
+/// One bounded page of a room transcript (OCEAN-249).
+///
+/// `messages` holds at most the effective limit of rows in ascending `seq`
+/// order. `next_seq` is the cursor a client replays as the next `after_seq` to
+/// fetch the following page; it is `Some(last_returned_seq)` when more rows exist
+/// and `None` when the page reached the end of the transcript. `has_more` is the
+/// same signal as a bool for callers that only need to know whether to keep
+/// paging.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptPage {
+    /// This page's messages, ascending by `seq`, at most the effective limit.
+    pub messages: Vec<RoomMessage>,
+    /// Cursor for the next page (`after_seq`), or `None` at the end.
+    pub next_seq: Option<u64>,
+    /// Whether at least one more row exists beyond this page.
+    pub has_more: bool,
+}
+
+/// Clamp a caller-supplied transcript limit into the allowed range. `None` (no
+/// limit given) maps to [`DEFAULT_TRANSCRIPT_LIMIT`]; any value is capped at
+/// [`MAX_TRANSCRIPT_LIMIT`] and floored at 1 so a `0` can never request an empty
+/// page that also reports `has_more = true`.
+pub fn clamp_transcript_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_TRANSCRIPT_LIMIT)
+        .clamp(1, MAX_TRANSCRIPT_LIMIT)
 }
 
 /// Error returned by store operations.
@@ -213,7 +256,30 @@ pub trait RoomStore {
     ) -> Result<RoomMessage>;
 
     /// Read a room's transcript, optionally only entries with `seq > after_seq`.
+    ///
+    /// **Bounded (OCEAN-249).** This returns at most [`DEFAULT_TRANSCRIPT_LIMIT`]
+    /// rows — it is no longer an unbounded full-table read. Callers that need to
+    /// page or that want the cursor/`has_more` signal should use
+    /// [`RoomStore::transcript_page`]; this method is kept as the convenience
+    /// "first page with the default cap" form for the many call sites that only
+    /// ever read a recent tail.
     fn transcript(&self, key: &RoomKey, after_seq: Option<u64>) -> Result<Vec<RoomMessage>>;
+
+    /// Read one bounded page of a room's transcript (OCEAN-249).
+    ///
+    /// Returns entries with `seq > after_seq` (or from the start when `None`) in
+    /// ascending `seq` order, at most `limit` rows. `limit` is clamped by
+    /// [`clamp_transcript_limit`]: `None` ⇒ [`DEFAULT_TRANSCRIPT_LIMIT`], and any
+    /// value is capped at [`MAX_TRANSCRIPT_LIMIT`]. The returned
+    /// [`TranscriptPage`] carries `next_seq` (the cursor to replay as the next
+    /// `after_seq`) and `has_more`. Page to the end by repeating with
+    /// `after_seq = next_seq` until `has_more` is false.
+    fn transcript_page(
+        &self,
+        key: &RoomKey,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<TranscriptPage>;
 
     /// The room's current trigger policy, if any.
     fn trigger_policy(&self, key: &RoomKey) -> Result<Option<RoomTriggerPolicy>>;
@@ -330,7 +396,14 @@ impl SqliteRoomStore {
 
         let trigger_policy = decode_policy(policy_json.as_deref())?;
         let participants = self.load_participants(key)?;
-        let transcript = self.load_transcript(key, None)?;
+        // A record's transcript is bounded (OCEAN-249): even the audit/closed-room
+        // view caps at MAX_TRANSCRIPT_LIMIT rather than hydrating an unbounded log.
+        // Callers needing the full history of a very long room page via
+        // `transcript_page`. This reads the first (oldest) page; the `has_more`
+        // signal is available through `transcript_page` for callers that care.
+        let transcript = self
+            .load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)?
+            .messages;
 
         let room = Room {
             id: RoomKey::new(id),
@@ -365,13 +438,32 @@ impl SqliteRoomStore {
         Ok(out)
     }
 
-    fn load_transcript(&self, key: &RoomKey, after_seq: Option<u64>) -> Result<Vec<RoomMessage>> {
+    /// Read a bounded slice of the transcript and report whether more rows exist
+    /// (OCEAN-249).
+    ///
+    /// The query carries a `LIMIT` so a long-lived room never triggers a
+    /// full-table scan. To know whether a *next* page exists without a second
+    /// `COUNT(*)` query, we ask SQLite for one extra row (`LIMIT limit + 1`): if
+    /// that sentinel comes back we drop it, keep exactly `limit` rows, and report
+    /// `has_more = true`. `effective_limit` is already clamped by the callers via
+    /// [`clamp_transcript_limit`]; it is passed in (not re-clamped here) so this
+    /// private helper has a single, predictable contract.
+    fn load_transcript_page(
+        &self,
+        key: &RoomKey,
+        after_seq: Option<u64>,
+        effective_limit: usize,
+    ) -> Result<TranscriptPage> {
         let after = after_seq.map(|s| s as i64).unwrap_or(-1);
+        // Fetch one extra row as the "is there a next page?" sentinel. Guard the
+        // `+ 1` against overflow on a pathological usize::MAX (clamp prevents it,
+        // but stay total) and bind as i64 for SQLite.
+        let fetch = effective_limit.saturating_add(1) as i64;
         let mut stmt = self.conn.prepare(
             "SELECT seq, author_id, author_kind, kind, body, created_at
-             FROM messages WHERE room_id = ?1 AND seq > ?2 ORDER BY seq",
+             FROM messages WHERE room_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![key.as_str(), after], |row| {
+        let rows = stmt.query_map(params![key.as_str(), after, fetch], |row| {
             let seq: i64 = row.get(0)?;
             let author_id: String = row.get(1)?;
             let author_kind: String = row.get(2)?;
@@ -392,7 +484,19 @@ impl SqliteRoomStore {
                 created_at: parse_ts(&created_at)?,
             });
         }
-        Ok(out)
+        // If we got the sentinel row back, there is at least one more page. Drop
+        // it so the page holds exactly `effective_limit` rows, then expose the
+        // last *kept* row's seq as the next cursor.
+        let has_more = out.len() > effective_limit;
+        if has_more {
+            out.truncate(effective_limit);
+        }
+        let next_seq = if has_more { out.last().map(|m| m.seq) } else { None };
+        Ok(TranscriptPage {
+            messages: out,
+            next_seq,
+            has_more,
+        })
     }
 
     /// Assign the next per-room seq and insert a message in one go. Caller must
@@ -700,10 +804,24 @@ impl RoomStore for SqliteRoomStore {
     }
 
     fn transcript(&self, key: &RoomKey, after_seq: Option<u64>) -> Result<Vec<RoomMessage>> {
+        // Bounded by default (OCEAN-249): delegate to the paged read with the
+        // default cap and hand back just the rows. Same open-room precondition as
+        // before — a closed room is still `UnknownRoom` here (the audit fallback
+        // lives in the daemon's handler).
+        Ok(self.transcript_page(key, after_seq, None)?.messages)
+    }
+
+    fn transcript_page(
+        &self,
+        key: &RoomKey,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<TranscriptPage> {
         if !self.room_is_open(key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        self.load_transcript(key, after_seq)
+        let effective_limit = clamp_transcript_limit(limit);
+        self.load_transcript_page(key, after_seq, effective_limit)
     }
 
     fn trigger_policy(&self, key: &RoomKey) -> Result<Option<RoomTriggerPolicy>> {
@@ -1065,6 +1183,142 @@ mod tests {
 
         // Tailing past the end is empty, not an error.
         assert!(s.transcript(&key, Some(99)).unwrap().is_empty());
+    }
+
+    /// Append `n` chat messages and return the store + key. Bodies are `msg-{i}`
+    /// so a test can assert exact ordering and contents.
+    fn store_with_messages(n: usize) -> (SqliteRoomStore, RoomKey) {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        for i in 0..n {
+            s.append_message(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                &format!("msg-{i}"),
+                now(),
+            )
+            .unwrap();
+        }
+        (s, key)
+    }
+
+    #[test]
+    fn transcript_page_caps_rows_and_returns_cursor() {
+        // 10 messages (seq 0..=9), ask for a page of 4.
+        let (s, key) = store_with_messages(10);
+        let page = s.transcript_page(&key, None, Some(4)).unwrap();
+        assert_eq!(page.messages.len(), 4, "page is capped at the limit");
+        assert_eq!(page.messages[0].seq, 0);
+        assert_eq!(page.messages[3].seq, 3);
+        assert!(page.has_more, "6 rows remain, so has_more is true");
+        // Cursor is the last *returned* seq, to be replayed as the next after_seq.
+        assert_eq!(page.next_seq, Some(3));
+    }
+
+    #[test]
+    fn transcript_page_paging_with_cursor_retrieves_all_rows() {
+        // Walk the whole transcript in pages of 3 using the returned cursor and
+        // assert we see every seq exactly once, in order, with no gaps/dupes.
+        let total = 17;
+        let (s, key) = store_with_messages(total);
+
+        let mut collected: Vec<u64> = Vec::new();
+        let mut after: Option<u64> = None;
+        let mut pages = 0;
+        loop {
+            let page = s.transcript_page(&key, after, Some(3)).unwrap();
+            pages += 1;
+            assert!(pages <= total + 2, "paging must terminate");
+            for m in &page.messages {
+                collected.push(m.seq);
+            }
+            if page.has_more {
+                // has_more ⇒ a usable cursor.
+                after = Some(page.next_seq.expect("has_more implies a cursor"));
+            } else {
+                assert_eq!(page.next_seq, None, "final page has no cursor");
+                break;
+            }
+        }
+        let expected: Vec<u64> = (0..total as u64).collect();
+        assert_eq!(collected, expected, "every row retrieved once, in seq order");
+    }
+
+    #[test]
+    fn transcript_page_last_page_has_no_cursor() {
+        // Exactly `limit` rows total: the single page must NOT claim has_more even
+        // though it is full (the +1 sentinel row simply doesn't exist).
+        let (s, key) = store_with_messages(5);
+        let page = s.transcript_page(&key, None, Some(5)).unwrap();
+        assert_eq!(page.messages.len(), 5);
+        assert!(!page.has_more, "a full final page is not 'has_more'");
+        assert_eq!(page.next_seq, None);
+    }
+
+    #[test]
+    fn transcript_default_cap_applies_when_no_limit_given() {
+        // More rows than the default cap: both the convenience `transcript()` and
+        // `transcript_page(.., None)` must bound at DEFAULT_TRANSCRIPT_LIMIT, NOT
+        // return everything (the OCEAN-249 regression guard).
+        let over = DEFAULT_TRANSCRIPT_LIMIT + 25;
+        let (s, key) = store_with_messages(over);
+
+        let rows = s.transcript(&key, None).unwrap();
+        assert_eq!(
+            rows.len(),
+            DEFAULT_TRANSCRIPT_LIMIT,
+            "transcript() is bounded by the default cap, not unbounded"
+        );
+
+        let page = s.transcript_page(&key, None, None).unwrap();
+        assert_eq!(page.messages.len(), DEFAULT_TRANSCRIPT_LIMIT);
+        assert!(page.has_more, "rows beyond the cap mean more pages");
+        assert_eq!(page.next_seq, Some(DEFAULT_TRANSCRIPT_LIMIT as u64 - 1));
+    }
+
+    #[test]
+    fn transcript_page_limit_is_clamped_to_max() {
+        // An absurd caller limit is clamped to MAX_TRANSCRIPT_LIMIT. With fewer
+        // rows than the cap we still get them all and has_more is false; the point
+        // is the request can't be coerced into an unbounded scan.
+        let (s, key) = store_with_messages(3);
+        let page = s
+            .transcript_page(&key, None, Some(usize::MAX))
+            .unwrap();
+        assert_eq!(page.messages.len(), 3);
+        assert!(!page.has_more);
+        assert_eq!(clamp_transcript_limit(Some(usize::MAX)), MAX_TRANSCRIPT_LIMIT);
+        assert_eq!(clamp_transcript_limit(None), DEFAULT_TRANSCRIPT_LIMIT);
+        // A 0 limit floors to 1 so it can never report an empty-yet-has_more page.
+        assert_eq!(clamp_transcript_limit(Some(0)), 1);
+    }
+
+    #[test]
+    fn transcript_page_after_seq_combines_with_limit() {
+        // after_seq and limit compose: skip the first 2, take 3 of the remaining.
+        let (s, key) = store_with_messages(10); // seq 0..=9
+        let page = s.transcript_page(&key, Some(1), Some(3)).unwrap();
+        assert_eq!(page.messages.len(), 3);
+        assert_eq!(page.messages[0].seq, 2, "starts just after after_seq");
+        assert_eq!(page.messages[2].seq, 4);
+        assert!(page.has_more);
+        assert_eq!(page.next_seq, Some(4));
+    }
+
+    #[test]
+    fn transcript_page_on_closed_room_is_unknown() {
+        // The open-room precondition is unchanged: a closed room is UnknownRoom on
+        // the page API too (the daemon handler is what falls back to the audit
+        // view). Pins that transcript_page didn't accidentally widen visibility.
+        let (mut s, key) = store_with_messages(2);
+        s.close(&key).unwrap();
+        assert!(matches!(
+            s.transcript_page(&key, None, Some(10)),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
     }
 
     #[test]
