@@ -1192,9 +1192,14 @@ impl DaemonApp {
                             age
                         )),
                         Line::from(format!("  {}", compact_text(&pending.reason, 56))),
+                        // Generous budget: for write/edit approvals the tail of
+                        // this line is the payload being approved (path ⇐ content
+                        // / old → new) — clamping it to the path's length would
+                        // make destructive approvals blind. The pane clips at
+                        // its own width anyway.
                         Line::from(format!(
                             "  args {}",
-                            compact_text(&pending.args_preview, 52)
+                            compact_text(&pending.args_preview, 160)
                         )),
                     ]
                 }),
@@ -1489,8 +1494,9 @@ impl PendingPermission {
             permission_id: status.permission_id,
             request_id: Some(status.request_id),
             // Humanized so the approval card leads with what the operator is
-            // actually approving (the bash command, the file path), not JSON.
-            args_preview: compact_text(&humanize_tool_args(&status.tool, &status.args), 56),
+            // actually approving (the bash command, the write payload), not
+            // JSON. Kept long here — each render site sets its own budget.
+            args_preview: compact_text(&humanize_tool_args(&status.tool, &status.args), 200),
             tool: status.tool,
             reason: status.reason,
             updated_at: Some(status.created_at),
@@ -6339,7 +6345,30 @@ fn humanize_tool_args(name: &str, args: &serde_json::Value) -> String {
     let summary = match name {
         "bash" => str_arg("command").to_string(),
         "glob" | "grep" => joined(vec![str_arg("pattern"), str_arg("path")]),
-        "read" | "write" | "edit" | "ls" => str_arg("path").to_string(),
+        "read" | "ls" => str_arg("path").to_string(),
+        // Mutating file tools keep their payload in the preview: the same
+        // string feeds the permission-approval card, and an operator approving
+        // a write/edit must see WHAT lands in the file, not just where
+        // (Codex review of PR #201). The caller's truncation sets the budget.
+        "write" => {
+            let path = str_arg("path");
+            let content = str_arg("content");
+            if content.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path} ⇐ {content}")
+            }
+        }
+        "edit" => {
+            let path = str_arg("path");
+            let old = str_arg("old_string");
+            let new = str_arg("new_string");
+            if old.is_empty() && new.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path}: {old} → {new}")
+            }
+        }
         "todo" => joined(vec![str_arg("action"), str_arg("text")]),
         "web_fetch" | "browser_navigate" => str_arg("url").to_string(),
         "browser_eval_js" => str_arg("js").to_string(),
@@ -6786,6 +6815,22 @@ mod tests {
             humanize_tool_args("read", &json!({"path": "docs/ARCHITECTURE.md"})),
             "docs/ARCHITECTURE.md"
         );
+        // Mutating file tools surface the payload, not just the target path —
+        // the permission-approval card renders this same preview, and approving
+        // a write/edit blind defeats the gate (Codex review of PR #201).
+        assert_eq!(
+            humanize_tool_args("write", &json!({"path": "a.txt", "content": "hello world"})),
+            "a.txt ⇐ hello world"
+        );
+        assert_eq!(
+            humanize_tool_args(
+                "edit",
+                &json!({"path": "a.rs", "old_string": "foo()", "new_string": "bar()"})
+            ),
+            "a.rs: foo() → bar()"
+        );
+        // Payload absent → degrade to the path alone, not a dangling arrow.
+        assert_eq!(humanize_tool_args("write", &json!({"path": "a.txt"})), "a.txt");
         assert_eq!(
             humanize_tool_args("todo", &json!({"action": "add", "index": 0, "text": "Run tests"})),
             "add Run tests"
