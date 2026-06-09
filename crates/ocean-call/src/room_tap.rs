@@ -116,14 +116,39 @@ pub mod live {
         mpsc::UnboundedReceiver<PcmFrame>,
         tokio::sync::oneshot::Receiver<super::TapLifecycle>,
     )> {
+        // Delegate to the room-exposing variant and drop the room handle here:
+        // the passive-only tap keeps it alive inside its own spawned task.
+        let (_room, rx, life_rx) = connect_and_tap_with_room(url, token).await?;
+        Ok((rx, life_rx))
+    }
+
+    /// Same connect + subscribe as [`connect_and_tap`], but also returns the
+    /// live [`Room`] handle (as an `Arc`) so the **active lane** can publish
+    /// Ocean's TTS voice track back into the *same* room — one connection per
+    /// call, never a second join. The PCM/lifecycle plumbing is identical.
+    ///
+    /// The returned `Arc<Room>` must be kept alive for the duration of the call;
+    /// dropping it tears the connection down. The active lane needs a join token
+    /// minted with `can_publish=true` for the publish to be accepted.
+    pub async fn connect_and_tap_with_room(
+        url: &str,
+        token: &str,
+    ) -> anyhow::Result<(
+        std::sync::Arc<Room>,
+        mpsc::UnboundedReceiver<PcmFrame>,
+        tokio::sync::oneshot::Receiver<super::TapLifecycle>,
+    )> {
         let (room, mut room_events) =
             Room::connect(url, token, RoomOptions::default()).await?;
+        let room = std::sync::Arc::new(room);
         let (tx, rx) = mpsc::unbounded_channel::<PcmFrame>();
         let (life_tx, life_rx) = tokio::sync::oneshot::channel::<super::TapLifecycle>();
 
+        // Keep a room handle alive for the lifetime of the event loop; the
+        // caller also holds an Arc (returned) for the publish side.
+        let room_for_loop = room.clone();
         tokio::spawn(async move {
-            // Keep the room handle alive for the lifetime of the tap.
-            let _room = room;
+            let _room = room_for_loop;
             let mut lifecycle = super::TapLifecycle::Ended;
             while let Some(event) = room_events.recv().await {
                 match event {
@@ -148,7 +173,7 @@ pub mod live {
             let _ = life_tx.send(lifecycle);
         });
 
-        Ok((rx, life_rx))
+        Ok((room, rx, life_rx))
     }
 
     /// Drain one remote audio track into 20ms PCM frames.
