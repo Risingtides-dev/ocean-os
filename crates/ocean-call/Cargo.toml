@@ -35,6 +35,12 @@ livekit-protocol = "0.5"
 livekit = { version = "0.7.44", optional = true }
 futures-util = { version = "0.3", optional = true }
 
+# WebSocket client for the Deepgram streaming STT adapter (stt_deepgram::live).
+# rustls (webpki roots) keeps us on the same TLS stack as reqwest — no OpenSSL,
+# no system cert store. Opt-in via the `deepgram-stt` feature so the default
+# build pulls no websocket stack and stays network/cred-free.
+tokio-tungstenite = { version = "0.24", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
 [features]
 default = []
 # Enables room_tap::live — the real LiveKit room connect + audio subscribe.
@@ -49,3 +55,7 @@ xai-stt = ["reqwest/multipart"]
 # decode/resample/request-shaping logic in `tts_xai` is always built and tested
 # without this feature, a network call, or an xAI key.
 xai-tts = ["livekit-tap"]
+# Enables stt_deepgram::live — the real Deepgram streaming WebSocket provider
+# (needs a runtime DEEPGRAM_API_KEY). Pulls tokio-tungstenite + futures-util.
+# The URL-building, PCM framing, and JSON parsing logic is always built + tested.
+deepgram-stt = ["dep:tokio-tungstenite", "dep:futures-util"]

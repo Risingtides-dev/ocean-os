@@ -29,6 +29,7 @@ pub mod session_task;
 pub mod sip_bridge;
 pub mod speaker;
 pub mod stt;
+pub mod stt_deepgram;
 pub mod stt_xai;
 pub mod summarizer;
 pub mod task_detector;
@@ -45,6 +46,10 @@ pub use session_task::{
 };
 pub use sip_bridge::{normalize_e164, CallBridge, LiveKitSipBridge, PlacedCall, SipConfig};
 pub use stt::{SegmentAssembler, SegmentUpdate, SttProvider, TranscriptSegment};
+pub use stt_deepgram::{
+    build_ws_url, parse_results, pcm_to_le_bytes, DeepgramConfig, SpeechActivity,
+    SpeechActivityTracker, CLOSE_STREAM_MSG, DEEPGRAM_WS_URL,
+};
 pub use summarizer::{SummaryAction, SummaryPolicy, Summarizer};
 pub use task_detector::{detect as detect_task, DetectedTask};
 pub use token::{mint_join_token, LiveKitTokenConfig, LiveKitTokenRequest, LiveKitTokenResponse};
