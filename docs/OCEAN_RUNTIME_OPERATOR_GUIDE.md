@@ -477,6 +477,8 @@ GET    /ready                             readiness (model/credentials wired)
 POST   /v1/agent/turns                    submit a turn { prompt, cwd, session_id, ... }
 POST   /v1/agent/voice                    submit a voice turn (transcribed prompt; voice surface)
 GET    /v1/agent/events                   SSE stream; ?session_id=<id> scopes to one session
+POST   /v1/agent/canvas/fulfill           Slack canvas bridge posts a fulfilled read/list/create result {session_id, op, result}
+GET    /v1/agent/canvas/fulfill           query a stored canvas fulfillment ?session_id=&canvas_id=
 POST   /v1/agent/sessions                 create a session before the first turn
 GET    /v1/agent/sessions                 list agent sessions
 GET    /v1/agent/sessions/{id}            agent session detail
