@@ -568,7 +568,16 @@ pub struct CapturingActivitySink {
 
 impl ActivitySink for CapturingActivitySink {
     fn on_activity(&mut self, activity: SpeechActivity) {
-        self.edges.lock().expect("activity edges lock").push(activity);
+        // Poison-tolerant (OCEAN-287): recover the inner guard instead of
+        // panicking. This sink lives on the active-lane loop boundary, so a
+        // prior holder that panicked must not turn every subsequent edge into a
+        // call-killing re-panic — degrade by continuing to record. Mirrors the
+        // daemon's `with_rooms_handle` / `with_rooms` recovery idiom.
+        let mut edges = match self.edges.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        edges.push(activity);
     }
 }
 
@@ -4085,5 +4094,48 @@ mod tests {
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
         assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
         assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+    }
+
+    /// OCEAN-287: a poisoned `CapturingActivitySink` edges lock must be recovered,
+    /// not re-panicked. The sink rides the active-lane loop boundary, so if one
+    /// `on_activity` (or any holder) panics mid-push, the *next* edge must still
+    /// land — a poison panic here would otherwise unwind the call. We poison the
+    /// mutex by panicking under a held guard on another thread, then assert a
+    /// subsequent `on_activity` neither panics nor drops the edge.
+    #[test]
+    fn capturing_activity_sink_recovers_from_poisoned_lock() {
+        let mut sink = CapturingActivitySink::default();
+        // Pre-seed one edge so we can prove the recovered guard preserves prior
+        // state (into_inner hands back the poisoned-but-intact Vec).
+        sink.on_activity(SpeechActivity::Settled);
+
+        // Poison the lock: lock it on a worker thread and panic while holding the
+        // guard. std marks the mutex poisoned; the panic is contained to the
+        // thread via the join handle below.
+        let edges = sink.edges.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = edges.lock().expect("first lock is not yet poisoned");
+            panic!("intentional panic to poison the activity edges mutex");
+        });
+        assert!(poisoner.join().is_err(), "the poisoning thread must have panicked");
+        assert!(
+            sink.edges.lock().is_err(),
+            "precondition: the mutex is now poisoned",
+        );
+
+        // The real assertion: pushing another edge through the live sink path
+        // must NOT panic — it recovers the inner guard and records the edge.
+        sink.on_activity(SpeechActivity::Onset);
+
+        let recovered = match sink.edges.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(
+            recovered,
+            vec![SpeechActivity::Settled, SpeechActivity::Onset],
+            "recovery must preserve the pre-poison edge AND append the new one — \
+             degrade gracefully, never lose the edge or crash the call",
+        );
     }
 }
