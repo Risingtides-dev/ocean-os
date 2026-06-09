@@ -56,6 +56,17 @@ mutating tool call** through the permission machinery: the daemon emits a
 it via `POST /v1/permissions/{id}/decision` (the TUI does this with `Shift-Y` /
 `Shift-N`).
 
+**Voice turns and permissions (OCEAN-224).** A spoken interface has no permission
+card to click, so a gated voice turn that nothing can answer would silently hang.
+`POST /v1/agent/voice` therefore enforces an explicit contract: a voice caller
+that can relay an approval mints a per-turn `decision_token` (OCEAN-185), sends it
+on the voice turn, and replays the same value on the decision POST — the gate is
+then approvable exactly like a text turn. A voice turn with **no** `decision_token`
+is accepted only when yolo is effective (every tool auto-approves, so no gate is
+ever raised). With no token **and** yolo off, the daemon rejects the turn up front
+with `400` and a clear, speakable message ("turn on yolo, or send a
+decision_token") instead of letting it stall on an un-answerable prompt.
+
 ```bash
 # Default: gated. Mutating tools require approval.
 cargo run -p ocean-daemon
