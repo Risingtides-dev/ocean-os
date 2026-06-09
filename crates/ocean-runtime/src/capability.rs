@@ -110,16 +110,30 @@ impl CapabilityProvider for BuiltinProvider {
 
     async fn tools(&self, ctx: &SessionContext) -> Vec<SharedTool> {
         let mut tools = self.tools.clone();
-        // OCEAN-60: `component_wait` must key its registry entry on the session
-        // the daemon resolves component events against. Rebind it to this turn's
-        // session id from SessionContext so it never trusts a model-supplied id.
-        // (`default_tools()` provides an unbound instance for ad-hoc/test paths.)
+        // Session-scoped rebinds: a few built-ins must key shared daemon state on
+        // the session the daemon resolves against, so they're rebuilt per-turn
+        // with this turn's authoritative session id (never a model-supplied one).
+        // `default_tools()` provides unbound instances for ad-hoc/test paths.
+        //
+        // - OCEAN-60: `component_wait` keys its wait registry on the session the
+        //   daemon resolves component events against.
+        // - OCEAN-271: `slack_canvas` keys its bridge-fulfillment lookup on the
+        //   session the daemon stored the fetched content under, so a `read`
+        //   surfaces real content instead of `pending_bridge`.
         if let Some(session_id) = &ctx.session_id {
             for tool in tools.iter_mut() {
-                if tool.name() == "component_wait" {
-                    *tool = Arc::new(crate::tools::component::ComponentWaitTool::for_session(
-                        Some(session_id.clone()),
-                    ));
+                match tool.name() {
+                    "component_wait" => {
+                        *tool = Arc::new(crate::tools::component::ComponentWaitTool::for_session(
+                            Some(session_id.clone()),
+                        ));
+                    }
+                    "slack_canvas" => {
+                        *tool = Arc::new(crate::tools::slack_canvas::SlackCanvasTool::for_session(
+                            Some(session_id.clone()),
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -316,6 +330,60 @@ mod tests {
             .await
             .expect_err("missing session arg with no binding errors");
         assert!(err.contains("session_id"), "expected session_id error, got: {err}");
+    }
+
+    /// OCEAN-271: the built-in provider rebinds `slack_canvas` to the turn's
+    /// session id too, so a `read` resolves bridge-fulfilled content the daemon
+    /// stored under that session. With a session in ctx, a read of a
+    /// pre-fulfilled canvas returns `fetched`; with no session, the unbound
+    /// default stays `pending_bridge`.
+    #[tokio::test]
+    async fn builtin_provider_injects_session_into_slack_canvas() {
+        use crate::tools::slack_canvas::{
+            canvas_fulfillment_key_for_op, CANVAS_FULFILLMENT_REGISTRY,
+        };
+        use ocean_agent_sdk::slack_canvas::{SlackCanvasId, SlackCanvasOp, SlackCanvasResult};
+
+        let provider = BuiltinProvider::new();
+        let canvas = "F_CAP_271";
+
+        // Seed a fulfillment under the ctx() session, as the daemon would.
+        CANVAS_FULFILLMENT_REGISTRY.put(
+            "test-session",
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Read {
+                canvas_id: SlackCanvasId::new(canvas),
+            }),
+            SlackCanvasResult::fulfilled_read(SlackCanvasId::new(canvas), "live body", json!(null)),
+        );
+
+        // Session bound → read surfaces fetched content.
+        let got = provider.tools(&ctx()).await;
+        let tool = got
+            .iter()
+            .find(|t| t.name() == "slack_canvas")
+            .expect("slack_canvas present");
+        let res = tool
+            .execute("cap-271", json!({ "op": "read", "canvas_id": canvas }))
+            .await
+            .expect("read executes");
+        assert_eq!(res.details["fetch_status"], "fetched");
+        assert_eq!(res.details["contents"], "live body");
+
+        // No session in ctx → unbound default can't scope the lookup → pending.
+        let no_sess = SessionContext {
+            cwd: PathBuf::from("/tmp"),
+            session_id: None,
+        };
+        let got = provider.tools(&no_sess).await;
+        let tool = got
+            .iter()
+            .find(|t| t.name() == "slack_canvas")
+            .expect("slack_canvas present");
+        let res = tool
+            .execute("cap-271-b", json!({ "op": "read", "canvas_id": canvas }))
+            .await
+            .expect("read executes");
+        assert_eq!(res.details["fetch_status"], "pending_bridge");
     }
 
     #[tokio::test]

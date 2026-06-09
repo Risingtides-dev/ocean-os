@@ -36,13 +36,149 @@
 //! [`SlackCanvasResult::fulfilled_list`] — the typed fulfillment seam this runtime
 //! defines so content flows through the moment the bridge provides it.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use ocean_agent_sdk::slack_canvas::{CanvasFetchStatus, SlackCanvasOp, SlackCanvasResult};
 use serde_json::{json, Value};
 
 use crate::types::{AgentTool, AgentToolResult, ToolSideEffect};
 
-pub struct SlackCanvasTool;
+// ---------------------------------------------------------------------------
+// Bridge fulfillment lookup (OCEAN-271) — closing the read loop
+// ---------------------------------------------------------------------------
+//
+// OCEAN-235 made `read`/`list` return an honest *pending* result and forwarded
+// the op as a side effect; OCEAN-262 (#183) made the daemon STORE the bridge's
+// fulfilled content (in `AppState.canvas_fulfillments`) and re-emit it on SSE.
+// But a *second* `read` of the same canvas still returned `pending_bridge`,
+// because this tool is a stateless unit struct in `ocean-runtime` and holds no
+// handle to the daemon's `AppState` — and threading daemon state into the
+// runtime crate would invert the layering (runtime is a dependency of the
+// daemon, not vice-versa).
+//
+// The fix mirrors the `component_wait` precedent exactly: a process-global
+// registry **owned by `ocean-runtime`** that both the tool and the daemon
+// reach. The tool *reads* it on a `read`/`list`; the daemon *writes* into it
+// from `POST /v1/agent/canvas/fulfill` (it already depends on `ocean-runtime`,
+// so supplying the impl is the normal direction — no inversion). On a read, if
+// a fulfilled result exists for `(session, canvas key)` the tool returns the
+// real fetched content (`fulfilled_read`/`fulfilled_list`); otherwise it stays
+// honest and returns `pending_bridge`.
+
+/// Process-global store of bridge-fulfilled `slack_canvas` awareness results,
+/// owned by `ocean-runtime` and shared with the daemon's
+/// `POST /v1/agent/canvas/fulfill` route — the same shape as
+/// [`COMPONENT_WAIT_REGISTRY`](crate::tools::component::COMPONENT_WAIT_REGISTRY).
+///
+/// The daemon depends on `ocean-runtime`, so it writes fulfillments here; the
+/// `slack_canvas` tool reads them on a later `read`/`list`. Nothing in
+/// `ocean-runtime` depends back on the daemon — the layering stays one-way.
+pub static CANVAS_FULFILLMENT_REGISTRY: std::sync::LazyLock<CanvasFulfillmentRegistry> =
+    std::sync::LazyLock::new(CanvasFulfillmentRegistry::new);
+
+/// Registry of fulfilled `slack_canvas` awareness results, keyed by
+/// `(session_id, canvas key)`.
+///
+/// The **canvas key** is identical to the daemon's `canvas_fulfillment_key_for_op`
+/// (OCEAN-262), produced here by [`canvas_fulfillment_key_for_op`] so a value the
+/// daemon stores under a given key is found by the tool computing the same key:
+/// `read`/`update`/`append` key on the Slack `canvas_id`; `list` on
+/// `list:{channel_id}`; `create` on `create:{title}`.
+#[derive(Default)]
+pub struct CanvasFulfillmentRegistry {
+    /// Map of `(session_id, canvas key)` → the fulfilled, typed result the bridge
+    /// produced. Last-write-wins per key, matching the daemon's store semantics.
+    fulfilled: Mutex<HashMap<(String, String), SlackCanvasResult>>,
+}
+
+impl CanvasFulfillmentRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store a fulfilled result for `(session_id, canvas key)`. Called by the
+    /// daemon when the bridge POSTs a fulfillment, so a later `read`/`list` of
+    /// the same canvas in the same session surfaces real content.
+    pub fn put(&self, session_id: impl Into<String>, canvas_key: impl Into<String>, result: SlackCanvasResult) {
+        let mut map = self
+            .fulfilled
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        map.insert((session_id.into(), canvas_key.into()), result);
+    }
+
+    /// Look up a fulfilled result for `(session_id, canvas key)`. Returns `None`
+    /// when the bridge has not fulfilled this awareness op yet — the tool then
+    /// stays honest and returns `pending_bridge`.
+    pub fn get(&self, session_id: &str, canvas_key: &str) -> Option<SlackCanvasResult> {
+        let map = self
+            .fulfilled
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        map.get(&(session_id.to_string(), canvas_key.to_string()))
+            .cloned()
+    }
+}
+
+/// The store key for a `slack_canvas` op — **kept byte-for-byte identical** to the
+/// daemon's `canvas_fulfillment_key_for_op` (OCEAN-262) so the daemon's writes and
+/// the tool's reads address the same slot. `read`/`update`/`append` key on the
+/// Slack `canvas_id`; `list` on `list:{channel_id}`; `create` on `create:{title}`.
+pub fn canvas_fulfillment_key_for_op(op: &SlackCanvasOp) -> String {
+    match op {
+        SlackCanvasOp::Read { canvas_id } => canvas_id.as_str().to_string(),
+        SlackCanvasOp::Update { canvas_id, .. } | SlackCanvasOp::Append { canvas_id, .. } => {
+            canvas_id.as_str().to_string()
+        }
+        SlackCanvasOp::List { channel_id } => format!("list:{channel_id}"),
+        SlackCanvasOp::Create { title, .. } => {
+            format!("create:{}", title.as_deref().unwrap_or(""))
+        }
+    }
+}
+
+/// The agent's `slack_canvas` tool.
+///
+/// `session_id` is the authoritative session id injected from the turn's
+/// [`SessionContext`](crate::capability::SessionContext) when the tool is built
+/// (mirroring `component_wait`, OCEAN-60). It is the session half of the
+/// fulfillment-registry key, so a `read`/`list` only ever surfaces content the
+/// bridge fulfilled for *this* session — never one a model-supplied id could
+/// point at. `None` (ad-hoc/test construction, or a turn with no session) means
+/// the tool can't match a stored fulfillment and stays `pending_bridge`.
+#[derive(Default)]
+pub struct SlackCanvasTool {
+    session_id: Option<String>,
+}
+
+impl SlackCanvasTool {
+    /// Construct with no bound session — awareness ops always return
+    /// `pending_bridge` (no session to key a fulfillment lookup on). Used by
+    /// `default_tools()` and ad-hoc/test paths.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct bound to a session. A `read`/`list` consults
+    /// [`CANVAS_FULFILLMENT_REGISTRY`] under this session id and returns the
+    /// bridge's fetched content when present.
+    pub fn for_session(session_id: Option<String>) -> Self {
+        Self { session_id }
+    }
+
+    /// Look up a bridge-fulfilled result for this awareness op in the
+    /// process-global [`CANVAS_FULFILLMENT_REGISTRY`], scoped to the tool's bound
+    /// session. Returns `None` when no session is bound (so the lookup can't be
+    /// scoped) or when the bridge has not fulfilled this `(session, canvas)` yet —
+    /// in both cases the caller falls back to the honest `pending_*` result.
+    fn lookup_fulfilled(&self, op: &SlackCanvasOp) -> Option<SlackCanvasResult> {
+        let session_id = self.session_id.as_deref()?;
+        let key = canvas_fulfillment_key_for_op(op);
+        CANVAS_FULFILLMENT_REGISTRY.get(session_id, &key)
+    }
+}
 
 #[async_trait]
 impl AgentTool for SlackCanvasTool {
@@ -147,7 +283,7 @@ impl AgentTool for SlackCanvasTool {
 
         // --- build the contracted result.
         //
-        // OCEAN-235: the runtime cannot itself fetch live Slack canvas content —
+        // OCEAN-235: the runtime cannot itself *fetch* live Slack canvas content —
         // it holds no Slack token and no Slack API client (by design: all Slack
         // I/O lives in the `ocean-agents` Python bridge transport). So for the
         // awareness ops (`read`/`list`) the runtime emits an **honest** pending
@@ -155,9 +291,19 @@ impl AgentTool for SlackCanvasTool {
         // the live content and stamps it back through
         // `SlackCanvasResult::fulfilled_read` / `fulfilled_list`.
         //
-        // Crucially, a pending `read` carries **no** `contents` (not an empty
-        // string) and is marked `CanvasFetchStatus::PendingBridge`, so the agent
-        // can never mistake an un-fulfilled read for a genuinely empty canvas.
+        // OCEAN-271: but once the bridge HAS fulfilled an awareness op, a later
+        // `read`/`list` of the same canvas should surface that fetched content
+        // instead of pending forever. The daemon stores each fulfillment in the
+        // process-global `CANVAS_FULFILLMENT_REGISTRY` (owned by this crate). So
+        // here, before falling back to pending, we consult that registry under the
+        // injected session id + the daemon-identical canvas key: a hit returns the
+        // bridge's real `fulfilled_read`/`fulfilled_list` result; a miss stays
+        // honest.
+        //
+        // Crucially, a *pending* `read` still carries **no** `contents` (not an
+        // empty string) and is marked `CanvasFetchStatus::PendingBridge`, so the
+        // agent can never mistake an un-fulfilled read for a genuinely empty canvas.
+        let fulfilled = self.lookup_fulfilled(&op);
         let result = match &op {
             SlackCanvasOp::Create { .. } => SlackCanvasResult {
                 ok: true,
@@ -169,9 +315,9 @@ impl AgentTool for SlackCanvasTool {
                 bridged: false,
                 metadata: Value::Null,
             },
-            SlackCanvasOp::Read { canvas_id } => {
-                SlackCanvasResult::pending_read(canvas_id.clone())
-            }
+            SlackCanvasOp::Read { canvas_id } => fulfilled
+                .filter(|f| f.fetch_status.is_fetched())
+                .unwrap_or_else(|| SlackCanvasResult::pending_read(canvas_id.clone())),
             SlackCanvasOp::Update { canvas_id, .. } | SlackCanvasOp::Append { canvas_id, .. } => {
                 SlackCanvasResult {
                     ok: true,
@@ -184,7 +330,9 @@ impl AgentTool for SlackCanvasTool {
                     metadata: Value::Null,
                 }
             }
-            SlackCanvasOp::List { .. } => SlackCanvasResult::pending_list(),
+            SlackCanvasOp::List { .. } => fulfilled
+                .filter(|f| f.fetch_status.is_fetched())
+                .unwrap_or_else(SlackCanvasResult::pending_list),
         };
 
         let summary = match &op {
@@ -193,7 +341,14 @@ impl AgentTool for SlackCanvasTool {
                 None => "queued create of a new Slack canvas".to_string(),
             },
             SlackCanvasOp::Read { canvas_id } => {
-                format!("read-back requested for Slack canvas '{canvas_id}'")
+                // OCEAN-271: report the fetched body when the bridge has already
+                // fulfilled this read, so the model's summary line matches the
+                // `contents` it can now see — not a misleading "requested".
+                if result.fetch_status.is_fetched() {
+                    format!("fetched current contents of Slack canvas '{canvas_id}'")
+                } else {
+                    format!("read-back requested for Slack canvas '{canvas_id}'")
+                }
             }
             SlackCanvasOp::Update { canvas_id, mode, .. } => {
                 format!("queued {mode:?} update of Slack canvas '{canvas_id}'")
@@ -202,7 +357,12 @@ impl AgentTool for SlackCanvasTool {
                 format!("queued append to Slack canvas '{canvas_id}'")
             }
             SlackCanvasOp::List { channel_id } => {
-                format!("listing Slack canvases in channel '{channel_id}'")
+                if result.fetch_status.is_fetched() {
+                    let n = result.canvases.as_ref().map(|c| c.len()).unwrap_or(0);
+                    format!("listed {n} Slack canvas(es) in channel '{channel_id}'")
+                } else {
+                    format!("listing Slack canvases in channel '{channel_id}'")
+                }
             }
         };
 
@@ -222,12 +382,13 @@ impl AgentTool for SlackCanvasTool {
 mod tests {
     use super::*;
     use crate::types::ToolSideEffect;
+    use ocean_agent_sdk::slack_canvas::{SlackCanvasId, SlackCanvasSummary};
 
     /// A valid `create` (title + markdown) is accepted, the result echoes the op,
     /// and the side effect carries the parsed op.
     #[tokio::test]
     async fn slack_canvas_accepts_create() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let args = json!({
             "op": "create",
             "title": "Campaign Plan",
@@ -263,7 +424,7 @@ mod tests {
     /// A bare `create` (no body) is accepted — the app/bridge fills in.
     #[tokio::test]
     async fn slack_canvas_accepts_bare_create() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let res = tool
             .execute("call-2", json!({ "op": "create" }))
             .await
@@ -279,7 +440,7 @@ mod tests {
     /// canvas. The read op is forwarded as a side effect for the bridge to fulfill.
     #[tokio::test]
     async fn slack_canvas_read_is_honest_pending_not_fake_empty() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let args = json!({ "op": "read", "canvas_id": "F0123ABCD" });
         let res = tool.execute("call-3", args).await.expect("valid read");
         assert_eq!(res.details["op"], "read");
@@ -307,7 +468,7 @@ mod tests {
     /// A valid `update` is accepted and defaults its mode to replace.
     #[tokio::test]
     async fn slack_canvas_accepts_update() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let args = json!({
             "op": "update",
             "canvas_id": "F1",
@@ -330,7 +491,7 @@ mod tests {
     /// A valid `append` is accepted.
     #[tokio::test]
     async fn slack_canvas_accepts_append() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let args = json!({ "op": "append", "canvas_id": "F1", "markdown": "more" });
         let res = tool.execute("call-5", args).await.expect("valid append");
         assert_eq!(res.details["op"], "append");
@@ -342,7 +503,7 @@ mod tests {
     /// array — until the bridge resolves the channel's real canvases.
     #[tokio::test]
     async fn slack_canvas_list_is_honest_pending() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let args = json!({ "op": "list", "channel_id": "C1" });
         let res = tool.execute("call-6", args).await.expect("valid list");
         assert_eq!(res.details["op"], "list");
@@ -359,7 +520,7 @@ mod tests {
     /// their own and don't await any bridge fetch.
     #[tokio::test]
     async fn slack_canvas_mutating_ops_are_not_applicable() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         for args in [
             json!({ "op": "create", "title": "T" }),
             json!({ "op": "update", "canvas_id": "F1", "markdown": "x" }),
@@ -378,7 +539,7 @@ mod tests {
     /// Missing `op` is rejected.
     #[tokio::test]
     async fn slack_canvas_rejects_missing_op() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let err = tool
             .execute("call-7", json!({ "canvas_id": "F1" }))
             .await
@@ -389,7 +550,7 @@ mod tests {
     /// An unknown op is rejected.
     #[tokio::test]
     async fn slack_canvas_rejects_unknown_op() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let err = tool
             .execute("call-8", json!({ "op": "obliterate" }))
             .await
@@ -400,7 +561,7 @@ mod tests {
     /// `read` without `canvas_id` is rejected (serde enforces the required field).
     #[tokio::test]
     async fn slack_canvas_rejects_read_without_canvas_id() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let err = tool
             .execute("call-9", json!({ "op": "read" }))
             .await
@@ -411,7 +572,7 @@ mod tests {
     /// `update` without `canvas_id` is rejected.
     #[tokio::test]
     async fn slack_canvas_rejects_update_without_canvas_id() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let err = tool
             .execute("call-10", json!({ "op": "update", "markdown": "x" }))
             .await
@@ -422,7 +583,7 @@ mod tests {
     /// `update`/`append` with empty markdown is rejected.
     #[tokio::test]
     async fn slack_canvas_rejects_empty_markdown() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let err = tool
             .execute(
                 "call-11",
@@ -436,7 +597,7 @@ mod tests {
     /// `list` without `channel_id` is rejected.
     #[tokio::test]
     async fn slack_canvas_rejects_list_without_channel_id() {
-        let tool = SlackCanvasTool;
+        let tool = SlackCanvasTool::new();
         let err = tool
             .execute("call-12", json!({ "op": "list" }))
             .await
@@ -447,6 +608,196 @@ mod tests {
     /// The tool is permission-gated (mutating ops dominate).
     #[test]
     fn slack_canvas_requires_permission() {
-        assert!(SlackCanvasTool.requires_permission());
+        assert!(SlackCanvasTool::new().requires_permission());
+    }
+
+    // -----------------------------------------------------------------------
+    // OCEAN-271: a read returns bridge-fulfilled content on the next read.
+    //
+    // The daemon stores fulfilled results in the process-global
+    // CANVAS_FULFILLMENT_REGISTRY keyed by (session, canvas key). A
+    // session-bound tool consults it on a read/list. These tests use **unique
+    // session ids per test** because the registry is process-global and tests
+    // run concurrently.
+    // -----------------------------------------------------------------------
+
+    /// The canvas key the tool computes matches the documented daemon scheme.
+    #[test]
+    fn canvas_key_matches_daemon_scheme() {
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Read {
+                canvas_id: "F0123ABCD".into()
+            }),
+            "F0123ABCD"
+        );
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::List {
+                channel_id: "C9".into()
+            }),
+            "list:C9"
+        );
+        assert_eq!(
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Create {
+                title: Some("Plan".into()),
+                markdown: None,
+                channel_id: None,
+            }),
+            "create:Plan"
+        );
+    }
+
+    /// THE CORE OCEAN-271 GUARANTEE. With a fulfillment stored for
+    /// `(session, canvas_id)` — as the daemon does when the bridge POSTs back —
+    /// a session-bound `read` returns the **real fetched content**
+    /// (`fetch_status: fetched`, `bridged: true`, `contents` present), not
+    /// `pending_bridge`.
+    #[tokio::test]
+    async fn read_returns_fulfilled_content_when_bridge_has_fulfilled() {
+        let session = "sess-271-read-fulfilled";
+        let canvas_id = SlackCanvasId::new("F_FULFILLED_1");
+
+        // The daemon would have written this when the bridge POSTed its fetch.
+        CANVAS_FULFILLMENT_REGISTRY.put(
+            session,
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Read {
+                canvas_id: canvas_id.clone(),
+            }),
+            SlackCanvasResult::fulfilled_read(
+                canvas_id.clone(),
+                "# Real canvas body\n- fetched from Slack",
+                json!({ "slack_file_id": "F_FULFILLED_1", "revision": 7 }),
+            ),
+        );
+
+        let tool = SlackCanvasTool::for_session(Some(session.to_string()));
+        let res = tool
+            .execute("call-271-a", json!({ "op": "read", "canvas_id": "F_FULFILLED_1" }))
+            .await
+            .expect("valid read");
+
+        // Real content surfaced — the loop is closed.
+        assert_eq!(res.details["op"], "read");
+        assert_eq!(res.details["canvas_id"], "F_FULFILLED_1");
+        assert_eq!(res.details["fetch_status"], "fetched");
+        assert_eq!(res.details["bridged"], true);
+        assert_eq!(
+            res.details["contents"],
+            "# Real canvas body\n- fetched from Slack"
+        );
+        // Bridge passthrough metadata rode along.
+        assert_eq!(res.details["metadata"]["revision"], 7);
+        // The summary reflects the fetched state, not "requested".
+        let summary = res.content[0].as_text().unwrap_or_default();
+        assert!(
+            summary.contains("fetched"),
+            "summary should report fetched content: {summary}"
+        );
+
+        // The op is still forwarded as a side effect (idempotent, harmless).
+        assert_eq!(res.side_effects.len(), 1);
+    }
+
+    /// The honest-pending path is preserved: a session-bound `read` with **no**
+    /// stored fulfillment still returns `pending_bridge` and fabricates no
+    /// `contents` — exactly the OCEAN-235 contract.
+    #[tokio::test]
+    async fn read_stays_pending_when_no_fulfillment_stored() {
+        let session = "sess-271-read-pending";
+        let tool = SlackCanvasTool::for_session(Some(session.to_string()));
+        let res = tool
+            .execute("call-271-b", json!({ "op": "read", "canvas_id": "F_NEVER_FETCHED" }))
+            .await
+            .expect("valid read");
+
+        assert_eq!(res.details["fetch_status"], "pending_bridge");
+        assert_eq!(res.details["bridged"], false);
+        assert!(
+            res.details.get("contents").is_none(),
+            "an unfulfilled read must not fabricate contents: {}",
+            res.details
+        );
+    }
+
+    /// A fulfillment is scoped to its session: the same canvas id under a
+    /// *different* session does not leak a fulfilled result. This is why the
+    /// session id is injected (never model-supplied) — content can't cross
+    /// sessions.
+    #[tokio::test]
+    async fn fulfillment_is_scoped_to_its_session() {
+        let canvas_id = SlackCanvasId::new("F_SCOPED");
+        CANVAS_FULFILLMENT_REGISTRY.put(
+            "sess-271-owner",
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Read {
+                canvas_id: canvas_id.clone(),
+            }),
+            SlackCanvasResult::fulfilled_read(canvas_id, "secret body", Value::Null),
+        );
+
+        // A different session reading the same canvas id sees only pending.
+        let tool = SlackCanvasTool::for_session(Some("sess-271-other".to_string()));
+        let res = tool
+            .execute("call-271-c", json!({ "op": "read", "canvas_id": "F_SCOPED" }))
+            .await
+            .expect("valid read");
+        assert_eq!(res.details["fetch_status"], "pending_bridge");
+        assert!(res.details.get("contents").is_none());
+    }
+
+    /// An *unbound* tool (no session — the `default_tools()` / test path) can't
+    /// scope a lookup, so it always returns `pending_bridge` even if a
+    /// fulfillment exists under some session.
+    #[tokio::test]
+    async fn unbound_tool_cannot_match_a_fulfillment() {
+        let canvas_id = SlackCanvasId::new("F_UNBOUND");
+        CANVAS_FULFILLMENT_REGISTRY.put(
+            "sess-271-somewhere",
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::Read {
+                canvas_id: canvas_id.clone(),
+            }),
+            SlackCanvasResult::fulfilled_read(canvas_id, "body", Value::Null),
+        );
+
+        let tool = SlackCanvasTool::new(); // unbound
+        let res = tool
+            .execute("call-271-d", json!({ "op": "read", "canvas_id": "F_UNBOUND" }))
+            .await
+            .expect("valid read");
+        assert_eq!(res.details["fetch_status"], "pending_bridge");
+        assert!(res.details.get("contents").is_none());
+    }
+
+    /// A `list` is fulfilled the same way as a `read`: with a stored
+    /// `fulfilled_list` under `list:{channel_id}`, a session-bound `list`
+    /// returns the resolved canvases instead of `pending_bridge`.
+    #[tokio::test]
+    async fn list_returns_fulfilled_canvases_when_stored() {
+        let session = "sess-271-list-fulfilled";
+        CANVAS_FULFILLMENT_REGISTRY.put(
+            session,
+            canvas_fulfillment_key_for_op(&SlackCanvasOp::List {
+                channel_id: "C_LIST".into(),
+            }),
+            SlackCanvasResult::fulfilled_list(
+                vec![SlackCanvasSummary {
+                    canvas_id: SlackCanvasId::new("F9"),
+                    title: Some("Plan".into()),
+                }],
+                Value::Null,
+            ),
+        );
+
+        let tool = SlackCanvasTool::for_session(Some(session.to_string()));
+        let res = tool
+            .execute("call-271-e", json!({ "op": "list", "channel_id": "C_LIST" }))
+            .await
+            .expect("valid list");
+
+        assert_eq!(res.details["fetch_status"], "fetched");
+        assert_eq!(res.details["bridged"], true);
+        let canvases = res.details["canvases"]
+            .as_array()
+            .expect("fulfilled list carries canvases");
+        assert_eq!(canvases.len(), 1);
+        assert_eq!(canvases[0]["canvas_id"], "F9");
     }
 }

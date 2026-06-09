@@ -38,7 +38,11 @@ pub fn default_tools() -> Vec<Arc<dyn AgentTool>> {
         Arc::new(component::ComponentRenderTool),
         Arc::new(component::ComponentUnmountTool),
         Arc::new(surface::SurfacePatchTool),
-        Arc::new(slack_canvas::SlackCanvasTool),
+        // Unbound: with no session it can't scope a fulfillment lookup, so reads
+        // stay `pending_bridge`. The session-scoped `BuiltinProvider` rebuilds
+        // this one with the turn's session id (OCEAN-271) so a read surfaces the
+        // bridge-fulfilled content; this default is for ad-hoc/test paths.
+        Arc::new(slack_canvas::SlackCanvasTool::new()),
         // Unbound: falls back to the model-supplied `session_id` arg. The
         // session-scoped `BuiltinProvider` rebuilds this one with the turn's
         // session id (OCEAN-60); this default is for ad-hoc/test paths.
