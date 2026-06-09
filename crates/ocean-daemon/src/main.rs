@@ -788,8 +788,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/settings/yolo", get(yolo_setting_get).post(yolo_setting_set))
         .route("/v1/component/event", post(component_event))
         // Longhouse + council convene routes (incl. the `/v1/council/convene`
-        // alias) live in one reusable group so the router here and the HTTP
-        // route test below register exactly the same table (OCEAN-227).
+        // alias and the read-only `/v1/longhouse/prepare` prep step) live in one
+        // reusable group so the router here and the HTTP route test below
+        // register exactly the same table (OCEAN-227, OCEAN-226).
         .merge(longhouse_routes())
         .route("/v1/calls/demo", post(call_demo))
         .route("/v1/calls/place", post(call_place))
@@ -958,6 +959,7 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/longhouse/demo",
             "POST /v1/longhouse/convene",
             "POST /v1/council/convene",
+            "POST /v1/longhouse/prepare",
             "GET /v1/longhouse/topics",
             "GET /v1/longhouse/topics/{topic_id}",
             "POST /v1/calls/demo",
@@ -1620,6 +1622,9 @@ fn longhouse_routes() -> Router<AppState> {
         .route("/v1/longhouse/convene", post(longhouse_convene))
         // Canonical-doc alias — same handler, governance-facing name (OCEAN-227).
         .route("/v1/council/convene", post(longhouse_convene))
+        // Read-only pre-turn prep step — the "first safe integration slice"
+        // (OCEAN-226). Advisory only; no gate, no side effect.
+        .route("/v1/longhouse/prepare", post(longhouse_prepare))
         .route("/v1/longhouse/topics", get(longhouse_topics))
         .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
 }
@@ -1908,6 +1913,112 @@ async fn longhouse_convene(
         "question": topic_hint,
         "federation": format!("{federation:?}").to_lowercase(),
         "streaming_on": "/v1/agent/events",
+    }))
+}
+
+/// Request body for `POST /v1/longhouse/prepare`.
+///
+/// Mirrors the [`ocean_longhouse::TurnBrief`] the prep loop ranks against — the
+/// daemon's own turn shape minus the heavy bits. Only `prompt` is required; the
+/// rest scope the skill index (`cwd`) or are reserved for future SOP/workflow
+/// selection. `top_n` overrides how many compact skill briefs come back.
+#[derive(Debug, serde::Deserialize)]
+struct LonghousePrepareRequest {
+    /// The upcoming turn's prompt — the text Longhouse ranks skills against.
+    prompt: String,
+    /// Opaque daemon session id this turn belongs to (carried through to the
+    /// brief; unused in v1 ranking).
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Working directory of the turn. When set, the skill index also scans the
+    /// repo-local `./skills` dir under it (`SkillRoots::for_cwd`), on top of the
+    /// documented home libraries.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Which client is steering ("tui", "surface", "voice"). Reserved for future
+    /// client-aware SOP reminders; unused in v1 ranking.
+    #[serde(default)]
+    client_type: Option<String>,
+    /// Cap on how many compact skill briefs to return. Defaults to
+    /// [`ocean_longhouse::DEFAULT_TOP_N`] when omitted.
+    #[serde(default)]
+    top_n: Option<usize>,
+}
+
+/// `POST /v1/longhouse/prepare` — the **read-only pre-turn preparation step**,
+/// the "first safe integration slice" from `docs/LONGHOUSE.md` §"First safe
+/// integration slice" (lines 101-115). This is the first real consumer of
+/// [`ocean_longhouse::SkillIndex::prepare`] (OCEAN-226): the library capability
+/// shipped in OCEAN-215 ph1 had no caller until now.
+///
+/// The daemon hands Longhouse a compact [`ocean_longhouse::TurnBrief`] (the
+/// prompt + a little session context) and gets back a [`ocean_longhouse::TurnPrep`]:
+/// the handful of skills (plus, in later phases, SOPs/workflows) most relevant to
+/// that prompt, each as a *compact* brief — name + one-line when-to-use, never a
+/// full body. A client may call this before submitting a turn and fold the briefs
+/// into its own guidance.
+///
+/// **Advisory only — Longhouse recommends, it never acts (per the repo's Longhouse
+/// rule + `docs/LONGHOUSE.md` line 115).** This endpoint performs no local side
+/// effects, executes nothing, and touches no permission gate: it loads the skill
+/// index off disk and ranks it. The returned `advisory: true` makes that contract
+/// explicit on the wire. The main agent still routes every real action back
+/// through the daemon's permission gates.
+///
+/// **Fail-open** (matches `prepare` itself): a missing/garbled skill library, an
+/// empty index, or an irrelevant prompt yields `ok: true` with an empty `prep` —
+/// it never errors, so consulting Longhouse can never block a would-be turn.
+///
+/// The disk scan runs on a blocking thread (`spawn_blocking`) so the index walk
+/// never stalls the async scheduler; the cheap keyword ranking then runs inline.
+async fn longhouse_prepare(
+    Json(req): Json<LonghousePrepareRequest>,
+) -> Json<serde_json::Value> {
+    let brief = ocean_longhouse::TurnBrief {
+        session_id: req.session_id.unwrap_or_default(),
+        prompt: req.prompt,
+        cwd: req.cwd.clone(),
+        client_type: req.client_type,
+    };
+    let top_n = req.top_n;
+
+    // Load the skill index + rank on a blocking thread: the loader walks
+    // ~/.spawner/skills, ~/.codex/skills (+ repo-local ./skills when a cwd is
+    // given), which is filesystem I/O we must not run on the async scheduler.
+    // Both load and rank are fail-open, so a JoinError (the only way this can
+    // fail) collapses to an empty prep — never a 500 — preserving the contract
+    // that consulting Longhouse can't block a turn.
+    let prep = tokio::task::spawn_blocking(move || {
+        let roots = match brief.cwd.as_deref() {
+            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
+            _ => ocean_longhouse::SkillRoots::default(),
+        };
+        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        let skills_indexed = index.len();
+        let prep = match top_n {
+            Some(n) => index.prepare_top_n(&brief, n),
+            None => index.prepare(&brief),
+        };
+        (prep, skills_indexed)
+    })
+    .await;
+
+    let (prep, skills_indexed) = prep.unwrap_or_else(|err| {
+        // spawn_blocking only errors if the closure panicked; the loader and
+        // ranker don't panic, but stay fail-open here regardless.
+        tracing::warn!(error = %err, "longhouse prepare task failed; returning empty prep");
+        (ocean_longhouse::TurnPrep::default(), 0)
+    });
+
+    Json(json!({
+        "ok": true,
+        // Advisory contract: Longhouse only recommends. This endpoint executes
+        // nothing and bypasses no permission gate.
+        "advisory": true,
+        // How many skills the index held this call (diagnostic: distinguishes
+        // "no library on disk" from "library present, nothing matched").
+        "skills_indexed": skills_indexed,
+        "prep": prep,
     }))
 }
 
@@ -9082,5 +9193,136 @@ mod tests {
         );
 
         std::env::remove_var(PUBLISH_TOKEN_ENV);
+    }
+
+    // ---- OCEAN-226: POST /v1/longhouse/prepare wires SkillIndex::prepare() ----
+    //
+    // OCEAN-215 ph1 shipped `prepare()`/`prepare_top_n()` as a read-only library
+    // capability with NO daemon consumer. These tests exercise the new endpoint
+    // that finally calls it, asserting it (a) actually invokes `prepare()` and
+    // returns the ranked brief, (b) stays advisory (no gate / no side effect),
+    // and (c) is fail-open.
+    //
+    // Hermetic without touching the process-global `HOME`: each test plants a
+    // uniquely-named repo-local skill under a temp `cwd` and queries it with a
+    // token only that skill matches. Whatever real `~/.spawner` / `~/.codex`
+    // libraries exist on the host can't match the nonce token, so the asserted
+    // result is deterministic regardless of the machine.
+
+    /// Plant a repo-local `./skills/<dir>/skill.yaml` under `cwd`.
+    fn plant_repo_skill(cwd: &std::path::Path, dir: &str, name: &str, description: &str) {
+        let skill_dir = cwd.join("skills").join(dir);
+        std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
+        std::fs::write(
+            skill_dir.join("skill.yaml"),
+            format!("name: {name}\ndescription: {description}\n"),
+        )
+        .expect("write skill.yaml");
+    }
+
+    #[tokio::test]
+    async fn longhouse_prepare_invokes_prepare_and_returns_the_brief() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        // A nonce token no real host skill will carry, so the match is ours.
+        plant_repo_skill(
+            cwd,
+            "zorptastic",
+            "Zorptastic Widget",
+            "Use when building a zorptastic widget for the flux capacitor",
+        );
+
+        let req = LonghousePrepareRequest {
+            prompt: "help me build a zorptastic widget".to_string(),
+            session_id: Some("sess-1".to_string()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            client_type: Some("tui".to_string()),
+            top_n: None,
+        };
+
+        let Json(body) = longhouse_prepare(Json(req)).await;
+
+        assert_eq!(body["ok"], json!(true));
+        // The advisory contract is asserted on the wire: Longhouse recommends,
+        // it never acts. If this flips, the endpoint stopped being read-only.
+        assert_eq!(
+            body["advisory"],
+            json!(true),
+            "prepare endpoint must advertise itself advisory (no gate bypass)"
+        );
+
+        // Round-trip the `prep` back into a real TurnPrep — proves `prepare()`
+        // ran and produced a well-formed brief, not just an arbitrary blob.
+        let prep: ocean_longhouse::TurnPrep =
+            serde_json::from_value(body["prep"].clone()).expect("prep is a valid TurnPrep");
+        assert!(
+            prep.skills.iter().any(|s| s.name == "Zorptastic Widget"
+                && s.source == ocean_longhouse::SkillSource::Repo),
+            "the planted repo skill must surface in the ranked brief, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        // SOPs / workflows are always empty in phase 1 — assert the contract holds
+        // through the endpoint, not just at the library boundary.
+        assert!(prep.sops.is_empty() && prep.workflows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn longhouse_prepare_honors_top_n_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        // Three skills that all carry the nonce term `zorpquok` — a token no real
+        // host skill will match, so ONLY these three can score against the query.
+        // That makes both the cap and the membership deterministic regardless of
+        // whatever `~/.spawner` / `~/.codex` libraries exist on the machine.
+        plant_repo_skill(cwd, "a", "Zorpquok Alpha", "a zorpquok skill alpha");
+        plant_repo_skill(cwd, "b", "Zorpquok Bravo", "a zorpquok skill bravo");
+        plant_repo_skill(cwd, "c", "Zorpquok Charlie", "a zorpquok skill charlie");
+
+        let req = LonghousePrepareRequest {
+            prompt: "zorpquok please".to_string(),
+            session_id: None,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            client_type: None,
+            // Cap to 2 → proves the request's top_n routes to prepare_top_n():
+            // three skills match the nonce, but only two come back.
+            top_n: Some(2),
+        };
+
+        let Json(body) = longhouse_prepare(Json(req)).await;
+        let prep: ocean_longhouse::TurnPrep =
+            serde_json::from_value(body["prep"].clone()).expect("valid TurnPrep");
+        assert_eq!(prep.skills.len(), 2, "top_n=2 must cap the returned briefs");
+        assert!(
+            prep.skills.iter().all(|s| s.name.starts_with("Zorpquok")),
+            "only the nonce-matching planted skills can rank, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn longhouse_prepare_is_fail_open_on_empty_and_irrelevant() {
+        // An empty cwd `./skills` plus a prompt nothing matches → empty prep, but
+        // still `ok: true` (consulting Longhouse can never block a turn). This
+        // does NOT assert the home libraries are empty; it asserts that even with
+        // a uniquely-irrelevant prompt the call succeeds and stays advisory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let req = LonghousePrepareRequest {
+            prompt: "qqzzxx-nonexistent-nonsense-token-7yt".to_string(),
+            session_id: None,
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            client_type: None,
+            top_n: None,
+        };
+
+        let Json(body) = longhouse_prepare(Json(req)).await;
+        assert_eq!(body["ok"], json!(true), "must stay ok even with no matches");
+        assert_eq!(body["advisory"], json!(true));
+        let prep: ocean_longhouse::TurnPrep =
+            serde_json::from_value(body["prep"].clone()).expect("valid TurnPrep");
+        assert!(
+            prep.skills.is_empty(),
+            "a nonsense prompt must match nothing, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 }

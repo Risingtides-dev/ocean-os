@@ -529,6 +529,7 @@ POST   /v1/component/event                surface component interaction event
 POST   /v1/longhouse/demo                 scripted demo harness (fake events)
 POST   /v1/longhouse/convene              convene a real council; events on /v1/agent/events
 POST   /v1/council/convene                alias of /v1/longhouse/convene (same handler)
+POST   /v1/longhouse/prepare              read-only pre-turn prep: compact skill briefs (advisory, no gate bypass)
 GET    /v1/longhouse/topics               list longhouse topics
 GET    /v1/longhouse/topics/{id}          longhouse topic detail
 
