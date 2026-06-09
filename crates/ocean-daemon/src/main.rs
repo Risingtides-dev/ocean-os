@@ -4026,7 +4026,11 @@ async fn agent_turn(
         session_id,
         prompt,
         cwd,
-        guidance: _,
+        // OCEAN-143: previously `guidance: _` — the documented `guidance`
+        // turn-field was destructured and dropped on the floor, so it was
+        // advertised as live but never reached the model. It is now folded into
+        // the turn prompt below, layered with room guidance.
+        guidance,
         room_id,
         project_id,
         client_type,
@@ -4182,7 +4186,7 @@ async fn agent_turn(
     // The bypass is opt-in, never the silent default.
     let yolo = effective_yolo();
 
-    let guided_prompt = apply_room_guidance(room_id, &prompt);
+    let guided_prompt = apply_turn_guidance(room_id, guidance.as_deref(), &prompt);
     let mut prompt_req = PromptRequest {
         prompt: guided_prompt,
         images,
@@ -4512,6 +4516,52 @@ fn apply_room_guidance(room_id: Option<RoomId>, prompt: &str) -> String {
     match room_id {
         Some(room_id) => format!("{}\n\n{}", room_guidance(room_id), prompt),
         None => prompt.to_string(),
+    }
+}
+
+/// Render the operator's per-turn `guidance` hints (OCEAN-143) into a steering
+/// block, or `None` when there is nothing to inject.
+///
+/// `guidance` is the documented `guidance` turn-field on `POST /v1/agent/turns`
+/// — short steering notes like `"focus on tests"` or `"be concise"`. Each
+/// non-blank entry becomes one bullet under a labelled header so the model reads
+/// it as explicit operator direction rather than part of the task text. Blank /
+/// whitespace-only entries are dropped; an all-blank (or empty) list yields
+/// `None`, leaving the prompt untouched.
+fn render_turn_guidance(guidance: Option<&[String]>) -> Option<String> {
+    let hints: Vec<&str> = guidance?
+        .iter()
+        .map(|hint| hint.trim())
+        .filter(|hint| !hint.is_empty())
+        .collect();
+    if hints.is_empty() {
+        return None;
+    }
+    let mut block = String::from("Operator guidance for this turn:");
+    for hint in hints {
+        block.push_str("\n- ");
+        block.push_str(hint);
+    }
+    Some(block)
+}
+
+/// Compose the prompt the model actually sees for a turn, layering (in order)
+/// any room guidance, then the operator's per-turn `guidance` hints, then the
+/// operator's prompt.
+///
+/// Both layers are prepended — matching how room guidance was already injected
+/// (`apply_room_guidance`) before OCEAN-143 — so steering text precedes the task
+/// without mutating it. With neither present this is exactly the bare prompt,
+/// preserving the legacy turn shape for clients that send no guidance.
+fn apply_turn_guidance(
+    room_id: Option<RoomId>,
+    guidance: Option<&[String]>,
+    prompt: &str,
+) -> String {
+    let with_room = apply_room_guidance(room_id, prompt);
+    match render_turn_guidance(guidance) {
+        Some(block) => format!("{block}\n\n{with_room}"),
+        None => with_room,
     }
 }
 
@@ -5819,6 +5869,63 @@ mod tests {
             assert!(guided.contains(room_name));
             assert!(guided.ends_with("verify the diff"));
         }
+    }
+
+    // OCEAN-143: the documented `guidance` turn-field used to be destructured
+    // and discarded (`guidance: _`), so it never reached the model. These tests
+    // pin the fix: guidance is folded into the turn prompt the model sees.
+
+    #[test]
+    fn turn_guidance_is_injected_into_the_prompt() {
+        let guidance = vec!["focus on tests".to_string(), "be concise".to_string()];
+        let guided = apply_turn_guidance(None, Some(&guidance), "ship the feature");
+
+        // Both hints reach the prompt, as bullets under the operator header,
+        // and the operator's prompt is preserved at the end.
+        assert!(guided.contains("Operator guidance for this turn:"));
+        assert!(guided.contains("- focus on tests"));
+        assert!(guided.contains("- be concise"));
+        assert!(guided.ends_with("ship the feature"));
+    }
+
+    #[test]
+    fn turn_guidance_absent_or_blank_leaves_the_prompt_untouched() {
+        // No guidance field at all → bare prompt (legacy turn shape).
+        assert_eq!(apply_turn_guidance(None, None, "do the thing"), "do the thing");
+        // Empty list → nothing to inject.
+        assert_eq!(
+            apply_turn_guidance(None, Some(&[]), "do the thing"),
+            "do the thing"
+        );
+        // All-whitespace entries are dropped, yielding the bare prompt.
+        let blank = vec!["   ".to_string(), "\t".to_string()];
+        assert_eq!(
+            apply_turn_guidance(None, Some(&blank), "do the thing"),
+            "do the thing"
+        );
+        // render_turn_guidance reports "nothing to inject" directly.
+        assert!(render_turn_guidance(None).is_none());
+        assert!(render_turn_guidance(Some(&blank)).is_none());
+    }
+
+    #[test]
+    fn turn_guidance_layers_on_top_of_room_guidance() {
+        let room = parse_agent_turn_room(Some("review")).unwrap().unwrap();
+        let guidance = vec!["check the migration".to_string()];
+        let guided = apply_turn_guidance(Some(room), Some(&guidance), "verify the diff");
+
+        // All three layers are present...
+        assert!(guided.contains("Operator guidance for this turn:"));
+        assert!(guided.contains("- check the migration"));
+        assert!(guided.contains("Review Room"));
+        assert!(guided.ends_with("verify the diff"));
+
+        // ...in order: operator guidance precedes room guidance precedes prompt.
+        let op = guided.find("Operator guidance for this turn:").unwrap();
+        let room_at = guided.find("Review Room").unwrap();
+        let prompt_at = guided.find("verify the diff").unwrap();
+        assert!(op < room_at, "operator guidance should precede room guidance");
+        assert!(room_at < prompt_at, "room guidance should precede the prompt");
     }
 
     #[test]
