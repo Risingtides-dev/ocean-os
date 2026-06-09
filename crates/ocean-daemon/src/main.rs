@@ -32,10 +32,11 @@ use ocean_core::{
     ProjectResponse, ProjectsResponse, PromptImage, PromptRequest, RequestControlResponse,
     RequestCreateResponse,
     RequestId,
-    evaluate_trigger_policy, RequestState, RequestStatus, RequestsResponse, RoomId, RoomKey,
-    RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind, RoomSnapshot,
-    RoomTriggerEvent, RoomTriggerPolicy, RoomsResponse, SessionDetail, SessionId, SessionResponse,
-    SessionRunState, SessionSummary,
+    evaluate_trigger_policy, RequestState, RequestStatus, RequestsResponse, RoomEventsResponse,
+    RoomId, RoomKey, RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind,
+    RoomProjectedMessage, RoomProjection, RoomProjectionProvenance, RoomProjectionResponse,
+    RoomSnapshot, RoomTriggerEvent, RoomTriggerPolicy, RoomTurn, RoomsResponse, SessionDetail,
+    SessionId, SessionResponse, SessionRunState, SessionSummary,
 };
 use ocean_runtime::{
     tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
@@ -859,6 +860,20 @@ async fn main() -> anyhow::Result<()> {
             get(room_events),
         )
         .route("/v1/rooms/{room_id}", get(room))
+        // OCEAN-256: the richer Track-0 projection. `snapshot` carries per-room
+        // turns / active_turn / message feed computed live from runtime state;
+        // `events` is its `?after_seq=` live-tail. The projection counterpart to
+        // the persistent rooms' snapshot/events, but for the four computed rooms.
+        // `{room_id}` here is a Track-0 enum id, never `persistent` (that block is
+        // matched by the routes above), so these never shadow each other.
+        .route(
+            "/v1/rooms/{room_id}/snapshot",
+            get(room_projection_snapshot),
+        )
+        .route(
+            "/v1/rooms/{room_id}/events",
+            get(room_projection_events),
+        )
         // OCEAN-137: mint a LiveKit join token for a room. The proxy + web
         // surface already POST to this path; the daemon honors it here so
         // in-room voice/video connects on web instead of 404ing.
@@ -1027,6 +1042,8 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/permissions/{id}/decision",
             "GET /v1/rooms",
             "GET /v1/rooms/{room_id}",
+            "GET /v1/rooms/{room_id}/snapshot",
+            "GET /v1/rooms/{room_id}/events",
             "POST /v1/rooms/{room_id}/livekit-token",
             "GET /v1/rooms/persistent",
             "POST /v1/rooms/persistent",
@@ -4634,6 +4651,93 @@ async fn room(
     )
 }
 
+/// `GET /v1/rooms/{room_id}/snapshot` — the richer Track-0 projection (OCEAN-256):
+/// per-room **turns**, the **active_turn**, and a **messages** feed, all computed
+/// live from daemon runtime state (the request registry + recent event ring), not
+/// a store. `components`/`participants` ship empty and are flagged in
+/// `projection.planned` because no per-room component ledger / Track-0 roster is
+/// persisted yet — the response self-documents real vs planned rather than faking
+/// fields.
+///
+/// This is the projection counterpart to the persistent-room
+/// `GET /v1/rooms/persistent/{key}/snapshot`. An unknown room id (anything that
+/// is not one of the four Track-0 rooms) is **404** — these four are a closed set,
+/// so an unrecognized id is a missing resource, not a malformed request.
+async fn room_projection_snapshot(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+) -> (StatusCode, Json<RoomProjectionResponse>) {
+    let Some(room_id) = RoomId::parse(room_id.trim()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(RoomProjectionResponse {
+                ok: false,
+                room: None,
+                error: Some(format!(
+                    "no Track-0 room '{room_id}'; expected pm, writers, orch_mesh, or review"
+                )),
+            }),
+        );
+    };
+
+    let input = room_projection_input(&state).await;
+    let projection = build_room_projection(&input, room_id);
+    (
+        StatusCode::OK,
+        Json(RoomProjectionResponse {
+            ok: true,
+            room: Some(projection),
+            error: None,
+        }),
+    )
+}
+
+/// `GET /v1/rooms/{room_id}/events?after_seq=N` — the live-tail companion to the
+/// projection snapshot (OCEAN-256). Returns the projected message feed with
+/// `seq > N` (omit `after_seq` for the whole current feed), plus `last_seq` so a
+/// client that just snapshotted can poll only what is new. The feed is the
+/// daemon's recent runtime event ring reshaped per the room lens — the same
+/// `messages` the snapshot carries — so this stays a thin filter over
+/// [`build_room_projection`]. Unknown room id ⇒ 404, matching `snapshot`.
+async fn room_projection_events(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Query(q): Query<TranscriptQuery>,
+) -> (StatusCode, Json<RoomEventsResponse>) {
+    let Some(room_id) = RoomId::parse(room_id.trim()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(RoomEventsResponse {
+                ok: false,
+                events: vec![],
+                last_seq: None,
+                error: Some(format!(
+                    "no Track-0 room '{room_id}'; expected pm, writers, orch_mesh, or review"
+                )),
+            }),
+        );
+    };
+
+    let input = room_projection_input(&state).await;
+    let projection = build_room_projection(&input, room_id);
+    let after = q.after_seq.unwrap_or(0);
+    let events: Vec<RoomProjectedMessage> = projection
+        .messages
+        .into_iter()
+        .filter(|m| m.seq > after)
+        .collect();
+    let last_seq = events.last().map(|m| m.seq);
+    (
+        StatusCode::OK,
+        Json(RoomEventsResponse {
+            ok: true,
+            events,
+            last_seq,
+            error: None,
+        }),
+    )
+}
+
 fn parse_room_id(room_id: &str) -> Result<RoomId, String> {
     RoomId::parse(room_id).ok_or_else(|| {
         format!("invalid room id '{room_id}'; expected pm, writers, orch_mesh, or review")
@@ -4823,6 +4927,116 @@ fn build_room_snapshot(input: &RoomProjectionInput, room_id: RoomId) -> RoomSnap
         status: input.runtime_status.clone(),
         updated_ms,
         panels,
+    }
+}
+
+/// Reshape one tracked request into a [`RoomTurn`] for the projection. A turn IS
+/// a request in the daemon's model, so this is a 1:1 view, plus the derived
+/// `active` flag (true until the request reaches a terminal state).
+fn request_to_turn(status: &RequestStatus) -> RoomTurn {
+    RoomTurn {
+        turn_id: status.request_id,
+        session_id: status.session_id,
+        state: request_state_label(status.state).to_string(),
+        active: !status.state.is_terminal(),
+        message: status.message.clone(),
+        started_at: status.started_at,
+        updated_at: status.updated_at,
+        finished_at: status.finished_at,
+    }
+}
+
+/// Order key for turn recency: newest activity first. Falls back through the
+/// available timestamps so a freshly-queued turn (no `started_at` yet) still
+/// sorts sensibly.
+fn turn_recency(status: &RequestStatus) -> DateTime<Utc> {
+    status
+        .finished_at
+        .or(status.updated_at)
+        .or(status.started_at)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now))
+}
+
+/// Compute the richer Track-0 projection for one room (OCEAN-256).
+///
+/// This is the real, computed backing for `GET /v1/rooms/{room_id}/snapshot`. It
+/// derives **turns** and the **active_turn** from the daemon's live request
+/// registry, and a **messages** feed from the recent runtime event ring — both
+/// real tracked state. `components` and `participants` are emitted empty and
+/// flagged in `projection.planned`, because no per-room component/canvas ledger
+/// and no Track-0 roster are persisted yet (rosters are a *persistent*-room
+/// concept). Nothing is fabricated.
+///
+/// Track-0 rooms are role lenses over the *same* global runtime state rather than
+/// workspace-partitioned rooms with private transcripts, so every room sees the
+/// same underlying request/event set (just as the summary panels in
+/// [`build_room_snapshot`] already do). The projection's value over the panels is
+/// that it is *structured* — turns/active_turn/messages a client can render and
+/// correlate — not pre-summarized strings.
+fn build_room_projection(input: &RoomProjectionInput, room_id: RoomId) -> RoomProjection {
+    // --- turns + active_turn (REAL: from the tracked request registry) ---
+    let mut ordered: Vec<&RequestStatus> = input.requests.iter().collect();
+    // Most-recent activity first.
+    ordered.sort_by(|a, b| turn_recency(b).cmp(&turn_recency(a)));
+
+    let turns: Vec<RoomTurn> = ordered.iter().map(|status| request_to_turn(status)).collect();
+
+    // The active turn is the most-recently-active non-terminal request. Track-0
+    // does not enforce one-active-turn-per-room, so we surface the freshest live
+    // turn as the room's current focus (and the full set stays in `turns`).
+    let active_turn = ordered
+        .iter()
+        .find(|status| !status.state.is_terminal())
+        .map(|status| request_to_turn(status));
+
+    // --- messages (REAL: from the recent runtime event ring) ---
+    // `events.recent()` returns newest-first; reverse to oldest-first so `seq` is
+    // monotonic-ascending and `after_seq` tailing behaves like the persistent
+    // rooms' transcript.
+    let mut chronological: Vec<&EventEnvelope> = input.events.iter().collect();
+    chronological.reverse();
+    let messages: Vec<RoomProjectedMessage> = chronological
+        .iter()
+        .enumerate()
+        .map(|(idx, env)| RoomProjectedMessage {
+            seq: (idx as u64) + 1,
+            at: env.at,
+            session_id: env.session_id,
+            request_id: env.request_id,
+            summary: event_summary(env),
+        })
+        .collect();
+    let last_seq = messages.last().map(|m| m.seq);
+
+    let updated_ms = input
+        .events
+        .first()
+        .map(|event| event.at.timestamp_millis())
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+
+    RoomProjection {
+        room_id,
+        title: room_id.title().into(),
+        summary: room_id.summary().into(),
+        status: input.runtime_status.clone(),
+        updated_ms,
+        messages,
+        turns,
+        // PLANNED — see RoomProjection docs; no backing source exists yet.
+        components: Vec::new(),
+        participants: Vec::new(),
+        active_turn,
+        last_seq,
+        projection: RoomProjectionProvenance {
+            real: vec![
+                "turns".into(),
+                "active_turn".into(),
+                "messages".into(),
+                "last_seq".into(),
+                "status".into(),
+            ],
+            planned: vec!["components".into(), "participants".into()],
+        },
     }
 }
 
@@ -8488,6 +8702,223 @@ mod tests {
         assert_eq!(rooms.len(), 4);
         assert_eq!(rooms[0].room_id, RoomId::Pm);
         assert_eq!(rooms[3].room_id, RoomId::Review);
+    }
+
+    // --- OCEAN-256: Track-0 projection (turns / active_turn / messages) ------
+
+    /// A `RequestStatus` fixture for projection tests, with explicit timestamps so
+    /// recency ordering is deterministic.
+    fn projection_request(
+        state: RequestState,
+        updated_secs: i64,
+        message: &str,
+    ) -> RequestStatus {
+        let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let updated = base + chrono::Duration::seconds(updated_secs);
+        RequestStatus {
+            request_id: RequestId::new_v4(),
+            session_id: Some(SessionId::new_v4()),
+            state,
+            permission_id: None,
+            message: Some(message.into()),
+            started_at: Some(base),
+            updated_at: Some(updated),
+            finished_at: if state.is_terminal() { Some(updated) } else { None },
+        }
+    }
+
+    fn projection_event(request_id: RequestId, text: &str) -> EventEnvelope {
+        let mut env = EventEnvelope::new(OceanEvent::AssistantDelta { text: text.into() });
+        env.request_id = Some(request_id);
+        env
+    }
+
+    #[test]
+    fn projection_computes_turns_and_active_turn_from_requests() {
+        // A running, a queued, and a completed request — only the non-terminal
+        // ones are "active"; the freshest active one is the room's active_turn.
+        let completed = projection_request(RequestState::Completed, 10, "done");
+        let queued = projection_request(RequestState::Queued, 20, "queued");
+        let running = projection_request(RequestState::Running, 30, "running");
+        let running_id = running.request_id;
+
+        let input = RoomProjectionInput {
+            runtime_status: "ocean-native-fake · fake · model · ready".into(),
+            sessions: vec![],
+            requests: vec![completed, queued, running],
+            permissions: vec![],
+            events: vec![],
+        };
+
+        let proj = build_room_projection(&input, RoomId::Pm);
+
+        // turns: all three requests, newest activity first (running > queued > done).
+        assert_eq!(proj.turns.len(), 3);
+        assert_eq!(proj.turns[0].turn_id, running_id);
+        assert_eq!(proj.turns[0].state, "running");
+        assert!(proj.turns[0].active, "running turn is active");
+        assert!(!proj.turns[2].active, "completed turn is not active");
+
+        // active_turn: the freshest non-terminal turn.
+        let active = proj.active_turn.expect("a live turn exists");
+        assert_eq!(active.turn_id, running_id);
+        assert!(active.active);
+
+        // provenance: turns/active_turn are REAL; components/participants PLANNED.
+        assert!(proj.projection.real.contains(&"turns".to_string()));
+        assert!(proj.projection.real.contains(&"active_turn".to_string()));
+        assert!(proj.projection.planned.contains(&"components".to_string()));
+        assert!(proj.projection.planned.contains(&"participants".to_string()));
+        // PLANNED fields are honestly empty, never fabricated.
+        assert!(proj.components.is_empty());
+        assert!(proj.participants.is_empty());
+    }
+
+    #[test]
+    fn projection_idle_room_has_no_active_turn() {
+        let done = projection_request(RequestState::Completed, 5, "done");
+        let input = RoomProjectionInput {
+            runtime_status: "fake".into(),
+            sessions: vec![],
+            requests: vec![done],
+            permissions: vec![],
+            events: vec![],
+        };
+        let proj = build_room_projection(&input, RoomId::Review);
+        assert_eq!(proj.turns.len(), 1);
+        assert!(proj.active_turn.is_none(), "no live turn ⇒ active_turn is null");
+    }
+
+    #[test]
+    fn projection_messages_are_seq_ordered_oldest_first() {
+        // events.recent() yields newest-first; the projection must reverse to
+        // oldest-first so `seq` ascends and `after_seq` tailing works.
+        let req = RequestId::new_v4();
+        let newest = projection_event(req, "third");
+        let middle = projection_event(req, "second");
+        let oldest = projection_event(req, "first");
+        // Mimic recent(): newest first.
+        let input = RoomProjectionInput {
+            runtime_status: "fake".into(),
+            sessions: vec![],
+            requests: vec![],
+            permissions: vec![],
+            events: vec![newest, middle, oldest],
+        };
+
+        let proj = build_room_projection(&input, RoomId::OrchMesh);
+        assert_eq!(proj.messages.len(), 3);
+        assert_eq!(proj.messages[0].seq, 1);
+        assert!(proj.messages[0].summary.contains("first"), "oldest is seq 1");
+        assert_eq!(proj.messages[2].seq, 3);
+        assert!(proj.messages[2].summary.contains("third"), "newest is last");
+        assert_eq!(proj.last_seq, Some(3));
+    }
+
+    #[tokio::test]
+    async fn projection_snapshot_handler_returns_real_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // Seed one live request so the projection has a turn to surface.
+        let running = projection_request(RequestState::Running, 30, "live work");
+        let running_id = running.request_id;
+        {
+            let mut reqs = state.requests.write().await;
+            reqs.insert(
+                running.request_id,
+                RequestControl {
+                    status: running,
+                    cancel: CancellationToken::new(),
+                    handle: None,
+                    decision_token: None,
+                },
+            );
+        }
+
+        let (status, Json(resp)) =
+            room_projection_snapshot(State(state.clone()), Path("pm".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp.ok);
+        let room = resp.room.expect("projection present");
+        assert_eq!(room.room_id, RoomId::Pm);
+        assert_eq!(room.turns.len(), 1, "the seeded request projects as one turn");
+        assert_eq!(room.turns[0].turn_id, running_id);
+        assert_eq!(
+            room.active_turn.map(|t| t.turn_id),
+            Some(running_id),
+            "the live request is the active turn"
+        );
+        // Honesty contract: planned fields are empty + declared planned.
+        assert!(room.components.is_empty());
+        assert!(room.participants.is_empty());
+        assert!(room.projection.planned.contains(&"components".to_string()));
+    }
+
+    #[tokio::test]
+    async fn projection_events_handler_filters_by_after_seq() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // Two events in the ring → projected feed has seq 1..=2.
+        let req = RequestId::new_v4();
+        state.events.emit(projection_event(req, "first"));
+        state.events.emit(projection_event(req, "second"));
+
+        // No after_seq ⇒ whole feed.
+        let (status, Json(all)) = room_projection_events(
+            State(state.clone()),
+            Path("orch_mesh".to_string()),
+            Query(TranscriptQuery { after_seq: None, limit: None }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(all.ok);
+        assert_eq!(all.events.len(), 2);
+        assert_eq!(all.last_seq, Some(2));
+
+        // after_seq = last_seq ⇒ empty tail (nothing newer yet).
+        let (status, Json(tail)) = room_projection_events(
+            State(state.clone()),
+            Path("orch_mesh".to_string()),
+            Query(TranscriptQuery { after_seq: Some(2), limit: None }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tail.events.is_empty(), "after_seq at the head returns nothing");
+        assert!(tail.last_seq.is_none());
+
+        // after_seq = 1 ⇒ only the newer half.
+        let (_, Json(some)) = room_projection_events(
+            State(state.clone()),
+            Path("orch_mesh".to_string()),
+            Query(TranscriptQuery { after_seq: Some(1), limit: None }),
+        )
+        .await;
+        assert_eq!(some.events.len(), 1);
+        assert_eq!(some.events[0].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn projection_unknown_room_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        let (status, Json(resp)) =
+            room_projection_snapshot(State(state.clone()), Path("nope".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!resp.ok);
+        assert!(resp.room.is_none());
+
+        let (status, Json(ev)) = room_projection_events(
+            State(state.clone()),
+            Path("nope".to_string()),
+            Query(TranscriptQuery { after_seq: None, limit: None }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!ev.ok);
+        assert!(ev.events.is_empty());
     }
 
     #[tokio::test]

@@ -458,6 +458,136 @@ pub struct RoomsResponse {
     pub error: Option<String>,
 }
 
+/// One turn in a Track-0 room projection (OCEAN-256).
+///
+/// A "turn" here is the daemon's own unit of agent work — a tracked request in
+/// the daemon's `RequestRegistry`. The projection lenses the live request set by
+/// room and reshapes each entry into this client-facing view, so the richer
+/// `GET /v1/rooms/{room_id}/snapshot` carries real per-room turn history rather
+/// than only the summary panels of [`RoomSnapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomTurn {
+    /// The tracked request id this turn corresponds to. The turn IS a request in
+    /// the daemon's model, so this doubles as the turn id.
+    pub turn_id: RequestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Lifecycle state of the underlying request (`queued`, `running`,
+    /// `waiting-permission`, `cancelling`, `cancelled`, `completed`, `errored`).
+    pub state: String,
+    /// True while the turn has not reached a terminal state — it is the room's
+    /// (or one of the room's) live turn(s).
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// One message line in a Track-0 room projection (OCEAN-256).
+///
+/// Track-0 rooms (`pm`/`writers`/`orch_mesh`/`review`) have no separate chat
+/// transcript the way persistent rooms do — their "messages" are the daemon's
+/// own runtime event feed (user/assistant/tool/permission/turn events). Each
+/// recent event the room lens selects is reshaped into this line, carrying the
+/// originating session/request so a client can correlate it with [`RoomTurn`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomProjectedMessage {
+    /// Monotonic position of this message within the projected feed, oldest = 1.
+    /// Lets `GET /v1/rooms/{room_id}/events?after_seq=N` tail like the persistent
+    /// rooms do, even though the underlying runtime events are keyed by UUID.
+    pub seq: u64,
+    pub at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+    /// Human-readable one-line rendering of the underlying runtime event.
+    pub summary: String,
+}
+
+/// Provenance of each field in a [`RoomProjection`] (OCEAN-256).
+///
+/// The Track-0 projection is computed from whatever runtime state the daemon
+/// actually tracks. Some of the collaboration-model's intended fields have no
+/// backing source yet (there is no per-room component/canvas ledger, and Track-0
+/// rooms carry no persisted roster — that is a *persistent* room concept). Rather
+/// than fabricate those fields, the projection ships them empty and reports here,
+/// honestly, which fields are backed by real state and which are still planned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomProjectionProvenance {
+    /// Fields computed from real tracked state, e.g. `["turns", "active_turn",
+    /// "messages", "last_seq"]`.
+    pub real: Vec<String>,
+    /// Fields whose backing source does not exist yet, e.g. `["components",
+    /// "participants"]`. Always emitted empty in the payload.
+    pub planned: Vec<String>,
+}
+
+/// The richer per-room projection served by `GET /v1/rooms/{room_id}/snapshot`
+/// (OCEAN-256): per-room turns, the active turn, a message feed, and (planned)
+/// rendered components — computed live from daemon runtime state, not a store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomProjection {
+    pub room_id: RoomId,
+    pub title: String,
+    pub summary: String,
+    pub status: String,
+    pub updated_ms: i64,
+    /// Recent runtime event feed for this room lens (REAL). See
+    /// [`RoomProjectedMessage`].
+    #[serde(default)]
+    pub messages: Vec<RoomProjectedMessage>,
+    /// Per-room turn history derived from tracked requests (REAL).
+    #[serde(default)]
+    pub turns: Vec<RoomTurn>,
+    /// Rendered components for this room (PLANNED — no per-room component/canvas
+    /// ledger is persisted yet; always empty today).
+    #[serde(default)]
+    pub components: Vec<serde_json::Value>,
+    /// Room roster (PLANNED — Track-0 rooms carry no persisted roster; that is a
+    /// persistent-room concept. Always empty today).
+    #[serde(default)]
+    pub participants: Vec<serde_json::Value>,
+    /// The single live turn for this room, or `null` when the room is idle (REAL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn: Option<RoomTurn>,
+    /// Tail cursor for `GET /v1/rooms/{room_id}/events?after_seq=` — the `seq` of
+    /// the last projected message, or `null` when the feed is empty (REAL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
+    /// Self-describing real-vs-planned field map, so the payload never silently
+    /// fakes a field whose source does not exist.
+    pub projection: RoomProjectionProvenance,
+}
+
+/// Response payload for `GET /v1/rooms/{room_id}/snapshot` (OCEAN-256).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomProjectionResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response payload for `GET /v1/rooms/{room_id}/events?after_seq=` (OCEAN-256).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomEventsResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub events: Vec<RoomProjectedMessage>,
+    /// `seq` of the last returned event, or `null` when the tail is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Free-form identifier for a *persistent* [`Room`] entity (OCEAN-39).
 ///
 /// Distinct from [`RoomId`], which is a closed enum of the four Track-0
