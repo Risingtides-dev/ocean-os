@@ -81,6 +81,20 @@ struct AppState {
     /// the guard is always dropped before any `await`, and every store method is
     /// synchronous, so a std `Mutex` is correct and never blocks the scheduler.
     rooms: RoomStoreHandle,
+    /// The **persisted Longhouse title registry** (OCEAN-246/272). Holds firekeeper
+    /// and validator titles durably across turns, storing only a salt+SHA-256
+    /// *verifier* per title (never the raw token). Convene mints into it; the
+    /// `POST /v1/longhouse/claim` endpoint verifies against it (constant-time,
+    /// rejecting revoked/released titles). Lives at `titles.db` next to `rooms.db`
+    /// under the agent's config dir, so the escrow security model is durable, not
+    /// inert. See [`TitleRegistryHandle`].
+    titles: TitleRegistryHandle,
+    /// The daemon's single [`ocean_longhouse::Revoker`] (the "War Chief"). Executes
+    /// graduated/hard title recall against [`AppState::titles`] when the daemon
+    /// decides a recall condition is met; a revoked title can never ratify again,
+    /// even with the correct token. Decide ≠ execute: this only *executes*. See
+    /// [`RevokerHandle`].
+    revoker: RevokerHandle,
     /// Daemon-wide count of call-transcript writes ultimately DROPPED after the
     /// bounded persistence retry (OCEAN-255). Shared (by clone of the `Arc`) into
     /// every per-call [`BusSink`] via [`BusSink::with_persistence_counter`], and
@@ -127,6 +141,21 @@ struct CanvasFulfillment {
 
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
 type RoomStoreHandle = Arc<Mutex<ocean_store::SqliteRoomStore>>;
+/// Shared handle to the daemon's **persisted** Longhouse title registry
+/// (OCEAN-246/272): the durable, salt+hash-verifier store of firekeeper/validator
+/// titles. Held behind a std `Mutex` exactly like [`RoomStoreHandle`] — every
+/// method is synchronous and the guard is always dropped before any `await`, so a
+/// std `Mutex` is correct and never blocks the scheduler. This is what makes
+/// `claim_outcome` a daemon-held op: a title minted when a council converges
+/// survives the turn here, so a firekeeper can ratify in a *later* turn.
+type TitleRegistryHandle = Arc<Mutex<ocean_longhouse::SqliteTitleRegistry>>;
+/// Shared handle to the daemon's single [`ocean_longhouse::Revoker`] — the "War
+/// Chief" that *executes* (never decides) title revocation. It holds a
+/// server-minted capability key; only code holding this `Arc` can present that
+/// key, so a forged recall by an unprivileged caller is refused. Wrapped in an
+/// `Arc` (no `Mutex`: `Revoker` is immutable — it mutates the registry it is
+/// handed, under that registry's own lock).
+type RevokerHandle = Arc<ocean_longhouse::Revoker>;
 
 type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
 type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
@@ -723,6 +752,23 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening rooms DB at {}", rooms_db_path.display()))?;
     tracing::info!(path = %rooms_db_path.display(), "persistent rooms store ready");
 
+    // Persisted Longhouse title registry (OCEAN-246/272): open the durable escrow
+    // store at startup so firekeeper/validator titles survive a daemon restart and
+    // `claim_outcome` can ratify across turns. It lives at `titles.db` alongside
+    // `rooms.db` under the same config dir (`OCEAN_TITLES_DB_PATH` overrides the
+    // whole path). `open` runs migrations idempotently — safe on a fresh or
+    // existing DB. The daemon also mints its single Revoker here; the capability
+    // key it holds is never emitted on the wire, so revocation is unforgeable.
+    let titles_db_path = titles_db_path();
+    if let Some(parent) = titles_db_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("creating titles DB directory {}", parent.display())
+        })?;
+    }
+    let title_registry = ocean_longhouse::SqliteTitleRegistry::open(&titles_db_path)
+        .with_context(|| format!("opening titles DB at {}", titles_db_path.display()))?;
+    tracing::info!(path = %titles_db_path.display(), "persisted longhouse title registry ready");
+
     let state = AppState {
         runtime,
         events: EventBus::new(1024),
@@ -731,6 +777,8 @@ async fn main() -> anyhow::Result<()> {
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
         rooms: Arc::new(Mutex::new(room_store)),
+        titles: Arc::new(Mutex::new(title_registry)),
+        revoker: Arc::new(ocean_longhouse::Revoker::new()),
         persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -1073,6 +1121,9 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/longhouse/prepare",
             "GET /v1/longhouse/topics",
             "GET /v1/longhouse/topics/{topic_id}",
+            "POST /v1/longhouse/claim",
+            "POST /v1/longhouse/board",
+            "POST /v1/longhouse/revoke",
             "POST /v1/calls/demo",
             "POST /v1/calls/place",
             "POST /v1/calls/webhook"
@@ -1766,6 +1817,15 @@ fn longhouse_routes() -> Router<AppState> {
         .route("/v1/longhouse/prepare", post(longhouse_prepare))
         .route("/v1/longhouse/topics", get(longhouse_topics))
         .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
+        // OCEAN-272: the persisted-escrow ops `longhouse_provider.rs` deferred.
+        // `claim` ratifies a converged outcome against the durable title registry
+        // (unforgeable, constant-time, revoked/released titles rejected — #229/#246);
+        // `board` posts a note/evidence mark to a tracked topic's durable board.
+        .route("/v1/longhouse/claim", post(longhouse_claim))
+        .route("/v1/longhouse/board", post(longhouse_board_post))
+        // The Revoker's execute side: the daemon presents its own server-minted
+        // key to pull a title (decide≠execute, unforgeable — #246).
+        .route("/v1/longhouse/revoke", post(longhouse_revoke))
 }
 
 /// Emit a scripted-but-real Longhouse deliberation onto the agent event bus so
@@ -2013,6 +2073,10 @@ async fn longhouse_convene(
 ) -> Json<serde_json::Value> {
     let bus = state.agent_events.clone();
     let registry = state.longhouse.clone();
+    // The persisted title registry (OCEAN-272): the convened council mints its
+    // firekeeper title into THIS durable store on convergence, so the title — and
+    // the right to `claim_outcome` against it — survives the turn.
+    let titles = state.titles.clone();
     let federation = parse_federation(req.federation.as_deref());
 
     let mut convene_req = ocean_longhouse::ConveneRequest::new(req.question.clone(), federation);
@@ -2039,6 +2103,62 @@ async fn longhouse_convene(
             bus.emit(ev.into_turn_event());
         })
         .await;
+
+        // OCEAN-272: persist the firekeeper title for a converged council into the
+        // durable registry, bound to the engine's decision. The in-frame title
+        // inside `convene()` already gated the binding `Converged` it emitted
+        // (OCEAN-229); this is the *additional* durable authority that lets a
+        // firekeeper ratify in a LATER turn via `POST /v1/longhouse/claim`.
+        //
+        // Security: `grant()` mints the secret server-side from the CSPRNG and the
+        // registry persists only a salt+SHA-256 verifier — the raw token is NEVER
+        // stored and NEVER emitted on any event (we log only the public title_id /
+        // agent_id / decision). The secret `FirekeeperTitle` returned here is used
+        // and dropped in this frame, mirroring how `convene()` itself mints, uses,
+        // and drops its in-frame title: the durable *authority* persists; the
+        // secret does not leak.
+        if let Some(decision) = outcome.decision {
+            // The winning proposal's author holds the firekeeper title (the same
+            // binding `convene()` uses). Fall back is irrelevant here — a converged
+            // outcome always has a recorded firekeeper on the snapshot.
+            let firekeeper = registry
+                .lock()
+                .ok()
+                .and_then(|reg| reg.topic(&outcome.topic_id).and_then(|t| t.firekeeper));
+            if let Some(firekeeper) = firekeeper {
+                let now = ocean_protocol::now_ms();
+                let granted = {
+                    let mut reg = titles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match reg.grant(outcome.topic_id, firekeeper, AgentRole::Firekeeper, now) {
+                        Ok((persisted, _secret)) => {
+                            // Bind the durable title to the engine's decision so a
+                            // later, engine-free `claim_bound_outcome` can ratify
+                            // exactly this proposal. `_secret` is dropped here.
+                            if let Err(e) = reg.bind_decision(persisted.title_id, decision) {
+                                tracing::warn!(error = %e, "failed to bind persisted firekeeper title to decision");
+                            }
+                            Some(persisted.title_id)
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to persist firekeeper title for converged council");
+                            None
+                        }
+                    }
+                };
+                if let Some(title_id) = granted {
+                    tracing::info!(
+                        topic = %outcome.topic_id,
+                        title = %title_id,
+                        firekeeper = %firekeeper,
+                        decision = %decision,
+                        "persisted firekeeper title bound to converged decision (claimable across turns)"
+                    );
+                }
+            }
+        }
+
         tracing::info!(
             topic = %outcome.topic_id,
             converged = outcome.decision.is_some(),
@@ -3537,6 +3657,359 @@ async fn longhouse_topic(
     }
 }
 
+// ---- OCEAN-272: persisted-escrow ops (claim_outcome / board_post) ----------
+//
+// These are the two ops `longhouse_provider.rs` deliberately deferred ("there is
+// no persisted, daemon-held engine to … claim an outcome against between turns").
+// OCEAN-246 shipped the durable `SqliteTitleRegistry`; OCEAN-272 holds it on
+// `AppState` (so it survives the turn) and exposes these endpoints against it.
+//
+// Security posture (mirrors #185/#220/#229/#246):
+//   * `claim` verifies the persisted title's secret in CONSTANT TIME and rejects a
+//     revoked/released title even with the correct token; it ratifies only the
+//     decision the daemon durably bound at convergence (the firekeeper signs the
+//     engine's choice, never its own). Verified before any decision state is read,
+//     so a forged/revoked caller learns nothing.
+//   * Longhouse stays advisory/coordinating: a successful claim records the close
+//     and releases validator escrow; it does NOT execute anything or bypass a
+//     daemon permission gate. The agent-facing tool seam (`longhouse_provider.rs`)
+//     keeps `requires_permission() == true`, so an agent claiming via a tool is
+//     still gated like `bash`/`write` (post-OCEAN-54).
+
+/// Run a closure with the locked persisted title registry, recovering a poisoned
+/// lock the same way the room/longhouse handlers do (`into_inner`). Synchronous:
+/// the guard is dropped before this returns, so no `await` is held across it.
+fn with_titles<T>(
+    state: &AppState,
+    f: impl FnOnce(&mut ocean_longhouse::SqliteTitleRegistry) -> T,
+) -> T {
+    let mut guard = match state.titles.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut guard)
+}
+
+/// Request body for `POST /v1/longhouse/claim`.
+#[derive(Debug, serde::Deserialize)]
+struct LonghouseClaimRequest {
+    /// The persisted title's id (public handle; on its own it grants nothing).
+    title_id: String,
+    /// The public agent id that holds the title (the firekeeper).
+    agent_id: String,
+    /// The secret proof-of-title minted server-side at convene-grant. Constant-
+    /// time-verified against the stored salt+hash verifier; never logged.
+    token: String,
+    /// The proposal the firekeeper claims as the converged outcome. Must equal the
+    /// decision the registry durably bound at convergence, else `WrongDecision`.
+    decision: String,
+}
+
+/// `POST /v1/longhouse/claim` — the daemon-held `claim_outcome` (OCEAN-272). A
+/// firekeeper ratifies a converged outcome against the **persisted** title
+/// registry, in a turn LATER than the one that minted the title. Verifies the
+/// title's secret in constant time, rejects a revoked/released title even with
+/// the correct token, and accepts only the durably-bound decision. On success,
+/// the title is released and the topic's validator escrow is released.
+///
+/// Status mapping: 200 on a ratified claim; 403 for a forged/revoked title
+/// (`ForgedFirekeeper`); 409 for a premature (`NotConverged`) or wrong-proposal
+/// (`WrongDecision`) claim; 400 for a malformed UUID. The body is a typed
+/// `{ ok, … }` shape, never a panic.
+async fn longhouse_claim(
+    State(state): State<AppState>,
+    Json(req): Json<LonghouseClaimRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let parse = |label: &str, raw: &str| {
+        Uuid::parse_str(raw.trim())
+            .map_err(|_| format!("`{label}` is not a valid UUID: {raw:?}"))
+    };
+    let (title_id, agent_id, decision) = match (
+        parse("title_id", &req.title_id),
+        parse("agent_id", &req.agent_id),
+        parse("decision", &req.decision),
+    ) {
+        (Ok(t), Ok(a), Ok(d)) => (t, a, d),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    // A blank token can never authorize; reject it as a forged claim WITHOUT
+    // touching the registry (uniform with a wrong token, leaks nothing).
+    let token = req.token.trim();
+    let presented = if token.is_empty() { None } else { Some(token) };
+
+    let now = ocean_protocol::now_ms();
+    let result = with_titles(&state, |reg| {
+        ocean_longhouse::claim_bound_outcome(reg, title_id, agent_id, presented, decision, now)
+    });
+
+    match result {
+        Ok(released) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "title_id": title_id,
+                "decision": decision,
+                "escrow_released": released,
+            })),
+        ),
+        // Forged identity OR a revoked/released title — refused identically so the
+        // verdict leaks neither the title's existence nor the bound decision.
+        Err(ocean_longhouse::ClaimError::ForgedFirekeeper) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": "claim refused: title not proven, or it has been revoked/released",
+            })),
+        ),
+        // Engine never bound a decision for this title (premature claim).
+        Err(ocean_longhouse::ClaimError::NotConverged) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": "claim refused: no converged decision is bound to this title yet",
+            })),
+        ),
+        // Right title, wrong proposal — the firekeeper may only sign the engine's
+        // own decision.
+        Err(ocean_longhouse::ClaimError::WrongDecision {
+            engine_decision,
+            claimed,
+        }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": format!(
+                    "claim refused: the bound decision is {engine_decision}, not {claimed}"
+                ),
+                "engine_decision": engine_decision,
+                "claimed": claimed,
+            })),
+        ),
+    }
+}
+
+/// Request body for `POST /v1/longhouse/revoke`.
+#[derive(Debug, serde::Deserialize)]
+struct LonghouseRevokeRequest {
+    /// The persisted title to pull. After a successful revoke it can never ratify
+    /// a claim again, even with the correct token.
+    title_id: String,
+    /// Human-facing reason recorded on the audit row (e.g. "unsafe tool call").
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /v1/longhouse/revoke` — execute a hard recall of a persisted title via
+/// the daemon's single [`ocean_longhouse::Revoker`] (OCEAN-246/272, the "War
+/// Chief").
+///
+/// **Decide ≠ execute.** The *decision* to revoke is the operator's explicit
+/// request, arriving over the daemon's local trust boundary (loopback +
+/// CORS-restricted, OCEAN-53) like every other mutating route. The *execution* is
+/// the daemon presenting its own server-minted `RevokerKey` — which it alone holds
+/// (it is never emitted on the wire) — so the unforgeable-revocation property is
+/// preserved: a caller who merely names a `title_id` cannot deauthorize a
+/// firekeeper; only the daemon, holding the key, can. This is what makes the held
+/// Revoker a live executor rather than inert state.
+///
+/// 200 on a pulled title; 404 if unknown; 409 if the title was already
+/// revoked/released (`NotLive`); 400 on a malformed UUID. (`Unauthorized` is
+/// unreachable here — the daemon always presents its own key — but is mapped to
+/// 403 for completeness.)
+async fn longhouse_revoke(
+    State(state): State<AppState>,
+    Json(req): Json<LonghouseRevokeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let title_id = match Uuid::parse_str(req.title_id.trim()) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("`title_id` is not a valid UUID: {:?}", req.title_id),
+                })),
+            );
+        }
+    };
+    let detail = req
+        .reason
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("operator-initiated recall")
+        .to_string();
+
+    let now = ocean_protocol::now_ms();
+    // The daemon presents ITS OWN key (held on AppState, never on the wire) — the
+    // execute side of decide≠execute. We pull a clone of the Arc'd Revoker out so
+    // the title-registry lock is the only lock held across the call.
+    let revoker = state.revoker.clone();
+    let key = revoker.key();
+    let result = with_titles(&state, |reg| {
+        revoker.revoke(
+            reg,
+            Some(key.secret()),
+            title_id,
+            ocean_longhouse::RevokeAuthorization::PolicyBreach { detail },
+            now,
+        )
+    });
+
+    match result {
+        Ok(revocation) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "title_id": revocation.title_id,
+                "topic_id": revocation.topic_id,
+                "agent_id": revocation.agent_id,
+                "reason": revocation.reason,
+            })),
+        ),
+        Err(ocean_longhouse::RevokeError::UnknownTitle(id)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("no title with id '{id}'") })),
+        ),
+        Err(ocean_longhouse::RevokeError::NotLive(id)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": format!("title '{id}' is not live (already revoked/released)"),
+            })),
+        ),
+        Err(ocean_longhouse::RevokeError::Unauthorized) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "revoke refused: missing Revoker capability" })),
+        ),
+        Err(ocean_longhouse::RevokeError::Storage(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": format!("revoke storage error: {e}") })),
+        ),
+    }
+}
+
+/// Request body for `POST /v1/longhouse/board`.
+#[derive(Debug, serde::Deserialize)]
+struct LonghouseBoardPostRequest {
+    /// The topic whose durable board receives the mark. Must be a tracked topic.
+    topic_id: String,
+    /// The agent posting the mark.
+    author: String,
+    /// Mark kind: `note` (default) or `evidence`. Proposal/endorse/inhibit are
+    /// quorum-affecting and are produced by the council's workers inside
+    /// `convene()`, never posted ad hoc here — the board post is an annotation on
+    /// the durable record, not a vote, so it never decides quorum.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Short human-facing summary of the mark (shown on the deck's blackboard).
+    summary: String,
+}
+
+/// Map a board-post `kind` string to a non-quorum-affecting [`MarkKind`].
+/// Anything other than an explicit `evidence` is a free-form `note`; the
+/// quorum-affecting kinds (proposal/endorse/inhibit) are intentionally not
+/// accepted here so a board post can never move convergence.
+fn parse_board_mark_kind(s: Option<&str>) -> MarkKind {
+    match s.map(|v| v.trim().to_lowercase()).as_deref() {
+        Some("evidence") => MarkKind::Evidence,
+        _ => MarkKind::Note,
+    }
+}
+
+/// `POST /v1/longhouse/board` — `board_post` (OCEAN-272): append a note/evidence
+/// mark to a tracked topic's **durable board** (the daemon-held
+/// `LonghouseRegistry`), and publish a `MarkPosted` onto the agent bus so live
+/// decks render it. Read-only with respect to convergence: the registry is the
+/// read-side projection, so this annotates the record — it never decides quorum
+/// (the engine does). 404 if the topic isn't tracked, 400 on a malformed UUID.
+async fn longhouse_board_post(
+    State(state): State<AppState>,
+    Json(req): Json<LonghouseBoardPostRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let topic_id = match Uuid::parse_str(req.topic_id.trim()) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("`topic_id` is not a valid UUID: {:?}", req.topic_id),
+                })),
+            );
+        }
+    };
+    let author = match Uuid::parse_str(req.author.trim()) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("`author` is not a valid UUID: {:?}", req.author),
+                })),
+            );
+        }
+    };
+    let summary = req.summary.trim();
+    if summary.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "`summary` must be a non-empty string" })),
+        );
+    }
+
+    // The topic must already be tracked — a board post annotates an existing
+    // council's record, it does not create a topic.
+    let exists = match state.longhouse.lock() {
+        Ok(reg) => reg.topic(&topic_id).is_some(),
+        Err(poisoned) => poisoned.into_inner().topic(&topic_id).is_some(),
+    };
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("no longhouse topic with id '{topic_id}'"),
+            })),
+        );
+    }
+
+    let mark_id = Uuid::new_v4();
+    let event = LonghouseEvent::MarkPosted {
+        topic_id,
+        mark: Mark {
+            mark_id,
+            author,
+            kind: parse_board_mark_kind(req.kind.as_deref()),
+            target: None,
+            summary: summary.to_string(),
+        },
+    };
+    // Fold into the durable board first, then publish to the live bus — identical
+    // ordering to `longhouse_convene` (registry is the durable mirror, bus is the
+    // live feed). The std Mutex guard is dropped before the bus emit.
+    if let Ok(mut reg) = state.longhouse.lock() {
+        reg.ingest(&event);
+    }
+    state.agent_events.emit(event.into_turn_event());
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "topic_id": topic_id,
+            "mark_id": mark_id,
+        })),
+    )
+}
+
 // ---- Persistent Rooms (OCEAN-65) -------------------------------------------
 //
 // These routes serve the *persistent* `Room` lifecycle: create, fetch, roster
@@ -3559,6 +4032,18 @@ fn room_db_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     ocean_agent::config_dir_from_env().join("rooms.db")
+}
+
+/// Where the persisted Longhouse **title registry** SQLite DB lives (OCEAN-272).
+/// `OCEAN_TITLES_DB_PATH` overrides the whole path; otherwise it is `titles.db`
+/// under the agent's config dir (`ocean_agent::config_dir_from_env`), so the
+/// escrow store sits right next to `rooms.db`, sessions, and projects under one
+/// config directory — the same convention `room_db_path` follows.
+fn titles_db_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("OCEAN_TITLES_DB_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    ocean_agent::config_dir_from_env().join("titles.db")
 }
 
 /// Run a closure with the locked room store, recovering a poisoned lock the same
@@ -10191,6 +10676,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
+            titles: Arc::new(Mutex::new(
+                ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
+            )),
+            revoker: Arc::new(ocean_longhouse::Revoker::new()),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -11047,6 +11536,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
+            titles: Arc::new(Mutex::new(
+                ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
+            )),
+            revoker: Arc::new(ocean_longhouse::Revoker::new()),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -11507,6 +12000,358 @@ mod tests {
         );
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    // ---- OCEAN-272: persisted escrow wired into the daemon ------------------
+    //
+    // These exercise the daemon-held title registry end to end through the REAL
+    // `longhouse_routes()` table: a title minted/bound in "one turn" is verified by
+    // `POST /v1/longhouse/claim` in a later, engine-free handler call (the core
+    // cross-turn property); a forged or revoked claim is refused; and the route is
+    // reachable. They also prove the persistence-no-leak property at the daemon's
+    // own DB path.
+
+    /// Deterministic uuid for the escrow tests.
+    fn esc_uid(n: u8) -> Uuid {
+        let mut b = [0u8; 16];
+        b[15] = n;
+        Uuid::from_bytes(b)
+    }
+
+    /// Build an `AppState` whose persisted title registry lives at a real on-disk
+    /// `titles.db` under `dir` (so a reopen test can prove durability), with an
+    /// in-memory rooms store and fake runtime. Returns the state.
+    fn escrow_state_with_titles_db(dir: &std::path::Path) -> AppState {
+        std::env::set_var("OCEAN_MODEL", "fake-ok");
+        let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
+        let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let titles = ocean_longhouse::SqliteTitleRegistry::open(dir.join("titles.db"))
+            .expect("on-disk titles");
+        AppState {
+            runtime,
+            events: EventBus::new(64),
+            agent_events: AgentEventBus::new(64),
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            permissions: Arc::new(RwLock::new(HashMap::new())),
+            longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
+            rooms: Arc::new(Mutex::new(store)),
+            titles: Arc::new(Mutex::new(titles)),
+            revoker: Arc::new(ocean_longhouse::Revoker::new()),
+            persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// POST a JSON body to `path` through an app and return (status, json).
+    async fn post_json(app: Router, path: &str, body: serde_json::Value) -> (StatusCode, Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    // THE CORE OCEAN-272 PROPERTY, through the daemon: a firekeeper title minted +
+    // bound in "turn 1" (a direct grant into the daemon's persisted registry, the
+    // same thing `longhouse_convene` does on convergence) is ratified by
+    // `POST /v1/longhouse/claim` in a LATER, engine-free handler call. No
+    // QuorumEngine is anywhere in the claim path — the durable bound decision is
+    // the verdict. The route is reachable and the legit claim returns 200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claim_route_ratifies_persisted_title_across_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let topic = esc_uid(1);
+        let agent = esc_uid(10);
+        let decision = esc_uid(2);
+
+        // "Turn 1": mint + bind into the daemon's persisted registry, capturing the
+        // server-minted secret (what the daemon holds; never on the wire).
+        let token = with_titles(&state, |reg| {
+            let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            reg.stake(topic, esc_uid(20), 100, 0).unwrap();
+            reg.bind_decision(p.title_id, decision).unwrap();
+            // Stash the title_id on the secret's debug-free return.
+            (p.title_id, secret.token().to_string())
+        });
+        let (title_id, token) = token;
+
+        // "Turn 2": a fresh request through the real route table. No engine exists.
+        let app = longhouse_routes().with_state(state);
+        let (status, body) = post_json(
+            app,
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": title_id.to_string(),
+                "agent_id": agent.to_string(),
+                "token": token,
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "legit cross-turn claim must 200; body: {body}");
+        assert_eq!(body["ok"], json!(true), "body: {body}");
+        assert_eq!(
+            body["escrow_released"], json!(1),
+            "the topic's one validator stake is released on a successful claim: {body}"
+        );
+    }
+
+    // A forged claim — the correct public ids but NO token — is refused 403 through
+    // the route, even though the title is genuinely bound. The token is the
+    // credential, not the id (OCEAN-229/246).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claim_route_rejects_forged_no_token_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let (topic, agent, decision) = (esc_uid(1), esc_uid(10), esc_uid(2));
+        let title_id = with_titles(&state, |reg| {
+            let (p, _secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            reg.bind_decision(p.title_id, decision).unwrap();
+            p.title_id
+        });
+        let app = longhouse_routes().with_state(state);
+        let (status, body) = post_json(
+            app,
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": title_id.to_string(),
+                "agent_id": agent.to_string(),
+                "token": "",
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a tokenless claim must 403; body: {body}");
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    // A REVOKED title is refused 403 through the route EVEN WITH THE CORRECT TOKEN.
+    // Revocation is executed by the daemon's own `Revoker` (holding its server-minted
+    // key) — the load-bearing OCEAN-246 property, end to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claim_route_rejects_revoked_title_even_with_right_token_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let (topic, agent, decision) = (esc_uid(1), esc_uid(10), esc_uid(2));
+
+        // Mint + bind, then have the daemon's Revoker pull the title with its key.
+        let (title_id, token) = with_titles(&state, |reg| {
+            let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            reg.bind_decision(p.title_id, decision).unwrap();
+            (p.title_id, secret.token().to_string())
+        });
+        let revoke_result = {
+            let revoker = state.revoker.clone();
+            let key = revoker.key();
+            with_titles(&state, |reg| {
+                revoker.revoke(
+                    reg,
+                    Some(key.secret()),
+                    title_id,
+                    ocean_longhouse::RevokeAuthorization::PolicyBreach {
+                        detail: "captured firekeeper".into(),
+                    },
+                    5,
+                )
+            })
+        };
+        assert!(revoke_result.is_ok(), "the daemon's Revoker (with its key) revokes");
+
+        let app = longhouse_routes().with_state(state);
+        let (status, body) = post_json(
+            app,
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": title_id.to_string(),
+                "agent_id": agent.to_string(),
+                "token": token, // the CORRECT token
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a revoked title must be refused even with the right token; body: {body}"
+        );
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    // A claim of the wrong proposal (right title + token, wrong decision) is a 409
+    // conflict — the firekeeper may only sign the bound decision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claim_route_wrong_decision_is_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let (topic, agent, bound, other) = (esc_uid(1), esc_uid(10), esc_uid(2), esc_uid(3));
+        let (title_id, token) = with_titles(&state, |reg| {
+            let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            reg.bind_decision(p.title_id, bound).unwrap();
+            (p.title_id, secret.token().to_string())
+        });
+        let app = longhouse_routes().with_state(state);
+        let (status, body) = post_json(
+            app,
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": title_id.to_string(),
+                "agent_id": agent.to_string(),
+                "token": token,
+                "decision": other.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "wrong decision is a 409; body: {body}");
+        assert_eq!(body["engine_decision"], json!(bound.to_string()));
+    }
+
+    // `POST /v1/longhouse/board` posts a note mark onto a tracked topic's durable
+    // board (200), and 404s for an unknown topic. It never decides quorum.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn board_post_route_appends_mark_to_tracked_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let topic = esc_uid(1);
+        let author = esc_uid(10);
+
+        // Seed a tracked topic into the durable board (as a convened council would).
+        {
+            let mut reg = state.longhouse.lock().unwrap();
+            reg.ingest(&LonghouseEvent::TopicConvened {
+                topic_id: topic,
+                board_id: esc_uid(99),
+                federation: Federation::Dev,
+                trigger: ConveneTrigger::UserRequest,
+                title: "seeded".into(),
+                deadline_ms: 120_000,
+            });
+        }
+
+        let app = longhouse_routes().with_state(state.clone());
+        let (status, body) = post_json(
+            app.clone(),
+            "/v1/longhouse/board",
+            json!({
+                "topic_id": topic.to_string(),
+                "author": author.to_string(),
+                "kind": "note",
+                "summary": "a board annotation",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "board post to a tracked topic must 200; body: {body}");
+        assert_eq!(body["ok"], json!(true));
+
+        // The mark landed on the durable board.
+        let marks = state.longhouse.lock().unwrap().topic(&topic).unwrap().marks;
+        assert!(
+            marks.iter().any(|m| m.summary == "a board annotation"),
+            "the posted mark must appear on the topic's board"
+        );
+
+        // An unknown topic 404s.
+        let (missing_status, _) = post_json(
+            app,
+            "/v1/longhouse/board",
+            json!({
+                "topic_id": esc_uid(77).to_string(),
+                "author": author.to_string(),
+                "summary": "into the void",
+            }),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND, "board post to an unknown topic 404s");
+    }
+
+    // Persistence-no-leak at the daemon's own DB path: after a grant, reopen the
+    // SAME titles.db (a fresh process) and confirm only the salt+hash verifier
+    // persisted — the raw token is absent — yet the original secret still verifies.
+    #[test]
+    fn daemon_titles_db_persists_verifier_not_token() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("OCEAN_TITLES_DB_PATH", dir.path().join("titles.db"));
+        let path = titles_db_path();
+        std::env::remove_var("OCEAN_TITLES_DB_PATH");
+        let (topic, agent) = (esc_uid(1), esc_uid(10));
+
+        let (title_id, token) = {
+            let mut reg = ocean_longhouse::SqliteTitleRegistry::open(&path).unwrap();
+            let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            (p.title_id, secret.token().to_string())
+        };
+
+        // Reopen the same file — the title survived, the secret still verifies, and
+        // a forged token does not.
+        let reg = ocean_longhouse::SqliteTitleRegistry::open(&path).unwrap();
+        assert_eq!(reg.verify_title(title_id, agent, Some(&token)), Ok(()));
+        assert_eq!(
+            reg.verify_title(title_id, agent, Some("forged")),
+            Err(ocean_longhouse::ClaimError::ForgedFirekeeper)
+        );
+    }
+
+    // The full decide≠execute + unforgeable-revocation loop through the REAL route
+    // table: the daemon's `POST /v1/longhouse/revoke` pulls a title (the daemon
+    // presents its own held key), and AFTER that a claim with the CORRECT token is
+    // refused 403. End to end, a revoked firekeeper cannot ratify.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoke_route_then_claim_is_rejected_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let (topic, agent, decision) = (esc_uid(1), esc_uid(10), esc_uid(2));
+        let (title_id, token) = with_titles(&state, |reg| {
+            let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            reg.bind_decision(p.title_id, decision).unwrap();
+            (p.title_id, secret.token().to_string())
+        });
+
+        let app = longhouse_routes().with_state(state);
+
+        // Operator revokes via the route — the daemon executes with its own key.
+        let (rev_status, rev_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/revoke",
+            json!({ "title_id": title_id.to_string(), "reason": "unsafe tool call" }),
+        )
+        .await;
+        assert_eq!(rev_status, StatusCode::OK, "operator revoke must 200; body: {rev_body}");
+        assert_eq!(rev_body["agent_id"], json!(agent.to_string()));
+
+        // The correct token now buys nothing — the title is revoked.
+        let (claim_status, claim_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": title_id.to_string(),
+                "agent_id": agent.to_string(),
+                "token": token,
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            claim_status,
+            StatusCode::FORBIDDEN,
+            "a claim after revoke must 403 even with the right token; body: {claim_body}"
+        );
+
+        // A second revoke of the now-revoked title is a 409 (NotLive).
+        let (again_status, _) = post_json(
+            app,
+            "/v1/longhouse/revoke",
+            json!({ "title_id": title_id.to_string() }),
+        )
+        .await;
+        assert_eq!(again_status, StatusCode::CONFLICT, "double-revoke is a 409 NotLive");
     }
 
     /// The convene FOOTPRINT (notice + audit line + turn) is gated on the mention
