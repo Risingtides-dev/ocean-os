@@ -521,8 +521,21 @@ pub mod live {
     #[cfg(feature = "xai-stt")]
     impl XaiTranscriber {
         pub fn new(api_key: impl Into<String>) -> Self {
+            // Bound the batch STT call. Without these, a stalled xAI response
+            // leaves `.send().await` (and `.json().await`) pending forever,
+            // which blocks the orchestrator's per-segment transcribe loop for
+            // the entire call. These are non-streaming POSTs (WAV in, JSON
+            // out), so a full request timeout is correct and safe here:
+            //   connect 10s — establish the TLS connection;
+            //   request 60s — the whole batch transcription, generous enough
+            //   for a long utterance but bounded so a hang can't freeze the call.
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             Self {
-                client: reqwest::Client::new(),
+                client,
                 api_key: api_key.into(),
             }
         }
