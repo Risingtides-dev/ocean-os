@@ -37,7 +37,7 @@ pub mod wake;
 pub mod webhook;
 
 pub use frame::{FrameChunker, PcmFrame};
-pub use orchestrator::{ActiveOutcome, CallSession, CapturingSink, EventSink};
+pub use orchestrator::{ActiveOutcome, CallSession, CapturingSink, EventSink, SegmentOutcome};
 pub use room_tap::TapLifecycle;
 pub use session_task::{
     run_call_session, FrameSource, SourceEnd, Transcriber, TurnRunner, UtterancePolicy, Voice,

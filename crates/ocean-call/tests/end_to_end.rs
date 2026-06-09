@@ -59,8 +59,16 @@ fn full_call_emits_expected_event_sequence() {
     let mut sink = CapturingSink::default();
 
     session.start(&mut sink, "call:e2e", vec!["sip:+17035081859".into()]);
+    // The orchestrator no longer emits CallSummaryUpdated itself — it hands the
+    // debounced transcript back via SegmentOutcome::summary_due, and the I/O lane
+    // (session_task) runs the real summary turn. Capture that the summary fired
+    // here at the orchestrator seam.
+    let mut summary_due_count = 0usize;
     for (speaker, text, ms) in call_script() {
-        session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+        let outcome = session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+        if outcome.summary_due.is_some() {
+            summary_due_count += 1;
+        }
     }
     session.end(&mut sink, 16_000);
 
@@ -85,8 +93,13 @@ fn full_call_emits_expected_event_sequence() {
     assert_eq!(kinds.iter().filter(|k| **k == "segment").count(), 6);
     // Two commitments detected ("I'll send the master", "verify the toll-free").
     assert_eq!(kinds.iter().filter(|k| **k == "task").count(), 2);
-    // Summary fired (3 finals before the wake turn).
-    assert!(kinds.contains(&"summary"));
+    // The orchestrator stays I/O-free: it never emits a raw-transcript summary.
+    assert!(
+        !kinds.contains(&"summary"),
+        "orchestrator must not emit CallSummaryUpdated; the I/O lane does"
+    );
+    // ...but it DID signal a summary was due (3 finals before the wake turn).
+    assert!(summary_due_count >= 1, "summary should fire after 3 finals");
     // The wake word was honored.
     assert!(kinds.contains(&"wake"));
 }

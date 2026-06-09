@@ -2326,7 +2326,9 @@ fn call_voice_muted() -> bool {
 /// SSE rail. Proves the daemon→orchestrator→EventBus path end to end WITHOUT
 /// any Twilio/LiveKit account — the live `place_call` path is gated on those.
 async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
-    use ocean_call::{CallSession, Summarizer, SummaryPolicy, TranscriptSegment, WakeGate};
+    use ocean_call::{
+        CallSession, EventSink, Summarizer, SummaryPolicy, TranscriptSegment, WakeGate,
+    };
 
     // Mint a unique `call:<uuid>` room so each demo run produces a fresh,
     // independently-queryable transcript (a fixed key would collide on the second
@@ -2355,7 +2357,17 @@ async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
         ("caller", "hey Ocean what did we just agree to", 10_000),
     ];
     for (speaker, text, ms) in script {
-        session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+        let outcome = session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+        // Offline demo path: there's no agent runtime here to run the real summary
+        // turn (that lives in the live `run_call_session` loop), so the debounced
+        // raw transcript is emitted directly as the summary to exercise the
+        // persistence path. The live call path produces an LLM summary instead.
+        if let Some(transcript) = outcome.summary_due {
+            sink.emit(OceanEvent::CallSummaryUpdated {
+                summary: transcript,
+                as_of_ms: ms,
+            });
+        }
     }
     session.end(&mut sink, 12_000);
 
@@ -6935,7 +6947,9 @@ mod tests {
     /// loop — exactly the demo's guarantee.
     #[test]
     fn call_demo_script_persists_transcript_to_a_room() {
-        use ocean_call::{CallSession, Summarizer, SummaryPolicy, TranscriptSegment, WakeGate};
+        use ocean_call::{
+            CallSession, EventSink, Summarizer, SummaryPolicy, TranscriptSegment, WakeGate,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("rooms.db");
@@ -6955,7 +6969,9 @@ mod tests {
         );
 
         // Same shape as call_demo: 5 final segments; the summarizer fires once at
-        // the 3rd final segment (every_n_segments = 3).
+        // the 3rd final segment (every_n_segments = 3). The orchestrator now hands
+        // the debounced transcript back instead of emitting it; this offline demo
+        // (no agent runtime) emits it directly to exercise summary persistence.
         session.start(&mut sink, &room, vec!["sip:+17035081859".into()]);
         let script = [
             ("caller", "hey thanks for jumping on", 0u64),
@@ -6965,7 +6981,14 @@ mod tests {
             ("caller", "hey Ocean what did we just agree to", 10_000),
         ];
         for (speaker, text, ms) in script {
-            session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+            let outcome =
+                session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+            if let Some(transcript) = outcome.summary_due {
+                sink.emit(OceanEvent::CallSummaryUpdated {
+                    summary: transcript,
+                    as_of_ms: ms,
+                });
+            }
         }
         session.end(&mut sink, 12_000);
 
