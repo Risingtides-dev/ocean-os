@@ -153,6 +153,14 @@ struct AppState {
     /// `/metrics` handler reads it straight off [`AppState::persist_failures`] so
     /// there is a single source of truth for that count. See [`TurnMetrics`].
     metrics: Arc<TurnMetrics>,
+    /// Bounded permit pool capping concurrently-running turns (OCEAN-304). Both
+    /// turn-intake handlers (`agent_turn`, `create_request`) take a permit before
+    /// running a turn and reject with 429 / `ok:false` when the pool is exhausted,
+    /// so a burst or a runaway client can't fan out into unbounded concurrent
+    /// provider calls. The permit is held for the life of the turn and released on
+    /// every exit path (it's an owned permit dropped — success, error, panic).
+    /// Sized by [`max_concurrent_turns`] (`OCEAN_MAX_CONCURRENT_TURNS`).
+    turn_limiter: TurnLimiter,
 }
 
 // ── OCEAN-303: in-process turn metrics ──────────────────────────────────────
@@ -454,6 +462,56 @@ type RecallRegistryHandle = Arc<Mutex<HashMap<Uuid, ocean_longhouse::RecallVote>
 
 type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
 type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
+
+// --- Turn-intake backpressure (OCEAN-304) -----------------------------------
+//
+// Both turn-intake paths (`POST /v1/agent/turns` and `POST /v1/requests`)
+// previously accepted and ran a turn per request with no ceiling: a burst, or a
+// runaway client loop, spawned unbounded concurrent provider calls and could
+// exhaust file descriptors / memory / provider rate budget. This bounds the
+// number of turns *running concurrently* in the daemon. A permit is taken when a
+// turn starts and released (via an owned permit dropped) on EVERY exit path —
+// success, error, timeout, cancellation, or a panic in the turn future — because
+// dropping the `OwnedSemaphorePermit` returns it to the pool unconditionally.
+//
+// At capacity the daemon REJECTS new turns immediately (HTTP 429 / `ok:false`)
+// rather than queueing them: a runaway client gets fast backpressure instead of
+// an unbounded wait, and legitimate clients can retry. The cap is sized for
+// normal multi-room / multi-client operation (see [`max_concurrent_turns`]).
+
+/// Bounded permit pool capping concurrently-running turns (OCEAN-304). Cloneable
+/// (it's an `Arc<Semaphore>`) so it can live on [`AppState`] and be moved into a
+/// spawned turn task. `try_acquire_owned` is the only acquisition used — it never
+/// blocks, so a full pool is an instant rejection, never a queue.
+type TurnLimiter = Arc<tokio::sync::Semaphore>;
+
+/// Default ceiling on concurrent turns when `OCEAN_MAX_CONCURRENT_TURNS` is unset
+/// or unparseable. High enough that normal multi-room / multi-client use never
+/// trips it, low enough that a burst or a runaway loop can't fan out into an
+/// unbounded number of simultaneous provider calls.
+const DEFAULT_MAX_CONCURRENT_TURNS: usize = 24;
+
+/// Resolve the concurrent-turn ceiling: `OCEAN_MAX_CONCURRENT_TURNS` if set to a
+/// parseable, non-zero `usize`, else [`DEFAULT_MAX_CONCURRENT_TURNS`]. A `0` or
+/// garbage value falls back to the default rather than wedging intake shut
+/// (Semaphore with 0 permits would reject every turn), matching how the other
+/// numeric env knobs (`OCEAN_SHUTDOWN_*`) degrade to a sane default.
+fn max_concurrent_turns() -> usize {
+    match env::var("OCEAN_MAX_CONCURRENT_TURNS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    default = DEFAULT_MAX_CONCURRENT_TURNS,
+                    "OCEAN_MAX_CONCURRENT_TURNS ignored (must be a positive integer); using default"
+                );
+                DEFAULT_MAX_CONCURRENT_TURNS
+            }
+        },
+        Err(_) => DEFAULT_MAX_CONCURRENT_TURNS,
+    }
+}
 
 struct RequestControl {
     status: RequestStatus,
@@ -1436,6 +1494,9 @@ async fn main() -> anyhow::Result<()> {
         shutdown: CancellationToken::new(),
         // OCEAN-303: daemon-wide turn metrics behind `GET /metrics`.
         metrics: Arc::new(TurnMetrics::default()),
+        // OCEAN-304: concurrent-turn ceiling. One permit per running turn;
+        // exhaustion → 429/busy at intake instead of unbounded provider fan-out.
+        turn_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_turns())),
     };
 
     // Background GC: the request/permission/canvas-fulfillment registries are
@@ -2131,6 +2192,31 @@ async fn create_request(
     State(state): State<AppState>,
     Json(mut req): Json<PromptRequest>,
 ) -> Json<RequestCreateResponse> {
+    // OCEAN-304: backpressure. Take a turn permit BEFORE registering the request
+    // or spawning anything, so a rejected request never pollutes the registry or
+    // emits a user message. At capacity we reject immediately with `ok:false`
+    // (this path's envelope; its sibling `POST /v1/agent/turns` carries the 429
+    // status code) instead of queueing — a runaway client gets fast backpressure.
+    // The permit is MOVED into the spawned turn task below, so it is held for the
+    // life of the turn and released when that task's future completes OR is
+    // dropped: success, error, cancellation, or a panic all return it to the pool.
+    let permit = match state.turn_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!(
+                limit = state.turn_limiter.available_permits(),
+                "create_request: at concurrency cap; rejecting request as busy (OCEAN-304)"
+            );
+            return Json(RequestCreateResponse {
+                ok: false,
+                request_id: Uuid::new_v4(),
+                session_id: req.session_id,
+                state: RequestState::Errored,
+                message: "daemon at concurrent-turn capacity; busy, try again shortly".into(),
+            });
+        }
+    };
+
     let (request_id, cancel) = register_running_request(
         &state,
         &mut req,
@@ -2155,6 +2241,9 @@ async fn create_request(
     );
     let task_state = state.clone();
     let handle = tokio::spawn(async move {
+        // `permit` is moved in and dropped when this future ends (or is aborted),
+        // releasing the turn slot on every exit path (OCEAN-304).
+        let _turn_permit = permit;
         let res = task_state.runtime.prompt(req, control).await;
         record_prompt_result(&task_state, request_id, &res).await;
     });
@@ -8040,6 +8129,40 @@ async fn agent_turn(
         decision_token,
     } = req;
 
+    // OCEAN-304: backpressure. Take a turn permit BEFORE any work (cwd
+    // resolution, longhouse consult, the provider call). The pool caps
+    // concurrently-running turns; when it's exhausted we reject *immediately*
+    // with 429 instead of queueing or spawning, so a burst / runaway loop gets
+    // fast backpressure and can't fan out into unbounded concurrent provider
+    // calls. `_turn_permit` is held for the rest of the handler — `agent_turn`
+    // runs its turn inline (it `.await`s `runtime.prompt` directly), so the
+    // permit covers the whole turn and is released when this scope ends on EVERY
+    // path: success, the BAD_REQUEST/408 early returns below, an error, or a
+    // panic (dropping the owned permit always returns it to the pool).
+    let _turn_permit = match state.turn_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let turn_id = AgentTurnId::new_v4();
+            tracing::warn!(
+                limit = state.turn_limiter.available_permits(),
+                "agent_turn: at concurrency cap; rejecting turn with 429 (OCEAN-304)"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(AgentTurnResponse {
+                    ok: false,
+                    turn_id,
+                    session_id: session_id.unwrap_or_else(AgentSessionId::new_v4),
+                    status: AgentTurnStatus::Failed,
+                    event_id_prefix: String::new(),
+                    error: Some(
+                        "daemon at concurrent-turn capacity; busy, try again shortly".to_string(),
+                    ),
+                }),
+            );
+        }
+    };
+
     // OCEAN-115: map the wire-level `TurnImage`s onto `ocean-core`'s `PromptImage`
     // (kept separate so ocean-core stays free of an ocean-protocol dependency).
     // The agent layer turns each into a `Content::Image` block on the first user
@@ -13138,7 +13261,201 @@ mod tests {
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             metrics: Arc::new(TurnMetrics::default()),
+            // OCEAN-304: generous cap in test helpers so existing concurrency
+            // behavior is unchanged; the backpressure tests build their own state
+            // with a deliberately small cap to exercise rejection/release.
+            turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
         }
+    }
+
+    // --- OCEAN-304: turn-intake backpressure ---------------------------------
+
+    /// `permission_test_state` (fake-ok runtime) but with a deliberately small
+    /// concurrent-turn cap, so the backpressure gate can be driven to exhaustion
+    /// deterministically without racing a real provider.
+    fn capped_turn_state(cap: usize) -> AppState {
+        let mut state = permission_test_state();
+        state.turn_limiter = Arc::new(tokio::sync::Semaphore::new(cap));
+        state
+    }
+
+    /// A minimal text turn for `agent_turn`. `session_id: None` → a new session,
+    /// so the fake-ok runtime can create-and-run it; `room_id: None` keeps it on
+    /// the happy path past the room-parse guard. `cwd` is a real existing dir (the
+    /// crate manifest dir) so the new-session cwd resolution/binding guards pass —
+    /// the daemon refuses an empty cwd with no project to bind to.
+    fn sample_agent_turn() -> AgentTurnRequest {
+        AgentTurnRequest {
+            session_id: None,
+            prompt: "ping".to_string(),
+            cwd: env!("CARGO_MANIFEST_DIR").to_string(),
+            guidance: None,
+            room_id: None,
+            project_id: None,
+            client_type: Some("test".to_string()),
+            thinking_level: None,
+            model_id: None,
+            images: None,
+            decision_token: None,
+        }
+    }
+
+    /// `max_concurrent_turns` honors a valid override, ignores zero/garbage, and
+    /// falls back to the default when unset. Holds the env lock since it mutates
+    /// the process-global `OCEAN_MAX_CONCURRENT_TURNS`.
+    #[test]
+    fn max_concurrent_turns_resolves_env_override() {
+        let _guard = yolo_env_guard();
+
+        std::env::remove_var("OCEAN_MAX_CONCURRENT_TURNS");
+        assert_eq!(max_concurrent_turns(), DEFAULT_MAX_CONCURRENT_TURNS);
+
+        std::env::set_var("OCEAN_MAX_CONCURRENT_TURNS", "5");
+        assert_eq!(max_concurrent_turns(), 5);
+
+        // Zero would wedge intake shut (a 0-permit Semaphore rejects every turn);
+        // it must degrade to the default instead.
+        std::env::set_var("OCEAN_MAX_CONCURRENT_TURNS", "0");
+        assert_eq!(max_concurrent_turns(), DEFAULT_MAX_CONCURRENT_TURNS);
+
+        std::env::set_var("OCEAN_MAX_CONCURRENT_TURNS", "not-a-number");
+        assert_eq!(max_concurrent_turns(), DEFAULT_MAX_CONCURRENT_TURNS);
+
+        std::env::remove_var("OCEAN_MAX_CONCURRENT_TURNS");
+    }
+
+    /// Turns up to the cap are admitted; the (cap+1)th — fired while the cap's
+    /// worth of permits are still held in-flight — is rejected with HTTP 429 and
+    /// an honest `ok:false` busy body, NOT a hang and NOT a queue.
+    #[tokio::test]
+    async fn agent_turn_rejects_over_cap_with_429() {
+        // No env guard needed: the over-cap rejection happens before any
+        // env-reading work (the permit check is the first thing in the handler),
+        // and the assertions don't depend on the yolo posture.
+        let cap = 2usize;
+        let state = capped_turn_state(cap);
+
+        // Simulate `cap` turns already in flight by holding their permits.
+        let held: Vec<_> = (0..cap)
+            .map(|_| {
+                state
+                    .turn_limiter
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit available up to the cap")
+            })
+            .collect();
+        assert_eq!(state.turn_limiter.available_permits(), 0);
+
+        // The next intake must be rejected immediately with 429 + ok:false.
+        let (status, body) = agent_turn(State(state.clone()), Json(sample_agent_turn())).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!body.ok, "over-cap turn must report ok:false");
+        assert_eq!(body.status, AgentTurnStatus::Failed);
+        assert!(
+            body.error.as_deref().unwrap_or_default().contains("capacity"),
+            "429 body should explain the daemon is at capacity, got {:?}",
+            body.error
+        );
+
+        // Releasing one in-flight permit frees a slot for a later turn.
+        drop(held);
+        assert_eq!(state.turn_limiter.available_permits(), cap);
+    }
+
+    /// A finished turn releases its permit: after a turn runs to completion on the
+    /// fake-ok runtime, the slot is back and a later turn is admitted (202).
+    #[tokio::test]
+    async fn agent_turn_releases_permit_on_success() {
+        // Runs a real fake-ok turn; the assertions are on status + permit count,
+        // not the yolo posture, so no process-env serialization is required (the
+        // turn calls no tools, so permission gating is irrelevant here).
+        let state = capped_turn_state(1);
+
+        let (status, body) = agent_turn(State(state.clone()), Json(sample_agent_turn())).await;
+        // fire-and-acknowledge: a run turn returns 202 with ok:true.
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.ok);
+        // The single permit must be back — the RAII guard dropped at handler exit.
+        assert_eq!(
+            state.turn_limiter.available_permits(),
+            1,
+            "permit must be released after a successful turn"
+        );
+
+        // And a second turn on the same cap-1 limiter is admitted, proving the
+        // slot was genuinely freed rather than leaked.
+        let (status2, body2) = agent_turn(State(state.clone()), Json(sample_agent_turn())).await;
+        assert_eq!(status2, StatusCode::ACCEPTED);
+        assert!(body2.ok);
+        assert_eq!(state.turn_limiter.available_permits(), 1);
+    }
+
+    /// The permit releases on an EARLY-ERROR exit too: a turn that fails the
+    /// room-parse guard (an unsupported `room_id`) returns 400 *after* acquiring
+    /// the permit, and the RAII guard must still return the slot to the pool.
+    #[tokio::test]
+    async fn agent_turn_releases_permit_on_error() {
+        // The room-parse error returns before any tool runs; assertions are on
+        // status + permit count, so no env serialization is required.
+        let state = capped_turn_state(1);
+
+        let mut turn = sample_agent_turn();
+        turn.room_id = Some("not-a-real-room".to_string());
+        let (status, body) = agent_turn(State(state.clone()), Json(turn)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.ok);
+        // Even on this early error return, the permit must be back.
+        assert_eq!(
+            state.turn_limiter.available_permits(),
+            1,
+            "permit must be released even when the turn errors out"
+        );
+    }
+
+    /// `create_request` (the async `/v1/requests` sibling) rejects over-cap intake
+    /// with `ok:false` busy + `Errored` state, and does so WITHOUT registering the
+    /// request — a rejected request must not pollute the registry or emit a user
+    /// message. Releasing a permit re-opens intake.
+    #[tokio::test]
+    async fn create_request_rejects_over_cap_when_busy() {
+        let cap = 1usize;
+        let state = capped_turn_state(cap);
+
+        // Hold the only permit to simulate a turn in flight.
+        let held = state
+            .turn_limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("one permit");
+        assert_eq!(state.turn_limiter.available_permits(), 0);
+
+        let req = PromptRequest {
+            prompt: "ping".to_string(),
+            images: None,
+            request_id: None,
+            session_id: None,
+            create_if_missing: true,
+            max_turns: None,
+            yolo: false,
+            cwd: String::new(),
+            project_id: None,
+            client_type: Some("test".to_string()),
+            decision_token: None,
+        };
+        let body = create_request(State(state.clone()), Json(req)).await;
+        assert!(!body.ok, "over-cap create_request must report ok:false");
+        assert_eq!(body.0.state, RequestState::Errored);
+        assert!(body.0.message.contains("capacity"));
+        // The rejected request never touched the registry.
+        assert!(
+            state.requests.read().await.is_empty(),
+            "a rejected request must not be registered"
+        );
+
+        // Free the slot — intake is open again.
+        drop(held);
+        assert_eq!(state.turn_limiter.available_permits(), cap);
     }
 
     /// Register a pending permission waiter bound to `token`, returning the
@@ -14002,6 +14319,10 @@ mod tests {
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             metrics: Arc::new(TurnMetrics::default()),
+            // OCEAN-304: generous cap in test helpers so existing concurrency
+            // behavior is unchanged; the backpressure tests build their own state
+            // with a deliberately small cap to exercise rejection/release.
+            turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
         }
     }
 
@@ -14503,6 +14824,10 @@ mod tests {
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             metrics: Arc::new(TurnMetrics::default()),
+            // OCEAN-304: generous cap in test helpers so existing concurrency
+            // behavior is unchanged; the backpressure tests build their own state
+            // with a deliberately small cap to exercise rejection/release.
+            turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
         }
     }
 
