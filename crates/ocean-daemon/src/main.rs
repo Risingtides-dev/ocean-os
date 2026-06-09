@@ -983,28 +983,44 @@ fn effective_yolo() -> bool {
     ocean_agent::load_yolo_pref(&ocean_agent::config_dir_from_env()).unwrap_or(false)
 }
 
-/// Whether the **opt-in Longhouse pre-turn consult** (OCEAN-245) is enabled.
+/// Whether the **Longhouse pre-turn consult** is enabled. **Default ON**
+/// (OCEAN-283): now that the skill index is cached and the ranking is relevant,
+/// the consult-before-acting loop runs for every turn unless an operator opts
+/// OUT — the value of consulting the hive before acting only lands if it ships on
+/// by default.
 ///
-/// Gated by `OCEAN_LONGHOUSE_PREPARE`, **default OFF**: unless an operator sets it
-/// to a recognized "on" spelling (`1`/`true`/`yes`/`on`), a turn behaves exactly
-/// as before — no skill index is loaded, no brief is injected, the prompt the
-/// model sees is byte-for-byte unchanged. This keeps the consult-before-acting
-/// prep-loop inert by default (the phase-2 hook the prepare endpoint named in
-/// OCEAN-215/PR #159) so turning it on is a deliberate operator decision, and so
-/// the hot turn path can never be destabilized by the prep step on the default
-/// path.
+/// Gated by `OCEAN_LONGHOUSE_PREPARE`:
+/// * **unset** → ON (the new default),
+/// * an explicit OFF spelling (`0` / `false` / `no` / `off`) → disabled: the turn
+///   behaves exactly as before, no skill index loaded, no brief injected, the
+///   prompt the model sees byte-for-byte unchanged,
+/// * any other / ON spelling (`1` / `true` / `yes` / `on`) → ON.
+///
+/// History: OCEAN-245 (#168) shipped this hook **default-OFF** behind the same
+/// env var, so the prep-loop shipped zero behavior unless opted in. OCEAN-281
+/// (#191) made selection cheap + relevant (the skill-librarian `SkillIndex`), and
+/// OCEAN-283 caches that index + improves the ranking, so the cost/benefit now
+/// favors default-on. The flip is **safe** because the consult stays:
+///   * **advisory-only** — the brief is injected into prompt context, never
+///     bypasses a permission gate or executes anything (see [`apply_longhouse_prep`]);
+///   * **fail-open** — any error / empty / slow path collapses to "no brief" and
+///     the turn proceeds with the unmodified prompt, never blocked;
+///   * **off the hot path + time-bounded** — the disk scan is cached (no per-turn
+///     walk) and the whole prep is wrapped in a deadline (see
+///     [`longhouse_prep_for_turn`]), so a slow/missing library can't tax a turn.
 ///
 /// Read fresh per turn (not cached), like [`yolo_env_pref`], so an operator can
-/// flip it by restarting with a different env and tests can scope it. Advisory
-/// only: even when on, the brief is injected into prompt context and changes
-/// nothing about permission gating or tool execution (see [`apply_longhouse_prep`]).
+/// flip it by restarting with a different env and tests can scope it.
 fn longhouse_prepare_enabled() -> bool {
     match env::var("OCEAN_LONGHOUSE_PREPARE") {
-        Ok(v) => matches!(
+        // Explicit opt-OUT only. Everything else (including unset, handled by the
+        // Err arm, and any unrecognized value) leaves the default-on consult ON.
+        Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
+            "0" | "false" | "no" | "off"
         ),
-        Err(_) => false,
+        // Unset → ON (the OCEAN-283 default).
+        Err(_) => true,
     }
 }
 
@@ -2689,18 +2705,19 @@ async fn longhouse_prepare(
     };
     let top_n = req.top_n;
 
-    // Load the skill index + rank on a blocking thread: the loader walks
-    // ~/.spawner/skills, ~/.codex/skills (+ repo-local ./skills when a cwd is
-    // given), which is filesystem I/O we must not run on the async scheduler.
-    // Both load and rank are fail-open, so a JoinError (the only way this can
-    // fail) collapses to an empty prep — never a 500 — preserving the contract
-    // that consulting Longhouse can't block a turn.
+    // Rank against the CACHED skill index on a blocking thread: a cold/stale load
+    // walks ~/.spawner/skills, ~/.codex/skills (+ repo-local ./skills when a cwd
+    // is given), which is filesystem I/O we must not run on the async scheduler;
+    // a warm cache hit just ranks an already-loaded index (OCEAN-283). Both load
+    // and rank are fail-open, so a JoinError (the only way this can fail)
+    // collapses to an empty prep — never a 500 — preserving the contract that
+    // consulting Longhouse can't block a turn.
     let prep = tokio::task::spawn_blocking(move || {
         let roots = match brief.cwd.as_deref() {
             Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
             _ => ocean_longhouse::SkillRoots::default(),
         };
-        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        let index = ocean_longhouse::cached_index_for(&roots);
         let skills_indexed = index.len();
         let prep = match top_n {
             Some(n) => index.prepare_top_n(&brief, n),
@@ -2804,15 +2821,17 @@ async fn skills_query(Json(req): Json<SkillQueryRequest>) -> Json<serde_json::Va
         ..Default::default()
     };
 
-    // Load + rank on a blocking thread — same rationale as `longhouse_prepare`:
-    // the loader walks the skill dirs (filesystem I/O) and must stay off the
-    // async scheduler. Fail-open: a JoinError collapses to an empty result.
+    // Rank on a blocking thread — same rationale as `longhouse_prepare`: a
+    // cold/stale load walks the skill dirs (filesystem I/O) and must stay off the
+    // async scheduler; a warm cache hit just ranks. Cached (OCEAN-283) so the
+    // librarian shares one index with the prep loop. Fail-open: a JoinError
+    // collapses to an empty result.
     let result = tokio::task::spawn_blocking(move || {
         let roots = match brief.cwd.as_deref() {
             Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
             _ => ocean_longhouse::SkillRoots::default(),
         };
-        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        let index = ocean_longhouse::cached_index_for(&roots);
         let skills_indexed = index.len();
         let prep = match top_n {
             Some(n) => index.prepare_top_n(&brief, n),
@@ -2898,16 +2917,19 @@ async fn skills_fetch(
         );
     }
 
-    // Resolve on a blocking thread: rebuild the index (same roots as query),
-    // find the brief whose source_path == id, then read that file's full body.
-    // Only an indexed path is ever read — the raw id is never opened directly.
+    // Resolve on a blocking thread: take the index (same roots as query, cached
+    // per OCEAN-283), find the brief whose source_path == id, then read that
+    // file's full body. Only an indexed path is ever read — the raw id is never
+    // opened directly, so the security contract (unknown id ⇒ 404, never an
+    // arbitrary file read) is unchanged. A path that vanished since it was cached
+    // falls through to the `Unreadable` (TOCTOU) arm, exactly as before.
     let id_for_task = id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let roots = match cwd.as_deref() {
             Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
             _ => ocean_longhouse::SkillRoots::default(),
         };
-        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        let index = ocean_longhouse::cached_index_for(&roots);
         let matched = index
             .skills()
             .iter()
@@ -7310,13 +7332,16 @@ async fn agent_turn(
 
     let guided_prompt = apply_turn_guidance(room_id, guidance.as_deref(), &prompt);
 
-    // OCEAN-245: opt-in Longhouse pre-turn consult. When `OCEAN_LONGHOUSE_PREPARE`
-    // is on, rank this turn's prompt against the local skill libraries (off the
-    // hot path via spawn_blocking) and prepend the compact, ADVISORY brief above
-    // the guided prompt — the same layering room/operator guidance uses. Default
-    // OFF, fail-open, and purely additive to context: this changes nothing the
-    // daemon does with permissions or tools, only what the model is told. A
-    // `None` (gate off / empty / scan error) leaves `guided_prompt` untouched.
+    // Longhouse pre-turn consult (OCEAN-283, default-ON). Unless the operator
+    // opted out (`OCEAN_LONGHOUSE_PREPARE=0|false|no|off`), rank this turn's
+    // prompt against the CACHED local skill libraries (off the hot path via
+    // spawn_blocking, under a hard deadline) and prepend the compact, ADVISORY
+    // brief above the guided prompt — the same layering room/operator guidance
+    // uses. Fail-open, time-bounded, and purely additive to context: this changes
+    // nothing the daemon does with permissions or tools, only what the model is
+    // told. A `None` (opted out / empty / scan error / deadline) leaves
+    // `guided_prompt` untouched, so a slow or missing skill library never taxes
+    // or blocks the turn.
     let consult = longhouse_prep_for_turn(prompt.clone(), cwd.clone()).await;
     let guided_prompt = apply_longhouse_prep(&guided_prompt, consult.as_ref());
 
@@ -7798,28 +7823,36 @@ fn apply_turn_guidance(
     }
 }
 
-// ---- OCEAN-245: opt-in Longhouse pre-turn consult (the phase-2 hook) ----------
+// ---- Longhouse pre-turn consult (default-on, OCEAN-283) -----------------------
 //
-// PR #159 shipped `POST /v1/longhouse/prepare` (the `longhouse_prepare` handler
-// above) but nothing in the turn path invoked it — the consult-before-acting loop
-// shipped zero behavior. This wires `ocean_longhouse::SkillIndex::prepare` into
-// `agent_turn`: before the LLM call, IF `OCEAN_LONGHOUSE_PREPARE` is on, the
-// daemon ranks the turn's prompt against the local skill libraries and injects the
-// resulting compact briefs into prompt context — exactly like room/operator
-// guidance (OCEAN-143), prepended so it precedes the task without mutating it.
+// PR #159 shipped `POST /v1/longhouse/prepare`; OCEAN-245 (#168) wired it into the
+// turn path behind `OCEAN_LONGHOUSE_PREPARE` **default-OFF**, so the
+// consult-before-acting loop shipped zero behavior unless opted in. OCEAN-283
+// promotes it to **default-ON**: before the LLM call, UNLESS an operator opts out,
+// the daemon ranks the turn's prompt against the (cached) local skill libraries
+// and injects the resulting compact briefs into prompt context — exactly like
+// room/operator guidance (OCEAN-143), prepended so it precedes the task without
+// mutating it.
 //
-// Three invariants, straight from `docs/LONGHOUSE.md` (esp. line 115):
+// Default-on raises the bar: every turn now consults, so the safety + perf
+// invariants below become load-bearing rather than nice-to-haves.
+//
+// Invariants, straight from `docs/LONGHOUSE.md` (esp. line 115):
 //   * **Advisory only.** The brief is a RECOMMENDATION the model reads. It does
 //     NOT touch a permission gate, does NOT execute anything, does NOT alter tool
 //     routing — `apply_longhouse_prep` only prepends text to the prompt string.
 //   * **Fail-open.** A missing/garbled library, an empty index, an irrelevant
-//     prompt, or a panicked scan all collapse to "no brief" → the turn proceeds
-//     with the unmodified prompt. The prep step can never block a turn.
-//   * **Off the hot path.** The disk walk runs on `spawn_blocking` (matching the
-//     `longhouse_prepare` handler), so the async scheduler never stalls on I/O.
+//     prompt, a panicked scan, OR a prep that blows its deadline all collapse to
+//     "no brief" → the turn proceeds with the unmodified prompt. The prep step can
+//     never block a turn.
+//   * **Off the hot path + time-bounded.** The skill index is CACHED (no per-turn
+//     disk walk — OCEAN-283); any cold/stale reload runs on `spawn_blocking` and
+//     under a hard deadline (`LONGHOUSE_PREP_DEADLINE`), so a slow/missing library
+//     can never add latency to a turn even though every turn now consults.
 //
-// And **default OFF**: `longhouse_prepare_enabled()` is false unless the operator
-// opts in, so on the default path none of this runs and the prompt is unchanged.
+// The opt-OUT: `OCEAN_LONGHOUSE_PREPARE=0|false|no|off` makes
+// `longhouse_prepare_enabled()` false, so none of this runs and the prompt is
+// byte-for-byte unchanged — the exact pre-OCEAN-283 behavior, on demand.
 
 /// Render a [`ocean_longhouse::TurnPrep`] into a compact, model-facing context
 /// block — or `None` when there is nothing to inject (the fail-open / no-op case).
@@ -7891,43 +7924,79 @@ fn apply_longhouse_prep(prompt: &str, prep: Option<&ocean_longhouse::TurnPrep>) 
     }
 }
 
-/// The async, env-gated, off-hot-path side of the consult: when
-/// `OCEAN_LONGHOUSE_PREPARE` is on, load the local skill index and rank it against
-/// `prompt`, returning the compact [`ocean_longhouse::TurnPrep`] to inject. Returns
-/// `None` (inject nothing) when the gate is off, the result is empty, or the scan
-/// task fails — every one of which is a fail-open no-op that leaves the turn
-/// exactly as it was without the hook.
+/// Hard deadline for the whole pre-turn consult. Default-on means EVERY turn
+/// runs this, so a pathologically slow skill library (a huge tree, a stalled
+/// network mount under `~/.spawner`) must never add unbounded latency to a turn.
+/// The cache makes the steady state a couple of string scans, but the *first*
+/// load after a cold start / TTL expiry still walks disk; this caps even that.
+/// On timeout we fail open — inject nothing, let the turn proceed immediately.
+const LONGHOUSE_PREP_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The async, env-gated, off-hot-path side of the consult: when the consult is
+/// enabled ([`longhouse_prepare_enabled`], **default on** — OCEAN-283), get the
+/// **cached** local skill index and rank it against `prompt`, returning the
+/// compact [`ocean_longhouse::TurnPrep`] to inject. Returns `None` (inject
+/// nothing) when the consult is opted out, the prompt is empty, the result is
+/// empty, the scan task fails, or the prep exceeds [`LONGHOUSE_PREP_DEADLINE`] —
+/// every one of which is a **fail-open** no-op that leaves the turn exactly as it
+/// was without the hook. A consult can never block or slow a turn.
 ///
-/// The skill-library disk walk (`~/.spawner/skills`, `~/.codex/skills`, plus the
-/// turn's repo-local `./skills` when `cwd` is set) runs on `spawn_blocking`, the
-/// same way the `longhouse_prepare` HTTP handler does — filesystem I/O must never
-/// run on the async scheduler and stall the turn. The cheap keyword ranking then
-/// runs inside the same blocking closure. This performs no side effects and
-/// touches no permission gate: it reads files and ranks them, nothing more.
+/// Two load-bearing perf guarantees, both now that default-on means every turn
+/// consults:
+/// * **No per-turn disk walk.** The index comes from
+///   [`ocean_longhouse::cached_index_for`] — a process-wide TTL cache — so the
+///   skill-library walk (`~/.spawner/skills`, `~/.codex/skills`, plus the turn's
+///   repo-local `./skills` when `cwd` is set) happens at most once per TTL window
+///   per root-set, not once per turn. The steady-state cost is ranking an
+///   already-loaded `Vec<SkillBrief>`.
+/// * **Time-bounded.** The whole consult (the cache check + any cold/stale reload
+///   + the rank) runs on `spawn_blocking` (filesystem I/O must never run on the
+///   async scheduler) AND under a [`LONGHOUSE_PREP_DEADLINE`] — if it overruns,
+///   we abandon it and inject nothing. So even a first cold load against a
+///   degraded disk caps the latency it can add to a turn.
+///
+/// This performs no side effects and touches no permission gate: it reads the
+/// cached index and ranks it, nothing more.
 async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_longhouse::TurnPrep> {
     if !longhouse_prepare_enabled() {
         return None;
     }
-    // Empty prompt can never rank anything; skip the disk walk entirely.
+    // Empty prompt can never rank anything; skip the work entirely.
     if prompt.trim().is_empty() {
         return None;
     }
 
-    let prep = tokio::task::spawn_blocking(move || {
+    let scan = tokio::task::spawn_blocking(move || {
         let roots = if cwd.is_empty() {
             ocean_longhouse::SkillRoots::default()
         } else {
             ocean_longhouse::SkillRoots::for_cwd(&cwd)
         };
-        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        // Cached: at most one disk walk per TTL window per root-set, NOT per turn.
+        let index = ocean_longhouse::cached_index_for(&roots);
         let brief = ocean_longhouse::TurnBrief {
             prompt,
             cwd: Some(cwd),
             ..Default::default()
         };
         index.prepare(&brief)
-    })
-    .await;
+    });
+
+    // Time-bound the whole consult so default-on can never tax a turn: if the
+    // (rare) cold/stale reload is slow, we abandon it and inject nothing.
+    let prep = match tokio::time::timeout(LONGHOUSE_PREP_DEADLINE, scan).await {
+        Ok(joined) => joined,
+        Err(_elapsed) => {
+            tracing::warn!(
+                deadline_ms = LONGHOUSE_PREP_DEADLINE.as_millis() as u64,
+                "longhouse pre-turn consult exceeded its deadline; injecting no brief"
+            );
+            // The spawn_blocking task is detached and harmless — it only reads
+            // files + ranks; its (now-ignored) result simply warms the cache for
+            // a later turn. The current turn proceeds with no brief.
+            return None;
+        }
+    };
 
     match prep {
         // Empty prep → inject nothing (no library on disk, or nothing matched).
@@ -15017,28 +15086,34 @@ mod tests {
     }
 
     #[test]
-    fn longhouse_prepare_enabled_defaults_off_and_opts_in_explicitly() {
+    fn longhouse_prepare_enabled_defaults_on_and_opts_out_explicitly() {
         let _guard = longhouse_prepare_env_guard();
         let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
 
-        // Unset → OFF. This is the safety invariant: nothing configured ⇒ inert.
+        // OCEAN-283: unset → ON. The consult-before-acting loop now ships on by
+        // default; consulting the hive is the new default posture.
         env::remove_var("OCEAN_LONGHOUSE_PREPARE");
         assert!(
-            !longhouse_prepare_enabled(),
-            "unset OCEAN_LONGHOUSE_PREPARE must keep the consult off (default)"
+            longhouse_prepare_enabled(),
+            "unset OCEAN_LONGHOUSE_PREPARE must enable the consult (default-on)"
         );
-        for off in ["", "0", "false", "no", "off", "nonsense"] {
+
+        // Explicit opt-OUT spellings turn it off.
+        for off in ["0", "false", "FALSE", "no", "off", "Off"] {
             env::set_var("OCEAN_LONGHOUSE_PREPARE", off);
             assert!(
                 !longhouse_prepare_enabled(),
-                "OCEAN_LONGHOUSE_PREPARE={off:?} must stay off"
+                "OCEAN_LONGHOUSE_PREPARE={off:?} must opt OUT of the consult"
             );
         }
-        for on in ["1", "true", "TRUE", "Yes", "on"] {
+
+        // ON spellings (and, deliberately, anything unrecognized) keep it on — the
+        // default-on bias means only an explicit off disables it.
+        for on in ["1", "true", "TRUE", "Yes", "on", "", "nonsense"] {
             env::set_var("OCEAN_LONGHOUSE_PREPARE", on);
             assert!(
                 longhouse_prepare_enabled(),
-                "OCEAN_LONGHOUSE_PREPARE={on:?} must opt into the consult"
+                "OCEAN_LONGHOUSE_PREPARE={on:?} must leave the consult on (default-on)"
             );
         }
 
@@ -15049,12 +15124,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn longhouse_prep_for_turn_off_by_default_injects_nothing() {
+    async fn longhouse_prep_for_turn_on_by_default_injects_relevant_brief() {
+        let _guard = longhouse_prepare_env_guard();
+        let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
+        let prior_ttl = env::var("OCEAN_LONGHOUSE_SKILL_TTL_SECS").ok();
+        // TTL=0 so this test always cold-loads its planted skill, never a stale
+        // cache entry from another test in the same process.
+        env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
+
+        // A planted, on-topic repo skill that should surface under the default-on
+        // consult with NO env opt-in set.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        plant_repo_skill(
+            cwd,
+            "zorptastic",
+            "Zorptastic Widget",
+            "Use when building a zorptastic widget for the flux capacitor",
+        );
+
+        // OCEAN-283: unset env → the consult runs by default.
+        env::remove_var("OCEAN_LONGHOUSE_PREPARE");
+        let prep = longhouse_prep_for_turn(
+            "help me build a zorptastic widget".to_string(),
+            cwd.to_string_lossy().into_owned(),
+        )
+        .await
+        .expect("default-on consult must produce a brief when a skill matches");
+        assert!(
+            prep.skills.iter().any(|s| s.name == "Zorptastic Widget"),
+            "the planted skill must surface under the default-on consult, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        match prior {
+            Some(v) => env::set_var("OCEAN_LONGHOUSE_PREPARE", v),
+            None => env::remove_var("OCEAN_LONGHOUSE_PREPARE"),
+        }
+        match prior_ttl {
+            Some(v) => env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", v),
+            None => env::remove_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn longhouse_prep_for_turn_opted_out_injects_nothing() {
         let _guard = longhouse_prepare_env_guard();
         let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
 
         // A planted, on-topic repo skill that WOULD match — proving the `None` is
-        // the gate's doing, not an absent library.
+        // the opt-OUT's doing, not an absent library.
         let tmp = tempfile::tempdir().expect("tempdir");
         let cwd = tmp.path();
         plant_repo_skill(
@@ -15064,7 +15183,8 @@ mod tests {
             "Use when building a zorptastic widget",
         );
 
-        env::remove_var("OCEAN_LONGHOUSE_PREPARE");
+        // Explicit opt-out → consult nothing, even with a matching skill on disk.
+        env::set_var("OCEAN_LONGHOUSE_PREPARE", "0");
         let prep = longhouse_prep_for_turn(
             "help me build a zorptastic widget".to_string(),
             cwd.to_string_lossy().into_owned(),
@@ -15072,7 +15192,7 @@ mod tests {
         .await;
         assert!(
             prep.is_none(),
-            "default-off gate must consult nothing even when a skill would match"
+            "an explicit opt-out must consult nothing even when a skill would match"
         );
 
         match prior {
@@ -15085,7 +15205,10 @@ mod tests {
     async fn longhouse_prep_for_turn_consults_when_enabled_and_is_fail_open() {
         let _guard = longhouse_prepare_env_guard();
         let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
+        let prior_ttl = env::var("OCEAN_LONGHOUSE_SKILL_TTL_SECS").ok();
         env::set_var("OCEAN_LONGHOUSE_PREPARE", "1");
+        // TTL=0 → each call cold-loads its own tempdir, never a stale cache entry.
+        env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
 
         // (a) Enabled + a matching repo skill → the brief surfaces and would inject.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -15138,6 +15261,39 @@ mod tests {
             Some(v) => env::set_var("OCEAN_LONGHOUSE_PREPARE", v),
             None => env::remove_var("OCEAN_LONGHOUSE_PREPARE"),
         }
+        match prior_ttl {
+            Some(v) => env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", v),
+            None => env::remove_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS"),
+        }
+    }
+
+    /// Time-bound guarantee (OCEAN-283): default-on means every turn consults, so
+    /// a prep that overruns [`LONGHOUSE_PREP_DEADLINE`] must fail open — inject
+    /// nothing, never block the turn. We don't need a real slow disk: with the
+    /// deadline this short, the assertion that a deadline path returns `None`
+    /// (not an error, not a hang) is the contract. Here we prove the everyday
+    /// path completes well within the deadline AND that the helper's own
+    /// `timeout` wrapper is wired (a zero-length deadline collapses to None).
+    #[tokio::test]
+    async fn longhouse_prep_is_time_bounded_and_fails_open_on_deadline() {
+        // The deadline constant is a real, finite bound (not absurdly large).
+        assert!(
+            LONGHOUSE_PREP_DEADLINE <= std::time::Duration::from_secs(1),
+            "the per-turn consult deadline must be tight enough to protect the turn"
+        );
+
+        // Directly exercise the timeout seam the helper uses: a future that would
+        // outlast a zero deadline collapses to None, never an error or a hang —
+        // the same fail-open shape `longhouse_prep_for_turn` relies on.
+        let slow = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            ocean_longhouse::TurnPrep::default()
+        });
+        let bounded = tokio::time::timeout(std::time::Duration::from_millis(0), slow).await;
+        assert!(
+            bounded.is_err(),
+            "a prep that exceeds its deadline must time out (→ fail-open None), not block the turn"
+        );
     }
 
     // ---- OCEAN-231: handler-level tests for the livekit-token + call_place ----

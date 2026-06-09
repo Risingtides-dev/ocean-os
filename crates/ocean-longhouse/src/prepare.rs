@@ -13,7 +13,7 @@
 //! [`TurnPrep`] rather than erroring, so a missing/garbled skill library can
 //! never block a turn.
 //!
-//! ## What this is (phase 1 of OCEAN-215)
+//! ## What this is
 //!
 //! * **Loaders** that index the documented skill sources
 //!   (`docs/LONGHOUSE.md` lines 119-122):
@@ -23,19 +23,33 @@
 //!   Missing dirs are skipped, malformed files are skipped + logged — a bad
 //!   file never fails the whole load.
 //! * A [`SkillIndex`] that caches the loaded [`SkillBrief`]s once (not per-call).
-//! * [`SkillIndex::prepare`] — a **cheap, deterministic** keyword-overlap match
-//!   between the brief's prompt and each skill's name + description, returning
-//!   the top-N most relevant skills. No embeddings, no LLM (the
-//!   `docs/LONGHOUSE.md` "cheap fast model reranker" is a later phase).
+//! * A **process-wide TTL cache** ([`cached_index_for`]) so the disk walk runs
+//!   at most once per [`CACHE_TTL`] window per root-set — not on every turn.
+//!   Now that the daemon's prepare-hook is **default-on** (OCEAN-283), a turn
+//!   must never re-walk `~/.spawner` / `~/.codex` from scratch; the cache makes
+//!   the steady-state cost of a consult a couple of string scans over an
+//!   already-loaded `Vec<SkillBrief>`.
+//! * [`SkillIndex::prepare`] — a **cheap, deterministic** relevance match
+//!   between the brief's prompt and each skill's name + description (OCEAN-283
+//!   ranking: term-set overlap, name-weighted, with a distinct-coverage bonus,
+//!   de-duplicated, and a minimum-score floor so a single weak common-word hit
+//!   never injects noise), returning the top-N most relevant skills. No
+//!   embeddings, no LLM — the `docs/LONGHOUSE.md` "cheap fast model reranker"
+//!   remains the named follow-up; this is the bounded deterministic prefilter
+//!   (step 1 of the documented selection path) that it would sit on top of.
 //!
 //! SOPs and workflows have **no real on-disk source yet**, so their briefs are
 //! intentionally always empty here (the types exist so the daemon contract is
-//! stable and phase 2 can fill them in without a signature change). We do not
-//! fabricate SOP/workflow sources.
+//! stable and a later phase can fill them in without a signature change). We do
+//! not fabricate SOP/workflow sources.
 //!
-//! The daemon hook + prompt injection are **phase 2** (separate, `main.rs`).
+//! The daemon hook + prompt injection live in `main.rs` (default-on, fail-open,
+//! time-bounded); this module is the read-only library half it calls.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -43,6 +57,14 @@ use walkdir::WalkDir;
 /// How many skill briefs `prepare` returns at most. `docs/LONGHOUSE.md` line 129
 /// calls for "3–7 compact skill briefs"; 5 sits in the middle.
 pub const DEFAULT_TOP_N: usize = 5;
+
+/// How long a cached [`SkillIndex`] stays fresh before the next consult re-walks
+/// disk. A skill library changes rarely (an operator edits a `skill.yaml` now
+/// and then), so a coarse TTL keeps default-on consults off the disk almost
+/// always while still picking up edits within a minute — no file-watcher needed.
+/// Override with `OCEAN_LONGHOUSE_SKILL_TTL_SECS` (0 disables caching entirely,
+/// e.g. for a test that wants a guaranteed-fresh scan).
+pub const CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// The compact task/session brief the daemon sends Longhouse before a turn.
 ///
@@ -145,7 +167,10 @@ impl TurnPrep {
 /// Configurable roots for the skill index. Defaults to the documented sources
 /// (`docs/LONGHOUSE.md` lines 119-122). Any root may be absent on disk — the
 /// loader skips missing dirs silently.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Hash`/`Eq` so it can key the process-wide [`cached_index_for`] cache: two
+/// turns with the same roots share one loaded index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SkillRoots {
     /// `~/.spawner/skills` — spawner `skill.yaml` files.
     pub spawner: Option<PathBuf>,
@@ -260,9 +285,32 @@ impl SkillIndex {
         }
     }
 
-    /// Score every skill by keyword overlap with the prompt and return the best
-    /// `top_n` (ties broken by name for determinism). Skills with zero overlap
-    /// are dropped — we never pad results with irrelevant skills.
+    /// Rank every skill against the prompt and return the best `top_n`.
+    ///
+    /// OCEAN-283 ranking — a better deterministic prefilter than raw keyword
+    /// overlap, still no model in the loop:
+    ///
+    /// * **Term-set match, not raw count.** Prompt and skill text are reduced to
+    ///   *sets* of distinct terms, so a skill is scored by *which* prompt terms
+    ///   it covers, never by how many times one word repeats — a long
+    ///   description can't win by sheer length.
+    /// * **Name weighted over description.** A prompt term hitting the skill's
+    ///   *name* (the strongest signal of what it's for) scores more than one
+    ///   hitting only the description.
+    /// * **Distinct-coverage bonus.** Matching several *different* prompt terms
+    ///   beats matching one term, so a skill that's relevant on multiple axes
+    ///   outranks an incidental single-word collision.
+    /// * **Minimum-score floor.** A lone weak description-only hit falls below
+    ///   [`MIN_RELEVANCE_SCORE`] and is dropped — default-on means every turn
+    ///   consults, so we inject a brief only when it's *genuinely* relevant,
+    ///   never noise.
+    /// * **De-duplicated.** The same skill reachable from two roots (e.g. a repo
+    ///   `./skills` copy shadowing a home one) collapses to a single brief, so
+    ///   we never inject the same name twice or waste a slot.
+    ///
+    /// Skills below the floor are dropped — we never pad results to `top_n` with
+    /// irrelevant skills. Ties break deterministically (score, then name, then
+    /// path) so the same prompt always yields the same briefs.
     fn rank_skills(&self, prompt: &str, top_n: usize) -> Vec<SkillBrief> {
         if top_n == 0 || self.skills.is_empty() {
             return Vec::new();
@@ -278,7 +326,7 @@ impl SkillIndex {
             .iter()
             .filter_map(|skill| {
                 let score = relevance_score(&prompt_terms, skill);
-                (score > 0).then_some((score, skill))
+                (score >= MIN_RELEVANCE_SCORE).then_some((score, skill))
             })
             .collect();
 
@@ -289,13 +337,114 @@ impl SkillIndex {
                 .then_with(|| a.1.source_path.cmp(&b.1.source_path))
         });
 
+        // De-dupe by (name, source_path): the same skill present under two roots
+        // must not occupy two slots. Keep the first (highest-scored) occurrence.
+        let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
         scored
             .into_iter()
+            .filter(|(_, skill)| seen.insert((skill.name.as_str(), skill.source_path.as_path())))
             .take(top_n)
             .map(|(_, skill)| skill.clone())
             .collect()
     }
 }
+
+/// Process-wide TTL cache of loaded [`SkillIndex`]es, keyed by [`SkillRoots`].
+///
+/// Now that the daemon's prepare-hook is **default-on** (OCEAN-283), every turn
+/// consults — so we must NOT re-walk `~/.spawner` / `~/.codex` (+ repo `./skills`)
+/// from disk each time. [`cached_index_for`] loads an index at most once per
+/// [`CACHE_TTL`] window per root-set; subsequent consults in that window reuse
+/// the in-memory `Arc<SkillIndex>`, making the steady-state cost of a consult a
+/// couple of string scans over an already-loaded `Vec<SkillBrief>`.
+///
+/// Std-only (`OnceLock<Mutex<…>>`) and **poison-tolerant** (a panic while another
+/// thread held the lock must not wedge every future turn — the same discipline
+/// as the rest of this repo's long-lived shared state, OCEAN-287): we recover the
+/// guard from a poisoned lock rather than propagate the panic.
+struct CacheEntry {
+    index: std::sync::Arc<SkillIndex>,
+    loaded_at: Instant,
+}
+
+fn index_cache() -> &'static Mutex<HashMap<SkillRoots, CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<SkillRoots, CacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache TTL, overridable via `OCEAN_LONGHOUSE_SKILL_TTL_SECS`. A value of
+/// `0` disables caching (every call re-walks disk) — useful for a test that
+/// needs a guaranteed-fresh scan, or an operator who edits skills constantly.
+fn cache_ttl() -> Duration {
+    match std::env::var("OCEAN_LONGHOUSE_SKILL_TTL_SECS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(_) => CACHE_TTL,
+        },
+        Err(_) => CACHE_TTL,
+    }
+}
+
+/// Return a cached [`SkillIndex`] for `roots`, loading it from disk only if the
+/// cache is cold or the cached copy is older than [`cache_ttl`]. This is the
+/// entry point the daemon's default-on prepare-hook uses so a consult does not
+/// re-walk the skill libraries every turn.
+///
+/// Fail-open like everything in this module: loading never errors (missing dirs
+/// and malformed files are skipped), and a poisoned cache lock is recovered, so
+/// a consult can always get *some* index back (an empty one at worst).
+pub fn cached_index_for(roots: &SkillRoots) -> std::sync::Arc<SkillIndex> {
+    let ttl = cache_ttl();
+
+    // TTL == 0 → caching disabled: always load fresh, don't touch the map.
+    if ttl.is_zero() {
+        return std::sync::Arc::new(SkillIndex::load_from(roots));
+    }
+
+    let mut cache = index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(entry) = cache.get(roots) {
+        if entry.loaded_at.elapsed() < ttl {
+            return std::sync::Arc::clone(&entry.index);
+        }
+    }
+
+    // Cold or stale → load once, store, hand back.
+    let index = std::sync::Arc::new(SkillIndex::load_from(roots));
+    cache.insert(
+        roots.clone(),
+        CacheEntry {
+            index: std::sync::Arc::clone(&index),
+            loaded_at: Instant::now(),
+        },
+    );
+    index
+}
+
+/// Convenience: cached index for the documented default roots (no repo `./skills`).
+pub fn cached_index() -> std::sync::Arc<SkillIndex> {
+    cached_index_for(&SkillRoots::default())
+}
+
+/// Drop all cached indexes. Test-only seam so a test that plants a skill on disk
+/// can force the next [`cached_index_for`] to re-scan rather than serve a stale
+/// entry left by an earlier test in the same process.
+#[doc(hidden)]
+pub fn clear_index_cache() {
+    index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Minimum relevance score for a skill to be surfaced. A single description-only
+/// term hit scores `DESC_HIT` (1) + the 1-distinct-term coverage bonus (1) = 2;
+/// we require strictly more than that so a lone incidental word match is dropped
+/// — only a name hit, or coverage of ≥2 distinct prompt terms, clears the floor.
+/// This is the "don't inject noise into every turn" guard for default-on.
+const MIN_RELEVANCE_SCORE: u32 = 3;
 
 /// Walk one root dir for skill files, parsing each into a [`SkillBrief`].
 ///
@@ -512,9 +661,11 @@ fn first_md_heading(text: &str) -> Option<String> {
     None
 }
 
-/// Lowercase alphanumeric tokens of length ≥ 3, deduped. Short tokens (`a`,
-/// `to`, `ai`) are dropped to avoid spurious overlaps; this keeps the match
-/// cheap and the results stable.
+/// Lowercase alphanumeric tokens of length ≥ 3, deduped, with high-frequency
+/// English/agent stop-words dropped. Short tokens (`a`, `to`, `ai`) and filler
+/// (`the`, `with`, `please`, `help`) are removed so they can't drive spurious
+/// overlaps now that every turn is consulted — the match stays on *content*
+/// words. Cheap and order-stable (insertion order preserved).
 fn tokenize(text: &str) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
@@ -523,6 +674,9 @@ fn tokenize(text: &str) -> Vec<String> {
         .filter(|w| w.len() >= 3)
     {
         let lower = word.to_ascii_lowercase();
+        if is_stop_word(&lower) {
+            continue;
+        }
         if seen.insert(lower.clone()) {
             out.push(lower);
         }
@@ -530,22 +684,57 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-/// Relevance = count of prompt terms that appear in the skill's name or
-/// description, with a name match weighted higher (the name is the strongest
-/// signal of what a skill is for).
+/// Common filler words that carry no skill-selection signal. Dropping them keeps
+/// a generic prompt ("please help me with the thing") from colliding with a
+/// skill description that happens to contain "help" or "with". Deliberately
+/// small + conservative — only words that are almost never a skill's *topic*.
+fn is_stop_word(word: &str) -> bool {
+    matches!(
+        word,
+        "the" | "and" | "for" | "you" | "your" | "with" | "this" | "that" | "from" | "into"
+            | "can" | "will" | "would" | "should" | "could" | "have" | "has" | "are" | "was"
+            | "were" | "but" | "not" | "use" | "using" | "used" | "via" | "per" | "out" | "get"
+            | "got" | "let" | "lets" | "make" | "made" | "want" | "need" | "help" | "please"
+            | "now" | "then" | "than" | "when" | "what" | "which" | "how" | "who" | "why"
+            | "all" | "any" | "some" | "here" | "there" | "about" | "over" | "under" | "more"
+    )
+}
+
+/// Relevance of a skill to the prompt — a better deterministic score than raw
+/// keyword overlap (OCEAN-283). Term *sets*, not counts; name-weighted; with a
+/// distinct-coverage bonus.
+///
+/// For each *distinct* prompt term: +[`NAME_HIT`] if it appears in the skill's
+/// name (the strongest signal of what the skill is for), else +[`DESC_HIT`] if
+/// it appears in the description. Then +1 per distinct prompt term matched
+/// anywhere (the coverage bonus), so a skill relevant on several axes outranks
+/// one with a single incidental collision. A skill that repeats a word in a long
+/// description gains nothing extra — only *distinct* term coverage counts.
 fn relevance_score(prompt_terms: &[String], skill: &SkillBrief) -> u32 {
     let name = skill.name.to_ascii_lowercase();
     let desc = skill.description.to_ascii_lowercase();
-    let mut score = 0u32;
+
+    let mut weighted = 0u32;
+    let mut distinct_hits = 0u32;
     for term in prompt_terms {
         if name.contains(term.as_str()) {
-            score += 2;
+            weighted += NAME_HIT;
+            distinct_hits += 1;
         } else if desc.contains(term.as_str()) {
-            score += 1;
+            weighted += DESC_HIT;
+            distinct_hits += 1;
         }
     }
-    score
+
+    // Coverage bonus: reward breadth of distinct matched terms, not depth of
+    // repetition. Zero hits ⇒ zero score (the skill is simply irrelevant).
+    weighted + distinct_hits
 }
+
+/// Score for a prompt term found in a skill's **name** — the strongest signal.
+const NAME_HIT: u32 = 2;
+/// Score for a prompt term found only in a skill's **description**.
+const DESC_HIT: u32 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -776,6 +965,182 @@ mod tests {
     #[test]
     fn turnprep_default_is_empty_fail_open() {
         assert!(TurnPrep::default().is_empty());
+    }
+
+    // ---- OCEAN-283: better deterministic ranking ----
+
+    #[test]
+    fn lone_description_word_hit_is_below_the_floor() {
+        // A single description-only term match (weighted 1 + 1 coverage = 2) sits
+        // below MIN_RELEVANCE_SCORE (3) and must NOT surface — default-on means we
+        // only inject genuinely-relevant briefs, never a one-word incidental hit.
+        let index = SkillIndex::from_briefs(vec![brief(
+            "Database Migrations",
+            "Author and run schema migrations against Postgres",
+        )]);
+        // "schema" hits the description once and nothing else → dropped.
+        let prep = index.prepare(&TurnBrief::from_prompt("rename a schema thing"));
+        assert!(
+            prep.skills.is_empty(),
+            "a lone description-only hit must fall below the floor, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_single_name_hit_clears_the_floor() {
+        // A name-term hit (weighted 2 + 1 coverage = 3) clears the floor: the name
+        // is the strongest "what this skill is for" signal, so one is enough.
+        let index = SkillIndex::from_briefs(vec![brief(
+            "Postgres",
+            "everything about the database engine",
+        )]);
+        let prep = index.prepare(&TurnBrief::from_prompt("connect to postgres"));
+        assert_eq!(prep.skills.len(), 1, "a name hit should surface the skill");
+        assert_eq!(prep.skills[0].name, "Postgres");
+    }
+
+    #[test]
+    fn broader_distinct_coverage_outranks_a_single_repeated_word() {
+        // One skill matches a single prompt term, repeated all over its blurb; the
+        // other matches two *distinct* prompt terms. Distinct coverage must win —
+        // the ranker rewards breadth, not repetition.
+        let index = SkillIndex::from_briefs(vec![
+            brief(
+                "Repeater",
+                "video video video video video video clips and more video",
+            ),
+            brief("Coverer", "render a programmatic video composition"),
+        ]);
+        let prep = index.prepare(&TurnBrief::from_prompt(
+            "render a programmatic video",
+        ));
+        assert_eq!(
+            prep.skills[0].name, "Coverer",
+            "two distinct matched terms beat one term repeated, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn duplicate_skill_across_roots_is_deduped() {
+        // The SAME skill (name + source_path) reachable twice must collapse to one
+        // brief, never occupy two of the capped slots.
+        let dup = brief("Remotion Video", "Build programmatic videos in React");
+        let index = SkillIndex::from_briefs(vec![dup.clone(), dup.clone()]);
+        let prep = index.prepare(&TurnBrief::from_prompt("programmatic video in react"));
+        assert_eq!(prep.skills.len(), 1, "duplicate skill must be deduped");
+        assert_eq!(prep.skills[0].name, "Remotion Video");
+    }
+
+    #[test]
+    fn stop_words_do_not_drive_spurious_matches() {
+        // A generic, filler-heavy prompt that shares only stop-words ("help",
+        // "with", "the", "please") with a skill description must not match.
+        let index = SkillIndex::from_briefs(vec![brief(
+            "Invoicing",
+            "Use this to help you with the billing please",
+        )]);
+        let prep = index.prepare(&TurnBrief::from_prompt(
+            "please help me with the thing",
+        ));
+        assert!(
+            prep.skills.is_empty(),
+            "stop-word-only overlap must not surface a skill, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- OCEAN-283: process-wide TTL cache ----
+
+    #[test]
+    fn cached_index_serves_without_rewalking_disk() {
+        // Warm the cache against an on-disk skill, then DELETE the skill dir. While
+        // the cache is fresh, a second `cached_index_for` must still return the
+        // skill — proving it served the cached copy and did NOT re-walk disk. Then
+        // bust the cache (TTL=0) and confirm the re-walk now sees the deletion.
+        let guard = ttl_env_guard();
+        clear_index_cache();
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        write(
+            repo,
+            "skills/zorp/skill.yaml",
+            "name: Zorptastic\ndescription: build a zorptastic widget\n",
+        );
+        let roots = SkillRoots {
+            spawner: None,
+            codex: None,
+            repo: Some(repo.join("skills")),
+        };
+
+        // Default TTL (60s) → cache is live across calls.
+        std::env::remove_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS");
+        let first = cached_index_for(&roots);
+        assert_eq!(first.len(), 1, "warm load sees the planted skill");
+
+        // Remove the source from disk. A cache HIT must not notice.
+        fs::remove_dir_all(repo.join("skills")).unwrap();
+        let second = cached_index_for(&roots);
+        assert_eq!(
+            second.len(),
+            1,
+            "fresh cache must serve the skill WITHOUT re-walking disk (the dir is gone)"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a cache hit returns the very same Arc, proving no reload happened"
+        );
+
+        // Now disable caching → the next call re-walks and sees the deletion.
+        std::env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
+        let third = cached_index_for(&roots);
+        assert_eq!(third.len(), 0, "with caching off, the re-walk sees the gone dir");
+
+        clear_index_cache();
+        drop(guard);
+    }
+
+    #[test]
+    fn ttl_zero_disables_cache_and_always_reloads() {
+        let guard = ttl_env_guard();
+        clear_index_cache();
+        std::env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        write(
+            repo,
+            "skills/a/skill.yaml",
+            "name: Alpha\ndescription: alpha skill\n",
+        );
+        let roots = SkillRoots {
+            spawner: None,
+            codex: None,
+            repo: Some(repo.join("skills")),
+        };
+
+        let a = cached_index_for(&roots);
+        let b = cached_index_for(&roots);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        // Distinct Arcs: TTL=0 means each call loads a fresh index (no caching).
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &b),
+            "TTL=0 must not cache: each call is a fresh load"
+        );
+
+        drop(guard);
+    }
+
+    /// Serialize the `OCEAN_LONGHOUSE_SKILL_TTL_SECS` env mutation + the shared
+    /// process-wide cache across the cache tests (both are global).
+    fn ttl_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static TTL_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let g = TTL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS");
+        g
     }
 
     /// Smoke test against the operator's real `~/.spawner` / `~/.codex` skill

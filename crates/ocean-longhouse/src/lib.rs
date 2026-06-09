@@ -46,8 +46,8 @@ pub use agent::ModelHandle;
 pub use longhouse_provider::{LonghouseProvider, LonghouseRegistryHandle};
 pub use config::{LonghouseConfig, LonghouseMode};
 pub use prepare::{
-    SkillBrief, SkillIndex, SkillRoots, SkillSource, SopBrief, TurnBrief, TurnPrep, WorkflowBrief,
-    DEFAULT_TOP_N,
+    cached_index, cached_index_for, clear_index_cache, SkillBrief, SkillIndex, SkillRoots,
+    SkillSource, SopBrief, TurnBrief, TurnPrep, WorkflowBrief, CACHE_TTL, DEFAULT_TOP_N,
 };
 pub use convene::{
     claim_outcome, ClaimError, Clock, ConveneOutcome, ConveneRequest, FirekeeperTitle, SystemClock,
