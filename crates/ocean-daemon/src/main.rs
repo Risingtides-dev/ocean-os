@@ -1511,6 +1511,16 @@ struct SessionListQuery {
     /// `?all=1` short-circuits the filter and returns every bucket.
     #[serde(default)]
     all: Option<String>,
+    /// Max sessions to return in this page (OCEAN-250). Omitted ⇒ the default
+    /// cap (`DEFAULT_LIST_LIMIT`); any value is clamped to `MAX_LIST_LIMIT`. The
+    /// session list is never unbounded — page with the returned `next_cursor`.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Pagination cursor (OCEAN-250): the `id` of the last session from the
+    /// previous page. Omitted ⇒ the first page. Replay `next_cursor` here to
+    /// fetch the following page.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 impl SessionListQuery {
@@ -1571,8 +1581,20 @@ async fn sessions(
     Query(q): Query<SessionListQuery>,
 ) -> Json<serde_json::Value> {
     let scope = q.workspace_filter(&state.runtime);
-    match state.runtime.list_sessions(scope.as_deref()) {
-        Ok(sessions) => Json(json!({"ok": true, "sessions": sessions, "workspace": scope})),
+    // Bounded + paginated (OCEAN-250): a daemon with thousands of historical
+    // sessions no longer pours every one into a multi-MB response per poll. The
+    // `sessions` array shape is unchanged; `next_cursor`/`has_more` are additive.
+    match state
+        .runtime
+        .list_sessions_page(scope.as_deref(), q.cursor.as_deref(), q.limit)
+    {
+        Ok(page) => Json(json!({
+            "ok": true,
+            "sessions": page.items,
+            "workspace": scope,
+            "next_cursor": page.next_cursor,
+            "has_more": page.has_more,
+        })),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
 }
@@ -3071,11 +3093,37 @@ async fn room_create(
 }
 
 /// `GET /v1/rooms/persistent` — list all persistent rooms (no transcripts).
+/// Pagination query for `GET /v1/rooms/persistent` (OCEAN-250).
+#[derive(Debug, serde::Deserialize, Default)]
+struct RoomsListQuery {
+    /// Max rooms to return in this page. Omitted ⇒ the store's default cap
+    /// (`DEFAULT_LIST_LIMIT`); any value is clamped to `MAX_LIST_LIMIT`.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Cursor: the room key of the last room from the previous page. Omitted ⇒
+    /// the first page. Replay `next_cursor` here for the following page.
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+/// `GET /v1/rooms/persistent?limit=&cursor=` — list open persistent rooms, one
+/// bounded page at a time (OCEAN-250). Rooms are ordered most-recently-updated
+/// first; the `rooms` array shape is unchanged, with additive
+/// `next_cursor`/`has_more` so a poller doesn't re-serialize every room each call.
 async fn rooms_list_persistent(
     State(state): State<AppState>,
+    Query(q): Query<RoomsListQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match with_rooms(&state, |reg| reg.list()) {
-        Ok(rooms) => (StatusCode::OK, Json(json!({ "ok": true, "rooms": rooms }))),
+    match with_rooms(&state, |reg| reg.list_page(q.cursor.as_deref(), q.limit)) {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "rooms": page.rooms,
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+            })),
+        ),
         Err(e) => room_store_error_response(e),
     }
 }
@@ -3782,18 +3830,44 @@ struct PatchProjectRequest {
     config: Option<ProjectConfig>,
 }
 
-/// `GET /v1/projects` — list all registered projects.
-async fn projects_list(State(state): State<AppState>) -> Json<ProjectsResponse> {
-    match state.runtime.list_projects() {
-        Ok(projects) => Json(ProjectsResponse {
+/// Pagination query for `GET /v1/projects` (OCEAN-250).
+#[derive(Debug, serde::Deserialize, Default)]
+struct ProjectsListQuery {
+    /// Max projects to return in this page. Omitted ⇒ the default cap
+    /// (`DEFAULT_LIST_LIMIT`); any value is clamped to `MAX_LIST_LIMIT`.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Cursor: the `id` of the last project from the previous page. Omitted ⇒
+    /// the first page. Replay `next_cursor` here for the following page.
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+/// `GET /v1/projects?limit=&cursor=` — list registered projects, one bounded
+/// page at a time (OCEAN-250). Projects are ordered newest-first; the `projects`
+/// array shape is unchanged, with additive `next_cursor`/`has_more` so a client
+/// can page instead of fetching every project on each call.
+async fn projects_list(
+    State(state): State<AppState>,
+    Query(q): Query<ProjectsListQuery>,
+) -> Json<ProjectsResponse> {
+    match state
+        .runtime
+        .list_projects_page(q.cursor.as_deref(), q.limit)
+    {
+        Ok(page) => Json(ProjectsResponse {
             ok: true,
-            projects,
+            projects: page.items,
             error: None,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
         }),
         Err(e) => Json(ProjectsResponse {
             ok: false,
             projects: vec![],
             error: Some(e.to_string()),
+            next_cursor: None,
+            has_more: false,
         }),
     }
 }
@@ -6001,10 +6075,17 @@ async fn agent_sessions(
     Query(q): Query<SessionListQuery>,
 ) -> Json<AgentSessionsResponse> {
     let scope = q.workspace_filter(&state.runtime);
-    let core_sessions = state
+    // Bounded + paginated (OCEAN-250): page the session list rather than mapping
+    // every historical session into the response on each poll. `next_cursor`/
+    // `has_more` are additive; the `sessions` array shape is unchanged.
+    let page = state
         .runtime
-        .list_sessions(scope.as_deref())
-        .unwrap_or_default();
+        .list_sessions_page(scope.as_deref(), q.cursor.as_deref(), q.limit)
+        .unwrap_or_else(|_| ocean_agent::Page {
+            items: Vec::new(),
+            next_cursor: None,
+            has_more: false,
+        });
     // Snapshot the live request registry once, then derive each summary's
     // active_turn from it via the same helper the detail endpoint uses
     // (OCEAN-205). This is a cheap status peek — no per-session transcript load.
@@ -6012,7 +6093,8 @@ async fn agent_sessions(
         let guard = state.requests.read().await;
         guard.values().map(|ctl| ctl.status.clone()).collect()
     };
-    let summaries: Vec<AgentSessionSummary> = core_sessions
+    let summaries: Vec<AgentSessionSummary> = page
+        .items
         .into_iter()
         .map(|s| AgentSessionSummary {
             id: sdk_sid(s.id),
@@ -6032,6 +6114,8 @@ async fn agent_sessions(
         ok: true,
         sessions: summaries,
         error: None,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
     })
 }
 
@@ -9673,6 +9757,250 @@ mod tests {
         assert_eq!(all["transcript"].as_array().unwrap().len(), total);
         assert_eq!(all["has_more"], json!(false));
         assert!(all["next_seq"].is_null());
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    // ---- OCEAN-250: list endpoints are bounded + pageable ------------------
+
+    /// `GET /v1/rooms/persistent` returns at most `limit` rooms with a cursor,
+    /// paging covers every open room exactly once, and an omitted limit applies
+    /// the default cap (never an unbounded dump).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rooms_list_is_bounded_and_pageable() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // 12 open rooms, each newer than the last so the newest-first order (and
+        // thus the cursor) is deterministic.
+        let total: usize = 12;
+        let base = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        with_rooms(&state, |reg| {
+            for i in 0..total {
+                let ts = base + chrono::Duration::seconds(i as i64);
+                reg.create(RoomKey::new(format!("room-{i:03}")), "R", None, ts)
+                    .unwrap();
+            }
+        });
+
+        // First page of 5: capped, with a cursor + has_more.
+        let (status, Json(first)) = rooms_list_persistent(
+            State(state.clone()),
+            Query(RoomsListQuery {
+                limit: Some(5),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page = first["rooms"].as_array().unwrap();
+        assert_eq!(page.len(), 5, "first page is capped at the requested limit");
+        assert_eq!(first["has_more"], json!(true));
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("has_more implies a cursor")
+            .to_string();
+
+        // Walk the rest with the cursor; collect every room key once.
+        let mut seen: Vec<String> = page
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        let mut after = Some(cursor);
+        let mut pages = 1;
+        loop {
+            let (status, Json(p)) = rooms_list_persistent(
+                State(state.clone()),
+                Query(RoomsListQuery {
+                    limit: Some(5),
+                    cursor: after.take(),
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            pages += 1;
+            assert!(pages <= total + 2, "paging must terminate");
+            for r in p["rooms"].as_array().unwrap() {
+                seen.push(r["id"].as_str().unwrap().to_string());
+            }
+            if p["has_more"] == json!(true) {
+                after = Some(p["next_cursor"].as_str().unwrap().to_string());
+            } else {
+                assert!(p["next_cursor"].is_null(), "final page has a null cursor");
+                break;
+            }
+        }
+        let expected: Vec<String> = (0..total).rev().map(|i| format!("room-{i:03}")).collect();
+        assert_eq!(seen, expected, "paging covers every room once, in list order");
+
+        // No limit ⇒ default cap; 12 < 100 so it's the whole list, no more pages.
+        let (status, Json(all)) = rooms_list_persistent(
+            State(state.clone()),
+            Query(RoomsListQuery {
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(all["rooms"].as_array().unwrap().len(), total);
+        assert_eq!(all["has_more"], json!(false));
+        assert!(all["next_cursor"].is_null());
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// `GET /v1/projects` pages: capped page + cursor, paging covers all, default
+    /// cap applies with no limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projects_list_is_bounded_and_pageable() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // 7 projects, each newer than the last (deterministic newest-first order).
+        let total: usize = 7;
+        for i in 0..total as i64 {
+            let p = Project {
+                id: uuid::Uuid::new_v4(),
+                name: format!("proj-{i}"),
+                workspace_root: format!("/dev/p{i}"),
+                config: ProjectConfig::default(),
+                created_ms: 1000 + i,
+                updated_ms: 1000 + i,
+            };
+            state.runtime.upsert_project(p, 1000 + i).unwrap();
+        }
+
+        // First page of 3.
+        let Json(first) = projects_list(
+            State(state.clone()),
+            Query(ProjectsListQuery {
+                limit: Some(3),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert!(first.ok);
+        assert_eq!(first.projects.len(), 3);
+        assert!(first.has_more);
+        let cursor = first.next_cursor.clone().expect("has_more ⇒ cursor");
+
+        // Walk to the end, collecting names.
+        let mut names: Vec<String> = first.projects.iter().map(|p| p.name.clone()).collect();
+        let mut after = Some(cursor);
+        let mut pages = 1;
+        loop {
+            let Json(p) = projects_list(
+                State(state.clone()),
+                Query(ProjectsListQuery {
+                    limit: Some(3),
+                    cursor: after.take(),
+                }),
+            )
+            .await;
+            pages += 1;
+            assert!(pages <= total + 2, "paging must terminate");
+            names.extend(p.projects.iter().map(|pr| pr.name.clone()));
+            if p.has_more {
+                after = Some(p.next_cursor.clone().unwrap());
+            } else {
+                assert!(p.next_cursor.is_none(), "final page has no cursor");
+                break;
+            }
+        }
+        let expected: Vec<String> = (0..total as i64).rev().map(|i| format!("proj-{i}")).collect();
+        assert_eq!(names, expected, "paging covers every project once, newest-first");
+
+        // No limit ⇒ default cap; 7 < 100 so all in one page, no more.
+        let Json(all) = projects_list(
+            State(state.clone()),
+            Query(ProjectsListQuery {
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(all.projects.len(), total);
+        assert!(!all.has_more);
+        assert!(all.next_cursor.is_none());
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// `GET /v1/sessions` pages: capped page + cursor, paging covers every
+    /// session once, default cap applies with no limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_list_is_bounded_and_pageable() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // 5 sessions bound to the same workspace (cwd ".").
+        let total: usize = 5;
+        for _ in 0..total {
+            state.runtime.create_session(".", None).unwrap();
+        }
+
+        // First page of 2 (no scope filter ⇒ ?all-style full list via default).
+        let Json(first) = sessions(
+            State(state.clone()),
+            Query(SessionListQuery {
+                limit: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(first["ok"], json!(true));
+        assert_eq!(first["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(first["has_more"], json!(true));
+        let cursor = first["next_cursor"].as_str().expect("has_more ⇒ cursor").to_string();
+
+        // Walk to the end; collect ids, assert each appears once.
+        let mut seen: Vec<String> = first["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        let mut after = Some(cursor);
+        let mut pages = 1;
+        loop {
+            let Json(p) = sessions(
+                State(state.clone()),
+                Query(SessionListQuery {
+                    limit: Some(2),
+                    cursor: after.take(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            pages += 1;
+            assert!(pages <= total + 2, "paging must terminate");
+            for s in p["sessions"].as_array().unwrap() {
+                seen.push(s["id"].as_str().unwrap().to_string());
+            }
+            if p["has_more"] == json!(true) {
+                after = Some(p["next_cursor"].as_str().unwrap().to_string());
+            } else {
+                assert!(p["next_cursor"].is_null(), "final page has a null cursor");
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "paging covers every session exactly once");
+
+        // No limit ⇒ default cap; 5 < 100 so all in one page, no more.
+        let Json(all) = sessions(
+            State(state.clone()),
+            Query(SessionListQuery::default()),
+        )
+        .await;
+        assert_eq!(all["sessions"].as_array().unwrap().len(), total);
+        assert_eq!(all["has_more"], json!(false));
+        assert!(all["next_cursor"].is_null());
 
         std::env::remove_var("OCEAN_YOLO");
     }

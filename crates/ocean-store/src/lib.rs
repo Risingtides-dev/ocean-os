@@ -138,6 +138,48 @@ pub fn clamp_transcript_limit(limit: Option<usize>) -> usize {
         .clamp(1, MAX_TRANSCRIPT_LIMIT)
 }
 
+/// Default number of rows returned by a *collection* list (rooms, sessions,
+/// projects) when a caller does not specify a limit (OCEAN-250). The list
+/// endpoints used to return everything — a daemon with thousands of historical
+/// rows answered a multi-MB JSON blob on every poll. This caps the default read;
+/// callers that need more page through with the returned cursor. (Distinct from
+/// [`DEFAULT_TRANSCRIPT_LIMIT`]: a transcript tail wants a larger default window
+/// than a list of room/session cards.)
+pub const DEFAULT_LIST_LIMIT: usize = 100;
+
+/// Hard ceiling on a single collection-list page (OCEAN-250). A caller-supplied
+/// limit is clamped to this so no single list request can be coerced into an
+/// unbounded scan + serialize.
+pub const MAX_LIST_LIMIT: usize = 1000;
+
+/// One bounded page of a room list (OCEAN-250).
+///
+/// `rooms` holds at most the effective limit of rooms in the store's stable list
+/// order (`updated_at DESC, id ASC`). `next_cursor` is the room key a client
+/// replays as the next `after` to fetch the following page; it is
+/// `Some(last_returned_key)` when more rows exist and `None` at the end.
+/// `has_more` is the same signal as a bool.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomPage {
+    /// This page's rooms, in list order, at most the effective limit.
+    pub rooms: Vec<Room>,
+    /// Cursor for the next page (the `after` room key), or `None` at the end.
+    pub next_cursor: Option<String>,
+    /// Whether at least one more room exists beyond this page.
+    pub has_more: bool,
+}
+
+/// Clamp a caller-supplied collection-list limit into the allowed range. `None`
+/// (no limit given) maps to [`DEFAULT_LIST_LIMIT`]; any value is capped at
+/// [`MAX_LIST_LIMIT`] and floored at 1 so a `0` can never request an empty page
+/// that also reports `has_more = true`. The sibling of [`clamp_transcript_limit`]
+/// for list endpoints.
+pub fn clamp_list_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT)
+}
+
 /// Error returned by store operations.
 ///
 /// The caller-input variants (`BadKey`, `UnknownRoom`, `AlreadyExists`,
@@ -211,7 +253,25 @@ pub trait RoomStore {
     fn get(&self, key: &RoomKey) -> Result<Option<RoomRecord>>;
 
     /// All open rooms, most-recently-updated first, ties broken by key.
+    ///
+    /// **Bounded (OCEAN-250).** This returns at most [`DEFAULT_LIST_LIMIT`]
+    /// rooms — it is no longer an unbounded list. Callers that need to page or
+    /// that want the cursor/`has_more` signal should use [`RoomStore::list_page`];
+    /// this method is kept as the convenience "first page with the default cap"
+    /// form.
     fn list(&self) -> Result<Vec<Room>>;
+
+    /// One bounded page of the open-room list (OCEAN-250).
+    ///
+    /// Returns open rooms in `updated_at DESC, id ASC` order starting *after* the
+    /// `after` room key (or from the top when `None`), at most `limit` rooms.
+    /// `limit` is clamped by [`clamp_list_limit`]: `None` ⇒ [`DEFAULT_LIST_LIMIT`],
+    /// any value capped at [`MAX_LIST_LIMIT`]. The returned [`RoomPage`] carries
+    /// `next_cursor` (the room key to replay as the next `after`) and `has_more`.
+    /// Page to the end by repeating with `after = next_cursor` until `has_more` is
+    /// false. An `after` key that is not in the list (closed/never-existed) simply
+    /// yields rows that sort after it — paging is resilient to a stale cursor.
+    fn list_page(&self, after: Option<&str>, limit: Option<usize>) -> Result<RoomPage>;
 
     /// Update a room's mutable metadata (name and/or trigger policy). `None`
     /// leaves a field unchanged; `Some(None)` clears the trigger policy.
@@ -610,22 +670,89 @@ impl RoomStore for SqliteRoomStore {
     }
 
     fn list(&self) -> Result<Vec<Room>> {
-        // updated_at DESC, ties broken by id ASC — same ordering as the registry.
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM rooms WHERE closed_at IS NULL ORDER BY updated_at DESC, id ASC",
-        )?;
-        let keys: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(stmt);
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            let key = RoomKey::new(k);
+        // Bounded by default (OCEAN-250): delegate to the paged read with the
+        // default cap and hand back just the rooms. A daemon with thousands of
+        // rows no longer serializes all of them on every poll.
+        Ok(self.list_page(None, None)?.rooms)
+    }
+
+    fn list_page(&self, after: Option<&str>, limit: Option<usize>) -> Result<RoomPage> {
+        let effective_limit = clamp_list_limit(limit);
+        // Keyset pagination over the stable `updated_at DESC, id ASC` order. The
+        // cursor is just the last returned room key; we resolve its `updated_at`
+        // (an indexed point lookup) so the WHERE clause can express "comes strictly
+        // after the cursor in this ordering" without an OFFSET (which would still
+        // scan all skipped rows). A cursor key that no longer exists (room closed
+        // since) yields no anchor row, so we fall back to the unanchored first page
+        // rather than 404 — paging stays resilient to a stale cursor.
+        let anchor: Option<(String, String)> = match after {
+            Some(k) => self
+                .conn
+                .query_row(
+                    "SELECT updated_at, id FROM rooms WHERE id = ?1 AND closed_at IS NULL",
+                    params![k],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?,
+            None => None,
+        };
+
+        // Fetch one extra row as the "is there a next page?" sentinel, then drop it.
+        let fetch = effective_limit.saturating_add(1) as i64;
+        let keys: Vec<String> = match &anchor {
+            // Strictly-after predicate for `updated_at DESC, id ASC`:
+            //   updated_at < u_c  OR  (updated_at = u_c AND id > id_c)
+            Some((u_c, id_c)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id FROM rooms
+                     WHERE closed_at IS NULL
+                       AND (updated_at < ?1 OR (updated_at = ?1 AND id > ?2))
+                     ORDER BY updated_at DESC, id ASC
+                     LIMIT ?3",
+                )?;
+                let keys = stmt
+                    .query_map(params![u_c, id_c, fetch], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                keys
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id FROM rooms WHERE closed_at IS NULL
+                     ORDER BY updated_at DESC, id ASC LIMIT ?1",
+                )?;
+                let keys = stmt
+                    .query_map(params![fetch], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                keys
+            }
+        };
+
+        // If we got the sentinel back, there is at least one more page. Drop it so
+        // the page holds exactly `effective_limit` keys.
+        let has_more = keys.len() > effective_limit;
+        let kept = if has_more {
+            &keys[..effective_limit]
+        } else {
+            &keys[..]
+        };
+        let next_cursor = if has_more {
+            kept.last().cloned()
+        } else {
+            None
+        };
+
+        let mut rooms = Vec::with_capacity(kept.len());
+        for k in kept {
+            let key = RoomKey::new(k.clone());
             if let Some(rec) = self.load_record(&key, false)? {
-                out.push(rec.room);
+                rooms.push(rec.room);
             }
         }
-        Ok(out)
+        Ok(RoomPage {
+            rooms,
+            next_cursor,
+            has_more,
+        })
     }
 
     fn update(
@@ -1109,6 +1236,142 @@ mod tests {
         // Most recently updated first.
         assert_eq!(list[0].id, RoomKey::new("map-fix"));
         assert_eq!(list[1].id, RoomKey::new("docs"));
+    }
+
+    /// Create `n` open rooms with strictly-increasing `updated_at` so the
+    /// newest-first list order (`updated_at DESC`) is deterministic: keys are
+    /// `room-000`, `room-001`, … and the list returns them in REVERSE (newest
+    /// created first). Returns the store. (OCEAN-250)
+    fn store_with_rooms(n: usize) -> SqliteRoomStore {
+        let mut s = store();
+        let base = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for i in 0..n {
+            // i seconds past base → later i sorts earlier in the DESC list.
+            let ts = base + chrono::Duration::seconds(i as i64);
+            s.create(RoomKey::new(format!("room-{i:03}")), "R", None, ts)
+                .unwrap();
+        }
+        s
+    }
+
+    /// The newest-first list order as room-key strings, for asserting paging
+    /// reconstructs exactly the full order.
+    fn expected_room_order(n: usize) -> Vec<String> {
+        (0..n).rev().map(|i| format!("room-{i:03}")).collect()
+    }
+
+    #[test]
+    fn list_page_caps_rows_and_returns_cursor() {
+        // 10 rooms, ask for a page of 4.
+        let s = store_with_rooms(10);
+        let page = s.list_page(None, Some(4)).unwrap();
+        assert_eq!(page.rooms.len(), 4, "page is capped at the limit");
+        // Newest-first: room-009 … room-006.
+        assert_eq!(page.rooms[0].id, RoomKey::new("room-009"));
+        assert_eq!(page.rooms[3].id, RoomKey::new("room-006"));
+        assert!(page.has_more, "6 rooms remain, so has_more is true");
+        // Cursor is the last returned key, to be replayed as the next `after`.
+        assert_eq!(page.next_cursor.as_deref(), Some("room-006"));
+    }
+
+    #[test]
+    fn list_page_paging_with_cursor_retrieves_all_rooms() {
+        // Walk the whole list in pages of 3 using the returned cursor; assert we
+        // see every room exactly once, in the store's order, no gaps/dupes.
+        let total = 17;
+        let s = store_with_rooms(total);
+
+        let mut collected: Vec<String> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = s.list_page(after.as_deref(), Some(3)).unwrap();
+            pages += 1;
+            assert!(pages <= total + 2, "paging must terminate");
+            for r in &page.rooms {
+                collected.push(r.id.as_str().to_string());
+            }
+            if page.has_more {
+                after = Some(page.next_cursor.clone().expect("has_more implies a cursor"));
+            } else {
+                assert_eq!(page.next_cursor, None, "final page has no cursor");
+                break;
+            }
+        }
+        assert_eq!(
+            collected,
+            expected_room_order(total),
+            "every room retrieved once, in list order"
+        );
+    }
+
+    #[test]
+    fn list_page_last_page_has_no_cursor() {
+        // Exactly `limit` rooms total: the single full page must NOT claim
+        // has_more (the +1 sentinel row simply doesn't exist).
+        let s = store_with_rooms(5);
+        let page = s.list_page(None, Some(5)).unwrap();
+        assert_eq!(page.rooms.len(), 5);
+        assert!(!page.has_more, "a full final page is not 'has_more'");
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn list_default_cap_applies_when_no_limit_given() {
+        // More rooms than the default cap: both the convenience `list()` and
+        // `list_page(.., None)` must bound at DEFAULT_LIST_LIMIT, NOT return
+        // everything (the OCEAN-250 regression guard).
+        let over = DEFAULT_LIST_LIMIT + 15;
+        let s = store_with_rooms(over);
+
+        let rooms = s.list().unwrap();
+        assert_eq!(
+            rooms.len(),
+            DEFAULT_LIST_LIMIT,
+            "list() is bounded by the default cap, not unbounded"
+        );
+
+        let page = s.list_page(None, None).unwrap();
+        assert_eq!(page.rooms.len(), DEFAULT_LIST_LIMIT);
+        assert!(page.has_more, "rooms beyond the cap mean more pages");
+    }
+
+    #[test]
+    fn list_page_limit_is_clamped_to_max() {
+        // An absurd caller limit is clamped to MAX_LIST_LIMIT. With fewer rooms
+        // than the cap we still get them all and has_more is false; the point is
+        // the request can't be coerced into an unbounded scan.
+        let s = store_with_rooms(3);
+        let page = s.list_page(None, Some(usize::MAX)).unwrap();
+        assert_eq!(page.rooms.len(), 3);
+        assert!(!page.has_more);
+        assert_eq!(clamp_list_limit(Some(usize::MAX)), MAX_LIST_LIMIT);
+        assert_eq!(clamp_list_limit(None), DEFAULT_LIST_LIMIT);
+        // A 0 limit floors to 1 so it can never report an empty-yet-has_more page.
+        assert_eq!(clamp_list_limit(Some(0)), 1);
+    }
+
+    #[test]
+    fn list_page_stale_cursor_falls_back_to_first_page() {
+        // A cursor key that isn't an open room (closed/never existed) must not
+        // 404 or panic — paging resumes from the top (resilient to a stale or
+        // since-closed cursor).
+        let s = store_with_rooms(4);
+        let page = s.list_page(Some("no-such-room"), Some(2)).unwrap();
+        assert_eq!(page.rooms.len(), 2);
+        assert_eq!(page.rooms[0].id, RoomKey::new("room-003"));
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn list_page_excludes_closed_rooms() {
+        // Closed rooms never appear in the page (the list is open-rooms-only).
+        let mut s = store_with_rooms(3); // room-000..room-002
+        s.close(&RoomKey::new("room-001")).unwrap();
+        let page = s.list_page(None, Some(10)).unwrap();
+        let ids: Vec<String> = page.rooms.iter().map(|r| r.id.as_str().to_string()).collect();
+        assert_eq!(ids, vec!["room-002".to_string(), "room-000".to_string()]);
+        assert!(!page.has_more);
     }
 
     #[test]

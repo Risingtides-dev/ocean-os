@@ -328,6 +328,14 @@ pub struct AgentSessionsResponse {
     pub sessions: Vec<AgentSessionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Pagination cursor for the next page (OCEAN-250): replay as `?cursor=` to
+    /// fetch the following page. `None` when this page reached the end of the
+    /// list. Additive — older clients that ignore it still get a bounded page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Whether at least one more session exists beyond this page (OCEAN-250).
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 /// Response payload for `GET /v1/agent/sessions/{id}`.
