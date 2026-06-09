@@ -1902,6 +1902,11 @@ async fn longhouse_convene(
 /// [`BusSink::with_persistence`] so the demo path records a transcript while the
 /// `place_call` lifecycle (which mints its own room separately) can use a
 /// bus-only sink.
+///
+/// Cloneable so the per-call session task can own its own sink (OCEAN-CALL) — every
+/// clone forwards to the same bus, and (since [`RoomStoreHandle`] is an
+/// `Arc<Mutex<…>>`) shares the same durable room store behind the handle.
+#[derive(Clone)]
 struct BusSink {
     events: EventBus,
     /// When set, call events are mirrored into this durable room store under
@@ -2064,6 +2069,258 @@ fn with_rooms_handle<T>(
     f(&mut guard)
 }
 
+/// The active lane's [`ocean_call::TurnRunner`]: runs one ephemeral agent turn
+/// over a wake command and returns the assistant's reply text for TTS.
+///
+/// It drives the *same* `AgentRuntime` every other turn uses — so a call answer
+/// is a real agent turn (tools, permissions, the operator's model) — but in its
+/// own throwaway session per call (`call:<room>`), tagged `client_type =
+/// "call-voice"`, so a call never pollutes a user's chat session. The reply is
+/// `res.stdout`, the full assistant text the runtime already streamed.
+///
+/// Only constructed in the live (`livekit-tap`) build — the wake/answer lane is
+/// part of the live audio loop — so the default build allows it as dead code.
+#[cfg_attr(not(feature = "livekit-tap"), allow(dead_code))]
+struct DaemonTurnRunner {
+    state: AppState,
+    /// Per-call session id, lazily created on the first answer so a call that
+    /// never triggers the active lane never creates a session.
+    session_id: Option<SessionId>,
+    cwd: String,
+    room_label: String,
+}
+
+#[cfg_attr(not(feature = "livekit-tap"), allow(dead_code))]
+impl DaemonTurnRunner {
+    fn new(state: AppState, room_label: String) -> Self {
+        // Voice answers run in the daemon's own workspace — they read context
+        // and talk, not edit a user's repo. `OCEAN_CALL_CWD` overrides.
+        let cwd = std::env::var("OCEAN_CALL_CWD")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| ".".to_string())
+            });
+        Self {
+            state,
+            session_id: None,
+            cwd,
+            room_label,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ocean_call::TurnRunner for DaemonTurnRunner {
+    async fn run(&mut self, command: &str) -> anyhow::Result<String> {
+        let is_new = self.session_id.is_none();
+        let session_id = *self.session_id.get_or_insert_with(SessionId::new_v4);
+        let request_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+
+        // Permission posture follows operator policy, same as any other turn.
+        let yolo = effective_yolo();
+        let control = build_prompt_control(
+            &self.state,
+            request_id,
+            Some(session_id),
+            yolo,
+            cancel,
+            None,
+        );
+
+        let prompt_req = PromptRequest {
+            prompt: command.to_string(),
+            images: None,
+            request_id: Some(request_id),
+            session_id: Some(session_id),
+            create_if_missing: is_new,
+            max_turns: None,
+            yolo,
+            cwd: self.cwd.clone(),
+            project_id: None,
+            client_type: Some("call-voice".to_string()),
+            decision_token: None,
+        };
+
+        tracing::info!(
+            room = %self.room_label,
+            %session_id,
+            "call active lane: running agent turn for wake answer"
+        );
+        let res = self.state.runtime.prompt(prompt_req, control).await;
+        if res.ok {
+            Ok(res.stdout)
+        } else {
+            anyhow::bail!("agent turn failed: {}", res.stderr)
+        }
+    }
+}
+
+/// Spawn the long-running per-call session task: audio tap → STT → orchestrator
+/// → (wake) agent turn → TTS, with every event forwarded onto the SSE rail via
+/// [`BusSink`] (so transcripts both stream and, once OCEAN-170 is in, persist).
+///
+/// This is the running wiring the call pipeline was missing. It is called from
+/// [`call_place`] (outbound) and [`call_webhook`] (inbound) right after the room
+/// exists. The heavy *live* leg — joining the LiveKit room and pumping native
+/// WebRTC PCM — is compiled only under the `livekit-tap` feature; the default
+/// daemon build keeps this function present but inert (it logs that the live tap
+/// isn't compiled in), so `cargo build -p ocean-daemon` never needs native libs.
+///
+/// Activation in the live build is further gated on `LIVEKIT_URL` + a join token
+/// (minted via the existing `ocean_call::token`) and `XAI_API_KEY` for STT; when
+/// those aren't set it logs and returns without spawning, exactly like the dial
+/// path returns 503 — the only thing between here and a live call is the creds.
+fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
+    let _ = participants; // used by the live arm below
+    #[cfg(not(feature = "livekit-tap"))]
+    {
+        let _ = (state, room);
+        tracing::info!(
+            room = %room,
+            "call-session task not spawned: live LiveKit tap requires the \
+             `livekit-tap` feature (native WebRTC). Lifecycle + scripted demo \
+             paths still emit on /v1/events; build with --features livekit-tap \
+             and set LIVEKIT_*/XAI_API_KEY to activate the live audio loop."
+        );
+    }
+
+    #[cfg(feature = "livekit-tap")]
+    {
+        use ocean_call::session_task::live::{LiveKitFrameSource, LiveKitVoice, TtsSynth};
+        use ocean_call::{
+            run_call_session, CallSession, Summarizer, SummaryPolicy, UtterancePolicy, WakeGate,
+        };
+
+        // Live activation needs LiveKit creds (to mint a tap token) + an STT key.
+        let token_config = match ocean_call::LiveKitTokenConfig::from_env() {
+            Ok(c) => c,
+            Err(missing) => {
+                tracing::info!(
+                    room = %room,
+                    missing = %missing,
+                    "call-session task not spawned: LiveKit not configured"
+                );
+                return;
+            }
+        };
+        let xai_key = match std::env::var("XAI_API_KEY") {
+            Ok(k) if !k.trim().is_empty() => k,
+            _ => {
+                tracing::info!(
+                    room = %room,
+                    "call-session task not spawned: XAI_API_KEY unset (no STT)"
+                );
+                return;
+            }
+        };
+
+        // Mint a publish-capable join token for the server tap so the active
+        // lane can also speak. The passive transcript lane only needs subscribe.
+        let token_req = ocean_call::LiveKitTokenRequest {
+            surface_id: ocean_call::room_tap::ROOM_TAP_IDENTITY.to_string(),
+            participant_id: ocean_call::room_tap::ROOM_TAP_IDENTITY.to_string(),
+            display_name: "Ocean".to_string(),
+            can_publish: true,
+            can_subscribe: true,
+        };
+        let token = match ocean_call::mint_join_token(&token_config, room, &token_req) {
+            Ok(t) => t.token,
+            Err(e) => {
+                tracing::warn!(room = %room, error = %e, "call-session token mint failed");
+                return;
+            }
+        };
+        let url = token_config.url.clone();
+
+        // Persistence-enabled sink: a live call's transcript both streams onto the
+        // SSE rail AND lands in a durable `call:<room>` room (OCEAN-170), so it
+        // survives a daemon restart and is queryable after the call ends — same as
+        // the demo path. `persist` keys off the orchestrator's `CallStarted.room_id`
+        // and creates the room on the fly (an already-existing room is fine), so
+        // this is safe whether or not the room was minted elsewhere first.
+        let sink = BusSink::with_persistence(state.events.clone(), state.rooms.clone());
+        let runner = DaemonTurnRunner::new(state.clone(), room.to_string());
+        let transcriber = ocean_call::session_task::live::XaiTranscriber::new(xai_key);
+        let session = CallSession::new(
+            room.to_string(),
+            Summarizer::new(SummaryPolicy::default()),
+            // Wake active by default; an `OCEAN_CALL_MUTED=1` keeps a sensitive
+            // call passive-only.
+            WakeGate::new(call_voice_muted(), 2_000),
+        );
+        let room_owned = room.to_string();
+
+        tokio::spawn(async move {
+            let (source, lk_room) = match LiveKitFrameSource::connect(&url, &token).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(room = %room_owned, error = %e, "call tap connect failed");
+                    // Close the lifecycle so no phantom in-progress call lingers.
+                    state_emit_call_ended(&sink, &room_owned);
+                    return;
+                }
+            };
+            let voice = LiveKitVoice::new(lk_room, NoopTts);
+            run_call_session(
+                session,
+                source,
+                transcriber,
+                runner,
+                voice,
+                sink,
+                room_owned,
+                participants,
+                UtterancePolicy::default(),
+                || ocean_protocol::now_ms() as u64,
+            )
+            .await;
+        });
+
+        /// Placeholder TTS until a provider is wired: logs and yields silence so
+        /// the publish path is exercised end-to-end without fabricating speech.
+        /// Swap for a real synth (xAI/ElevenLabs/Cartesia → 16kHz mono) to make
+        /// Ocean audibly answer; the rest of the active lane is already live.
+        struct NoopTts;
+        #[async_trait::async_trait]
+        impl TtsSynth for NoopTts {
+            async fn synth(&mut self, text: &str) -> anyhow::Result<ocean_call::PcmFrame> {
+                tracing::warn!(
+                    reply = %text,
+                    "call TTS synth not wired — emitting silence; CallAgentSpoke still fires"
+                );
+                // 200ms of 16kHz mono silence as a benign placeholder utterance.
+                Ok(ocean_call::PcmFrame::new(vec![0i16; 3_200], 16_000, 1))
+            }
+        }
+    }
+}
+
+/// Emit a `CallEnded` for `room` through a [`BusSink`], so a failed live connect
+/// still closes the call lifecycle (no phantom "in progress" call).
+#[cfg(feature = "livekit-tap")]
+fn state_emit_call_ended(sink: &BusSink, room: &str) {
+    use ocean_call::EventSink;
+    let mut sink = sink.clone();
+    sink.emit(ocean_core::OceanEvent::CallEnded {
+        call_id: room.to_string(),
+        duration_ms: 0,
+    });
+}
+
+/// Whether the call active lane is muted (passive-only). `OCEAN_CALL_MUTED=1`
+/// (or `true`) keeps a sensitive call transcript-only — Ocean never speaks.
+#[cfg(feature = "livekit-tap")]
+fn call_voice_muted() -> bool {
+    matches!(
+        std::env::var("OCEAN_CALL_MUTED").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
 /// Demo: run the ocean-call orchestrator over a scripted transcript and emit
 /// the real call events (CallStarted/Transcript/Task/Summary/Ended) onto the
 /// SSE rail. Proves the daemon→orchestrator→EventBus path end to end WITHOUT
@@ -2177,16 +2434,22 @@ async fn call_place(
     ));
 
     match bridge.place_call(&dialed, &room).await {
-        Ok(call) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "dialed": call.dialed,
-                "room": call.room,
-                "participant_id": call.participant_id,
-                "streaming_on": "/v1/events"
-            })),
-        ),
+        Ok(call) => {
+            // Dial accepted — spawn the running call-session task so audio →
+            // STT → orchestrator → TTS starts the moment the room has media.
+            // (Inert without the `livekit-tap` feature / live creds; logs why.)
+            spawn_call_session(&state, &call.room, vec![format!("sip:{dialed}")]);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "dialed": call.dialed,
+                    "room": call.room,
+                    "participant_id": call.participant_id,
+                    "streaming_on": "/v1/events"
+                })),
+            )
+        }
         Err(e) => {
             // Balance the lifecycle: we already emitted CallStarted, so a failed
             // dial MUST emit CallEnded or subscribers (TUI/surface) are left with
@@ -2272,6 +2535,10 @@ async fn call_webhook(
                 state.events.emit(ocean_core::EventEnvelope::new(event));
             }
             tracing::info!(%room, "inbound call room started");
+            // Inbound call: a real caller SIP-routed into this room. Spawn the
+            // running session task so Ocean joins, transcribes, and (on wake)
+            // answers. Inert without the `livekit-tap` feature / live creds.
+            spawn_call_session(&state, &room, vec![]);
             (StatusCode::OK, Json(json!({ "ok": true, "action": "join", "room": room })))
         }
         Ok(action @ ocean_call::WebhookAction::EndCall { .. }) => {

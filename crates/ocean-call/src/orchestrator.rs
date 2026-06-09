@@ -29,6 +29,14 @@ pub trait EventSink: Send {
     fn emit(&mut self, event: OceanEvent);
 }
 
+/// Forward through a `&mut` so callers can lend a sink to a generic consumer
+/// (e.g. [`crate::session_task::run_call_session`]) without giving up ownership.
+impl<T: EventSink + ?Sized> EventSink for &mut T {
+    fn emit(&mut self, event: OceanEvent) {
+        (**self).emit(event)
+    }
+}
+
 /// A simple capturing sink, handy for tests and for buffering before flush.
 #[derive(Debug, Default)]
 pub struct CapturingSink {

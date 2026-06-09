@@ -10,6 +10,16 @@ rust-version.workspace = true
 name = "ocean-daemon"
 path = "src/main.rs"
 
+[features]
+default = []
+# Activates the live call-session audio loop (OCEAN-CALL): joins the LiveKit
+# room, taps remote PCM, and publishes Ocean's voice back. Pulls native
+# libwebrtc via ocean-call's own `livekit-tap` feature, so it is OPT-IN — the
+# default daemon build stays fast and credential-free. The wiring
+# (`spawn_call_session`) compiles either way; only the live tap is gated.
+# `xai-stt` enables the live xAI batch transcription HTTP call.
+livekit-tap = ["ocean-call/livekit-tap", "ocean-call/xai-stt"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

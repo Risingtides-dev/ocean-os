@@ -25,6 +25,7 @@
 pub mod frame;
 pub mod orchestrator;
 pub mod room_tap;
+pub mod session_task;
 pub mod sip_bridge;
 pub mod speaker;
 pub mod stt;
@@ -38,6 +39,9 @@ pub mod webhook;
 pub use frame::{FrameChunker, PcmFrame};
 pub use orchestrator::{ActiveOutcome, CallSession, CapturingSink, EventSink};
 pub use room_tap::TapLifecycle;
+pub use session_task::{
+    run_call_session, FrameSource, SourceEnd, Transcriber, TurnRunner, UtterancePolicy, Voice,
+};
 pub use sip_bridge::{normalize_e164, CallBridge, LiveKitSipBridge, PlacedCall, SipConfig};
 pub use stt::{SegmentAssembler, SegmentUpdate, SttProvider, TranscriptSegment};
 pub use summarizer::{SummaryAction, SummaryPolicy, Summarizer};
