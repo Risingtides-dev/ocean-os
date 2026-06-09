@@ -3475,6 +3475,10 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                 patches.len()
             ));
         }
+        AgentTurnEvent::SlackCanvas { op, .. } => {
+            // The TUI isn't the Slack surface (the bridge fulfills these); note it.
+            app.push_transcript(format!("🗒️ slack canvas `{}`", op.op_name()));
+        }
     }
 }
 
@@ -4331,6 +4335,9 @@ fn summarize_agent_event(event: &AgentTurnEvent) -> String {
             canvas_id, patches, ..
         } => {
             format!("surface patch ×{} on {canvas_id}", patches.len())
+        }
+        AgentTurnEvent::SlackCanvas { op, .. } => {
+            format!("slack canvas {}", op.op_name())
         }
     }
 }

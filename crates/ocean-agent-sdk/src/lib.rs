@@ -497,6 +497,30 @@ pub enum AgentTurnEvent {
         /// The applied patches, each stamped into a routing/persistence envelope.
         patches: Vec<crate::surface::SurfacePatchEnvelope>,
     },
+    /// The agent emitted a validated `slack_canvas` op (OCEAN-214 / OCEAN-235).
+    /// The daemon relays this onto `/v1/agent/events` so the **Slack canvas
+    /// bridge** (`ocean-agents`) can round-trip it to the Slack Canvas API. For
+    /// the awareness ops (`read`/`list`) the bridge fetches live content and
+    /// stamps it back via [`crate::slack_canvas::SlackCanvasResult::fulfilled_read`]
+    /// / [`fulfilled_list`](crate::slack_canvas::SlackCanvasResult::fulfilled_list).
+    /// Scoped to `session_id` like every other session-bearing event.
+    ///
+    /// This is the **delivery seam OCEAN-235 wires**: before it, the runtime's
+    /// `AgentEvent::SlackCanvas` was dropped by the daemon's relay (`_ => {}`) and
+    /// never reached any consumer. The `result` carries the runtime's contracted
+    /// pending result so a bridge has both the op to fulfill and the shape to
+    /// stamp content into.
+    SlackCanvas {
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+        /// The validated op the agent emitted (`create`/`read`/`update`/`append`/
+        /// `list`). The bridge fulfills the awareness ops against Slack.
+        op: crate::slack_canvas::SlackCanvasOp,
+        /// The runtime's contracted result for this op. For `read`/`list` this is
+        /// the pending shape (`fetch_status: pending_bridge`, no content) the
+        /// bridge replaces with a fulfilled one.
+        result: crate::slack_canvas::SlackCanvasResult,
+    },
     /// Catch-all for unexpected or extension events (e.g. Longhouse council
     /// events). Includes the raw payload and an optional session scope.
     ///
@@ -542,7 +566,8 @@ impl AgentTurnEvent {
             | AgentTurnEvent::ComponentRender { session_id, .. }
             | AgentTurnEvent::ComponentUnmount { session_id, .. }
             | AgentTurnEvent::BrowserActivity { session_id, .. }
-            | AgentTurnEvent::SurfacePatch { session_id, .. } => Some(*session_id),
+            | AgentTurnEvent::SurfacePatch { session_id, .. }
+            | AgentTurnEvent::SlackCanvas { session_id, .. } => Some(*session_id),
             AgentTurnEvent::Extension { scope, .. } => *scope,
         }
     }
@@ -1056,6 +1081,18 @@ mod tests {
                     },
                 }],
             },
+            // Session-scoped SlackCanvas: a pending `read` (OCEAN-235) carrying its
+            // session — exercises serde round-trip of the new variant + result.
+            AgentTurnEvent::SlackCanvas {
+                session_id: sid,
+                turn_id: tid,
+                op: crate::slack_canvas::SlackCanvasOp::Read {
+                    canvas_id: crate::slack_canvas::SlackCanvasId::new("F0123ABCD"),
+                },
+                result: crate::slack_canvas::SlackCanvasResult::pending_read(
+                    crate::slack_canvas::SlackCanvasId::new("F0123ABCD"),
+                ),
+            },
             // Session-scoped Extension: behaves like any session-bearing event.
             AgentTurnEvent::Extension {
                 extension: "longhouse".into(),
@@ -1081,6 +1118,7 @@ mod tests {
                 | AgentTurnEvent::ComponentUnmount { .. }
                 | AgentTurnEvent::BrowserActivity { .. }
                 | AgentTurnEvent::SurfacePatch { .. }
+                | AgentTurnEvent::SlackCanvas { .. }
                 | AgentTurnEvent::Extension { .. } => {}
             }
         }
