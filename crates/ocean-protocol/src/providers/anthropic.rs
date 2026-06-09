@@ -122,11 +122,12 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new() -> Self {
+        // OCEAN-221: streaming SSE client with connect + idle (read) timeouts
+        // and NO total request timeout, so long completions are never cut off.
+        // (The shared builder also applies the pool_max_idle_per_host(4) that
+        // this provider previously set on its own.)
         Self {
-            client: reqwest::Client::builder()
-                .pool_max_idle_per_host(4)
-                .build()
-                .expect("reqwest client"),
+            client: crate::http::streaming_client(),
         }
     }
 }

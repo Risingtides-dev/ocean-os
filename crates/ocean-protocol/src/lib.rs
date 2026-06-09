@@ -6,6 +6,7 @@
 //! provider-agnostic.
 
 pub mod error;
+pub mod http;
 pub mod providers;
 pub mod retry;
 pub mod stream;
