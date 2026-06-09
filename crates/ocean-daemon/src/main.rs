@@ -1892,15 +1892,176 @@ async fn longhouse_convene(
 }
 
 /// Bridges ocean-call's orchestrator events onto the daemon EventBus, turning
-/// each OceanEvent into an EventEnvelope on the real SSE rail.
+/// each OceanEvent into an EventEnvelope on the real SSE rail — and, when given a
+/// room store, *persisting* the call's transcript into a durable Room so it
+/// survives daemon restarts and is queryable after the call ends (OCEAN-170).
+///
+/// The live SSE emit and the durable write are independent: a store failure is
+/// logged but never blocks the bus emit, so a transient DB hiccup can't stall the
+/// live feed the rail subscribers depend on. Persistence is opt-in via
+/// [`BusSink::with_persistence`] so the demo path records a transcript while the
+/// `place_call` lifecycle (which mints its own room separately) can use a
+/// bus-only sink.
 struct BusSink {
     events: EventBus,
+    /// When set, call events are mirrored into this durable room store under
+    /// [`Self::room_key`]. `None` = bus-only (no persistence).
+    rooms: Option<RoomStoreHandle>,
+    /// The persistent room key (`call:<uuid>`) the transcript lands under. Filled
+    /// from the first `CallStarted.room_id` so the sink writes to the same room the
+    /// orchestrator announced. Empty until the call starts.
+    room_key: String,
+}
+
+impl BusSink {
+    /// A bus-only sink: forwards events onto the SSE rail, no persistence. Today
+    /// only the tests exercise this (the live `place_call` path emits directly on
+    /// `state.events`), so it's gated to test builds to keep the release binary
+    /// warning-free; lift the gate when a production caller needs a non-persisting
+    /// call sink.
+    #[cfg(test)]
+    fn bus_only(events: EventBus) -> Self {
+        Self {
+            events,
+            rooms: None,
+            room_key: String::new(),
+        }
+    }
+
+    /// A sink that ALSO persists the call transcript into `rooms` (OCEAN-170).
+    fn with_persistence(events: EventBus, rooms: RoomStoreHandle) -> Self {
+        Self {
+            events,
+            rooms: Some(rooms),
+            room_key: String::new(),
+        }
+    }
+
+    /// Mirror a call event into the durable room store, if persistence is on.
+    /// Best-effort: every failure is logged and swallowed so the live SSE emit is
+    /// never blocked by the DB. Maps the call lifecycle onto room operations:
+    ///   - `CallStarted`            → create the `call:<uuid>` room (key = room_id)
+    ///   - `CallTranscriptSegment`  → append FINAL segments as chat messages
+    ///                                 (author_id = speaker); interim segments are
+    ///                                 skipped to avoid duplicate/revised noise
+    ///   - `CallSummaryUpdated`     → append the rolling summary as a System message
+    ///   - `CallEnded`              → close the room (freezes the transcript)
+    fn persist(&mut self, event: &ocean_core::OceanEvent) {
+        use ocean_core::OceanEvent::*;
+        let Some(rooms) = self.rooms.clone() else {
+            return;
+        };
+        let now = Utc::now();
+        match event {
+            CallStarted { room_id, .. } => {
+                // Remember which room this call's transcript belongs to, then
+                // create it. The orchestrator announces the room_id here; we mint
+                // the durable Room under the same key so a later GET on
+                // /v1/rooms/persistent/{room_id}/transcript reads it back.
+                self.room_key = room_id.clone();
+                let key = RoomKey::new(room_id.as_str());
+                let res = with_rooms_handle(&rooms, |store| {
+                    store.create(key, "Call transcript", None, now)
+                });
+                match res {
+                    Ok(_) => {}
+                    // A re-announced room (e.g. a webhook JoinCall after the demo
+                    // already created it) is not an error for us — the transcript
+                    // just keeps appending to the existing room.
+                    Err(ocean_store::RoomStoreError::AlreadyExists(_)) => {}
+                    Err(e) => tracing::warn!(room = %room_id, error = %e,
+                        "call-transcript: failed to create persistent room"),
+                }
+            }
+            CallTranscriptSegment {
+                speaker,
+                text,
+                is_final,
+                ..
+            } => {
+                // FINAL segments only: interim segments get revised by streaming
+                // STT, so persisting them would write duplicate/contradictory rows.
+                if !*is_final || self.room_key.is_empty() {
+                    return;
+                }
+                let key = RoomKey::new(self.room_key.as_str());
+                let res = with_rooms_handle(&rooms, |store| {
+                    store.append_message(
+                        &key,
+                        speaker,
+                        RoomParticipantKind::Human,
+                        RoomMessageKind::Message,
+                        text,
+                        now,
+                    )
+                });
+                if let Err(e) = res {
+                    tracing::warn!(room = %self.room_key, error = %e,
+                        "call-transcript: failed to append transcript segment");
+                }
+            }
+            CallSummaryUpdated { summary, .. } => {
+                if self.room_key.is_empty() {
+                    return;
+                }
+                let key = RoomKey::new(self.room_key.as_str());
+                let res = with_rooms_handle(&rooms, |store| {
+                    store.append_message(
+                        &key,
+                        "ocean",
+                        RoomParticipantKind::System,
+                        RoomMessageKind::System,
+                        summary,
+                        now,
+                    )
+                });
+                if let Err(e) = res {
+                    tracing::warn!(room = %self.room_key, error = %e,
+                        "call-transcript: failed to append summary");
+                }
+            }
+            CallEnded { .. } => {
+                if self.room_key.is_empty() {
+                    return;
+                }
+                let key = RoomKey::new(self.room_key.as_str());
+                let res = with_rooms_handle(&rooms, |store| store.close(&key));
+                if let Err(e) = res {
+                    tracing::warn!(room = %self.room_key, error = %e,
+                        "call-transcript: failed to close room on call end");
+                }
+            }
+            // Wake/spoke/task events are live-only signals, not transcript content.
+            _ => {}
+        }
+    }
 }
 
 impl ocean_call::EventSink for BusSink {
     fn emit(&mut self, event: ocean_core::OceanEvent) {
+        // Persist first (best-effort), then publish to the live rail. Ordering is
+        // immaterial to correctness — the two paths are independent — but writing
+        // before emit means a subscriber that immediately reads back the transcript
+        // sees the row that triggered its notification.
+        self.persist(&event);
         self.events.emit(ocean_core::EventEnvelope::new(event));
     }
+}
+
+/// Run a closure with a locked room store behind a [`RoomStoreHandle`], recovering
+/// a poisoned lock the same way [`with_rooms`] does. Synchronous: the guard is
+/// dropped before this returns, so no `await` is ever held across the lock. Takes
+/// the handle directly (rather than `&AppState`) so the call sink — which only
+/// holds the `rooms` handle, not the whole state — can write through.
+fn with_rooms_handle<T>(
+    rooms: &RoomStoreHandle,
+    f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T,
+) -> T {
+    let mut guard = match rooms.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut guard)
 }
 
 /// Demo: run the ocean-call orchestrator over a scripted transcript and emit
@@ -1910,9 +2071,15 @@ impl ocean_call::EventSink for BusSink {
 async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
     use ocean_call::{CallSession, Summarizer, SummaryPolicy, TranscriptSegment, WakeGate};
 
-    let mut sink = BusSink {
-        events: state.events.clone(),
-    };
+    // Mint a unique `call:<uuid>` room so each demo run produces a fresh,
+    // independently-queryable transcript (a fixed key would collide on the second
+    // run). The same key is announced via CallStarted and returned below so the
+    // caller can read it back at GET /v1/rooms/persistent/{room}/transcript.
+    let room = format!("call:{}", Uuid::new_v4());
+    // Persistence-enabled sink: events both stream onto the SSE rail AND land in
+    // the durable room store (OCEAN-170), so the demo transcript survives a
+    // restart with no LiveKit/Twilio account in the loop.
+    let mut sink = BusSink::with_persistence(state.events.clone(), state.rooms.clone());
     let mut session = CallSession::new(
         format!("demo-{}", Uuid::new_v4()),
         Summarizer::new(SummaryPolicy {
@@ -1922,7 +2089,7 @@ async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
         WakeGate::new(false, 2_000),
     );
 
-    session.start(&mut sink, "call:demo", vec!["sip:+17035081859".into()]);
+    session.start(&mut sink, &room, vec!["sip:+17035081859".into()]);
     let script = [
         ("caller", "hey thanks for jumping on", 0u64),
         ("caller", "so for the Warner Q3 push", 2_000),
@@ -1935,7 +2102,12 @@ async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
     }
     session.end(&mut sink, 12_000);
 
-    Json(json!({ "ok": true, "streaming_on": "/v1/events" }))
+    Json(json!({
+        "ok": true,
+        "room": room,
+        "streaming_on": "/v1/events",
+        "transcript_at": format!("/v1/rooms/persistent/{room}/transcript"),
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -2789,13 +2961,38 @@ struct TranscriptQuery {
 
 /// `GET /v1/rooms/persistent/{key}/transcript` — read a room's transcript,
 /// optionally only entries after a given seq.
+///
+/// Falls back to the audit (soft-closed) view when the room is closed: a finished
+/// call closes its room on `CallEnded` (OCEAN-170), but its transcript must stay
+/// queryable afterwards — that frozen record is the whole reason it was persisted.
+/// The `after_seq` tail filter is applied in-handler for that fallback path since
+/// the audit getter returns the full transcript.
 async fn room_transcript(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Query(q): Query<TranscriptQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
-    match with_rooms(&state, |reg| reg.transcript(&key, q.after_seq)) {
+    let result = with_rooms(&state, |reg| match reg.transcript(&key, q.after_seq) {
+        // Open room (the live case): serve it directly.
+        Ok(transcript) => Ok(transcript),
+        // Closed room: a finished call's frozen transcript. Read the audit view
+        // and apply the same `after_seq` tail filter the open path would.
+        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+            match reg.get_including_closed(&key) {
+                Ok(Some(rec)) => Ok(rec
+                    .transcript
+                    .into_iter()
+                    .filter(|m| q.after_seq.map_or(true, |after| m.seq > after))
+                    .collect()),
+                // Genuinely no such room (never created): preserve the 404.
+                Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    });
+    match result {
         Ok(transcript) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "transcript": transcript })),
@@ -6343,6 +6540,182 @@ mod tests {
         // And it shows up in the list view after the reopen.
         let listed = store.list().unwrap();
         assert!(listed.iter().any(|r| r.id == key));
+    }
+
+    // ---- OCEAN-170: call transcripts persisted to a room --------------------
+
+    /// Build a `RoomStoreHandle` over a temp-file SQLite store, matching the
+    /// daemon's `Arc<Mutex<SqliteRoomStore>>` so the call sink can write through.
+    fn room_handle(path: &std::path::Path) -> RoomStoreHandle {
+        Arc::new(Mutex::new(
+            ocean_store::SqliteRoomStore::open(path).unwrap(),
+        ))
+    }
+
+    /// Drives the SAME orchestrator script `call_demo` runs (CallStarted →
+    /// final transcript segments → CallSummaryUpdated → CallEnded) through a
+    /// persistence-enabled `BusSink`, then asserts the transcript rows landed in
+    /// the store, survive a reopen (daemon restart), and read back via the audit
+    /// view the `/transcript` endpoint falls back to once the call closes the
+    /// room. This is the end-to-end OCEAN-170 path with NO LiveKit/Twilio in the
+    /// loop — exactly the demo's guarantee.
+    #[test]
+    fn call_demo_script_persists_transcript_to_a_room() {
+        use ocean_call::{CallSession, Summarizer, SummaryPolicy, TranscriptSegment, WakeGate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("rooms.db");
+        let rooms = room_handle(&db_path);
+        let room = format!("call:{}", Uuid::new_v4());
+
+        // A persisting sink over a real EventBus (events also fan out live; we
+        // only assert on the durable side here).
+        let mut sink = BusSink::with_persistence(EventBus::new(8), rooms.clone());
+        let mut session = CallSession::new(
+            "demo-test",
+            Summarizer::new(SummaryPolicy {
+                every_n_segments: 3,
+                silence_ms: 15_000,
+            }),
+            WakeGate::new(false, 2_000),
+        );
+
+        // Same shape as call_demo: 5 final segments; the summarizer fires once at
+        // the 3rd final segment (every_n_segments = 3).
+        session.start(&mut sink, &room, vec!["sip:+17035081859".into()]);
+        let script = [
+            ("caller", "hey thanks for jumping on", 0u64),
+            ("caller", "so for the Warner Q3 push", 2_000),
+            ("caller", "I'll send the master to Atlantic tonight", 4_000),
+            ("caller", "and we need to verify the toll-free number by Friday", 7_000),
+            ("caller", "hey Ocean what did we just agree to", 10_000),
+        ];
+        for (speaker, text, ms) in script {
+            session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+        }
+        session.end(&mut sink, 12_000);
+
+        // Drop the live store handle to simulate a daemon restart, then reopen the
+        // same DB file: the transcript must survive (the whole point of OCEAN-170).
+        drop(sink);
+        drop(rooms);
+        let key = RoomKey::new(room.as_str());
+        let store = ocean_store::SqliteRoomStore::open(&db_path).unwrap();
+
+        // The room closed on CallEnded, so it's a soft-closed audit record now —
+        // hidden from the open view, recoverable for the transcript.
+        assert!(
+            store.get(&key).unwrap().is_none(),
+            "room must be soft-closed after CallEnded"
+        );
+        let rec = store
+            .get_including_closed(&key)
+            .unwrap()
+            .expect("closed call room must survive the restart");
+
+        // Every FINAL caller segment is a Human Message authored by the speaker.
+        let caller_msgs: Vec<_> = rec
+            .transcript
+            .iter()
+            .filter(|m| {
+                m.kind == RoomMessageKind::Message
+                    && m.author_kind == RoomParticipantKind::Human
+            })
+            .collect();
+        assert_eq!(
+            caller_msgs.len(),
+            script.len(),
+            "every final transcript segment must be persisted as a message"
+        );
+        assert!(caller_msgs.iter().all(|m| m.author_id == "caller"));
+        assert_eq!(caller_msgs[0].body, "hey thanks for jumping on");
+        assert_eq!(
+            caller_msgs.last().unwrap().body,
+            "hey Ocean what did we just agree to"
+        );
+
+        // The rolling summary landed as a System-kind message (author "ocean").
+        let summaries: Vec<_> = rec
+            .transcript
+            .iter()
+            .filter(|m| m.kind == RoomMessageKind::System)
+            .collect();
+        assert!(
+            !summaries.is_empty(),
+            "CallSummaryUpdated must be persisted as a System message"
+        );
+        assert!(summaries.iter().all(|m| m.author_kind == RoomParticipantKind::System));
+
+        // Interim segments are never persisted — assert no row duplicates a body
+        // (the assembler emits an interim+final pair per utterance; only finals
+        // are written, so each body appears exactly once).
+        for (_, text, _) in script {
+            let hits = rec.transcript.iter().filter(|m| m.body == text).count();
+            assert_eq!(hits, 1, "interim segments must not double-write '{text}'");
+        }
+    }
+
+    /// The transcript HTTP handler's fallback contract in isolation: once a call
+    /// closes its room, `transcript()` returns `UnknownRoom`, but the audit
+    /// (`get_including_closed`) view still yields the frozen rows. This pins the
+    /// behaviour `room_transcript` relies on so a closed call transcript stays
+    /// queryable instead of 404ing.
+    #[test]
+    fn closed_call_room_transcript_is_still_readable_via_audit_view() {
+        use ocean_store::{RoomStore, RoomStoreError, SqliteRoomStore};
+        let mut store = SqliteRoomStore::open_in_memory().unwrap();
+        let key = RoomKey::new("call:abc");
+        store
+            .create(key.clone(), "Call transcript", None, Utc::now())
+            .unwrap();
+        store
+            .append_message(
+                &key,
+                "caller",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "we agreed to ship Friday",
+                Utc::now(),
+            )
+            .unwrap();
+        store.close(&key).unwrap();
+
+        // Open-view read now fails (room is closed)...
+        assert!(matches!(
+            store.transcript(&key, None),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        // ...but the audit view the handler falls back to still has the row.
+        let rec = store.get_including_closed(&key).unwrap().unwrap();
+        assert_eq!(rec.transcript.len(), 1);
+        assert_eq!(rec.transcript[0].body, "we agreed to ship Friday");
+    }
+
+    /// A bus-only sink (no room store) must never touch persistence: it forwards
+    /// events to the SSE rail and nothing else. Guards against a regression where
+    /// the place_call lifecycle's sink accidentally starts writing rooms.
+    #[test]
+    fn bus_only_sink_does_not_persist() {
+        use ocean_call::EventSink;
+        let mut sink = BusSink::bus_only(EventBus::new(8));
+        // Emitting a full call lifecycle must be a no-op on the (absent) store and
+        // must not panic — room_key stays empty, rooms is None.
+        sink.emit(ocean_core::OceanEvent::CallStarted {
+            call_id: "c".into(),
+            room_id: "call:x".into(),
+            participants: vec![],
+        });
+        sink.emit(ocean_core::OceanEvent::CallTranscriptSegment {
+            speaker: "caller".into(),
+            text: "hi".into(),
+            start_ms: 0,
+            is_final: true,
+        });
+        sink.emit(ocean_core::OceanEvent::CallEnded {
+            call_id: "c".into(),
+            duration_ms: 1,
+        });
+        assert!(sink.rooms.is_none());
     }
 
     #[test]
