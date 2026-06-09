@@ -998,6 +998,84 @@ pub fn claim_outcome_persisted(
     Ok(released)
 }
 
+/// The **fully daemon-held** `claim_outcome` — the variant that needs *no live
+/// [`QuorumEngine`]* at all, only the persisted registry.
+///
+/// [`claim_outcome_persisted`] still takes a `&mut QuorumEngine` for boundary 2,
+/// which works when the claim happens in the *same* turn the council ran (the
+/// engine is still on the stack). But the load-bearing OCEAN-272 property is a
+/// claim posted in a **later** turn (`POST /v1/longhouse/claim`), after the
+/// `convene()` future — and its engine — are long gone. There is no engine to
+/// pass. This function is that path: it satisfies **both** boundaries from
+/// durable state.
+///
+/// 1. **Persisted identity + not revoked (OCEAN-246 / 229).** Identical to
+///    [`claim_outcome_persisted`]: [`SqliteTitleRegistry::verify_title`] checks
+///    the presented `(agent_id, token)` against the stored verifier in constant
+///    time **and** requires the title to still be `Live`. A revoked or released
+///    title fails here even with the correct token. Checked **first**, so a
+///    forged/revoked caller learns nothing about the decision.
+/// 2. **Decision agreement, from the durable record (the original brake,
+///    persisted).** When the council converged, the daemon bound the title to the
+///    engine's decision via [`SqliteTitleRegistry::bind_decision`]. That bound
+///    `decision` *is* the latched verdict the live engine would have reported —
+///    persisted, so it survives the turn. A firekeeper may only ratify exactly
+///    that proposal:
+///      * title not yet bound to any decision → [`ClaimError::NotConverged`]
+///        (the council never reached a binding outcome for this title);
+///      * bound to a *different* proposal than `claimed` →
+///        [`ClaimError::WrongDecision`].
+///    The firekeeper still cannot manufacture a decision: it can only sign the
+///    one the daemon already recorded as converged. The brake is preserved; only
+///    its *source* moved from the in-memory engine to the durable column.
+///
+/// On success the title is **released** (its convening is closing) and the
+/// validator escrow for the topic is released. Like [`claim_outcome_persisted`],
+/// a storage error on the release does not retroactively un-authorize a claim
+/// that already cleared both boundaries.
+///
+/// Returns the number of validator stakes released on success.
+pub fn claim_bound_outcome(
+    registry: &mut SqliteTitleRegistry,
+    title_id: Uuid,
+    agent_id: Uuid,
+    presented_token: Option<&str>,
+    claimed: Uuid,
+    now_ms: i64,
+) -> std::result::Result<usize, ClaimError> {
+    // Boundary 1 — persisted identity + liveness (rejects revoked/released),
+    // constant-time. Checked FIRST so a forged/revoked claim leaks no decision
+    // state (it cannot tell "wrong token" from "wrong decision").
+    registry.verify_title(title_id, agent_id, presented_token)?;
+
+    // Boundary 2 — ratify only the decision the daemon durably bound at
+    // convergence. The title is Live here (boundary 1 passed), so this re-reads
+    // it for its bound `decision`.
+    let title = registry
+        .lookup(title_id)
+        .ok()
+        .flatten()
+        .ok_or(ClaimError::ForgedFirekeeper)?;
+    match title.decision {
+        // Never bound → the council never reached a binding outcome for this
+        // title. A premature claim lands here, exactly like the engine's Pending.
+        None => return Err(ClaimError::NotConverged),
+        Some(engine_decision) if engine_decision != claimed => {
+            return Err(ClaimError::WrongDecision {
+                engine_decision,
+                claimed,
+            });
+        }
+        Some(_) => {}
+    }
+
+    // Authorized + ratified: close the title and release the topic's escrow.
+    let topic_id = title.topic_id;
+    let _ = registry.release(title_id, now_ms);
+    let released = registry.release_stakes(topic_id, now_ms).unwrap_or(0);
+    Ok(released)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1530,6 +1608,146 @@ mod tests {
         assert_eq!(
             reg.verify_title(uid(123), uid(10), Some("whatever")),
             Err(ClaimError::ForgedFirekeeper)
+        );
+    }
+
+    // ---- claim_bound_outcome: the engine-free, cross-turn daemon claim --------
+    //
+    // This is the OCEAN-272 path: a firekeeper ratifies in a LATER turn, when the
+    // council's QuorumEngine is gone. Boundary 2 is satisfied from the title's
+    // durable bound `decision` (set by bind_decision at convergence) instead of a
+    // live engine. The identity/revocation/leak properties must match
+    // claim_outcome_persisted exactly.
+
+    // THE CORE CROSS-TURN PROPERTY: grant + bind in "turn 1" (then drop the whole
+    // registry process), reopen the SAME db in "turn 2", and the persisted bound
+    // title authorizes a claim with no engine in sight.
+    #[test]
+    fn bound_claim_succeeds_across_a_reopen_with_no_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("titles.db");
+        let topic = uid(1);
+        let agent = uid(10);
+        let decision = uid(2);
+
+        // Turn 1: grant, stake escrow, bind the title to the converged decision.
+        let (title_id, token) = {
+            let mut reg = SqliteTitleRegistry::open(&path).unwrap();
+            let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            reg.stake(topic, uid(20), 100, 0).unwrap();
+            reg.bind_decision(p.title_id, decision).unwrap();
+            (p.title_id, secret.token().to_string())
+        };
+
+        // Turn 2 (fresh process, NO engine): the persisted bound title ratifies.
+        let mut reg = SqliteTitleRegistry::open(&path).unwrap();
+        let released =
+            claim_bound_outcome(&mut reg, title_id, agent, Some(&token), decision, 1)
+                .expect("legit cross-turn claim succeeds against the persisted bound title");
+        assert_eq!(released, 1, "the topic's one validator stake is released");
+        // The title is now released (its convening closed) and cannot re-claim.
+        assert_eq!(
+            reg.lookup(title_id).unwrap().unwrap().status,
+            TitleStatus::Released
+        );
+        assert_eq!(
+            claim_bound_outcome(&mut reg, title_id, agent, Some(&token), decision, 2),
+            Err(ClaimError::ForgedFirekeeper),
+            "a released title cannot be claimed again"
+        );
+    }
+
+    // A forged claim (no token) against a bound title is refused — and refused as
+    // ForgedFirekeeper, NOT WrongDecision/NotConverged, so the decision never
+    // leaks to an unauthorized caller (identity checked first).
+    #[test]
+    fn bound_claim_rejects_forged_no_token_without_leaking_decision() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let (p, _secret) = reg.grant(uid(1), uid(10), AgentRole::Firekeeper, 0).unwrap();
+        reg.bind_decision(p.title_id, uid(2)).unwrap();
+        assert_eq!(
+            claim_bound_outcome(&mut reg, p.title_id, uid(10), None, uid(2), 0),
+            Err(ClaimError::ForgedFirekeeper)
+        );
+    }
+
+    // A REVOKED title is refused even with the correct token and the correct
+    // bound decision — the load-bearing revocation property, on the engine-free
+    // path.
+    #[test]
+    fn bound_claim_rejects_revoked_title_even_with_right_token() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let topic = uid(1);
+        let agent = uid(10);
+        let decision = uid(2);
+        let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+        reg.bind_decision(p.title_id, decision).unwrap();
+
+        // Sanity: the correct token + decision authorizes BEFORE revocation
+        // (proving the rejection below is caused by revocation, not a bad token).
+        assert_eq!(
+            reg.verify_title(p.title_id, agent, Some(secret.token())),
+            Ok(())
+        );
+
+        let revoker = Revoker::new();
+        revoker
+            .revoke(
+                &mut reg,
+                Some(revoker.key().secret()),
+                p.title_id,
+                RevokeAuthorization::PolicyBreach {
+                    detail: "captured firekeeper".into(),
+                },
+                5,
+            )
+            .expect("authorized revoke");
+
+        assert_eq!(
+            claim_bound_outcome(&mut reg, p.title_id, agent, Some(secret.token()), decision, 6),
+            Err(ClaimError::ForgedFirekeeper),
+            "a revoked title must be rejected even with the right token + decision"
+        );
+    }
+
+    // The firekeeper may only sign the bound decision: claiming a different
+    // proposal is WrongDecision, and the title stays live to retry.
+    #[test]
+    fn bound_claim_rejects_wrong_decision_and_keeps_title_live() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let agent = uid(10);
+        let (bound, other) = (uid(2), uid(3));
+        let (p, secret) = reg.grant(uid(1), agent, AgentRole::Firekeeper, 0).unwrap();
+        reg.bind_decision(p.title_id, bound).unwrap();
+        assert_eq!(
+            claim_bound_outcome(&mut reg, p.title_id, agent, Some(secret.token()), other, 0),
+            Err(ClaimError::WrongDecision {
+                engine_decision: bound,
+                claimed: other,
+            })
+        );
+        assert_eq!(
+            reg.lookup(p.title_id).unwrap().unwrap().status,
+            TitleStatus::Live,
+            "a wrong-decision claim must not close the title"
+        );
+    }
+
+    // An unbound title (council never reached a binding outcome) → NotConverged,
+    // even with the correct token. A premature claim cannot ratify.
+    #[test]
+    fn bound_claim_rejects_unbound_title_as_not_converged() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let agent = uid(10);
+        let (p, secret) = reg.grant(uid(1), agent, AgentRole::Firekeeper, 0).unwrap();
+        // No bind_decision → decision is None.
+        assert_eq!(
+            claim_bound_outcome(&mut reg, p.title_id, agent, Some(secret.token()), uid(2), 0),
+            Err(ClaimError::NotConverged)
+        );
+        assert_eq!(
+            reg.lookup(p.title_id).unwrap().unwrap().status,
+            TitleStatus::Live
         );
     }
 }

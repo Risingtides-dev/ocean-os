@@ -54,9 +54,9 @@ pub use convene::{
     convene,
 };
 pub use escrow::{
-    claim_outcome_persisted, EscrowError, EscrowState, PersistedTitle, Revocation,
-    RevokeAuthorization, RevokeError, Revoker, RevokerKey, SqliteTitleRegistry, TitleStatus,
-    TitleVerifier,
+    claim_bound_outcome, claim_outcome_persisted, EscrowError, EscrowState, PersistedTitle,
+    Revocation, RevokeAuthorization, RevokeError, Revoker, RevokerKey, SqliteTitleRegistry,
+    TitleStatus, TitleVerifier,
 };
 pub use quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
 pub use registry::{LonghouseRegistry, TopicSnapshot, TopicState};
