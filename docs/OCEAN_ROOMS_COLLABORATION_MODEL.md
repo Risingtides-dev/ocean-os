@@ -356,35 +356,79 @@ empty. Both endpoints fall back to the soft-closed audit view, so a finished
 call's frozen room stays hydratable. Two-step: snapshot first, then live tail.
 Client guards against stale loads via a requested-vs-current room check.
 
-### Planned: Track-0 projection snapshot
+### Shipped: Track-0 projection snapshot (OCEAN-256)
 
 The richer projection rooms (`pm` / `writers` / `orch_mesh` / `review`, served by
 `GET /v1/rooms/{room_id}`) are computed from live runtime state rather than the
-store. A hydration snapshot for them that also carries per-room **turns**,
-rendered **components**, and the **active_turn** is **planned — not yet
-implemented**; that data is not persisted per room yet. The intended shape:
+store. Their hydration snapshot now ships, **backed by real tracked state** — not
+fabricated. Because Track-0 rooms are role *lenses* over the same global runtime
+state (not workspace-partitioned rooms with private transcripts), the projection
+reshapes that shared state per room rather than reading a per-room store:
 
 ```http
-GET /v1/rooms/{room_id}/snapshot   # (planned — not yet implemented)
+GET /v1/rooms/{room_id}/snapshot
 ```
 
 ```json
 {
-  "room": { "id": "...", "name": "...", "workspace": "..." },
-  "messages": [...],
-  "turns": [...],
-  "components": [...],
-  "participants": [...],
-  "active_turn": null,
-  "last_seq": 1842
+  "ok": true,
+  "room": {
+    "room_id": "pm",
+    "title": "PM",
+    "summary": "...",
+    "status": "ocean-native · anthropic · claude-… · ready",
+    "updated_ms": 1717900000000,
+    "messages": [
+      { "seq": 1, "at": "...", "session_id": "...", "request_id": "...", "summary": "… · tool start: read" }
+    ],
+    "turns": [
+      { "turn_id": "…", "session_id": "…", "state": "running", "active": true,
+        "message": "…", "started_at": "…", "updated_at": "…", "finished_at": null }
+    ],
+    "components": [],
+    "participants": [],
+    "active_turn": { "turn_id": "…", "state": "running", "active": true, "…": "…" },
+    "last_seq": 17,
+    "projection": {
+      "real": ["turns", "active_turn", "messages", "last_seq", "status"],
+      "planned": ["components", "participants"]
+    }
+  }
 }
 ```
 
+Field provenance is **honest and self-describing** via the `projection` block:
+
+- **`turns`** (REAL) — derived from the daemon's tracked request registry; a turn
+  *is* a request in the daemon's model, with `active` = not-yet-terminal.
+- **`active_turn`** (REAL) — the most-recently-active non-terminal turn, or `null`
+  when the room is idle.
+- **`messages`** (REAL) — the recent runtime **event** ring reshaped per room
+  (user/assistant/tool/permission/turn lines), each carrying its originating
+  session/request and a monotonic `seq`. Track-0 rooms have no separate chat
+  transcript, so the event feed *is* their message stream.
+- **`last_seq`** / **`status`** (REAL) — tail cursor and runtime status line.
+- **`components`** (PLANNED) — always `[]`. No per-room component/canvas ledger is
+  persisted yet; `SurfacePatch` events are bus-relayed, not stored room-keyed.
+- **`participants`** (PLANNED) — always `[]`. A persisted roster is a *persistent*-
+  room concept (`GET /v1/rooms/persistent/{key}/snapshot`); Track-0 rooms carry
+  none.
+
+The live tail mirrors the persistent-room contract — return only the projected
+messages newer than `after_seq`:
+
 ```http
-GET /v1/rooms/{room_id}/events?after_seq=1842   # (planned — not yet implemented)
+GET /v1/rooms/{room_id}/events?after_seq=1842
 ```
 
-Until then, use the shipped persistent-room hydration above.
+```json
+{ "ok": true, "events": [...], "last_seq": 1850 }
+```
+
+An unknown room id (anything outside the four Track-0 rooms) is `404` on both
+endpoints — the set is closed, so an unrecognized id is a missing resource. For
+dynamically-created rooms with a persisted transcript, use the persistent-room
+hydration above instead.
 
 Client guards against stale loads via requested-vs-current room check.
 
