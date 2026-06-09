@@ -513,18 +513,19 @@ pub struct RoomProjectedMessage {
 /// Provenance of each field in a [`RoomProjection`] (OCEAN-256).
 ///
 /// The Track-0 projection is computed from whatever runtime state the daemon
-/// actually tracks. Some of the collaboration-model's intended fields have no
-/// backing source yet (there is no per-room component/canvas ledger, and Track-0
-/// rooms carry no persisted roster — that is a *persistent* room concept). Rather
-/// than fabricate those fields, the projection ships them empty and reports here,
-/// honestly, which fields are backed by real state and which are still planned.
+/// actually tracks. Rather than fabricate a field whose source does not exist, the
+/// projection reports here, honestly, which fields are backed by real state and
+/// which are still planned. As of OCEAN-277 `components` and `participants` are
+/// backed by a real per-room ledger (see [`RoomProjection`]), so the `planned` set
+/// is empty for the structured snapshot today — but the field stays in the wire
+/// contract so a future field added without a source is still reported honestly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomProjectionProvenance {
     /// Fields computed from real tracked state, e.g. `["turns", "active_turn",
-    /// "messages", "last_seq"]`.
+    /// "messages", "last_seq", "components", "participants"]`.
     pub real: Vec<String>,
-    /// Fields whose backing source does not exist yet, e.g. `["components",
-    /// "participants"]`. Always emitted empty in the payload.
+    /// Fields whose backing source does not exist yet. Empty for the structured
+    /// snapshot as of OCEAN-277; a field listed here is always emitted empty.
     pub planned: Vec<String>,
 }
 
@@ -545,12 +546,22 @@ pub struct RoomProjection {
     /// Per-room turn history derived from tracked requests (REAL).
     #[serde(default)]
     pub turns: Vec<RoomTurn>,
-    /// Rendered components for this room (PLANNED — no per-room component/canvas
-    /// ledger is persisted yet; always empty today).
+    /// Rendered components for this room (REAL as of OCEAN-277). Folded by the
+    /// daemon from the surface patches emitted by *room-bound* turns (turns
+    /// submitted with this `room_id`): each `upsert/move/resize/delete` op updates
+    /// a live per-`(canvas, component)` snapshot, projected here oldest-first. Each
+    /// row is a JSON object — `canvas_id`, `component_id`, `kind`, optional
+    /// `rect`/`z_index`/`content`/`metadata`, and `updated_at`. Honestly empty when
+    /// the room has had no surface-patch activity (and note a turn carrying no
+    /// `room_id` is bound to no Track-0 room, so its patches appear in none). This
+    /// is a live projection mirror, not the canvas's source of truth (OCEAN-258).
     #[serde(default)]
     pub components: Vec<serde_json::Value>,
-    /// Room roster (PLANNED — Track-0 rooms carry no persisted roster; that is a
-    /// persistent-room concept. Always empty today).
+    /// Room roster (REAL as of OCEAN-277): the sessions that have run a room-bound
+    /// turn here — i.e. the agents/operators actually active in this room's domain,
+    /// derived from turn binding rather than a configured/persisted roster. Each
+    /// row is `{ "kind": "session", "session_id", "last_seen" }`, oldest-first.
+    /// Honestly empty when no turn has been bound to this room.
     #[serde(default)]
     pub participants: Vec<serde_json::Value>,
     /// The single live turn for this room, or `null` when the room is idle (REAL).
