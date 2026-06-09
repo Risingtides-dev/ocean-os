@@ -6667,13 +6667,12 @@ async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_lo
 // event, round-trips the op to the real Slack Canvas API, and POSTs the fulfilled
 // result back here as `{session_id, op, result}`.
 //
-// DELIVERY SEMANTICS (why this shape, given the runtime can't reach AppState):
-// the `slack_canvas` runtime tool is a stateless unit struct in the separate
-// `ocean-runtime` crate (built via `default_tools()`); it holds no handle to this
-// daemon's `AppState`, so it CANNOT itself check a fulfillment store on a later
-// `read`. Threading daemon state into the runtime crate would invert the layering
-// (runtime is a dependency of the daemon, not vice-versa). So fulfillment is
-// delivered the two ways that don't require that inversion:
+// DELIVERY SEMANTICS (why this shape): the `slack_canvas` runtime tool lives in
+// the separate `ocean-runtime` crate (built via `default_tools()`) and holds no
+// handle to this daemon's `AppState` — and threading daemon state INTO the runtime
+// crate would invert the layering (runtime is a dependency of the daemon, not
+// vice-versa). So a fulfillment is delivered the three ways that respect that
+// one-way dependency:
 //
 //   1. STORE + QUERY — the result is stored in `AppState.canvas_fulfillments`
 //      keyed by `(session_id, canvas key)` and is queryable via
@@ -6686,6 +6685,16 @@ async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_lo
 //      pending event the loop opened with: it goes back out on the very channel the
 //      agent's clients already watch, so the canvas resolves pending → fulfilled in
 //      real time without the runtime tool needing daemon state.
+//
+//   3. RUNTIME LOOKUP REGISTRY (OCEAN-271) — the same fulfilled result is fed into
+//      the process-global `ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY`,
+//      a store *owned by the runtime crate* that the `slack_canvas` tool reads on a
+//      later `read`/`list`. The daemon (which already depends on the runtime)
+//      supplies the impl — the normal direction, no inversion — mirroring how
+//      `component_wait` shares `COMPONENT_WAIT_REGISTRY` with the daemon's
+//      `/v1/component/event` route. This is what makes a *second* `read` of the same
+//      canvas return the bridge's fetched content instead of `pending_bridge`,
+//      closing the loop end-to-end.
 // ---------------------------------------------------------------------------
 
 /// The store key for a fulfilled `slack_canvas` op (OCEAN-262). `read`/`update`/
@@ -6858,6 +6867,11 @@ async fn canvas_fulfillment_post(
     };
 
     let canvas_key = canvas_fulfillment_key_for_op(&op);
+    // Normalized session-id string, formatted identically to the `session_id` the
+    // runtime injects into `SessionContext` (both `AgentSessionId::to_string()`),
+    // so the runtime registry key (OCEAN-271) matches what the `slack_canvas` tool
+    // computes — independent of however the bridge formatted the raw `session_id`.
+    let session_key = session_id.to_string();
 
     // 1. STORE (last-write-wins per (session, canvas key)).
     {
@@ -6876,6 +6890,20 @@ async fn canvas_fulfillment_post(
 
     // 2. SSE RE-EMIT — fulfilled result back to the originating session.
     let fulfilled = fulfilled_result_from_bridge(&op, &result);
+
+    // 2b. RUNTIME LOOKUP STORE (OCEAN-271) — feed the same typed fulfilled result
+    // into the process-global `CANVAS_FULFILLMENT_REGISTRY` owned by `ocean-runtime`
+    // (the daemon depends on the runtime, so supplying the impl is the normal
+    // direction — no layering inversion). This is what lets a *subsequent*
+    // `slack_canvas` `read`/`list` in the same session return the bridge's fetched
+    // content instead of `pending_bridge`. We store under the daemon-identical
+    // `(session_key, canvas_key)`; the tool keys its lookup the same way.
+    ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY.put(
+        session_key,
+        canvas_key.clone(),
+        fulfilled.clone(),
+    );
+
     state.agent_events.emit(AgentTurnEvent::SlackCanvas {
         session_id,
         // The fulfillment is a standalone relay, not part of a live turn; mint a
@@ -8210,6 +8238,61 @@ mod tests {
         .await;
         assert_eq!(nstatus, StatusCode::NOT_FOUND);
         assert_eq!(nresp.0["fulfilled"], false);
+    }
+
+    /// END TO END (OCEAN-271): the bridge POSTs a fulfilled `read`; the daemon
+    /// feeds it into the runtime-owned `CANVAS_FULFILLMENT_REGISTRY`; a
+    /// *subsequent* `slack_canvas` `read` by the session-bound runtime tool then
+    /// returns the REAL fetched content instead of `pending_bridge`. This is the
+    /// loop OCEAN-262 (#183) and OCEAN-235 (#15) left open — proven across the
+    /// daemon→runtime seam without any layering inversion.
+    #[tokio::test]
+    async fn fulfillment_post_makes_runtime_tool_read_return_real_content() {
+        use ocean_runtime::tools::slack_canvas::SlackCanvasTool;
+        use ocean_runtime::types::AgentTool;
+
+        let state = permission_test_state();
+        // Unique canvas id so this test never collides with another in the
+        // process-global registry.
+        let session = AgentSessionId::new_v4();
+        let canvas = "F_OCEAN271_E2E";
+
+        // Bridge fulfillment arrives at the daemon.
+        let body = json!({
+            "session_id": session.to_string(),
+            "op": { "op": "read", "canvas_id": canvas },
+            "result": {
+                "ok": true, "op": "read", "canvas_id": canvas,
+                "contents": "# Fetched body\n- from the bridge",
+                "bridged": true, "raw": { "revision": 9 }
+            }
+        });
+        let (status, _) = canvas_fulfillment_post(State(state.clone()), Json(body)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The runtime tool, bound to the SAME session the daemon used (the daemon
+        // keys the registry on `AgentSessionId::to_string()`, which is exactly
+        // what `BuiltinProvider` injects into the tool), now reads fulfilled.
+        let tool = SlackCanvasTool::for_session(Some(session.to_string()));
+        let res = tool
+            .execute("e2e-read", json!({ "op": "read", "canvas_id": canvas }))
+            .await
+            .expect("read executes");
+        assert_eq!(
+            res.details["fetch_status"], "fetched",
+            "a read after a stored fulfillment must surface fetched content: {}",
+            res.details
+        );
+        assert_eq!(res.details["bridged"], true);
+        assert_eq!(res.details["contents"], "# Fetched body\n- from the bridge");
+
+        // A different canvas in the same session is still honestly pending.
+        let pending = tool
+            .execute("e2e-read-2", json!({ "op": "read", "canvas_id": "F_NOT_FETCHED_271" }))
+            .await
+            .expect("read executes");
+        assert_eq!(pending.details["fetch_status"], "pending_bridge");
+        assert!(pending.details.get("contents").is_none());
     }
 
     /// A fulfillment for session A must not be visible when querying session B —
