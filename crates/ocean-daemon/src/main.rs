@@ -2377,16 +2377,39 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                 return;
             }
         };
-        let xai_key = match std::env::var("XAI_API_KEY") {
-            Ok(k) if !k.trim().is_empty() => k,
-            _ => {
-                tracing::info!(
-                    room = %room,
-                    "call-session task not spawned: XAI_API_KEY unset (no STT)"
-                );
-                return;
-            }
-        };
+
+        // STT provider selection (OCEAN-242): with `DEEPGRAM_API_KEY` set (and the
+        // `deepgram-stt` feature compiled) the call runs the *streaming* loop —
+        // live socket, real-time interims, barge-in onset. Otherwise it runs the
+        // verified *batch* xAI loop, which needs `XAI_API_KEY`. The active-lane TTS
+        // uses `XAI_API_KEY` in both modes (silence fallback if unset / xai-tts off).
+        let deepgram_key = std::env::var("DEEPGRAM_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty());
+        let xai_key = std::env::var("XAI_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty());
+
+        // `use_streaming` is only ever true when the streaming provider is actually
+        // compiled in; without the feature the daemon always takes the batch arm.
+        #[cfg(feature = "deepgram-stt")]
+        let use_streaming = deepgram_key.is_some();
+        #[cfg(not(feature = "deepgram-stt"))]
+        let use_streaming = false;
+        #[cfg(not(feature = "deepgram-stt"))]
+        let _ = &deepgram_key; // referenced only under the deepgram-stt arm
+
+        // STT credentials gate. Streaming is entitled by `DEEPGRAM_API_KEY`; batch
+        // by `XAI_API_KEY`. If neither path has its key, don't spawn — exactly like
+        // the dial path returning 503 when unconfigured.
+        if !use_streaming && xai_key.is_none() {
+            tracing::info!(
+                room = %room,
+                "call-session task not spawned: no STT key (set DEEPGRAM_API_KEY for \
+                 streaming STT, or XAI_API_KEY for batch STT)"
+            );
+            return;
+        }
 
         // Mint a publish-capable join token for the server tap so the active
         // lane can also speak. The passive transcript lane only needs subscribe.
@@ -2419,10 +2442,9 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
         // this is safe whether or not the room was minted elsewhere first.
         let sink = BusSink::with_persistence(state.events.clone(), state.rooms.clone());
         let runner = DaemonTurnRunner::new(state.clone(), room.to_string());
-        // The active lane speaks via xAI TTS too (same key as STT). Keep a copy
-        // before the transcriber takes ownership of the key.
-        let tts_key = xai_key.clone();
-        let transcriber = ocean_call::session_task::live::XaiTranscriber::new(xai_key);
+        // The active lane speaks via xAI TTS (silence fallback if no key / xai-tts
+        // off). Both STT modes share this — TTS is independent of the STT provider.
+        let tts_key = xai_key.clone().unwrap_or_default();
         let session = CallSession::new(
             room.to_string(),
             Summarizer::new(SummaryPolicy::default()),
@@ -2431,6 +2453,8 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
             WakeGate::new(call_voice_muted(), 2_000),
         );
         let room_owned = room.to_string();
+        // Moved into the streaming arm of the spawned task (else unused there).
+        let _ = &xai_key;
 
         tokio::spawn(async move {
             let (source, lk_room) = match LiveKitFrameSource::connect(&url, &token).await {
@@ -2446,6 +2470,59 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
             // silence fallback (the publish path still runs and CallAgentSpoke
             // still fires). See ocean_call::tts_xai.
             let voice = LiveKitVoice::new(lk_room, default_tts_synth(&tts_key));
+            let clock = || ocean_protocol::now_ms() as u64;
+
+            // --- Streaming STT path (OCEAN-242): Deepgram live socket. ---
+            #[cfg(feature = "deepgram-stt")]
+            if use_streaming {
+                use ocean_call::stt_deepgram::live::DeepgramStt;
+                use ocean_call::stt_deepgram::DeepgramConfig;
+                use ocean_call::{run_call_session_streaming, NoopActivitySink};
+                use std::sync::Arc;
+
+                // Safe: `use_streaming` is only true when `deepgram_key.is_some()`.
+                let dg_key = deepgram_key.expect("deepgram key present when streaming");
+                // Call lane audio is 16kHz mono; the provider must agree.
+                let cfg = DeepgramConfig::default();
+                let clock_arc: Arc<dyn Fn() -> u64 + Send + Sync> =
+                    Arc::new(|| ocean_protocol::now_ms() as u64);
+                let (provider, events_rx) =
+                    match DeepgramStt::connect(&cfg, &dg_key, clock_arc).await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            tracing::warn!(room = %room_owned, error = %e, "deepgram connect failed");
+                            // Close the lifecycle so no phantom in-progress call lingers.
+                            state_emit_call_ended(&sink, &room_owned);
+                            return;
+                        }
+                    };
+                tracing::info!(room = %room_owned, "call-session: streaming STT (deepgram) active");
+                run_call_session_streaming(
+                    session,
+                    source,
+                    Arc::new(provider),
+                    events_rx,
+                    runner,
+                    voice,
+                    sink,
+                    // Barge-in onset is exposed but not yet consumed — OCEAN-243
+                    // swaps this for a TTS-stop sink. Until then, drop the edges.
+                    NoopActivitySink,
+                    room_owned,
+                    participants,
+                    UtterancePolicy::default(),
+                    clock,
+                )
+                .await;
+                return;
+            }
+
+            // --- Batch STT path (default): verified xAI batch endpoint. ---
+            // `xai_key` is guaranteed present here (the gate above returned early
+            // when batch was selected without it).
+            let xai_key = xai_key.expect("xai key present when batch STT selected");
+            let transcriber = ocean_call::session_task::live::XaiTranscriber::new(xai_key);
+            tracing::info!(room = %room_owned, "call-session: batch STT (xai) active");
             run_call_session(
                 session,
                 source,
@@ -2456,7 +2533,7 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                 room_owned,
                 participants,
                 UtterancePolicy::default(),
-                || ocean_protocol::now_ms() as u64,
+                clock,
             )
             .await;
         });

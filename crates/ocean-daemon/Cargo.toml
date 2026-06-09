@@ -21,6 +21,14 @@ default = []
 # the live xAI TTS synth so the active lane speaks Ocean's reply aloud (both use
 # the same XAI_API_KEY the live tap already requires).
 livekit-tap = ["ocean-call/livekit-tap", "ocean-call/xai-stt", "ocean-call/xai-tts"]
+# Adds the Deepgram *streaming* STT provider to the live call loop (OCEAN-242):
+# when `DEEPGRAM_API_KEY` is set the daemon runs `run_call_session_streaming`
+# (live socket, real-time interims + barge-in onset) instead of the batch xAI
+# loop; without the key it still falls back to batch. Implies `livekit-tap`
+# because the streaming path reuses the same LiveKit frame source + voice. Pulls
+# the websocket stack via ocean-call's `deepgram-stt`; OPT-IN so the default and
+# `livekit-tap`-only builds pull no websocket deps.
+deepgram-stt = ["livekit-tap", "ocean-call/deepgram-stt"]
 
 [dependencies]
 anyhow.workspace = true
