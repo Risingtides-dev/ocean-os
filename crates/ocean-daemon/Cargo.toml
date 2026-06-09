@@ -17,8 +17,10 @@ default = []
 # libwebrtc via ocean-call's own `livekit-tap` feature, so it is OPT-IN — the
 # default daemon build stays fast and credential-free. The wiring
 # (`spawn_call_session`) compiles either way; only the live tap is gated.
-# `xai-stt` enables the live xAI batch transcription HTTP call.
-livekit-tap = ["ocean-call/livekit-tap", "ocean-call/xai-stt"]
+# `xai-stt` enables the live xAI batch transcription HTTP call; `xai-tts` enables
+# the live xAI TTS synth so the active lane speaks Ocean's reply aloud (both use
+# the same XAI_API_KEY the live tap already requires).
+livekit-tap = ["ocean-call/livekit-tap", "ocean-call/xai-stt", "ocean-call/xai-tts"]
 
 [dependencies]
 anyhow.workspace = true

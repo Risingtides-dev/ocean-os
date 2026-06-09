@@ -2190,7 +2190,7 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
 
     #[cfg(feature = "livekit-tap")]
     {
-        use ocean_call::session_task::live::{LiveKitFrameSource, LiveKitVoice, TtsSynth};
+        use ocean_call::session_task::live::{default_tts_synth, LiveKitFrameSource, LiveKitVoice};
         use ocean_call::{
             run_call_session, CallSession, Summarizer, SummaryPolicy, UtterancePolicy, WakeGate,
         };
@@ -2244,6 +2244,9 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
         // this is safe whether or not the room was minted elsewhere first.
         let sink = BusSink::with_persistence(state.events.clone(), state.rooms.clone());
         let runner = DaemonTurnRunner::new(state.clone(), room.to_string());
+        // The active lane speaks via xAI TTS too (same key as STT). Keep a copy
+        // before the transcriber takes ownership of the key.
+        let tts_key = xai_key.clone();
         let transcriber = ocean_call::session_task::live::XaiTranscriber::new(xai_key);
         let session = CallSession::new(
             room.to_string(),
@@ -2264,7 +2267,10 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                     return;
                 }
             };
-            let voice = LiveKitVoice::new(lk_room, NoopTts);
+            // Active-lane voice: real xAI TTS when built with `xai-tts`, else a
+            // silence fallback (the publish path still runs and CallAgentSpoke
+            // still fires). See ocean_call::tts_xai.
+            let voice = LiveKitVoice::new(lk_room, default_tts_synth(&tts_key));
             run_call_session(
                 session,
                 source,
@@ -2279,23 +2285,6 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
             )
             .await;
         });
-
-        /// Placeholder TTS until a provider is wired: logs and yields silence so
-        /// the publish path is exercised end-to-end without fabricating speech.
-        /// Swap for a real synth (xAI/ElevenLabs/Cartesia → 16kHz mono) to make
-        /// Ocean audibly answer; the rest of the active lane is already live.
-        struct NoopTts;
-        #[async_trait::async_trait]
-        impl TtsSynth for NoopTts {
-            async fn synth(&mut self, text: &str) -> anyhow::Result<ocean_call::PcmFrame> {
-                tracing::warn!(
-                    reply = %text,
-                    "call TTS synth not wired — emitting silence; CallAgentSpoke still fires"
-                );
-                // 200ms of 16kHz mono silence as a benign placeholder utterance.
-                Ok(ocean_call::PcmFrame::new(vec![0i16; 3_200], 16_000, 1))
-            }
-        }
     }
 }
 

@@ -33,6 +33,7 @@ pub mod stt_xai;
 pub mod summarizer;
 pub mod task_detector;
 pub mod token;
+pub mod tts_xai;
 pub mod wake;
 pub mod webhook;
 
@@ -47,5 +48,8 @@ pub use stt::{SegmentAssembler, SegmentUpdate, SttProvider, TranscriptSegment};
 pub use summarizer::{SummaryAction, SummaryPolicy, Summarizer};
 pub use task_detector::{detect as detect_task, DetectedTask};
 pub use token::{mint_join_token, LiveKitTokenConfig, LiveKitTokenRequest, LiveKitTokenResponse};
+pub use tts_xai::{
+    decode_wav_pcm, resample_linear, to_mono, tts_request_body, wav_to_call_pcm, DecodedPcm,
+};
 pub use wake::{match_wake, WakeAction, WakeGate, WakeMatch};
 pub use webhook::{decide as decide_webhook, verify_and_decide, WebhookAction};
