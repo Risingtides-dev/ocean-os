@@ -110,3 +110,30 @@ summary, and detected-task stream.
   the audio-publish-into-room adapter remains.
 - Inbound trunk + dispatch rule (so people can *call* Ocean), if/when wanted —
   outbound (Ocean calls out) is the current target.
+
+---
+
+## Troubleshooting: `could not find native static library webrtc`
+
+The `livekit-tap` feature (pulled in by `xai-tts`, used for the live room audio
+tap) depends on `webrtc-sys`, whose build script **downloads a prebuilt
+libwebrtc archive** into a scratch dir under `target/`. If that download is ever
+interrupted (Ctrl-C, dropped network, OOM kill), the scratch dir is left
+existing-but-incomplete; the build script then early-returns a false "success"
+and never re-fetches, so the link step fails with:
+
+```text
+error: could not find native static library `webrtc`
+```
+
+Un-poison it with the xtask — it removes the poisoned scratch / `webrtc-sys` /
+fingerprint dirs across both profiles, then you rebuild:
+
+```bash
+cargo xtask clear-webrtc-cache
+cargo build -p ocean-call --features livekit-tap
+# or in one step:
+cargo xtask clear-webrtc-cache --rebuild
+```
+
+See `xtask/README.md` for details. (OCEAN-252)

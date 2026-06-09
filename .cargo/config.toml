@@ -1,0 +1,11 @@
+# Cargo aliases for Ocean OS.
+#
+# `cargo xtask <cmd>` runs the dev-task runner crate at /xtask. It's a plain
+# workspace binary (the cargo-xtask pattern), so this is just sugar for
+# `cargo run -p xtask --`.
+#
+#   cargo xtask clear-webrtc-cache            # un-poison the libwebrtc cache
+#   cargo xtask clear-webrtc-cache --rebuild  # then rebuild ocean-call w/ tap
+#   cargo xtask help
+[alias]
+xtask = "run -p xtask --"
