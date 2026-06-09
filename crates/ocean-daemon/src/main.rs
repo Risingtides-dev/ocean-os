@@ -61,6 +61,11 @@ use tower_http::{
 };
 use uuid::Uuid;
 
+/// One-time startup config validation (OCEAN-276): fail-fast on malformed
+/// telephony/STT/provider/Longhouse env, warn on partial feature config, and log
+/// a boot-time readiness summary. Called once at the top of `main`.
+mod startup;
+
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<AgentRuntime>,
@@ -720,6 +725,15 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive("ocean_daemon=info".parse()?),
         )
         .init();
+
+    // OCEAN-276: validate config ONCE at boot, before building the runtime / DBs
+    // / listener. Fail-fast on a *malformed* value (a bad OCEAN_BIND, a non-E.164
+    // caller number, a non-URL LIVEKIT_URL, an unparseable numeric env, a bad
+    // Longhouse mode), warn on partially-configured optional features, and log a
+    // one-time readiness summary. Returning here aborts boot with a clear error
+    // instead of letting a typo surface at first call/turn. Optional features are
+    // never *required* — a daemon with no telephony/provider creds still boots.
+    startup::validate_startup_config()?;
 
     let bind = env::var("OCEAN_BIND").unwrap_or_else(|_| "127.0.0.1:4780".to_string());
 
