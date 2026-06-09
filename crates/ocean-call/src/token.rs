@@ -11,6 +11,7 @@
 //! video on the web. We deliberately read those three directly rather than going
 //! through `SipConfig::from_env()`, which would 503 on a missing trunk.
 
+use chrono::{SecondsFormat, Utc};
 use livekit_api::access_token::{AccessToken, VideoGrants};
 use serde::{Deserialize, Serialize};
 
@@ -96,12 +97,23 @@ impl Default for LiveKitTokenRequest {
 
 /// The response shape the web bridge decodes: it needs `token` + `url` and
 /// checks `ok`. `room` echoes the room id back for the SDK status line.
+///
+/// `expires_at` is the instant `token` stops being valid (`now + TOKEN_TTL`),
+/// emitted as an RFC3339/UTC string. The surface declares this field with NO
+/// serde default (`ocean-gui` `shell::daemon::LiveKitTokenResponse`) and threads
+/// it into live connection state so it can pre-emptively refresh before the TTL
+/// cliff (OCEAN-240). Emitting it is a contract requirement, not optional —
+/// omit it and the surface either fails to deserialize the payload or
+/// zero-values the expiry and drops mid-call at the 6h boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LiveKitTokenResponse {
     pub ok: bool,
     pub url: String,
     pub token: String,
     pub room: String,
+    /// RFC3339 UTC timestamp (`Z`-suffixed, e.g. `2026-06-03T22:00:00Z`) at
+    /// which `token` expires — the exact shape the surface parses.
+    pub expires_at: String,
 }
 
 /// How long a minted join token stays valid. Six hours comfortably covers a
@@ -178,11 +190,19 @@ pub fn mint_join_token(
         .to_jwt()
         .map_err(|e| format!("failed to sign LiveKit token: {e}"))?;
 
+    // Tell the client when this token dies so it can refresh ahead of the cliff
+    // (OCEAN-240). `now + TOKEN_TTL` mirrors the `with_ttl(TOKEN_TTL)` the SDK
+    // stamps onto the JWT `exp` (the SDK's reference "now" is the same call,
+    // within sub-ms — immaterial against a 6h horizon). RFC3339, seconds
+    // precision, `Z`-suffixed UTC — the exact shape the surface parses.
+    let expires_at = (Utc::now() + TOKEN_TTL).to_rfc3339_opts(SecondsFormat::Secs, true);
+
     Ok(LiveKitTokenResponse {
         ok: true,
         url: config.url.clone(),
         token,
         room: room_id.to_string(),
+        expires_at,
     })
 }
 
@@ -257,6 +277,70 @@ mod tests {
         assert!(claims.video.room_join);
         assert_eq!(claims.video.room, "call:abc");
         assert_eq!(claims.sub, "alice"); // identity
+    }
+
+    #[test]
+    fn response_carries_well_formed_expires_at_about_six_hours_ahead() {
+        // OCEAN-240 contract: every token response MUST carry `expires_at` in the
+        // RFC3339/UTC shape the surface parses, set to ~now + TOKEN_TTL (6h) so
+        // the client can pre-emptively refresh before the JWT cliff.
+        let cfg = config();
+        let req = LiveKitTokenRequest {
+            participant_id: "alice".into(),
+            ..Default::default()
+        };
+        let before = Utc::now();
+        let resp = mint_join_token(&cfg, "call:abc", &req, PublishGrant::Deny).unwrap();
+        let after = Utc::now();
+
+        // Present and well-formed: parses as RFC3339 and is `Z`-suffixed UTC,
+        // exactly matching the surface fixtures (e.g. "2026-06-03T22:00:00Z").
+        assert!(
+            resp.expires_at.ends_with('Z'),
+            "expires_at must be Z-suffixed UTC, got {}",
+            resp.expires_at
+        );
+        let parsed = chrono::DateTime::parse_from_rfc3339(&resp.expires_at)
+            .expect("expires_at parses as RFC3339")
+            .with_timezone(&Utc);
+
+        // ~6h ahead: must fall within [before + TTL, after + TTL]. Allow a
+        // one-second slack for the seconds-truncation in the emitted string.
+        let lo = before + TOKEN_TTL - chrono::Duration::seconds(1);
+        let hi = after + TOKEN_TTL + chrono::Duration::seconds(1);
+        assert!(
+            parsed >= lo && parsed <= hi,
+            "expires_at {parsed} not within ~6h window [{lo}, {hi}]"
+        );
+
+        // It must also corroborate the JWT's real `exp` claim — the value we
+        // advertise has to match the token we actually signed, not drift from it.
+        let claims = TokenVerifier::with_api_key(&cfg.api_key, &cfg.api_secret)
+            .verify(&resp.token)
+            .unwrap();
+        let exp = chrono::DateTime::from_timestamp(claims.exp as i64, 0)
+            .expect("exp is a valid instant");
+        assert!(
+            (parsed - exp).num_seconds().abs() <= 2,
+            "advertised expires_at {parsed} must match the JWT exp {exp}"
+        );
+    }
+
+    #[test]
+    fn response_roundtrips_with_expires_at() {
+        // The surface declares `expires_at` with no serde default, so a daemon
+        // payload that omits it fails to deserialize there. Lock that the wire
+        // shape we emit always includes the field (OCEAN-240).
+        let cfg = config();
+        let resp =
+            mint_join_token(&cfg, "r", &LiveKitTokenRequest::default(), PublishGrant::Deny).unwrap();
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(
+            json.get("expires_at").and_then(|v| v.as_str()).is_some(),
+            "serialized response must carry a string expires_at, got {json}"
+        );
+        let back: LiveKitTokenResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
     }
 
     #[test]
