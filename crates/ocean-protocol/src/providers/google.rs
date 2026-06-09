@@ -352,8 +352,10 @@ pub struct GoogleProvider {
 
 impl GoogleProvider {
     pub fn new() -> Self {
+        // OCEAN-221: streaming SSE client with connect + idle (read) timeouts
+        // and NO total request timeout, so long completions are never cut off.
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::streaming_client(),
         }
     }
 }
