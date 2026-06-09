@@ -6352,21 +6352,28 @@ fn humanize_tool_args(name: &str, args: &serde_json::Value) -> String {
         // (Codex review of PR #201). The caller's truncation sets the budget.
         "write" => {
             let path = str_arg("path");
-            let content = str_arg("content");
-            if content.is_empty() {
-                path.to_string()
-            } else {
-                format!("{path} ⇐ {content}")
+            // Key-presence, not is_empty(): `content: ""` is a real payload
+            // (it truncates the file) and the approval card must say so
+            // (Codex P2 on PR #201). Only a genuinely absent key degrades to
+            // the bare path.
+            match args.get("content").and_then(|v| v.as_str()) {
+                None => path.to_string(),
+                Some("") => format!("{path} ⇐ (empty file)"),
+                Some(content) => format!("{path} ⇐ {content}"),
             }
         }
         "edit" => {
             let path = str_arg("path");
-            let old = str_arg("old_string");
-            let new = str_arg("new_string");
-            if old.is_empty() && new.is_empty() {
+            let old = args.get("old_string").and_then(|v| v.as_str());
+            let new = args.get("new_string").and_then(|v| v.as_str());
+            if old.is_none() && new.is_none() {
                 path.to_string()
             } else {
-                format!("{path}: {old} → {new}")
+                format!(
+                    "{path}: {} → {}",
+                    old.unwrap_or_default(),
+                    new.unwrap_or_default()
+                )
             }
         }
         "todo" => joined(vec![str_arg("action"), str_arg("text")]),
@@ -6829,8 +6836,14 @@ mod tests {
             ),
             "a.rs: foo() → bar()"
         );
-        // Payload absent → degrade to the path alone, not a dangling arrow.
+        // Payload KEY absent → degrade to the path alone, not a dangling arrow.
         assert_eq!(humanize_tool_args("write", &json!({"path": "a.txt"})), "a.txt");
+        // But an explicit empty string is a real payload — it truncates the
+        // file — and the approval card must say so, not hide it (Codex P2).
+        assert_eq!(
+            humanize_tool_args("write", &json!({"path": "a.txt", "content": ""})),
+            "a.txt ⇐ (empty file)"
+        );
         assert_eq!(
             humanize_tool_args("todo", &json!({"action": "add", "index": 0, "text": "Run tests"})),
             "add Run tests"
