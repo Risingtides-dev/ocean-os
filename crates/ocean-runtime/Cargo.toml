@@ -34,6 +34,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[test]]
 name = "tools_smoke"
@@ -46,3 +48,7 @@ path = "tests/trim_invariants.rs"
 [[test]]
 name = "agent_loop_e2e"
 path = "tests/agent_loop_e2e.rs"
+
+[[test]]
+name = "turn_tracing_spans"
+path = "tests/turn_tracing_spans.rs"

@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 mod config;
 pub use config::{DaemonConfig, McpSection};
@@ -771,6 +772,14 @@ impl AgentRuntime {
         Ok((session.id, stdout, String::new(), TokenUsage::default()))
     }
 
+    // OCEAN-274: the `runtime.prompt` span — the session/history layer's slice of
+    // the turn. Sits under the daemon's `turn` root span (the daemon `.instrument`s
+    // the `prompt()` call) and is the parent the spawned `agent_loop` future is
+    // re-attached to below, so load → run → persist all read as one turn in the
+    // logs. `skip_all` because the args carry the prompt text, tools, permission
+    // policy and snapshot — none of which belong in a span field; `session_id` is
+    // recorded explicitly once resolved.
+    #[tracing::instrument(name = "runtime.prompt", skip_all, fields(session_id = tracing::field::Empty))]
     async fn run_prompt(
         &self,
         req: PromptRequest,
@@ -789,6 +798,11 @@ impl AgentRuntime {
         // None means "new session" — mint the id now so the lock still covers
         // the load/run/save window.
         let session_id = req.session_id.unwrap_or_else(SessionId::new_v4);
+        // Now that the id is resolved (supplied or freshly minted), stamp it onto
+        // the `runtime.prompt` span so every log line in this turn slice — and the
+        // child `agent_loop`/`persist` spans — is attributable to one session
+        // even under concurrent turns (OCEAN-274).
+        tracing::Span::current().record("session_id", tracing::field::display(session_id));
 
         // Hold the per-session lock across load → run → save. Without it, two
         // turns on the same session both load the same history and the last to
@@ -935,10 +949,15 @@ impl AgentRuntime {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cfg_cloned = cfg.clone();
-        let handle =
-            tokio::spawn(
-                async move { run_agent_with_history(&cfg_cloned, history, Some(tx)).await },
-            );
+        // The agent loop runs on its own task, so the turn's span context does NOT
+        // propagate automatically — a freshly spawned task starts with no parent
+        // span. Re-attach the current `runtime.prompt` span (OCEAN-274) so the
+        // `agent_loop` span (and its `round`/`provider_stream`/`tool_exec`
+        // children) nest under this turn instead of detaching into a rootless tree.
+        let handle = tokio::spawn(
+            async move { run_agent_with_history(&cfg_cloned, history, Some(tx)).await }
+                .instrument(tracing::Span::current()),
+        );
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -986,8 +1005,19 @@ impl AgentRuntime {
         // context window, but the *stored* transcript would otherwise grow
         // forever and be reloaded in full on every future turn (the dominant
         // source of runaway input-token cost). Keep the most recent messages.
-        session.replace_messages(cap_session_history(run.messages.clone()));
-        session::save(&self.config_dir, &session)?;
+        //
+        // Persist under a `persist` span (OCEAN-274) — the final leaf of the turn
+        // tree (turn → runtime.prompt → agent_loop → … → persist). `save` is
+        // synchronous, so a plain span guard (no await held across it) is correct
+        // here. Only the retained message count is recorded; the transcript bytes
+        // never enter a span field.
+        let persisted = cap_session_history(run.messages.clone());
+        let persist_span = tracing::info_span!("persist", messages = persisted.len());
+        {
+            let _persist = persist_span.enter();
+            session.replace_messages(persisted);
+            session::save(&self.config_dir, &session)?;
+        }
 
         if stdout.trim().is_empty() {
             stdout = last_assistant_text(&run.messages).unwrap_or_default();

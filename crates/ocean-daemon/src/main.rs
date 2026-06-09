@@ -757,11 +757,31 @@ fn is_loopback_origin(origin: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // OCEAN-274: render per-turn span context so concurrent turns are
+    // distinguishable in the logs.
+    //
+    // 1. Filter: enable the turn-lifecycle spans/events across the crates they
+    //    live in (`ocean_runtime`/`ocean_agent`/`ocean_protocol`) in addition to
+    //    `ocean_daemon`. Without these, the spans are created but filtered out and
+    //    never render. `from_default_env()` still wins where `RUST_LOG` is set, so
+    //    an operator can dial any target up/down; these are defaults, appended.
+    // 2. Format: the default `Full` formatter prints the active span scope —
+    //    `turn{turn_id=… session_id=…}:runtime.prompt:agent_loop:round{round=N}:
+    //    provider_stream{provider=… model=…}` — ahead of each event line, so every
+    //    log line carries the `turn_id` of the turn that produced it and the
+    //    turn → provider → tool → persist tree is visible. `with_span_events`
+    //    additionally emits explicit NEW/CLOSE lines (CLOSE carries `time.busy`/
+    //    `time.idle`) so a turn's span open/close and durations show even when a
+    //    span emits no events of its own.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ocean_daemon=info".parse()?),
+                .add_directive("ocean_daemon=info".parse()?)
+                .add_directive("ocean_runtime=info".parse()?)
+                .add_directive("ocean_agent=info".parse()?)
+                .add_directive("ocean_protocol=info".parse()?),
         )
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW | tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .init();
 
     // OCEAN-276: validate config ONCE at boot, before building the runtime / DBs
@@ -6497,6 +6517,23 @@ async fn agent_turn(
     let request_id = turn_id.0;
     let event_prefix = request_id.to_string()[..8].to_string();
 
+    // Turn-root span (OCEAN-274). Every log line emitted while this turn runs —
+    // including everything inside the runtime, the provider call, tool execution
+    // and persistence — is tagged with this `turn_id`/`request_id`/`session_id`,
+    // so a single turn is followable end-to-end through interleaved concurrent
+    // turns. The runtime work (`runtime.prompt` and its `agent_loop` →
+    // `provider_stream` / `tool_exec` / `persist` children) is `.instrument`-ed
+    // into this span below, where the turn fans into the runtime. The span is
+    // built here, right after the ids are minted, so it is available for the
+    // whole handler; only `runtime.prompt(...)` is attached to it (the hot
+    // pre-flight stays untouched). No prompt text or secrets in the fields.
+    let turn_span = tracing::info_span!(
+        "turn",
+        turn_id = %turn_id,
+        request_id = %request_id,
+        session_id = %session_id
+    );
+
     // Session↔workspace binding (OCEAN-52) + resume cwd pinning (OCEAN-55).
     //
     // A NEW session (`is_new_session`) legitimately sets its own cwd: the
@@ -6892,7 +6929,16 @@ async fn agent_turn(
             // `model_id` into this turn's config only, leaving the runtime's
             // global model selection untouched.
             .with_model_id(model_id.clone());
-    let res = state.runtime.prompt(prompt_req, control).await;
+    // Run the turn inside the turn-root span (OCEAN-274): the runtime's
+    // `runtime.prompt` span (and every child — agent_loop, provider_stream,
+    // tool_exec, persist) nests under `turn`, so the full lifecycle of this turn
+    // is one followable tree in the logs, tagged with `turn_id`/`session_id`.
+    use tracing::Instrument as _;
+    let res = state
+        .runtime
+        .prompt(prompt_req, control)
+        .instrument(turn_span)
+        .await;
     // Wait for the bridge to drain (the sender has been dropped by now).
     let _ = bridge.await;
     // Prefer real provider usage; fall back to a visible-text estimate only
