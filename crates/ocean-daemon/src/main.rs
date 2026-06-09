@@ -4464,16 +4464,91 @@ struct AgentVoiceRequest {
     room_id: Option<String>,
     #[serde(default)]
     project_id: Option<Uuid>,
+    /// Per-turn permission secret (OCEAN-224, extending OCEAN-185). A voice
+    /// caller that can answer a permission prompt (the surface proxy relaying
+    /// `/v1/permissions/{id}/decision`, a future wake-word client) mints a token
+    /// with [`ocean_core::mint_decision_token`], sends it here, and replays the
+    /// SAME value on the decision POST. The daemon binds the turn's permission
+    /// gate to it exactly like `POST /v1/agent/turns`, so a gated mutating tool in
+    /// a voice turn becomes approvable instead of stalling on an un-answerable
+    /// prompt. `None` is only valid when yolo is effective (every tool
+    /// auto-approves); otherwise the handler rejects the turn fast so it can
+    /// never silently hang on a prompt no voice caller can answer — see
+    /// [`agent_voice`].
+    #[serde(default)]
+    decision_token: Option<String>,
+}
+
+/// Whether a voice turn would dead-end on a permission prompt no voice caller can
+/// answer (OCEAN-224). True ⇒ the turn must be rejected up front rather than run.
+///
+/// A voice turn is *un-answerable* only when BOTH hold: it carries no
+/// `decision_token` (so it cannot bind/approve a gate via OCEAN-185) AND yolo is
+/// not effective (so a mutating tool *will* raise a gate). In that one case the
+/// gate would surface as a `PermissionRequest` onto the SSE that a spoken
+/// interface has no card to click — the turn would silently hang. With a token,
+/// the gate is approvable; with yolo, no gate is ever raised. Pure so the
+/// fail-fast contract is unit-tested directly, not asserted via a copy.
+fn voice_turn_is_unanswerable(decision_token: Option<&str>, yolo_effective: bool) -> bool {
+    decision_token.is_none() && !yolo_effective
 }
 
 /// POST /v1/agent/voice — accept a transcribed utterance and run it as a normal
-/// agent turn tagged `client_type = "voice"`. Thin wrapper over `agent_turn` so
-/// it inherits cwd resolution, per-session locking, cancellation, and SSE
+/// agent turn tagged `client_type = "leo-voice"`. Thin wrapper over `agent_turn`
+/// so it inherits cwd resolution, per-session locking, cancellation, and SSE
 /// streaming with zero duplication.
+///
+/// # Permission posture (OCEAN-224)
+///
+/// A voice turn that hits a mutating tool is gated exactly like a text turn when
+/// yolo is off. The trap this endpoint used to have: it hardcoded
+/// `decision_token: None`, so a gated voice turn raised a `PermissionRequest`
+/// onto the SSE that **no voice caller could answer** — the turn then hung until
+/// it was cancelled or timed out. A spoken interface has no permission card to
+/// click, so an un-answerable prompt is a silent dead-end, not a UX papercut.
+///
+/// The fix makes the posture explicit, with no silent stall possible:
+///
+/// 1. **Caller supplies a `decision_token`** → it is threaded onto the inner
+///    turn (same OCEAN-185 binding as `agent_turn`). The gate is now answerable:
+///    whoever can relay `/v1/permissions/{id}/decision` for this caller (the
+///    surface proxy, a wake-word client) replays the same token and approves.
+/// 2. **No token, but yolo is effective** → every tool auto-approves, so no gate
+///    is ever raised. Unbound is fine; the turn runs.
+/// 3. **No token and yolo is off** → a mutating tool *would* raise a gate nobody
+///    can answer. Rather than accept the turn and let it hang, we **reject it up
+///    front** with `400` and a short, speakable reason. The caller fails fast and
+///    can tell the operator to enable yolo or send a token, instead of the agent
+///    going silent mid-utterance.
 async fn agent_voice(
     State(state): State<AppState>,
     Json(req): Json<AgentVoiceRequest>,
 ) -> (StatusCode, Json<AgentTurnResponse>) {
+    // OCEAN-224: refuse the un-answerable case before any work. A voice turn with
+    // no `decision_token` can only be safely run when yolo is effective (no gate
+    // will ever be raised). Without a token AND without yolo, a mutating tool
+    // would stall on a permission prompt no spoken interface can answer — so fail
+    // fast with a clear, speakable message instead of hanging.
+    if voice_turn_is_unanswerable(req.decision_token.as_deref(), effective_yolo()) {
+        let session_id = req.session_id.unwrap_or_else(AgentSessionId::new_v4);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AgentTurnResponse {
+                ok: false,
+                turn_id: AgentTurnId::new_v4(),
+                session_id,
+                status: AgentTurnStatus::Failed,
+                event_id_prefix: String::new(),
+                error: Some(
+                    "Voice turns can't approve permission prompts on their own. \
+                     Turn on yolo mode, or send a decision_token with the voice \
+                     turn and use it to approve."
+                        .to_string(),
+                ),
+            }),
+        );
+    }
+
     let turn = AgentTurnRequest {
         session_id: req.session_id,
         prompt: req.transcript,
@@ -4488,10 +4563,11 @@ async fn agent_voice(
         model_id: None,
         // Voice turns carry no images.
         images: None,
-        // OCEAN-185: the voice endpoint is a daemon-side wrapper; the surface
-        // does not yet mint a per-turn decision_token. Left unbound here — the
-        // surface-side follow-up must thread one through if it approves perms.
-        decision_token: None,
+        // OCEAN-224: thread the caller's per-turn secret through so a gated voice
+        // turn is approvable (binds the gate to this submitter, OCEAN-185). `None`
+        // here only ever reaches `agent_turn` when yolo is effective — the guard
+        // above already rejected the un-answerable no-token, no-yolo case.
+        decision_token: req.decision_token,
     };
     agent_turn(State(state), Json(turn)).await
 }
@@ -7879,6 +7955,111 @@ mod tests {
             None => env::remove_var("OCEAN_CONFIG_DIR"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// OCEAN-224: the fail-fast predicate truth table. A voice turn is
+    /// "un-answerable" — and so must be rejected up front rather than allowed to
+    /// hang on a permission prompt — ONLY when it carries no `decision_token` AND
+    /// yolo is off. A token (it can approve the gate) OR yolo (no gate is raised)
+    /// makes it answerable. This is the heart of the no-silent-stall guarantee.
+    #[test]
+    fn voice_turn_unanswerable_predicate_truth_table() {
+        // No token + no yolo ⇒ the one dead-end case ⇒ reject up front.
+        assert!(
+            voice_turn_is_unanswerable(None, false),
+            "no decision_token and no yolo ⇒ gate would hang ⇒ must fail fast"
+        );
+        // A token makes the gate approvable, regardless of yolo.
+        assert!(
+            !voice_turn_is_unanswerable(Some("tok"), false),
+            "a decision_token can approve the gate ⇒ answerable, run it"
+        );
+        assert!(
+            !voice_turn_is_unanswerable(Some("tok"), true),
+            "token + yolo ⇒ answerable"
+        );
+        // Yolo means no gate is ever raised, so a missing token is harmless.
+        assert!(
+            !voice_turn_is_unanswerable(None, true),
+            "yolo auto-approves every tool ⇒ no gate ⇒ unbound voice turn is fine"
+        );
+    }
+
+    /// OCEAN-224 — THE BUG, CLOSED: a non-yolo voice turn with no `decision_token`
+    /// must fail fast (HTTP 400 + a clear, speakable error) instead of being
+    /// accepted and silently stalling on a permission prompt no spoken interface
+    /// can answer. We drive the real `agent_voice` handler with yolo forced off;
+    /// the rejection path returns BEFORE the runtime is touched, so this is a
+    /// fast, deterministic assertion of the no-silent-stall contract.
+    #[tokio::test]
+    async fn voice_turn_without_token_and_no_yolo_fails_fast_not_hang() {
+        let _guard = yolo_env_guard();
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior_yolo = env::var("OCEAN_YOLO").ok();
+        let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
+
+        // Force operator policy OFF: no persisted file (fresh config dir) and
+        // OCEAN_YOLO explicitly off, so `effective_yolo()` is false.
+        let tmp = std::env::temp_dir().join(format!("ocean-voice-224-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", &tmp);
+        env::set_var("OCEAN_YOLO", "0");
+        assert!(!effective_yolo(), "test precondition: yolo must be off");
+
+        let state = permission_test_state();
+        let req = AgentVoiceRequest {
+            session_id: None,
+            transcript: "delete the old branches".to_string(),
+            cwd: String::new(),
+            room_id: None,
+            project_id: None,
+            // The dead-end input: no token to approve a gate with.
+            decision_token: None,
+        };
+
+        let (status, resp) = agent_voice(State(state), Json(req)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-yolo, token-less voice turn must be rejected up front, not run"
+        );
+        assert!(!resp.ok, "rejection response must report ok=false");
+        assert_eq!(resp.status, AgentTurnStatus::Failed);
+        let err = resp.error.clone().unwrap_or_default();
+        assert!(
+            err.to_lowercase().contains("yolo")
+                && err.to_lowercase().contains("decision_token"),
+            "the error must name BOTH escape hatches (enable yolo / send a \
+             decision_token) so the caller can act; got: {err:?}"
+        );
+
+        // Restore env.
+        match prior_yolo {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+        match prior_cfg {
+            Some(v) => env::set_var("OCEAN_CONFIG_DIR", v),
+            None => env::remove_var("OCEAN_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// OCEAN-224: a voice turn that DOES carry a `decision_token` is answerable
+    /// even with yolo off (the token binds + approves the gate exactly like a text
+    /// turn, OCEAN-185), so the fail-fast guard must NOT trip on it. Asserted via
+    /// the predicate to avoid spinning up the full agent loop for the happy path.
+    #[test]
+    fn voice_turn_with_token_is_answerable_even_without_yolo() {
+        let token = ocean_core::mint_decision_token();
+        assert!(
+            !voice_turn_is_unanswerable(Some(&token), false),
+            "a real minted decision_token makes a non-yolo voice turn approvable, \
+             not a dead-end — the guard must let it through to agent_turn"
+        );
     }
 
     /// OCEAN-160 (P0): the legacy `POST /v1/prompt` (and its async sibling
