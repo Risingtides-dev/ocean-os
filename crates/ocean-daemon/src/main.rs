@@ -1147,17 +1147,27 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 }
 
 async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(
-        serde_json::to_value(state.runtime.provider_readiness()).unwrap_or_else(|err| {
-            json!({
-                "ok": false,
-                "error": {
-                    "code": "READINESS_SERIALIZE_ERROR",
-                    "message": err.to_string()
-                }
-            })
-        }),
-    )
+    let mut body = serde_json::to_value(state.runtime.provider_readiness()).unwrap_or_else(|err| {
+        json!({
+            "ok": false,
+            "error": {
+                "code": "READINESS_SERIALIZE_ERROR",
+                "message": err.to_string()
+            }
+        })
+    });
+    // Surface the configured failover targets (OCEAN-275): the ready alternates a
+    // degraded primary would route to, highest-priority first. Additive — only
+    // attached when the readiness payload is an object, so the existing shape and
+    // the serialize-error fallback are untouched. An empty array while `ok` is
+    // false is the visible "all providers degraded, nowhere to fail over" signal.
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "fallback_providers".into(),
+            json!(state.runtime.fallback_providers()),
+        );
+    }
+    Json(body)
 }
 
 fn legacy_event_to_sse(envelope: &EventEnvelope) -> Event {

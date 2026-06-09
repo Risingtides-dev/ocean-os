@@ -267,6 +267,133 @@ pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, Prov
     })
 }
 
+// ---------------------------------------------------------------------------
+// Provider fallback / failover (OCEAN-275)
+// ---------------------------------------------------------------------------
+//
+// Readiness already tells us whether *the selected* provider can serve a turn,
+// but a degraded/credential-missing primary used to just fail the turn — nothing
+// routed to a ready alternate. This block resolves an ordered list of ready
+// *alternate* providers so a caller (the agent layer) can fail over at SELECTION
+// time, and on a connect-failure before any output streamed. It deliberately
+// does NOT decide *when* to fail over (that's the agent layer, which owns the
+// turn lifecycle and the mid-stream-safety boundary); it only answers "given the
+// environment, what ready providers could serve this request, in what order?".
+
+/// Env var holding the ordered fallback list (OCEAN-275), comma-separated model
+/// aliases — e.g. `claude-sonnet-4-6,gpt-5.4,deepseek-v4-pro`. Each alias is
+/// resolved through the same [`resolve_provider_config`] path as a primary
+/// selection, so anything valid for `OCEAN_MODEL` is valid here. Unset ⇒
+/// [`DEFAULT_FALLBACK_ORDER`]. Unparseable/unknown entries are skipped (with a
+/// warning), never fatal — a typo degrades the list, it doesn't break turns.
+/// Mirrors the env-config pattern of `OCEAN_RETRY_*` (OCEAN-259) and the provider
+/// timeout knobs (OCEAN-221): config, never code; absent ⇒ a sensible default.
+pub const ENV_PROVIDER_FALLBACK: &str = "OCEAN_PROVIDER_FALLBACK";
+
+/// Default cross-provider fallback order when [`ENV_PROVIDER_FALLBACK`] is unset.
+///
+/// One representative model alias per real, credential-backed provider, ordered
+/// most- to least-capable. Only the entries whose credential is actually present
+/// in the environment survive [`fallback_candidates`]; the rest are silently
+/// unavailable. `Fake` is intentionally excluded — failing a production turn over
+/// to a canned echo would hide an outage rather than route around it (an operator
+/// who wants that can still list `fake` explicitly in the env override).
+pub const DEFAULT_FALLBACK_ORDER: &[&str] = &[
+    "claude-sonnet-4-6", // anthropic
+    "gpt-5.4",           // openai-codex
+    "deepseek-v4-pro",   // deepseek
+    "gemini-2.0-flash",  // google
+    "kimi-k2.6",         // kimi
+    "minimax-m2",        // minimax
+];
+
+/// Parse the configured fallback order into a list of model aliases.
+///
+/// Returns the [`ENV_PROVIDER_FALLBACK`] entries (trimmed, empties dropped) when
+/// set and non-empty, otherwise [`DEFAULT_FALLBACK_ORDER`]. A set-but-blank value
+/// (e.g. `OCEAN_PROVIDER_FALLBACK=""` or all-commas) falls back to the default
+/// rather than yielding an empty list, so an exported-but-empty var can never
+/// silently disable failover.
+fn fallback_order(env: &ProviderEnv) -> Vec<String> {
+    if let Some(raw) = env.get(ENV_PROVIDER_FALLBACK) {
+        let parsed: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    DEFAULT_FALLBACK_ORDER.iter().map(|s| s.to_string()).collect()
+}
+
+/// Resolve the ordered list of **ready alternate** provider configs for failover.
+///
+/// Walks the configured [`fallback_order`], resolving each model alias against the
+/// same `env` snapshot the primary used (so credentials line up), and keeps only
+/// configs that are *ready* (`readiness().ok` — credential present, or the
+/// provider needs none). The result is:
+/// - deduped by [`ProviderId`] (first ready alias per provider wins), since two
+///   aliases on the same degraded provider are not independent failover targets;
+/// - excludes `exclude_provider` (the primary), so we never "fail over" to the
+///   same provider that just failed.
+///
+/// An alias that doesn't resolve (unknown model, missing base url) is skipped — a
+/// bad fallback entry must not break the turn (the agent layer logs the overall
+/// failover decision; this crate stays dependency-light and silent). The returned
+/// vec is in priority order; an empty vec means "no ready alternate exists".
+pub fn fallback_candidates(
+    env: &ProviderEnv,
+    exclude_provider: &ProviderId,
+) -> Vec<ProviderConfig> {
+    let mut out: Vec<ProviderConfig> = Vec::new();
+    for alias in fallback_order(env) {
+        // Resolve this alias as if it were the selected model: same env, so the
+        // OCEAN_MODEL override is the only thing that changes.
+        let mut alias_env = env.clone();
+        alias_env.vars.insert("OCEAN_MODEL".to_string(), alias.clone());
+        // A fallback alias must route purely on the alias itself, not inherit an
+        // OCEAN_PROVIDER pin meant for the primary (which would force every
+        // candidate onto the same provider and defeat failover).
+        alias_env.vars.remove("OCEAN_PROVIDER");
+        let Ok(config) = resolve_provider_config(&alias_env) else {
+            // Unknown model / missing base url for this entry — skip it.
+            continue;
+        };
+        let provider = config.selection.provider.clone();
+        if &provider == exclude_provider {
+            continue;
+        }
+        if !config.readiness().ok {
+            // Not ready (e.g. its own credential is missing) — not a usable
+            // failover target right now. Skip silently; this is the common,
+            // expected case for providers the operator hasn't configured.
+            continue;
+        }
+        if out.iter().any(|c| c.selection.provider == provider) {
+            continue;
+        }
+        out.push(config);
+    }
+    out
+}
+
+/// Resolve the single best ready alternate provider for failover, or `None` when
+/// every configured fallback is unavailable.
+///
+/// Thin convenience over [`fallback_candidates`] returning just the first (
+/// highest-priority) ready alternate. The agent layer uses this both at
+/// selection time (primary not ready) and after a connect-failure (primary
+/// returned an availability error before streaming any output).
+pub fn resolve_fallback_config(
+    env: &ProviderEnv,
+    exclude_provider: &ProviderId,
+) -> Option<ProviderConfig> {
+    fallback_candidates(env, exclude_provider).into_iter().next()
+}
+
 /// Read the ChatGPT account id from the `openai-codex` auth.json block.
 fn resolve_codex_account_id(env: &ProviderEnv) -> Option<String> {
     let path = env.auth_file.as_ref()?;
@@ -958,5 +1085,122 @@ mod tests {
         let readiness = config.readiness();
         assert!(readiness.ok);
         assert!(!readiness.credential_present);
+    }
+
+    // ---- Fallback / failover (OCEAN-275) ----------------------------------
+
+    #[test]
+    fn fallback_picks_a_ready_alternate_when_primary_provider_is_degraded() {
+        // Primary = deepseek (its key is intentionally absent → degraded), but an
+        // Anthropic key IS present. The default order leads with Anthropic, so the
+        // first ready alternate must be Anthropic.
+        let e = env(&[
+            ("OCEAN_MODEL", "deepseek-v4-pro"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+        ]);
+        let alt = resolve_fallback_config(&e, &ProviderId::DeepSeek)
+            .expect("a ready anthropic alternate should be found");
+        assert_eq!(alt.selection.provider, ProviderId::Anthropic);
+        assert!(alt.readiness().ok);
+        assert!(alt.credential.is_some());
+    }
+
+    #[test]
+    fn fallback_is_empty_when_every_alternate_is_degraded() {
+        // Only the deepseek key is set, and deepseek is the excluded primary, so
+        // no *alternate* provider has a credential → no failover target. This is
+        // the "all providers degraded → clear error" precondition the agent layer
+        // turns into an explicit error rather than a silent hang.
+        let e = env(&[
+            ("OCEAN_MODEL", "deepseek-v4-pro"),
+            ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
+        ]);
+        assert!(resolve_fallback_config(&e, &ProviderId::DeepSeek).is_none());
+        assert!(fallback_candidates(&e, &ProviderId::DeepSeek).is_empty());
+    }
+
+    #[test]
+    fn fallback_never_routes_back_to_the_excluded_primary() {
+        // Anthropic key present; if the primary is ALSO anthropic, the anthropic
+        // entry must be excluded — failing over to the provider that just failed
+        // is pointless. With no other key set, there's no alternate at all.
+        let e = env(&[
+            ("OCEAN_MODEL", "claude-opus-4-7"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+        ]);
+        let alt = resolve_fallback_config(&e, &ProviderId::Anthropic);
+        assert!(
+            alt.is_none(),
+            "anthropic is the primary; it must not be its own fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_dedupes_by_provider_and_honors_priority_order() {
+        // Both deepseek and anthropic keys present. Primary = google (degraded).
+        // Default order is anthropic, then codex, then deepseek… → the first ready
+        // alternate is anthropic, and the candidate list holds at most one entry
+        // per provider.
+        let e = env(&[
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
+        ]);
+        let candidates = fallback_candidates(&e, &ProviderId::Google);
+        assert_eq!(
+            candidates.first().map(|c| c.selection.provider.clone()),
+            Some(ProviderId::Anthropic),
+            "highest-priority ready alternate should be first"
+        );
+        // deepseek is also ready and must appear, exactly once.
+        let providers: Vec<_> = candidates.iter().map(|c| &c.selection.provider).collect();
+        assert!(providers.contains(&&ProviderId::DeepSeek));
+        let deepseek_count = providers
+            .iter()
+            .filter(|p| ***p == ProviderId::DeepSeek)
+            .count();
+        assert_eq!(deepseek_count, 1, "no duplicate provider entries");
+    }
+
+    #[test]
+    fn env_override_reorders_and_restricts_the_fallback_list() {
+        // Operator pins the order to deepseek-first. Both deepseek and anthropic
+        // are ready; primary = google. The override must put deepseek first even
+        // though the default order leads with anthropic.
+        let e = env(&[
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+            ("OCEAN_PROVIDER_FALLBACK", "deepseek-v4-pro, claude-opus-4-7"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
+        ]);
+        let alt = resolve_fallback_config(&e, &ProviderId::Google).unwrap();
+        assert_eq!(alt.selection.provider, ProviderId::DeepSeek);
+        assert_eq!(alt.selection.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn blank_env_override_falls_back_to_the_default_order() {
+        // An exported-but-empty override must not silently disable failover; it
+        // falls back to the default order (anthropic-first here).
+        let e = env(&[
+            ("OCEAN_MODEL", "deepseek-v4-pro"),
+            ("OCEAN_PROVIDER_FALLBACK", "  , ,"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+        ]);
+        let alt = resolve_fallback_config(&e, &ProviderId::DeepSeek).unwrap();
+        assert_eq!(alt.selection.provider, ProviderId::Anthropic);
+    }
+
+    #[test]
+    fn unknown_fallback_entries_are_skipped_not_fatal() {
+        // A typo'd alias in the override is skipped; the next valid+ready entry
+        // still wins.
+        let e = env(&[
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+            ("OCEAN_PROVIDER_FALLBACK", "not-a-model, claude-opus-4-7"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+        ]);
+        let alt = resolve_fallback_config(&e, &ProviderId::Google).unwrap();
+        assert_eq!(alt.selection.provider, ProviderId::Anthropic);
     }
 }

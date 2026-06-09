@@ -233,6 +233,13 @@ pub struct AgentRuntime {
     /// created on demand and kept for the process lifetime (one cheap Arc<Mutex>
     /// per session ever touched — negligible).
     session_locks: Arc<std::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Test-only override for the per-turn environment snapshot used by provider
+    /// failover (OCEAN-275). Production always reads the real process env via
+    /// [`AgentRuntime::turn_env`]; tests inject a deterministic [`ProviderEnv`]
+    /// here so the failover policy can be exercised end-to-end through `prompt`
+    /// without mutating (and racing on) the global process environment.
+    #[cfg(test)]
+    test_env: Option<ProviderEnv>,
 }
 
 impl AgentRuntime {
@@ -251,6 +258,8 @@ impl AgentRuntime {
             state: Arc::new(RwLock::new(state)),
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            test_env: None,
         };
         runtime.migrate_legacy_sessions();
         // Bound on-disk session growth: prune session files past the TTL once
@@ -339,12 +348,50 @@ impl AgentRuntime {
         self.state.read().expect("runtime state poisoned").clone()
     }
 
+    /// The per-turn environment snapshot driving provider failover (OCEAN-275).
+    ///
+    /// Production reads the live process environment. In test builds a runtime
+    /// may carry an injected [`ProviderEnv`] (`test_env`) so failover behavior is
+    /// deterministic without touching global process env; when unset it falls
+    /// back to the process env exactly like production.
+    fn turn_env(&self) -> ProviderEnv {
+        #[cfg(test)]
+        if let Some(env) = &self.test_env {
+            return env.clone();
+        }
+        ProviderEnv::from_process()
+    }
+
     pub fn backend_name(&self) -> String {
         self.snapshot().backend_name
     }
 
     pub fn provider_readiness(&self) -> ProviderReadiness {
         self.snapshot().provider_config.readiness()
+    }
+
+    /// The ordered list of **ready fallback providers** for the current model
+    /// (OCEAN-275), as non-secret `provider/model` labels.
+    ///
+    /// These are the alternates a degraded primary (or a pre-stream
+    /// connect-failure) would route to, highest-priority first, drawn from the
+    /// same environment a turn would use. Surfaced in `/ready` so an operator can
+    /// see at a glance whether failover has anywhere to go — an empty list while
+    /// the primary is degraded is the "all providers degraded" condition. Carries
+    /// no credentials, only provider/model identifiers.
+    pub fn fallback_providers(&self) -> Vec<String> {
+        let primary = self.snapshot().provider_config.selection.provider;
+        let env = self.turn_env();
+        ocean_providers::fallback_candidates(&env, &primary)
+            .into_iter()
+            .map(|cfg| {
+                format!(
+                    "{}/{}",
+                    cfg.selection.provider.as_str(),
+                    cfg.selection.model
+                )
+            })
+            .collect()
     }
 
     /// Currently-bound model and provider id, for `/model` read paths.
@@ -442,41 +489,47 @@ impl AgentRuntime {
             None => None,
         };
         let global_snapshot = self.snapshot();
-        let snapshot: &RuntimeState = turn_state.as_ref().unwrap_or(&global_snapshot);
+        let turn_snapshot: RuntimeState =
+            turn_state.unwrap_or_else(|| global_snapshot.clone());
 
-        // Readiness check against the EFFECTIVE provider/model for this turn.
-        if let Some(stderr) = Self::preflight_error_for(snapshot) {
-            return PromptResponse {
-                request_id: Some(request_id),
-                ok: false,
-                session_id: req.session_id,
-                code: None,
-                wall_ms: start.elapsed().as_millis() as u64,
-                stdout: String::new(),
-                stderr,
-                cwd,
-                usage: TokenUsage::default(),
-            };
-        }
+        // Resolve the environment ONCE for the whole failover decision (selection
+        // + connect-failure), so the fallback list is computed against a single
+        // consistent snapshot and the process env is read once per turn.
+        let env = self.turn_env();
 
-        // Fake provider dispatch. The default `fake-ok` is a text-only echo that
-        // never touches the runtime loop (`run_fake_prompt`). The OCEAN-130
-        // `fake-tool` variant is different: it must trip the *real* permission
-        // gate and run a *real* tool, so it routes through `run_prompt` like a
-        // real provider — only with a deterministic `FakeToolProvider` injected
-        // (no network, no key) that emits one `write` tool call.
-        // The OCEAN-150 `fake-surface` variant likewise drives the real loop (it
-        // emits a `surface_patch` tool call so the daemon's SurfacePatch SSE
-        // bridge can be exercised end to end), so it routes through `run_prompt`.
-        let is_fake = snapshot.provider_config.selection.provider == ProviderId::Fake;
-        let is_fake_real_loop = is_fake
-            && (snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL
-                || snapshot.model.id == ocean_runtime::FAKE_SURFACE_MODEL);
-        let result = if is_fake && !is_fake_real_loop {
-            self.run_fake_prompt(req.clone(), control, snapshot).await
-        } else {
-            self.run_prompt(req.clone(), control, snapshot).await
+        // Selection-time failover (OCEAN-275). If the EFFECTIVE provider for this
+        // turn is not ready (degraded / missing credential), route to a ready
+        // alternate BEFORE the turn starts — the fully-safe failover point, since
+        // nothing has run yet. `resolve_turn_state_with_failover` returns the
+        // alternate's state (logging `primary degraded → routed to alternate`), or
+        // — when no alternate is ready — a clear "all providers degraded" error
+        // rather than the bare single-provider preflight message. A ready primary
+        // passes straight through untouched.
+        let effective = match Self::resolve_turn_state_with_failover(turn_snapshot, &env) {
+            Ok(state) => state,
+            Err(stderr) => {
+                return PromptResponse {
+                    request_id: Some(request_id),
+                    ok: false,
+                    session_id: req.session_id,
+                    code: None,
+                    wall_ms: start.elapsed().as_millis() as u64,
+                    stdout: String::new(),
+                    stderr,
+                    cwd,
+                    usage: TokenUsage::default(),
+                };
+            }
         };
+
+        // Run the turn against the effective provider; on a pre-stream
+        // connect-failure with a transient/availability error, fail over once to
+        // the next ready alternate (bounded — see `run_turn_with_failover`). This
+        // never fails over mid-stream: the moment any output streamed, the attempt
+        // is final.
+        let result = self
+            .run_turn_with_failover(req.clone(), control, effective, &env)
+            .await;
 
         match result {
             Ok((session_id, stdout, stderr, usage)) => PromptResponse {
@@ -512,6 +565,158 @@ impl AgentRuntime {
                     usage: TokenUsage::default(),
                 }
             }
+        }
+    }
+
+    /// Selection-time provider failover (OCEAN-275).
+    ///
+    /// Given the effective per-turn state, returns a state whose provider is
+    /// *ready* to serve the turn:
+    /// - if the requested provider is already ready, returns it unchanged;
+    /// - otherwise resolves the highest-priority ready *alternate* (see
+    ///   [`ocean_providers::resolve_fallback_config`]), logs the reroute, and
+    ///   returns the alternate's state;
+    /// - if no alternate is ready, returns `Err(message)` describing that **all**
+    ///   providers are degraded — a clear failure instead of a silent hang or a
+    ///   bare single-provider preflight error.
+    ///
+    /// This is the fully-safe failover point: it runs before any turn work, so
+    /// swapping providers here can never replay output or side effects.
+    ///
+    /// `env` is the process-environment snapshot resolved once per turn; the
+    /// fallback candidates are drawn from it so credentials line up with the
+    /// primary's. Taking it as a parameter (rather than reading the process env
+    /// here) keeps the policy deterministic and unit-testable.
+    fn resolve_turn_state_with_failover(
+        requested: RuntimeState,
+        env: &ProviderEnv,
+    ) -> Result<RuntimeState, String> {
+        // Ready primary → use it as-is. This is the overwhelmingly common path
+        // and adds only a readiness check (no env re-resolution).
+        if Self::preflight_error_for(&requested).is_none() {
+            return Ok(requested);
+        }
+
+        // Primary is degraded. Look for a ready alternate, resolved from the same
+        // environment the primary used (so credentials line up).
+        let primary = requested.provider_config.selection.provider.clone();
+        let primary_model = requested.provider_config.selection.model.clone();
+        let alternate = ocean_providers::resolve_fallback_config(env, &primary);
+
+        match alternate.and_then(|cfg| state_from_provider_config(cfg).ok()) {
+            Some(alt_state) => {
+                tracing::warn!(
+                    primary_provider = primary.as_str(),
+                    primary_model = %primary_model,
+                    fallback_provider =
+                        alt_state.provider_config.selection.provider.as_str(),
+                    fallback_model = %alt_state.provider_config.selection.model,
+                    "provider degraded at selection; routing turn to ready fallback provider"
+                );
+                Ok(alt_state)
+            }
+            None => {
+                // Nothing ready anywhere — surface the primary's own reason plus
+                // the explicit "all providers degraded" signal.
+                let primary_detail = Self::preflight_error_for(&requested)
+                    .unwrap_or_else(|| "provider is not ready".to_string());
+                Err(format!(
+                    "all providers degraded: {primary_detail}. No ready fallback provider \
+                     is configured (set credentials for an alternate, or configure \
+                     {} to point at a ready one).",
+                    ocean_providers::ENV_PROVIDER_FALLBACK
+                ))
+            }
+        }
+    }
+
+    /// Run one turn against `state`, failing over once to the next ready
+    /// alternate on a **pre-stream** availability failure (OCEAN-275).
+    ///
+    /// Bounded and safe:
+    /// - the primary attempt runs first;
+    /// - failover is attempted only when [`failover_eligible`] is true — i.e. the
+    ///   attempt streamed *no* output (so no model output / tool side effect can
+    ///   be replayed) **and** the error is transient/availability. A mid-stream
+    ///   failure, a user/content error, or a cancellation is returned as-is;
+    /// - at most ONE alternate is tried (the highest-priority ready provider
+    ///   other than the one that just failed), so failover can never fan out or
+    ///   loop. If the alternate also fails, its error is returned.
+    ///
+    /// The returned error is always the plain underlying `anyhow::Error` (the
+    /// internal [`TurnFailure`] wrapper is unwrapped here), so `prompt`'s existing
+    /// `AgentError` downcast — e.g. the 408 timeout mapping — is unchanged.
+    ///
+    /// `env` is the same per-turn environment snapshot used for selection-time
+    /// failover, so the connect-failure fallback draws from the identical
+    /// candidate list.
+    async fn run_turn_with_failover(
+        &self,
+        req: PromptRequest,
+        control: PromptControl,
+        state: RuntimeState,
+        env: &ProviderEnv,
+    ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
+        let failed_provider = state.provider_config.selection.provider.clone();
+        match self.dispatch_turn(req.clone(), control.clone(), &state).await {
+            Ok(ok) => Ok(ok),
+            Err(e) => {
+                if !failover_eligible(&e) {
+                    // Mid-stream, user-error, or non-availability — final. Unwrap
+                    // any TurnFailure wrapper so the caller sees the bare error.
+                    return Err(unwrap_turn_failure(e));
+                }
+                // Pre-stream availability failure: try ONE ready alternate.
+                let alternate = ocean_providers::resolve_fallback_config(env, &failed_provider)
+                    .and_then(|cfg| state_from_provider_config(cfg).ok());
+                let Some(alt_state) = alternate else {
+                    // No alternate to try — return the original failure as-is.
+                    return Err(unwrap_turn_failure(e));
+                };
+                tracing::warn!(
+                    primary_provider = failed_provider.as_str(),
+                    fallback_provider =
+                        alt_state.provider_config.selection.provider.as_str(),
+                    fallback_model = %alt_state.provider_config.selection.model,
+                    error = %e,
+                    "provider call failed before streaming; failing over to ready alternate"
+                );
+                // Single bounded retry on the alternate. Whatever it returns is
+                // final (success or failure) — no further fan-out.
+                self.dispatch_turn(req, control, &alt_state)
+                    .await
+                    .map_err(unwrap_turn_failure)
+            }
+        }
+    }
+
+    /// Dispatch a single turn to the fake echo path or the real agent loop,
+    /// exactly as the pre-failover `prompt` did. Factored out so
+    /// [`Self::run_turn_with_failover`] can invoke it for both the primary and
+    /// the fallback provider without duplicating the fake-vs-real branching.
+    async fn dispatch_turn(
+        &self,
+        req: PromptRequest,
+        control: PromptControl,
+        snapshot: &RuntimeState,
+    ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
+        // Fake provider dispatch. The default `fake-ok` is a text-only echo that
+        // never touches the runtime loop (`run_fake_prompt`). The OCEAN-130
+        // `fake-tool` variant is different: it must trip the *real* permission
+        // gate and run a *real* tool, so it routes through `run_prompt` like a
+        // real provider — only with a deterministic `FakeToolProvider` injected
+        // (no network, no key) that emits one `write` tool call.
+        // The OCEAN-150 `fake-surface` variant likewise drives the real loop (it
+        // emits a `surface_patch` tool call so the daemon's SurfacePatch SSE
+        // bridge can be exercised end to end), so it routes through `run_prompt`.
+        let is_fake = snapshot.provider_config.selection.provider == ProviderId::Fake;
+        let is_fake_real_loop = is_fake
+            && (snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL
+                || snapshot.model.id == ocean_runtime::FAKE_SURFACE_MODEL);
+        if is_fake && !is_fake_real_loop {
+            self.run_fake_prompt(req, control, snapshot).await
+        } else {
+            self.run_prompt(req, control, snapshot).await
         }
     }
 
@@ -942,24 +1147,43 @@ impl AgentRuntime {
 
         let mut stdout = String::new();
         let mut stderr = String::new();
+        // Failover safety boundary (OCEAN-275). The agent loop emits control
+        // events (`AgentStart`/`TurnStart`) *before* it connects to the provider;
+        // those are not observable side effects. The moment ANY content or tool
+        // event flows — assistant text/thinking, a tool execution, a permission
+        // outcome — the turn has begun producing real, possibly side-effecting
+        // output. We flip `streamed_output` on exactly those events so the caller
+        // (`prompt()`) can tell a pre-stream connect-failure (safe to fail over)
+        // from a mid-stream failure (UNSAFE — failing over would re-run the model
+        // and replay tool side effects). On a connect-failure the loop sees only
+        // control events, so this stays `false` and failover is allowed.
+        let mut streamed_output = false;
         while let Some(ev) = rx.recv().await {
             if let Some(sink) = event_sink.as_ref() {
                 let _ = sink.send(ev.clone());
             }
             match ev {
-                AgentEvent::TextDelta { delta, .. } => stdout.push_str(&delta),
+                AgentEvent::TextDelta { delta, .. } => {
+                    streamed_output = true;
+                    stdout.push_str(&delta)
+                }
                 AgentEvent::ThinkingDelta { delta, .. } => {
+                    streamed_output = true;
                     stderr.push_str("thinking: ");
                     stderr.push_str(&delta);
                     stderr.push('\n');
                 }
                 AgentEvent::AssistantMessage { .. } if !stdout.ends_with('\n') => {
+                    streamed_output = true;
                     stdout.push('\n');
                 }
-                AgentEvent::AssistantMessage { .. } => {}
+                AgentEvent::AssistantMessage { .. } => {
+                    streamed_output = true;
+                }
                 AgentEvent::ToolExecutionStart {
                     tool_name, args, ..
                 } => {
+                    streamed_output = true;
                     stderr.push_str(&format!("→ {tool_name}({args})\n"));
                 }
                 AgentEvent::ToolExecutionEnd {
@@ -967,6 +1191,7 @@ impl AgentRuntime {
                     is_error,
                     ..
                 } => {
+                    streamed_output = true;
                     stderr.push_str(&format!(
                         "← {tool_name} {}\n",
                         if is_error { "error" } else { "ok" }
@@ -975,13 +1200,30 @@ impl AgentRuntime {
                 AgentEvent::PermissionDenied {
                     tool_name, reason, ..
                 } => {
+                    streamed_output = true;
                     stderr.push_str(&format!("✗ permission denied for {tool_name}: {reason}\n"));
                 }
                 _ => {}
             }
         }
 
-        let run = handle.await.context("agent task join failed")??;
+        let run = match handle.await.context("agent task join failed")? {
+            Ok(run) => run,
+            // The agent loop failed. Carry the `streamed_output` flag out so the
+            // caller can decide whether failover is safe (only when nothing
+            // streamed). We do NOT save the session here — a failed turn commits
+            // no transcript, so a fallback retry starts from the same clean
+            // history with no partial/duplicated state.
+            Err(e) => {
+                return Err(TurnFailure {
+                    streamed_output,
+                    // Box as anyhow so the failover classifier can downcast back
+                    // to the concrete `AgentError`/protocol cause.
+                    error: anyhow::Error::new(e),
+                }
+                .into())
+            }
+        };
         // Cap what we persist. The agent loop already trims per-send to the
         // context window, but the *stored* transcript would otherwise grow
         // forever and be reloaded in full on every future turn (the dominant
@@ -1007,6 +1249,83 @@ impl AgentRuntime {
             total_tokens: run.usage.total_tokens,
         };
         Ok((session.id, stdout, stderr, usage))
+    }
+}
+
+/// A failed turn, carrying whether the provider had begun streaming output when
+/// it failed (OCEAN-275).
+///
+/// `run_prompt` wraps its underlying `anyhow::Error` in this so the failover
+/// decision in [`AgentRuntime::prompt`] can recover the `streamed_output` flag by
+/// downcast. The flag is the mid-stream-safety gate: failover is only ever
+/// attempted when `streamed_output == false` (a pre-stream connect-failure), so a
+/// turn that already emitted assistant text or ran a tool is NEVER replayed
+/// against a second provider. `Display`/`source` delegate to the inner error, so
+/// the user-facing message and `downcast_ref::<AgentError>()` (the existing 408
+/// timeout mapping) keep working unchanged.
+#[derive(Debug)]
+struct TurnFailure {
+    streamed_output: bool,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for TurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for TurnFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// Classify whether a failed turn is eligible for provider failover (OCEAN-275).
+///
+/// Two conditions, both required:
+/// 1. **Nothing streamed.** A turn that already emitted content or a tool event
+///    must not be retried on another provider (it would replay side effects).
+///    A bare `anyhow::Error` that isn't a [`TurnFailure`] is treated as
+///    "streamed/unknown" → not eligible, the conservative default.
+/// 2. **Availability error.** The underlying failure must be transient/
+///    availability (connect/timeout, 429, 5xx, missing credential, or an
+///    exhausted-retry wrapping one of those) — not a user/content error that
+///    would fail identically on any provider.
+///
+/// Returns `None` when not eligible, otherwise `Some(())` (the caller already
+/// holds the context it needs to pick the alternate).
+fn failover_eligible(err: &anyhow::Error) -> bool {
+    // Must be a TurnFailure that did not stream — otherwise mid-stream/unknown.
+    let Some(turn) = err.downcast_ref::<TurnFailure>() else {
+        return false;
+    };
+    if turn.streamed_output {
+        return false;
+    }
+    // The wrapped error must be an availability/transient one. The chain is
+    // anyhow(TurnFailure) → anyhow(inner) → AgentError → ocean_protocol::Error.
+    // Recover the protocol error: AgentError::Provider holds it; otherwise the
+    // failure isn't a provider-availability problem (e.g. a join error).
+    match turn.error.downcast_ref::<AgentError>() {
+        Some(AgentError::Provider(perr)) => perr.is_retryable_availability(),
+        // AgentError::Timeout is a per-turn deadline; a provider that hangs past
+        // the deadline is an availability problem worth trying an alternate for.
+        Some(AgentError::Timeout { .. }) => true,
+        _ => false,
+    }
+}
+
+/// Strip the internal [`TurnFailure`] wrapper, returning the underlying
+/// `anyhow::Error` (the one carrying the `AgentError`/protocol cause).
+///
+/// `prompt`'s error handling — the 408 timeout `downcast_ref::<AgentError>()` and
+/// the `Display` shown to the caller — expects the original error, not the
+/// failover-bookkeeping wrapper. A non-`TurnFailure` error passes through.
+fn unwrap_turn_failure(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<TurnFailure>() {
+        Ok(turn) => turn.error,
+        Err(other) => other,
     }
 }
 
@@ -2707,12 +3026,25 @@ done
     }
 
     fn runtime(config_dir: PathBuf, provider_config: ProviderConfig) -> AgentRuntime {
+        runtime_with_env(config_dir, provider_config, None)
+    }
+
+    /// Like [`runtime`] but injects a deterministic [`ProviderEnv`] used by the
+    /// failover decision (OCEAN-275), so `prompt`-level failover can be tested
+    /// without touching the global process environment. `None` ⇒ falls back to
+    /// the real process env (same as production).
+    fn runtime_with_env(
+        config_dir: PathBuf,
+        provider_config: ProviderConfig,
+        test_env: Option<ProviderEnv>,
+    ) -> AgentRuntime {
         let state = state_from_provider_config(provider_config).unwrap();
         AgentRuntime {
             config_dir,
             state: std::sync::Arc::new(std::sync::RwLock::new(state)),
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            test_env,
         }
     }
 
@@ -2967,9 +3299,14 @@ done
     #[tokio::test]
     async fn missing_credential_preflight_names_ocean_provider_and_model() {
         let config_dir = temp_config_dir("missing-credential");
-        let runtime = runtime(
+        // Inject an EMPTY environment so provider failover (OCEAN-275) finds no
+        // ready alternate — the deterministic all-degraded path. Without this the
+        // turn could reroute to whatever real provider credential happens to be in
+        // the test process env, making the assertion non-hermetic.
+        let runtime = runtime_with_env(
             config_dir.clone(),
             provider_config(ProviderId::DeepSeek, "deepseek-v4-pro", false),
+            Some(ProviderEnv::default()),
         );
 
         let res = runtime
@@ -2991,13 +3328,62 @@ done
             )
             .await;
 
+        // The turn fails clearly, and the message still names the degraded
+        // provider+model (the original contract) while now also flagging the
+        // all-degraded condition (no ready fallback).
         assert!(!res.ok);
+        assert!(res.stderr.contains("all providers degraded"));
         assert!(res.stderr.contains("provider deepseek"));
         assert!(res.stderr.contains("deepseek-v4-pro"));
         assert!(!res.stderr.contains("provider openai"));
         assert!(runtime.list_sessions(None).unwrap().is_empty());
         let missing = runtime.session_detail(SessionId::new_v4()).unwrap_err();
         assert!(missing.to_string().contains("not found"));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // OCEAN-275 end-to-end: a turn whose PRIMARY provider is degraded is routed
+    // through `prompt()` to a ready alternate and SUCCEEDS, rather than failing.
+    // The injected env makes `fake-ok` the configured fallback — it's ready with
+    // no credential and runs the no-network fake path, so this exercises the full
+    // selection-time failover wiring deterministically.
+    #[tokio::test]
+    async fn prompt_fails_over_degraded_primary_to_ready_alternate_and_succeeds() {
+        let config_dir = temp_config_dir("failover-success");
+        let env = provider_env(&[("OCEAN_PROVIDER_FALLBACK", "fake-ok")]);
+        let runtime = runtime_with_env(
+            config_dir.clone(),
+            // Primary deepseek with NO credential → degraded at selection.
+            provider_config(ProviderId::DeepSeek, "deepseek-v4-pro", false),
+            Some(env),
+        );
+
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "hello".into(),
+                    images: None,
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                    decision_token: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+
+        // Rerouted to the ready fake-ok alternate → the turn succeeds.
+        assert!(
+            res.ok,
+            "degraded primary should fail over to the ready alternate, got stderr: {}",
+            res.stderr
+        );
+        assert!(res.stdout.contains("OCEAN_FAKE_OK"));
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
@@ -3033,6 +3419,196 @@ done
             .expect("an uncredentialed state must fail preflight");
         assert!(err.contains("deepseek"));
         assert!(err.contains("deepseek-v4-pro"));
+    }
+
+    // ---- Provider failover wiring (OCEAN-275) -----------------------------
+
+    /// Build a `ProviderEnv` from key/value pairs for deterministic failover
+    /// tests (no process-env mutation).
+    fn provider_env(vars: &[(&str, &str)]) -> ProviderEnv {
+        ProviderEnv {
+            vars: vars
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            auth_file: None,
+        }
+    }
+
+    // A READY primary passes straight through selection-time failover untouched —
+    // failover must never perturb the happy path.
+    #[test]
+    fn selection_failover_passes_a_ready_primary_through_unchanged() {
+        let ready = state_from_provider_config(provider_config(
+            ProviderId::DeepSeek,
+            "deepseek-v4-pro",
+            true,
+        ))
+        .unwrap();
+        let env = provider_env(&[("ANTHROPIC_API_KEY", "sk-ant")]);
+        let out = AgentRuntime::resolve_turn_state_with_failover(ready.clone(), &env)
+            .expect("ready primary must resolve");
+        assert_eq!(
+            out.provider_config.selection.provider,
+            ProviderId::DeepSeek,
+            "a ready primary must not be rerouted"
+        );
+        assert_eq!(out.provider_config.selection.model, "deepseek-v4-pro");
+    }
+
+    // A DEGRADED primary (no credential) with a ready alternate in the env routes
+    // the turn to that alternate. This is the core OCEAN-275 behavior at the
+    // agent-wiring level: degraded → routed to a ready provider, not failed.
+    #[test]
+    fn selection_failover_routes_degraded_primary_to_ready_alternate() {
+        // Primary deepseek has no credential here (degraded), but an Anthropic key
+        // is present — the default fallback order leads with Anthropic.
+        let degraded = state_from_provider_config(provider_config(
+            ProviderId::DeepSeek,
+            "deepseek-v4-pro",
+            false,
+        ))
+        .unwrap();
+        let env = provider_env(&[("ANTHROPIC_API_KEY", "sk-ant")]);
+        let out = AgentRuntime::resolve_turn_state_with_failover(degraded, &env)
+            .expect("a ready alternate must be selected");
+        assert_eq!(
+            out.provider_config.selection.provider,
+            ProviderId::Anthropic,
+            "degraded primary must route to the ready anthropic alternate"
+        );
+        assert!(
+            AgentRuntime::preflight_error_for(&out).is_none(),
+            "the chosen alternate must itself be ready"
+        );
+    }
+
+    // A degraded primary with NO ready alternate anywhere yields a clear
+    // "all providers degraded" error — never a silent hang or a bare
+    // single-provider message.
+    #[test]
+    fn selection_failover_errors_clearly_when_all_providers_degraded() {
+        let degraded = state_from_provider_config(provider_config(
+            ProviderId::DeepSeek,
+            "deepseek-v4-pro",
+            false,
+        ))
+        .unwrap();
+        // No credentials for any alternate.
+        let env = provider_env(&[]);
+        let err = AgentRuntime::resolve_turn_state_with_failover(degraded, &env)
+            .expect_err("no ready provider anywhere must be an error");
+        assert!(
+            err.contains("all providers degraded"),
+            "error must name the all-degraded condition, got: {err}"
+        );
+        // It also names the override knob so the operator knows the lever.
+        assert!(err.contains(ocean_providers::ENV_PROVIDER_FALLBACK));
+    }
+
+    // The env override steers WHICH alternate selection-time failover picks.
+    #[test]
+    fn selection_failover_honors_env_override_order() {
+        let degraded = state_from_provider_config(provider_config(
+            ProviderId::Google,
+            "gemini-2.0-flash",
+            false,
+        ))
+        .unwrap();
+        // Both deepseek and anthropic are credentialed; override puts deepseek
+        // first, so it must win over the default anthropic-first order.
+        let env = provider_env(&[
+            ("OCEAN_PROVIDER_FALLBACK", "deepseek-v4-pro, claude-opus-4-7"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
+        ]);
+        let out = AgentRuntime::resolve_turn_state_with_failover(degraded, &env).unwrap();
+        assert_eq!(out.provider_config.selection.provider, ProviderId::DeepSeek);
+    }
+
+    // `failover_eligible`: a pre-stream availability failure (nothing streamed +
+    // transient cause) IS eligible.
+    #[test]
+    fn failover_eligible_for_prestream_availability_error() {
+        let err: anyhow::Error = TurnFailure {
+            streamed_output: false,
+            error: anyhow::Error::new(AgentError::Provider(
+                ocean_protocol::Error::ProviderError {
+                    status: 503,
+                    body: "overloaded".into(),
+                },
+            )),
+        }
+        .into();
+        assert!(failover_eligible(&err));
+    }
+
+    // `failover_eligible`: once output streamed, the SAME availability error is
+    // NOT eligible — this is the mid-stream safety gate that prevents replaying
+    // tool side effects against a second provider.
+    #[test]
+    fn no_failover_after_output_streamed_even_on_availability_error() {
+        let err: anyhow::Error = TurnFailure {
+            streamed_output: true,
+            error: anyhow::Error::new(AgentError::Provider(
+                ocean_protocol::Error::ProviderError {
+                    status: 503,
+                    body: "overloaded".into(),
+                },
+            )),
+        }
+        .into();
+        assert!(
+            !failover_eligible(&err),
+            "a turn that already streamed must never fail over"
+        );
+    }
+
+    // `failover_eligible`: a user/content error (4xx other than 429) is NOT
+    // eligible even pre-stream — it would fail identically on any provider.
+    #[test]
+    fn no_failover_on_user_error() {
+        let err: anyhow::Error = TurnFailure {
+            streamed_output: false,
+            error: anyhow::Error::new(AgentError::Provider(
+                ocean_protocol::Error::ProviderError {
+                    status: 400,
+                    body: "bad request".into(),
+                },
+            )),
+        }
+        .into();
+        assert!(!failover_eligible(&err));
+    }
+
+    // `failover_eligible`: a plain error that isn't a `TurnFailure` (e.g. a
+    // pre-stream session/config error) is conservatively NOT eligible.
+    #[test]
+    fn no_failover_for_non_turnfailure_errors() {
+        let err = anyhow::anyhow!("session not found");
+        assert!(!failover_eligible(&err));
+    }
+
+    // `unwrap_turn_failure` strips the wrapper so the existing AgentError
+    // downcast (e.g. the 408 timeout mapping) keeps working.
+    #[test]
+    fn unwrap_turn_failure_recovers_the_inner_agent_error() {
+        let wrapped: anyhow::Error = TurnFailure {
+            streamed_output: false,
+            error: anyhow::Error::new(AgentError::Timeout { secs: 300 }),
+        }
+        .into();
+        let inner = unwrap_turn_failure(wrapped);
+        assert!(
+            matches!(
+                inner.downcast_ref::<AgentError>(),
+                Some(AgentError::Timeout { secs: 300 })
+            ),
+            "the inner AgentError::Timeout must survive unwrapping"
+        );
+        // A non-TurnFailure passes through untouched.
+        let plain = anyhow::anyhow!("plain");
+        assert_eq!(unwrap_turn_failure(plain).to_string(), "plain");
     }
 
     // The Fake dispatch must also key off the EFFECTIVE state. A Fake global
