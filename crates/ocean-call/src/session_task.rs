@@ -168,6 +168,35 @@ fn summary_prompt(transcript: &str) -> String {
     format!("{SUMMARY_INSTRUCTION}\n\nTranscript:\n{}", transcript.trim())
 }
 
+/// Hard ceiling on a single summary turn (OCEAN-254). The summary turn issues an
+/// agent turn through the [`TurnRunner`], which has no deadline of its own; if
+/// that turn hangs (a provider stall the per-provider timeout missed, a wedged
+/// runtime, etc.) it would otherwise block the call loop — and therefore the
+/// final drain, [`CallSession::end`], and `CallEnded` — *forever*. So the turn is
+/// raced against this deadline; on expiry the summary is skipped (the prior
+/// summary stands, exactly like a failed turn) and teardown proceeds. A short
+/// summary needs only a few seconds, so 25s is generous slack yet still bounds
+/// the hang. Override with `OCEAN_CALL_SUMMARY_TIMEOUT_MS`.
+const SUMMARY_TURN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Hard ceiling on a single wake-answer turn (OCEAN-254). [`run_answer`] awaits
+/// the same unbounded [`TurnRunner::run`] from inside the call loop, so a hung
+/// answer turn stalls the very same teardown path as a hung summary. Bounded the
+/// same way: on expiry the answer is skipped (no `CallAgentSpoke`), the wake
+/// cooldown still starts so the same echo can't immediately re-trigger it, and
+/// the call continues. Override with `OCEAN_CALL_ANSWER_TIMEOUT_MS`.
+const ANSWER_TURN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Resolve a turn timeout, honouring an optional `env` override (milliseconds).
+/// A missing/blank/unparseable/zero value falls back to `default`, so a fat-
+/// fingered env can never *disable* the bound — the whole point of OCEAN-254.
+fn turn_timeout(env: &str, default: Duration) -> Duration {
+    match std::env::var(env).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(ms) if ms > 0 => Duration::from_millis(ms),
+        _ => default,
+    }
+}
+
 /// Estimate the buffered audio duration in ms from sample count + format.
 fn buffered_ms(samples: usize, sample_rate: u32, channels: u16) -> u64 {
     if sample_rate == 0 {
@@ -387,12 +416,27 @@ async fn run_answer<R, V, K>(
     V: Voice,
     K: EventSink,
 {
-    let reply = match runner.run(&command).await {
-        Ok(reply) => reply,
-        Err(e) => {
+    // Bound the turn so a hung answer can't stall call teardown (OCEAN-254):
+    // `run_answer` awaits the same unbounded `runner.run` from inside the call
+    // loop, so a wedged answer would block `CallEnded` just like a wedged summary.
+    // On timeout (or error) we skip the answer — no `CallAgentSpoke` — but still
+    // start the cooldown so the same echo can't immediately re-trigger it.
+    let timeout = turn_timeout("OCEAN_CALL_ANSWER_TIMEOUT_MS", ANSWER_TURN_TIMEOUT);
+    let reply = match tokio::time::timeout(timeout, runner.run(&command)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, command, "agent turn failed for wake answer");
             // Still start the cooldown so a failed answer doesn't re-trigger in
             // a tight loop on the same utterance echo.
+            session.mark_replied(clock().saturating_sub(started_ms));
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                command,
+                "wake answer turn timed out; skipping answer, not blocking teardown"
+            );
             session.mark_replied(clock().saturating_sub(started_ms));
             return;
         }
@@ -430,10 +474,22 @@ where
         return;
     }
     let prompt = summary_prompt(&transcript);
-    let summary = match runner.run(&prompt).await {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
+    // Bound the turn so a hung summary can't stall call teardown (OCEAN-254): a
+    // wedged `runner.run` here would otherwise block the loop's final drain and
+    // `CallEnded`. On timeout we degrade exactly like a failed turn — skip the
+    // summary, keep the prior one, never emit a raw-transcript fallback.
+    let timeout = turn_timeout("OCEAN_CALL_SUMMARY_TIMEOUT_MS", SUMMARY_TURN_TIMEOUT);
+    let summary = match tokio::time::timeout(timeout, runner.run(&prompt)).await {
+        Ok(Ok(s)) => s.trim().to_string(),
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "agent turn failed for call summary; keeping prior summary");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                "call summary turn timed out; keeping prior summary, not blocking teardown"
+            );
             return;
         }
     };
@@ -1583,6 +1639,208 @@ mod tests {
             !types.contains(&"summary"),
             "failed summary turn must not emit a raw-transcript fallback; got {types:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // OCEAN-254: a HUNG turn (not a fast error) must not stall call teardown.
+    //
+    // `run_summary` / `run_answer` await the unbounded `TurnRunner::run` from
+    // inside the call loop, so a wedged turn — a provider that never returns,
+    // the very case #152/#153's narrower timeouts can miss — would block the
+    // loop's final drain, `CallSession::end`, and therefore `CallEnded` forever.
+    // The fix races each turn against a bounded `tokio::time::timeout`. These
+    // tests prove the bound fires: a runner that sleeps far past the (env-
+    // shortened) deadline still lets the call end cleanly, with no summary /
+    // no spoke, and — load-bearing — without deadlocking.
+    //
+    // Both manipulate the timeout-override envs, which are process-global, so a
+    // mutex serializes them against each other; no other test reads these envs.
+    // Each runs under an OUTER `tokio::time::timeout` guard so a regression that
+    // reintroduces the hang fails fast here instead of wedging the test binary.
+    // -----------------------------------------------------------------------
+
+    /// Serializes the env-mutating OCEAN-254 tests so their writes to the
+    /// process-global timeout-override env vars can't interleave. An async-aware
+    /// mutex (not `std::sync`) so the guard can be held across the `await` of the
+    /// call under test without tripping `clippy::await_holding_lock`. It carries
+    /// no data and is never poisoned, so `.lock().await` can't fail.
+    static OCEAN_254_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A [`TurnRunner`] that never returns within the test horizon — it sleeps
+    /// far longer than any (shortened) turn deadline, modelling a wedged provider
+    /// / agent runtime. Records whether it was entered so a test can prove the
+    /// turn was actually attempted before the timeout pre-empted it.
+    struct HangingRunner {
+        entered: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl TurnRunner for HangingRunner {
+        async fn run(&mut self, _command: &str) -> anyhow::Result<String> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            // Effectively "never returns" for the test: far beyond the millisecond
+            // deadline the env override installs. The production `timeout` must cut
+            // this off; if it doesn't, the OUTER guard in the test trips instead.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok("unreachable: the turn timeout must fire first".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_summary_turn_times_out_and_call_still_ends() {
+        // Two finals cross the every_n_segments=2 threshold → a summary turn is
+        // due. That turn hangs. The bounded summary timeout must cut it off so the
+        // call drains, ends, and emits CallEnded — never blocking teardown — and
+        // no summary is emitted (degraded gracefully, prior summary stands).
+        let _guard = OCEAN_254_ENV_LOCK.lock().await;
+        // Shorten ONLY the summary deadline so the hang is cut in milliseconds.
+        std::env::set_var("OCEAN_CALL_SUMMARY_TIMEOUT_MS", "50");
+
+        let entered = Arc::new(AtomicU64::new(0));
+        let frames = vec![frame_3s(), frame_3s()];
+        let stt = ScriptedStt::new(vec![Some("the quarterly numbers"), Some("ship it friday")]);
+        let mut out = CapturingSink::default();
+
+        // OUTER guard: if the summary timeout ever fails to fire, the call loop
+        // wedges on the 60s sleep and THIS trips at 5s — turning a deadlock into a
+        // fast, legible failure instead of a hung test binary.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_call_session(
+                session(false),
+                VecFrames::new(frames),
+                stt,
+                HangingRunner {
+                    entered: entered.clone(),
+                },
+                CapturingVoice::default(),
+                &mut out,
+                "call:room".into(),
+                vec![],
+                UtterancePolicy::default(),
+                step_clock(0, 100),
+            ),
+        )
+        .await;
+
+        std::env::remove_var("OCEAN_CALL_SUMMARY_TIMEOUT_MS");
+
+        assert!(
+            result.is_ok(),
+            "the call must finish (no deadlock); a hung summary turn must not stall teardown"
+        );
+        assert!(
+            entered.load(Ordering::SeqCst) >= 1,
+            "the summary turn must have actually been attempted before the timeout fired"
+        );
+        let types = ev_types(&out);
+        // Teardown completed: CallEnded is non-negotiable even with a hung turn.
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded must fire; got {types:?}");
+        // Graceful degradation: a timed-out summary emits NO summary event (the
+        // prior summary stands), and certainly never the raw transcript.
+        assert!(
+            !types.contains(&"summary"),
+            "a timed-out summary turn must not emit a summary; got {types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_answer_turn_times_out_and_call_still_ends() {
+        // A wake command fires and its answer turn hangs. The bounded answer
+        // timeout must cut it off: the call still ends cleanly, nothing is spoken,
+        // and no CallAgentSpoke is emitted — the answer is skipped, never a hang.
+        let _guard = OCEAN_254_ENV_LOCK.lock().await;
+        // Shorten ONLY the answer deadline so the wedged wake turn is cut fast.
+        std::env::set_var("OCEAN_CALL_ANSWER_TIMEOUT_MS", "50");
+
+        let entered = Arc::new(AtomicU64::new(0));
+        let frames = vec![frame_3s()];
+        let stt = ScriptedStt::new(vec![Some("hey Ocean what did we agree to")]);
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_call_session(
+                session(false),
+                VecFrames::new(frames),
+                stt,
+                HangingRunner {
+                    entered: entered.clone(),
+                },
+                voice,
+                &mut out,
+                "call:room".into(),
+                vec![],
+                UtterancePolicy::default(),
+                step_clock(0, 100),
+            ),
+        )
+        .await;
+
+        std::env::remove_var("OCEAN_CALL_ANSWER_TIMEOUT_MS");
+
+        assert!(
+            result.is_ok(),
+            "the call must finish (no deadlock); a hung answer turn must not stall teardown"
+        );
+        assert!(
+            entered.load(Ordering::SeqCst) >= 1,
+            "the answer turn must have actually been attempted before the timeout fired"
+        );
+        let types = ev_types(&out);
+        // Wake fired, the call ended cleanly...
+        assert!(types.contains(&"wake"), "wake should still trigger; got {types:?}");
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded must fire; got {types:?}");
+        // ...but the timed-out answer spoke nothing and emitted no spoke event.
+        assert!(
+            !types.contains(&"spoke"),
+            "a timed-out answer must not emit CallAgentSpoke; got {types:?}"
+        );
+        assert!(
+            spoken.lock().unwrap().is_empty(),
+            "a timed-out answer must speak nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_timeout_env_override_parses_and_guards() {
+        // The override is honoured when valid, and a fat-fingered value can never
+        // DISABLE the bound — it falls back to the default (the OCEAN-254 guard).
+        let _guard = OCEAN_254_ENV_LOCK.lock().await;
+        let key = "OCEAN_CALL_SUMMARY_TIMEOUT_MS";
+        let default = Duration::from_secs(25);
+
+        std::env::remove_var(key);
+        assert_eq!(turn_timeout(key, default), default, "unset → default");
+
+        std::env::set_var(key, "1500");
+        assert_eq!(
+            turn_timeout(key, default),
+            Duration::from_millis(1500),
+            "a valid ms value is honoured"
+        );
+
+        std::env::set_var(key, "  900  ");
+        assert_eq!(
+            turn_timeout(key, default),
+            Duration::from_millis(900),
+            "surrounding whitespace is trimmed"
+        );
+
+        // Zero / blank / garbage must NOT disable the bound — fall back to default.
+        for bad in ["0", "", "   ", "abc", "-5", "12.5"] {
+            std::env::set_var(key, bad);
+            assert_eq!(
+                turn_timeout(key, default),
+                default,
+                "a non-positive/unparseable value ({bad:?}) must fall back to the default"
+            );
+        }
+        std::env::remove_var(key);
     }
 
     #[test]
