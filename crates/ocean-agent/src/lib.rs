@@ -42,6 +42,103 @@ const APP_NAME: &str = "ocean-rs";
 /// than wedging daemon startup.
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Default page size for a collection list (sessions, projects) when a caller
+/// does not specify a limit (OCEAN-250). The list endpoints used to return every
+/// row — a daemon with thousands of historical sessions answered a multi-MB JSON
+/// blob on every poll. This caps the default; callers page through with the
+/// returned cursor. Mirrors `ocean_store::DEFAULT_LIST_LIMIT`.
+pub const DEFAULT_LIST_LIMIT: usize = 100;
+
+/// Hard ceiling on a single collection-list page (OCEAN-250). A caller-supplied
+/// limit is clamped to this so no list request can be coerced into an unbounded
+/// load + serialize. Mirrors `ocean_store::MAX_LIST_LIMIT`.
+pub const MAX_LIST_LIMIT: usize = 1000;
+
+/// Clamp a caller-supplied collection-list limit into the allowed range. `None`
+/// ⇒ [`DEFAULT_LIST_LIMIT`]; any value is capped at [`MAX_LIST_LIMIT`] and
+/// floored at 1 so `0` can never request an empty-yet-`has_more` page.
+pub fn clamp_list_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT)
+}
+
+/// One bounded page of a collection list (OCEAN-250).
+///
+/// `items` holds at most the effective limit of rows, in the list's existing
+/// stable order. `next_cursor` is the opaque cursor a client replays to fetch the
+/// next page (here, the `id` of the last returned item); it is `Some(..)` when
+/// more rows exist and `None` at the end. `has_more` is the same signal as a
+/// bool. The list-endpoint analogue of `ocean_store::TranscriptPage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    /// This page's items, in list order, at most the effective limit.
+    pub items: Vec<T>,
+    /// Cursor for the next page, or `None` at the end of the list.
+    pub next_cursor: Option<String>,
+    /// Whether at least one more item exists beyond this page.
+    pub has_more: bool,
+}
+
+/// Order projects newest-first by `(updated_ms DESC, id DESC)` (OCEAN-250).
+///
+/// The on-disk project index has no inherent order; a stable sort here gives the
+/// list endpoint a deterministic sequence so its keyset cursor is meaningful (and
+/// matches how sessions are ordered). The `id` tiebreak keeps the order total
+/// when two projects share an `updated_ms`.
+fn sort_projects_newest_first(projects: &mut [Project]) {
+    projects.sort_by(|a, b| {
+        b.updated_ms
+            .cmp(&a.updated_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+/// Page an already-ordered list by an opaque per-item cursor key (OCEAN-250).
+///
+/// `items` MUST already be in the caller's stable display order (these lists are
+/// fully sorted before paging). `key_of` extracts each item's cursor string (a
+/// stable, unique id). When `after` is `Some`, we resume *just past* the item
+/// whose key equals it; a cursor that matches nothing (item deleted since it was
+/// handed out) falls back to the start rather than erroring, so paging is
+/// resilient to a stale cursor. At most `clamp_list_limit(limit)` items are
+/// returned, with `next_cursor` = the last returned item's key when more remain.
+///
+/// This is the in-memory counterpart to the store's SQL `LIMIT + 1` sentinel:
+/// the file-backed session/project stores load their (already bounded by the
+/// filesystem) set and slice it here, so a single response is still capped.
+fn paginate_by_id<T>(
+    items: Vec<T>,
+    after: Option<&str>,
+    limit: Option<usize>,
+    key_of: impl Fn(&T) -> String,
+) -> Page<T> {
+    let effective_limit = clamp_list_limit(limit);
+    // Resume index: the first item *after* the cursor. Unknown cursor ⇒ 0 (start).
+    let start = match after {
+        Some(cursor) => items
+            .iter()
+            .position(|it| key_of(it) == cursor)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let remaining = items.len().saturating_sub(start);
+    let take = effective_limit.min(remaining);
+    let has_more = remaining > take;
+    let page: Vec<T> = items.into_iter().skip(start).take(take).collect();
+    let next_cursor = if has_more {
+        page.last().map(&key_of)
+    } else {
+        None
+    };
+    Page {
+        items: page,
+        next_cursor,
+        has_more,
+    }
+}
+
 /// Build the first user `Message` of a turn from the prompt text and any
 /// attached images (OCEAN-115). The content is always `[Text, Image, Image…]`:
 /// the text leads, then one `Content::Image` block per image, so the provider
@@ -425,6 +522,24 @@ impl AgentRuntime {
         session::list(&self.config_dir, workspace_root)
     }
 
+    /// One bounded page of sessions (OCEAN-250), optionally scoped to a workspace.
+    ///
+    /// Sessions come back newest-first (`updated_ms DESC, id DESC`) exactly as
+    /// [`Self::list_sessions`] orders them; this slices that order by the `after`
+    /// cursor (a session id) and caps the page via [`clamp_list_limit`]. The
+    /// returned [`Page`] carries `next_cursor` (the last returned session's id, to
+    /// replay as the next `after`) and `has_more`. Page to the end by repeating
+    /// with `after = next_cursor` until `has_more` is false.
+    pub fn list_sessions_page(
+        &self,
+        workspace_root: Option<&str>,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Page<SessionSummary>> {
+        let all = session::list(&self.config_dir, workspace_root)?;
+        Ok(paginate_by_id(all, after, limit, |s| s.id.to_string()))
+    }
+
     /// Resolve the workspace root for an arbitrary cwd. Exposed so callers
     /// (daemon, TUI) can ask "what workspace would my current cwd map to?"
     /// without depending on the private session module.
@@ -434,9 +549,31 @@ impl AgentRuntime {
 
     // ---- Projects ----------------------------------------------------------
 
-    /// Every registered project.
+    /// Every registered project, newest-first (`updated_ms DESC, id DESC`).
+    ///
+    /// The on-disk index is an unordered array; this returns it in a stable,
+    /// deterministic order so clients (and the cursor in [`Self::list_projects_page`])
+    /// see a consistent sequence rather than filesystem/insertion order.
     pub fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
-        project::load_all(&self.config_dir)
+        let mut projects = project::load_all(&self.config_dir)?;
+        sort_projects_newest_first(&mut projects);
+        Ok(projects)
+    }
+
+    /// One bounded page of projects (OCEAN-250).
+    ///
+    /// Projects are ordered newest-first (`updated_ms DESC, id DESC`) — the same
+    /// stable order [`Self::list_projects`] returns — then sliced by the `after`
+    /// cursor (a project id) and capped via [`clamp_list_limit`]. The returned
+    /// [`Page`] carries `next_cursor` (the last returned project's id) and
+    /// `has_more`; page to the end by repeating with `after = next_cursor`.
+    pub fn list_projects_page(
+        &self,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Page<Project>> {
+        let all = self.list_projects()?;
+        Ok(paginate_by_id(all, after, limit, |p| p.id.to_string()))
     }
 
     /// One project by id.
@@ -3364,6 +3501,195 @@ done
         assert_eq!(detail.tool_context[0].tool_name, "read");
         assert_eq!(detail.tool_context[1].kind, "result");
         assert_eq!(detail.tool_context[1].text, "contents");
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // ---- OCEAN-250: collection-list pagination -----------------------------
+
+    #[test]
+    fn clamp_list_limit_defaults_and_clamps() {
+        assert_eq!(clamp_list_limit(None), DEFAULT_LIST_LIMIT);
+        assert_eq!(clamp_list_limit(Some(usize::MAX)), MAX_LIST_LIMIT);
+        // 0 floors to 1 so it can never request an empty-yet-has_more page.
+        assert_eq!(clamp_list_limit(Some(0)), 1);
+        assert_eq!(clamp_list_limit(Some(50)), 50);
+    }
+
+    #[test]
+    fn paginate_by_id_caps_and_returns_cursor() {
+        let items: Vec<u32> = (0..10).collect();
+        let page = paginate_by_id(items, None, Some(4), |n| n.to_string());
+        assert_eq!(page.items, vec![0, 1, 2, 3]);
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn paginate_by_id_resumes_after_cursor_and_walks_to_end() {
+        // Page the whole list in steps of 3 via the cursor; reconstruct it all.
+        let total = 17usize;
+        let all: Vec<usize> = (0..total).collect();
+        let mut collected: Vec<usize> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard <= total + 2, "paging must terminate");
+            let page = paginate_by_id(all.clone(), after.as_deref(), Some(3), |n| n.to_string());
+            collected.extend(page.items.iter().copied());
+            match page.next_cursor {
+                Some(c) => {
+                    assert!(page.has_more);
+                    after = Some(c);
+                }
+                None => {
+                    assert!(!page.has_more, "no cursor ⇒ no more pages");
+                    break;
+                }
+            }
+        }
+        assert_eq!(collected, all, "every item once, in order");
+    }
+
+    #[test]
+    fn paginate_by_id_full_final_page_has_no_cursor() {
+        let items: Vec<u32> = (0..5).collect();
+        let page = paginate_by_id(items, None, Some(5), |n| n.to_string());
+        assert_eq!(page.items.len(), 5);
+        assert!(!page.has_more, "a full final page is not has_more");
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn paginate_by_id_unknown_cursor_falls_back_to_start() {
+        // A cursor matching nothing (item removed since) resumes from the top
+        // rather than erroring — resilient to a stale cursor.
+        let items: Vec<u32> = (0..4).collect();
+        let page = paginate_by_id(items, Some("nope"), Some(2), |n| n.to_string());
+        assert_eq!(page.items, vec![0, 1]);
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn paginate_by_id_default_cap_bounds_a_large_list() {
+        // More items than the default cap ⇒ exactly the cap, with more pages.
+        let big: Vec<usize> = (0..(DEFAULT_LIST_LIMIT + 25)).collect();
+        let page = paginate_by_id(big, None, None, |n| n.to_string());
+        assert_eq!(page.items.len(), DEFAULT_LIST_LIMIT);
+        assert!(page.has_more, "rows beyond the cap mean more pages");
+    }
+
+    #[test]
+    fn sort_projects_newest_first_orders_by_updated_then_id() {
+        use ocean_core::ProjectConfig;
+        let mk = |updated: i64| Project {
+            id: uuid::Uuid::new_v4(),
+            name: "p".into(),
+            workspace_root: "/x".into(),
+            config: ProjectConfig::default(),
+            created_ms: 0,
+            updated_ms: updated,
+        };
+        let mut projects = vec![mk(100), mk(300), mk(200)];
+        sort_projects_newest_first(&mut projects);
+        assert_eq!(projects[0].updated_ms, 300);
+        assert_eq!(projects[1].updated_ms, 200);
+        assert_eq!(projects[2].updated_ms, 100);
+    }
+
+    #[test]
+    fn list_projects_page_is_bounded_and_pageable() {
+        let config_dir = temp_config_dir("list-projects-page");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        // 5 projects, each newer than the last so the order is deterministic.
+        for i in 0..5i64 {
+            let p = Project {
+                id: uuid::Uuid::new_v4(),
+                name: format!("proj-{i}"),
+                workspace_root: format!("/dev/p{i}"),
+                config: ocean_core::ProjectConfig::default(),
+                created_ms: 1000 + i,
+                updated_ms: 1000 + i,
+            };
+            runtime.upsert_project(p, 1000 + i).unwrap();
+        }
+
+        // First page of 2 (newest-first: proj-4, proj-3).
+        let page1 = runtime.list_projects_page(None, Some(2)).unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert_eq!(page1.items[0].name, "proj-4");
+        assert_eq!(page1.items[1].name, "proj-3");
+        assert!(page1.has_more);
+        let cursor = page1.next_cursor.clone().expect("more pages ⇒ cursor");
+        assert_eq!(cursor, page1.items[1].id.to_string());
+
+        // Walk to the end with the cursor; collect everything once.
+        let mut names: Vec<String> = page1.items.iter().map(|p| p.name.clone()).collect();
+        let mut after = Some(cursor);
+        loop {
+            let page = runtime.list_projects_page(after.as_deref(), Some(2)).unwrap();
+            names.extend(page.items.iter().map(|p| p.name.clone()));
+            match page.next_cursor {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(
+            names,
+            vec!["proj-4", "proj-3", "proj-2", "proj-1", "proj-0"],
+            "paging reconstructs the full newest-first order exactly once"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn list_sessions_page_is_bounded_and_pageable() {
+        let config_dir = temp_config_dir("list-sessions-page");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        // Three sessions in the same workspace (the default cwd ".").
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let (id, _, _) = runtime.create_session(".", None).unwrap();
+            ids.push(id);
+        }
+
+        // Page of 2 then the rest via the cursor; union is all three, no dupes.
+        // (scope = None ⇒ all workspaces.)
+        let page1 = runtime.list_sessions_page(None, None, Some(2)).unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.has_more);
+        let cursor = page1.next_cursor.clone().expect("more ⇒ cursor");
+
+        let page2 = runtime
+            .list_sessions_page(None, Some(&cursor), Some(2))
+            .unwrap();
+        assert_eq!(page2.items.len(), 1, "one session left after the first page");
+        assert!(!page2.has_more);
+        assert_eq!(page2.next_cursor, None);
+
+        let mut seen: Vec<SessionId> = page1.items.iter().map(|s| s.id).collect();
+        seen.extend(page2.items.iter().map(|s| s.id));
+        seen.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(seen, expected, "paging covers every session exactly once");
+
+        // Default cap is bounded (not unbounded): with 3 sessions and no limit,
+        // the first default page holds all three and reports no more.
+        let page_default = runtime.list_sessions_page(None, None, None).unwrap();
+        assert_eq!(page_default.items.len(), 3);
+        assert!(!page_default.has_more);
+
         let _ = std::fs::remove_dir_all(config_dir);
     }
 }
