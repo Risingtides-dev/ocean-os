@@ -24,6 +24,15 @@ pub struct HealthResponse {
     pub service: String,
     pub version: String,
     pub backend: String,
+    /// Count of call-transcript writes the daemon ultimately DROPPED after its
+    /// bounded persistence retry (OCEAN-255). Best-effort transcript persistence
+    /// never stalls the live rail, so a sustained store failure would otherwise be
+    /// invisible; surfacing the running total here makes silent data-loss
+    /// observable (poll it; a climbing value means transcripts are being lost).
+    /// `0` on a healthy daemon. Defaulted on deserialize so older clients/payloads
+    /// that predate the field still parse.
+    #[serde(default)]
+    pub persist_failures_total: u64,
 }
 
 /// Lifecycle state for a request.

@@ -80,6 +80,13 @@ struct AppState {
     /// the guard is always dropped before any `await`, and every store method is
     /// synchronous, so a std `Mutex` is correct and never blocks the scheduler.
     rooms: RoomStoreHandle,
+    /// Daemon-wide count of call-transcript writes ultimately DROPPED after the
+    /// bounded persistence retry (OCEAN-255). Shared (by clone of the `Arc`) into
+    /// every per-call [`BusSink`] via [`BusSink::with_persistence_counter`], and
+    /// reported by `GET /health` as `persist_failures_total` so a sustained DB
+    /// problem that's silently losing transcripts becomes observable instead of
+    /// only living in the logs.
+    persist_failures: Arc<std::sync::atomic::AtomicU64>,
 }
 
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
@@ -688,6 +695,7 @@ async fn main() -> anyhow::Result<()> {
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
         rooms: Arc::new(Mutex::new(room_store)),
+        persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     // Background GC: the request/permission registries are otherwise unbounded
@@ -1014,6 +1022,12 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         service: "ocean-daemon".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         backend: state.runtime.backend_name().to_string(),
+        // Surface dropped-transcript-write count (OCEAN-255): best-effort call
+        // persistence never stalls the rail, so this is how a sustained store
+        // failure that's silently losing transcripts becomes visible. `0` healthy.
+        persist_failures_total: state
+            .persist_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -2083,6 +2097,296 @@ async fn longhouse_prepare(
     }))
 }
 
+// --- Call-transcript persistence: bounded retry + drop accounting (OCEAN-255) -
+//
+// PR #147's write-through is best-effort by design — a store failure must never
+// stall the live SSE rail. But "best-effort" was previously "warn! once and
+// drop", so a sustained DB problem silently lost the whole transcript while the
+// call looked healthy. OCEAN-255 keeps the rail unblocked but makes the durable
+// write *retry transient failures* and *surface* when it ultimately gives up.
+
+/// Max attempts for a single transcript write before it's dropped (one initial
+/// try plus up to `PERSIST_MAX_ATTEMPTS` minus one retries). Small and bounded:
+/// this is a best-effort side-channel, not a durable queue. The goal is to ride
+/// out a brief SQLite hiccup (a momentary lock/`SQLITE_BUSY`, a transient I/O
+/// blip), never to block forever on a dead disk.
+const PERSIST_MAX_ATTEMPTS: u32 = 3;
+
+/// Base backoff between retries. Doubles each attempt (≈10ms, 20ms), so the whole
+/// retry budget is tens of milliseconds — long enough to clear a transient lock,
+/// short enough that even the synchronous fallback (no Tokio runtime, e.g. unit
+/// tests) stays fast.
+const PERSIST_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Whether a store error is worth retrying. Only [`RoomStoreError::Db`] — an
+/// underlying SQLite/I-O failure — is transient (a lock, a momentary I/O error
+/// that a retry can clear). The caller-input variants (`BadKey`, `UnknownRoom`,
+/// `AlreadyExists`, `UnknownParticipant`) and `Encode` are deterministic: the
+/// same input fails identically, so retrying is pointless. Those still count as a
+/// drop (so they're visible) but skip the backoff loop.
+fn persist_error_is_transient(e: &ocean_store::RoomStoreError) -> bool {
+    matches!(e, ocean_store::RoomStoreError::Db(_))
+}
+
+/// One durable write the sink wants to make, captured with *owned* data so it can
+/// be retried — including on a spawned task that outlives the `emit()` call.
+/// Holding owned fields (not `&str` borrowed from the event) is what lets the
+/// retry move to a background task without borrowing the live event.
+#[derive(Clone)]
+enum PersistJob {
+    /// Create the `call:<uuid>` room the transcript lands under.
+    CreateRoom { room_key: String },
+    /// Append a final transcript segment as a Human chat message.
+    AppendSegment {
+        room_key: String,
+        speaker: String,
+        text: String,
+    },
+    /// Append the rolling summary as a System message.
+    AppendSummary { room_key: String, summary: String },
+    /// Close the room on call end (freezes the transcript).
+    CloseRoom { room_key: String },
+}
+
+impl PersistJob {
+    /// A short, stable label for logs/metrics — never the transcript body.
+    fn kind(&self) -> &'static str {
+        match self {
+            PersistJob::CreateRoom { .. } => "create_room",
+            PersistJob::AppendSegment { .. } => "append_segment",
+            PersistJob::AppendSummary { .. } => "append_summary",
+            PersistJob::CloseRoom { .. } => "close_room",
+        }
+    }
+
+    fn room_key(&self) -> &str {
+        match self {
+            PersistJob::CreateRoom { room_key }
+            | PersistJob::AppendSegment { room_key, .. }
+            | PersistJob::AppendSummary { room_key, .. }
+            | PersistJob::CloseRoom { room_key } => room_key,
+        }
+    }
+
+    /// Run this write once against a locked store. `AlreadyExists` on create is
+    /// folded to `Ok` here (a re-announced room is not an error — the transcript
+    /// just keeps appending), so it neither retries nor counts as a drop.
+    fn run_once(
+        &self,
+        rooms: &RoomStoreHandle,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), ocean_store::RoomStoreError> {
+        with_rooms_handle(rooms, |store| match self {
+            PersistJob::CreateRoom { room_key } => {
+                let key = RoomKey::new(room_key.as_str());
+                match store.create(key, "Call transcript", None, now) {
+                    Ok(_) => Ok(()),
+                    Err(ocean_store::RoomStoreError::AlreadyExists(_)) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+            PersistJob::AppendSegment {
+                room_key,
+                speaker,
+                text,
+            } => {
+                let key = RoomKey::new(room_key.as_str());
+                store
+                    .append_message(
+                        &key,
+                        speaker,
+                        RoomParticipantKind::Human,
+                        RoomMessageKind::Message,
+                        text,
+                        now,
+                    )
+                    .map(|_| ())
+            }
+            PersistJob::AppendSummary { room_key, summary } => {
+                let key = RoomKey::new(room_key.as_str());
+                store
+                    .append_message(
+                        &key,
+                        "ocean",
+                        RoomParticipantKind::System,
+                        RoomMessageKind::System,
+                        summary,
+                        now,
+                    )
+                    .map(|_| ())
+            }
+            PersistJob::CloseRoom { room_key } => {
+                let key = RoomKey::new(room_key.as_str());
+                store.close(&key).map(|_| ())
+            }
+        })
+    }
+}
+
+/// The bounded backoff retry, decoupled from the store so the engine is unit-
+/// testable with a fault-injecting closure (OCEAN-255 tests). `run` performs one
+/// write attempt; `label`/`room` are just for logs/metrics; `sleep` is the per-
+/// attempt delay (async, so it never blocks an OS thread). On success it returns
+/// after logging recovery; on a non-transient error or budget exhaustion it bumps
+/// `failures` and escalates to `error!` so the drop is observable.
+///
+/// `attempts_used` is how many tries already burned before this loop (1 — the hot-
+/// path first attempt). The production caller passes a `run` closure that calls
+/// [`PersistJob::run_once`]; tests pass one backed by a counter.
+async fn persist_retry_with<R, S, F>(
+    label: &'static str,
+    room: &str,
+    mut run: R,
+    mut sleep: S,
+    failures: &Arc<std::sync::atomic::AtomicU64>,
+    mut attempts_used: u32,
+) where
+    R: FnMut() -> std::result::Result<(), ocean_store::RoomStoreError>,
+    S: FnMut(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let mut backoff = PERSIST_RETRY_BACKOFF;
+    while attempts_used < PERSIST_MAX_ATTEMPTS {
+        sleep(backoff).await;
+        backoff *= 2;
+        attempts_used += 1;
+        match run() {
+            Ok(()) => {
+                tracing::info!(
+                    room = %room,
+                    op = label,
+                    attempt = attempts_used,
+                    "call-transcript: persist recovered on retry"
+                );
+                return;
+            }
+            Err(e) if persist_error_is_transient(&e) => {
+                tracing::warn!(
+                    room = %room,
+                    op = label,
+                    attempt = attempts_used,
+                    error = %e,
+                    "call-transcript: persist retry failed; will retry"
+                );
+            }
+            Err(e) => {
+                // Turned non-transient (or always was) mid-retry: stop, drop, surface.
+                record_persist_drop_labeled(failures, label, room, &e, attempts_used);
+                return;
+            }
+        }
+    }
+    // Exhausted the bounded budget on transient errors: this write is lost.
+    record_persist_drop_exhausted_labeled(failures, label, room, attempts_used);
+}
+
+/// Production retry: drive [`persist_retry_with`] over a real [`PersistJob`] and
+/// store handle, sleeping with `tokio::time::sleep`. Re-stamps `now` per attempt
+/// (a retried row is "written when it landed"). Runs OFF the hot path — a spawned
+/// task in the daemon, or inline only where there's no runtime (unit tests).
+async fn persist_retry_loop(
+    rooms: RoomStoreHandle,
+    job: PersistJob,
+    failures: Arc<std::sync::atomic::AtomicU64>,
+    attempts_used: u32,
+) {
+    let label = job.kind();
+    let room = job.room_key().to_string();
+    persist_retry_with(
+        label,
+        &room,
+        || job.run_once(&rooms, Utc::now()),
+        tokio::time::sleep,
+        &failures,
+        attempts_used,
+    )
+    .await;
+}
+
+/// Drive a future that NEVER returns `Pending` to completion with a no-op waker —
+/// no runtime, no executor. Used only on the no-Tokio-runtime persistence retry
+/// fallback (the `sleep` closure there blocks synchronously and returns a ready
+/// future, so every poll completes). Would spin forever on a future that actually
+/// awaits I/O, so it must stay confined to that all-ready use.
+fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    // A waker that does nothing: the future is all-ready, so it's never parked and
+    // never needs waking.
+    fn raw() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        RawWaker::new(
+            std::ptr::null(),
+            &RawWakerVTable::new(clone, no_op, no_op, no_op),
+        )
+    }
+    // SAFETY: the vtable's fns are all valid for the null data pointer (they ignore
+    // it), satisfying RawWaker's contract.
+    let waker = unsafe { Waker::from_raw(raw()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            // Unreachable for the all-ready fallback future; loop defensively.
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// Account + escalate a *dropped* write (non-transient). Increments the drop
+/// counter and logs at `error!` (not `warn!`) so silent data-loss is visible.
+/// Job-typed convenience over [`record_persist_drop_labeled`].
+fn record_persist_drop(
+    failures: &Arc<std::sync::atomic::AtomicU64>,
+    job: &PersistJob,
+    e: &ocean_store::RoomStoreError,
+    attempts: u32,
+) {
+    record_persist_drop_labeled(failures, job.kind(), job.room_key(), e, attempts);
+}
+
+/// Core drop accounting (non-transient): bump the counter, escalate to `error!`.
+/// Takes a `label`/`room` rather than a job so the unit-testable retry engine can
+/// call it without a `PersistJob`.
+fn record_persist_drop_labeled(
+    failures: &Arc<std::sync::atomic::AtomicU64>,
+    label: &'static str,
+    room: &str,
+    e: &ocean_store::RoomStoreError,
+    attempts: u32,
+) {
+    let total = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::error!(
+        room = %room,
+        op = label,
+        attempts,
+        error = %e,
+        persist_failures_total = total,
+        "call-transcript: persist DROPPED (non-transient); transcript row lost"
+    );
+}
+
+/// Core drop accounting (budget exhausted on transient errors): same counter +
+/// `error!` escalation as [`record_persist_drop_labeled`].
+fn record_persist_drop_exhausted_labeled(
+    failures: &Arc<std::sync::atomic::AtomicU64>,
+    label: &'static str,
+    room: &str,
+    attempts: u32,
+) {
+    let total = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::error!(
+        room = %room,
+        op = label,
+        attempts,
+        persist_failures_total = total,
+        "call-transcript: persist DROPPED after {attempts} attempts; transcript row lost"
+    );
+}
+
 /// Bridges ocean-call's orchestrator events onto the daemon EventBus, turning
 /// each OceanEvent into an EventEnvelope on the real SSE rail — and, when given a
 /// room store, *persisting* the call's transcript into a durable Room so it
@@ -2095,9 +2399,15 @@ async fn longhouse_prepare(
 /// `place_call` lifecycle (which mints its own room separately) can use a
 /// bus-only sink.
 ///
+/// Durability contract (OCEAN-255): persistence stays best-effort — `emit()` does
+/// one fast synchronous write and NEVER waits on a retry. On a transient store
+/// error the retry is handed to a spawned task (off the hot path); when it finally
+/// gives up it bumps [`Self::persist_failures`] and escalates to `error!`, and
+/// that counter is surfaced in `/health` so sustained silent loss is observable.
+///
 /// Cloneable so the per-call session task can own its own sink (OCEAN-CALL) — every
-/// clone forwards to the same bus, and (since [`RoomStoreHandle`] is an
-/// `Arc<Mutex<…>>`) shares the same durable room store behind the handle.
+/// clone forwards to the same bus, shares the same durable room store behind the
+/// `Arc<Mutex<…>>` handle, AND shares the same `Arc<AtomicU64>` drop counter.
 #[derive(Clone)]
 struct BusSink {
     events: EventBus,
@@ -2108,6 +2418,11 @@ struct BusSink {
     /// from the first `CallStarted.room_id` so the sink writes to the same room the
     /// orchestrator announced. Empty until the call starts.
     room_key: String,
+    /// Count of transcript writes ultimately DROPPED after the bounded retry
+    /// (OCEAN-255). Shared across clones so every per-call sink folds into the same
+    /// daemon-wide total; surfaced at `GET /health` as `persist_failures_total`.
+    /// `Relaxed` is fine — it's a monotonic observability counter, not a lock.
+    persist_failures: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BusSink {
@@ -2122,52 +2437,71 @@ impl BusSink {
             events,
             rooms: None,
             room_key: String::new(),
+            persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// A sink that ALSO persists the call transcript into `rooms` (OCEAN-170).
+    /// A sink that ALSO persists the call transcript into `rooms` (OCEAN-170) with
+    /// a fresh, private drop counter — convenient for tests that assert on this
+    /// sink's drops in isolation. The daemon never uses this: it constructs sinks
+    /// via [`Self::with_persistence_counter`] so drops fold into the shared
+    /// `/health` total (OCEAN-255). Test-gated to keep the release binary
+    /// warning-free now that production always shares the counter.
+    #[cfg(test)]
     fn with_persistence(events: EventBus, rooms: RoomStoreHandle) -> Self {
         Self {
             events,
             rooms: Some(rooms),
             room_key: String::new(),
+            persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Like [`Self::with_persistence`] but folds drops into a *caller-owned*
+    /// counter (OCEAN-255) — the daemon passes `AppState::persist_failures` so the
+    /// per-call sink's drops land in the same total `GET /health` reports. Cloned
+    /// sinks share the `Arc`, so every clone of this call's sink counts together.
+    fn with_persistence_counter(
+        events: EventBus,
+        rooms: RoomStoreHandle,
+        persist_failures: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            events,
+            rooms: Some(rooms),
+            room_key: String::new(),
+            persist_failures,
         }
     }
 
     /// Mirror a call event into the durable room store, if persistence is on.
-    /// Best-effort: every failure is logged and swallowed so the live SSE emit is
-    /// never blocked by the DB. Maps the call lifecycle onto room operations:
-    ///   - `CallStarted`            → create the `call:<uuid>` room (key = room_id)
-    ///   - `CallTranscriptSegment`  → append FINAL segments as chat messages
-    ///                                 (author_id = speaker); interim segments are
-    ///                                 skipped to avoid duplicate/revised noise
-    ///   - `CallSummaryUpdated`     → append the rolling summary as a System message
-    ///   - `CallEnded`              → close the room (freezes the transcript)
+    /// Best-effort and NON-BLOCKING (OCEAN-255): maps the event to a [`PersistJob`],
+    /// makes ONE fast synchronous attempt, and on a *transient* store error hands
+    /// the bounded retry off the hot path (a spawned task) so `emit()` never waits
+    /// on the DB. A non-transient error (or a final give-up) increments the drop
+    /// counter and escalates to `error!`. Maps the call lifecycle onto room ops:
+    /// `CallStarted` creates the `call:<uuid>` room (key = room_id);
+    /// `CallTranscriptSegment` appends FINAL segments as chat messages (author_id =
+    /// speaker; interim segments are skipped to avoid duplicate/revised rows);
+    /// `CallSummaryUpdated` appends the rolling summary as a System message;
+    /// `CallEnded` closes the room (freezes the transcript).
     fn persist(&mut self, event: &ocean_core::OceanEvent) {
         use ocean_core::OceanEvent::*;
         let Some(rooms) = self.rooms.clone() else {
             return;
         };
-        let now = Utc::now();
-        match event {
+        // Translate the event into an owned write job (so a retry can outlive this
+        // call), or bail for events that aren't transcript content. `CallStarted`
+        // also latches `room_key` for the rest of the call.
+        let job = match event {
             CallStarted { room_id, .. } => {
-                // Remember which room this call's transcript belongs to, then
-                // create it. The orchestrator announces the room_id here; we mint
-                // the durable Room under the same key so a later GET on
+                // Remember which room this call's transcript belongs to. The
+                // orchestrator announces the room_id here; we mint the durable Room
+                // under the same key so a later GET on
                 // /v1/rooms/persistent/{room_id}/transcript reads it back.
                 self.room_key = room_id.clone();
-                let key = RoomKey::new(room_id.as_str());
-                let res = with_rooms_handle(&rooms, |store| {
-                    store.create(key, "Call transcript", None, now)
-                });
-                match res {
-                    Ok(_) => {}
-                    // A re-announced room (e.g. a webhook JoinCall after the demo
-                    // already created it) is not an error for us — the transcript
-                    // just keeps appending to the existing room.
-                    Err(ocean_store::RoomStoreError::AlreadyExists(_)) => {}
-                    Err(e) => tracing::warn!(room = %room_id, error = %e,
-                        "call-transcript: failed to create persistent room"),
+                PersistJob::CreateRoom {
+                    room_key: room_id.clone(),
                 }
             }
             CallTranscriptSegment {
@@ -2181,55 +2515,90 @@ impl BusSink {
                 if !*is_final || self.room_key.is_empty() {
                     return;
                 }
-                let key = RoomKey::new(self.room_key.as_str());
-                let res = with_rooms_handle(&rooms, |store| {
-                    store.append_message(
-                        &key,
-                        speaker,
-                        RoomParticipantKind::Human,
-                        RoomMessageKind::Message,
-                        text,
-                        now,
-                    )
-                });
-                if let Err(e) = res {
-                    tracing::warn!(room = %self.room_key, error = %e,
-                        "call-transcript: failed to append transcript segment");
+                PersistJob::AppendSegment {
+                    room_key: self.room_key.clone(),
+                    speaker: speaker.clone(),
+                    text: text.clone(),
                 }
             }
             CallSummaryUpdated { summary, .. } => {
                 if self.room_key.is_empty() {
                     return;
                 }
-                let key = RoomKey::new(self.room_key.as_str());
-                let res = with_rooms_handle(&rooms, |store| {
-                    store.append_message(
-                        &key,
-                        "ocean",
-                        RoomParticipantKind::System,
-                        RoomMessageKind::System,
-                        summary,
-                        now,
-                    )
-                });
-                if let Err(e) = res {
-                    tracing::warn!(room = %self.room_key, error = %e,
-                        "call-transcript: failed to append summary");
+                PersistJob::AppendSummary {
+                    room_key: self.room_key.clone(),
+                    summary: summary.clone(),
                 }
             }
             CallEnded { .. } => {
                 if self.room_key.is_empty() {
                     return;
                 }
-                let key = RoomKey::new(self.room_key.as_str());
-                let res = with_rooms_handle(&rooms, |store| store.close(&key));
-                if let Err(e) = res {
-                    tracing::warn!(room = %self.room_key, error = %e,
-                        "call-transcript: failed to close room on call end");
+                PersistJob::CloseRoom {
+                    room_key: self.room_key.clone(),
                 }
             }
             // Wake/spoke/task events are live-only signals, not transcript content.
-            _ => {}
+            _ => return,
+        };
+
+        // FIRST ATTEMPT — synchronous, on the hot path, exactly as before. The
+        // happy path ends here: one lock, one write, no task spawn, no allocation
+        // beyond the job. Writing before `emit()` (see EventSink::emit) means a
+        // subscriber reading back the transcript sees the row that triggered it.
+        match job.run_once(&rooms, Utc::now()) {
+            Ok(()) => {}
+            Err(e) if persist_error_is_transient(&e) => {
+                // Transient: do NOT block emit on the retry. Hand the remaining
+                // bounded attempts to the side-channel (a spawned task in the
+                // daemon; a synchronous fallback only where there's no runtime).
+                tracing::warn!(
+                    room = %job.room_key(),
+                    op = job.kind(),
+                    attempt = 1u32,
+                    error = %e,
+                    "call-transcript: persist failed (transient); retrying off the hot path"
+                );
+                self.dispatch_retry(rooms, job);
+            }
+            Err(e) => {
+                // Non-transient: retrying can't help. Drop, count, surface.
+                record_persist_drop(&self.persist_failures, &job, &e, 1);
+            }
+        }
+    }
+
+    /// Run the bounded retry for a transiently-failed write WITHOUT blocking the
+    /// caller (`emit()`). In the daemon a Tokio runtime is always present, so the
+    /// retry loop is `tokio::spawn`-ed and `emit()` returns immediately. The only
+    /// place with no runtime is offline unit tests; there we fall back to a
+    /// synchronous bounded retry (still fast — tens of ms — and the live emit has
+    /// already happened, so correctness/observability still hold).
+    fn dispatch_retry(&self, rooms: RoomStoreHandle, job: PersistJob) {
+        let failures = self.persist_failures.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(persist_retry_loop(rooms, job, failures, 1));
+            }
+            Err(_) => {
+                // No async runtime (unit test / non-tokio caller): retry inline,
+                // reusing the same engine with a blocking sleep. The sleep closure
+                // returns an already-ready future, so the engine never yields and
+                // `block_on_ready` drives it to completion without an executor.
+                let label = job.kind();
+                let room = job.room_key().to_string();
+                block_on_ready(persist_retry_with(
+                    label,
+                    &room,
+                    || job.run_once(&rooms, Utc::now()),
+                    |d| {
+                        std::thread::sleep(d);
+                        std::future::ready(())
+                    },
+                    &failures,
+                    1,
+                ));
+            }
         }
     }
 }
@@ -2462,7 +2831,13 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
         // the demo path. `persist` keys off the orchestrator's `CallStarted.room_id`
         // and creates the room on the fly (an already-existing room is fine), so
         // this is safe whether or not the room was minted elsewhere first.
-        let sink = BusSink::with_persistence(state.events.clone(), state.rooms.clone());
+        // Counter-shared (OCEAN-255): any dropped transcript write folds into the
+        // daemon-wide `persist_failures_total` reported at `GET /health`.
+        let sink = BusSink::with_persistence_counter(
+            state.events.clone(),
+            state.rooms.clone(),
+            state.persist_failures.clone(),
+        );
         let runner = DaemonTurnRunner::new(state.clone(), room.to_string());
         // The active lane speaks via xAI TTS (silence fallback if no key / xai-tts
         // off). Both STT modes share this — TTS is independent of the STT provider.
@@ -2608,8 +2983,13 @@ async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
     let room = format!("call:{}", Uuid::new_v4());
     // Persistence-enabled sink: events both stream onto the SSE rail AND land in
     // the durable room store (OCEAN-170), so the demo transcript survives a
-    // restart with no LiveKit/Twilio account in the loop.
-    let mut sink = BusSink::with_persistence(state.events.clone(), state.rooms.clone());
+    // restart with no LiveKit/Twilio account in the loop. Counter-shared
+    // (OCEAN-255): dropped writes fold into `/health`'s `persist_failures_total`.
+    let mut sink = BusSink::with_persistence_counter(
+        state.events.clone(),
+        state.rooms.clone(),
+        state.persist_failures.clone(),
+    );
     let mut session = CallSession::new(
         format!("demo-{}", Uuid::new_v4()),
         Summarizer::new(SummaryPolicy {
@@ -8125,6 +8505,223 @@ mod tests {
         assert!(sink.rooms.is_none());
     }
 
+    // ---- OCEAN-255: persistence retry + drop observability ------------------
+
+    /// A `RoomStoreError::Db` (transient) for the engine tests — built via the
+    /// store's public `From<rusqlite::Error>` so no internal seam is needed.
+    fn transient_db_err() -> ocean_store::RoomStoreError {
+        ocean_store::RoomStoreError::from(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    /// Only `Db` (an underlying SQLite/I-O failure) is retried; the deterministic
+    /// caller-input variants and `Encode` are not. This pins the policy the retry
+    /// loop branches on — misclassifying would either spin on a permanent error or
+    /// silently drop a recoverable one.
+    #[test]
+    fn persist_error_is_transient_classifies_db_only() {
+        assert!(persist_error_is_transient(&transient_db_err()));
+        assert!(!persist_error_is_transient(
+            &ocean_store::RoomStoreError::UnknownRoom(RoomKey::new("call:x"))
+        ));
+        assert!(!persist_error_is_transient(&ocean_store::RoomStoreError::BadKey(
+            "".into()
+        )));
+        assert!(!persist_error_is_transient(
+            &ocean_store::RoomStoreError::AlreadyExists(RoomKey::new("call:x"))
+        ));
+        assert!(!persist_error_is_transient(&ocean_store::RoomStoreError::Encode(
+            "boom".into()
+        )));
+    }
+
+    /// A no-op sleep so the retry engine runs instantly under a plain
+    /// `#[tokio::test]` — the backoff *duration* isn't what these tests pin (that's
+    /// a constant); the control flow is. Returns an already-ready future, so the
+    /// engine never actually waits.
+    fn no_sleep(_d: std::time::Duration) -> std::future::Ready<()> {
+        std::future::ready(())
+    }
+
+    /// A store that fails transiently a few times then succeeds: the bounded retry
+    /// must land the write and NOT count a drop. Drives the real
+    /// [`persist_retry_with`] engine with a counter-backed `run` closure.
+    #[tokio::test]
+    async fn persist_retry_recovers_when_store_fails_then_succeeds() {
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The hot-path first attempt already failed (attempts_used = 1). The loop
+        // makes up to PERSIST_MAX_ATTEMPTS-1 more tries; succeed on the first retry.
+        let run_attempts = attempts.clone();
+        persist_retry_with(
+            "append_segment",
+            "call:x",
+            move || {
+                let n = run_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(transient_db_err()) // first retry: still failing
+                } else {
+                    Ok(()) // second retry: recovered
+                }
+            },
+            no_sleep,
+            &failures,
+            1,
+        )
+        .await;
+        // Recovered → no drop counted.
+        assert_eq!(failures.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Exactly two retry attempts ran (fail, then succeed); the loop stopped on
+        // success rather than burning the whole budget.
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A store that ALWAYS fails transiently: after the bounded budget the write is
+    /// dropped — the failure counter increments exactly once, and the loop made no
+    /// more than the budgeted number of attempts (no unbounded spin).
+    #[tokio::test]
+    async fn persist_retry_exhausts_budget_and_counts_one_drop() {
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let run_attempts = attempts.clone();
+        persist_retry_with(
+            "append_segment",
+            "call:x",
+            move || {
+                run_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(transient_db_err())
+            },
+            no_sleep,
+            &failures,
+            1,
+        )
+        .await;
+        assert_eq!(
+            failures.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an exhausted write must count exactly one drop"
+        );
+        // attempts_used started at 1 (hot path), so the loop runs MAX-1 more times.
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) as u32,
+            PERSIST_MAX_ATTEMPTS - 1,
+            "retry must be bounded to the attempt budget"
+        );
+    }
+
+    /// A non-transient error encountered mid-retry stops immediately: no further
+    /// attempts, and exactly one drop counted. Guards against retrying a permanent
+    /// failure (which would waste the budget and delay surfacing the loss).
+    #[tokio::test]
+    async fn persist_retry_stops_on_non_transient_error() {
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let run_attempts = attempts.clone();
+        persist_retry_with(
+            "append_segment",
+            "call:x",
+            move || {
+                run_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Non-transient on the very first retry.
+                Err(ocean_store::RoomStoreError::UnknownRoom(RoomKey::new("call:x")))
+            },
+            no_sleep,
+            &failures,
+            1,
+        )
+        .await;
+        assert_eq!(failures.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-transient error must stop the loop after one attempt"
+        );
+    }
+
+    /// End-to-end through the real sink + real store: a persistence failure must
+    /// NOT block the live SSE emit, AND must register on the drop counter. We point
+    /// the sink at a room that was never created so the real `append_message` fails
+    /// (UnknownRoom — non-transient, so it drops on the first attempt with no
+    /// spawn). Asserts: (1) the event still reached the EventBus (emit unblocked),
+    /// (2) `persist_failures` incremented — the data-loss is observable.
+    #[test]
+    fn emit_keeps_live_rail_when_persist_fails_and_counts_drop() {
+        use ocean_call::EventSink;
+        let store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let rooms: RoomStoreHandle = Arc::new(Mutex::new(store));
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe(); // attach a live subscriber BEFORE emitting
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut sink =
+            BusSink::with_persistence_counter(bus.clone(), rooms.clone(), counter.clone());
+
+        // Latch a room_key WITHOUT creating the room, so the summary append below
+        // fails non-transiently in the store (UnknownRoom). Same module → the
+        // private field is reachable; this simulates "the create write was lost but
+        // the call kept going", exactly the silent-loss case OCEAN-255 surfaces.
+        sink.room_key = "call:never-created".to_string();
+        sink.emit(ocean_core::OceanEvent::CallSummaryUpdated {
+            summary: "we agreed to ship Friday".into(),
+            as_of_ms: 0,
+        });
+
+        // (1) The live rail still got the event — emit was not blocked/aborted by
+        // the failed write.
+        let got = rx.try_recv().expect("event must reach the live bus despite persist failure");
+        assert!(matches!(
+            got.event,
+            ocean_core::OceanEvent::CallSummaryUpdated { .. }
+        ));
+        // (2) The drop is observable: the counter (what /health reports) went up.
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a dropped transcript write must increment persist_failures_total"
+        );
+    }
+
+    /// Happy path through the real sink + store: a created room + a final segment
+    /// lands the row with NO drop counted — proves the first synchronous attempt is
+    /// still the whole story when the store is healthy (no regression from the
+    /// retry plumbing). Complements the OCEAN-170 end-to-end test by asserting on
+    /// the OCEAN-255 counter staying clean.
+    #[test]
+    fn emit_happy_path_persists_with_no_drops() {
+        use ocean_call::EventSink;
+        let store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let rooms: RoomStoreHandle = Arc::new(Mutex::new(store));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut sink =
+            BusSink::with_persistence_counter(EventBus::new(8), rooms.clone(), counter.clone());
+        let room = "call:healthy";
+        sink.emit(ocean_core::OceanEvent::CallStarted {
+            call_id: "c".into(),
+            room_id: room.into(),
+            participants: vec![],
+        });
+        sink.emit(ocean_core::OceanEvent::CallTranscriptSegment {
+            speaker: "caller".into(),
+            text: "hello there".into(),
+            start_ms: 0,
+            is_final: true,
+        });
+        sink.emit(ocean_core::OceanEvent::CallEnded {
+            call_id: "c".into(),
+            duration_ms: 1,
+        });
+        // No drops on a healthy store.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // The row actually landed (room closed on end → read via audit view).
+        let key = RoomKey::new(room);
+        let rec = {
+            let guard = rooms.lock().unwrap();
+            guard.get_including_closed(&key).unwrap().unwrap()
+        };
+        assert!(
+            rec.transcript.iter().any(|m| m.body == "hello there"),
+            "the final segment must have persisted on the happy path"
+        );
+    }
+
     #[test]
     fn mention_with_policy_produces_convene_decision() {
         // The exact inputs the message handler feeds the evaluator: a stored
@@ -8405,6 +9002,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
+            persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -9259,6 +9857,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
+            persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
