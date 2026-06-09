@@ -108,14 +108,51 @@ pub struct LiveKitTokenResponse {
 /// long call/meeting; LiveKit refreshes the session itself once connected.
 const TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
-/// Mint a LiveKit join JWT for `room_id` scoped to the requested participant and
-/// publish/subscribe grants. The identity falls back across
-/// participant_id → surface_id → "web-surface" so the token always carries an
-/// identity (LiveKit rejects a `room_join` token without one).
+/// Whether a minted token may PUBLISH media into the room — the load-bearing
+/// capability, because publishing means injecting audio/video into a live
+/// call/meeting.
+///
+/// OCEAN-220 (P0): this is a *server* decision, never read off the wire. The
+/// `can_publish` field on [`LiveKitTokenRequest`] is now inert for capability
+/// purposes (kept only so the existing wire body still deserializes); the
+/// daemon route derives this value from operator policy and passes it
+/// explicitly — the same move OCEAN-160 made when it stopped trusting the wire
+/// `yolo` flag and resolved the posture server-side. A caller that does not
+/// prove publish entitlement gets [`PublishGrant::Deny`] → a listen-only token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishGrant {
+    /// The caller proved entitlement (operator-secret verified on the route, or
+    /// an in-process server lane like the call tap): the token may publish.
+    Allow,
+    /// Default-deny: subscribe/listen only. Unauthorized HTTP callers land here,
+    /// so a forged/replayed request can at most listen, never inject media.
+    Deny,
+}
+
+impl PublishGrant {
+    /// Map the grant to the LiveKit `can_publish` bit.
+    fn can_publish(self) -> bool {
+        matches!(self, PublishGrant::Allow)
+    }
+}
+
+/// Mint a LiveKit join JWT for `room_id` scoped to the requested participant.
+///
+/// The identity falls back across participant_id → surface_id → "web-surface"
+/// so the token always carries an identity (LiveKit rejects a `room_join` token
+/// without one). Subscribe is always granted (you joined to hear the room);
+/// `publish` is the server-decided capability — see [`PublishGrant`].
+///
+/// SECURITY (OCEAN-220, P0): `req.can_publish` is deliberately NOT consulted.
+/// Whether this token may publish is decided by the *caller* of this function
+/// (the daemon route resolves it from operator policy) and passed as `publish`.
+/// This keeps the publish capability off the wire, so a client cannot grant
+/// itself media-injection rights into someone else's live call.
 pub fn mint_join_token(
     config: &LiveKitTokenConfig,
     room_id: &str,
     req: &LiveKitTokenRequest,
+    publish: PublishGrant,
 ) -> Result<LiveKitTokenResponse, String> {
     let identity = first_non_empty(&[&req.participant_id, &req.surface_id, "web-surface"]);
     let name = if req.display_name.trim().is_empty() {
@@ -127,7 +164,8 @@ pub fn mint_join_token(
     let grants = VideoGrants {
         room_join: true,
         room: room_id.to_string(),
-        can_publish: req.can_publish,
+        // Server-decided, never `req.can_publish` (OCEAN-220, P0).
+        can_publish: publish.can_publish(),
         can_subscribe: req.can_subscribe,
         ..Default::default()
     };
@@ -206,7 +244,7 @@ mod tests {
             can_subscribe: true,
             ..Default::default()
         };
-        let resp = mint_join_token(&cfg, "call:abc", &req).unwrap();
+        let resp = mint_join_token(&cfg, "call:abc", &req, PublishGrant::Allow).unwrap();
         assert!(resp.ok);
         assert_eq!(resp.url, "wss://test.livekit.cloud");
         assert_eq!(resp.room, "call:abc");
@@ -222,6 +260,37 @@ mod tests {
     }
 
     #[test]
+    fn publish_grant_is_server_decided_not_wire() {
+        // OCEAN-220 (P0): even a request that screams can_publish=true must NOT
+        // get a publish-capable token unless the SERVER passes PublishGrant::Allow.
+        let cfg = config();
+        let req = LiveKitTokenRequest {
+            participant_id: "attacker".into(),
+            can_publish: true, // wire says yes — must be ignored
+            can_subscribe: true,
+            ..Default::default()
+        };
+
+        // Server denies publish → listen-only token regardless of the wire flag.
+        let denied = mint_join_token(&cfg, "call:victim", &req, PublishGrant::Deny).unwrap();
+        let claims = TokenVerifier::with_api_key(&cfg.api_key, &cfg.api_secret)
+            .verify(&denied.token)
+            .unwrap();
+        assert!(
+            !claims.video.can_publish,
+            "wire can_publish=true must NOT yield a publish grant when the server denies"
+        );
+        assert!(claims.video.can_subscribe);
+
+        // Server allows publish (the entitled path) → publish-capable token.
+        let allowed = mint_join_token(&cfg, "call:victim", &req, PublishGrant::Allow).unwrap();
+        let claims = TokenVerifier::with_api_key(&cfg.api_key, &cfg.api_secret)
+            .verify(&allowed.token)
+            .unwrap();
+        assert!(claims.video.can_publish);
+    }
+
+    #[test]
     fn subscribe_only_grant_is_honored() {
         let cfg = config();
         let req = LiveKitTokenRequest {
@@ -230,7 +299,8 @@ mod tests {
             can_subscribe: true,
             ..Default::default()
         };
-        let resp = mint_join_token(&cfg, "room1", &req).unwrap();
+        // Server denies publish: a subscribe-only token.
+        let resp = mint_join_token(&cfg, "room1", &req, PublishGrant::Deny).unwrap();
         let claims = TokenVerifier::with_api_key(&cfg.api_key, &cfg.api_secret)
             .verify(&resp.token)
             .unwrap();
@@ -245,7 +315,7 @@ mod tests {
             surface_id: "surfaceX".into(),
             ..Default::default()
         };
-        let resp = mint_join_token(&cfg, "r", &req).unwrap();
+        let resp = mint_join_token(&cfg, "r", &req, PublishGrant::Deny).unwrap();
         let claims = TokenVerifier::with_api_key(&cfg.api_key, &cfg.api_secret)
             .verify(&resp.token)
             .unwrap();
