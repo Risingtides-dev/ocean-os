@@ -28,8 +28,9 @@ use ocean_agent_sdk::{
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
-    PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectResponse,
-    ProjectsResponse, PromptImage, PromptRequest, RequestControlResponse, RequestCreateResponse,
+    PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectRef,
+    ProjectResponse, ProjectsResponse, PromptImage, PromptRequest, RequestControlResponse,
+    RequestCreateResponse,
     RequestId,
     evaluate_trigger_policy, RequestState, RequestStatus, RequestsResponse, RoomId, RoomKey,
     RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind, RoomSnapshot,
@@ -3252,11 +3253,15 @@ fn spawn_room_agent_turn(
     triggered_by_seq: u64,
 ) {
     tokio::spawn(async move {
-        // Resolve a working directory for the turn. A room-bound agent has no
-        // project binding in the current data model, so fall back to the
-        // daemon's launch dir — a sensible default that always exists. (See the
-        // assumption documented on the PR: room participants gain a workspace
-        // binding in a follow-up; until then sessions are keyed by room+agent.)
+        // Resolve a working directory for the turn. A `Room` carries no
+        // `workspace_root` of its own (see `ocean_core::Room`), so a room-bound
+        // agent has no project to bind to from the room side — we fall back to
+        // the daemon's launch dir, a sensible default that always exists, and
+        // key the session by room+agent. (Sessions that DO land in a project's
+        // workspace are still associated back to that project on read, via
+        // `find_by_workspace` in `enrich_session_detail` — OCEAN-228. Giving
+        // rooms their own workspace binding so room turns inherit a project is
+        // the remaining follow-up.)
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
@@ -4112,6 +4117,25 @@ async fn enrich_session_detail(state: &AppState, session: &mut SessionDetail) {
         session.state = session_run_state(latest.state);
         session.resumable = true;
     }
+
+    // Session→project binding (OCEAN-228): map the session's bound
+    // `workspace_root` back to the project that claims that directory, so a
+    // client viewing this session sees the project it belongs to. This is the
+    // reverse of the project→sessions map `GET /v1/projects/{id}` already uses;
+    // resolving it on read (rather than storing a project id on the session)
+    // means a renamed/rebound project is always reflected without rewriting
+    // session files. A project-less workspace simply leaves this `None`; a
+    // lookup error is logged and treated as "no project" so it can never fail a
+    // session read.
+    session.owning_project = session.workspace_root.as_deref().and_then(|root| {
+        match state.runtime.project_for_workspace(root) {
+            Ok(found) => found.map(ProjectRef::from),
+            Err(error) => {
+                tracing::warn!(%error, workspace_root = root, "owning-project lookup failed");
+                None
+            }
+        }
+    });
 }
 
 fn session_run_state(state: RequestState) -> SessionRunState {
@@ -6629,6 +6653,7 @@ mod tests {
             git_branch: None,
             git_commit: None,
             client_type: None,
+            owning_project: None,
         }
     }
 

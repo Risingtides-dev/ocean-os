@@ -327,6 +327,33 @@ pub struct SessionDetail {
     /// clients can render which surface owns the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+    /// The project that owns this session, derived by mapping the session's
+    /// `workspace_root` back to the project that claims that directory
+    /// (`projects.json`). `None` when no project is bound to the session's
+    /// workspace — sessions remain valid without a project. This is the reverse
+    /// of [`Project`] → its sessions: the daemon resolves it on read rather than
+    /// storing a project id on the session, so a project that is renamed or
+    /// rebound is always reflected without rewriting session files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_project: Option<ProjectRef>,
+}
+
+/// A lightweight reference to the [`Project`] a session belongs to: just the
+/// stable id and display name, enough for a client to render and link to the
+/// project without re-fetching the full record. Surfaced on [`SessionDetail`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectRef {
+    pub id: ProjectId,
+    pub name: String,
+}
+
+impl From<Project> for ProjectRef {
+    fn from(p: Project) -> Self {
+        Self {
+            id: p.id,
+            name: p.name,
+        }
+    }
 }
 
 /// Response payload for `GET /v1/sessions/{id}`.
