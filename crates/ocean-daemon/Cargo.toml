@@ -69,3 +69,9 @@ http-body-util = "0.1"
 # rode into the minted token end-to-end. Test-only; the production daemon never
 # decodes its own tokens. Already pinned in the workspace, so no new download.
 base64 = "0.22"
+# OCEAN-255: the persistence-retry tests construct a `RoomStoreError::Db` (the
+# transient class) via its public `From<rusqlite::Error>`, so they need to name a
+# `rusqlite::Error`. Test-only; the production daemon talks to the store only
+# through `ocean-store`'s API. Already in the workspace lock (transitive via
+# ocean-store), so this pulls no new download.
+rusqlite = { workspace = true }

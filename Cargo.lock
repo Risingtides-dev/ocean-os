@@ -3021,6 +3021,7 @@ dependencies = [
  "ocean-protocol",
  "ocean-runtime",
  "ocean-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
