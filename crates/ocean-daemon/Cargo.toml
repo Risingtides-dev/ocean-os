@@ -56,3 +56,8 @@ futures = "0.3"
 # new downloads. Versions match axum 0.8's `http`/`http-body` stack.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# OCEAN-231: decode the LiveKit JWT payload in the `room_livekit_token` handler
+# tests to assert the server-decided publish grant (`video.canPublish`) actually
+# rode into the minted token end-to-end. Test-only; the production daemon never
+# decodes its own tokens. Already pinned in the workspace, so no new download.
+base64 = "0.22"

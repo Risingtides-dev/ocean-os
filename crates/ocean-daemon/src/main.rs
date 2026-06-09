@@ -9387,4 +9387,420 @@ mod tests {
             prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
+
+    // ---- OCEAN-231: handler-level tests for the livekit-token + call_place ----
+    // request guards.
+    //
+    // What #154 (OCEAN-220) already covers — and these therefore do NOT re-test —
+    // is the PURE authorization helpers in isolation:
+    //   * `call_room_token_allowed(&store, ..)` — gate-1 existence logic for
+    //     unknown / known-open / closed `call:` rooms and the non-`call:`
+    //     passthrough (`unknown_call_room_is_rejected`, `known_open_call_room_is_allowed`,
+    //     `closed_call_room_is_rejected`, `non_call_rooms_pass_existence_gate`).
+    //   * `resolve_publish_grant(&headers)` — gate-2 grant logic with/without the
+    //     operator secret (`publish_denied_when_no_secret_configured`,
+    //     `publish_requires_matching_operator_secret`).
+    // And token.rs already verifies `mint_join_token` honors the passed grant.
+    //
+    // The GAP these fill is the REQUEST level: driving the actual
+    // `room_livekit_token` / `call_place` axum handlers end-to-end and asserting
+    // the status codes + JSON body shapes the surface depends on — the two gates
+    // *wired together* through the handler (existence-gate → 404, creds-gate →
+    // 503, and the publish grant actually riding into the minted JWT), plus the
+    // `call_place` guard paths (bad number → 400, missing telephony creds → 503
+    // naming the env vars). The live dial / live token signing past the guards
+    // needs real LiveKit+Twilio creds and is out of scope for a hermetic test.
+
+    /// Serializes tests that mutate the LiveKit credential env vars (`LIVEKIT_*`,
+    /// `OCEAN_CALL_*`). Parallel unit tests share one process env, so a test that
+    /// sets these to drive the happy path must not race one asserting the
+    /// missing-creds 503. Distinct from `PUBLISH_ENV_LOCK` (which guards only
+    /// `OCEAN_LIVEKIT_PUBLISH_TOKEN`); a test touching both acquires THIS lock
+    /// first, then the publish lock, so the order is global and deadlock-free.
+    static LIVEKIT_CREDS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn livekit_creds_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        LIVEKIT_CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Every env var either LiveKit handler reads, so a test can wipe the slate
+    /// before asserting a missing-creds path regardless of host environment.
+    const LIVEKIT_HANDLER_ENV: &[&str] = &[
+        "LIVEKIT_URL",
+        "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET",
+        "OCEAN_CALL_OUTBOUND_TRUNK",
+        "OCEAN_CALL_CALLER_NUMBER",
+    ];
+
+    fn clear_livekit_env() {
+        for k in LIVEKIT_HANDLER_ENV {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// Set the three token-signing vars to dev values good enough for
+    /// `LiveKitTokenConfig::from_env()` to validate and `mint_join_token` to sign
+    /// a verifiable JWT (the secret is HMAC key material — any non-empty string
+    /// works; this is never a real credential).
+    fn set_livekit_token_env() {
+        std::env::set_var("LIVEKIT_URL", "wss://test.livekit.cloud");
+        std::env::set_var("LIVEKIT_API_KEY", "devkey");
+        std::env::set_var(
+            "LIVEKIT_API_SECRET",
+            "devsecretdevsecretdevsecret0123456789",
+        );
+    }
+
+    /// Decode the `video` grants object out of a LiveKit JWT WITHOUT verifying the
+    /// signature — we only assert the *grant the daemon embedded*, not LiveKit's
+    /// crypto (token.rs already round-trips signing via `TokenVerifier`). A JWT is
+    /// `header.payload.sig`; the middle segment is base64url(json claims).
+    fn jwt_video_grants(token: &str) -> serde_json::Value {
+        use base64::Engine;
+        let payload_b64 = token
+            .split('.')
+            .nth(1)
+            .expect("a JWT has a header.payload.sig shape");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .expect("JWT payload is base64url");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("JWT payload is JSON claims");
+        claims["video"].clone()
+    }
+
+    /// Author an open `call:` room in `state`'s store so the gate-1 existence
+    /// check passes for it (mirrors what `CallStarted` persistence does live).
+    fn author_open_call_room(state: &AppState, room: &str) {
+        with_rooms(state, |store| {
+            store
+                .create(RoomKey::new(room), "Call transcript", None, Utc::now())
+                .expect("author call room");
+        });
+    }
+
+    /// HANDLER, GATE 1 wired: a token request for a `call:` room the server never
+    /// authored gets a 404 with the typed `{ ok:false, error }` body the other
+    /// room routes use — driven through the real `room_livekit_token` handler, not
+    /// the helper in isolation (#154 tested the helper). Asserted creds-present so
+    /// the 404 is the EXISTENCE gate firing, not a creds 503 masquerading as it.
+    #[tokio::test]
+    async fn token_handler_unknown_call_room_is_404() {
+        let _creds = livekit_creds_env_guard();
+        set_livekit_token_env(); // creds present → 503 is off the table
+
+        let state = permission_test_state();
+        let (status, Json(body)) = room_livekit_token(
+            State(state),
+            Path("call:never-authored-by-server".to_string()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown call: room must 404 at the handler, not mint a token"
+        );
+        assert_eq!(body["ok"], json!(false));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("never-authored-by-server"),
+            "404 body should name the rejected room, got {body}"
+        );
+        clear_livekit_env();
+    }
+
+    /// HANDLER: a blank/whitespace room id is a 400 before any gate runs — the
+    /// handler's own input guard, distinct from the 404 existence gate.
+    #[tokio::test]
+    async fn token_handler_blank_room_is_400() {
+        let _creds = livekit_creds_env_guard();
+        set_livekit_token_env();
+
+        let state = permission_test_state();
+        let (status, Json(body)) = room_livekit_token(
+            State(state),
+            Path("   ".to_string()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "empty room id must 400");
+        assert_eq!(body["ok"], json!(false));
+        clear_livekit_env();
+    }
+
+    /// HANDLER, GATE 2 wired (deny): with NO operator secret, a request to a
+    /// LEGITIMATE (server-authored, open) call room still succeeds (200) — but the
+    /// minted token is listen-only (`canPublish=false`), even though the body sets
+    /// `can_publish:true` on the wire. This is the end-to-end fail-closed publish
+    /// posture through the handler + a real signed JWT, which #154's helper test
+    /// could not observe.
+    #[tokio::test]
+    async fn token_handler_publish_denied_without_secret() {
+        let _creds = livekit_creds_env_guard();
+        let _publish = publish_env_guard();
+        std::env::remove_var(PUBLISH_TOKEN_ENV); // no operator secret
+        set_livekit_token_env();
+
+        let state = permission_test_state();
+        let room = "call:legit-open-room";
+        author_open_call_room(&state, room);
+
+        // Wire screams publish=true and sends a bogus auth header; must be ignored.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ocean-publish-token",
+            HeaderValue::from_static("not-the-secret"),
+        );
+        let req = ocean_call::LiveKitTokenRequest {
+            participant_id: "web-surface".into(),
+            can_publish: true,
+            can_subscribe: true,
+            ..Default::default()
+        };
+
+        let (status, Json(body)) = room_livekit_token(
+            State(state),
+            Path(room.to_string()),
+            headers,
+            Some(Json(req)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "a legit open call room must mint a token");
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["room"], json!(room));
+        let video = jwt_video_grants(body["token"].as_str().expect("token string"));
+        assert_eq!(
+            video["canPublish"],
+            json!(false),
+            "no operator secret ⇒ listen-only token even when the wire asks to publish"
+        );
+        assert_eq!(
+            video["canSubscribe"],
+            json!(true),
+            "subscribe is always granted — you joined to hear the room"
+        );
+
+        clear_livekit_env();
+    }
+
+    /// HANDLER, GATE 2 wired (allow): with the operator secret set AND presented,
+    /// the SAME request mints a publish-capable token (`canPublish=true`). Paired
+    /// with the deny test above, this proves the handler routes the resolved grant
+    /// into the mint — the entitled-operator path that keeps in-room voice working.
+    #[tokio::test]
+    async fn token_handler_publish_granted_with_secret() {
+        let _creds = livekit_creds_env_guard();
+        let _publish = publish_env_guard();
+        std::env::set_var(PUBLISH_TOKEN_ENV, "s3cret-operator-token");
+        set_livekit_token_env();
+
+        let state = permission_test_state();
+        let room = "call:operator-room";
+        author_open_call_room(&state, room);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ocean-publish-token",
+            HeaderValue::from_static("s3cret-operator-token"),
+        );
+        let (status, Json(body)) = room_livekit_token(
+            State(state),
+            Path(room.to_string()),
+            headers,
+            None, // a missing body still mints — identity/subscribe default
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        let video = jwt_video_grants(body["token"].as_str().expect("token string"));
+        assert_eq!(
+            video["canPublish"],
+            json!(true),
+            "the entitled operator (matching secret) must get a publish-capable token"
+        );
+
+        std::env::remove_var(PUBLISH_TOKEN_ENV);
+        clear_livekit_env();
+    }
+
+    /// HANDLER: a NON-`call:` room (the operator's own surface space) is NOT
+    /// existence-gated, so it mints with creds present even though it was never
+    /// authored in the store — the legitimate "open a fresh surface room" flow.
+    /// Publish is still independently denied (no operator secret), so the token is
+    /// listen-only. This exercises gate-1 passthrough AND gate-2 deny together at
+    /// the request level.
+    #[tokio::test]
+    async fn token_handler_non_call_room_passes_through() {
+        let _creds = livekit_creds_env_guard();
+        let _publish = publish_env_guard();
+        std::env::remove_var(PUBLISH_TOKEN_ENV);
+        set_livekit_token_env();
+
+        let state = permission_test_state();
+        // Never created in the store; a `project:` surface room minted lazily.
+        let room = "project:surface-main";
+        let (status, Json(body)) = room_livekit_token(
+            State(state),
+            Path(room.to_string()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a non-call room must pass the existence gate and mint"
+        );
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["room"], json!(room));
+        let video = jwt_video_grants(body["token"].as_str().expect("token string"));
+        assert_eq!(video["room"], json!(room), "token must be scoped to the room");
+        assert_eq!(
+            video["canPublish"],
+            json!(false),
+            "publish stays denied for a surface room with no operator secret"
+        );
+        clear_livekit_env();
+    }
+
+    /// HANDLER, CREDS GATE: with the LiveKit auth vars unset, the handler returns a
+    /// clean 503 (never a 404) with the typed shape the surface renders as a
+    /// degraded state — `{ ok:false, blocked_on:"livekit not configured",
+    /// needed_env:[LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET], missing:.. }`.
+    /// Asserted on a non-`call:` room so the existence gate passes and the 503 is
+    /// unambiguously the creds gate.
+    #[tokio::test]
+    async fn token_handler_missing_creds_is_503_with_shape() {
+        let _creds = livekit_creds_env_guard();
+        clear_livekit_env(); // the load-bearing precondition: no creds at all
+
+        let state = permission_test_state();
+        let (status, Json(body)) = room_livekit_token(
+            State(state),
+            Path("project:surface-main".to_string()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unset LiveKit creds must 503, not 404/500"
+        );
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["blocked_on"], json!("livekit not configured"));
+        assert_eq!(
+            body["needed_env"],
+            json!(["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"]),
+            "the 503 must name exactly the token-signing vars the surface needs"
+        );
+        // `missing` names the FIRST unset var so the operator knows where to start.
+        assert_eq!(
+            body["missing"], json!("LIVEKIT_URL not set"),
+            "missing should name the first unset var, got {body}"
+        );
+    }
+
+    /// CALL_PLACE GUARD: missing telephony creds → 503 naming exactly the env the
+    /// operator must provision (`LIVEKIT_URL` + the SIP trunk/caller vars), with
+    /// the typed body shape (`blocked_on:"telephony not configured"`, `needed_env`,
+    /// `missing`). The live dial past this guard needs a real Twilio trunk; only
+    /// the guard is hermetically testable, and this pins its contract.
+    #[tokio::test]
+    async fn call_place_missing_creds_is_503_naming_env() {
+        let _creds = livekit_creds_env_guard();
+        clear_livekit_env();
+
+        let state = permission_test_state();
+        let (status, Json(body)) = call_place(
+            State(state),
+            // A valid number, so we pass the format guard and reach the creds gate.
+            Json(PlaceCallRequest { to: "+17035551234".into() }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no telephony creds must 503 (account not provisioned), not 500/200"
+        );
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["blocked_on"], json!("telephony not configured"));
+        assert_eq!(
+            body["needed_env"],
+            json!([
+                "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
+                "OCEAN_CALL_OUTBOUND_TRUNK", "OCEAN_CALL_CALLER_NUMBER"
+            ]),
+            "the 503 must enumerate the full telephony env set, got {body}"
+        );
+        assert_eq!(
+            body["missing"], json!("LIVEKIT_URL not set"),
+            "missing should name the first unset var"
+        );
+    }
+
+    /// CALL_PLACE GUARD: a non-phone `to` is rejected 400 by the E.164 format guard
+    /// BEFORE any creds are read — so a malformed request fails fast and identically
+    /// whether or not telephony is provisioned. We set the creds to prove the 400 is
+    /// the number guard, not the creds gate firing first.
+    #[tokio::test]
+    async fn call_place_bad_number_is_400_before_creds() {
+        let _creds = livekit_creds_env_guard();
+        // Provision creds so the ONLY thing that can reject is the number guard.
+        set_livekit_token_env();
+        std::env::set_var("OCEAN_CALL_OUTBOUND_TRUNK", "ST_devtrunk");
+        std::env::set_var("OCEAN_CALL_CALLER_NUMBER", "+15558675309");
+
+        let state = permission_test_state();
+        let (status, Json(body)) = call_place(
+            State(state),
+            Json(PlaceCallRequest { to: "not-a-number".into() }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-phone `to` must 400 at the format guard, ahead of the creds gate"
+        );
+        assert_eq!(body["ok"], json!(false));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a valid phone number"),
+            "400 body should explain the number was invalid, got {body}"
+        );
+        clear_livekit_env();
+    }
+
+    /// CALL_PLACE GUARD: an empty `to` (no digits at all) likewise fails the format
+    /// guard with a 400 — the boundary case of `normalize_e164` returning None.
+    #[tokio::test]
+    async fn call_place_empty_number_is_400() {
+        let _creds = livekit_creds_env_guard();
+        clear_livekit_env();
+
+        let state = permission_test_state();
+        let (status, Json(body)) = call_place(
+            State(state),
+            Json(PlaceCallRequest { to: "   ".into() }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an empty number must 400");
+        assert_eq!(body["ok"], json!(false));
+    }
 }
