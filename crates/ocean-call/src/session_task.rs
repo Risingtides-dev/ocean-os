@@ -3199,4 +3199,891 @@ mod tests {
             "with no barge-in the speak must run to completion (no spurious cancel)"
         );
     }
+
+    // =======================================================================
+    // OCEAN-251: interleaving + lifecycle RACE coverage.
+    //
+    // #160 covered failure *modes* (an STT/summary/answer that errors or hangs);
+    // #176 covered the barge-in *primitives* and one happy-path streaming cut.
+    // This section covers the *interleavings* the streaming + barge-in additions
+    // (#173/#176) introduced — events racing an in-flight answer, the order of
+    // teardown vs. a wedged turn, and the BargeInSignal rearm edges — using only
+    // the existing trait seams plus a couple of controlled-timing mocks below.
+    //
+    // Every test runs under an OUTER `tokio::time::timeout`: a real race
+    // regression (a lost CallEnded, a stuck signal, a dropped/replayed-twice
+    // segment that wedges a borrow) shows up as a fast, legible timeout instead
+    // of hanging the suite.
+    // =======================================================================
+
+    /// Outer-timeout helper: a race that wedges the loop must fail *fast*, not
+    /// hang the test binary. Wraps the call-under-test in a 10s deadline (orders
+    /// of magnitude over any fake-clock test, so it only trips on a real hang).
+    async fn within<F: std::future::Future>(fut: F) -> F::Output {
+        match tokio::time::timeout(Duration::from_secs(10), fut).await {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "call loop did not finish within 10s — a race regression \
+                 (lost CallEnded / stuck barge-in signal / wedged replay) likely deadlocked it"
+            ),
+        }
+    }
+
+    /// A streaming [`SttProvider`] whose event emission the **test** drives, event
+    /// by event, rather than flushing a fixed script up front like
+    /// [`MockStreamingStt`]. The test holds an [`EmitHandle`] and calls
+    /// `emit(...)` exactly when the loop is known to be parked at an interesting
+    /// point (e.g. mid-`speak`), so an event can be made to *race* a specific loop
+    /// state deterministically — the only way to exercise the stash/replay and
+    /// barge-in-at-boundary interleavings without real wall-clock timing.
+    ///
+    /// `finish()` drops the sender (channel disconnects) so the loop's Phase-2
+    /// drain returns at once — same teardown shape as the real Deepgram pump.
+    struct ProgrammableStt {
+        tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>>,
+        pushes: Arc<AtomicU64>,
+        finished: Arc<AtomicU64>,
+    }
+
+    /// A cloneable handle the test uses to inject events into a [`ProgrammableStt`]
+    /// at a chosen instant. Sending after the loop has ended is a harmless no-op
+    /// (the receiver is gone), so a test never has to race the channel shut.
+    #[derive(Clone)]
+    struct EmitHandle {
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    }
+
+    impl EmitHandle {
+        /// Inject one event now. Ignores a closed receiver (loop already ended).
+        fn emit(&self, ev: StreamEvent) {
+            let _ = self.tx.send(ev);
+        }
+    }
+
+    impl ProgrammableStt {
+        /// Build the provider, the receiver the loop consumes, a test-side
+        /// [`EmitHandle`], and the push/finish counters.
+        fn new() -> (
+            Arc<Self>,
+            UnboundedReceiver<StreamEvent>,
+            EmitHandle,
+            Arc<AtomicU64>,
+            Arc<AtomicU64>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let pushes = Arc::new(AtomicU64::new(0));
+            let finished = Arc::new(AtomicU64::new(0));
+            let handle = EmitHandle { tx: tx.clone() };
+            let me = Arc::new(Self {
+                tx: std::sync::Mutex::new(Some(tx)),
+                pushes: pushes.clone(),
+                finished: finished.clone(),
+            });
+            (me, rx, handle, pushes, finished)
+        }
+    }
+
+    #[async_trait]
+    impl SttProvider for ProgrammableStt {
+        async fn push_frame(&self, _frame: PcmFrame) -> anyhow::Result<()> {
+            self.pushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn finish(&self) -> anyhow::Result<()> {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            // Drop the sender so Phase-2 drain disconnects immediately.
+            *self.tx.lock().unwrap() = None;
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "programmable-streaming"
+        }
+    }
+
+    /// A [`Voice`] that **parks** the first speak on a flag the test flips when it
+    /// chooses — unlike [`GatedVoice`], whose park is only ever ended by
+    /// cancellation. Lets a test hold an answer mid-`speak` (Ocean is talking),
+    /// inject racing events, then `release()` so the speak *completes normally*
+    /// and assert the post-answer replay path committed what arrived during the
+    /// window.
+    ///
+    /// The park is race-free regardless of release/park ordering: it registers
+    /// the `Notify` future *before* re-checking the flag (the same discipline as
+    /// [`BargeInSignal::barged`]), so a `release()` that lands before the speak
+    /// parks is not lost.
+    #[derive(Clone)]
+    struct ReleasableVoice {
+        started: Arc<AtomicU64>,
+        finished: Arc<AtomicU64>,
+        park_first: Arc<AtomicU64>,
+        released: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    impl ReleasableVoice {
+        fn new(park_first: u64) -> Self {
+            Self {
+                started: Arc::new(AtomicU64::new(0)),
+                finished: Arc::new(AtomicU64::new(0)),
+                park_first: Arc::new(AtomicU64::new(park_first)),
+                released: Arc::new(AtomicBool::new(false)),
+                notify: Arc::new(Notify::new()),
+            }
+        }
+        /// Let any parked speak proceed to completion.
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl Voice for ReleasableVoice {
+        async fn speak(&mut self, _text: &str) -> anyhow::Result<()> {
+            let n = self.started.fetch_add(1, Ordering::SeqCst);
+            if n < self.park_first.load(Ordering::SeqCst) {
+                // Park until released — race-free: register the waiter before the
+                // flag re-check so a release that already happened isn't missed.
+                loop {
+                    let notified = self.notify.notified();
+                    if self.released.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Count how many `CallEnded` events a sink saw — the load-bearing "exactly
+    /// one, never lost, never duplicated" lifecycle invariant.
+    fn count_ended(sink: &CapturingSink) -> usize {
+        sink.events
+            .iter()
+            .filter(|e| matches!(e, OceanEvent::CallEnded { .. }))
+            .count()
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch loop — lifecycle ordering under trailing work + a hung answer.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn batch_source_end_during_in_flight_answer_still_ends_once() {
+        // The classic "CallEnded racing an in-flight run_answer": the wake command
+        // is the LAST utterance, so the answer turn runs during the loop's final
+        // drain — the source has already ended. The answer must complete, THEN
+        // CallEnded fires exactly once, after the spoke. No lost/duplicated end.
+        let frames = vec![frame_3s()];
+        let stt = ScriptedStt::new(vec![Some("hey Ocean what did we agree to")]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        within(run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            stt,
+            CannedRunner::new("You agreed to send the master.", seen.clone()),
+            voice,
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        ))
+        .await;
+
+        let types = ev_types(&out);
+        // Exactly one CallEnded, and it is the very last event (after the spoke).
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        // The answer ran to completion before teardown — spoke is present and
+        // strictly precedes ended.
+        let spoke_idx = types.iter().position(|t| *t == "spoke");
+        let ended_idx = types.iter().rposition(|t| *t == "ended");
+        assert!(spoke_idx.is_some(), "the trailing answer must have spoken; got {types:?}");
+        assert!(
+            spoke_idx < ended_idx,
+            "the in-flight answer must finish before CallEnded; got {types:?}"
+        );
+        assert_eq!(
+            spoken.lock().unwrap().as_slice(),
+            &["You agreed to send the master.".to_string()],
+            "the answer that raced teardown still spoke exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_trailing_audio_flush_then_wake_then_end_in_order() {
+        // A frame is buffered but never hits the size-flush (sub-3s), so it is
+        // flushed only in the loop's post-loop drain — and that flushed utterance
+        // is itself a wake command. This races the trailing-flush, the answer, and
+        // teardown back-to-back. Invariant: the trailing transcript commits, the
+        // answer speaks, and CallEnded still fires last, exactly once.
+        let small = PcmFrame::new(vec![1i16; 16_000], 16_000, 1); // 1s — no size flush
+        let stt = ScriptedStt::new(vec![Some("hey Ocean summarize the call")]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        within(run_call_session(
+            session(false),
+            VecFrames::new(vec![small]),
+            stt,
+            CannedRunner::new("Here is the summary.", seen.clone()),
+            voice,
+            &mut out,
+            "call:room".into(),
+            vec![],
+            // Large gap so the frame-gap flush never fires in this compressed run;
+            // the only flush is the post-loop drain.
+            UtterancePolicy {
+                max_utterance_ms: 3_000,
+                silence_gap_ms: 10_000,
+                tick_interval_ms: 10_000,
+            },
+            step_clock(0, 100),
+        ))
+        .await;
+
+        let types = ev_types(&out);
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        // The trailing utterance was transcribed (segment), woke Ocean, and was
+        // answered — none of it lost to the race with teardown.
+        assert!(types.contains(&"segment"), "trailing audio must commit a segment; got {types:?}");
+        assert!(types.contains(&"wake"), "trailing wake must fire; got {types:?}");
+        assert_eq!(
+            spoken.lock().unwrap().as_slice(),
+            &["Here is the summary.".to_string()],
+            "the trailing-flush wake answer still spoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_hung_summary_then_trailing_wake_all_resolve_and_end() {
+        // Summary timeout RACING the rest of teardown: two finals cross the
+        // every_n_segments=2 threshold (summary due) AND the second is a wake
+        // command. The summary turn hangs; its bounded timeout must fire, the wake
+        // answer must still run, and CallEnded must still fire exactly once — i.e.
+        // a wedged summary can't strand the answer or the end. A runner that hangs
+        // ONLY on the summary prompt but answers wake turns promptly isolates this.
+        let _guard = OCEAN_254_ENV_LOCK.lock().await;
+        std::env::set_var("OCEAN_CALL_SUMMARY_TIMEOUT_MS", "50");
+
+        struct HangSummaryAnswerOk {
+            summary_entered: Arc<AtomicU64>,
+            spoke_reply: String,
+        }
+        #[async_trait]
+        impl TurnRunner for HangSummaryAnswerOk {
+            async fn run(&mut self, command: &str) -> anyhow::Result<String> {
+                if command.starts_with(SUMMARY_INSTRUCTION) {
+                    self.summary_entered.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(60)).await; // must be cut by timeout
+                    Ok("unreachable".into())
+                } else {
+                    Ok(self.spoke_reply.clone())
+                }
+            }
+        }
+
+        let summary_entered = Arc::new(AtomicU64::new(0));
+        let frames = vec![frame_3s(), frame_3s()];
+        // First final: a plain line. Second final: crosses summary threshold AND is
+        // a wake command. So on the 2nd segment, summary_due is set (hangs) and the
+        // active lane is Answer (must still run after the summary timeout).
+        let stt = ScriptedStt::new(vec![
+            Some("the numbers look strong this quarter"),
+            Some("hey Ocean what's the plan"),
+        ]);
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_call_session(
+                session(false),
+                VecFrames::new(frames),
+                stt,
+                HangSummaryAnswerOk {
+                    summary_entered: summary_entered.clone(),
+                    spoke_reply: "The plan is to ship Friday.".into(),
+                },
+                voice,
+                &mut out,
+                "call:room".into(),
+                vec![],
+                UtterancePolicy::default(),
+                step_clock(0, 100),
+            ),
+        )
+        .await;
+
+        std::env::remove_var("OCEAN_CALL_SUMMARY_TIMEOUT_MS");
+
+        assert!(res.is_ok(), "a hung summary must not strand the trailing wake answer or teardown");
+        assert!(
+            summary_entered.load(Ordering::SeqCst) >= 1,
+            "the summary turn must have been attempted (then timed out)"
+        );
+        let types = ev_types(&out);
+        // No summary emitted (it timed out), but the wake answer still ran and the
+        // call still ended exactly once.
+        assert!(
+            !types.contains(&"summary"),
+            "a timed-out summary emits no summary; got {types:?}"
+        );
+        assert!(types.contains(&"wake"), "the trailing wake still fired; got {types:?}");
+        assert_eq!(
+            spoken.lock().unwrap().as_slice(),
+            &["The plan is to ship Friday.".to_string()],
+            "the wake answer ran after the summary timed out"
+        );
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming loop — events racing an in-flight wake answer (`run_answer_barge_in`).
+    //
+    // The streaming answer runs CONCURRENTLY with a pump that keeps draining
+    // `stt_events` so a barge-in Onset can cut the speak. The non-obvious
+    // invariant (#173's doc): a `Final` that arrives during that speak window is
+    // **stashed** (edge forwarded live) and **replayed in order** once the answer
+    // resolves — never dropped, never double-committed, single writer to `sink`
+    // throughout. These drive that with `ProgrammableStt` (emit on command) +
+    // `ReleasableVoice` (park the speak until the test releases it).
+    // -----------------------------------------------------------------------
+
+    /// Spin until `cond()` holds, yielding to the loop between checks. Bounded by
+    /// the caller's outer timeout, so a never-true condition fails as a timeout.
+    async fn spin_until(cond: impl Fn() -> bool) {
+        while !cond() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_final_arriving_mid_answer_is_replayed_not_dropped() {
+        // The stash/replay race. A wake final starts an answer whose `speak` parks
+        // (Ocean mid-utterance). While parked, a *new, non-wake* final arrives off
+        // the stream — the concurrent pump must STASH it (not drop it, not feed it
+        // re-entrantly). When the speak is released and the answer resolves, that
+        // stashed final must be REPLAYED exactly once as a committed transcript
+        // segment. Then the source ends and the call closes once.
+        let (stt, rx, emit, _pushes, finished) = ProgrammableStt::new();
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = ReleasableVoice::new(1); // the first (wake) answer parks
+        let started = voice.started.clone();
+        let started_driver = voice.started.clone();
+        let finished_speaks = voice.finished.clone();
+        let release_voice = voice.clone();
+        // Real barge-in wiring (canceller + BargeInVoice share one signal), so the
+        // stash/replay path is exercised exactly as in production — but no Onset is
+        // ever sent here, so the parked speak is released normally, not cancelled.
+        let (canceller, signal) = BargeInCanceller::new();
+        let bargein_voice = BargeInVoice::new(voice, signal);
+        let mut out = CapturingSink::default();
+
+        // Driver: sequence the race off observable loop state.
+        let driver = tokio::spawn(async move {
+            // 1) Kick the wake command → the answer starts and its speak parks.
+            emit.emit(final_event("hey Ocean give me the long version", 0));
+            // 2) Wait until the speak is actually parked (started bumped, not done).
+            spin_until(|| started_driver.load(Ordering::SeqCst) == 1).await;
+            // 3) Now race a NON-wake final into the speak window. The pump stashes it.
+            emit.emit(final_event("by the way the invoice is approved", 1_000));
+            // 4) Give the pump a few ticks to dequeue + stash it before releasing.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            // 5) Release the parked speak → answer resolves → stashed final replays.
+            release_voice.release();
+        });
+
+        within(run_call_session_streaming(
+            session_cooldown(false, 0),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("Here is the long version.", seen.clone()),
+            bargein_voice,
+            &mut out,
+            canceller,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        ))
+        .await;
+        driver.await.expect("driver task should not panic");
+
+        let types = ev_types(&out);
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+
+        // The wake answer spoke to completion (released, not cancelled).
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the wake answer started speaking");
+        assert_eq!(
+            finished_speaks.load(Ordering::SeqCst),
+            1,
+            "the released speak ran to completion (no spurious barge-in cancel)"
+        );
+
+        // THE load-bearing assertion: the final that arrived mid-answer was
+        // committed EXACTLY ONCE — neither dropped nor replayed twice.
+        let replayed = out
+            .events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                OceanEvent::CallTranscriptSegment { text, is_final: true, .. }
+                    if text == "by the way the invoice is approved"
+            ))
+            .count();
+        assert_eq!(
+            replayed, 1,
+            "the mid-answer final must be replayed exactly once (not dropped, not doubled); got {types:?}"
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+    }
+
+    #[tokio::test]
+    async fn streaming_stream_close_mid_answer_lets_answer_finish_then_ends() {
+        // The provider's read pump dies (socket closed) WHILE a wake answer is
+        // parked mid-`speak`. `run_answer_barge_in`'s `None` arm must let the
+        // answer run to completion, then the loop tears down: one CallEnded, the
+        // answer still spoke, no panic from the closed channel.
+        let (stt, rx, emit, _pushes, finished) = ProgrammableStt::new();
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = ReleasableVoice::new(1);
+        let started = voice.started.clone();
+        let started_driver = voice.started.clone();
+        let finished_speaks = voice.finished.clone();
+        let release_voice = voice.clone();
+        let stt_for_driver = stt.clone();
+        let mut out = CapturingSink::default();
+
+        let driver = tokio::spawn(async move {
+            // Start the wake answer; wait for its speak to park.
+            emit.emit(final_event("hey Ocean hold on a sec", 0));
+            spin_until(|| started_driver.load(Ordering::SeqCst) == 1).await;
+            // Close the STT stream mid-answer: drop the provider's sender. The pump
+            // in run_answer_barge_in hits its `None` arm and awaits the answer.
+            let _ = stt_for_driver.finish().await; // drops the event sender
+            // Let a few ticks pass so the pump observes the disconnect while parked.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            // Release so the answer completes; the loop then ends the call.
+            release_voice.release();
+        });
+
+        within(run_call_session_streaming(
+            session_cooldown(false, 0),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("Okay, holding.", seen.clone()),
+            voice,
+            &mut out,
+            NoopActivitySink,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        ))
+        .await;
+        driver.await.expect("driver task should not panic");
+
+        let types = ev_types(&out);
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded even with stream closed mid-answer; got {types:?}");
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the answer started before the stream closed");
+        assert_eq!(
+            finished_speaks.load(Ordering::SeqCst),
+            1,
+            "the answer ran to completion after the stream closed mid-flight"
+        );
+        assert!(types.contains(&"spoke"), "the answer still emitted CallAgentSpoke; got {types:?}");
+        // finish() was called by the driver; the loop's own finish() is a harmless
+        // second call (sender already None) — at least one, never a panic.
+        assert!(finished.load(Ordering::SeqCst) >= 1, "finish() was invoked");
+    }
+
+    // -----------------------------------------------------------------------
+    // Barge-in at boundary conditions — the BargeInSignal rearm logic.
+    //
+    // The signal is shared mutable state across the canceller (writer on edges)
+    // and the BargeInVoice (reader/racer + self-rearm at speak start). These pin
+    // the edges most likely to leave it STUCK: repeated onsets with no settle, a
+    // stale onset standing when the next answer starts, and onsets that land
+    // outside any speak window.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn barge_in_repeated_triggers_are_idempotent_and_one_rearm_clears() {
+        // Primitive-level: a burst of onsets (no settle between) must not "stack" —
+        // the signal is simply barged, and a SINGLE rearm clears it. A bug that
+        // counted triggers (and needed N rearms) would leave the next answer muted.
+        let (mut canceller, signal) = BargeInCanceller::new();
+        for _ in 0..5 {
+            canceller.on_activity(SpeechActivity::Onset);
+        }
+        assert!(signal.is_barged(), "any onset trips the signal");
+        // One settle rearms despite five onsets — not a counter.
+        canceller.on_activity(SpeechActivity::Settled);
+        assert!(
+            !signal.is_barged(),
+            "a single Settled must clear the signal regardless of how many onsets preceded it"
+        );
+
+        // And `barged()` resolves instantly while tripped, parks-then-wakes after a
+        // rearm — proving no stuck wakers linger from the burst.
+        canceller.on_activity(SpeechActivity::Onset);
+        tokio::time::timeout(Duration::from_secs(1), signal.barged())
+            .await
+            .expect("a tripped signal must resolve barged() immediately");
+        canceller.on_activity(SpeechActivity::Settled);
+        // Now barged() must block (no stale wake); a fresh trigger releases it.
+        let sig2 = signal.clone();
+        let waiter = tokio::spawn(async move { sig2.barged().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "after rearm, barged() must park — no leftover wake from the burst");
+        signal.trigger();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a fresh trigger must wake the parked waiter")
+            .expect("waiter task should not panic");
+    }
+
+    #[tokio::test]
+    async fn streaming_onset_burst_then_settle_still_lets_next_answer_speak() {
+        // End-to-end: a wake answer parks mid-speak; the human barges with a BURST
+        // of onset interims (no settle between), cutting it; then a single settle
+        // rearms and a second wake answer must speak normally. Proves a rapid-fire
+        // onset burst doesn't wedge the rearm (started=2, finished=1, clean end).
+        let during = vec![
+            final_event("hey Ocean give me the long version", 0),
+            // Burst: three onset interims with no settle between them.
+            interim_onset_event("wait", 1_000),
+            interim_onset_event("wait no", 1_050),
+            interim_onset_event("wait no hold on", 1_100),
+            // The spurt finally settles (rearm), then a second wake command.
+            StreamEvent {
+                update: SegmentUpdate::Final(TranscriptSegment::final_(
+                    "caller",
+                    "wait no hold on never mind",
+                    1_000,
+                )),
+                activity: Some(SpeechActivity::Settled),
+            },
+            final_event("hey Ocean what's next", 2_000),
+        ];
+        let (stt, rx, _pushes, finished) = MockStreamingStt::new(during, vec![]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let gated = GatedVoice::new(1); // first answer parks → can be cut
+        let started = gated.started.clone();
+        let finished_speaks = gated.finished.clone();
+        let (canceller, signal) = BargeInCanceller::new();
+        let voice = BargeInVoice::new(gated, signal);
+        let mut out = CapturingSink::default();
+
+        within(run_call_session_streaming(
+            session_cooldown(false, 0),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("Here is the long version.", seen.clone()),
+            voice,
+            &mut out,
+            canceller,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        ))
+        .await;
+
+        let types = ev_types(&out);
+        assert_eq!(types.last(), Some(&"ended"), "the call must end cleanly after an onset burst; got {types:?}");
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(started.load(Ordering::SeqCst), 2, "both wake answers began speaking despite the burst");
+        assert_eq!(
+            finished_speaks.load(Ordering::SeqCst),
+            1,
+            "first answer cut by the burst, second answer spoke to completion (rearm survived)"
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+    }
+
+    #[tokio::test]
+    async fn barge_in_voice_self_rearms_stale_onset_so_next_answer_speaks() {
+        // The `BargeInVoice::speak` self-rearm guard in isolation: an onset is left
+        // STANDING (tripped, never settled) from a prior spurt; the next answer's
+        // `speak` must clear it at the top and play to completion, NOT cancel on a
+        // dead onset. Without the self-rearm, this speak would be pre-cancelled.
+        let (mut canceller, signal) = BargeInCanceller::new();
+        let inner = GatedVoice::new(0); // never parks — a quick utterance
+        let started = inner.started.clone();
+        let finished = inner.finished.clone();
+        let mut voice = BargeInVoice::new(inner, signal.clone());
+
+        // Stale onset standing, with NO settle to clear it.
+        canceller.on_activity(SpeechActivity::Onset);
+        assert!(signal.is_barged(), "onset is standing (no settle)");
+
+        // The next answer must still speak — `speak` rearms the stale onset itself.
+        tokio::time::timeout(Duration::from_secs(5), voice.speak("the next reply"))
+            .await
+            .expect("a stale onset must not deadlock the next speak")
+            .expect("a self-rearmed voice must speak");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the next answer started");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "the next answer ran to completion — the stale onset was self-rearmed, not honoured"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_onset_after_speak_finished_does_not_mute_next_answer() {
+        // Onset arriving AFTER a speak completes (Ocean already done): the human
+        // starts talking between answers. With no settle scripted before the next
+        // wake, the standing onset must be self-rearmed by the next answer's speak
+        // — both answers complete (started=2, finished=2). Guards against a late
+        // onset spuriously muting the following utterance end-to-end.
+        let during = vec![
+            // Answer #1 — completes immediately (GatedVoice never parks).
+            final_event("hey Ocean quick status", 0),
+            // Human starts talking AFTER #1 finished; onset stands (no settle).
+            interim_onset_event("um", 1_000),
+            // Answer #2 — must still speak; its speak self-rearms the stale onset.
+            final_event("hey Ocean and the next step", 2_000),
+        ];
+        let (stt, rx, _pushes, finished_calls) = MockStreamingStt::new(during, vec![]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let gated = GatedVoice::new(0); // neither answer parks
+        let started = gated.started.clone();
+        let finished_speaks = gated.finished.clone();
+        let (canceller, signal) = BargeInCanceller::new();
+        let voice = BargeInVoice::new(gated, signal);
+        let mut out = CapturingSink::default();
+
+        within(run_call_session_streaming(
+            session_cooldown(false, 0),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("On it.", seen.clone()),
+            voice,
+            &mut out,
+            canceller,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        ))
+        .await;
+
+        let types = ev_types(&out);
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(started.load(Ordering::SeqCst), 2, "both answers started speaking");
+        assert_eq!(
+            finished_speaks.load(Ordering::SeqCst),
+            2,
+            "both answers completed — a post-speak onset must not mute the next answer"
+        );
+        let spoke_count = out
+            .events
+            .iter()
+            .filter(|e| matches!(e, OceanEvent::CallAgentSpoke { .. }))
+            .count();
+        assert_eq!(spoke_count, 2, "both answers emit CallAgentSpoke; got {types:?}");
+        assert_eq!(finished_calls.load(Ordering::SeqCst), 1, "finish() ran once");
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming loop — interims/finals interleaved with wake + source-end.
+    // Ordering + teardown invariants across the whole mixed stream.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn streaming_interleaved_interims_finals_wake_preserve_order_and_close_once() {
+        // A realistic mixed stream: interim → final(line) → interim → final(wake)
+        // → final(line), then a trailing final flushed on finish(). Invariants:
+        //   - every interim renders as a NON-final line (liveness),
+        //   - every final commits as a FINAL line, in stream order,
+        //   - the wake fires and is answered,
+        //   - the trailing-on-finish final is drained (last words not lost),
+        //   - exactly one CallEnded, and it is last.
+        let during = vec![
+            interim_onset_event("so the", 0),
+            final_event("so the masters are ready", 0),
+            StreamEvent {
+                update: SegmentUpdate::Interim(TranscriptSegment::interim("caller", "hey", 1_000)),
+                activity: None,
+            },
+            final_event("hey Ocean confirm the date", 1_000),
+            final_event("and the budget is approved", 2_000),
+        ];
+        let trailing = vec![final_event("talk soon", 3_000)];
+        let (stt, rx, _pushes, finished) = MockStreamingStt::new(during, trailing);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        within(run_call_session_streaming(
+            session_cooldown(false, 0),
+            VecFrames::new(vec![frame_3s()]),
+            stt,
+            rx,
+            CannedRunner::new("Confirmed.", seen.clone())
+                .with_summary("Masters ready; date and budget confirmed."),
+            voice,
+            &mut out,
+            NoopActivitySink,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        ))
+        .await;
+
+        let types = ev_types(&out);
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        assert!(types.contains(&"wake"), "the wake final must fire; got {types:?}");
+        assert!(types.contains(&"spoke"), "the wake answer must speak; got {types:?}");
+
+        // The FINAL transcript lines committed in stream order — including the
+        // trailing-on-finish "talk soon" (last words not lost), with the wake
+        // final among them. (Interims are excluded; finals only.)
+        let finals: Vec<String> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                OceanEvent::CallTranscriptSegment { text, is_final: true, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finals,
+            vec![
+                "so the masters are ready".to_string(),
+                "hey Ocean confirm the date".to_string(),
+                "and the budget is approved".to_string(),
+                "talk soon".to_string(),
+            ],
+            "finals must commit in stream order, trailing-on-finish included; got {finals:?}"
+        );
+        // Both interims surfaced as non-final liveness lines.
+        let non_finals: Vec<String> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                OceanEvent::CallTranscriptSegment { text, is_final: false, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            non_finals.contains(&"so the".to_string()) && non_finals.contains(&"hey".to_string()),
+            "interims must surface as non-final lines; got {non_finals:?}"
+        );
+        assert_eq!(
+            spoken.lock().unwrap().as_slice(),
+            &["Confirmed.".to_string()],
+            "exactly the one wake answer was spoken"
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+    }
+
+    #[tokio::test]
+    async fn streaming_hung_summary_racing_source_end_still_closes_once() {
+        // Summary timeout RACING source-end on the STREAMING loop. Two finals cross
+        // the every_n_segments=2 threshold mid-stream → a summary turn is due and
+        // runs inline in `handle_stream_event`. It hangs. The source ends right
+        // after. The bounded summary timeout (OCEAN-254) must fire so Phase-1 → the
+        // finish()/drain → CallEnded all complete: no summary emitted, exactly one
+        // CallEnded, no deadlock. A runner that hangs only on the summary prompt
+        // isolates the summary-vs-teardown race.
+        let _guard = OCEAN_254_ENV_LOCK.lock().await;
+        std::env::set_var("OCEAN_CALL_SUMMARY_TIMEOUT_MS", "50");
+
+        struct HangSummaryRunner {
+            summary_entered: Arc<AtomicU64>,
+        }
+        #[async_trait]
+        impl TurnRunner for HangSummaryRunner {
+            async fn run(&mut self, command: &str) -> anyhow::Result<String> {
+                if command.starts_with(SUMMARY_INSTRUCTION) {
+                    self.summary_entered.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok("unreachable".into())
+                } else {
+                    Ok("noop".into())
+                }
+            }
+        }
+
+        let summary_entered = Arc::new(AtomicU64::new(0));
+        // Two plain finals (no wake) cross the summary threshold; the summary turn
+        // they trigger hangs.
+        let during = vec![
+            final_event("the quarterly numbers are in", 0),
+            final_event("revenue is up double digits", 1_000),
+        ];
+        let (stt, rx, _pushes, finished) = MockStreamingStt::new(during, vec![]);
+        let mut out = CapturingSink::default();
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_call_session_streaming(
+                session(false),
+                VecFrames::new(vec![frame_3s()]),
+                stt,
+                rx,
+                HangSummaryRunner {
+                    summary_entered: summary_entered.clone(),
+                },
+                CapturingVoice::default(),
+                &mut out,
+                NoopActivitySink,
+                "call:room".into(),
+                vec![],
+                UtterancePolicy::default(),
+                step_clock(0, 100),
+            ),
+        )
+        .await;
+
+        std::env::remove_var("OCEAN_CALL_SUMMARY_TIMEOUT_MS");
+
+        assert!(
+            res.is_ok(),
+            "a hung summary must not stall the streaming loop's teardown (no deadlock)"
+        );
+        assert!(
+            summary_entered.load(Ordering::SeqCst) >= 1,
+            "the summary turn must have been attempted before the timeout fired"
+        );
+        let types = ev_types(&out);
+        assert!(
+            !types.contains(&"summary"),
+            "a timed-out summary emits no summary on the streaming path; got {types:?}"
+        );
+        assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
+        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+    }
 }
