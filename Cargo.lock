@@ -3058,6 +3058,7 @@ dependencies = [
  "clap",
  "futures",
  "ocean-agent-sdk",
+ "ocean-core",
  "ocean-protocol",
  "ocean-providers",
  "ocean-runtime",

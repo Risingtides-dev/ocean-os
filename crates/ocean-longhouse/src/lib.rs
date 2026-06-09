@@ -49,7 +49,8 @@ pub use prepare::{
     DEFAULT_TOP_N,
 };
 pub use convene::{
-    claim_outcome, ClaimError, Clock, ConveneOutcome, ConveneRequest, SystemClock, convene,
+    claim_outcome, ClaimError, Clock, ConveneOutcome, ConveneRequest, FirekeeperTitle, SystemClock,
+    convene,
 };
 pub use quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
 pub use registry::{LonghouseRegistry, TopicSnapshot, TopicState};

@@ -176,15 +176,30 @@ and emits `Converged`/`Aborted`.
 
 **Steps 6 and beyond are future / unbuilt.** Treat the following as not-yet-real:
 
-- **Escrow trio (step 6).** `TitleRegistry` and `Revoker` as separate daemon
-  principals do not exist. The firekeeper title is bound to the winning proposer
-  inside `convene`, but it is not a separately-escrowed grant/exercise/revoke
-  capability.
-- **Unforgeable `claim_outcome` gate (step 6).** A `claim_outcome` function
-  exists, but the daemon does not yet REJECT a firekeeper's `Converged` claim
-  unless the daemon's own quorum state already agrees. Until that daemon-side
-  check lands, a firekeeper effectively just emits the outcome — the
-  "unforgeable" property is not enforced.
+- **Unforgeable `claim_outcome` gate (step 6).** BUILT (OCEAN-229). When
+  `convene` seats the firekeeper on the winning proposer it mints a
+  [`FirekeeperTitle`](../crates/ocean-longhouse/src/convene.rs): the public
+  `agent_id` paired with a **secret token** drawn server-side from the OCEAN-185
+  decision-token primitive (`mint_decision_token`, ~244 bits of OS-CSPRNG
+  entropy). The token is the proof-of-title; it never appears on any emitted
+  `LonghouseEvent` (`RoleGranted`/`Converged` carry only the `agent_id`).
+  `claim_outcome` now requires the claimant to present a matching `(agent_id,
+  token)` pair and verifies the token in **constant time**
+  (`decision_token_matches`) *before* consulting the engine — so a forged
+  firekeeper that only learned the public id off the event stream is rejected
+  with `ClaimError::ForgedFirekeeper` even when the quorum genuinely converged.
+  The original accountability brake still holds on top: a legitimately-titled
+  firekeeper may only ratify the engine's own decision (`NotConverged` /
+  `WrongDecision` otherwise). This is the same trust-boundary discipline as
+  OCEAN-185 (public id, secret token) and OCEAN-220 (the right is server-decided
+  and minted, not claimant-asserted).
+- **Escrow trio (step 6) — partial.** The unforgeable title is minted and
+  verified per the gate above, but it lives in the `convene` stack frame for one
+  council. `TitleRegistry` (a persisted, daemon-held store of live titles across
+  turns) and `Revoker` (graduated recall / revocation as a separate daemon
+  principal) do not yet exist; the title is not a separately-escrowed
+  grant/exercise/revoke capability spanning multiple turns. This is the natural
+  follow-up to OCEAN-229.
 - **Graduated recall + `Warned` strikes**, **validator process-veto**, and the
   **subsidiarity escalation predicate** (most things should never convene a
   council at all) — all stubbed.

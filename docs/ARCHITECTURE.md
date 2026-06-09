@@ -207,9 +207,13 @@ Room auto-convene — WIRED (a resolved mention now wakes the agent).
 One related item is still partial and tracked in its own doc:
 
 - **Longhouse governance (quorum steps 6+)** — the convergence engine (steps
-  1–5) is built and tested; the escrow trio (TitleRegistry + Revoker +
-  validator escrow) and the unforgeable `claim_outcome` gate are stubbed. See
-  `docs/LONGHOUSE.md` § "Built vs unbuilt".
+  1–5) is built and tested. The unforgeable `claim_outcome` gate is now **built**
+  (OCEAN-229): the firekeeper title is minted server-side at convene time with an
+  unforgeable token (the OCEAN-185 decision-token primitive) and `claim_outcome`
+  verifies it in constant time, so a forged firekeeper that only names the public
+  firekeeper id cannot claim an outcome. The broader escrow trio (a persisted
+  `TitleRegistry` + `Revoker` + validator escrow as separate daemon principals)
+  remains a follow-up. See `docs/LONGHOUSE.md` § "Built vs unbuilt".
 
 ## API model
 

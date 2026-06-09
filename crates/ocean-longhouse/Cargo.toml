@@ -11,6 +11,12 @@ rust-version.workspace = true
 # the SAME LonghouseEvent / Mark / Federation / AgentRole types the deck
 # already renders — we never invent a new event shape.
 ocean-agent-sdk = { path = "../ocean-agent-sdk" }
+# Shared protocol primitives. We reuse the OCEAN-185 unforgeable-token primitive
+# (`mint_decision_token` / `decision_token_matches`, constant-time) to make the
+# firekeeper's right to `claim_outcome` unforgeable — the same trust-boundary
+# discipline as permission decision tokens. ocean-core depends only on
+# chrono/serde/uuid, so there is no dependency cycle.
+ocean-core = { path = "../ocean-core" }
 # LLM calls go through the existing unified provider protocol (stream_simple),
 # never a hand-rolled HTTP client.
 ocean-protocol = { path = "../ocean-protocol" }
