@@ -41,6 +41,16 @@ tracing-subscriber.workspace = true
 # Recursive directory scan for the skill index loader (prepare.rs). Already in
 # the dependency tree transitively; pinned here as a direct, intentional dep.
 walkdir = "2"
+# Durable storage for the escrow trio's persisted TitleRegistry (OCEAN-246).
+# Same `rusqlite` (bundled) backend, sync + Mutex-guardable, hermetic (no system
+# libsqlite3) as `ocean-store`'s SqliteRoomStore — we mirror that pattern rather
+# than introduce a second DB convention.
+rusqlite = { workspace = true }
+# SHA-256 for the persistence-safe title *verifier* (salt + hash), so the secret
+# proof-of-title token is NEVER stored — only `SHA-256(salt||token)`, like
+# password storage. Already in the workspace lockfile (5+ transitive users);
+# pinned here as a direct, intentional dep.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }

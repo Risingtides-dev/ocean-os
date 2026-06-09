@@ -35,6 +35,7 @@
 pub mod agent;
 pub mod config;
 pub mod convene;
+pub mod escrow;
 pub mod longhouse_provider;
 pub mod prepare;
 pub mod quorum;
@@ -51,6 +52,11 @@ pub use prepare::{
 pub use convene::{
     claim_outcome, ClaimError, Clock, ConveneOutcome, ConveneRequest, FirekeeperTitle, SystemClock,
     convene,
+};
+pub use escrow::{
+    claim_outcome_persisted, EscrowError, EscrowState, PersistedTitle, Revocation,
+    RevokeAuthorization, RevokeError, Revoker, RevokerKey, SqliteTitleRegistry, TitleStatus,
+    TitleVerifier,
 };
 pub use quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
 pub use registry::{LonghouseRegistry, TopicSnapshot, TopicState};

@@ -211,9 +211,17 @@ One related item is still partial and tracked in its own doc:
   (OCEAN-229): the firekeeper title is minted server-side at convene time with an
   unforgeable token (the OCEAN-185 decision-token primitive) and `claim_outcome`
   verifies it in constant time, so a forged firekeeper that only names the public
-  firekeeper id cannot claim an outcome. The broader escrow trio (a persisted
-  `TitleRegistry` + `Revoker` + validator escrow as separate daemon principals)
-  remains a follow-up. See `docs/LONGHOUSE.md` § "Built vs unbuilt".
+  firekeeper id cannot claim an outcome. The escrow trio is now **built**
+  (OCEAN-246, `crates/ocean-longhouse/src/escrow.rs`): a persisted
+  `SqliteTitleRegistry` (titles survive across turns; the secret token is never
+  stored — only a salted SHA-256 verifier), a separate `Revoker` principal
+  (graduated `Warned` strikes → hard `RoleRevoked`; a revoked title fails
+  `claim_outcome` even with the right token; revocation requires the Revoker's
+  own server-minted key so it can't be forged), and a validator escrow ledger
+  (stake → held → released-on-claim / forfeited-on-abort). Remaining follow-ups:
+  wiring the persisted registry onto the daemon's `AppState` (it is an additive
+  library today, as `ocean-store` was when it landed) and the staking *economics*.
+  See `docs/LONGHOUSE.md` § "Built vs unbuilt".
 
 ## API model
 
