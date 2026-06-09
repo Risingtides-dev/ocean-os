@@ -3157,6 +3157,12 @@ struct RoomCreateRequest {
     /// Optional trigger policy controlling auto-convene/notify behaviour.
     #[serde(default)]
     trigger_policy: Option<RoomTriggerPolicy>,
+    /// Optional workspace directory the room belongs to (OCEAN-260). When set,
+    /// the room is bound to this project/cwd, so a room-bound agent turn resolves
+    /// its owning project and `cwd` from it. Absent/empty ⇒ no binding (room
+    /// agents fall back to room+agent keying with the daemon's launch dir).
+    #[serde(default)]
+    workspace_root: Option<String>,
 }
 
 /// `POST /v1/rooms/persistent` — create a persistent room.
@@ -3165,8 +3171,14 @@ async fn room_create(
     Json(req): Json<RoomCreateRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(req.key.trim());
+    // Normalize an empty/whitespace workspace_root to None so a blank field is
+    // treated as "no binding" rather than a bound-to-empty-string room.
+    let workspace_root = req
+        .workspace_root
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty());
     let result = with_rooms(&state, |reg| {
-        reg.create(key, &req.name, req.trigger_policy, Utc::now())
+        reg.create_in_workspace(key, &req.name, workspace_root, req.trigger_policy, Utc::now())
     });
     match result {
         Ok(rec) => (
@@ -3557,18 +3569,41 @@ fn spawn_room_agent_turn(
     triggered_by_seq: u64,
 ) {
     tokio::spawn(async move {
-        // Resolve a working directory for the turn. A `Room` carries no
-        // `workspace_root` of its own (see `ocean_core::Room`), so a room-bound
-        // agent has no project to bind to from the room side — we fall back to
-        // the daemon's launch dir, a sensible default that always exists, and
-        // key the session by room+agent. (Sessions that DO land in a project's
-        // workspace are still associated back to that project on read, via
-        // `find_by_workspace` in `enrich_session_detail` — OCEAN-228. Giving
-        // rooms their own workspace binding so room turns inherit a project is
-        // the remaining follow-up.)
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| ".".to_string());
+        // Resolve a working directory for the turn. A `Room` may now carry its own
+        // `workspace_root` (OCEAN-260): if it does, that binding is the project the
+        // room belongs to, so the turn runs in that dir and resolves its owning
+        // project from it via the reverse map (`project_for_workspace`, OCEAN-228).
+        // If the room has no binding (None — the legacy default, and every room
+        // created before OCEAN-260), we fall back to the daemon's launch dir and
+        // key the session by room+agent, exactly as before. (Sessions that land in
+        // a project's workspace are still associated back to that project on read,
+        // via `find_by_workspace` in `enrich_session_detail`.)
+        let room_workspace = with_rooms(&state, |reg| {
+            reg.get(&room).ok().flatten().and_then(|rec| rec.room.workspace_root)
+        });
+
+        let (cwd, project_id) = match room_workspace {
+            Some(ws) => {
+                // Bound room: cwd is the room's workspace. Resolve the owning
+                // project (best-effort) so the turn is project-scoped; a lookup
+                // error or "no project at this root" degrades to no project_id
+                // rather than failing the convene.
+                let project_id = state
+                    .runtime
+                    .project_for_workspace(&ws)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.id);
+                (ws, project_id)
+            }
+            None => {
+                // Unbound room (legacy): the daemon's launch dir, no project.
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| ".".to_string());
+                (cwd, None)
+            }
+        };
 
         let session_id = room_agent_session_id(&room, &agent.id);
 
@@ -3608,7 +3643,9 @@ fn spawn_room_agent_turn(
             max_turns: None,
             yolo,
             cwd,
-            project_id: None,
+            // The room's workspace binding resolves to its owning project
+            // (OCEAN-260); `None` for unbound rooms preserves the legacy posture.
+            project_id,
             client_type: Some("room".to_string()),
             // Daemon-internal auto-convene: no external submitter, so no
             // decision_token. Permission gating here defers to OCEAN_YOLO.
@@ -9283,6 +9320,24 @@ mod tests {
         None
     }
 
+    /// Poll `session_detail` until the session is readable or the deadline passes.
+    /// A convened turn writes its session file during the turn (immediately before
+    /// the reply posts), so it is on disk by the time the reply is visible — but
+    /// poll a few times anyway to absorb any directory-entry visibility lag rather
+    /// than reading exactly on the same tick the reply lands.
+    async fn wait_for_session(
+        state: &AppState,
+        sid: ocean_core::SessionId,
+    ) -> Option<ocean_core::SessionDetail> {
+        for _ in 0..200 {
+            if let Ok(detail) = state.runtime.session_detail(sid) {
+                return Some(detail);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn at_mention_queues_turn_and_posts_reply_back() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
@@ -9353,6 +9408,210 @@ mod tests {
             .values()
             .any(|c| c.status.session_id == Some(expected_sid));
         assert!(registered, "a turn must be registered for the room+agent session");
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// OCEAN-260: a room bound to a workspace (`workspace_root`) makes its
+    /// auto-convened agent turn run IN that workspace, which closes the
+    /// session→project dead-end — the resulting session binds to the project's
+    /// directory and resolves its owning project via the reverse map
+    /// (`project_for_workspace`, OCEAN-228). We prove it end-to-end: register a
+    /// project on a directory, create a room bound to that same directory, mention
+    /// the agent, and assert the convened session's `workspace_root` is that
+    /// directory and its `owning_project` is the registered project.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_room_convene_resolves_its_project() {
+        let _guard = AUTO_CONVENE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // The room's workspace is a real directory NOT inside a git repo, so the
+        // session's workspace anchor is exactly this path (no git-toplevel shift),
+        // making the project lookup an exact match.
+        let ws_dir = tempfile::tempdir().unwrap();
+        let ws = ws_dir.path().to_string_lossy().into_owned();
+
+        // Register a project claiming that directory (writes projects.json under
+        // the temp OCEAN_CONFIG_DIR the runtime reads).
+        let now_ms = Utc::now().timestamp_millis();
+        let project = state
+            .runtime
+            .upsert_project(
+                Project {
+                    id: uuid::Uuid::new_v4(),
+                    name: "Bound Project".into(),
+                    workspace_root: ws.clone(),
+                    config: ProjectConfig::default(),
+                    created_ms: now_ms,
+                    updated_ms: now_ms,
+                },
+                now_ms,
+            )
+            .unwrap();
+
+        // A room BOUND to that same workspace, with an agent + on_mention policy.
+        let key = RoomKey::new("bound-convene-room");
+        with_rooms(&state, |reg| {
+            reg.create_in_workspace(
+                key.clone(),
+                "Bound Convene Room",
+                Some(ws.clone()),
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )
+            .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        // Mention the agent → convene a turn that runs in the room's workspace.
+        let (status, _body) = room_post_message(
+            State(state.clone()),
+            Path("bound-convene-room".to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@helper status?".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Wait for the convened reply so the turn has run and the session exists.
+        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let _reply = wait_for_message(&state, &key, |m| {
+            m.author_id == "helper" && matches!(m.author_kind, RoomParticipantKind::Agent)
+        })
+        .await
+        .expect("the woken agent must post a reply back into the room");
+
+        // The convened turn ran IN the room's workspace: the resulting session is
+        // bound to `ws`, not the daemon's launch dir. That binding is what closes
+        // the dead-end — the session now lives in the project's directory. The
+        // session file is written during the turn (just before the reply posts),
+        // so poll briefly for it to become readable rather than assuming the
+        // directory entry is visible the same instant the reply lands.
+        let detail = wait_for_session(&state, expected_sid)
+            .await
+            .expect("the convened session must exist");
+        assert_eq!(
+            detail.workspace_root.as_deref(),
+            Some(ws.as_str()),
+            "a bound room's turn must run in the room's workspace_root"
+        );
+
+        // And that workspace resolves back to the registered project via the
+        // reverse map `spawn_room_agent_turn` uses to scope the turn (OCEAN-228).
+        // Before OCEAN-260 a room agent had no workspace to resolve from at all.
+        let owning = state
+            .runtime
+            .project_for_workspace(detail.workspace_root.as_deref().unwrap())
+            .expect("project lookup must not error")
+            .expect("the room's workspace must resolve to the registered project");
+        assert_eq!(
+            owning.id, project.id,
+            "the bound room's workspace must map back to its owning project"
+        );
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// OCEAN-260 backward-compat: a room with NO workspace binding (every room
+    /// created before this feature) convenes exactly as before — the turn falls
+    /// back to the daemon's launch dir and the session resolves no owning project.
+    /// This pins that unbound rooms are not silently swept into some project.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unbound_room_convene_falls_back_with_no_project() {
+        let _guard = AUTO_CONVENE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // Plain `create` (no workspace_root) — the legacy path.
+        let key = RoomKey::new("unbound-convene-room");
+        with_rooms(&state, |reg| {
+            reg.create(
+                key.clone(),
+                "Unbound Convene Room",
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )
+            .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        let (status, _body) = room_post_message(
+            State(state.clone()),
+            Path("unbound-convene-room".to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@helper status?".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let _reply = wait_for_message(&state, &key, |m| {
+            m.author_id == "helper" && matches!(m.author_kind, RoomParticipantKind::Agent)
+        })
+        .await
+        .expect("the woken agent must post a reply back into the room");
+
+        // No workspace binding ⇒ the turn falls back to the daemon's launch dir
+        // (its workspace anchor), exactly as before OCEAN-260 — NOT the bound
+        // path. The session binds to that launch-dir workspace.
+        let launch_ws = state
+            .runtime
+            .workspace_root_for(&std::env::current_dir().unwrap())
+            .to_string_lossy()
+            .into_owned();
+        let detail = wait_for_session(&state, expected_sid)
+            .await
+            .expect("the convened session must exist");
+        assert_eq!(
+            detail.workspace_root.as_deref(),
+            Some(launch_ws.as_str()),
+            "an unbound room's turn must fall back to the daemon launch dir"
+        );
+        // And no project is registered there in this temp config, so the reverse
+        // map yields no project — the legacy "room agent has no project" posture.
+        assert!(
+            state
+                .runtime
+                .project_for_workspace(&launch_ws)
+                .expect("project lookup must not error")
+                .is_none(),
+            "an unbound room's session must not resolve an owning project"
+        );
 
         std::env::remove_var("OCEAN_YOLO");
     }
