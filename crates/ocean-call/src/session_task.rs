@@ -634,16 +634,23 @@ pub mod live {
         async fn ensure_source(
             &mut self,
         ) -> anyhow::Result<&livekit::webrtc::audio_source::native::NativeAudioSource> {
-            if self.source.is_none() {
-                let src = crate::speaker::live::publish_voice_track(
-                    &self.room,
-                    self.sample_rate,
-                    self.num_channels,
-                )
-                .await?;
-                self.source = Some(src);
-            }
-            Ok(self.source.as_ref().expect("source just set"))
+            // Lazily publish the voice track on first use. Structured so the type
+            // proves the source exists by the time we borrow it — no unwrap/expect
+            // on the live call path. If publishing fails, `?` propagates the error
+            // and the speak attempt fails gracefully (the call keeps running); it
+            // never panics the per-call task.
+            Ok(match self.source {
+                Some(ref src) => src,
+                None => {
+                    let src = crate::speaker::live::publish_voice_track(
+                        &self.room,
+                        self.sample_rate,
+                        self.num_channels,
+                    )
+                    .await?;
+                    self.source.insert(src)
+                }
+            })
         }
     }
 
@@ -1517,5 +1524,76 @@ mod tests {
         assert_eq!(types.first(), Some(&"started"));
         assert_eq!(types.last(), Some(&"ended"));
         assert!(!types.contains(&"spoke"), "no successful speak amid failures; got {types:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // OCEAN-241: the live-voice lazy-init-then-borrow invariant.
+    //
+    // `LiveKitVoice::ensure_source` (in `session_task::live`, behind the
+    // `livekit-tap` native feature) publishes its audio source on first use,
+    // then borrows it. It used to do that as `self.source = Some(src);
+    // Ok(self.source.as_ref().expect("source just set"))` — an `.expect()` on a
+    // value the prior line had just set. That expect can't be reached in the
+    // happy path, but it's a non-test panic site on the live call task: if the
+    // structure ever drifts (an early return, a refactor that clears the field),
+    // it panics the per-call task and can poison shared state instead of failing
+    // the one speak attempt. The fix removes the expect entirely by returning
+    // the value `Option::insert` hands back, so the type — not a runtime check —
+    // proves the source exists.
+    //
+    // `LiveKitVoice` needs a real native `livekit::Room`, so it can't be built
+    // here without the feature + a live connection. This test instead pins the
+    // exact control-flow shape the fix relies on, with a local stand-in, and
+    // asserts: (1) the init runs once on the `None` branch and the borrow yields
+    // the freshly-inserted value (the arm that replaced the `expect`), (2) a
+    // second call takes the `Some` branch and does NOT re-init, and (3) an init
+    // failure propagates via `?` and never panics — the call survives a publish
+    // failure as a failed speak, mirroring `ensure_source`'s real contract.
+    #[tokio::test]
+    async fn ensure_source_invariant_never_panics_on_lazy_init() {
+        // A stand-in mirroring `LiveKitVoice`'s lazy source field + ensure path,
+        // structured identically to the production `ensure_source` so this guards
+        // the same invariant without the native livekit dependency.
+        struct LazySource {
+            source: Option<String>,
+            inits: u32,
+            fail: bool,
+        }
+        impl LazySource {
+            // Same shape as the fixed `ensure_source`: match on the Option, and on
+            // the `None` arm publish-then-`insert`, returning what `insert` hands
+            // back. No `.unwrap()` / `.expect()` anywhere on this path.
+            async fn ensure(&mut self) -> anyhow::Result<&str> {
+                Ok(match self.source {
+                    Some(ref s) => s,
+                    None => {
+                        self.inits += 1;
+                        if self.fail {
+                            anyhow::bail!("publish_voice_track failed");
+                        }
+                        // Stands in for `publish_voice_track(...).await?`.
+                        self.source.insert("track-published".to_string())
+                    }
+                })
+            }
+        }
+
+        // (1) None branch: init runs once, borrow yields the inserted value.
+        let mut v = LazySource { source: None, inits: 0, fail: false };
+        let first = v.ensure().await.expect("first ensure must succeed");
+        assert_eq!(first, "track-published", "None arm must return the inserted source");
+        assert_eq!(v.inits, 1, "init must run exactly once on first use");
+
+        // (2) Some branch: no re-init, same value, still no panic.
+        let again = v.ensure().await.expect("second ensure must succeed");
+        assert_eq!(again, "track-published");
+        assert_eq!(v.inits, 1, "subsequent calls must not re-publish the source");
+
+        // (3) Init failure propagates via `?` as Err — never a panic. A live
+        // publish failure fails the one speak attempt; the call keeps running.
+        let mut bad = LazySource { source: None, inits: 0, fail: true };
+        let err = bad.ensure().await;
+        assert!(err.is_err(), "a publish failure must surface as Err, not a panic");
+        assert!(bad.source.is_none(), "a failed init must leave the source unset");
     }
 }
