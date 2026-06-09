@@ -7229,6 +7229,7 @@ mod tests {
             git_branch: None,
             git_commit: None,
             client_type: None,
+            owning_project: None,
         };
 
         let lines = DaemonApp::session_detail_lines(&detail).join("\n");

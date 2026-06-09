@@ -444,6 +444,16 @@ impl AgentRuntime {
         project::find_by_id(&self.config_dir, id)
     }
 
+    /// The project that owns a given workspace directory, if any project claims
+    /// it. This is the reverse of [`Self::find_project`] → `workspace_root`: it
+    /// maps a session's bound `workspace_root` back to its owning project, so a
+    /// client viewing a session can see (and link to) the project it belongs to
+    /// without scanning the project list itself. `None` ⇒ the directory is not a
+    /// project root (the session is project-less, which is valid).
+    pub fn project_for_workspace(&self, workspace_root: &str) -> anyhow::Result<Option<Project>> {
+        project::find_by_workspace(&self.config_dir, workspace_root)
+    }
+
     /// Create or replace a project (by id), stamping `updated_ms` to `now_ms`.
     pub fn upsert_project(&self, p: Project, now_ms: i64) -> anyhow::Result<Project> {
         project::upsert(&self.config_dir, p, now_ms)
@@ -1929,6 +1939,10 @@ mod session {
             git_branch: session.git_branch,
             git_commit: session.git_commit,
             client_type: session.client_type,
+            // Resolved by the daemon's `enrich_session_detail` from
+            // `workspace_root` (it owns the project store path); the agent layer
+            // has no project index, so it leaves the binding unresolved here.
+            owning_project: None,
         }
     }
 

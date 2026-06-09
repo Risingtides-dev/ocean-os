@@ -173,4 +173,41 @@ mod tests {
         std::fs::write(projects_path(&dir), "{ not valid json").unwrap();
         assert!(load_all(&dir).is_err());
     }
+
+    // OCEAN-228: `find_by_workspace` is the reverse of project→sessions — it maps
+    // a session's bound `workspace_root` back to its owning project. This pins
+    // the exact-match semantics the daemon's session-detail enrichment relies on
+    // (a project owns its root, but NOT sub-dirs or unrelated paths), so the
+    // session→project binding can't silently broaden or break.
+    #[test]
+    fn find_by_workspace_matches_exact_root_only() {
+        let dir = tmp_dir();
+        let p = project("ocean-os", "/dev/ocean-os");
+        let id = p.id;
+        upsert(&dir, p, 1000).unwrap();
+
+        // Exact workspace root resolves to the owning project.
+        assert_eq!(
+            find_by_workspace(&dir, "/dev/ocean-os")
+                .unwrap()
+                .expect("exact root binds")
+                .id,
+            id,
+        );
+        // A sub-directory of the root is NOT the project root, so no binding —
+        // session keying is by the canonical workspace_root, not any cwd within.
+        assert!(
+            find_by_workspace(&dir, "/dev/ocean-os/crates")
+                .unwrap()
+                .is_none(),
+            "a sub-dir of the root must not resolve to the project"
+        );
+        // An unrelated directory never binds.
+        assert!(find_by_workspace(&dir, "/dev/other").unwrap().is_none());
+        // No projects at all ⇒ no binding (the project-less session case).
+        let empty = tmp_dir();
+        assert!(find_by_workspace(&empty, "/dev/ocean-os")
+            .unwrap()
+            .is_none());
+    }
 }
