@@ -1,9 +1,13 @@
 //! Track-0 room shell renderer.
 //!
-//! This module is render-only. It mirrors the live Tides Mesh tmux room/window
-//! layout with fixture-friendly pane content. No backend/protocol behavior lives
-//! here.
+//! This module is render-only — it projects state the [`crate::DaemonApp`]
+//! already holds (sessions, requests, tool timeline, daemon health, provider
+//! readiness, the mesh agent registry, and the unified event feed) into the
+//! per-room pane layout. The TideDash / WorkOps / WorldMap rooms render live
+//! daemon data rather than fixtures (OCEAN-233). No backend/protocol behavior
+//! lives here.
 
+use chrono::Utc;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::Line,
@@ -14,6 +18,26 @@ use ratatui::{
 use ocean_core::RoomPanelSnapshot;
 
 use crate::{DaemonApp, WorkspaceRoom};
+
+/// Render an epoch-millisecond timestamp as a compact relative age ("12s",
+/// "4m", "3h", "2d"), matching the bucketing used by [`crate::time_ago`] so the
+/// room panes read consistently with the rest of the TUI.
+fn relative_age_ms(updated_ms: i64) -> String {
+    let delta = Utc::now().timestamp_millis().saturating_sub(updated_ms);
+    if delta < 0 {
+        return "now".to_string();
+    }
+    let secs = delta / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
 
 /// Render the selected Track-0 room body into the provided area.
 pub fn draw_daemon_room_body(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
@@ -91,97 +115,346 @@ fn draw_room_review(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
     );
 }
 
+/// TideDash = activity / flow. Renders the live tide of work moving through the
+/// daemon: a session-flow rollup on the left (sessions, turns, requests in
+/// flight) and a real activity tail on the right (the unified event feed when
+/// present, else the in-process SSE activity buffer). No fixtures — every line
+/// is derived from daemon state the TUI already holds (OCEAN-233).
 fn draw_room_tidedash(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
-    let unified = &app.support.unified;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(area);
+
+    draw_lines_pane(frame, cols[0], "Tide — flow", tidedash_flow_lines(app));
+
+    let feed_width = cols[1].width.saturating_sub(2) as usize;
     draw_lines_pane(
         frame,
-        area,
-        "TideDash — coming soon",
-        vec![
-            Line::from("TideDash campaign dashboard (placeholder · coming soon)"),
-            Line::from("Campaigns        3 active"),
-            Line::from("Deals            2 in progress"),
-            Line::from("Pipeline         $48K"),
-            Line::from(""),
-            Line::from(crate::value_summary_line(
-                &unified.summary,
-                "tidedash_statuses",
-                "status snapshots",
-            )),
-            Line::from(crate::value_summary_line(
-                &unified.summary,
-                "tidedash_errors",
-                "error snapshots",
-            )),
-        ],
+        cols[1],
+        "Tide — recent activity",
+        tidedash_activity_lines(app, feed_width),
     );
 }
 
-fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
+/// Left TideDash pane: rolled-up counts of what is flowing through the daemon
+/// right now — sessions, total turns across them, and live request states.
+fn tidedash_flow_lines(app: &DaemonApp) -> Vec<Line<'static>> {
+    let total_turns: u32 = app.sessions.iter().map(|session| session.turns).sum();
+    let running = app
+        .requests
+        .iter()
+        .filter(|request| matches!(request.state, ocean_core::RequestState::Running))
+        .count();
+    let queued = app
+        .requests
+        .iter()
+        .filter(|request| matches!(request.state, ocean_core::RequestState::Queued))
+        .count();
+    let waiting = app.pending_permissions.len();
+
+    let mut lines = vec![
+        Line::from(format!("sessions          {}", app.sessions.len())),
+        Line::from(format!("turns (total)     {total_turns}")),
+        Line::from(format!("requests          {}", app.requests.len())),
+        Line::from(format!("  running         {running}")),
+        Line::from(format!("  queued          {queued}")),
+        Line::from(format!("  awaiting ok     {waiting}")),
+        Line::from(format!("tool events       {}", app.tool_timeline.len())),
+        Line::from(""),
+        Line::from("Most recent sessions:"),
+    ];
+
+    if app.sessions.is_empty() {
+        lines.push(Line::from("  no sessions yet — start a turn to see flow"));
+    } else {
+        lines.extend(app.sessions.iter().take(6).map(|session| {
+            let age = session
+                .updated_ms
+                .map(relative_age_ms)
+                .unwrap_or_else(|| "—".to_string());
+            Line::from(format!(
+                "  [{}] {:>3}t {:>4} {}",
+                crate::short_id(session.id),
+                session.turns,
+                age,
+                crate::compact_text(&session.title, 22)
+            ))
+        }));
+    }
+
+    lines
+}
+
+/// Right TideDash pane: the activity tail. Prefers the unified event feed
+/// (`.pi/unified/events.jsonl`) when populated, otherwise falls back to the
+/// in-process SSE activity buffer so the pane is never empty when the daemon
+/// is live.
+fn tidedash_activity_lines(app: &DaemonApp, width: usize) -> Vec<Line<'static>> {
     let unified = &app.support.unified;
+    if !unified.events.is_empty() {
+        let mut lines = Vec::new();
+        if let Some(generated) = unified.generated_at.as_deref() {
+            lines.push(Line::from(format!(
+                "unified feed · updated {}",
+                crate::time_ago(Some(generated))
+            )));
+        }
+        lines.extend(
+            unified
+                .events
+                .iter()
+                .take(12)
+                .map(|event| Line::from(crate::render_unified_event(event, width))),
+        );
+        return lines;
+    }
+
+    if app.activity.is_empty() {
+        return vec![
+            Line::from("No activity yet."),
+            Line::from("Live turns + tool calls stream here as they run."),
+            Line::from(format!("daemon: {}", app.stream_status)),
+        ];
+    }
+
+    app.activity
+        .iter()
+        .rev()
+        .take(12)
+        .map(|line| Line::from(crate::compact_text(line, width)))
+        .collect()
+}
+
+/// WorkOps = work / ops. Left pane is the live work queue (requests in flight +
+/// the most recent tool calls the runtime executed); right pane is the ops
+/// console (daemon health, provider/model readiness, mesh task rollup, pending
+/// approvals). All real daemon state — no fixtures (OCEAN-233).
+fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+
+    let queue_width = cols[0].width.saturating_sub(2) as usize;
     draw_lines_pane(
         frame,
         cols[0],
-        "WorkOps board — coming soon",
-        vec![
-            Line::from("WorkOps board (placeholder · coming soon)"),
-            Line::from(crate::value_summary_line(
-                &unified.summary,
-                "ops_attention",
-                "ops attention",
-            )),
-            Line::from("Fixtures: services, jobs, queue health, operator alerts"),
-            Line::from("WorkOps remains provisional / out-of-scope."),
-        ],
+        "WorkOps — work queue",
+        workops_queue_lines(app, queue_width),
     );
+
+    draw_lines_pane(frame, cols[1], "WorkOps — ops console", workops_console_lines(app));
+}
+
+/// Left WorkOps pane: requests currently in flight, then a tail of the most
+/// recent tool-call events from the runtime so the operator can see what work
+/// is actually moving.
+fn workops_queue_lines(app: &DaemonApp, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("Requests:")];
+    if app.requests.is_empty() {
+        lines.push(Line::from("  no requests yet"));
+    } else {
+        lines.extend(app.requests.iter().take(6).map(|request| {
+            let marker = if request.state.is_cancellable() {
+                "•"
+            } else {
+                " "
+            };
+            let message = request
+                .message
+                .as_deref()
+                .map(|m| crate::compact_text(m, width.saturating_sub(28)))
+                .unwrap_or_else(|| "(no message)".to_string());
+            Line::from(format!(
+                "{marker} [{}] {:<18} {}",
+                crate::short_id(request.request_id),
+                crate::state_label(request.state),
+                message
+            ))
+        }));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Recent tool calls:"));
+    if app.tool_timeline.is_empty() {
+        lines.push(Line::from("  none yet — waiting on SSE tool events"));
+    } else {
+        lines.extend(
+            app.tool_timeline
+                .iter()
+                .rev()
+                .take(6)
+                .map(|entry| {
+                    Line::from(format!(
+                        "  {:>4} {:<12} {:<9} {}",
+                        crate::time_ago(Some(&entry.at.to_rfc3339())),
+                        crate::compact_text(&entry.tool, 12),
+                        crate::compact_text(&entry.phase, 9),
+                        crate::compact_text(&entry.message, width.saturating_sub(32))
+                    ))
+                }),
+        );
+    }
+
+    lines
+}
+
+/// Right WorkOps pane: the ops console — daemon health/backend/version, the
+/// active provider+model and credential readiness, a mesh task rollup, and any
+/// permission approvals waiting on the operator.
+fn workops_console_lines(app: &DaemonApp) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(crate::compact_text(&app.health_summary(), 58)),
+        Line::from(format!("checked: {}", app.checked_text())),
+        Line::from(""),
+        Line::from(format!(
+            "provider: {}",
+            crate::compact_text(&app.model_config.provider, 40)
+        )),
+        Line::from(format!(
+            "model:    {}",
+            crate::compact_text(&app.model_config.model, 40)
+        )),
+        Line::from(format!("api key:  {}", app.model_config.credential)),
+        Line::from(""),
+    ];
+
+    let counts = &app.support.mesh.counts;
+    let total = app.support.mesh.tasks.len();
+    if total == 0 {
+        lines.push(Line::from("mesh tasks: none loaded"));
+    } else {
+        lines.push(Line::from(format!(
+            "mesh tasks: {total} total · {} in-progress · {} blocked · {} done",
+            counts.in_progress, counts.blocked, counts.done
+        )));
+    }
+
+    let pending = app.pending_permissions.len();
+    if pending == 0 {
+        lines.push(Line::from("approvals:  none waiting"));
+    } else {
+        lines.push(Line::from(format!(
+            "approvals:  {pending} waiting (Shift-Y allow · Shift-N deny)"
+        )));
+        if let Some(next) = app.pending_permissions.first() {
+            lines.push(Line::from(format!(
+                "  → {} · {}",
+                crate::compact_text(&next.tool, 18),
+                crate::compact_text(&next.reason, 30)
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "status: {}",
+        crate::compact_text(&app.status, 50)
+    )));
+
+    lines
+}
+
+/// WorldMap = system topology. Renders the live shape of the system the TUI is
+/// steering: the daemon endpoint + health/backend/version, the active
+/// provider/model, runtime counts (sessions/requests/agents), and the live
+/// agent-registry presence map. Replaces the old fixed-timezone fixture with
+/// real daemon topology (OCEAN-233).
+fn draw_room_worldmap(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(area);
+
+    draw_lines_pane(frame, cols[0], "WorldMap — daemon topology", worldmap_topology_lines(app));
+
+    let width = cols[1].width.saturating_sub(2) as usize;
     draw_lines_pane(
         frame,
         cols[1],
-        "bash / ops shell",
-        vec![
-            Line::from("$ ./scripts/operator-layout.sh"),
-            Line::from("fixture: tailing workops.log"),
-            Line::from("fixture: all watched jobs idle"),
-            Line::from(format!("operator status: {}", app.status)),
-            Line::from("WorkOps room is provisional."),
-        ],
+        "WorldMap — agent presence",
+        worldmap_presence_lines(app, width),
     );
 }
 
-fn draw_room_worldmap(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
-    let mesh = &app.support.mesh;
-    let mut lines = vec![
-        Line::from("WorldMap presence pane (placeholder · coming soon)"),
+/// Left WorldMap pane: where the daemon is, whether it is healthy, what it is
+/// running on, and the live runtime counts the TUI is tracking.
+fn worldmap_topology_lines(app: &DaemonApp) -> Vec<Line<'static>> {
+    let (label, _) = app.status_label();
+    let agents = &app.support.mesh.agents;
+    let active_agents = agents
+        .iter()
+        .filter(|agent| matches!(agent.presence, crate::AgentPresence::Active))
+        .count();
+
+    vec![
+        Line::from(format!("daemon:   {}", crate::compact_text(&app.url, 40))),
+        Line::from(format!("status:   {label}")),
+        Line::from(crate::compact_text(&app.health_summary(), 58)),
+        Line::from(format!("checked:  {}", app.checked_text())),
         Line::from(""),
-        Line::from("UTC  14:32  ● Orchestrator  ● KNOX  ● BRICK"),
-        Line::from("PST  06:32  ○ Charlotte     ○ Henry"),
-        Line::from("JST  23:32  ◉ Rev           ◉ PIXEL"),
-        Line::from("CET  15:32  ○ PM"),
+        Line::from(format!(
+            "provider: {}",
+            crate::compact_text(&app.model_config.provider, 40)
+        )),
+        Line::from(format!(
+            "model:    {}",
+            crate::compact_text(&app.model_config.model, 40)
+        )),
         Line::from(""),
-        Line::from("Live agent records:"),
-    ];
-    if mesh.agents.is_empty() {
-        lines.push(Line::from("fixture: no live registry rows loaded"));
-    } else {
-        lines.extend(mesh.agents.iter().take(10).map(|agent| {
+        Line::from("Runtime counts:"),
+        Line::from(format!("  sessions   {}", app.sessions.len())),
+        Line::from(format!("  requests   {}", app.requests.len())),
+        Line::from(format!("  rooms      {}", app.room_snapshots.len())),
+        Line::from(format!(
+            "  agents     {} ({} active)",
+            agents.len(),
+            active_agents
+        )),
+    ]
+}
+
+/// Right WorldMap pane: the live agent-registry presence map — who is online,
+/// their presence state, last-seen age, and a short preview of what they are
+/// doing. Reads the same mesh registry the dedicated mesh view uses.
+fn worldmap_presence_lines(app: &DaemonApp, width: usize) -> Vec<Line<'static>> {
+    let agents = &app.support.mesh.agents;
+    if agents.is_empty() {
+        return vec![
+            Line::from("No live agent records."),
+            Line::from("Populated from the mesh registry under the project root."),
+        ];
+    }
+
+    agents
+        .iter()
+        .take(12)
+        .map(|agent| {
+            let dot = match agent.presence {
+                crate::AgentPresence::Active => '●',
+                crate::AgentPresence::Away => '◐',
+                crate::AgentPresence::Stale => '○',
+            };
             let state = match agent.presence {
                 crate::AgentPresence::Active => "active",
                 crate::AgentPresence::Away => "away",
                 crate::AgentPresence::Stale => "stale",
             };
+            let preview = agent
+                .preview
+                .as_deref()
+                .or(agent.last_event.as_deref())
+                .unwrap_or("—");
             Line::from(format!(
-                "{} · {} · {}",
-                crate::compact_text(&agent.agent, 16),
+                "{dot} {:<14} {:<6} {:>4}  {}",
+                crate::compact_text(&agent.agent, 14),
                 state,
-                crate::time_ago(agent.updated_at.as_deref())
+                crate::time_ago(agent.updated_at.as_deref()),
+                crate::compact_text(preview, width.saturating_sub(34))
             ))
-        }));
-    }
-    draw_lines_pane(frame, area, "WorldMap — coming soon", lines);
+        })
+        .collect()
 }
 
 fn draw_lines_pane(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'static>>) {
