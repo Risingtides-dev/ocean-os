@@ -145,23 +145,28 @@ Agents are woken by mentions, not direct invocation:
 
 Under the hood, a mention creates a turn request queued for that agent.
 
-> **Built, pending daemon integration — auto-convene is observable but inert.**
-> The trigger machinery is half-wired today. `POST /v1/rooms/persistent/{key}/messages`
-> (the `room_post_message` handler) DOES parse `@id` mentions from the body and
-> DOES call `evaluate_trigger_policy` (the tested evaluator in `ocean-core`)
-> against the room's stored trigger policy. On a positive decision it emits a
-> `room_trigger` notice onto the agent event bus and appends an `auto-convene`
-> audit line to the transcript.
+> **Live.** `POST /v1/rooms/persistent/{key}/messages` (the `room_post_message`
+> handler) parses `@id` mentions from the body, runs `evaluate_trigger_policy`
+> (the tested evaluator in `ocean-core`) against the room's stored trigger
+> policy, and on a positive decision that resolves to an **agent** participant in
+> the roster it does three things: (1) emits a `room_trigger` notice onto the
+> agent event bus, (2) appends an `auto-convene` audit line to the transcript,
+> and (3) **queues a real agent turn** for that participant via
+> `spawn_room_agent_turn`. The turn hydrates the recent transcript as context,
+> runs through the same `runtime.prompt` path every other turn uses (registered
+> as a tracked request, permission-gated, resumable under a deterministic
+> per-(room, agent) session id), and posts the agent's reply back into the room
+> as an `Agent`-authored message. So an `@agent` mention in a persistent room
+> actually wakes the agent and gets an answer in the transcript.
 >
-> What it does **not** do yet: actually queue an agent turn for the mentioned
-> participant. The decision fires a *notice*, not a *turn* — the "a mention
-> creates a turn request queued for that agent" behavior described above is the
-> intended end state, not the current one. The handler's own comment marks the
-> wiring point and explains the deferral: queuing the real turn is held out of
-> the in-flight `agent_turn` handler and its permission/cwd code on the held
-> security PRs. So today an `@agent` mention in a persistent room is auditable
-> and observable, but no agent actually wakes up. Auto-convene-on-mention is
-> non-functional pending that daemon wiring.
+> A mention that resolves to a human/bot/tool id (or an unknown id) still fires
+> no convene footprint — no notice, no audit line, no turn — even if the policy
+> matched, because there is no agent to wake.
+>
+> **Loop safety.** Agent-authored messages are never evaluated for triggers, and
+> the agent's own reply is posted as `Agent`-kind, so a reply that @-mentions
+> another agent (or itself) can never ping-pong the room. Only
+> human/bot/system-authored lines can convene an agent. (OCEAN-111 / OCEAN-225.)
 
 ## Read-before-answer
 

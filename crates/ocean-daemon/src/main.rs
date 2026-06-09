@@ -3026,8 +3026,10 @@ struct RoomMessageRequest {
 
 /// `POST /v1/rooms/persistent/{key}/messages` — append a chat message to the
 /// transcript, then evaluate the room's trigger policy against any @-mentions in
-/// the body. On a positive decision, emit a `room.trigger` notice onto the agent
-/// event bus (the observable half of auto-convene).
+/// the body. On a positive decision that resolves to an agent participant, emit a
+/// `room_trigger` notice onto the agent event bus AND queue a real agent turn for
+/// that agent (it reads the room context and posts its reply back into the
+/// transcript). See `spawn_room_agent_turn` for the turn path (OCEAN-111/225).
 async fn room_post_message(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -8734,6 +8736,66 @@ mod tests {
             missing_status,
             StatusCode::NOT_FOUND,
             "only the documented /v1/council/convene is aliased; other council paths 404"
+        );
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// The convene FOOTPRINT (notice + audit line + turn) is gated on the mention
+    /// resolving to a runnable AGENT. A human-authored message that @-mentions a
+    /// *human* id matches the policy (`triggers_fired` is non-empty) but must
+    /// queue NO turn — there is no agent to wake. This is the end-to-end negative
+    /// of `at_mention_queues_turn_and_posts_reply_back`, asserted through the real
+    /// handler at the turn-registration level (OCEAN-225).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mention_of_non_agent_queues_no_turn() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // Room whose only non-author participant is a HUMAN, plus an on_mention
+        // policy. Mentioning the human must convene nobody.
+        let key = RoomKey::new("no-agent-room");
+        with_rooms(&state, |reg| {
+            reg.create(
+                key.clone(),
+                "No Agent Room",
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )
+            .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "dana".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Dana".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        let (status, _body) = room_post_message(
+            State(state.clone()),
+            Path("no-agent-room".to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@dana what did you think?".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Give any errant spawned turn a moment, then assert nothing was queued.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            state.requests.read().await.is_empty(),
+            "a mention that resolves to a non-agent must queue no turn"
         );
 
         std::env::remove_var("OCEAN_YOLO");
