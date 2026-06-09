@@ -25,6 +25,8 @@ use ocean_agent_sdk::{
     ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
     ToolCall, ToolCallId, ToolResult,
 };
+// OCEAN-277: surface-patch op vocabulary the per-room component ledger folds.
+use ocean_agent_sdk::surface::{CanvasId, ComponentId, SurfacePatch};
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
@@ -117,6 +119,13 @@ struct AppState {
     /// live content back here. Held behind a std `Mutex` (the guard is always
     /// dropped before any `await`).
     canvas_fulfillments: CanvasFulfillmentStore,
+    /// Per-Track-0-room component + participant ledger (OCEAN-277). Backs the
+    /// `components`/`participants` fields of `GET /v1/rooms/{room_id}/snapshot`,
+    /// which OCEAN-256 shipped always-empty. Fed by the surface-patch relay
+    /// (components) and room-bound-turn registration (participants); read by
+    /// [`build_room_projection`]. Bounded by [`gc_room_canvas`]. See
+    /// [`RoomCanvasStore`].
+    room_canvas: RoomCanvasStore,
 }
 
 /// Per-`(session, canvas)` store of bridge-fulfilled `slack_canvas` results
@@ -144,6 +153,79 @@ struct CanvasFulfillment {
     /// When the daemon received this fulfillment. Used by the GC sweep to evict
     /// entries older than `CANVAS_FULFILLMENT_TTL` (OCEAN-273).
     received_at: DateTime<Utc>,
+}
+
+/// Per-Track-0-room component + participant ledger (OCEAN-277).
+///
+/// Track-0 rooms (`pm`/`writers`/`orch_mesh`/`review`) are role lenses over the
+/// global runtime, not canvas-partitioned workspaces — so before this there was
+/// no per-room component or roster source and the projection shipped both fields
+/// always-empty (OCEAN-256). This store backs them from real state without faking:
+///
+/// - **components**: when a turn is submitted *with* a `room_id`, that turn's
+///   session is bound to the room (see [`bind_room_session`]). The surface-patch
+///   relay — which already has the turn's `room_id` and `session_id` in scope —
+///   feeds every `AgentTurnEvent::SurfacePatch` it emits into that room's
+///   component ledger via [`RoomCanvasLedger::apply_patch`], folding the
+///   upsert/move/resize/delete ops into the latest snapshot per
+///   `(canvas, component)`. The projection reads this back as real components.
+/// - **participants**: the set of sessions that have run a room-bound turn, i.e.
+///   the agents/operators actually active in that room's domain. Honest and
+///   derived, not a configured/fabricated roster.
+///
+/// A turn submitted with **no** `room_id` (the common foreground TUI case) binds
+/// to no Track-0 room, so its patches are intentionally *not* attributed to any
+/// room here — there is no room to attribute them to. That room's components stay
+/// honestly empty.
+///
+/// Bounded like the canvas-fulfillment store (OCEAN-273): every entry carries a
+/// last-touched timestamp and the GC sweep evicts by TTL + a hard per-store cap so
+/// a long-lived daemon never leaks (see [`gc_room_canvas`]). Held behind a std
+/// `Mutex`; the guard is always dropped before any `await`.
+type RoomCanvasStore = Arc<Mutex<HashMap<RoomId, RoomCanvasLedger>>>;
+
+/// One room's live component + participant ledger (OCEAN-277). Built incrementally
+/// from the surface-patch relay and the room-bound-turn registration; read by the
+/// projection. Nothing here is persisted — it is a live mirror of in-flight state,
+/// exactly like the rest of the Track-0 projection.
+#[derive(Default)]
+struct RoomCanvasLedger {
+    /// Latest component snapshot per `(canvas, component)` for this room. Folded
+    /// from surface-patch ops: `UpsertComponent` inserts/replaces, `Move`/`Resize`
+    /// update geometry on an existing entry, `DeleteComponent` removes. View-state
+    /// and edge ops (`Select`/`Focus`/`SetViewport`/`Connect`/…) don't define a
+    /// component register, so they don't create entries.
+    components: HashMap<(CanvasId, ComponentId), TrackedComponent>,
+    /// Sessions that have run a room-bound turn here — the room's real roster.
+    participants: HashMap<SessionId, RoomParticipantEntry>,
+}
+
+/// One tracked component in a [`RoomCanvasLedger`] (OCEAN-277): the latest known
+/// kind/geometry/content/metadata for a component on a room's canvas, plus when it
+/// was last touched (drives TTL eviction).
+#[derive(Clone)]
+struct TrackedComponent {
+    canvas_id: CanvasId,
+    component_id: ComponentId,
+    /// Component kind/template (`"card"`, `"brief_card"`, …) from the last upsert.
+    kind: String,
+    /// Latest placement, if any op has set one.
+    rect: Option<ocean_agent_sdk::surface::Rect>,
+    z_index: Option<i32>,
+    /// Latest free-form content payload (`null` until an upsert sets it).
+    content: Value,
+    /// Latest free-form metadata (`null` until an upsert sets it).
+    metadata: Value,
+    /// Last time a patch touched this component. Used by the GC sweep.
+    updated_at: DateTime<Utc>,
+}
+
+/// One participant in a [`RoomCanvasLedger`] (OCEAN-277): a session bound to the
+/// room by having run a turn there, plus the last time it did (drives TTL).
+#[derive(Clone)]
+struct RoomParticipantEntry {
+    session_id: SessionId,
+    last_seen: DateTime<Utc>,
 }
 
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
@@ -217,6 +299,22 @@ const REGISTRY_MAX_ENTRIES: usize = 10_000;
 /// runtime's lookup registry) expire on the same schedule.
 const CANVAS_FULFILLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
 
+/// TTL for entries in the per-room component/participant ledger (OCEAN-277). Like
+/// `canvas_fulfillments`, a tracked component or participant has no terminal state
+/// — the projection reads it without consuming it — so it is evictable purely by
+/// age. A component the agent stopped touching, or a session that long since went
+/// idle, is dropped once stale so the store mirrors *live* room state rather than
+/// accreting forever. Generous (well past a typical turn) so an active room keeps
+/// its components for the projection's lifetime.
+const ROOM_CANVAS_TTL: chrono::Duration = chrono::Duration::hours(6);
+
+/// Hard cap on tracked components (and, separately, participants) *per room*
+/// (OCEAN-277). A burst backstop independent of the TTL: on overflow the oldest
+/// (by last-touched) are evicted first, so a runaway producer can't grow one
+/// room's ledger without bound between GC ticks. Four rooms × this cap is the
+/// worst case, which stays small.
+const ROOM_CANVAS_MAX_PER_ROOM: usize = 2_000;
+
 impl RequestControl {
     /// Whether this request has reached a terminal lifecycle state.
     fn is_terminal(&self) -> bool {
@@ -248,13 +346,15 @@ impl PermissionWaiter {
 
 /// One GC sweep: drop terminal entries older than [`REGISTRY_TERMINAL_TTL`],
 /// then enforce [`REGISTRY_MAX_ENTRIES`] by evicting oldest-terminal first.
-/// Also bounds the `canvas_fulfillments` store and the runtime's process-global
-/// fulfillment lookup registry (OCEAN-273) on the same tick. `now` is injected
-/// so the sweep is deterministic in tests.
+/// Also bounds the `canvas_fulfillments` store, the runtime's process-global
+/// fulfillment lookup registry (OCEAN-273), and the per-room component/participant
+/// ledger (OCEAN-277) on the same tick. `now` is injected so the sweep is
+/// deterministic in tests.
 async fn gc_registries(
     requests: &RequestRegistry,
     permissions: &PermissionRegistry,
     canvas_fulfillments: &CanvasFulfillmentStore,
+    room_canvas: &RoomCanvasStore,
     now: DateTime<Utc>,
 ) {
     let ttl = REGISTRY_TERMINAL_TTL;
@@ -296,6 +396,8 @@ async fn gc_registries(
         ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL,
         ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_MAX_ENTRIES,
     );
+    // OCEAN-277: bound the per-room component/participant ledger on the same tick.
+    gc_room_canvas(room_canvas, now);
 }
 
 /// Trim `map` down to [`REGISTRY_MAX_ENTRIES`]. Removes oldest-terminal entries
@@ -325,6 +427,258 @@ fn evict_overflow<K, V, FTerm, FAt>(
         b.1.cmp(&a.1).then(a.2.cmp(&b.2))
     });
     for (key, _, _) in ranked.into_iter().take(overflow) {
+        map.remove(&key);
+    }
+}
+
+// --- Per-room component/participant ledger (OCEAN-277) -----------------------
+
+impl RoomCanvasLedger {
+    /// Fold one surface-patch op into this room's component ledger (OCEAN-277).
+    ///
+    /// `now` is injected so the sweep/recency is deterministic in tests. Only ops
+    /// that define a *component register* mutate the snapshot:
+    ///
+    /// - `UpsertComponent` inserts or replaces the component, carrying its
+    ///   kind/rect/z-index/content/metadata.
+    /// - `MoveComponent` / `ResizeComponent` update geometry on an existing entry
+    ///   (a move/resize for a component we've never seen is ignored — there is no
+    ///   register to mutate, and fabricating one would invent a component the
+    ///   upsert never created).
+    /// - `DeleteComponent` removes the entry.
+    ///
+    /// Edge ops (`Connect`/`Disconnect`), selection/focus/viewport view-state, and
+    /// `Layout`/`Group` (which touch many components without defining any) are not
+    /// component registers, so they are intentionally no-ops here — exactly the
+    /// same partition [`SurfacePatch::target_component`] draws for the merge layer.
+    fn apply_patch(&mut self, canvas_id: &CanvasId, patch: &SurfacePatch, now: DateTime<Utc>) {
+        match patch {
+            SurfacePatch::UpsertComponent { component } => {
+                let key = (canvas_id.clone(), component.id.clone());
+                self.components.insert(
+                    key,
+                    TrackedComponent {
+                        canvas_id: canvas_id.clone(),
+                        component_id: component.id.clone(),
+                        kind: component.kind.clone(),
+                        rect: component.rect,
+                        z_index: component.z_index,
+                        content: component.content.clone(),
+                        metadata: component.metadata.clone(),
+                        updated_at: now,
+                    },
+                );
+            }
+            SurfacePatch::MoveComponent { component_id, x, y } => {
+                if let Some(c) = self
+                    .components
+                    .get_mut(&(canvas_id.clone(), component_id.clone()))
+                {
+                    let mut rect = c.rect.unwrap_or(ocean_agent_sdk::surface::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.0,
+                        h: 0.0,
+                    });
+                    rect.x = *x;
+                    rect.y = *y;
+                    c.rect = Some(rect);
+                    c.updated_at = now;
+                }
+            }
+            SurfacePatch::ResizeComponent {
+                component_id,
+                width,
+                height,
+            } => {
+                if let Some(c) = self
+                    .components
+                    .get_mut(&(canvas_id.clone(), component_id.clone()))
+                {
+                    let mut rect = c.rect.unwrap_or(ocean_agent_sdk::surface::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.0,
+                        h: 0.0,
+                    });
+                    rect.w = *width;
+                    rect.h = *height;
+                    c.rect = Some(rect);
+                    c.updated_at = now;
+                }
+            }
+            SurfacePatch::DeleteComponent { component_id } => {
+                self.components
+                    .remove(&(canvas_id.clone(), component_id.clone()));
+            }
+            // Edge / view-state / multi-component ops don't define a component
+            // register (see `SurfacePatch::target_component`) — nothing to track.
+            SurfacePatch::Connect { .. }
+            | SurfacePatch::Disconnect { .. }
+            | SurfacePatch::Focus { .. }
+            | SurfacePatch::Select { .. }
+            | SurfacePatch::SetViewport { .. }
+            | SurfacePatch::Layout { .. }
+            | SurfacePatch::Group { .. } => {}
+        }
+    }
+
+    /// Record that `session` ran a turn in this room at `now` (OCEAN-277) — i.e.
+    /// it is a live participant. Idempotent: re-touches `last_seen` so an active
+    /// session is never GC'd out from under the projection.
+    fn touch_participant(&mut self, session: SessionId, now: DateTime<Utc>) {
+        self.participants
+            .entry(session)
+            .and_modify(|p| p.last_seen = now)
+            .or_insert(RoomParticipantEntry {
+                session_id: session,
+                last_seen: now,
+            });
+    }
+
+    /// True once nothing live remains, so the room's whole entry can be dropped.
+    fn is_empty(&self) -> bool {
+        self.components.is_empty() && self.participants.is_empty()
+    }
+}
+
+/// Bind a session to a Track-0 room (OCEAN-277): record it as a participant of the
+/// room it ran a turn in. Called from the agent-turn handler for a room-bound turn
+/// (`room_id == Some`). A turn with no `room_id` binds to no room and is not
+/// recorded — there is no Track-0 room to attribute it to. The std-`Mutex` guard
+/// is taken and dropped synchronously (no `await` held).
+fn bind_room_session(
+    store: &RoomCanvasStore,
+    room_id: RoomId,
+    session: SessionId,
+    now: DateTime<Utc>,
+) {
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    store
+        .entry(room_id)
+        .or_default()
+        .touch_participant(session, now);
+}
+
+/// Fold a relayed surface patch into a room's component ledger (OCEAN-277). Called
+/// from the surface-patch relay for a room-bound turn. The guard is taken and
+/// dropped synchronously.
+fn apply_room_surface_patch(
+    store: &RoomCanvasStore,
+    room_id: RoomId,
+    canvas_id: &CanvasId,
+    patch: &SurfacePatch,
+    now: DateTime<Utc>,
+) {
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    store
+        .entry(room_id)
+        .or_default()
+        .apply_patch(canvas_id, patch, now);
+}
+
+/// Snapshot the components + participants tracked for `room_id`, oldest-first by
+/// last-touched (OCEAN-277). Returns `(components, participants)` already shaped as
+/// the projection's `serde_json::Value` rows, so `build_room_projection` stays a
+/// pure function of its [`RoomProjectionInput`]. Empty vecs when nothing is
+/// tracked for the room — honestly empty, never fabricated.
+fn room_canvas_snapshot(store: &RoomCanvasStore, room_id: RoomId) -> (Vec<Value>, Vec<Value>) {
+    let store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(ledger) = store.get(&room_id) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut components: Vec<&TrackedComponent> = ledger.components.values().collect();
+    components.sort_by_key(|c| c.updated_at);
+    let components = components
+        .into_iter()
+        .map(|c| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("canvas_id".into(), json!(c.canvas_id.as_str()));
+            obj.insert("component_id".into(), json!(c.component_id.as_str()));
+            obj.insert("kind".into(), json!(c.kind));
+            if let Some(rect) = c.rect {
+                obj.insert(
+                    "rect".into(),
+                    json!({ "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h }),
+                );
+            }
+            if let Some(z) = c.z_index {
+                obj.insert("z_index".into(), json!(z));
+            }
+            if !c.content.is_null() {
+                obj.insert("content".into(), c.content.clone());
+            }
+            if !c.metadata.is_null() {
+                obj.insert("metadata".into(), c.metadata.clone());
+            }
+            obj.insert("updated_at".into(), json!(c.updated_at));
+            Value::Object(obj)
+        })
+        .collect();
+
+    let mut participants: Vec<&RoomParticipantEntry> = ledger.participants.values().collect();
+    participants.sort_by_key(|p| p.last_seen);
+    let participants = participants
+        .into_iter()
+        .map(|p| {
+            json!({
+                "kind": "session",
+                "session_id": p.session_id,
+                "last_seen": p.last_seen,
+            })
+        })
+        .collect();
+
+    (components, participants)
+}
+
+/// Bound the per-room component/participant ledger (OCEAN-277), mirroring the
+/// canvas-fulfillment sweep (OCEAN-273). For every room: drop components and
+/// participants older than [`ROOM_CANVAS_TTL`], then enforce
+/// [`ROOM_CANVAS_MAX_PER_ROOM`] on each map (oldest-by-last-touched evicted first),
+/// and finally drop any room whose ledger went fully empty so the outer map
+/// doesn't retain empty shells. `now` is injected for deterministic tests.
+fn gc_room_canvas(store: &RoomCanvasStore, now: DateTime<Utc>) {
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let ttl = ROOM_CANVAS_TTL;
+    for ledger in store.values_mut() {
+        ledger
+            .components
+            .retain(|_, c| (now - c.updated_at) <= ttl);
+        if ledger.components.len() > ROOM_CANVAS_MAX_PER_ROOM {
+            evict_overflow_to(&mut ledger.components, ROOM_CANVAS_MAX_PER_ROOM, |c| {
+                c.updated_at
+            });
+        }
+        ledger
+            .participants
+            .retain(|_, p| (now - p.last_seen) <= ttl);
+        if ledger.participants.len() > ROOM_CANVAS_MAX_PER_ROOM {
+            evict_overflow_to(&mut ledger.participants, ROOM_CANVAS_MAX_PER_ROOM, |p| {
+                p.last_seen
+            });
+        }
+    }
+    store.retain(|_, ledger| !ledger.is_empty());
+}
+
+/// Trim `map` down to `max` entries, evicting oldest-by-`at` first (OCEAN-277).
+/// A simpler sibling of [`evict_overflow`] for the per-room ledger maps, whose
+/// entries have no terminal/live distinction — only an age.
+fn evict_overflow_to<K, V, FAt>(map: &mut HashMap<K, V>, max: usize, at: FAt)
+where
+    K: std::hash::Hash + Eq + Clone,
+    FAt: Fn(&V) -> DateTime<Utc>,
+{
+    if map.len() <= max {
+        return;
+    }
+    let overflow = map.len() - max;
+    let mut ranked: Vec<(K, DateTime<Utc>)> =
+        map.iter().map(|(k, v)| (k.clone(), at(v))).collect();
+    ranked.sort_by_key(|(_, at)| *at);
+    for (key, _) in ranked.into_iter().take(overflow) {
         map.remove(&key);
     }
 }
@@ -853,6 +1207,7 @@ async fn main() -> anyhow::Result<()> {
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
         persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
+        room_canvas: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Background GC: the request/permission/canvas-fulfillment registries are
@@ -864,6 +1219,7 @@ async fn main() -> anyhow::Result<()> {
         let requests = state.requests.clone();
         let permissions = state.permissions.clone();
         let canvas_fulfillments = state.canvas_fulfillments.clone();
+        let room_canvas = state.room_canvas.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(REGISTRY_GC_INTERVAL);
             // Skip the immediate first tick; first sweep happens one interval in.
@@ -879,8 +1235,9 @@ async fn main() -> anyhow::Result<()> {
                 let reqs = requests.clone();
                 let perms = permissions.clone();
                 let canvas = canvas_fulfillments.clone();
+                let rooms = room_canvas.clone();
                 let sweep = tokio::spawn(async move {
-                    gc_registries(&reqs, &perms, &canvas, Utc::now()).await
+                    gc_registries(&reqs, &perms, &canvas, &rooms, Utc::now()).await
                 });
                 if let Err(join_err) = sweep.await {
                     tracing::error!(
@@ -5182,7 +5539,7 @@ async fn session(
 }
 
 async fn rooms(State(state): State<AppState>) -> Json<RoomsResponse> {
-    let input = room_projection_input(&state).await;
+    let input = room_projection_input(&state, None).await;
     Json(RoomsResponse {
         ok: true,
         rooms: build_room_snapshots(&input),
@@ -5208,7 +5565,7 @@ async fn room(
         }
     };
 
-    let input = room_projection_input(&state).await;
+    let input = room_projection_input(&state, None).await;
     let room = build_room_snapshot(&input, room_id);
     (
         StatusCode::OK,
@@ -5249,7 +5606,7 @@ async fn room_projection_snapshot(
         );
     };
 
-    let input = room_projection_input(&state).await;
+    let input = room_projection_input(&state, Some(room_id)).await;
     let projection = build_room_projection(&input, room_id);
     (
         StatusCode::OK,
@@ -5287,7 +5644,7 @@ async fn room_projection_events(
         );
     };
 
-    let input = room_projection_input(&state).await;
+    let input = room_projection_input(&state, Some(room_id)).await;
     let projection = build_room_projection(&input, room_id);
     let after = q.after_seq.unwrap_or(0);
     let events: Vec<RoomProjectedMessage> = projection
@@ -5319,9 +5676,23 @@ struct RoomProjectionInput {
     requests: Vec<RequestStatus>,
     permissions: Vec<PermissionStatus>,
     events: Vec<EventEnvelope>,
+    /// Components tracked for the room being projected (OCEAN-277), already shaped
+    /// as JSON rows by [`room_canvas_snapshot`]. Empty for room-agnostic callers
+    /// (the multi-room `RoomSnapshot` views, which don't carry components) and for
+    /// a room with no surface-patch activity.
+    room_components: Vec<Value>,
+    /// Participants (room-bound sessions) tracked for the room being projected
+    /// (OCEAN-277). Empty for room-agnostic callers and idle rooms.
+    room_participants: Vec<Value>,
 }
 
-async fn room_projection_input(state: &AppState) -> RoomProjectionInput {
+/// Gather the live state the room projection lenses. `room` scopes the per-room
+/// component/participant ledger (OCEAN-277): pass `Some(room)` for the structured
+/// `/v1/rooms/{room}/snapshot` projection so its `components`/`participants` are
+/// backed, or `None` for the room-agnostic `RoomSnapshot` views which carry
+/// neither. The runtime-status/sessions/requests/events lenses are global either
+/// way (Track-0 rooms share the same underlying runtime state).
+async fn room_projection_input(state: &AppState, room: Option<RoomId>) -> RoomProjectionInput {
     let sessions = state.runtime.list_sessions(None).unwrap_or_default();
     let requests = state
         .requests
@@ -5332,6 +5703,10 @@ async fn room_projection_input(state: &AppState) -> RoomProjectionInput {
         .collect::<Vec<_>>();
     let permissions = pending_permissions_snapshot(&state.permissions).await;
     let events = state.events.recent(32);
+    let (room_components, room_participants) = match room {
+        Some(room) => room_canvas_snapshot(&state.room_canvas, room),
+        None => (Vec::new(), Vec::new()),
+    };
 
     RoomProjectionInput {
         runtime_status: runtime_status_line(state.runtime.as_ref()),
@@ -5339,6 +5714,8 @@ async fn room_projection_input(state: &AppState) -> RoomProjectionInput {
         requests,
         permissions,
         events,
+        room_components,
+        room_participants,
     }
 }
 
@@ -5531,10 +5908,11 @@ fn turn_recency(status: &RequestStatus) -> DateTime<Utc> {
 /// This is the real, computed backing for `GET /v1/rooms/{room_id}/snapshot`. It
 /// derives **turns** and the **active_turn** from the daemon's live request
 /// registry, and a **messages** feed from the recent runtime event ring — both
-/// real tracked state. `components` and `participants` are emitted empty and
-/// flagged in `projection.planned`, because no per-room component/canvas ledger
-/// and no Track-0 roster are persisted yet (rosters are a *persistent*-room
-/// concept). Nothing is fabricated.
+/// real tracked state. As of OCEAN-277 **components** and **participants** are also
+/// real: they come from the per-room ledger ([`RoomCanvasStore`]) carried on the
+/// [`RoomProjectionInput`], folded from this room's bound turns' surface patches
+/// (components) and the room's bound sessions (participants). All are honestly
+/// empty — never fabricated — for a room with no such activity.
 ///
 /// Track-0 rooms are role lenses over the *same* global runtime state rather than
 /// workspace-partitioned rooms with private transcripts, so every room sees the
@@ -5583,6 +5961,18 @@ fn build_room_projection(input: &RoomProjectionInput, room_id: RoomId) -> RoomPr
         .map(|event| event.at.timestamp_millis())
         .unwrap_or_else(|| Utc::now().timestamp_millis());
 
+    let updated_ms = input
+        .room_components
+        .iter()
+        .chain(input.room_participants.iter())
+        .filter_map(|row| row.get("updated_at").or_else(|| row.get("last_seen")))
+        .filter_map(|v| v.as_str())
+        .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .chain(std::iter::once(updated_ms))
+        .max()
+        .unwrap_or(updated_ms);
+
     RoomProjection {
         room_id,
         title: room_id.title().into(),
@@ -5591,9 +5981,12 @@ fn build_room_projection(input: &RoomProjectionInput, room_id: RoomId) -> RoomPr
         updated_ms,
         messages,
         turns,
-        // PLANNED — see RoomProjection docs; no backing source exists yet.
-        components: Vec::new(),
-        participants: Vec::new(),
+        // REAL (OCEAN-277): folded from this turn's relayed surface patches and the
+        // room's bound sessions. Honestly empty when this room has had no
+        // surface-patch activity / no room-bound turns — the *source* exists either
+        // way, exactly like `turns`/`messages` are real-but-empty for an idle room.
+        components: input.room_components.clone(),
+        participants: input.room_participants.clone(),
         active_turn,
         last_seq,
         projection: RoomProjectionProvenance {
@@ -5603,8 +5996,11 @@ fn build_room_projection(input: &RoomProjectionInput, room_id: RoomId) -> RoomPr
                 "messages".into(),
                 "last_seq".into(),
                 "status".into(),
+                // OCEAN-277: now backed by the per-room component/participant ledger.
+                "components".into(),
+                "participants".into(),
             ],
-            planned: vec!["components".into(), "participants".into()],
+            planned: vec![],
         },
     }
 }
@@ -6701,6 +7097,19 @@ async fn agent_turn(
     let bridge_bus = state.agent_events.clone();
     let bridge_turn_id = turn_id;
     let bridge_session_id = session_id;
+
+    // OCEAN-277: a turn submitted *with* a `room_id` binds its session to that
+    // Track-0 room. Record the participant now (so the projection shows the room's
+    // roster even before any patch lands) and hand the room into the bridge below,
+    // so every surface patch this turn emits is folded into that room's component
+    // ledger. A turn with no `room_id` binds to no room — nothing is recorded, and
+    // its patches are attributed to no Track-0 room (there is none to attribute to).
+    let bridge_room_id = room_id;
+    if let Some(room) = bridge_room_id {
+        bind_room_session(&state.room_canvas, room, core_sid(bridge_session_id), Utc::now());
+    }
+    let bridge_room_canvas = state.room_canvas.clone();
+
     let bridge = tokio::spawn(async move {
         let mut tool_call_ids: HashMap<String, ToolCallId> = HashMap::new();
         while let Some(ev) = event_rx.recv().await {
@@ -6838,26 +7247,46 @@ async fn agent_turn(
                     };
                     let canvas = CanvasId::new(canvas_id);
                     let created_at_ms = ocean_protocol::now_ms();
+                    // OCEAN-277: if this turn is room-bound, fold each patch into
+                    // that room's component ledger before it is moved into its
+                    // envelope. This is a *projection mirror*, not the merge
+                    // authority — exactly like the SSE relay below, the daemon only
+                    // observes the patch stream; the surface ledger remains the
+                    // source of truth for the canvas (masterbuild §4). Off the
+                    // critical path: a `None` room (no `room_id` on the turn) skips
+                    // it entirely.
+                    let now = Utc::now();
                     let envelopes: Vec<SurfacePatchEnvelope> = patches
                         .into_iter()
-                        .map(|patch| SurfacePatchEnvelope {
-                            patch_id: PatchId::new(Uuid::new_v4().to_string()),
-                            session_id: bridge_session_id,
-                            surface_id: SurfaceId::new("gpui:local"),
-                            canvas_id: canvas.clone(),
-                            actor: ActorRef::agent(None),
-                            created_at_ms,
-                            patch,
-                            // OCEAN-258: the daemon is a transport, not the merge
-                            // authority — the ledger is where the operator's local
-                            // edits and the agent's streamed patches actually meet,
-                            // so the *surface ledger* stamps the convergent-merge
-                            // `version` (from its per-canvas Lamport clock) when it
-                            // applies this patch. Stamping an authoritative rev here
-                            // would split-brain the clock across daemon + ledger and
-                            // violate masterbuild §4 ("no daemon table is the source
-                            // of truth for the canvas"). Left None on the wire.
-                            version: None,
+                        .map(|patch| {
+                            if let Some(room) = bridge_room_id {
+                                apply_room_surface_patch(
+                                    &bridge_room_canvas,
+                                    room,
+                                    &canvas,
+                                    &patch,
+                                    now,
+                                );
+                            }
+                            SurfacePatchEnvelope {
+                                patch_id: PatchId::new(Uuid::new_v4().to_string()),
+                                session_id: bridge_session_id,
+                                surface_id: SurfaceId::new("gpui:local"),
+                                canvas_id: canvas.clone(),
+                                actor: ActorRef::agent(None),
+                                created_at_ms,
+                                patch,
+                                // OCEAN-258: the daemon is a transport, not the merge
+                                // authority — the ledger is where the operator's local
+                                // edits and the agent's streamed patches actually meet,
+                                // so the *surface ledger* stamps the convergent-merge
+                                // `version` (from its per-canvas Lamport clock) when it
+                                // applies this patch. Stamping an authoritative rev here
+                                // would split-brain the clock across daemon + ledger and
+                                // violate masterbuild §4 ("no daemon table is the source
+                                // of truth for the canvas"). Left None on the wire.
+                                version: None,
+                            }
                         })
                         .collect();
                     bridge_bus.emit(AgentTurnEvent::SurfacePatch {
@@ -8260,6 +8689,12 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    /// Empty per-room ledger for `gc_registries` calls that don't exercise the
+    /// OCEAN-277 room-canvas sweep (the room-canvas GC has its own focused tests).
+    fn empty_room_canvas_store() -> RoomCanvasStore {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     fn status(request_id: RequestId, state: RequestState) -> RequestControl {
         RequestControl {
             status: RequestStatus {
@@ -9374,6 +9809,8 @@ mod tests {
             requests: vec![],
             permissions: vec![],
             events: vec![],
+            room_components: vec![],
+            room_participants: vec![],
         };
 
         let room = build_room_snapshot(&input, RoomId::Pm);
@@ -9432,6 +9869,8 @@ mod tests {
             requests: vec![completed, queued, running],
             permissions: vec![],
             events: vec![],
+            room_components: vec![],
+            room_participants: vec![],
         };
 
         let proj = build_room_projection(&input, RoomId::Pm);
@@ -9448,12 +9887,16 @@ mod tests {
         assert_eq!(active.turn_id, running_id);
         assert!(active.active);
 
-        // provenance: turns/active_turn are REAL; components/participants PLANNED.
+        // provenance (OCEAN-277): turns/active_turn AND components/participants are
+        // all REAL now — the latter are backed by the per-room ledger, just empty
+        // here because this fixture has no room-bound surface activity. Nothing is
+        // listed as planned for the structured snapshot.
         assert!(proj.projection.real.contains(&"turns".to_string()));
         assert!(proj.projection.real.contains(&"active_turn".to_string()));
-        assert!(proj.projection.planned.contains(&"components".to_string()));
-        assert!(proj.projection.planned.contains(&"participants".to_string()));
-        // PLANNED fields are honestly empty, never fabricated.
+        assert!(proj.projection.real.contains(&"components".to_string()));
+        assert!(proj.projection.real.contains(&"participants".to_string()));
+        assert!(proj.projection.planned.is_empty());
+        // Real-but-empty (no fabrication) when there is no source for this room.
         assert!(proj.components.is_empty());
         assert!(proj.participants.is_empty());
     }
@@ -9467,6 +9910,8 @@ mod tests {
             requests: vec![done],
             permissions: vec![],
             events: vec![],
+            room_components: vec![],
+            room_participants: vec![],
         };
         let proj = build_room_projection(&input, RoomId::Review);
         assert_eq!(proj.turns.len(), 1);
@@ -9488,6 +9933,8 @@ mod tests {
             requests: vec![],
             permissions: vec![],
             events: vec![newest, middle, oldest],
+            room_components: vec![],
+            room_participants: vec![],
         };
 
         let proj = build_room_projection(&input, RoomId::OrchMesh);
@@ -9497,6 +9944,188 @@ mod tests {
         assert_eq!(proj.messages[2].seq, 3);
         assert!(proj.messages[2].summary.contains("third"), "newest is last");
         assert_eq!(proj.last_seq, Some(3));
+    }
+
+    // --- OCEAN-277: per-room component/participant ledger ---------------------
+
+    fn upsert(id: &str, kind: &str) -> SurfacePatch {
+        SurfacePatch::UpsertComponent {
+            component: ocean_agent_sdk::surface::CanvasComponentPatch {
+                id: ComponentId::new(id),
+                kind: kind.into(),
+                rect: None,
+                z_index: None,
+                content: json!({ "n": id }),
+                metadata: Value::Null,
+            },
+        }
+    }
+
+    #[test]
+    fn ledger_folds_upsert_move_resize_delete() {
+        let mut ledger = RoomCanvasLedger::default();
+        let canvas = CanvasId::new("c:main");
+        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        // Upsert creates the component.
+        ledger.apply_patch(&canvas, &upsert("a", "card"), t0);
+        assert_eq!(ledger.components.len(), 1);
+
+        // Move + resize update geometry on the existing entry (no new entry).
+        ledger.apply_patch(
+            &canvas,
+            &SurfacePatch::MoveComponent {
+                component_id: ComponentId::new("a"),
+                x: 5.0,
+                y: 6.0,
+            },
+            t0,
+        );
+        ledger.apply_patch(
+            &canvas,
+            &SurfacePatch::ResizeComponent {
+                component_id: ComponentId::new("a"),
+                width: 100.0,
+                height: 50.0,
+            },
+            t0,
+        );
+        let c = ledger
+            .components
+            .get(&(canvas.clone(), ComponentId::new("a")))
+            .unwrap();
+        let rect = c.rect.expect("rect set by move/resize");
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (5.0, 6.0, 100.0, 50.0));
+
+        // A move for an unknown component is ignored — never fabricates an entry.
+        ledger.apply_patch(
+            &canvas,
+            &SurfacePatch::MoveComponent {
+                component_id: ComponentId::new("ghost"),
+                x: 1.0,
+                y: 1.0,
+            },
+            t0,
+        );
+        assert_eq!(ledger.components.len(), 1, "move on unknown id is a no-op");
+
+        // Delete removes it.
+        ledger.apply_patch(
+            &canvas,
+            &SurfacePatch::DeleteComponent {
+                component_id: ComponentId::new("a"),
+            },
+            t0,
+        );
+        assert!(ledger.components.is_empty(), "delete removes the component");
+    }
+
+    #[test]
+    fn ledger_ignores_non_component_ops() {
+        let mut ledger = RoomCanvasLedger::default();
+        let canvas = CanvasId::new("c:main");
+        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        // Selection/viewport are view-state, not a component register.
+        ledger.apply_patch(
+            &canvas,
+            &SurfacePatch::Select {
+                ids: vec![ComponentId::new("x")],
+            },
+            t0,
+        );
+        ledger.apply_patch(
+            &canvas,
+            &SurfacePatch::SetViewport {
+                viewport: ocean_agent_sdk::surface::Viewport::default(),
+            },
+            t0,
+        );
+        assert!(
+            ledger.components.is_empty(),
+            "view-state ops never create components"
+        );
+    }
+
+    #[test]
+    fn snapshot_shapes_components_and_participants_oldest_first() {
+        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
+        let canvas = CanvasId::new("c:main");
+        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(10);
+
+        // Two components on PM, touched at different times → snapshot oldest-first.
+        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("a", "card"), t0);
+        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("b", "node"), t1);
+        let s1 = SessionId::new_v4();
+        bind_room_session(&store, RoomId::Pm, s1, t1);
+
+        let (components, participants) = room_canvas_snapshot(&store, RoomId::Pm);
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0]["component_id"], "a", "oldest component first");
+        assert_eq!(components[1]["component_id"], "b");
+        assert_eq!(components[0]["canvas_id"], "c:main");
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0]["kind"], "session");
+
+        // A room with no ledger is honestly empty.
+        let (ec, ep) = room_canvas_snapshot(&store, RoomId::Review);
+        assert!(ec.is_empty() && ep.is_empty());
+    }
+
+    #[test]
+    fn binding_a_session_twice_keeps_one_participant() {
+        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
+        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let s1 = SessionId::new_v4();
+        bind_room_session(&store, RoomId::Writers, s1, t0);
+        bind_room_session(&store, RoomId::Writers, s1, t0 + chrono::Duration::seconds(5));
+        let (_c, participants) = room_canvas_snapshot(&store, RoomId::Writers);
+        assert_eq!(participants.len(), 1, "re-binding the same session is idempotent");
+    }
+
+    #[test]
+    fn gc_room_canvas_evicts_stale_and_drops_empty_rooms() {
+        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
+        let canvas = CanvasId::new("c:main");
+        let old = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let fresh = old + ROOM_CANVAS_TTL - chrono::Duration::minutes(1);
+        let now = old + ROOM_CANVAS_TTL + chrono::Duration::minutes(1);
+
+        // PM: one stale component (at `old`) + one fresh (at `fresh`).
+        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("stale", "card"), old);
+        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("fresh", "card"), fresh);
+        // Review: only a stale participant → whole room should drop after GC.
+        bind_room_session(&store, RoomId::Review, SessionId::new_v4(), old);
+
+        gc_room_canvas(&store, now);
+
+        let (pm_components, _) = room_canvas_snapshot(&store, RoomId::Pm);
+        assert_eq!(pm_components.len(), 1, "only the fresh component survives TTL");
+        assert_eq!(pm_components[0]["component_id"], "fresh");
+
+        let guard = store.lock().unwrap();
+        assert!(
+            !guard.contains_key(&RoomId::Review),
+            "a room emptied by GC is dropped, not kept as a shell"
+        );
+    }
+
+    #[test]
+    fn gc_room_canvas_caps_per_room() {
+        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
+        let canvas = CanvasId::new("c:main");
+        let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        // Insert cap + 5 components, each fresh but at strictly increasing times.
+        for i in 0..(ROOM_CANVAS_MAX_PER_ROOM + 5) {
+            let at = base + chrono::Duration::milliseconds(i as i64);
+            apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert(&format!("c{i}"), "card"), at);
+        }
+        // GC at a time within TTL: nothing expires, so only the cap trims.
+        gc_room_canvas(&store, base + chrono::Duration::seconds(1));
+        let (components, _) = room_canvas_snapshot(&store, RoomId::Pm);
+        assert_eq!(components.len(), ROOM_CANVAS_MAX_PER_ROOM, "trimmed to the per-room cap");
+        // Oldest were evicted: c0..c4 gone, the snapshot's oldest is c5.
+        assert_eq!(components[0]["component_id"], "c5");
     }
 
     #[tokio::test]
@@ -9533,10 +10162,55 @@ mod tests {
             Some(running_id),
             "the live request is the active turn"
         );
-        // Honesty contract: planned fields are empty + declared planned.
+        // OCEAN-277: with no room-bound surface activity yet, components +
+        // participants are honestly empty — but now declared REAL (the source
+        // exists), not planned.
         assert!(room.components.is_empty());
         assert!(room.participants.is_empty());
-        assert!(room.projection.planned.contains(&"components".to_string()));
+        assert!(room.projection.real.contains(&"components".to_string()));
+        assert!(room.projection.real.contains(&"participants".to_string()));
+        assert!(room.projection.planned.is_empty());
+
+        // Now seed the per-room ledger the way the relay + turn-binding would: a
+        // bound session (participant) and an upserted component on PM's canvas.
+        let now = Utc::now();
+        let session = SessionId::new_v4();
+        bind_room_session(&state.room_canvas, RoomId::Pm, session, now);
+        apply_room_surface_patch(
+            &state.room_canvas,
+            RoomId::Pm,
+            &CanvasId::new("canvas:main"),
+            &SurfacePatch::UpsertComponent {
+                component: ocean_agent_sdk::surface::CanvasComponentPatch {
+                    id: ComponentId::new("brief-1"),
+                    kind: "brief_card".into(),
+                    rect: Some(ocean_agent_sdk::surface::Rect::new(10.0, 20.0, 300.0, 200.0)),
+                    z_index: None,
+                    content: json!({ "title": "Sales Brief" }),
+                    metadata: json!({ "source": "longhouse.sales" }),
+                },
+            },
+            now,
+        );
+
+        // The very next projection reflects the real per-room state — and only for
+        // the room it was bound to.
+        let (_s, Json(resp2)) =
+            room_projection_snapshot(State(state.clone()), Path("pm".to_string())).await;
+        let pm = resp2.room.expect("pm projection");
+        assert_eq!(pm.components.len(), 1, "the upserted component projects");
+        assert_eq!(pm.components[0]["component_id"], "brief-1");
+        assert_eq!(pm.components[0]["kind"], "brief_card");
+        assert_eq!(pm.components[0]["content"]["title"], "Sales Brief");
+        assert_eq!(pm.participants.len(), 1, "the bound session projects");
+        assert_eq!(pm.participants[0]["kind"], "session");
+
+        // A different room saw none of it — honestly empty, no cross-room bleed.
+        let (_s, Json(resp3)) =
+            room_projection_snapshot(State(state.clone()), Path("review".to_string())).await;
+        let review = resp3.room.expect("review projection");
+        assert!(review.components.is_empty(), "components don't bleed across rooms");
+        assert!(review.participants.is_empty(), "participants don't bleed across rooms");
     }
 
     #[tokio::test]
@@ -9830,7 +10504,14 @@ mod tests {
         ])));
         let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
+        gc_registries(
+            &requests,
+            &permissions,
+            &empty_canvas_store(),
+            &empty_room_canvas_store(),
+            now,
+        )
+        .await;
 
         let reqs = requests.read().await;
         assert!(!reqs.contains_key(&old_terminal), "old terminal evicted");
@@ -9873,7 +10554,14 @@ mod tests {
         ])));
         let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
+        gc_registries(
+            &requests,
+            &permissions,
+            &empty_canvas_store(),
+            &empty_room_canvas_store(),
+            now,
+        )
+        .await;
 
         let perms = permissions.read().await;
         assert!(!perms.contains_key(&leaked), "old consumed waiter evicted");
@@ -10798,6 +11486,7 @@ mod tests {
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
+            room_canvas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -11658,6 +12347,7 @@ mod tests {
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
+            room_canvas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -12155,6 +12845,7 @@ mod tests {
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
+            room_canvas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -13182,7 +13873,14 @@ mod tests {
             );
         }
 
-        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
+        gc_registries(
+            &requests,
+            &permissions,
+            &empty_canvas_store(),
+            &empty_room_canvas_store(),
+            now,
+        )
+        .await;
 
         let reqs = requests.read().await;
         assert!(
@@ -13243,7 +13941,14 @@ mod tests {
             }
         }
 
-        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
+        gc_registries(
+            &requests,
+            &permissions,
+            &empty_canvas_store(),
+            &empty_room_canvas_store(),
+            now,
+        )
+        .await;
 
         let reqs = requests.read().await;
         assert_eq!(
@@ -13297,7 +14002,14 @@ mod tests {
             ),
         ])));
 
-        gc_registries(&requests, &permissions, &store, now).await;
+        gc_registries(
+            &requests,
+            &permissions,
+            &store,
+            &empty_room_canvas_store(),
+            now,
+        )
+        .await;
 
         let s = store.lock().unwrap();
         assert!(
@@ -13339,7 +14051,14 @@ mod tests {
             }
         }
 
-        gc_registries(&requests, &permissions, &store, now).await;
+        gc_registries(
+            &requests,
+            &permissions,
+            &store,
+            &empty_room_canvas_store(),
+            now,
+        )
+        .await;
 
         let s = store.lock().unwrap();
         assert_eq!(
