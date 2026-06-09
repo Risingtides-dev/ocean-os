@@ -40,6 +40,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ocean_agent_sdk::slack_canvas::{CanvasFetchStatus, SlackCanvasOp, SlackCanvasResult};
 use serde_json::{json, Value};
 
@@ -78,6 +79,28 @@ use crate::types::{AgentTool, AgentToolResult, ToolSideEffect};
 pub static CANVAS_FULFILLMENT_REGISTRY: std::sync::LazyLock<CanvasFulfillmentRegistry> =
     std::sync::LazyLock::new(CanvasFulfillmentRegistry::new);
 
+/// A fulfilled result is only useful until the agent reads it back (reads are
+/// non-destructive, so nothing removes the entry on read). Past this age the GC
+/// sweep evicts it — generous enough for a read-back within a turn or two, far
+/// shorter than the daemon's lifetime so the map can't grow without bound
+/// (OCEAN-273). Kept equal to the daemon's `CANVAS_FULFILLMENT_TTL` so both
+/// halves of the same `(session, canvas)` slot expire on the same schedule.
+pub const CANVAS_FULFILLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
+
+/// Hard cap on stored fulfillments (OCEAN-273), mirroring the daemon's
+/// `REGISTRY_MAX_ENTRIES`. A TTL bounds age; this bounds a burst of ops that
+/// arrive faster than one GC interval. On overflow the oldest entries (by
+/// `received_at`) are evicted first.
+pub const CANVAS_FULFILLMENT_MAX_ENTRIES: usize = 10_000;
+
+/// One stored fulfillment: the typed result plus when it was inserted, so the GC
+/// sweep can evict by age (OCEAN-273). `SlackCanvasResult` itself carries no
+/// timestamp, hence the wrapper.
+struct StoredFulfillment {
+    result: SlackCanvasResult,
+    received_at: DateTime<Utc>,
+}
+
 /// Registry of fulfilled `slack_canvas` awareness results, keyed by
 /// `(session_id, canvas key)`.
 ///
@@ -86,11 +109,17 @@ pub static CANVAS_FULFILLMENT_REGISTRY: std::sync::LazyLock<CanvasFulfillmentReg
 /// daemon stores under a given key is found by the tool computing the same key:
 /// `read`/`update`/`append` key on the Slack `canvas_id`; `list` on
 /// `list:{channel_id}`; `create` on `create:{title}`.
+///
+/// Entries are write-once-read-many (a read never removes them), so without a
+/// sweep the map would grow one entry per fulfilled op for the daemon's whole
+/// lifetime. [`gc`](Self::gc) — driven from the daemon's registry GC task —
+/// bounds it by TTL and a hard cap (OCEAN-273).
 #[derive(Default)]
 pub struct CanvasFulfillmentRegistry {
     /// Map of `(session_id, canvas key)` → the fulfilled, typed result the bridge
-    /// produced. Last-write-wins per key, matching the daemon's store semantics.
-    fulfilled: Mutex<HashMap<(String, String), SlackCanvasResult>>,
+    /// produced (with its insertion time). Last-write-wins per key, matching the
+    /// daemon's store semantics.
+    fulfilled: Mutex<HashMap<(String, String), StoredFulfillment>>,
 }
 
 impl CanvasFulfillmentRegistry {
@@ -100,13 +129,32 @@ impl CanvasFulfillmentRegistry {
 
     /// Store a fulfilled result for `(session_id, canvas key)`. Called by the
     /// daemon when the bridge POSTs a fulfillment, so a later `read`/`list` of
-    /// the same canvas in the same session surfaces real content.
+    /// the same canvas in the same session surfaces real content. Stamps the
+    /// entry with the current time for TTL eviction (OCEAN-273).
     pub fn put(&self, session_id: impl Into<String>, canvas_key: impl Into<String>, result: SlackCanvasResult) {
+        self.put_at(session_id, canvas_key, result, Utc::now());
+    }
+
+    /// As [`put`](Self::put) but with an explicit insertion time, so GC behaviour
+    /// is deterministic in tests (OCEAN-273).
+    pub fn put_at(
+        &self,
+        session_id: impl Into<String>,
+        canvas_key: impl Into<String>,
+        result: SlackCanvasResult,
+        received_at: DateTime<Utc>,
+    ) {
         let mut map = self
             .fulfilled
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        map.insert((session_id.into(), canvas_key.into()), result);
+        map.insert(
+            (session_id.into(), canvas_key.into()),
+            StoredFulfillment {
+                result,
+                received_at,
+            },
+        );
     }
 
     /// Look up a fulfilled result for `(session_id, canvas key)`. Returns `None`
@@ -118,7 +166,47 @@ impl CanvasFulfillmentRegistry {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         map.get(&(session_id.to_string(), canvas_key.to_string()))
-            .cloned()
+            .map(|stored| stored.result.clone())
+    }
+
+    /// One GC sweep (OCEAN-273): drop entries older than `ttl`, then enforce the
+    /// `max_entries` cap by evicting the oldest (by `received_at`) first. `now` is
+    /// injected so the sweep is deterministic in tests, matching the daemon's
+    /// `gc_registries(now)` pattern. Driven from the daemon's registry GC task on
+    /// the same interval — nothing in `ocean-runtime` self-schedules.
+    pub fn gc(&self, now: DateTime<Utc>, ttl: chrono::Duration, max_entries: usize) {
+        let mut map = self
+            .fulfilled
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        map.retain(|_, stored| (now - stored.received_at) <= ttl);
+        if map.len() <= max_entries {
+            return;
+        }
+        let overflow = map.len() - max_entries;
+        // Oldest first: rank by insertion time and drop exactly `overflow` keys.
+        let mut ranked: Vec<((String, String), DateTime<Utc>)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.received_at))
+            .collect();
+        ranked.sort_by_key(|(_, received_at)| *received_at);
+        for (key, _) in ranked.into_iter().take(overflow) {
+            map.remove(&key);
+        }
+    }
+
+    /// Current number of stored fulfillments. Used by the daemon's bounded-growth
+    /// test and exposed for observability (OCEAN-273).
+    pub fn len(&self) -> usize {
+        self.fulfilled
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+
+    /// Whether the registry holds no fulfillments.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -799,5 +887,102 @@ mod tests {
             .expect("fulfilled list carries canvases");
         assert_eq!(canvases.len(), 1);
         assert_eq!(canvases[0]["canvas_id"], "F9");
+    }
+
+    // -----------------------------------------------------------------------
+    // OCEAN-273: the process-global registry is bounded by TTL + a hard cap.
+    //
+    // These exercise `gc` against a *local* `CanvasFulfillmentRegistry` (not the
+    // process-global static), so they're isolated from other concurrently-running
+    // tests that write into `CANVAS_FULFILLMENT_REGISTRY`.
+    // -----------------------------------------------------------------------
+
+    fn fulfilled(body: &str) -> SlackCanvasResult {
+        SlackCanvasResult::fulfilled_read(SlackCanvasId::new("F_GC"), body, Value::Null)
+    }
+
+    /// A sweep drops entries past the TTL and keeps fresh ones — by age alone,
+    /// since a fulfillment has no terminal state (reads don't consume it).
+    #[test]
+    fn gc_evicts_entries_past_ttl_keeps_fresh() {
+        let reg = CanvasFulfillmentRegistry::new();
+        let now = Utc::now();
+        reg.put_at(
+            "sess",
+            "F_OLD",
+            fulfilled("stale"),
+            now - CANVAS_FULFILLMENT_TTL - chrono::Duration::seconds(1),
+        );
+        reg.put_at(
+            "sess",
+            "F_FRESH",
+            fulfilled("fresh"),
+            now - chrono::Duration::minutes(1),
+        );
+
+        reg.gc(now, CANVAS_FULFILLMENT_TTL, CANVAS_FULFILLMENT_MAX_ENTRIES);
+
+        assert!(
+            reg.get("sess", "F_OLD").is_none(),
+            "entry older than the TTL must be evicted"
+        );
+        assert!(
+            reg.get("sess", "F_FRESH").is_some(),
+            "a fresh fulfillment survives the sweep and stays readable"
+        );
+        assert_eq!(reg.len(), 1);
+    }
+
+    /// An entry exactly at the TTL boundary is kept (eviction is strictly
+    /// older-than), so a read-back right at the edge still resolves.
+    #[test]
+    fn gc_keeps_entry_exactly_at_ttl_boundary() {
+        let reg = CanvasFulfillmentRegistry::new();
+        let now = Utc::now();
+        reg.put_at("sess", "F_EDGE", fulfilled("edge"), now - CANVAS_FULFILLMENT_TTL);
+        reg.gc(now, CANVAS_FULFILLMENT_TTL, CANVAS_FULFILLMENT_MAX_ENTRIES);
+        assert!(reg.get("sess", "F_EDGE").is_some(), "boundary entry retained");
+    }
+
+    /// The hard cap bounds a burst that arrives within a single TTL window:
+    /// with a cap of 2 and three fresh entries, the oldest is evicted first.
+    #[test]
+    fn gc_cap_evicts_oldest_first_under_burst() {
+        let reg = CanvasFulfillmentRegistry::new();
+        let now = Utc::now();
+        // All within TTL, so only the cap can evict. Distinct ages so "oldest" is
+        // unambiguous.
+        reg.put_at("sess", "F_OLDEST", fulfilled("a"), now - chrono::Duration::minutes(3));
+        reg.put_at("sess", "F_MID", fulfilled("b"), now - chrono::Duration::minutes(2));
+        reg.put_at("sess", "F_NEWEST", fulfilled("c"), now - chrono::Duration::minutes(1));
+
+        reg.gc(now, CANVAS_FULFILLMENT_TTL, 2);
+
+        assert_eq!(reg.len(), 2, "cap holds the map at max_entries");
+        assert!(reg.get("sess", "F_OLDEST").is_none(), "oldest evicted by the cap");
+        assert!(reg.get("sess", "F_MID").is_some());
+        assert!(reg.get("sess", "F_NEWEST").is_some());
+    }
+
+    /// Repeated sweeps keep the map bounded under sustained churn: 5x the cap of
+    /// fresh ops, swept once, lands exactly at the cap (not unbounded).
+    #[test]
+    fn gc_bounds_growth_under_many_ops() {
+        let reg = CanvasFulfillmentRegistry::new();
+        let now = Utc::now();
+        let cap = 50usize;
+        for i in 0..(cap * 5) {
+            // Staggered, all within TTL, unique keys.
+            reg.put_at(
+                "sess",
+                format!("F{i}"),
+                fulfilled("x"),
+                now - chrono::Duration::seconds(i as i64),
+            );
+        }
+        assert_eq!(reg.len(), cap * 5, "all inserted before any sweep");
+
+        reg.gc(now, CANVAS_FULFILLMENT_TTL, cap);
+        assert_eq!(reg.len(), cap, "sweep bounds the map to the cap");
     }
 }
