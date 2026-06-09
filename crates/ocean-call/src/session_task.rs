@@ -151,6 +151,19 @@ impl Default for UtterancePolicy {
     }
 }
 
+/// Instruction prepended to a call-segment transcript when running the summary
+/// turn. The active-lane [`TurnRunner`] takes only a prompt (no separate system
+/// field), so the directive rides at the head of the prompt — the transcript
+/// follows under a clear delimiter. Kept tight so the model returns the summary
+/// and nothing else, suitable to drop straight onto the operator rail.
+const SUMMARY_INSTRUCTION: &str = "Summarize this call segment in 2-3 sentences. \
+Reply with the summary only — no preamble, no labels, no quoting the transcript.";
+
+/// Build the summary-turn prompt from the raw joined transcript.
+fn summary_prompt(transcript: &str) -> String {
+    format!("{SUMMARY_INSTRUCTION}\n\nTranscript:\n{}", transcript.trim())
+}
+
 /// Estimate the buffered audio duration in ms from sample count + format.
 fn buffered_ms(samples: usize, sample_rate: u32, channels: u16) -> u64 {
     if sample_rate == 0 {
@@ -172,6 +185,11 @@ fn buffered_ms(samples: usize, sample_rate: u32, channels: u16) -> u64 {
 ///   the source ends — a phantom "in progress" call can never be left behind;
 /// - buffers frames into utterances, flushing to `transcribe` on size/gap, then
 ///   feeds each resulting segment to [`CallSession::on_segment`];
+/// - when the debounced summarizer fires (via `on_segment`'s
+///   [`crate::orchestrator::SegmentOutcome::summary_due`] or `on_tick` on
+///   silence), runs an agent turn over the joined transcript and emits
+///   [`ocean_core::OceanEvent::CallSummaryUpdated`] with the *LLM summary* — the
+///   orchestrator never emits a raw-transcript "summary" itself;
 /// - on [`ActiveOutcome::Answer`], runs the turn, speaks the reply, emits
 ///   [`ocean_core::OceanEvent::CallAgentSpoke`], and starts the wake cooldown;
 /// - calls [`CallSession::on_tick`] on `policy.tick_interval_ms`.
@@ -266,8 +284,12 @@ pub async fn run_call_session<S, T, R, V, K>(
             }
 
             _ = tick.tick() => {
-                let now = clock();
-                session.on_tick(now.saturating_sub(started_ms), &mut sink);
+                let now = clock().saturating_sub(started_ms);
+                // A debounced silence-summary may be due; the orchestrator hands
+                // back the raw transcript and we run the real summary turn.
+                if let Some(transcript) = session.on_tick(now) {
+                    run_summary(transcript, &mut runner, &mut sink, now).await;
+                }
             }
         }
     }
@@ -334,7 +356,15 @@ async fn flush_utterance<T, R, V, K>(
     };
 
     let now = clock().saturating_sub(started_ms);
-    if let ActiveOutcome::Answer(command) = session.on_segment(seg, now, sink) {
+    let outcome = session.on_segment(seg, now, sink);
+    // Summary lane: the orchestrator decided a summary is due and handed back the
+    // raw transcript. Run a real agent turn over it and emit the LLM summary —
+    // never the raw join. Done before the answer so the rolling summary reflects
+    // the segment that may also have triggered the wake answer.
+    if let Some(transcript) = outcome.summary_due {
+        run_summary(transcript, runner, sink, now).await;
+    }
+    if let ActiveOutcome::Answer(command) = outcome.active {
         run_answer(command, session, runner, voice, sink, started_ms, clock).await;
     }
 }
@@ -373,6 +403,44 @@ async fn run_answer<R, V, K>(
         sink.emit(ocean_core::OceanEvent::CallAgentSpoke { text: reply });
     }
     session.mark_replied(clock().saturating_sub(started_ms));
+}
+
+/// Run one debounced summary turn: agent turn over the joined transcript →
+/// emit [`OceanEvent::CallSummaryUpdated`] with the LLM summary.
+///
+/// This is what makes the rolling summary a *real* summary: the orchestrator
+/// only debounces and hands back the raw joined transcript; the actual 2-3
+/// sentence summary is produced by an agent turn here, exactly mirroring how
+/// [`run_answer`] turns a wake command into spoken text.
+///
+/// Failure policy: a failed or empty summary turn is logged and *skipped* — we
+/// never fall back to emitting the raw transcript as if it were a summary (that
+/// is the very bug this fixes), and a summary failure must never drop the call.
+/// The previous summary simply stands until the next one succeeds.
+async fn run_summary<R, K>(transcript: String, runner: &mut R, sink: &mut K, as_of_ms: u64)
+where
+    R: TurnRunner,
+    K: EventSink,
+{
+    if transcript.trim().is_empty() {
+        return;
+    }
+    let prompt = summary_prompt(&transcript);
+    let summary = match runner.run(&prompt).await {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, "agent turn failed for call summary; keeping prior summary");
+            return;
+        }
+    };
+    if summary.is_empty() {
+        tracing::warn!("call summary turn returned empty text; keeping prior summary");
+        return;
+    }
+    sink.emit(ocean_core::OceanEvent::CallSummaryUpdated {
+        summary,
+        as_of_ms,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -648,17 +716,47 @@ mod tests {
         }
     }
 
-    /// A turn runner that echoes a fixed reply and records the command it saw.
+    /// A turn runner that records every prompt it saw and replies. The same
+    /// [`TurnRunner`] serves both the wake-answer lane and the summary lane, so
+    /// the mock distinguishes them by the [`SUMMARY_INSTRUCTION`] prefix and
+    /// returns a dedicated `summary_reply` for summary turns — letting a test
+    /// assert the emitted `CallSummaryUpdated` carries the *runner's* summary,
+    /// not the raw transcript, while leaving the spoken wake reply unchanged.
     struct CannedRunner {
+        /// Reply for wake-answer turns (spoken back to the call).
         reply: String,
+        /// Reply for summary turns; falls back to `reply` if unset.
+        summary_reply: Option<String>,
+        /// Every prompt the runner was handed, in order.
         seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CannedRunner {
+        fn new(reply: &str, seen: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                reply: reply.into(),
+                summary_reply: None,
+                seen,
+            }
+        }
+        fn with_summary(mut self, summary_reply: &str) -> Self {
+            self.summary_reply = Some(summary_reply.into());
+            self
+        }
     }
 
     #[async_trait]
     impl TurnRunner for CannedRunner {
         async fn run(&mut self, command: &str) -> anyhow::Result<String> {
             self.seen.lock().unwrap().push(command.to_string());
-            Ok(self.reply.clone())
+            if command.starts_with(SUMMARY_INSTRUCTION) {
+                Ok(self
+                    .summary_reply
+                    .clone()
+                    .unwrap_or_else(|| self.reply.clone()))
+            } else {
+                Ok(self.reply.clone())
+            }
         }
     }
 
@@ -722,10 +820,7 @@ mod tests {
             session(false),
             VecFrames::new(vec![]),
             ScriptedStt::new(vec![]),
-            CannedRunner {
-                reply: "hi".into(),
-                seen: Default::default(),
-            },
+            CannedRunner::new("hi", Default::default()),
             CapturingVoice::default(),
             &mut out,
             "call:room".into(),
@@ -757,10 +852,8 @@ mod tests {
             session(false),
             VecFrames::new(frames),
             stt,
-            CannedRunner {
-                reply: "You agreed to send the master.".into(),
-                seen: seen.clone(),
-            },
+            CannedRunner::new("You agreed to send the master.", seen.clone())
+                .with_summary("Caller will send the master and the release is locked for Friday."),
             voice,
             &mut out,
             "call:room".into(),
@@ -781,15 +874,31 @@ mod tests {
         // Active lane: wake fired, agent ran over the command, Ocean spoke.
         assert!(types.contains(&"wake"), "got {types:?}");
         assert!(types.contains(&"spoke"), "got {types:?}");
-        assert_eq!(
-            seen.lock().unwrap().as_slice(),
-            &["what did we agree to".to_string()],
-            "runner should receive the command after the wake word, stripped"
+        // The runner was driven for BOTH lanes: first the summary turn over the
+        // joined transcript (2nd final crossed the threshold), then the wake
+        // command. The summary prompt carries the instruction + raw transcript.
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "runner drives summary + answer; got {seen:?}");
+        assert!(
+            seen[0].starts_with(SUMMARY_INSTRUCTION),
+            "first turn is the summary turn; got {:?}",
+            seen[0]
         );
+        assert!(
+            seen[0].contains("I'll send the master to Atlantic tonight")
+                && seen[0].contains("the release is locked for friday"),
+            "summary turn must carry the joined raw transcript; got {:?}",
+            seen[0]
+        );
+        assert_eq!(
+            seen[1], "what did we agree to",
+            "second turn is the wake command, stripped"
+        );
+        // Only the wake answer is spoken — a summary is never spoken aloud.
         assert_eq!(
             spoken.lock().unwrap().as_slice(),
             &["You agreed to send the master.".to_string()],
-            "voice should speak the agent reply"
+            "voice should speak the agent reply, not the summary"
         );
         // The spoke event carries the reply text.
         let spoke = out
@@ -800,6 +909,24 @@ mod tests {
         if let OceanEvent::CallAgentSpoke { text } = spoke {
             assert_eq!(text, "You agreed to send the master.");
         }
+        // The summary event carries the LLM summary (the runner's summary_reply),
+        // NOT the raw joined transcript — the whole point of OCEAN-CALL.
+        let summary = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                OceanEvent::CallSummaryUpdated { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("a CallSummaryUpdated must be emitted");
+        assert_eq!(
+            summary,
+            "Caller will send the master and the release is locked for Friday."
+        );
+        assert!(
+            !summary.contains("the release is locked for friday"),
+            "summary must be the LLM output, not the raw lowercase transcript join"
+        );
     }
 
     #[tokio::test]
@@ -815,10 +942,7 @@ mod tests {
             session(true), // muted
             VecFrames::new(frames),
             stt,
-            CannedRunner {
-                reply: "should not be spoken".into(),
-                seen: seen.clone(),
-            },
+            CannedRunner::new("should not be spoken", seen.clone()),
             voice,
             &mut out,
             "call:sensitive".into(),
@@ -855,10 +979,7 @@ mod tests {
             session(false),
             VecFrames::new(frames),
             stt,
-            CannedRunner {
-                reply: "x".into(),
-                seen: Default::default(),
-            },
+            CannedRunner::new("x", Default::default()),
             CapturingVoice::default(),
             &mut out,
             "call:room".into(),
@@ -884,10 +1005,7 @@ mod tests {
             session(false),
             VecFrames::dropped(vec![], "SignalClose"),
             ScriptedStt::new(vec![]),
-            CannedRunner {
-                reply: "x".into(),
-                seen: Default::default(),
-            },
+            CannedRunner::new("x", Default::default()),
             CapturingVoice::default(),
             &mut out,
             "call:room".into(),
@@ -912,10 +1030,7 @@ mod tests {
             session(false),
             VecFrames::new(vec![short]),
             stt,
-            CannedRunner {
-                reply: "x".into(),
-                seen: Default::default(),
-            },
+            CannedRunner::new("x", Default::default()),
             CapturingVoice::default(),
             &mut out,
             "call:room".into(),
@@ -928,6 +1043,114 @@ mod tests {
         assert!(
             ev_types(&out).contains(&"segment"),
             "trailing sub-threshold audio should still be transcribed at end"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_turn_emits_llm_summary_not_raw_transcript() {
+        // Two finals cross the every_n_segments=2 threshold → one summary turn.
+        // Neither line is a task or wake command, so the ONLY runner call is the
+        // summary turn — letting us assert the transcript it received and that the
+        // emitted summary is the runner's reply, not the raw join.
+        let frames = vec![frame_3s(), frame_3s()];
+        let stt = ScriptedStt::new(vec![
+            Some("we walked through the Q3 numbers"),
+            Some("budget approval lands next week"),
+        ]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            stt,
+            CannedRunner::new("unused answer", seen.clone())
+                .with_summary("The team reviewed Q3 numbers; budget approval is due next week."),
+            voice,
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        // Exactly one runner call: the summary turn (no wake, no task lane turn).
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "only the summary turn runs; got {seen:?}");
+        // It carried the summarize instruction and the joined raw transcript.
+        assert!(seen[0].starts_with(SUMMARY_INSTRUCTION));
+        assert!(
+            seen[0].contains("we walked through the Q3 numbers")
+                && seen[0].contains("budget approval lands next week"),
+            "summary turn must receive the joined transcript; got {:?}",
+            seen[0]
+        );
+        // A summary is never spoken aloud.
+        assert!(spoken.lock().unwrap().is_empty(), "summary must not be spoken");
+        // The emitted CallSummaryUpdated carries the LLM summary, not the raw join.
+        let summary = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                OceanEvent::CallSummaryUpdated { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("a CallSummaryUpdated must be emitted");
+        assert_eq!(
+            summary,
+            "The team reviewed Q3 numbers; budget approval is due next week."
+        );
+        assert!(
+            !summary.contains("we walked through the Q3 numbers"),
+            "must be the LLM output, not the raw transcript join"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_turn_failure_keeps_prior_summary_and_call_survives() {
+        // A runner that errors on the summary turn must not emit a summary and must
+        // not drop the call — the prior (here: none) summary simply stands.
+        struct FailingSummaryRunner;
+        #[async_trait]
+        impl TurnRunner for FailingSummaryRunner {
+            async fn run(&mut self, command: &str) -> anyhow::Result<String> {
+                if command.starts_with(SUMMARY_INSTRUCTION) {
+                    anyhow::bail!("summary provider down");
+                }
+                Ok("ok".into())
+            }
+        }
+
+        let frames = vec![frame_3s(), frame_3s()];
+        let stt = ScriptedStt::new(vec![Some("first thing"), Some("second thing")]);
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            stt,
+            FailingSummaryRunner,
+            CapturingVoice::default(),
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        // The call still brackets cleanly and transcripts still flow...
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"));
+        assert!(types.contains(&"segment"), "got {types:?}");
+        // ...but a failed summary turn emits NO summary (never the raw transcript).
+        assert!(
+            !types.contains(&"summary"),
+            "failed summary turn must not emit a raw-transcript fallback; got {types:?}"
         );
     }
 
