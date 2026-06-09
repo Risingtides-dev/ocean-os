@@ -513,6 +513,36 @@ fn effective_yolo() -> bool {
     ocean_agent::load_yolo_pref(&ocean_agent::config_dir_from_env()).unwrap_or(false)
 }
 
+/// Resolve the YOLO posture for a turn arriving on a wire `PromptRequest`
+/// (`POST /v1/prompt`, `POST /v1/requests`), DELIBERATELY IGNORING the
+/// client-supplied `wire_yolo` flag (OCEAN-160, P0).
+///
+/// History: the legacy handlers used to compute `req.yolo || effective_yolo()`.
+/// Because `PromptRequest.yolo` deserializes straight off the request JSON, any
+/// client could POST `{"yolo": true, ...}` and force the bypass on — every tool
+/// auto-approved, the entire `DaemonPermissionPolicy` gate skipped — even when
+/// the operator had NOT opted in. That is an auth-bypass: a per-request wire
+/// flag must never be able to escalate past the operator's policy.
+///
+/// The fix matches the modern product path (`POST /v1/agent/turns`, see
+/// `agent_turn`), whose `AgentTurnRequest` carries no yolo field at all and
+/// resolves the posture purely from `effective_yolo()` (OCEAN_YOLO env →
+/// persisted operator default → off). It also matches the established
+/// epic-E7 pattern: OCEAN-162 documented that "the daemon ignores the wire
+/// `yolo` flag and gates mutating tools on its own `OCEAN_YOLO`" and patched
+/// the CLI to stop sending it — this closes the daemon side of that contract so
+/// the field is truly inert, regardless of which client sends it.
+///
+/// A legitimate operator who relies on the persisted/env yolo default is
+/// unaffected: that path runs through `effective_yolo()` exactly as before. The
+/// `wire_yolo` parameter is accepted (and ignored) only so the inert flag is
+/// explicit at the call site and the security intent is greppable.
+fn resolve_request_yolo(wire_yolo: bool) -> bool {
+    // The wire flag is intentionally discarded; see the doc comment above.
+    let _ = wire_yolo;
+    effective_yolo()
+}
+
 /// HTTP methods advertised in the CORS preflight (`Access-Control-Allow-Methods`).
 /// Must cover EVERY method the router actually serves, or the browser's OPTIONS
 /// preflight fails and the real request never fires (OCEAN-87). The router serves
@@ -1026,9 +1056,11 @@ async fn prompt(
 ) -> Json<ocean_core::PromptResponse> {
     let (request_id, cancel) =
         register_running_request(&state, &mut req, "prompt running", RequestState::Running).await;
-    // Precedence: an explicit per-request `yolo: true` forces the bypass on for
-    // this turn; otherwise fall through to env → persisted default → off.
-    req.yolo = req.yolo || effective_yolo();
+    // OCEAN-160 (P0): do NOT trust the wire `yolo` flag to escalate. The posture
+    // is resolved purely from operator policy (env → persisted default → off),
+    // exactly like `POST /v1/agent/turns`; a client-supplied `yolo: true` is
+    // inert and can no longer bypass the permission gate on its own.
+    req.yolo = resolve_request_yolo(req.yolo);
     emit_user_message(&state.events, &req, request_id);
 
     let control = build_prompt_control(
@@ -1057,8 +1089,10 @@ async fn create_request(
     )
     .await;
     let session_id = req.session_id;
-    // Precedence: explicit per-request `yolo: true` wins; else env → persisted → off.
-    req.yolo = req.yolo || effective_yolo();
+    // OCEAN-160 (P0): same wire-yolo bypass as `POST /v1/prompt` — this is its
+    // async sibling on the same `PromptRequest` wire type. Resolve from operator
+    // policy only (env → persisted default → off); the wire `yolo` flag is inert.
+    req.yolo = resolve_request_yolo(req.yolo);
     emit_user_message(&state.events, &req, request_id);
 
     let control = build_prompt_control(
@@ -6909,6 +6943,82 @@ mod tests {
         );
 
         // Restore env.
+        match prior_yolo {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+        match prior_cfg {
+            Some(v) => env::set_var("OCEAN_CONFIG_DIR", v),
+            None => env::remove_var("OCEAN_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// OCEAN-160 (P0): the legacy `POST /v1/prompt` (and its async sibling
+    /// `POST /v1/requests`) must NOT trust the wire `yolo` flag to escalate.
+    /// `resolve_request_yolo` is the handler's yolo resolver; it must ignore the
+    /// client-supplied flag and return exactly `effective_yolo()` (operator
+    /// policy: env → persisted → off) in every state.
+    ///
+    /// The load-bearing assertion is the first block: operator policy OFF +
+    /// wire `yolo: true` ⇒ STILL off. That is the auth-bypass the ticket closes.
+    #[test]
+    fn resolve_request_yolo_ignores_wire_flag() {
+        let _guard = yolo_env_guard();
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior_yolo = env::var("OCEAN_YOLO").ok();
+        let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
+
+        let tmp = std::env::temp_dir().join(format!("ocean-yolo-wire-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", &tmp);
+
+        // Operator policy OFF (no env, no persisted). A wire `yolo: true` must
+        // NOT flip the bypass on — this is the OCEAN-160 vuln, closed.
+        env::remove_var("OCEAN_YOLO");
+        assert!(
+            !resolve_request_yolo(true),
+            "wire yolo=true must NOT bypass the gate when operator policy is off (OCEAN-160)"
+        );
+        assert!(
+            !resolve_request_yolo(false),
+            "wire yolo=false with policy off stays off"
+        );
+
+        // Operator opted in via persisted default ⇒ on, independent of the wire
+        // flag (a legitimate operator default still works, both inputs).
+        ocean_agent::persist_yolo_pref(&tmp, true);
+        env::remove_var("OCEAN_YOLO");
+        assert!(
+            resolve_request_yolo(false),
+            "persisted operator default true is honored even with wire yolo=false"
+        );
+        assert!(
+            resolve_request_yolo(true),
+            "persisted operator default true stays on with wire yolo=true"
+        );
+
+        // Operator opted in via env ⇒ on regardless of wire flag.
+        ocean_agent::persist_yolo_pref(&tmp, false);
+        env::set_var("OCEAN_YOLO", "1");
+        assert!(resolve_request_yolo(false), "OCEAN_YOLO=1 ⇒ on (wire false)");
+        assert!(resolve_request_yolo(true), "OCEAN_YOLO=1 ⇒ on (wire true)");
+
+        // env explicitly OFF must override even a wire true.
+        env::set_var("OCEAN_YOLO", "0");
+        assert!(
+            !resolve_request_yolo(true),
+            "OCEAN_YOLO=0 must keep the gate on even with wire yolo=true"
+        );
+
+        // resolve_request_yolo is exactly effective_yolo, flag aside.
+        env::remove_var("OCEAN_YOLO");
+        ocean_agent::persist_yolo_pref(&tmp, true);
+        assert_eq!(resolve_request_yolo(true), effective_yolo());
+        assert_eq!(resolve_request_yolo(false), effective_yolo());
+
         match prior_yolo {
             Some(v) => env::set_var("OCEAN_YOLO", v),
             None => env::remove_var("OCEAN_YOLO"),
