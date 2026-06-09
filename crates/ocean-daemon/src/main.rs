@@ -3544,45 +3544,93 @@ struct TranscriptQuery {
     /// If set, return only entries with `seq > after_seq` (live-tail).
     #[serde(default)]
     after_seq: Option<u64>,
+    /// Max rows to return in this page (OCEAN-249). Omitted ⇒ the store's default
+    /// cap; any value is clamped to `MAX_TRANSCRIPT_LIMIT`. Transcript reads are
+    /// never unbounded — page with the returned `next_seq` cursor.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
-/// `GET /v1/rooms/persistent/{key}/transcript` — read a room's transcript,
-/// optionally only entries after a given seq.
+/// Read one bounded transcript page for a room, transparently falling back to the
+/// soft-closed audit view (OCEAN-249 + OCEAN-170).
 ///
-/// Falls back to the audit (soft-closed) view when the room is closed: a finished
-/// call closes its room on `CallEnded` (OCEAN-170), but its transcript must stay
-/// queryable afterwards — that frozen record is the whole reason it was persisted.
-/// The `after_seq` tail filter is applied in-handler for that fallback path since
-/// the audit getter returns the full transcript.
-async fn room_transcript(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Query(q): Query<TranscriptQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(key.trim());
-    let result = with_rooms(&state, |reg| match reg.transcript(&key, q.after_seq) {
-        // Open room (the live case): serve it directly.
-        Ok(transcript) => Ok(transcript),
-        // Closed room: a finished call's frozen transcript. Read the audit view
-        // and apply the same `after_seq` tail filter the open path would.
+/// The open path defers to `transcript_page` (the `LIMIT`ed query). For a closed
+/// room — a finished call's frozen transcript that must stay queryable — the audit
+/// getter still returns a (now `MAX_TRANSCRIPT_LIMIT`-bounded) record, so we apply
+/// the same `after_seq` filter and `limit + 1` sentinel paging in memory to hand
+/// back an identical `TranscriptPage` shape regardless of room state. `Ok(None)`
+/// from the audit view (room never existed) is mapped back to `UnknownRoom` so the
+/// handlers preserve their 404.
+fn read_transcript_page(
+    reg: &ocean_store::SqliteRoomStore,
+    key: &RoomKey,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<ocean_store::TranscriptPage, ocean_store::RoomStoreError> {
+    use ocean_store::RoomStore as _;
+    match reg.transcript_page(key, after_seq, limit) {
+        // Open room (the live case): the store already paged it.
+        Ok(page) => Ok(page),
+        // Closed room: page the frozen audit transcript in-handler with the same
+        // contract the store would apply.
         Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
-            match reg.get_including_closed(&key) {
-                Ok(Some(rec)) => Ok(rec
-                    .transcript
-                    .into_iter()
-                    .filter(|m| q.after_seq.map_or(true, |after| m.seq > after))
-                    .collect()),
+            match reg.get_including_closed(key) {
+                Ok(Some(rec)) => {
+                    let effective_limit = ocean_store::clamp_transcript_limit(limit);
+                    let mut msgs: Vec<_> = rec
+                        .transcript
+                        .into_iter()
+                        .filter(|m| after_seq.map_or(true, |after| m.seq > after))
+                        .collect();
+                    let has_more = msgs.len() > effective_limit;
+                    if has_more {
+                        msgs.truncate(effective_limit);
+                    }
+                    let next_seq = if has_more { msgs.last().map(|m| m.seq) } else { None };
+                    Ok(ocean_store::TranscriptPage {
+                        messages: msgs,
+                        next_seq,
+                        has_more,
+                    })
+                }
                 // Genuinely no such room (never created): preserve the 404.
                 Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
                 Err(e) => Err(e),
             }
         }
         Err(e) => Err(e),
-    });
+    }
+}
+
+/// `GET /v1/rooms/persistent/{key}/transcript?after_seq=N&limit=M` — read one
+/// bounded page of a room's transcript, optionally only entries after a given seq.
+///
+/// Bounded + paginated (OCEAN-249): the read is capped (default cap when `limit`
+/// is omitted, clamped to `MAX_TRANSCRIPT_LIMIT`), and the response carries
+/// additive `next_seq` (cursor to replay as `after_seq`) and `has_more` fields so
+/// a client can page through a long transcript instead of forcing a full-table
+/// read on every call. The `transcript` array shape is unchanged.
+///
+/// Falls back to the audit (soft-closed) view when the room is closed: a finished
+/// call closes its room on `CallEnded` (OCEAN-170), but its transcript must stay
+/// queryable afterwards — that frozen record is the whole reason it was persisted.
+async fn room_transcript(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(q): Query<TranscriptQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    let result =
+        with_rooms(&state, |reg| read_transcript_page(reg, &key, q.after_seq, q.limit));
     match result {
-        Ok(transcript) => (
+        Ok(page) => (
             StatusCode::OK,
-            Json(json!({ "ok": true, "transcript": transcript })),
+            Json(json!({
+                "ok": true,
+                "transcript": page.messages,
+                "next_seq": page.next_seq,
+                "has_more": page.has_more,
+            })),
         ),
         Err(e) => room_store_error_response(e),
     }
@@ -3606,6 +3654,7 @@ async fn room_transcript(
 async fn room_snapshot(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    Query(q): Query<TranscriptQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let trimmed = key.trim();
     if trimmed.is_empty() {
@@ -3615,25 +3664,41 @@ async fn room_snapshot(
         );
     }
     let key = RoomKey::new(trimmed);
-    // Prefer the live room; fall back to the audit view for a soft-closed room so
-    // its frozen transcript is still hydratable. The std mutex guard is dropped
+    // Hydrate room metadata (entity + roster) and the FIRST bounded transcript page
+    // under one lock. The transcript is no longer the room's entire log poured into
+    // one response (OCEAN-249): a long-lived call room would make every hydration a
+    // full-table read. We serve `limit` rows + a `next_seq` cursor so the client
+    // immediately knows whether to page (`/transcript?after_seq=next_seq`) or tail
+    // (`/events?after_seq=last_seq`). Both reads prefer the live room and fall back
+    // to the soft-closed audit view (OCEAN-170). The std mutex guard is dropped
     // inside `with_rooms`; it is never held across an `.await`.
-    let record = with_rooms(&state, |reg| match reg.get(&key) {
-        Ok(Some(rec)) => Ok(Some(rec)),
-        Ok(None) => reg.get_including_closed(&key),
-        Err(e) => Err(e),
+    let result = with_rooms(&state, |reg| {
+        // Room metadata: live first, then audit for a soft-closed room.
+        let record = match reg.get(&key) {
+            Ok(Some(rec)) => Ok(Some(rec)),
+            Ok(None) => reg.get_including_closed(&key),
+            Err(e) => Err(e),
+        }?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        // First bounded page of the transcript (from the start of the log).
+        let page = read_transcript_page(reg, &key, q.after_seq, q.limit)?;
+        Ok(Some((record, page)))
     });
-    match record {
-        Ok(Some(rec)) => {
-            let last_seq = rec.transcript.last().map(|m| m.seq);
+    match result {
+        Ok(Some((rec, page))) => {
+            let last_seq = page.messages.last().map(|m| m.seq);
             (
                 StatusCode::OK,
                 Json(json!({
                     "ok": true,
                     "room": rec.room.clone(),
                     "participants": rec.room.participants,
-                    "transcript": rec.transcript,
+                    "transcript": page.messages,
                     "last_seq": last_seq,
+                    "next_seq": page.next_seq,
+                    "has_more": page.has_more,
                 })),
             )
         }
@@ -3645,13 +3710,18 @@ async fn room_snapshot(
     }
 }
 
-/// `GET /v1/rooms/persistent/{key}/events?after_seq=N` — the live-tail half of the
-/// hydrate-then-subscribe pattern: return transcript entries with `seq > N` (omit
-/// `after_seq` for the full log). The transcript IS the room's event log — chat
-/// lines plus join/leave/system markers, each carrying a monotonic `seq` — so
-/// this is a thin alias over the same read `room_transcript` serves, shaped as
-/// `events` for the client that just snapshotted at `last_seq` and wants only what
-/// happened since.
+/// `GET /v1/rooms/persistent/{key}/events?after_seq=N&limit=M` — the live-tail
+/// half of the hydrate-then-subscribe pattern: return transcript entries with
+/// `seq > N` (omit `after_seq` for the start of the log). The transcript IS the
+/// room's event log — chat lines plus join/leave/system markers, each carrying a
+/// monotonic `seq` — so this is a thin alias over the same read `room_transcript`
+/// serves, shaped as `events` for the client that just snapshotted at `last_seq`
+/// and wants only what happened since.
+///
+/// Bounded + paginated (OCEAN-249): a busy room's event log no longer streams
+/// unbounded on each poll. `last_seq` (the last seq in this batch, for the
+/// existing tail-resume contract) is retained; `next_seq`/`has_more` are added so
+/// a client can drain a large backlog page-by-page before catching up to live.
 ///
 /// Mirrors `room_transcript`'s soft-closed audit fallback so a finished call's
 /// frozen room keeps replaying.
@@ -3661,31 +3731,20 @@ async fn room_events(
     Query(q): Query<TranscriptQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
-    let result = with_rooms(&state, |reg| match reg.transcript(&key, q.after_seq) {
-        // Open room (the live case): serve it directly.
-        Ok(events) => Ok(events),
-        // Closed room: a finished call's frozen transcript. Read the audit view
-        // and apply the same `after_seq` tail filter the open path would.
-        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
-            match reg.get_including_closed(&key) {
-                Ok(Some(rec)) => Ok(rec
-                    .transcript
-                    .into_iter()
-                    .filter(|m| q.after_seq.map_or(true, |after| m.seq > after))
-                    .collect()),
-                // Genuinely no such room (never created): preserve the 404.
-                Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
-                Err(e) => Err(e),
-            }
-        }
-        Err(e) => Err(e),
-    });
+    let result =
+        with_rooms(&state, |reg| read_transcript_page(reg, &key, q.after_seq, q.limit));
     match result {
-        Ok(events) => {
-            let last_seq = events.last().map(|m| m.seq);
+        Ok(page) => {
+            let last_seq = page.messages.last().map(|m| m.seq);
             (
                 StatusCode::OK,
-                Json(json!({ "ok": true, "events": events, "last_seq": last_seq })),
+                Json(json!({
+                    "ok": true,
+                    "events": page.messages,
+                    "last_seq": last_seq,
+                    "next_seq": page.next_seq,
+                    "has_more": page.has_more,
+                })),
             )
         }
         Err(e) => room_store_error_response(e),
@@ -9379,8 +9438,15 @@ mod tests {
         });
 
         // --- snapshot: full hydration in one read. ---
-        let (status, Json(snap)) =
-            room_snapshot(State(state.clone()), Path("hydrate-me".to_string())).await;
+        let (status, Json(snap)) = room_snapshot(
+            State(state.clone()),
+            Path("hydrate-me".to_string()),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(snap["ok"], json!(true));
         assert_eq!(snap["room"]["id"], json!("hydrate-me"));
@@ -9400,12 +9466,27 @@ mod tests {
             transcript.last().unwrap()["seq"].as_u64().unwrap(),
             "last_seq must equal the final transcript entry's seq"
         );
+        // Pagination metadata is additive and present (OCEAN-249). This short
+        // transcript fits under the default cap, so the snapshot is the whole
+        // log: no more pages.
+        assert_eq!(
+            snap["has_more"],
+            json!(false),
+            "short transcript fits one page"
+        );
+        assert!(
+            snap["next_seq"].is_null(),
+            "no cursor when the snapshot already returned everything"
+        );
 
         // --- events (no after_seq): the same log, shaped as `events`. ---
         let (status, Json(all)) = room_events(
             State(state.clone()),
             Path("hydrate-me".to_string()),
-            Query(TranscriptQuery { after_seq: None }),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -9416,6 +9497,9 @@ mod tests {
             "events with no after_seq returns the full transcript"
         );
         assert_eq!(all["last_seq"].as_u64().unwrap(), last_seq);
+        // Full log fits one page: no more, no cursor.
+        assert_eq!(all["has_more"], json!(false));
+        assert!(all["next_seq"].is_null());
 
         // --- events (after_seq = last_seq): the live tail is empty until more
         // happens — exactly what a client that just snapshotted should see. ---
@@ -9424,6 +9508,7 @@ mod tests {
             Path("hydrate-me".to_string()),
             Query(TranscriptQuery {
                 after_seq: Some(last_seq),
+                limit: None,
             }),
         )
         .await;
@@ -9436,6 +9521,9 @@ mod tests {
             tail["last_seq"].is_null(),
             "empty tail reports no last_seq"
         );
+        // An empty tail is the end of the log: no more pages, no cursor.
+        assert_eq!(tail["has_more"], json!(false));
+        assert!(tail["next_seq"].is_null());
 
         // Append once more, then tail from the prior head: only the new line.
         with_rooms(&state, |reg| {
@@ -9454,6 +9542,7 @@ mod tests {
             Path("hydrate-me".to_string()),
             Query(TranscriptQuery {
                 after_seq: Some(last_seq),
+                limit: None,
             }),
         )
         .await;
@@ -9462,16 +9551,128 @@ mod tests {
         assert_eq!(tail2_events[0]["body"], json!("third"));
 
         // --- unknown room: 404, not a panic, on both endpoints. ---
-        let (status, _) =
-            room_snapshot(State(state.clone()), Path("no-such-room".to_string())).await;
+        let (status, _) = room_snapshot(
+            State(state.clone()),
+            Path("no-such-room".to_string()),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = room_events(
             State(state.clone()),
             Path("no-such-room".to_string()),
-            Query(TranscriptQuery { after_seq: None }),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// `GET /v1/rooms/persistent/{key}/transcript` is bounded + pageable
+    /// (OCEAN-249). A transcript longer than the requested `limit` returns only
+    /// `limit` rows plus a `next_seq` cursor and `has_more=true`; replaying the
+    /// cursor walks the entire log exactly once with no gaps or duplicates; and
+    /// the final page reports `has_more=false` with a null cursor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_transcript_is_bounded_and_pageable() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // 25 chat lines (seq 0..=24) in one room.
+        let key = RoomKey::new("pageable");
+        let total: usize = 25;
+        with_rooms(&state, |reg| {
+            reg.create(key.clone(), "Pageable", None, Utc::now()).unwrap();
+            for i in 0..total {
+                reg.append_message(
+                    &key,
+                    "amy",
+                    RoomParticipantKind::Human,
+                    RoomMessageKind::Message,
+                    &format!("line-{i}"),
+                    Utc::now(),
+                )
+                .unwrap();
+            }
+        });
+
+        // Page size 10: first page caps at 10 with a cursor + has_more.
+        let (status, Json(first)) = room_transcript(
+            State(state.clone()),
+            Path("pageable".to_string()),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: Some(10),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            first["transcript"].as_array().unwrap().len(),
+            10,
+            "first page is capped at the requested limit"
+        );
+        assert_eq!(first["has_more"], json!(true));
+        let cursor = first["next_seq"].as_u64().expect("has_more implies a cursor");
+        assert_eq!(cursor, 9, "cursor is the last returned seq");
+
+        // Walk the rest with the cursor; collect every seq we see.
+        let mut seen: Vec<u64> = first["transcript"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["seq"].as_u64().unwrap())
+            .collect();
+        let mut after = Some(cursor);
+        let mut pages = 1;
+        loop {
+            let (status, Json(page)) = room_transcript(
+                State(state.clone()),
+                Path("pageable".to_string()),
+                Query(TranscriptQuery {
+                    after_seq: after,
+                    limit: Some(10),
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            pages += 1;
+            assert!(pages <= total + 2, "paging must terminate");
+            for m in page["transcript"].as_array().unwrap() {
+                seen.push(m["seq"].as_u64().unwrap());
+            }
+            if page["has_more"] == json!(true) {
+                after = Some(page["next_seq"].as_u64().unwrap());
+            } else {
+                assert!(page["next_seq"].is_null(), "final page has a null cursor");
+                break;
+            }
+        }
+        let expected: Vec<u64> = (0..total as u64).collect();
+        assert_eq!(seen, expected, "paging covers every row once, in seq order");
+
+        // No limit given ⇒ the default cap applies, but 25 < 200 so it's one page.
+        let (status, Json(all)) = room_transcript(
+            State(state.clone()),
+            Path("pageable".to_string()),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(all["transcript"].as_array().unwrap().len(), total);
+        assert_eq!(all["has_more"], json!(false));
+        assert!(all["next_seq"].is_null());
 
         std::env::remove_var("OCEAN_YOLO");
     }
