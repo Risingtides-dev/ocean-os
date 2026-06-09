@@ -452,6 +452,136 @@ fn seeded_pick(candidates: &[Uuid], seed: u64) -> Uuid {
     best
 }
 
+// ===========================================================================
+// Recall vote (OCEAN-302) — the no-confidence primitive behind quorum-of-recall.
+// ===========================================================================
+//
+// The [`QuorumEngine`] above decides *content* (which proposal a council adopts).
+// A **recall** is a different question: should the council *depose its seated
+// firekeeper*? It is still a credential-weighted quorum — but over a single
+// yes/no ("no confidence in this title"), not a field of rival proposals.
+//
+// Like the content engine, this is **pure Rust with no LLM** and the same
+// load-bearing discipline that makes a recall *unforgeable*:
+//
+//   * **One credential per voter, latest wins.** A voter is counted once no
+//     matter how many times it casts; re-casting only refreshes its vote. A
+//     single caller therefore cannot manufacture a recall by spamming — it is
+//     one credential. This is the [`QuorumEngine`] C1 rule, narrowed to recall.
+//   * **A genuine threshold of *distinct* credentials.** Convergence ("carried")
+//     fires only when the count of distinct voters meets a configured
+//     `threshold` (≥ 1). A lone vote never carries unless the council is so
+//     small the operator set the threshold to 1 — which is an explicit choice,
+//     not a forgery. The daemon couples the *execution* of the recall (pulling
+//     the title via the [`crate::escrow::Revoker`]) to a `Carried` outcome, so
+//     the title is never revoked on anything less than genuine quorum.
+//
+// The recall vote does NOT itself touch the title registry or the Revoker — it
+// only *counts*. Execution (decide ≠ execute) stays with the daemon, which
+// presents the server-minted `RevokerKey` once this reports `Carried`.
+
+/// The standing no-confidence tally against **one** seated title (firekeeper).
+///
+/// Records at most one recall vote per voter (latest wins, so a voter can also
+/// *withdraw* by being absent from a fresh round — though the common path is
+/// purely additive). Reports [`RecallOutcome::Carried`] once the count of
+/// distinct voters reaches the configured threshold, and latches there.
+#[derive(Debug, Clone)]
+pub struct RecallVote {
+    /// The title under recall (the firekeeper's persisted title id). The vote is
+    /// *about* this title; the daemon resolves it to a revoke target.
+    title_id: Uuid,
+    /// Distinct voters who currently hold a "no confidence" stance. A `HashSet`
+    /// enforces one-credential-per-voter structurally: re-inserting the same id
+    /// is a no-op, so a spammer is one element, not many.
+    voters: std::collections::HashSet<Uuid>,
+    /// Distinct credentialed votes required to carry the recall (≥ 1). Set by the
+    /// convener from the council's roster size; a single vote cannot carry unless
+    /// the operator deliberately set this to 1.
+    threshold: usize,
+    /// Latches once carried so the outcome cannot flip back (a deposition, once
+    /// reached, is reached — mirrors the content engine's `converged` latch).
+    carried: bool,
+}
+
+/// The outcome of a recall tally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecallOutcome {
+    /// Not enough distinct credentialed votes yet. Carries how many votes are in
+    /// and how many are needed, for observability.
+    Pending { votes: usize, threshold: usize },
+    /// The recall reached quorum: at least `threshold` distinct voters hold a
+    /// no-confidence stance. The daemon executes the deposition (Revoker) on this.
+    Carried { title_id: Uuid, votes: usize },
+}
+
+impl RecallVote {
+    /// Open a recall tally against `title_id`, requiring `threshold` distinct
+    /// credentialed votes to carry. A `threshold` of 0 is clamped to 1: a recall
+    /// must always require at least one genuine vote, never zero (which would let
+    /// an empty tally "carry" and forge a deposition).
+    pub fn new(title_id: Uuid, threshold: usize) -> Self {
+        Self {
+            title_id,
+            voters: std::collections::HashSet::new(),
+            threshold: threshold.max(1),
+            carried: false,
+        }
+    }
+
+    /// The title this recall is about.
+    pub fn title_id(&self) -> Uuid {
+        self.title_id
+    }
+
+    /// Distinct credentialed votes required to carry.
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
+    /// Distinct voters currently holding a no-confidence stance.
+    pub fn votes(&self) -> usize {
+        self.voters.len()
+    }
+
+    /// Cast (or re-affirm) a no-confidence vote by `voter`. Idempotent per voter:
+    /// the same voter voting twice still counts once. Returns the outcome after
+    /// the cast. A vote cast after the recall already carried is a no-op on the
+    /// verdict (it stays `Carried`).
+    pub fn cast(&mut self, voter: Uuid) -> RecallOutcome {
+        self.voters.insert(voter);
+        self.evaluate()
+    }
+
+    /// Withdraw `voter`'s no-confidence stance (the voter recants). Does not
+    /// un-latch an already-carried recall — a reached deposition stays reached.
+    pub fn withdraw(&mut self, voter: Uuid) -> RecallOutcome {
+        self.voters.remove(&voter);
+        self.evaluate()
+    }
+
+    /// The current verdict without mutating. `Carried` once distinct votes reach
+    /// the threshold (and stays carried thereafter).
+    pub fn evaluate(&mut self) -> RecallOutcome {
+        if self.carried || self.voters.len() >= self.threshold {
+            self.carried = true;
+            return RecallOutcome::Carried {
+                title_id: self.title_id,
+                votes: self.voters.len(),
+            };
+        }
+        RecallOutcome::Pending {
+            votes: self.voters.len(),
+            threshold: self.threshold,
+        }
+    }
+
+    /// Has this recall already carried?
+    pub fn is_carried(&self) -> bool {
+        self.carried
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +889,98 @@ mod tests {
         eng.endorse(p, uid(11), None, 0); // net 2.0 == midpoint -> confidence 0.5
         eng.endorse(p, uid(12), None, 0); // net 3.0 > midpoint -> crosses
         assert!(matches!(eng.evaluate(0), QuorumOutcome::Converged { .. }));
+    }
+
+    // ---- RecallVote (OCEAN-302): quorum-of-recall, unforgeable --------------
+
+    // A recall carries only once a genuine threshold of DISTINCT credentialed
+    // voters has voted no-confidence — and stays carried after.
+    #[test]
+    fn recall_carries_at_threshold_of_distinct_voters() {
+        let title = uid(1);
+        let mut recall = RecallVote::new(title, 3);
+
+        // First two distinct votes: still pending (2 < 3).
+        assert_eq!(
+            recall.cast(uid(10)),
+            RecallOutcome::Pending { votes: 1, threshold: 3 }
+        );
+        assert_eq!(
+            recall.cast(uid(11)),
+            RecallOutcome::Pending { votes: 2, threshold: 3 }
+        );
+        assert!(!recall.is_carried());
+
+        // Third DISTINCT vote crosses the threshold -> carried.
+        assert_eq!(
+            recall.cast(uid(12)),
+            RecallOutcome::Carried { title_id: title, votes: 3 }
+        );
+        assert!(recall.is_carried());
+
+        // Stays carried (a reached deposition is reached).
+        assert!(matches!(recall.evaluate(), RecallOutcome::Carried { .. }));
+    }
+
+    // THE UNFORGEABILITY PROPERTY: a single voter cannot manufacture a recall by
+    // spamming. One credential per voter, latest wins — 100 casts by one id is
+    // one vote, which never carries a threshold-3 recall.
+    #[test]
+    fn recall_single_voter_spamming_counts_once_and_never_carries() {
+        let title = uid(1);
+        let mut recall = RecallVote::new(title, 3);
+        let lone = uid(99);
+        for _ in 0..100 {
+            let out = recall.cast(lone);
+            assert_eq!(
+                out,
+                RecallOutcome::Pending { votes: 1, threshold: 3 },
+                "one voter is one credential no matter how many casts"
+            );
+        }
+        assert!(
+            !recall.is_carried(),
+            "a single forged voter must NOT carry a genuine-quorum recall"
+        );
+        assert_eq!(recall.votes(), 1);
+    }
+
+    // A threshold of 0 is clamped to 1: an empty recall can never "carry" with no
+    // votes (which would forge a deposition out of nothing).
+    #[test]
+    fn recall_threshold_zero_is_clamped_to_one() {
+        let title = uid(1);
+        let mut recall = RecallVote::new(title, 0);
+        assert_eq!(recall.threshold(), 1);
+        // No votes yet -> pending, not carried (the empty tally cannot depose).
+        assert_eq!(
+            recall.evaluate(),
+            RecallOutcome::Pending { votes: 0, threshold: 1 }
+        );
+        // One genuine vote then carries.
+        assert!(matches!(recall.cast(uid(10)), RecallOutcome::Carried { .. }));
+    }
+
+    // A voter can recant before quorum, dropping the count back below threshold.
+    #[test]
+    fn recall_withdraw_drops_count_before_quorum() {
+        let title = uid(1);
+        let mut recall = RecallVote::new(title, 2);
+        recall.cast(uid(10));
+        assert_eq!(
+            recall.cast(uid(11)),
+            RecallOutcome::Carried { title_id: title, votes: 2 }
+        );
+        // Already carried: withdrawing does NOT un-latch a reached deposition.
+        assert!(matches!(recall.withdraw(uid(11)), RecallOutcome::Carried { .. }));
+
+        // But on a fresh recall, withdrawing before quorum drops the count.
+        let mut recall2 = RecallVote::new(title, 2);
+        recall2.cast(uid(10));
+        assert_eq!(
+            recall2.withdraw(uid(10)),
+            RecallOutcome::Pending { votes: 0, threshold: 2 }
+        );
+        assert!(!recall2.is_carried());
     }
 }

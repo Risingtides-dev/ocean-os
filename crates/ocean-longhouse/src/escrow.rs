@@ -68,7 +68,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::convene::{ClaimError, FirekeeperTitle};
-use crate::quorum::{QuorumEngine, QuorumOutcome};
+use crate::quorum::{QuorumEngine, QuorumOutcome, RecallOutcome};
 
 use ocean_agent_sdk::AgentRole;
 
@@ -934,6 +934,209 @@ impl Default for Revoker {
     }
 }
 
+// ===========================================================================
+// Automated decision-triggers (OCEAN-302).
+// ===========================================================================
+//
+// The [`Revoker`] above is the *execute* side: `warn` accrues a strike, `revoke`
+// hard-pulls — both already gated by the server-minted [`RevokerKey`]. Until now
+// the only caller was an operator-initiated `POST /v1/longhouse/revoke`; the
+// graduated `warn` and the autonomous (quorum / breach) triggers documented on
+// [`RevokeAuthorization`] were *dead* — nothing computed the condition that
+// drives them.
+//
+// These two helpers are the *decide* side (decide ≠ execute, the constitutional
+// split): they translate a **already-validated** trigger condition into the
+// matching existing execute-side call. They do not invent authority — every path
+// still presents the `RevokerKey`, so a forged trigger cannot deauthorize a
+// legitimate firekeeper:
+//
+//   * **Quorum-of-recall** ([`recall_to_revocation`]): the daemon's pure
+//     [`crate::quorum::RecallVote`] has already counted a genuine threshold of
+//     *distinct* credentialed no-confidence votes (a single forged vote is one
+//     credential and never carries — see the `RecallVote` tests). This helper
+//     fires the hard [`Revoker::revoke`] **only** on a [`RecallOutcome::Carried`];
+//     a `Pending` outcome is refused with [`TriggerRefused::RecallNotCarried`],
+//     so the title is never pulled on less than genuine quorum.
+//   * **Policy-breach** ([`PolicyBreachLedger`]): a *detected* breach (a
+//     firekeeper acting outside its bound decision, or a claim that fails
+//     verification) accrues a graduated [`Revoker::warn`] strike; once the strike
+//     count reaches the configured threshold the same ledger escalates to a hard
+//     [`Revoker::revoke`] with [`RevokeAuthorization::StrikeThreshold`]. The
+//     gradient and the hard pull are exactly the existing model — this only wires
+//     the *trigger* to it.
+
+/// Why an automated trigger declined to execute a recall. Distinct from
+/// [`RevokeError`] (which is about the *execute* call): these are the *decide*
+/// side refusing to fire because the trigger condition was not genuinely met.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerRefused {
+    /// A quorum-of-recall was asked to execute, but the recall tally has not
+    /// carried (fewer than the threshold of distinct credentialed votes). The
+    /// title is left live — a recall fires only on genuine quorum.
+    RecallNotCarried { votes: usize, threshold: usize },
+    /// The underlying execute-side [`Revoker`] call was refused (e.g. wrong key,
+    /// unknown/already-closed title). Carries the original [`RevokeError`].
+    Revoke(RevokeError),
+}
+
+impl std::fmt::Display for TriggerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TriggerRefused::RecallNotCarried { votes, threshold } => write!(
+                f,
+                "recall trigger refused: only {votes}/{threshold} credentialed votes (not carried)"
+            ),
+            TriggerRefused::Revoke(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for TriggerRefused {}
+
+impl From<RevokeError> for TriggerRefused {
+    fn from(e: RevokeError) -> Self {
+        TriggerRefused::Revoke(e)
+    }
+}
+
+/// **Quorum-of-recall trigger.** Execute a deposition iff the council's recall
+/// tally has *carried* (a genuine quorum of distinct credentialed no-confidence
+/// votes). The carried [`RecallOutcome`] is produced by the pure
+/// [`crate::quorum::RecallVote`]; this function does not re-decide it, it only
+/// gates the execute-side [`Revoker::revoke`] on it.
+///
+/// Unforgeability: a [`RecallOutcome::Pending`] is refused with
+/// [`TriggerRefused::RecallNotCarried`] **before** the registry is touched, so a
+/// recall that did not reach quorum cannot pull the title. And because the actual
+/// pull goes through [`Revoker::revoke`], the daemon must still present the
+/// `RevokerKey` (`presented_key`) — a caller that forged a `Carried` outcome but
+/// lacks the key is still refused by the Revoker. The recall is recorded on the
+/// audit row as a [`RevokeAuthorization::PolicyBreach`] whose detail names the
+/// vote count, so the deposition's provenance ("quorum-of-recall: N votes") is
+/// durable.
+pub fn recall_to_revocation(
+    revoker: &Revoker,
+    registry: &mut SqliteTitleRegistry,
+    presented_key: Option<&str>,
+    outcome: &RecallOutcome,
+    now_ms: i64,
+) -> std::result::Result<Revocation, TriggerRefused> {
+    match outcome {
+        RecallOutcome::Pending { votes, threshold } => Err(TriggerRefused::RecallNotCarried {
+            votes: *votes,
+            threshold: *threshold,
+        }),
+        RecallOutcome::Carried { title_id, votes } => {
+            let authorization = RevokeAuthorization::PolicyBreach {
+                detail: format!("quorum-of-recall: {votes} no-confidence votes"),
+            };
+            revoker
+                .revoke(registry, presented_key, *title_id, authorization, now_ms)
+                .map_err(TriggerRefused::from)
+        }
+    }
+}
+
+/// What a policy-breach trigger did to a title on this signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreachAction {
+    /// The breach accrued a graduated strike; the title is still live. Carries the
+    /// new strike count and the threshold it is climbing toward.
+    Warned { strikes: u8, threshold: u8 },
+    /// The strike count reached the threshold; the title was hard-revoked. Carries
+    /// the resulting [`Revocation`] (so the daemon can cancel the bound turn and
+    /// emit `RoleRevoked`).
+    Revoked(Revocation),
+}
+
+/// **Policy-breach trigger** — the graduated `warn → revoke` escalator.
+///
+/// A *detected* policy breach (a firekeeper attempting an action outside its
+/// title's bound decision; a claim that fails verification; an unsafe tool call)
+/// is reported here. Each report accrues one graduated [`Revoker::warn`] strike;
+/// when the strike count reaches `strike_threshold`, the same report escalates to
+/// a hard [`Revoker::revoke`] keyed [`RevokeAuthorization::StrikeThreshold`]. This
+/// is the existing graduated model from [`Revoker`] — the ledger only supplies
+/// the *trigger* (when to warn, when the gradient tips to a pull).
+///
+/// The ledger holds no secret: every mutating step runs through the Revoker and
+/// therefore requires the `RevokerKey`. A forged breach report without the key is
+/// refused by [`Revoker::warn`]/[`Revoker::revoke`] before any strike accrues, so
+/// breach signals cannot be used to grind a legitimate firekeeper toward recall.
+///
+/// It is intentionally a thin policy object (the strike state of record lives on
+/// the persisted title row, `PersistedTitle::strikes`); the threshold is the only
+/// state it carries, so it is cheap to hold on the daemon and survives nothing it
+/// shouldn't.
+#[derive(Debug, Clone)]
+pub struct PolicyBreachLedger {
+    /// Distinct breaches a title may accrue before the graduated gradient tips to
+    /// a hard revoke. Clamped to ≥ 1 so a single genuine breach can never be
+    /// configured to *immediately* revoke-by-accident; a true zero-tolerance
+    /// breach should use [`Revoker::revoke`] with `PolicyBreach` directly.
+    strike_threshold: u8,
+}
+
+impl PolicyBreachLedger {
+    /// A ledger that escalates to a hard revoke once a title accrues
+    /// `strike_threshold` graduated strikes (clamped to ≥ 1).
+    pub fn new(strike_threshold: u8) -> Self {
+        Self {
+            strike_threshold: strike_threshold.max(1),
+        }
+    }
+
+    /// The strike count at which a breach escalates from `warn` to `revoke`.
+    pub fn strike_threshold(&self) -> u8 {
+        self.strike_threshold
+    }
+
+    /// Report one detected policy breach against `title_id` at `now_ms`. Accrues a
+    /// graduated strike via [`Revoker::warn`]; if that brings the title's strike
+    /// count to (or past) the threshold, escalates to a hard [`Revoker::revoke`]
+    /// in the same call. `now_ms` is threaded explicitly (matching the module's
+    /// clock discipline) so the revoke's audit timestamp is deterministic in tests.
+    ///
+    /// Returns [`BreachAction::Warned`] while still below threshold, or
+    /// [`BreachAction::Revoked`] (with the [`Revocation`]) on the escalating
+    /// report. Authorization is enforced by the Revoker: a missing/invalid
+    /// `presented_key` is refused as [`RevokeError::Unauthorized`] before any
+    /// state changes, so a forged breach cannot accrue strikes.
+    pub fn report(
+        &self,
+        revoker: &Revoker,
+        registry: &mut SqliteTitleRegistry,
+        presented_key: Option<&str>,
+        title_id: Uuid,
+        detail: &str,
+        now_ms: i64,
+    ) -> std::result::Result<BreachAction, RevokeError> {
+        // Graduated step: accrue a strike (key-gated inside `warn`).
+        let strikes = revoker.warn(registry, presented_key, title_id, detail)?;
+
+        // Below threshold → a warning stands; the title is still live.
+        if strikes < self.strike_threshold {
+            return Ok(BreachAction::Warned {
+                strikes,
+                threshold: self.strike_threshold,
+            });
+        }
+
+        // At/over threshold → the gradient tips to a hard pull, recorded as a
+        // graduated (StrikeThreshold) revoke so the audit reason reads
+        // "graduated recall: N strikes" — the existing demotion path.
+        let revocation = revoker.revoke(
+            registry,
+            presented_key,
+            title_id,
+            RevokeAuthorization::StrikeThreshold { strikes },
+            now_ms,
+        )?;
+        Ok(BreachAction::Revoked(revocation))
+    }
+}
+
 /// The **daemon-held** `claim_outcome` — the persisted analog of
 /// [`crate::convene::claim_outcome`], the op `longhouse_provider.rs` notes cannot
 /// exist without a persisted title.
@@ -1749,5 +1952,237 @@ mod tests {
             reg.lookup(p.title_id).unwrap().unwrap().status,
             TitleStatus::Live
         );
+    }
+
+    // ---- (d) Automated triggers (OCEAN-302) ---------------------------------
+    //
+    // The two decision-triggers wired onto the EXISTING graduated warn/revoke
+    // model: quorum-of-recall (a carried no-confidence vote → hard revoke) and
+    // policy-breach (graduated strikes → revoke at threshold). The load-bearing
+    // properties: a revoked title fails a subsequent claim even with the right
+    // token; a single non-quorum vote does NOT revoke (unforgeable).
+
+    use crate::quorum::RecallVote;
+
+    // QUORUM-OF-RECALL: a carried recall vote revokes the firekeeper's title, and
+    // a subsequent claim with the CORRECT token is then rejected (the revocation
+    // integrates with the claim gate — #246/#272).
+    #[test]
+    fn quorum_of_recall_revokes_title_and_subsequent_claim_is_rejected() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let topic = uid(1);
+        let decision = uid(2);
+        let firekeeper = uid(10);
+        let (title, secret) = reg.grant(topic, firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        reg.bind_decision(title.title_id, decision).unwrap();
+
+        // Sanity: before recall, the correct token + bound decision authorizes a
+        // claim (proves the rejection below is caused by the recall, not a bad token).
+        assert_eq!(reg.verify_title(title.title_id, firekeeper, Some(secret.token())), Ok(()));
+
+        let revoker = Revoker::new();
+        let key = revoker.key();
+
+        // The council convenes a recall needing 3 distinct credentialed votes.
+        let mut recall = RecallVote::new(title.title_id, 3);
+        recall.cast(uid(20));
+        recall.cast(uid(21));
+        let carried = recall.cast(uid(22)); // third DISTINCT vote → carries
+        assert!(matches!(carried, RecallOutcome::Carried { .. }));
+
+        // The daemon (holding its key) executes the carried recall → hard revoke.
+        let revocation = recall_to_revocation(&revoker, &mut reg, Some(key.secret()), &carried, 9)
+            .expect("a carried recall executes the deposition");
+        assert_eq!(revocation.title_id, title.title_id);
+        assert_eq!(revocation.agent_id, firekeeper);
+        assert!(revocation.reason.contains("quorum-of-recall"));
+
+        // The title is revoked …
+        let after = reg.lookup(title.title_id).unwrap().unwrap();
+        assert_eq!(after.status, TitleStatus::Revoked);
+
+        // … and a subsequent claim with the CORRECT token + bound decision is now
+        // refused as forged (the load-bearing revocation property on the claim path).
+        assert_eq!(
+            claim_bound_outcome(&mut reg, title.title_id, firekeeper, Some(secret.token()), decision, 10),
+            Err(ClaimError::ForgedFirekeeper),
+            "a recalled title must fail claim even with the right token"
+        );
+    }
+
+    // UNFORGEABILITY: a single, non-quorum recall vote does NOT revoke the title.
+    // The trigger refuses a Pending outcome and the title stays live + claimable.
+    #[test]
+    fn single_non_quorum_recall_vote_does_not_revoke() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let topic = uid(1);
+        let decision = uid(2);
+        let firekeeper = uid(10);
+        let (title, secret) = reg.grant(topic, firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        reg.bind_decision(title.title_id, decision).unwrap();
+
+        let revoker = Revoker::new();
+        let key = revoker.key();
+
+        // One lone vote against a threshold-3 recall: NOT carried.
+        let mut recall = RecallVote::new(title.title_id, 3);
+        let pending = recall.cast(uid(20));
+        assert_eq!(pending, RecallOutcome::Pending { votes: 1, threshold: 3 });
+
+        // Executing it is refused — and the title is untouched.
+        assert_eq!(
+            recall_to_revocation(&revoker, &mut reg, Some(key.secret()), &pending, 5),
+            Err(TriggerRefused::RecallNotCarried { votes: 1, threshold: 3 })
+        );
+        assert_eq!(
+            reg.lookup(title.title_id).unwrap().unwrap().status,
+            TitleStatus::Live,
+            "a non-quorum recall must NOT revoke"
+        );
+        // The legitimate firekeeper can still ratify: its authority is intact.
+        assert_eq!(
+            claim_bound_outcome(&mut reg, title.title_id, firekeeper, Some(secret.token()), decision, 6),
+            Ok(0)
+        );
+    }
+
+    // Even a CARRIED recall cannot pull a title without the Revoker key: the
+    // execute side is still key-gated, so a forged "carried" can't deauthorize.
+    #[test]
+    fn carried_recall_without_revoker_key_is_refused() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let firekeeper = uid(10);
+        let (title, _secret) = reg.grant(uid(1), firekeeper, AgentRole::Firekeeper, 0).unwrap();
+
+        let revoker = Revoker::new();
+        let mut recall = RecallVote::new(title.title_id, 1);
+        let carried = recall.cast(uid(20)); // threshold 1 → carries
+        assert!(matches!(carried, RecallOutcome::Carried { .. }));
+
+        // No key → refused by the underlying Revoker, surfaced as Trigger::Revoke.
+        assert_eq!(
+            recall_to_revocation(&revoker, &mut reg, None, &carried, 1),
+            Err(TriggerRefused::Revoke(RevokeError::Unauthorized))
+        );
+        // Wrong key (an independently-minted token) → same refusal.
+        let attacker = mint_decision_token();
+        assert_eq!(
+            recall_to_revocation(&revoker, &mut reg, Some(&attacker), &carried, 1),
+            Err(TriggerRefused::Revoke(RevokeError::Unauthorized))
+        );
+        assert_eq!(
+            reg.lookup(title.title_id).unwrap().unwrap().status,
+            TitleStatus::Live
+        );
+    }
+
+    // POLICY-BREACH: each detected breach accrues a graduated strike via warn();
+    // the title is revoked once strikes reach the threshold. A claim is then
+    // rejected even with the right token.
+    #[test]
+    fn policy_breach_accrues_strikes_then_revokes_at_threshold() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let topic = uid(1);
+        let decision = uid(2);
+        let firekeeper = uid(10);
+        let (title, secret) = reg.grant(topic, firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        reg.bind_decision(title.title_id, decision).unwrap();
+
+        let revoker = Revoker::new();
+        let key = revoker.key();
+        let ledger = PolicyBreachLedger::new(3); // revoke on the 3rd breach
+
+        // Breach 1 and 2: graduated strikes accrue, title stays live.
+        assert_eq!(
+            ledger.report(&revoker, &mut reg, Some(key.secret()), title.title_id, "acted outside bound decision", 1),
+            Ok(BreachAction::Warned { strikes: 1, threshold: 3 })
+        );
+        assert_eq!(
+            ledger.report(&revoker, &mut reg, Some(key.secret()), title.title_id, "claim failed verification", 2),
+            Ok(BreachAction::Warned { strikes: 2, threshold: 3 })
+        );
+        assert_eq!(reg.lookup(title.title_id).unwrap().unwrap().strikes, 2);
+        assert_eq!(reg.lookup(title.title_id).unwrap().unwrap().status, TitleStatus::Live);
+
+        // Breach 3: the gradient tips to a hard revoke (StrikeThreshold path).
+        let action = ledger
+            .report(&revoker, &mut reg, Some(key.secret()), title.title_id, "unsafe tool call", 3)
+            .unwrap();
+        match action {
+            BreachAction::Revoked(rev) => {
+                assert_eq!(rev.agent_id, firekeeper);
+                assert!(rev.reason.contains("graduated recall"), "got: {}", rev.reason);
+            }
+            other => panic!("expected revoke at threshold, got {other:?}"),
+        }
+        assert_eq!(reg.lookup(title.title_id).unwrap().unwrap().status, TitleStatus::Revoked);
+
+        // The revoked title fails a claim even with the right token.
+        assert_eq!(
+            claim_bound_outcome(&mut reg, title.title_id, firekeeper, Some(secret.token()), decision, 4),
+            Err(ClaimError::ForgedFirekeeper)
+        );
+    }
+
+    // A single breach below threshold does NOT revoke — the gradient is real.
+    #[test]
+    fn single_breach_below_threshold_does_not_revoke() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let firekeeper = uid(10);
+        let (title, _secret) = reg.grant(uid(1), firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let revoker = Revoker::new();
+        let key = revoker.key();
+        let ledger = PolicyBreachLedger::new(3);
+
+        assert_eq!(
+            ledger.report(&revoker, &mut reg, Some(key.secret()), title.title_id, "one breach", 1),
+            Ok(BreachAction::Warned { strikes: 1, threshold: 3 })
+        );
+        assert_eq!(
+            reg.lookup(title.title_id).unwrap().unwrap().status,
+            TitleStatus::Live,
+            "one breach below threshold must not revoke"
+        );
+    }
+
+    // UNFORGEABILITY: a forged breach report (no Revoker key) accrues NO strike
+    // and cannot grind a legitimate firekeeper toward recall.
+    #[test]
+    fn forged_breach_report_accrues_no_strike() {
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let firekeeper = uid(10);
+        let (title, _secret) = reg.grant(uid(1), firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let revoker = Revoker::new();
+        let ledger = PolicyBreachLedger::new(2);
+
+        // No key → refused before any strike accrues.
+        assert_eq!(
+            ledger.report(&revoker, &mut reg, None, title.title_id, "spoofed breach", 1),
+            Err(RevokeError::Unauthorized)
+        );
+        assert_eq!(
+            reg.lookup(title.title_id).unwrap().unwrap().strikes,
+            0,
+            "a forged breach must not accrue a strike"
+        );
+    }
+
+    // A PolicyBreachLedger with threshold 0 is clamped to 1 — a single breach is
+    // then a genuine threshold breach, but it can never be a zero-tolerance
+    // accidental-immediate-revoke with no strike at all.
+    #[test]
+    fn breach_threshold_zero_is_clamped_to_one() {
+        let ledger = PolicyBreachLedger::new(0);
+        assert_eq!(ledger.strike_threshold(), 1);
+
+        let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
+        let (title, _secret) = reg.grant(uid(1), uid(10), AgentRole::Firekeeper, 0).unwrap();
+        let revoker = Revoker::new();
+        let key = revoker.key();
+        // First (and only) breach: strike 1 == threshold 1 → revoke.
+        let action = ledger
+            .report(&revoker, &mut reg, Some(key.secret()), title.title_id, "breach", 1)
+            .unwrap();
+        assert!(matches!(action, BreachAction::Revoked(_)));
     }
 }

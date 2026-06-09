@@ -55,11 +55,13 @@ pub use convene::{
     convene,
 };
 pub use escrow::{
-    claim_bound_outcome, claim_outcome_persisted, EscrowError, EscrowState, PersistedTitle,
-    Revocation, RevokeAuthorization, RevokeError, Revoker, RevokerKey, SqliteTitleRegistry,
-    TitleStatus, TitleVerifier,
+    claim_bound_outcome, claim_outcome_persisted, recall_to_revocation, BreachAction, EscrowError,
+    EscrowState, PersistedTitle, PolicyBreachLedger, Revocation, RevokeAuthorization, RevokeError,
+    Revoker, RevokerKey, SqliteTitleRegistry, TitleStatus, TitleVerifier, TriggerRefused,
 };
-pub use quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
+pub use quorum::{
+    QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule, RecallOutcome, RecallVote,
+};
 pub use registry::{LonghouseRegistry, TopicSnapshot, TopicState};
 pub use replay::{replay, sweep, RecordedMark, RecordedMarkKind, Recording, ReplayResult};
 pub use subagent::{
