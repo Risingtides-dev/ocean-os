@@ -4393,6 +4393,24 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
 
     /// Build the system prompt, optionally scoped to `cwd` and `client_type`.
     pub fn build_system_prompt(cwd: Option<&str>, client_type: Option<&str>) -> String {
+        // Production resolves the surface profile against the real assistants
+        // root (`OCEAN_ASSISTANTS_DIR`, else the Ocean config dir). Tests call
+        // [`build_system_prompt_from`] with an explicit temp root for isolation.
+        build_system_prompt_from(cwd, client_type, assistants_root().as_deref())
+    }
+
+    /// Inner form of [`build_system_prompt`] that resolves any file-loaded
+    /// surface profile against an explicit `assistants_root` instead of the
+    /// process-global one. This is the isolation seam (OCEAN-285): tests pass a
+    /// temp root (or `None`) so a surface-profile lookup never reads — or
+    /// depends on the contents of — the operator's real
+    /// `~/.config/ocean-rs/assistants`, and never has to mutate process env.
+    /// Passing `assistants_root()` reproduces production behavior exactly.
+    fn build_system_prompt_from(
+        cwd: Option<&str>,
+        client_type: Option<&str>,
+        assistants_root: Option<&Path>,
+    ) -> String {
         let cwd = cwd
             .and_then(|s| {
                 if s.is_empty() {
@@ -4407,11 +4425,11 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
             .map(|p| load_project_prompt(p))
             .unwrap_or_default();
         if project.is_empty() {
-            append_client_type(BASE_SYSTEM_PROMPT, client_type)
+            append_client_type_from(BASE_SYSTEM_PROMPT, client_type, assistants_root)
         } else {
             let prompt =
                 format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----\n{project}");
-            append_client_type(&prompt, client_type)
+            append_client_type_from(&prompt, client_type, assistants_root)
         }
     }
 
@@ -4638,12 +4656,20 @@ is the user's real, signed-in browser session.\n\n\
     }
 
     /// Prefer an on-disk surface profile for this `client_type` over the
-    /// compiled-in const. Returns the file's contents when present and
-    /// non-empty, else `None` (caller falls back to the seed const). This is
-    /// the R2 file-loaded seam — the consts stay as seed + fallback, but the
-    /// editable file wins, enabling hot-reconfigure (ocean-agents).
-    fn load_surface_profile(client_type: Option<&str>) -> Option<String> {
-        load_surface_profile_from(assistants_root()?.as_path(), client_type)
+    /// compiled-in const, resolved against an already-resolved optional
+    /// assistants root. Returns the file's contents when present and non-empty,
+    /// else `None` (caller falls back to the seed const). This is the R2
+    /// file-loaded seam — the consts stay as seed + fallback, but the editable
+    /// file wins, enabling hot-reconfigure (ocean-agents).
+    ///
+    /// Production passes `assistants_root()` (real `OCEAN_ASSISTANTS_DIR` / config
+    /// dir); tests pass a temp root for isolation. `None` root means "no
+    /// assistants dir", so the caller takes the const fallback (OCEAN-285).
+    fn load_surface_profile_opt(
+        assistants_root: Option<&Path>,
+        client_type: Option<&str>,
+    ) -> Option<String> {
+        load_surface_profile_from(assistants_root?, client_type)
     }
 
     /// Inner form that reads from an explicit root — keeps the file-loaded
@@ -4663,10 +4689,19 @@ is the user's real, signed-in browser session.\n\n\
         }
     }
 
-    fn append_client_type(prompt: &str, client_type: Option<&str>) -> String {
+    /// Append the per-surface ("current client") section to a base prompt,
+    /// resolving any file-loaded surface profile against an explicit optional
+    /// assistants root rather than the process-global one (OCEAN-285 isolation
+    /// seam — see [`build_system_prompt_from`]). Production passes
+    /// `assistants_root()`; tests pass a temp root (or `None`).
+    fn append_client_type_from(
+        prompt: &str,
+        client_type: Option<&str>,
+        assistants_root: Option<&Path>,
+    ) -> String {
         // File-loaded surface profile wins when present (R2 / ocean-agents
         // hot-reconfigure). Falls through to the seed consts below otherwise.
-        if let Some(profile) = load_surface_profile(client_type) {
+        if let Some(profile) = load_surface_profile_opt(assistants_root, client_type) {
             return format!("{prompt}\n\n## Current client\n\n{profile}\n");
         }
         match client_type {
@@ -4717,58 +4752,57 @@ is the user's real, signed-in browser session.\n\n\
     #[cfg(test)]
     mod tests {
         use super::{
-            build_system_prompt, load_surface_profile_from, surface_dir, surface_flag,
+            build_system_prompt_from, load_surface_profile_from, surface_dir, surface_flag,
         };
         use std::path::Path;
+        use tempfile::TempDir;
 
-        /// RAII guard that pins a process-global env var for the duration of a
-        /// test and restores the prior value on drop. Used to isolate
-        /// `build_system_prompt` from on-disk surface-profile overrides
-        /// (`OCEAN_ASSISTANTS_DIR`) so the compiled fallback is the path under
-        /// test, without leaking the override into other tests.
-        struct EnvVarGuard {
-            key: &'static str,
-            prior: Option<std::ffi::OsString>,
+        /// A fresh, empty, auto-cleaned assistants root. Building a system prompt
+        /// against this root resolves NO on-disk surface profile (the dir holds
+        /// no `<DIR>/system.md`), so `build_system_prompt_from` takes the
+        /// compiled-in const fallback — the path these tests actually assert on.
+        ///
+        /// This is the OCEAN-285 isolation primitive: every prompt-building test
+        /// pins its own temp root instead of letting the lookup fall through to
+        /// the operator's real `~/.config/ocean-rs/assistants`. No process env is
+        /// read or mutated, so parallel `cargo test` threads can't race, and the
+        /// result never depends on whatever profiles happen to exist on the box.
+        fn empty_assistants_root() -> TempDir {
+            tempfile::Builder::new()
+                .prefix("ocean-assistants-empty-")
+                .tempdir()
+                .expect("create temp assistants root")
         }
 
-        impl EnvVarGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let prior = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, prior }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                match self.prior.take() {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
+        /// An auto-cleaned assistants root seeded with a single
+        /// `<surface_dir>/system.md` for `client_type`, holding `body`. Used to
+        /// exercise the file-loaded-profile-wins path in isolation.
+        fn seeded_assistants_root(client_type: &str, body: &str) -> TempDir {
+            let root = empty_assistants_root();
+            let dir = root.path().join(surface_dir(Some(client_type)));
+            std::fs::create_dir_all(&dir).expect("create surface dir");
+            std::fs::write(dir.join("system.md"), body).expect("write seeded profile");
+            root
         }
 
         #[test]
         fn file_loaded_surface_profile_wins_over_const() {
             // R2: an on-disk assistants/<DIR>/system.md must override the seed
-            // const so a surface can be reconfigured without a rebuild.
-            let root = std::env::temp_dir().join(format!(
-                "ocean-assistants-test-{}",
-                super::super::SessionId::new_v4()
-            ));
-            let dir = root.join("SLACK");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("system.md"), "CUSTOM SLACK PROFILE FROM FILE").unwrap();
+            // const so a surface can be reconfigured without a rebuild. Isolated
+            // against a temp root (auto-cleaned), never the real config.
+            let root = seeded_assistants_root("surface-slack", "CUSTOM SLACK PROFILE FROM FILE");
 
-            let loaded = load_surface_profile_from(&root, Some("surface-slack"));
+            let loaded = load_surface_profile_from(root.path(), Some("surface-slack"));
             assert_eq!(loaded.as_deref(), Some("CUSTOM SLACK PROFILE FROM FILE"));
 
             // Unknown surface never resolves a file.
-            assert!(load_surface_profile_from(&root, Some("who-knows")).is_none());
+            assert!(load_surface_profile_from(root.path(), Some("who-knows")).is_none());
             // Missing file → None (falls back to const).
-            assert!(load_surface_profile_from(&root, Some("tui")).is_none());
+            assert!(load_surface_profile_from(root.path(), Some("tui")).is_none());
 
-            let _ = std::fs::remove_dir_all(&root);
+            // And the loaded file actually wins inside the full prompt build.
+            let prompt = build_system_prompt_from(None, Some("surface-slack"), Some(root.path()));
+            assert!(prompt.contains("CUSTOM SLACK PROFILE FROM FILE"));
         }
 
         #[test]
@@ -4805,9 +4839,12 @@ is the user's real, signed-in browser session.\n\n\
         #[test]
         fn slack_and_canvas_have_real_arms_not_unknown_fallthrough() {
             // R3: the runtime must recognize these surfaces ahead of the
-            // inbound path, so they don't resolve to "unknown client".
+            // inbound path, so they don't resolve to "unknown client". Pinned to
+            // an empty temp assistants root so the compiled fallback is exercised
+            // (OCEAN-285) — never the operator's real ~/.config profiles.
+            let root = empty_assistants_root();
             for ct in ["surface-slack", "surface-canvas", "surface-mobile"] {
-                let prompt = build_system_prompt(None, Some(ct));
+                let prompt = build_system_prompt_from(None, Some(ct), Some(root.path()));
                 assert!(
                     !prompt.contains("unknown client"),
                     "{ct} must have a real surface arm, not the fallthrough"
@@ -4823,24 +4860,18 @@ is the user's real, signed-in browser session.\n\n\
         #[test]
         fn slack_canvas_mobile_get_real_profiles_not_stub() {
             // This test asserts against the COMPILED FALLBACK profiles
-            // (SLACK/CNVS/MOBL consts). But `build_system_prompt` resolves an
-            // on-disk `assistants/<DIR>/system.md` first via
-            // `load_surface_profile` → `assistants_root()`, which honors
-            // `OCEAN_ASSISTANTS_DIR` (else ~/.config/ocean-rs/assistants). In
-            // any dev/CI env that has a real SLACK/CNVS/MOBL profile on disk
-            // (or with OCEAN_ASSISTANTS_DIR pointed at temp profiles), that
-            // file would shadow the consts under test and these assertions
-            // would check external content instead — wrong/flaky. Pin
-            // OCEAN_ASSISTANTS_DIR to a guaranteed-nonexistent root so
-            // `load_surface_profile` finds nothing and the const fallback is
-            // the path actually exercised — the same nonexistent-root idiom as
-            // `missing_profile_root_falls_back_to_const`.
-            let _guard = EnvVarGuard::set(
-                "OCEAN_ASSISTANTS_DIR",
-                "/nonexistent/ocean/assistants/root",
-            );
+            // (SLACK/CNVS/MOBL consts). `build_system_prompt` would otherwise
+            // resolve an on-disk `assistants/<DIR>/system.md` first via the real
+            // `assistants_root()` (OCEAN_ASSISTANTS_DIR, else
+            // ~/.config/ocean-rs/assistants), and in any dev/CI box that has a
+            // real SLACK/CNVS/MOBL profile that file would shadow the consts
+            // under test — wrong/flaky, and a read of the operator's machine
+            // state. Build against an empty temp root instead (OCEAN-285): the
+            // file lookup finds nothing, the const fallback is exercised, and no
+            // process env is touched (no save/restore race with sibling tests).
+            let root = empty_assistants_root();
 
-            let slack = build_system_prompt(None, Some("surface-slack"));
+            let slack = build_system_prompt_from(None, Some("surface-slack"), Some(root.path()));
             // Slack-native: thread-aware, concise, mrkdwn-not-Markdown, canvas-aware.
             assert!(slack.contains("Slack surface UX"));
             assert!(slack.contains("thread"));
@@ -4851,13 +4882,13 @@ is the user's real, signed-in browser session.\n\n\
             // Not the old stub one-liner, and not a web/HTML surface.
             assert!(!slack.contains("Responses render as HTML"));
 
-            let canvas = build_system_prompt(None, Some("surface-canvas"));
+            let canvas = build_system_prompt_from(None, Some("surface-canvas"), Some(root.path()));
             assert!(canvas.contains("canvas surface UX"));
             assert!(canvas.contains("artifact"));
             assert!(canvas.contains("append over overwrite"));
             assert!(canvas.contains("pair the canvas with a message"));
 
-            let mobile = build_system_prompt(None, Some("surface-mobile"));
+            let mobile = build_system_prompt_from(None, Some("surface-mobile"), Some(root.path()));
             assert!(mobile.contains("mobile surface UX"));
             assert!(mobile.contains("phone"));
             assert!(mobile.contains("answer-first"));
@@ -4880,7 +4911,10 @@ is the user's real, signed-in browser session.\n\n\
 
         #[test]
         fn web_surface_gets_leptos_component_guidance() {
-            let prompt = build_system_prompt(None, Some("surface-web"));
+            // Const fallback under test — pin an empty temp assistants root so a
+            // real WEB profile on the box can't shadow it (OCEAN-285).
+            let root = empty_assistants_root();
+            let prompt = build_system_prompt_from(None, Some("surface-web"), Some(root.path()));
 
             assert!(prompt.contains("Leptos components"));
             assert!(prompt.contains("component_render"));
@@ -4910,7 +4944,8 @@ is the user's real, signed-in browser session.\n\n\
 
         #[test]
         fn gpui_surface_avoids_web_component_guidance() {
-            let prompt = build_system_prompt(None, Some("surface-gpui"));
+            let root = empty_assistants_root();
+            let prompt = build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()));
 
             assert!(prompt.contains("Ocean GUI"));
             assert!(prompt.contains("GPUI"));
@@ -4929,7 +4964,8 @@ is the user's real, signed-in browser session.\n\n\
         /// alternative).
         #[test]
         fn gpui_surface_guides_to_surface_patch_not_ascii() {
-            let prompt = build_system_prompt(None, Some("surface-gpui"));
+            let root = empty_assistants_root();
+            let prompt = build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()));
 
             // The keystone: the model is told the canvas tool exists and how to
             // use it.
@@ -4946,7 +4982,8 @@ is the user's real, signed-in browser session.\n\n\
 
         #[test]
         fn legacy_native_surface_is_not_treated_as_webview() {
-            let prompt = build_system_prompt(None, Some("surface-native"));
+            let root = empty_assistants_root();
+            let prompt = build_system_prompt_from(None, Some("surface-native"), Some(root.path()));
 
             assert!(prompt.contains("Ocean native surface"));
             assert!(prompt.contains("surface_patch"));
@@ -4955,7 +4992,8 @@ is the user's real, signed-in browser session.\n\n\
 
         #[test]
         fn tui_surface_avoids_web_component_guidance() {
-            let prompt = build_system_prompt(None, Some("tui"));
+            let root = empty_assistants_root();
+            let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()));
 
             assert!(prompt.contains("Ocean TUI"));
             assert!(prompt.contains("terminal-native"));
