@@ -130,12 +130,14 @@ type CanvasFulfillmentStore = Arc<Mutex<HashMap<CanvasFulfillmentKey, CanvasFulf
 type CanvasFulfillmentKey = (AgentSessionId, String);
 
 /// One stored bridge fulfillment (OCEAN-262): the raw `result` body the bridge
-/// POSTed plus the wall-clock time we received it (for observability/GC later).
+/// POSTed plus the wall-clock time we received it. `received_at` drives TTL
+/// eviction in `gc_registries` (OCEAN-273) so the store stays bounded.
 #[derive(Clone)]
 struct CanvasFulfillment {
     /// The bridge's `result` JSON verbatim (SDK-result-shaped superset).
     result: Value,
-    /// When the daemon received this fulfillment.
+    /// When the daemon received this fulfillment. Used by the GC sweep to evict
+    /// entries older than `CANVAS_FULFILLMENT_TTL` (OCEAN-273).
     received_at: DateTime<Utc>,
 }
 
@@ -201,6 +203,15 @@ const REGISTRY_TERMINAL_TTL: chrono::Duration = chrono::Duration::hours(1);
 /// evicted first (then, if still over, oldest entries regardless of state).
 const REGISTRY_MAX_ENTRIES: usize = 10_000;
 
+/// TTL for `canvas_fulfillments` (OCEAN-273). Unlike requests/permissions a
+/// fulfillment has no terminal state — a read never consumes it — so it's
+/// evictable purely by age once it's old enough that the agent has almost
+/// certainly read it back. Kept equal to the runtime's
+/// [`ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL`] so both halves
+/// of the same `(session, canvas)` slot (the daemon's query store and the
+/// runtime's lookup registry) expire on the same schedule.
+const CANVAS_FULFILLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
+
 impl RequestControl {
     /// Whether this request has reached a terminal lifecycle state.
     fn is_terminal(&self) -> bool {
@@ -232,10 +243,13 @@ impl PermissionWaiter {
 
 /// One GC sweep: drop terminal entries older than [`REGISTRY_TERMINAL_TTL`],
 /// then enforce [`REGISTRY_MAX_ENTRIES`] by evicting oldest-terminal first.
-/// `now` is injected so the sweep is deterministic in tests.
+/// Also bounds the `canvas_fulfillments` store and the runtime's process-global
+/// fulfillment lookup registry (OCEAN-273) on the same tick. `now` is injected
+/// so the sweep is deterministic in tests.
 async fn gc_registries(
     requests: &RequestRegistry,
     permissions: &PermissionRegistry,
+    canvas_fulfillments: &CanvasFulfillmentStore,
     now: DateTime<Utc>,
 ) {
     let ttl = REGISTRY_TERMINAL_TTL;
@@ -253,6 +267,30 @@ async fn gc_registries(
             evict_overflow(&mut perms, |w| w.is_terminal(), |w| w.terminal_at());
         }
     }
+    // OCEAN-273: bound the bridge-fulfillment query store. A fulfillment has no
+    // terminal state (a `GET`/SSE read never removes it), so every entry is
+    // evictable purely by age — drop anything older than `CANVAS_FULFILLMENT_TTL`,
+    // then enforce `REGISTRY_MAX_ENTRIES` as a burst backstop. For the cap, every
+    // entry is treated as "terminal" (`is_terminal = true`) so `evict_overflow`
+    // simply removes the oldest by `received_at`.
+    {
+        let mut store = canvas_fulfillments
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let cttl = CANVAS_FULFILLMENT_TTL;
+        store.retain(|_, f| (now - f.received_at) <= cttl);
+        if store.len() > REGISTRY_MAX_ENTRIES {
+            evict_overflow(&mut store, |_| true, |f| f.received_at);
+        }
+    }
+    // OCEAN-273: bound the runtime-owned lookup registry (OCEAN-271) the same way.
+    // The daemon writes both halves of each fulfillment in lock-step, so they
+    // share a TTL + cap and expire together.
+    ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY.gc(
+        now,
+        ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL,
+        ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_MAX_ENTRIES,
+    );
 }
 
 /// Trim `map` down to [`REGISTRY_MAX_ENTRIES`]. Removes oldest-terminal entries
@@ -783,13 +821,15 @@ async fn main() -> anyhow::Result<()> {
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    // Background GC: the request/permission registries are otherwise unbounded
-    // and accrete one entry per turn/permission for the daemon's whole lifetime.
-    // This task reaps terminal entries on an interval so a long-lived daemon
-    // doesn't leak memory. See `gc_registries`.
+    // Background GC: the request/permission/canvas-fulfillment registries are
+    // otherwise unbounded and accrete one entry per turn/permission/fulfilled
+    // slack_canvas op for the daemon's whole lifetime. This task reaps stale
+    // entries on an interval so a long-lived daemon doesn't leak memory. See
+    // `gc_registries`.
     {
         let requests = state.requests.clone();
         let permissions = state.permissions.clone();
+        let canvas_fulfillments = state.canvas_fulfillments.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(REGISTRY_GC_INTERVAL);
             // Skip the immediate first tick; first sweep happens one interval in.
@@ -804,10 +844,10 @@ async fn main() -> anyhow::Result<()> {
                 // (OCEAN-87).
                 let reqs = requests.clone();
                 let perms = permissions.clone();
-                let sweep =
-                    tokio::spawn(
-                        async move { gc_registries(&reqs, &perms, Utc::now()).await },
-                    );
+                let canvas = canvas_fulfillments.clone();
+                let sweep = tokio::spawn(async move {
+                    gc_registries(&reqs, &perms, &canvas, Utc::now()).await
+                });
                 if let Err(join_err) = sweep.await {
                     tracing::error!(
                         error = %join_err,
@@ -8144,6 +8184,12 @@ mod tests {
         YOLO_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// An empty canvas-fulfillment store for the `gc_registries` tests that only
+    /// exercise the request/permission paths (OCEAN-273 widened the signature).
+    fn empty_canvas_store() -> CanvasFulfillmentStore {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     fn status(request_id: RequestId, state: RequestState) -> RequestControl {
         RequestControl {
             status: RequestStatus {
@@ -9714,7 +9760,7 @@ mod tests {
         ])));
         let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-        gc_registries(&requests, &permissions, now).await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let reqs = requests.read().await;
         assert!(!reqs.contains_key(&old_terminal), "old terminal evicted");
@@ -9757,7 +9803,7 @@ mod tests {
         ])));
         let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-        gc_registries(&requests, &permissions, now).await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let perms = permissions.read().await;
         assert!(!perms.contains_key(&leaked), "old consumed waiter evicted");
@@ -13066,7 +13112,7 @@ mod tests {
             );
         }
 
-        gc_registries(&requests, &permissions, now).await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let reqs = requests.read().await;
         assert!(
@@ -13127,7 +13173,7 @@ mod tests {
             }
         }
 
-        gc_registries(&requests, &permissions, now).await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let reqs = requests.read().await;
         assert_eq!(
@@ -13139,6 +13185,102 @@ mod tests {
             assert!(
                 !reqs.contains_key(id),
                 "the oldest terminal entries must be the ones evicted by the cap"
+            );
+        }
+    }
+
+    // ---- OCEAN-273: GC + bound the canvas_fulfillments store ----------------
+    //
+    // OCEAN-262 added `AppState.canvas_fulfillments` but left it out of the GC
+    // sweep, so every slack_canvas op leaked an entry for the daemon's lifetime.
+    // These pin the fix: TTL eviction by age (a fulfillment has no terminal
+    // state — a read never consumes it), a hard-cap backstop, and that a fresh
+    // fulfillment is still readable before its TTL expires.
+
+    /// One stored fulfillment at an explicit receive time, for deterministic GC.
+    fn canvas_fulfillment_at(received_at: DateTime<Utc>) -> CanvasFulfillment {
+        CanvasFulfillment {
+            result: json!({ "ok": true, "bridged": true }),
+            received_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_evicts_canvas_fulfillments_past_ttl_keeps_fresh() {
+        let now = Utc::now();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let sess = AgentSessionId::new_v4();
+        let stale_key = (sess, "F_STALE".to_string());
+        let fresh_key = (sess, "F_FRESH".to_string());
+        let store: CanvasFulfillmentStore = Arc::new(Mutex::new(HashMap::from([
+            (
+                stale_key.clone(),
+                // One second past the TTL → evicted.
+                canvas_fulfillment_at(now - CANVAS_FULFILLMENT_TTL - chrono::Duration::seconds(1)),
+            ),
+            (
+                fresh_key.clone(),
+                // Inside the TTL → kept, and still readable.
+                canvas_fulfillment_at(now - chrono::Duration::minutes(1)),
+            ),
+        ])));
+
+        gc_registries(&requests, &permissions, &store, now).await;
+
+        let s = store.lock().unwrap();
+        assert!(
+            !s.contains_key(&stale_key),
+            "a fulfillment older than the TTL must be evicted"
+        );
+        assert!(
+            s.contains_key(&fresh_key),
+            "a fresh fulfillment survives the sweep and stays readable before expiry"
+        );
+        assert_eq!(s.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gc_canvas_fulfillments_cap_bounds_growth_evicting_oldest_first() {
+        // Every entry is RECENT (inside TTL), so only the hard cap can trim. Insert
+        // > the cap and assert the count is bounded to exactly REGISTRY_MAX_ENTRIES
+        // with the oldest (by received_at) dropped.
+        let now = Utc::now();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let sess = AgentSessionId::new_v4();
+
+        let overflow = 5usize;
+        let total = REGISTRY_MAX_ENTRIES + overflow;
+        let store: CanvasFulfillmentStore = Arc::new(Mutex::new(HashMap::new()));
+        let mut oldest_keys = Vec::new();
+        {
+            let mut s = store.lock().unwrap();
+            for i in 0..total {
+                // Larger i => more recent. Millisecond spacing keeps even the oldest
+                // well inside the TTL, so the cap (not the TTL) does the trimming.
+                let ts = now - chrono::Duration::milliseconds((total - i) as i64);
+                let key = (sess, format!("F{i}"));
+                if i < overflow {
+                    oldest_keys.push(key.clone());
+                }
+                s.insert(key, canvas_fulfillment_at(ts));
+            }
+        }
+
+        gc_registries(&requests, &permissions, &store, now).await;
+
+        let s = store.lock().unwrap();
+        assert_eq!(
+            s.len(),
+            REGISTRY_MAX_ENTRIES,
+            "the cap must bound the fulfillment store to REGISTRY_MAX_ENTRIES"
+        );
+        for key in &oldest_keys {
+            assert!(
+                !s.contains_key(key),
+                "the oldest fulfillments must be the ones evicted by the cap"
             );
         }
     }
