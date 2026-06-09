@@ -2164,7 +2164,39 @@ async fn events(
 async fn prompt(
     State(state): State<AppState>,
     Json(mut req): Json<PromptRequest>,
-) -> Json<ocean_core::PromptResponse> {
+) -> (StatusCode, Json<ocean_core::PromptResponse>) {
+    // OCEAN-304: backpressure. The legacy synchronous path runs its turn inline
+    // (it `.await`s `runtime.prompt` directly), so without this gate it would
+    // bypass the concurrency cap entirely and fan out unbounded provider calls.
+    // Same contract as `agent_turn`: take the permit BEFORE registering or
+    // emitting anything, reject immediately with 429 at capacity, and hold the
+    // permit for the rest of the handler so the RAII drop releases it on every
+    // exit path.
+    let _turn_permit = match state.turn_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!(
+                limit = state.turn_limiter.available_permits(),
+                "prompt: at concurrency cap; rejecting with 429 (OCEAN-304)"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ocean_core::PromptResponse {
+                    ok: false,
+                    request_id: None,
+                    session_id: req.session_id,
+                    code: None,
+                    wall_ms: 0,
+                    stdout: String::new(),
+                    stderr: "daemon at concurrent-turn capacity; busy, try again shortly"
+                        .to_string(),
+                    cwd: req.cwd.clone(),
+                    usage: ocean_core::TokenUsage::default(),
+                }),
+            );
+        }
+    };
+
     let (request_id, cancel) =
         register_running_request(&state, &mut req, "prompt running", RequestState::Running).await;
     // OCEAN-160 (P0): do NOT trust the wire `yolo` flag to escalate. The posture
@@ -2185,7 +2217,7 @@ async fn prompt(
     let res = state.runtime.prompt(req, control).await;
     record_prompt_result(&state, request_id, &res).await;
 
-    Json(res)
+    (StatusCode::OK, Json(res))
 }
 
 async fn create_request(
@@ -13451,6 +13483,51 @@ mod tests {
         assert!(
             state.requests.read().await.is_empty(),
             "a rejected request must not be registered"
+        );
+
+        // Free the slot — intake is open again.
+        drop(held);
+        assert_eq!(state.turn_limiter.available_permits(), cap);
+    }
+
+    /// The legacy synchronous `/v1/prompt` path is gated by the same limiter
+    /// (Codex review of PR #199 caught it bypassing the cap): over-cap intake is
+    /// rejected with 429 + ok:false WITHOUT registering the request, and the
+    /// rejection never consumes a permit.
+    #[tokio::test]
+    async fn prompt_rejects_over_cap_with_429() {
+        let cap = 1usize;
+        let state = capped_turn_state(cap);
+
+        // Hold the only permit to simulate a turn in flight.
+        let held = state
+            .turn_limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("one permit");
+        assert_eq!(state.turn_limiter.available_permits(), 0);
+
+        let req = PromptRequest {
+            prompt: "ping".to_string(),
+            images: None,
+            request_id: None,
+            session_id: None,
+            create_if_missing: true,
+            max_turns: None,
+            yolo: false,
+            cwd: String::new(),
+            project_id: None,
+            client_type: Some("test".to_string()),
+            decision_token: None,
+        };
+        let (status, body) = prompt(State(state.clone()), Json(req)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!body.ok, "over-cap prompt must report ok:false");
+        assert!(body.stderr.contains("capacity"));
+        // The rejected request never touched the registry.
+        assert!(
+            state.requests.read().await.is_empty(),
+            "a rejected prompt must not be registered"
         );
 
         // Free the slot — intake is open again.
