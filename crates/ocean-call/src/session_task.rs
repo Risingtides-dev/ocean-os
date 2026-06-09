@@ -787,6 +787,80 @@ mod tests {
         }
     }
 
+    /// A voice whose TTS transport always fails (synth down / publish dropped),
+    /// while still recording what it was *asked* to speak. Models the live
+    /// `LiveKitVoice::speak` returning `Err` (synth error or publish failure) so a
+    /// test can assert the call survives and `CallAgentSpoke` is still emitted —
+    /// the operator rail must show what Ocean said even when the audio leg fails.
+    #[derive(Clone, Default)]
+    struct FailingVoice {
+        attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Voice for FailingVoice {
+        async fn speak(&mut self, text: &str) -> anyhow::Result<()> {
+            self.attempts.lock().unwrap().push(text.to_string());
+            anyhow::bail!("TTS transport down")
+        }
+    }
+
+    /// An STT that errors on every utterance (provider 5xx / network drop). The
+    /// loop must skip the utterance and keep running, never panic or abort the
+    /// call. Counts attempts so a test can prove the loop kept feeding it.
+    struct ErroringStt {
+        attempts: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Transcriber for ErroringStt {
+        async fn transcribe(
+            &mut self,
+            _wav: Vec<u8>,
+            _start_ms: u64,
+        ) -> anyhow::Result<Option<TranscriptSegment>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("STT provider unavailable")
+        }
+    }
+
+    /// An STT that errors on the first N utterances, then yields scripted text —
+    /// proving a transient STT failure mid-call is survived and later utterances
+    /// still transcribe (resilience, not just "doesn't crash on the first error").
+    struct FlakyStt {
+        fail_first: u64,
+        seen: u64,
+        scripts: VecDeque<Option<String>>,
+    }
+
+    impl FlakyStt {
+        fn new(fail_first: u64, scripts: Vec<Option<&str>>) -> Self {
+            Self {
+                fail_first,
+                seen: 0,
+                scripts: scripts.into_iter().map(|s| s.map(String::from)).collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Transcriber for FlakyStt {
+        async fn transcribe(
+            &mut self,
+            _wav: Vec<u8>,
+            start_ms: u64,
+        ) -> anyhow::Result<Option<TranscriptSegment>> {
+            self.seen += 1;
+            if self.seen <= self.fail_first {
+                anyhow::bail!("STT transient error (attempt {})", self.seen);
+            }
+            match self.scripts.pop_front() {
+                Some(Some(text)) => Ok(Some(TranscriptSegment::final_("caller", text, start_ms))),
+                _ => Ok(None),
+            }
+        }
+    }
+
     fn frame_3s() -> PcmFrame {
         // 16kHz mono, 3000ms = 48_000 samples → flushes on the 3s size policy.
         PcmFrame::new(vec![1i16; 48_000], 16_000, 1)
@@ -1175,5 +1249,273 @@ mod tests {
         assert_eq!(buffered_ms(96_000, 16_000, 2), 3_000);
         assert_eq!(buffered_ms(0, 16_000, 1), 0);
         assert_eq!(buffered_ms(1_000, 0, 1), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Failure modes (OCEAN-230). The four outside-world seams can all fail in
+    // production — STT 5xx, the agent turn timing out, TTS synth/publish
+    // dropping. The loop's contract is that NONE of these aborts the call: a
+    // failing utterance is dropped, a failing answer/summary is logged and
+    // skipped, and the call still brackets cleanly with CallStarted/CallEnded.
+    // These tests drive each error arm in `flush_utterance` / `run_answer` /
+    // `run_summary` and assert survival, exercising the paths the happy-path
+    // tests above can't reach.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stt_error_mid_call_is_skipped_and_call_survives() {
+        // Transcriber errors on the only utterance. The loop must drop it (no
+        // segment), keep running, and still close the call cleanly — an STT
+        // outage degrades to "no transcript", never a dropped call.
+        let frames = vec![frame_3s()];
+        let attempts = Arc::new(AtomicU64::new(0));
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            ErroringStt {
+                attempts: attempts.clone(),
+            },
+            CannedRunner::new("unused", seen.clone()),
+            voice,
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        // The STT was actually driven (the utterance reached transcribe)...
+        assert!(attempts.load(Ordering::SeqCst) >= 1, "STT must have been called");
+        // ...but the failure produced no transcript and the call still bracketed.
+        assert_eq!(
+            ev_types(&out),
+            vec!["started", "ended"],
+            "STT error must drop the utterance, not the call"
+        );
+        // No downstream lane ran off a failed transcription.
+        assert!(seen.lock().unwrap().is_empty(), "no agent turn off failed STT");
+        assert!(spoken.lock().unwrap().is_empty(), "nothing spoken off failed STT");
+    }
+
+    #[tokio::test]
+    async fn stt_recovers_after_transient_error() {
+        // First utterance's STT fails; the second succeeds and must transcribe
+        // normally. Proves a transient STT error mid-call is survived AND the
+        // pipeline keeps working afterward — not just "no panic on first error".
+        let frames = vec![frame_3s(), frame_3s()];
+        let stt = FlakyStt::new(1, vec![Some("the second utterance came through")]);
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            stt,
+            CannedRunner::new("x", Default::default()),
+            CapturingVoice::default(),
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"));
+        // Exactly the recovered utterance produced a segment.
+        assert!(
+            types.contains(&"segment"),
+            "post-error utterance must still transcribe; got {types:?}"
+        );
+        let seg = out.events.iter().find_map(|e| match e {
+            OceanEvent::CallTranscriptSegment { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(seg.as_deref(), Some("the second utterance came through"));
+    }
+
+    #[tokio::test]
+    async fn agent_turn_failure_on_wake_does_not_drop_call() {
+        // The wake fires, but the agent turn errors. The call must survive: no
+        // CallAgentSpoke, nothing spoken, but CallWakeTriggered already fired and
+        // the call still ends cleanly. (mark_replied is still called so a failed
+        // answer can't re-trigger on the same echo — covered by survival here.)
+        struct FailingAnswerRunner {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl TurnRunner for FailingAnswerRunner {
+            async fn run(&mut self, command: &str) -> anyhow::Result<String> {
+                self.seen.lock().unwrap().push(command.to_string());
+                anyhow::bail!("agent runtime unavailable")
+            }
+        }
+
+        let frames = vec![frame_3s()];
+        let stt = ScriptedStt::new(vec![Some("hey Ocean what did we decide")]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            stt,
+            FailingAnswerRunner { seen: seen.clone() },
+            voice,
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        // Wake fired and the runner WAS driven over the command...
+        assert!(types.contains(&"wake"), "wake should still trigger; got {types:?}");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["what did we decide".to_string()],
+            "the agent turn was attempted over the wake command"
+        );
+        // ...but the failed turn spoke nothing and emitted no CallAgentSpoke...
+        assert!(!types.contains(&"spoke"), "failed turn must not emit spoke; got {types:?}");
+        assert!(spoken.lock().unwrap().is_empty(), "failed turn speaks nothing");
+        // ...and the call still closed cleanly (no panic, no abort).
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"));
+    }
+
+    #[tokio::test]
+    async fn tts_failure_still_emits_spoke_and_survives() {
+        // The agent turn succeeds but TTS playback fails. Contract (run_answer):
+        // CallAgentSpoke is emitted REGARDLESS of TTS transport success, so the
+        // operator rail shows what Ocean said even when the audio leg degrades —
+        // and a failed speak never drops the call.
+        let frames = vec![frame_3s()];
+        let stt = ScriptedStt::new(vec![Some("hey Ocean summarize that")]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = FailingVoice::default();
+        let attempts = voice.attempts.clone();
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            stt,
+            CannedRunner::new("Here is the summary you asked for.", seen.clone()),
+            voice,
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        // TTS was actually attempted with the reply text...
+        assert_eq!(
+            attempts.lock().unwrap().as_slice(),
+            &["Here is the summary you asked for.".to_string()],
+            "voice.speak must be attempted with the agent reply"
+        );
+        // ...and despite the transport failure, CallAgentSpoke still fired with
+        // the reply text (the load-bearing contract for the operator rail)...
+        assert!(types.contains(&"spoke"), "spoke must fire even when TTS fails; got {types:?}");
+        let spoke_text = out.events.iter().find_map(|e| match e {
+            OceanEvent::CallAgentSpoke { text } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(spoke_text.as_deref(), Some("Here is the summary you asked for."));
+        // ...and the call survived the TTS failure and closed cleanly.
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"));
+    }
+
+    #[tokio::test]
+    async fn empty_reply_is_not_spoken_and_call_survives() {
+        // A wake turn that returns whitespace-only text: run_answer trims to empty
+        // and must NOT speak or emit CallAgentSpoke (no empty bubble on the rail),
+        // yet still completes the answer (cooldown) and the call ends cleanly.
+        let frames = vec![frame_3s()];
+        let stt = ScriptedStt::new(vec![Some("hey Ocean anything")]);
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let voice = CapturingVoice::default();
+        let spoken = voice.spoken.clone();
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::new(frames),
+            stt,
+            CannedRunner::new("   ", seen.clone()), // whitespace-only reply
+            voice,
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        // The turn ran (wake fired, runner saw the command)...
+        assert!(types.contains(&"wake"), "wake should fire; got {types:?}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the answer turn ran");
+        // ...but an empty reply produces no speech and no spoke event...
+        assert!(spoken.lock().unwrap().is_empty(), "empty reply must not be spoken");
+        assert!(!types.contains(&"spoke"), "empty reply must not emit spoke; got {types:?}");
+        // ...and the call still closes cleanly.
+        assert_eq!(types.last(), Some(&"ended"));
+    }
+
+    #[tokio::test]
+    async fn cascading_failures_still_close_the_call() {
+        // Worst case: STT errors on utterance 1, then utterance 2 transcribes a
+        // wake command whose agent turn ALSO errors, then the source drops. The
+        // call must still bracket and end on the drop — no single failure, and no
+        // pile-up of failures, can leave a phantom in-progress call.
+        struct AlwaysFailRunner;
+        #[async_trait]
+        impl TurnRunner for AlwaysFailRunner {
+            async fn run(&mut self, _command: &str) -> anyhow::Result<String> {
+                anyhow::bail!("runtime down")
+            }
+        }
+
+        let frames = vec![frame_3s(), frame_3s()];
+        let stt = FlakyStt::new(1, vec![Some("hey Ocean what's the status")]);
+        let mut out = CapturingSink::default();
+
+        run_call_session(
+            session(false),
+            VecFrames::dropped(frames, "PeerConnectionFailed"),
+            stt,
+            AlwaysFailRunner,
+            FailingVoice::default(),
+            &mut out,
+            "call:room".into(),
+            vec![],
+            UtterancePolicy::default(),
+            step_clock(0, 100),
+        )
+        .await;
+
+        let types = ev_types(&out);
+        // Even with STT + agent-turn + TTS all failing and the tap dropping, the
+        // call brackets cleanly. CallEnded is non-negotiable.
+        assert_eq!(types.first(), Some(&"started"));
+        assert_eq!(types.last(), Some(&"ended"));
+        assert!(!types.contains(&"spoke"), "no successful speak amid failures; got {types:?}");
     }
 }
