@@ -787,10 +787,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(models_list))
         .route("/v1/settings/yolo", get(yolo_setting_get).post(yolo_setting_set))
         .route("/v1/component/event", post(component_event))
-        .route("/v1/longhouse/demo", post(longhouse_demo))
-        .route("/v1/longhouse/convene", post(longhouse_convene))
-        .route("/v1/longhouse/topics", get(longhouse_topics))
-        .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
+        // Longhouse + council convene routes (incl. the `/v1/council/convene`
+        // alias) live in one reusable group so the router here and the HTTP
+        // route test below register exactly the same table (OCEAN-227).
+        .merge(longhouse_routes())
         .route("/v1/calls/demo", post(call_demo))
         .route("/v1/calls/place", post(call_place))
         .route("/v1/calls/webhook", post(call_webhook))
@@ -957,6 +957,7 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/component/event",
             "POST /v1/longhouse/demo",
             "POST /v1/longhouse/convene",
+            "POST /v1/council/convene",
             "GET /v1/longhouse/topics",
             "GET /v1/longhouse/topics/{topic_id}",
             "POST /v1/calls/demo",
@@ -1603,6 +1604,24 @@ async fn yolo_setting_set(Json(req): Json<YoloSetRequest>) -> Json<serde_json::V
         "effective": effective_yolo(),
         "env_override": env_override,
     }))
+}
+
+/// Longhouse/council convene route group, factored out of `main()` so the live
+/// router and the HTTP route test share one source of truth (OCEAN-227).
+///
+/// `POST /v1/council/convene` is a first-class **alias** of
+/// `POST /v1/longhouse/convene`: "council" is the governance term for the same
+/// convene/quorum flow, and `docs/LONGHOUSE.md` documents the council path as a
+/// live route. Both names dispatch to the identical `longhouse_convene` handler
+/// so a client following the canonical doc no longer 404s.
+fn longhouse_routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/longhouse/demo", post(longhouse_demo))
+        .route("/v1/longhouse/convene", post(longhouse_convene))
+        // Canonical-doc alias — same handler, governance-facing name (OCEAN-227).
+        .route("/v1/council/convene", post(longhouse_convene))
+        .route("/v1/longhouse/topics", get(longhouse_topics))
+        .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
 }
 
 /// Emit a scripted-but-real Longhouse deliberation onto the agent event bus so
@@ -8635,6 +8654,86 @@ mod tests {
         assert!(
             state.requests.read().await.is_empty(),
             "no turn may be queued from an agent-authored message"
+        );
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    // ---- Council convene alias (OCEAN-227) ---------------------------------
+
+    /// Drive a request through the **real** `longhouse_routes()` table — the same
+    /// group `main()` mounts — to prove `POST /v1/council/convene` is wired as a
+    /// live alias of `POST /v1/longhouse/convene`. The canonical `docs/LONGHOUSE.md`
+    /// documents the council path; before this alias a doc-following client 404'd.
+    ///
+    /// We assert the alias returns the convene handler's synchronous ack
+    /// (`200 { ok: true, .. }`), that the canonical path returns the identical
+    /// shape, and that an unregistered sibling (`/v1/council/nope`) still 404s so
+    /// the alias is a specific route — not a catch-all swallowing everything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn council_convene_is_a_live_alias_of_longhouse_convene() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // Fake provider so the background `convene` task never touches a live LLM.
+        let state = fake_convene_state(&tmp);
+        let app = longhouse_routes().with_state(state);
+
+        // Helper: POST a convene body to `path`, returning (status, json).
+        async fn post_convene(
+            app: Router,
+            path: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let req = axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri(path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    json!({ "question": "ship it?" }).to_string(),
+                ))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, body)
+        }
+
+        // The alias must route to the handler, not 404.
+        let (alias_status, alias_body) =
+            post_convene(app.clone(), "/v1/council/convene").await;
+        assert_eq!(
+            alias_status,
+            StatusCode::OK,
+            "POST /v1/council/convene must be a live route (the canonical doc lists it), got {alias_status}"
+        );
+        assert_eq!(alias_body["ok"], json!(true), "alias body: {alias_body}");
+        assert_eq!(
+            alias_body["question"],
+            json!("ship it?"),
+            "alias must reach the real convene handler and echo the question"
+        );
+
+        // The canonical longhouse path returns the identical shape — same handler.
+        let (canon_status, canon_body) =
+            post_convene(app.clone(), "/v1/longhouse/convene").await;
+        assert_eq!(canon_status, StatusCode::OK);
+        assert_eq!(canon_body["ok"], json!(true));
+        assert_eq!(
+            canon_body["question"], alias_body["question"],
+            "alias and canonical path must be the same convene flow"
+        );
+
+        // A sibling that was never registered still 404s: the alias is a specific
+        // route, not a wildcard swallowing the whole /v1/council namespace.
+        let (missing_status, _) = post_convene(app, "/v1/council/nope").await;
+        assert_eq!(
+            missing_status,
+            StatusCode::NOT_FOUND,
+            "only the documented /v1/council/convene is aliased; other council paths 404"
         );
 
         std::env::remove_var("OCEAN_YOLO");

@@ -77,6 +77,9 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
 
 - `POST /v1/longhouse/demo`
 - `POST /v1/longhouse/convene`
+- `POST /v1/council/convene` — alias of `/v1/longhouse/convene` (same handler).
+  "council" is the governance-facing name for the convene/quorum flow; both
+  paths dispatch identically so a client can use either name (OCEAN-227).
 - `GET /v1/longhouse/topics` — list every topic's observable state. Returns
   `{ "ok": true, "topics": [...] }` from the in-process topic registry.
 - `GET /v1/longhouse/topics/{topic_id}` — one topic's full observable state by
@@ -87,7 +90,10 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
 Local/remote service shape now starts with:
 
 - `GET /health`
-- `POST /v1/council/convene` — standalone HTTP wrapper around the existing `convene` flow; returns the ordered `LonghouseEvent` list plus outcome JSON.
+- `POST /v1/council/convene` — HTTP wrapper around the existing `convene` flow.
+  Already served by the embedded daemon as an alias of `/v1/longhouse/convene`
+  (see the embedded route list above); a standalone Longhouse service should
+  expose the same path so clients can target either deployment unchanged.
 
 Future Longhouse APIs should add:
 
