@@ -514,6 +514,31 @@ fn effective_yolo() -> bool {
     ocean_agent::load_yolo_pref(&ocean_agent::config_dir_from_env()).unwrap_or(false)
 }
 
+/// Whether the **opt-in Longhouse pre-turn consult** (OCEAN-245) is enabled.
+///
+/// Gated by `OCEAN_LONGHOUSE_PREPARE`, **default OFF**: unless an operator sets it
+/// to a recognized "on" spelling (`1`/`true`/`yes`/`on`), a turn behaves exactly
+/// as before — no skill index is loaded, no brief is injected, the prompt the
+/// model sees is byte-for-byte unchanged. This keeps the consult-before-acting
+/// prep-loop inert by default (the phase-2 hook the prepare endpoint named in
+/// OCEAN-215/PR #159) so turning it on is a deliberate operator decision, and so
+/// the hot turn path can never be destabilized by the prep step on the default
+/// path.
+///
+/// Read fresh per turn (not cached), like [`yolo_env_pref`], so an operator can
+/// flip it by restarting with a different env and tests can scope it. Advisory
+/// only: even when on, the brief is injected into prompt context and changes
+/// nothing about permission gating or tool execution (see [`apply_longhouse_prep`]).
+fn longhouse_prepare_enabled() -> bool {
+    match env::var("OCEAN_LONGHOUSE_PREPARE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Resolve the YOLO posture for a turn arriving on a wire `PromptRequest`
 /// (`POST /v1/prompt`, `POST /v1/requests`), DELIBERATELY IGNORING the
 /// client-supplied `wire_yolo` flag (OCEAN-160, P0).
@@ -5145,6 +5170,17 @@ async fn agent_turn(
     let yolo = effective_yolo();
 
     let guided_prompt = apply_turn_guidance(room_id, guidance.as_deref(), &prompt);
+
+    // OCEAN-245: opt-in Longhouse pre-turn consult. When `OCEAN_LONGHOUSE_PREPARE`
+    // is on, rank this turn's prompt against the local skill libraries (off the
+    // hot path via spawn_blocking) and prepend the compact, ADVISORY brief above
+    // the guided prompt — the same layering room/operator guidance uses. Default
+    // OFF, fail-open, and purely additive to context: this changes nothing the
+    // daemon does with permissions or tools, only what the model is told. A
+    // `None` (gate off / empty / scan error) leaves `guided_prompt` untouched.
+    let consult = longhouse_prep_for_turn(prompt.clone(), cwd.clone()).await;
+    let guided_prompt = apply_longhouse_prep(&guided_prompt, consult.as_ref());
+
     let mut prompt_req = PromptRequest {
         prompt: guided_prompt,
         images,
@@ -5568,6 +5604,150 @@ fn apply_turn_guidance(
     match render_turn_guidance(guidance) {
         Some(block) => format!("{block}\n\n{with_room}"),
         None => with_room,
+    }
+}
+
+// ---- OCEAN-245: opt-in Longhouse pre-turn consult (the phase-2 hook) ----------
+//
+// PR #159 shipped `POST /v1/longhouse/prepare` (the `longhouse_prepare` handler
+// above) but nothing in the turn path invoked it — the consult-before-acting loop
+// shipped zero behavior. This wires `ocean_longhouse::SkillIndex::prepare` into
+// `agent_turn`: before the LLM call, IF `OCEAN_LONGHOUSE_PREPARE` is on, the
+// daemon ranks the turn's prompt against the local skill libraries and injects the
+// resulting compact briefs into prompt context — exactly like room/operator
+// guidance (OCEAN-143), prepended so it precedes the task without mutating it.
+//
+// Three invariants, straight from `docs/LONGHOUSE.md` (esp. line 115):
+//   * **Advisory only.** The brief is a RECOMMENDATION the model reads. It does
+//     NOT touch a permission gate, does NOT execute anything, does NOT alter tool
+//     routing — `apply_longhouse_prep` only prepends text to the prompt string.
+//   * **Fail-open.** A missing/garbled library, an empty index, an irrelevant
+//     prompt, or a panicked scan all collapse to "no brief" → the turn proceeds
+//     with the unmodified prompt. The prep step can never block a turn.
+//   * **Off the hot path.** The disk walk runs on `spawn_blocking` (matching the
+//     `longhouse_prepare` handler), so the async scheduler never stalls on I/O.
+//
+// And **default OFF**: `longhouse_prepare_enabled()` is false unless the operator
+// opts in, so on the default path none of this runs and the prompt is unchanged.
+
+/// Render a [`ocean_longhouse::TurnPrep`] into a compact, model-facing context
+/// block — or `None` when there is nothing to inject (the fail-open / no-op case).
+///
+/// Each surfaced skill becomes one bullet: `name — one-line when-to-use`. The
+/// header frames it as an **advisory** recommendation, not an instruction or a
+/// granted capability, so the model treats it as "here are skills that might be
+/// relevant; you still route every action through the normal gates." SOPs and
+/// workflows are included on the same footing for forward-compat (always empty in
+/// phase 1, so they contribute nothing today).
+///
+/// Pure + deterministic (no env, no disk): this is the unit-testable core of the
+/// injection. The empty-prep case returns `None`, mirroring `render_turn_guidance`.
+fn render_longhouse_prep(prep: &ocean_longhouse::TurnPrep) -> Option<String> {
+    if prep.is_empty() {
+        return None;
+    }
+    let mut block = String::from(
+        "Longhouse consult (advisory — relevant skills/SOPs for this turn; \
+         recommendations only, not granted capabilities; you still route every \
+         action through the normal permission gates):",
+    );
+    for skill in &prep.skills {
+        block.push_str("\n- ");
+        block.push_str(&skill.name);
+        let desc = skill.description.trim();
+        if !desc.is_empty() {
+            block.push_str(" — ");
+            block.push_str(desc);
+        }
+    }
+    for sop in &prep.sops {
+        block.push_str("\n- ");
+        block.push_str(&sop.name);
+        let desc = sop.description.trim();
+        if !desc.is_empty() {
+            block.push_str(" — ");
+            block.push_str(desc);
+        }
+    }
+    for wf in &prep.workflows {
+        block.push_str("\n- ");
+        block.push_str(&wf.name);
+        let desc = wf.description.trim();
+        if !desc.is_empty() {
+            block.push_str(" — ");
+            block.push_str(desc);
+        }
+    }
+    Some(block)
+}
+
+/// Layer a Longhouse consult brief on top of an already-composed turn prompt.
+///
+/// `prep` is `None` (consult disabled / errored) or an empty [`ocean_longhouse::TurnPrep`]
+/// → the prompt is returned **unchanged**, byte-for-byte. A non-empty prep is
+/// rendered by [`render_longhouse_prep`] and **prepended** (advisory block, blank
+/// line, then the prompt), exactly how room/operator guidance is layered
+/// (`apply_turn_guidance`) — steering context precedes the task, the task text is
+/// never mutated.
+///
+/// This is the pure seam the turn-hook test drives: feed it a known prep and
+/// assert the brief reaches the prompt; feed it `None` and assert the prompt is
+/// untouched. No env, no disk, no async.
+fn apply_longhouse_prep(prompt: &str, prep: Option<&ocean_longhouse::TurnPrep>) -> String {
+    match prep.and_then(render_longhouse_prep) {
+        Some(block) => format!("{block}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
+}
+
+/// The async, env-gated, off-hot-path side of the consult: when
+/// `OCEAN_LONGHOUSE_PREPARE` is on, load the local skill index and rank it against
+/// `prompt`, returning the compact [`ocean_longhouse::TurnPrep`] to inject. Returns
+/// `None` (inject nothing) when the gate is off, the result is empty, or the scan
+/// task fails — every one of which is a fail-open no-op that leaves the turn
+/// exactly as it was without the hook.
+///
+/// The skill-library disk walk (`~/.spawner/skills`, `~/.codex/skills`, plus the
+/// turn's repo-local `./skills` when `cwd` is set) runs on `spawn_blocking`, the
+/// same way the `longhouse_prepare` HTTP handler does — filesystem I/O must never
+/// run on the async scheduler and stall the turn. The cheap keyword ranking then
+/// runs inside the same blocking closure. This performs no side effects and
+/// touches no permission gate: it reads files and ranks them, nothing more.
+async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_longhouse::TurnPrep> {
+    if !longhouse_prepare_enabled() {
+        return None;
+    }
+    // Empty prompt can never rank anything; skip the disk walk entirely.
+    if prompt.trim().is_empty() {
+        return None;
+    }
+
+    let prep = tokio::task::spawn_blocking(move || {
+        let roots = if cwd.is_empty() {
+            ocean_longhouse::SkillRoots::default()
+        } else {
+            ocean_longhouse::SkillRoots::for_cwd(&cwd)
+        };
+        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        let brief = ocean_longhouse::TurnBrief {
+            prompt,
+            cwd: Some(cwd),
+            ..Default::default()
+        };
+        index.prepare(&brief)
+    })
+    .await;
+
+    match prep {
+        // Empty prep → inject nothing (no library on disk, or nothing matched).
+        Ok(prep) if !prep.is_empty() => Some(prep),
+        Ok(_) => None,
+        Err(err) => {
+            // spawn_blocking only errors on a panic; the loader/ranker don't
+            // panic, but stay fail-open regardless — a turn never fails on prep.
+            tracing::warn!(error = %err, "longhouse pre-turn consult task failed; injecting no brief");
+            None
+        }
     }
 }
 
@@ -9770,6 +9950,256 @@ mod tests {
             "a nonsense prompt must match nothing, got {:?}",
             prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+    }
+
+    // ---- OCEAN-245: opt-in Longhouse pre-turn consult turn-hook ----------------
+    //
+    // These pin the phase-2 hook that wires `prepare` into the turn path: with the
+    // gate ON a turn consults Longhouse and the compact brief reaches the prompt
+    // the model sees; with it OFF (the default) the turn prompt is byte-for-byte
+    // unchanged. They also pin the three Longhouse invariants — advisory (text
+    // only, never a gate/exec), fail-open (empty/error → no brief, never a block),
+    // and the env gate's default-off posture.
+
+    /// Dedicated lock serializing the `OCEAN_LONGHOUSE_PREPARE` env mutation in the
+    /// tests below (process env is global; parallel test threads would race it),
+    /// mirroring `YOLO_ENV_LOCK`.
+    static LONGHOUSE_PREPARE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn longhouse_prepare_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        LONGHOUSE_PREPARE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Build a non-empty `TurnPrep` with the given (name, description) skills, for
+    /// the pure renderer/injection tests (no disk, no env).
+    fn prep_with(skills: &[(&str, &str)]) -> ocean_longhouse::TurnPrep {
+        ocean_longhouse::TurnPrep {
+            skills: skills
+                .iter()
+                .map(|(name, desc)| ocean_longhouse::SkillBrief {
+                    name: name.to_string(),
+                    description: desc.to_string(),
+                    source_path: std::path::PathBuf::from(format!("/skills/{name}")),
+                    source: ocean_longhouse::SkillSource::Repo,
+                })
+                .collect(),
+            sops: Vec::new(),
+            workflows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_longhouse_prep_empty_is_none() {
+        // The fail-open / no-op case: nothing to inject → no block at all.
+        assert!(render_longhouse_prep(&ocean_longhouse::TurnPrep::default()).is_none());
+    }
+
+    #[test]
+    fn render_longhouse_prep_lists_skills_under_an_advisory_header() {
+        let prep = prep_with(&[
+            ("Remotion Video", "Build programmatic videos in React"),
+            ("Supabase Postgres", "Optimize Postgres queries and schema"),
+        ]);
+        let block = render_longhouse_prep(&prep).expect("non-empty prep renders a block");
+
+        // Framed explicitly as ADVISORY, not an instruction or a granted
+        // capability — this is the contract that the brief can't read as
+        // permission to bypass a gate.
+        let lower = block.to_ascii_lowercase();
+        assert!(lower.contains("advisory"), "header must mark the block advisory");
+        assert!(
+            lower.contains("permission gates"),
+            "header must remind the model it still routes through the gates"
+        );
+        // Each skill surfaces as a `name — description` bullet.
+        assert!(block.contains("- Remotion Video — Build programmatic videos in React"));
+        assert!(block.contains("- Supabase Postgres — Optimize Postgres queries and schema"));
+    }
+
+    #[test]
+    fn apply_longhouse_prep_none_leaves_prompt_byte_for_byte() {
+        // The default-path shape: no consult → the prompt is returned unchanged.
+        let prompt = "ship the feature";
+        assert_eq!(apply_longhouse_prep(prompt, None), prompt);
+        // An empty prep is the same no-op (fail-open: nothing matched).
+        let empty = ocean_longhouse::TurnPrep::default();
+        assert_eq!(apply_longhouse_prep(prompt, Some(&empty)), prompt);
+    }
+
+    #[test]
+    fn apply_longhouse_prep_prepends_brief_above_the_prompt() {
+        let prep = prep_with(&[("Remotion Video", "Build programmatic videos in React")]);
+        let prompt = "render a promo clip";
+        let out = apply_longhouse_prep(prompt, Some(&prep));
+
+        // The brief reaches the prompt context...
+        assert!(out.contains("Remotion Video"), "brief must reach the prompt");
+        // ...and the original task text is preserved, untouched, after it.
+        assert!(out.ends_with(prompt), "task text preserved verbatim at the end");
+        let brief_at = out.find("Remotion Video").unwrap();
+        let prompt_at = out.find(prompt).unwrap();
+        assert!(brief_at < prompt_at, "advisory brief precedes the task prompt");
+    }
+
+    /// End-to-end at the real seam the turn path uses: layering the consult on top
+    /// of the already-guided prompt injects the brief AND preserves operator
+    /// guidance + the task; disabling the consult yields exactly the guided prompt
+    /// (the turn is unchanged). This is the "brief reaches the prompt context vs.
+    /// turn unchanged" assertion, expressed through the same two functions
+    /// `agent_turn` calls in sequence.
+    #[test]
+    fn turn_seam_injects_consult_when_present_and_is_unchanged_when_absent() {
+        let guidance = vec!["focus on tests".to_string()];
+        let guided = apply_turn_guidance(None, Some(&guidance), "build the widget");
+
+        // Consult disabled (None) → composed prompt IS the guided prompt, verbatim.
+        assert_eq!(
+            apply_longhouse_prep(&guided, None),
+            guided,
+            "with the consult off, the turn prompt must be unchanged"
+        );
+
+        // Consult enabled → brief is prepended; guidance + task both survive below.
+        let prep = prep_with(&[("Widget Builder", "Use when building a widget")]);
+        let composed = apply_longhouse_prep(&guided, Some(&prep));
+        assert!(composed.contains("Widget Builder"), "consult brief reaches prompt");
+        assert!(
+            composed.contains("Operator guidance for this turn:"),
+            "operator guidance is preserved under the consult"
+        );
+        assert!(composed.contains("build the widget"), "task text is preserved");
+        // Ordering: advisory consult, then operator guidance, then the task.
+        let consult_at = composed.find("Widget Builder").unwrap();
+        let guidance_at = composed.find("Operator guidance for this turn:").unwrap();
+        let task_at = composed.find("build the widget").unwrap();
+        assert!(consult_at < guidance_at, "consult precedes operator guidance");
+        assert!(guidance_at < task_at, "guidance precedes the task");
+    }
+
+    #[test]
+    fn longhouse_prepare_enabled_defaults_off_and_opts_in_explicitly() {
+        let _guard = longhouse_prepare_env_guard();
+        let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
+
+        // Unset → OFF. This is the safety invariant: nothing configured ⇒ inert.
+        env::remove_var("OCEAN_LONGHOUSE_PREPARE");
+        assert!(
+            !longhouse_prepare_enabled(),
+            "unset OCEAN_LONGHOUSE_PREPARE must keep the consult off (default)"
+        );
+        for off in ["", "0", "false", "no", "off", "nonsense"] {
+            env::set_var("OCEAN_LONGHOUSE_PREPARE", off);
+            assert!(
+                !longhouse_prepare_enabled(),
+                "OCEAN_LONGHOUSE_PREPARE={off:?} must stay off"
+            );
+        }
+        for on in ["1", "true", "TRUE", "Yes", "on"] {
+            env::set_var("OCEAN_LONGHOUSE_PREPARE", on);
+            assert!(
+                longhouse_prepare_enabled(),
+                "OCEAN_LONGHOUSE_PREPARE={on:?} must opt into the consult"
+            );
+        }
+
+        match prior {
+            Some(v) => env::set_var("OCEAN_LONGHOUSE_PREPARE", v),
+            None => env::remove_var("OCEAN_LONGHOUSE_PREPARE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn longhouse_prep_for_turn_off_by_default_injects_nothing() {
+        let _guard = longhouse_prepare_env_guard();
+        let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
+
+        // A planted, on-topic repo skill that WOULD match — proving the `None` is
+        // the gate's doing, not an absent library.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        plant_repo_skill(
+            cwd,
+            "zorptastic",
+            "Zorptastic Widget",
+            "Use when building a zorptastic widget",
+        );
+
+        env::remove_var("OCEAN_LONGHOUSE_PREPARE");
+        let prep = longhouse_prep_for_turn(
+            "help me build a zorptastic widget".to_string(),
+            cwd.to_string_lossy().into_owned(),
+        )
+        .await;
+        assert!(
+            prep.is_none(),
+            "default-off gate must consult nothing even when a skill would match"
+        );
+
+        match prior {
+            Some(v) => env::set_var("OCEAN_LONGHOUSE_PREPARE", v),
+            None => env::remove_var("OCEAN_LONGHOUSE_PREPARE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn longhouse_prep_for_turn_consults_when_enabled_and_is_fail_open() {
+        let _guard = longhouse_prepare_env_guard();
+        let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
+        env::set_var("OCEAN_LONGHOUSE_PREPARE", "1");
+
+        // (a) Enabled + a matching repo skill → the brief surfaces and would inject.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        // Nonce term no real host skill carries, so the match is unambiguously ours
+        // regardless of the machine's ~/.spawner / ~/.codex libraries.
+        plant_repo_skill(
+            cwd,
+            "zorptastic",
+            "Zorptastic Widget",
+            "Use when building a zorptastic widget for the flux capacitor",
+        );
+        let prep = longhouse_prep_for_turn(
+            "help me build a zorptastic widget".to_string(),
+            cwd.to_string_lossy().into_owned(),
+        )
+        .await
+        .expect("an on-topic prompt with the gate on must produce a brief");
+        assert!(
+            prep.skills.iter().any(|s| s.name == "Zorptastic Widget"),
+            "the planted repo skill must surface in the consult, got {:?}",
+            prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        // And it threads through the injection seam into the prompt.
+        let injected = apply_longhouse_prep("build the zorptastic widget", Some(&prep));
+        assert!(injected.contains("Zorptastic Widget"));
+
+        // (b) Fail-open: enabled but an irrelevant prompt against an empty `./skills`
+        // → no brief (None), never an error, so the turn proceeds untouched.
+        let empty_tmp = tempfile::tempdir().expect("tempdir");
+        let none = longhouse_prep_for_turn(
+            "qqzzxx-nonexistent-nonsense-token-7yt".to_string(),
+            empty_tmp.path().to_string_lossy().into_owned(),
+        )
+        .await;
+        assert!(
+            none.is_none(),
+            "an unmatched prompt must inject nothing (fail-open), got {none:?}"
+        );
+
+        // (c) Fail-open on an empty prompt: skip the scan entirely → None.
+        assert!(
+            longhouse_prep_for_turn(String::new(), cwd.to_string_lossy().into_owned())
+                .await
+                .is_none(),
+            "an empty prompt can rank nothing and must inject nothing"
+        );
+
+        match prior {
+            Some(v) => env::set_var("OCEAN_LONGHOUSE_PREPARE", v),
+            None => env::remove_var("OCEAN_LONGHOUSE_PREPARE"),
+        }
     }
 
     // ---- OCEAN-231: handler-level tests for the livekit-token + call_place ----
