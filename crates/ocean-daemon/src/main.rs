@@ -2227,13 +2227,18 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
             can_publish: true,
             can_subscribe: true,
         };
-        let token = match ocean_call::mint_join_token(&token_config, room, &token_req) {
-            Ok(t) => t.token,
-            Err(e) => {
-                tracing::warn!(room = %room, error = %e, "call-session token mint failed");
-                return;
-            }
-        };
+        // This is an IN-PROCESS server lane (the daemon joining its own call room
+        // to publish Ocean's TTS). It is entitled by construction — it never
+        // crosses the HTTP trust boundary — so it explicitly asks for publish
+        // (OCEAN-220). The wire authz gate lives on `room_livekit_token`.
+        let token =
+            match ocean_call::mint_join_token(&token_config, room, &token_req, ocean_call::PublishGrant::Allow) {
+                Ok(t) => t.token,
+                Err(e) => {
+                    tracing::warn!(room = %room, error = %e, "call-session token mint failed");
+                    return;
+                }
+            };
         let url = token_config.url.clone();
 
         // Persistence-enabled sink: a live call's transcript both streams onto the
@@ -2564,32 +2569,170 @@ async fn call_webhook(
     }
 }
 
+/// Env var holding the operator's LiveKit **publish** capability secret
+/// (OCEAN-220, P0). A request to `POST /v1/rooms/{room_id}/livekit-token` only
+/// receives a publish-capable token if it presents this exact value (bearer
+/// `Authorization` or `x-ocean-publish-token`); otherwise it gets a
+/// subscribe/listen-only token. Unset ⇒ NO HTTP caller can publish (fail-closed)
+/// — the in-process call lane is unaffected because it never hits this route.
+const PUBLISH_TOKEN_ENV: &str = "OCEAN_LIVEKIT_PUBLISH_TOKEN";
+
+/// The `call:` key prefix marks a server-authored call/meeting room: created by
+/// the call lifecycle (`CallStarted`) or the inbound webhook (`JoinCall`), never
+/// by a wire client. These are the sensitive rooms a live call runs in, so the
+/// token route refuses to mint for a `call:` room the server didn't author
+/// (OCEAN-220).
+const CALL_ROOM_PREFIX: &str = "call:";
+
+/// Decide whether this request is entitled to a PUBLISH grant (OCEAN-220, P0).
+///
+/// Publish = the right to inject audio/video into the room, so it is gated on
+/// proof the caller is the operator: a server-side secret (`OCEAN_LIVEKIT_PUBLISH_TOKEN`)
+/// presented as `Authorization: Bearer <token>` or `x-ocean-publish-token: <token>`,
+/// compared in constant time (the same primitive OCEAN-185 uses for permission
+/// decisions). Default-deny: no env configured, or a missing/wrong header, and
+/// the caller gets [`ocean_call::PublishGrant::Deny`] (a listen-only token).
+///
+/// This is the OCEAN-160 move applied to publish: the wire `can_publish` flag is
+/// inert; the capability is resolved purely from operator policy here.
+fn resolve_publish_grant(headers: &HeaderMap) -> ocean_call::PublishGrant {
+    // No operator secret configured → no HTTP caller may publish. Fail-closed.
+    let Some(expected) = std::env::var(PUBLISH_TOKEN_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return ocean_call::PublishGrant::Deny;
+    };
+
+    let presented = headers
+        .get("x-ocean-publish-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // `Authorization: Bearer <token>` form.
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+
+    if ocean_core::decision_token_matches(Some(expected.as_str()), presented) {
+        ocean_call::PublishGrant::Allow
+    } else {
+        // Secret is set but the caller didn't present a matching one: deny
+        // publish (still allowed to subscribe). Never log the token value.
+        if presented.is_some() {
+            tracing::warn!(
+                "livekit-token: publish denied — invalid publish capability token (OCEAN-220)"
+            );
+        }
+        ocean_call::PublishGrant::Deny
+    }
+}
+
+/// Whether a token may be minted for `room_id` given the room store (OCEAN-220,
+/// P0 — gate 1, the existence check).
+///
+/// - A `call:` room is server-authored (created only by the call lifecycle /
+///   inbound webhook). We mint ONLY if such a room currently EXISTS and is OPEN
+///   in the store — a closed or never-created call room is refused, so a caller
+///   cannot fabricate a token for an arbitrary in-progress call id.
+/// - Any other room id (the operator's own `project:`/surface spaces, opened
+///   ad-hoc by the local surface and created lazily by LiveKit on first join) is
+///   allowed through this gate — existence-gating them would break the legitimate
+///   "open a fresh surface room" flow, and they are not call-eavesdrop targets.
+///   Publish into them is still independently gated by [`resolve_publish_grant`].
+fn call_room_token_allowed(store: &ocean_store::SqliteRoomStore, room_id: &str) -> bool {
+    if !room_id.starts_with(CALL_ROOM_PREFIX) {
+        return true;
+    }
+    let key = RoomKey::new(room_id);
+    matches!(store.get(&key), Ok(Some(_)))
+}
+
 /// `POST /v1/rooms/{room_id}/livekit-token` — mint a LiveKit join token for a
-/// room (OCEAN-137).
+/// room (OCEAN-137), AUTHORIZED (OCEAN-220, P0).
 ///
-/// This is the path the ocean-surface proxy and web surface already call to get
-/// a JWT for the `livekit-client` SDK; the daemon had every other room/calls
-/// route but not this one, so the proxied POST 404'd and in-room voice/video
-/// never connected on web. We honor the contract both clients expect here.
+/// This is the path the ocean-surface proxy and web surface call to get a JWT
+/// for the `livekit-client` SDK. Reuses the LiveKit credentials + token signing
+/// in `ocean_call::token` (just the three LiveKit auth vars; no Twilio SIP trunk
+/// needed). If those aren't configured, returns a clean 503 the surface renders
+/// as a degraded error — never a 404. The response is `{ ok, url, token, room }`,
+/// the shape the web bridge decodes.
 ///
-/// Reuses the LiveKit credentials + token signing in `ocean_call::token`, which
-/// reads just the three LiveKit auth vars (no Twilio SIP trunk needed). If those
-/// aren't configured, returns a clean 503 the surface renders as a degraded
-/// error (`{ ok:false, error }`) — never a 404. The response is
-/// `{ ok, url, token, room }`, the shape the web bridge decodes.
+/// ## Authorization (OCEAN-220, P0)
+///
+/// The original route signed a 6-hour `room_join` JWT for ANY caller-supplied
+/// `room_id`, with client-controlled `can_publish`/identity, with ZERO check
+/// that the requester was entitled to that room. Any local process (CORS does
+/// not gate non-browser clients; `OCEAN_BIND` can expose off-loopback) could
+/// mint publish credentials into an in-progress call. Two server-side gates
+/// close that, matching how the rest of the daemon does authz:
+///
+/// 1. **Existence-gate for `call:` rooms.** A `call:` room is server-authored
+///    (the call lifecycle / inbound webhook create it). We refuse to mint for a
+///    `call:` room that does not EXIST and is not OPEN in the room store (404,
+///    the same `UnknownRoom` shape the other room routes use). So a caller can
+///    no longer fabricate a token for an arbitrary live-call room id. Non-`call:`
+///    rooms (the operator's own `project:`/surface spaces, opened ad-hoc by the
+///    local surface) are not existence-gated — that would break the legitimate
+///    "open a fresh surface room" flow, and they are not call-eavesdrop targets.
+///
+/// 2. **Publish is server-derived, never wire-trusted.** `req.can_publish` is
+///    ignored (OCEAN-160 pattern). A token is publish-capable ONLY if the caller
+///    proves operator entitlement via `OCEAN_LIVEKIT_PUBLISH_TOKEN` (see
+///    [`resolve_publish_grant`]); otherwise it is subscribe/listen-only. So an
+///    unauthorized caller, even for a room it is allowed to observe, can never
+///    inject media.
+///
+/// This establishes: "no HTTP caller mints publish creds for any room without
+/// the operator secret, and none mints any token for an unknown call room." It
+/// is intentionally NOT full per-identity room membership (the route carries no
+/// authenticated session to bind to, unlike `agent_turn`); that is the documented
+/// next step. The in-process call lane is unaffected (it never hits this route).
 async fn room_livekit_token(
+    State(state): State<AppState>,
     Path(room_id): Path<String>,
+    headers: HeaderMap,
     body: Option<Json<ocean_call::LiveKitTokenRequest>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if room_id.trim().is_empty() {
+    let room_id_trimmed = room_id.trim();
+    if room_id_trimmed.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "ok": false, "error": "room_id is empty" })),
         );
     }
 
-    // A missing/empty body is fine — the grants default to publish+subscribe.
+    // OCEAN-220 gate 1: a `call:` room must be one the SERVER authored and that
+    // is still open. Minting for an unknown/closed call room is refused (404),
+    // so a caller cannot get any token for an arbitrary in-progress call id.
+    let call_room_known =
+        with_rooms(&state, |store| call_room_token_allowed(store, room_id_trimmed));
+    if !call_room_known {
+        tracing::warn!(
+            room = %room_id_trimmed,
+            "rejected livekit-token: unknown/closed call room (OCEAN-220)"
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("no open room '{room_id_trimmed}'"),
+            })),
+        );
+    }
+
+    // A missing/empty body is fine — identity falls back, subscribe defaults on.
     let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    // OCEAN-220 gate 2: publish is decided HERE from operator policy, never from
+    // the wire `req.can_publish`.
+    let publish = resolve_publish_grant(&headers);
 
     let config = match ocean_call::LiveKitTokenConfig::from_env() {
         Ok(c) => c,
@@ -2609,7 +2752,7 @@ async fn room_livekit_token(
         }
     };
 
-    match ocean_call::mint_join_token(&config, &room_id, &req) {
+    match ocean_call::mint_join_token(&config, room_id_trimmed, &req, publish) {
         Ok(resp) => (
             StatusCode::OK,
             Json(serde_json::to_value(resp).unwrap_or_else(|_| {
@@ -8485,5 +8628,154 @@ mod tests {
                 "the oldest terminal entries must be the ones evicted by the cap"
             );
         }
+    }
+
+    // ---- OCEAN-220 (P0): LiveKit token authorization -----------------------
+    //
+    // The token route used to mint a 6-hour publish-capable `room_join` JWT for
+    // ANY caller-supplied room id, with client-controlled `can_publish`, with no
+    // entitlement check. These tests pin the two server-side gates that close it:
+    //   gate 1 — `call_room_token_allowed`: no token for an unknown/closed call room
+    //   gate 2 — `resolve_publish_grant`:   no publish without the operator secret
+
+    /// Serializes tests that mutate the publish-token env var, like the yolo
+    /// tests do for their env (parallel unit tests share one process env).
+    static PUBLISH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn publish_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        PUBLISH_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// GATE 1 — the load-bearing rejection: a token request for a `call:` room
+    /// the server never authored is refused. This is the exact attack the ticket
+    /// names — minting credentials into an arbitrary in-progress call room.
+    #[test]
+    fn unknown_call_room_is_rejected() {
+        let store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        // Nothing created → an attacker-chosen call room id is unknown.
+        assert!(
+            !call_room_token_allowed(&store, "call:victims-meeting"),
+            "must NOT mint a token for a call room the server didn't author"
+        );
+    }
+
+    /// GATE 1 — the legit path still works: once the call lifecycle has authored
+    /// the room (as `BusSink::persist` does on `CallStarted`), the same id is
+    /// accepted, so a real in-call participant can still get a token.
+    #[test]
+    fn known_open_call_room_is_allowed() {
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let room = "call:real-call-abc";
+        store
+            .create(RoomKey::new(room), "Call transcript", None, Utc::now())
+            .unwrap();
+        assert!(
+            call_room_token_allowed(&store, room),
+            "a server-authored, open call room must still mint a token"
+        );
+    }
+
+    /// GATE 1 — a closed call room is refused: once the call ends the room is
+    /// soft-closed, and a stale token request for it must not succeed.
+    #[test]
+    fn closed_call_room_is_rejected() {
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let room = "call:ended-call";
+        store
+            .create(RoomKey::new(room), "Call transcript", None, Utc::now())
+            .unwrap();
+        store.close(&RoomKey::new(room)).unwrap();
+        assert!(
+            !call_room_token_allowed(&store, room),
+            "a closed call room must not mint a token"
+        );
+    }
+
+    /// GATE 1 — non-`call:` rooms are NOT existence-gated: the operator's own
+    /// surface/`project:` spaces are opened ad-hoc and created lazily by LiveKit
+    /// on first join, so requiring them to pre-exist would break the legitimate
+    /// "open a fresh surface room" flow. (Publish into them is still gated.)
+    #[test]
+    fn non_call_rooms_pass_existence_gate() {
+        let store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        // The surface's default room id — never pre-created in the store.
+        assert!(call_room_token_allowed(&store, "project:surface-main"));
+        assert!(call_room_token_allowed(&store, "anything-else"));
+    }
+
+    /// GATE 2 — fail-closed default: with NO operator secret configured, NO HTTP
+    /// caller can publish, even one that sets `can_publish` on the wire and sends
+    /// arbitrary auth headers. Listen-only is the most a wire caller ever gets by
+    /// default.
+    #[test]
+    fn publish_denied_when_no_secret_configured() {
+        let _g = publish_env_guard();
+        std::env::remove_var(PUBLISH_TOKEN_ENV);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ocean-publish-token", HeaderValue::from_static("anything"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer anything"),
+        );
+        assert_eq!(
+            resolve_publish_grant(&headers),
+            ocean_call::PublishGrant::Deny,
+            "no operator secret ⇒ no HTTP caller may publish"
+        );
+        // And an empty request (no headers) is likewise listen-only.
+        assert_eq!(
+            resolve_publish_grant(&HeaderMap::new()),
+            ocean_call::PublishGrant::Deny
+        );
+    }
+
+    /// GATE 2 — with the operator secret set, a caller that presents the matching
+    /// value (via either header form) is granted publish; a wrong/absent value is
+    /// denied. This is the entitled-operator path that keeps in-room voice working.
+    #[test]
+    fn publish_requires_matching_operator_secret() {
+        let _g = publish_env_guard();
+        std::env::set_var(PUBLISH_TOKEN_ENV, "s3cret-operator-token");
+
+        // Correct secret via the dedicated header → publish allowed.
+        let mut ok_hdr = HeaderMap::new();
+        ok_hdr.insert(
+            "x-ocean-publish-token",
+            HeaderValue::from_static("s3cret-operator-token"),
+        );
+        assert_eq!(
+            resolve_publish_grant(&ok_hdr),
+            ocean_call::PublishGrant::Allow
+        );
+
+        // Correct secret via `Authorization: Bearer` → publish allowed.
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer s3cret-operator-token"),
+        );
+        assert_eq!(
+            resolve_publish_grant(&bearer),
+            ocean_call::PublishGrant::Allow
+        );
+
+        // Wrong secret → denied (constant-time compare under the hood).
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            "x-ocean-publish-token",
+            HeaderValue::from_static("not-the-secret"),
+        );
+        assert_eq!(
+            resolve_publish_grant(&wrong),
+            ocean_call::PublishGrant::Deny
+        );
+
+        // No header at all → denied.
+        assert_eq!(
+            resolve_publish_grant(&HeaderMap::new()),
+            ocean_call::PublishGrant::Deny
+        );
+
+        std::env::remove_var(PUBLISH_TOKEN_ENV);
     }
 }
