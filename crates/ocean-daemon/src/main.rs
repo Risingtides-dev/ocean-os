@@ -1193,6 +1193,8 @@ async fn root() -> Json<serde_json::Value> {
             "POST /v1/longhouse/convene",
             "POST /v1/council/convene",
             "POST /v1/longhouse/prepare",
+            "POST /v1/skills/query",
+            "POST /v1/skills/fetch",
             "GET /v1/longhouse/topics",
             "GET /v1/longhouse/topics/{topic_id}",
             "POST /v1/longhouse/claim",
@@ -1899,6 +1901,11 @@ fn longhouse_routes() -> Router<AppState> {
         // Read-only pre-turn prep step — the "first safe integration slice"
         // (OCEAN-226). Advisory only; no gate, no side effect.
         .route("/v1/longhouse/prepare", post(longhouse_prepare))
+        // Skill-librarian query→fetch pair (OCEAN-281): the same SkillIndex the
+        // prep step uses, exposed as a standalone library browse — `query`
+        // ranks, `fetch` returns one skill's full body. Advisory + read-only.
+        .route("/v1/skills/query", post(skills_query))
+        .route("/v1/skills/fetch", post(skills_fetch))
         .route("/v1/longhouse/topics", get(longhouse_topics))
         .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
         // OCEAN-272: the persisted-escrow ops `longhouse_provider.rs` deferred.
@@ -2363,6 +2370,260 @@ async fn longhouse_prepare(
         "skills_indexed": skills_indexed,
         "prep": prep,
     }))
+}
+
+// --- Skill-librarian API: /v1/skills/query + /v1/skills/fetch (OCEAN-281) -----
+//
+// `docs/LONGHOUSE.md` §"Future Longhouse APIs" (lines 98-101) + §"Skill
+// Librarian future" (lines 123-136) describe a standalone, queryable skill
+// librarian: index the documented skill dirs, prefilter by relevance, return
+// 3–7 compact briefs, then fetch the full body of a chosen one on demand. The
+// in-process prep loop (`longhouse_prepare` above, OCEAN-226) already exposes
+// the ranking half via the shared `SkillIndex`; these two endpoints expose that
+// SAME indexer as a query→fetch pair so a non-turn caller (or a future
+// standalone Longhouse service) can browse the library directly.
+//
+// Both are **advisory + read-only** (the repo's Longhouse rule + line 115):
+// they load the index off disk, rank or read, and return — no execution, no
+// permission gate, no mutation. `query` is the deterministic prefilter
+// (`SkillIndex::prepare`/`prepare_top_n`); `fetch` reads one skill's full file
+// body, but ONLY for a `source_path` the indexer itself discovered — it never
+// reads an arbitrary path off disk, so it cannot be turned into a file-read
+// primitive. The disk scan + file read run on `spawn_blocking`, off the async
+// scheduler, exactly like `longhouse_prepare`.
+//
+// **Skill id = `source_path`.** `SkillBrief` carries no synthetic id; its
+// absolute `source_path` is already unique, stable, and (per the `SkillSource`
+// doc-comment) the documented handle for fetching the body later. `query`
+// returns it as `id` on each brief; `fetch` takes it back as `id`.
+
+/// Request body for `POST /v1/skills/query` — the skill-librarian prefilter.
+///
+/// Carries the same inputs as [`LonghousePrepareRequest`] (a query/prompt, an
+/// optional `cwd`, and a result cap), but is framed as a librarian query rather
+/// than a pre-turn brief. The caller asks which skills are relevant to an intent
+/// and gets ranked briefs back, each carrying an `id` it can then hand to fetch.
+#[derive(serde::Deserialize)]
+struct SkillQueryRequest {
+    /// The query / intent text to rank skills against (same role as a turn
+    /// prompt). An empty query yields an empty result (fail-open), not an error.
+    #[serde(default)]
+    query: String,
+    /// Working directory to scope repo-local `./skills` into the scan, on top of
+    /// the documented home libraries (`SkillRoots::for_cwd`). Omitted → home
+    /// libraries only.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Cap on how many compact briefs to return. Defaults to
+    /// [`ocean_longhouse::DEFAULT_TOP_N`] (the doc's "3–7") when omitted.
+    #[serde(default)]
+    top_n: Option<usize>,
+}
+
+/// `POST /v1/skills/query` — the **skill-librarian prefilter** (OCEAN-281).
+///
+/// Runs the shared [`ocean_longhouse::SkillIndex`] — the exact indexer the
+/// pre-turn prep loop uses (`longhouse_prepare`) — over the documented skill
+/// dirs (`~/.spawner/skills`, `~/.codex/skills`, + repo-local `./skills` when a
+/// `cwd` is given) and returns the top-N compact briefs most relevant to the
+/// query by the deterministic keyword-overlap rank. This is `prepare`'s ranking
+/// surfaced as a standalone, queryable endpoint per `docs/LONGHOUSE.md`
+/// §"Skill Librarian future" step 1+3.
+///
+/// Each returned brief carries an `id` (its `source_path`) the caller hands to
+/// `POST /v1/skills/fetch` to pull the full body — the query→fetch flow.
+///
+/// **Advisory + read-only + fail-open** (matches `longhouse_prepare`): no
+/// execution, no permission gate; an empty/garbled library, an empty index, or
+/// an irrelevant query yields `ok: true` with an empty `skills` list — never an
+/// error. The disk walk runs on `spawn_blocking`.
+async fn skills_query(Json(req): Json<SkillQueryRequest>) -> Json<serde_json::Value> {
+    let SkillQueryRequest { query, cwd, top_n } = req;
+
+    // Reuse the prep indexer verbatim: a TurnBrief whose `prompt` is the query.
+    let brief = ocean_longhouse::TurnBrief {
+        prompt: query,
+        cwd: cwd.clone(),
+        ..Default::default()
+    };
+
+    // Load + rank on a blocking thread — same rationale as `longhouse_prepare`:
+    // the loader walks the skill dirs (filesystem I/O) and must stay off the
+    // async scheduler. Fail-open: a JoinError collapses to an empty result.
+    let result = tokio::task::spawn_blocking(move || {
+        let roots = match brief.cwd.as_deref() {
+            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
+            _ => ocean_longhouse::SkillRoots::default(),
+        };
+        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        let skills_indexed = index.len();
+        let prep = match top_n {
+            Some(n) => index.prepare_top_n(&brief, n),
+            None => index.prepare(&brief),
+        };
+        (prep.skills, skills_indexed)
+    })
+    .await;
+
+    let (skills, skills_indexed) = result.unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "skills query task failed; returning empty result");
+        (Vec::new(), 0)
+    });
+
+    // Shape each brief as a librarian record: a fetchable `id` (the source path)
+    // plus the compact fields. We render explicitly rather than serializing
+    // `SkillBrief` so the `id` ↔ fetch contract is visible on the wire.
+    let skills: Vec<serde_json::Value> = skills
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id": s.source_path.to_string_lossy(),
+                "name": s.name,
+                "description": s.description,
+                "source": s.source,
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "ok": true,
+        // Advisory: the librarian only ranks + returns. No gate, no side effect.
+        "advisory": true,
+        // Diagnostic: distinguishes "no library on disk" from "library present,
+        // nothing matched the query".
+        "skills_indexed": skills_indexed,
+        "skills": skills,
+    }))
+}
+
+/// Request body for `POST /v1/skills/fetch` — pull one skill's full body.
+#[derive(serde::Deserialize)]
+struct SkillFetchRequest {
+    /// The skill id to fetch — the `id` (= `source_path`) returned by
+    /// `POST /v1/skills/query`. Must be a path the indexer discovered; an
+    /// unknown id is a `404`, an arbitrary path is simply unknown (never read).
+    id: String,
+    /// Same optional `cwd` scoping as the query, so a repo-local skill id
+    /// (under `./skills`) resolves against the same roots it was queried from.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// `POST /v1/skills/fetch` — fetch one skill's **full body** by id (OCEAN-281).
+///
+/// The second half of the query→fetch flow (`docs/LONGHOUSE.md` §"Skill
+/// Librarian future" step 4 / §"First safe integration slice": "the daemon
+/// fetches the body on demand if a skill is selected"). Given an `id` returned
+/// by `POST /v1/skills/query`, returns that skill's compact brief PLUS the full
+/// text of its source file (`skill.yaml` / `SKILL.md`), so a caller can query
+/// for candidates and then read the one it chose.
+///
+/// **Security: the id must be a skill the indexer discovered.** We rebuild the
+/// shared [`ocean_longhouse::SkillIndex`] and only read a `source_path` that
+/// appears in it — never the raw `id` directly. So `fetch` cannot be coerced
+/// into reading an arbitrary file off disk: an unknown / out-of-library path is
+/// a `404`, not a file read.
+///
+/// **Advisory + read-only**: loads the index, matches the id, reads one file.
+/// No execution, no permission gate, no mutation. Index load + file read run on
+/// `spawn_blocking`. Errors map to typed `{ ok: false, error }` bodies:
+/// `404` for an unknown id, `500` only if the matched file became unreadable
+/// between index + read (a TOCTOU race) — mirrors the topic-fetch error shape.
+async fn skills_fetch(
+    Json(req): Json<SkillFetchRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let SkillFetchRequest { id, cwd } = req;
+
+    if id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "skill id must not be empty" })),
+        );
+    }
+
+    // Resolve on a blocking thread: rebuild the index (same roots as query),
+    // find the brief whose source_path == id, then read that file's full body.
+    // Only an indexed path is ever read — the raw id is never opened directly.
+    let id_for_task = id.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let roots = match cwd.as_deref() {
+            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
+            _ => ocean_longhouse::SkillRoots::default(),
+        };
+        let index = ocean_longhouse::SkillIndex::load_from(&roots);
+        let matched = index
+            .skills()
+            .iter()
+            .find(|s| s.source_path.to_string_lossy() == id_for_task)
+            .cloned();
+
+        match matched {
+            // Known skill: read its full body. A read failure here is a TOCTOU
+            // race (file vanished/changed perms after the index walk).
+            Some(brief) => match std::fs::read_to_string(&brief.source_path) {
+                Ok(body) => SkillFetchOutcome::Found { brief, body },
+                Err(err) => SkillFetchOutcome::Unreadable {
+                    error: err.to_string(),
+                },
+            },
+            // Not in the index → unknown id. Never read the raw `id` path.
+            None => SkillFetchOutcome::Unknown,
+        }
+    })
+    .await;
+
+    let outcome = outcome.unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "skills fetch task panicked");
+        SkillFetchOutcome::Unreadable {
+            error: "skill fetch task failed".to_string(),
+        }
+    });
+
+    match outcome {
+        SkillFetchOutcome::Found { brief, body } => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "advisory": true,
+                "skill": {
+                    "id": brief.source_path.to_string_lossy(),
+                    "name": brief.name,
+                    "description": brief.description,
+                    "source": brief.source,
+                    // The full skill body — the whole reason to fetch.
+                    "body": body,
+                },
+            })),
+        ),
+        SkillFetchOutcome::Unknown => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("no skill with id {id:?} in the skill index"),
+            })),
+        ),
+        SkillFetchOutcome::Unreadable { error } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": format!("skill {id:?} is indexed but its body could not be read: {error}"),
+            })),
+        ),
+    }
+}
+
+/// Result of resolving a `POST /v1/skills/fetch` id against the index, kept as
+/// an enum so the blocking closure stays synchronous (no `StatusCode` inside).
+enum SkillFetchOutcome {
+    /// Id matched an indexed skill and its body was read.
+    Found {
+        brief: ocean_longhouse::SkillBrief,
+        body: String,
+    },
+    /// Id matched no skill in the index → `404`.
+    Unknown,
+    /// Id matched, but the file could not be read (TOCTOU race) → `500`.
+    Unreadable { error: String },
 }
 
 // --- Call-transcript persistence: bounded retry + drop accounting (OCEAN-255) -
@@ -13633,6 +13894,281 @@ mod tests {
             "a nonsense prompt must match nothing, got {:?}",
             prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+    }
+
+    // ---- OCEAN-281: skill-librarian /v1/skills/query + /v1/skills/fetch --------
+    //
+    // These pin the standalone librarian endpoints that expose the SAME
+    // `SkillIndex` the prep loop uses (above): `query` ranks, `fetch` returns one
+    // skill's full body. Same hermetic trick as the prepare tests — plant a
+    // uniquely-named repo-local skill under a temp `cwd` and address it with a
+    // nonce token no real host library carries, so assertions are deterministic
+    // regardless of the machine's `~/.spawner` / `~/.codex` contents. They assert
+    // the query→fetch flow end to end, the advisory/read-only contract, the
+    // 404-on-unknown-id and 400-on-empty-id error shapes, and fail-open emptiness.
+
+    /// Plant a repo-local `./skills/<dir>/SKILL.md` (codex format) with a real
+    /// body under `cwd`, so a `fetch` can return content the compact brief omits.
+    fn plant_repo_skill_md(cwd: &std::path::Path, dir: &str, name: &str, desc: &str, body: &str) {
+        let skill_dir = cwd.join("skills").join(dir);
+        std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: \"{name}\"\ndescription: \"{desc}\"\n---\n\n{body}\n"),
+        )
+        .expect("write SKILL.md");
+    }
+
+    #[tokio::test]
+    async fn skills_query_returns_ranked_brief_with_fetchable_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        // Nonce token no real host skill carries → the match is unambiguously ours.
+        plant_repo_skill(
+            cwd,
+            "blorptastic",
+            "Blorptastic Engine",
+            "Use when tuning a blorptastic engine for the warp core",
+        );
+
+        let req = SkillQueryRequest {
+            query: "help me tune a blorptastic engine".to_string(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            top_n: None,
+        };
+        let Json(body) = skills_query(Json(req)).await;
+
+        assert_eq!(body["ok"], json!(true));
+        // Advisory contract asserted on the wire: the librarian only ranks.
+        assert_eq!(
+            body["advisory"],
+            json!(true),
+            "query endpoint must advertise itself advisory (no gate bypass)"
+        );
+
+        let skills = body["skills"].as_array().expect("skills is an array");
+        let planted = skills
+            .iter()
+            .find(|s| s["name"] == json!("Blorptastic Engine"))
+            .expect("planted skill must surface in the ranked result");
+        assert_eq!(planted["source"], json!("repo"));
+        assert!(
+            planted["description"]
+                .as_str()
+                .unwrap()
+                .contains("blorptastic engine"),
+            "brief carries the description"
+        );
+        // The fetchable id is the source_path, pointing at the planted file.
+        let id = planted["id"].as_str().expect("id present");
+        assert!(
+            id.ends_with("skills/blorptastic/skill.yaml"),
+            "id is the source_path of the planted skill, got {id:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_query_honors_top_n_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        // Three skills sharing a nonce term so ONLY these can score against it.
+        plant_repo_skill(cwd, "a", "Blorpquok Alpha", "a blorpquok skill alpha");
+        plant_repo_skill(cwd, "b", "Blorpquok Bravo", "a blorpquok skill bravo");
+        plant_repo_skill(cwd, "c", "Blorpquok Charlie", "a blorpquok skill charlie");
+
+        let req = SkillQueryRequest {
+            query: "blorpquok please".to_string(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            top_n: Some(2),
+        };
+        let Json(body) = skills_query(Json(req)).await;
+        let skills = body["skills"].as_array().expect("skills array");
+        assert_eq!(skills.len(), 2, "top_n=2 must cap the returned briefs");
+        assert!(
+            skills
+                .iter()
+                .all(|s| s["name"].as_str().unwrap().starts_with("Blorpquok")),
+            "only the nonce-matching planted skills can rank, got {skills:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_query_is_fail_open_on_irrelevant_query() {
+        // A unique-nonsense query matches nothing → empty `skills`, still ok:true.
+        // Does NOT assert the home libraries are empty; asserts the no-error
+        // contract holds even when nothing the caller asked for is present.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let req = SkillQueryRequest {
+            query: "qqzzxx-nonexistent-librarian-token-9pl".to_string(),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            top_n: None,
+        };
+        let Json(body) = skills_query(Json(req)).await;
+        assert_eq!(body["ok"], json!(true), "must stay ok with no matches");
+        assert_eq!(body["advisory"], json!(true));
+        assert!(
+            body["skills"].as_array().expect("skills array").is_empty(),
+            "a nonsense query must match nothing, got {:?}",
+            body["skills"]
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_fetch_returns_full_body_for_a_queried_id() {
+        // The whole query→fetch flow: query for a planted skill, take the `id` it
+        // returns, fetch that id, and assert we get the FULL file body (content the
+        // compact brief never carries). Uses a codex SKILL.md so the body is
+        // meaningfully larger than name+description.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        let unique_body =
+            "# Blizzcorp Protocol\n\nStep 1: spin up the blizzcorp manifold.\nStep 2: vent plasma.";
+        plant_repo_skill_md(
+            cwd,
+            "blizzcorp",
+            "Blizzcorp Protocol",
+            "Use when operating the blizzcorp manifold",
+            unique_body,
+        );
+
+        // 1) query → get the fetchable id.
+        let Json(qbody) = skills_query(Json(SkillQueryRequest {
+            query: "operate the blizzcorp manifold".to_string(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            top_n: None,
+        }))
+        .await;
+        let id = qbody["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == json!("Blizzcorp Protocol"))
+            .expect("planted skill in query result")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 2) fetch the id → full body.
+        let (status, Json(fbody)) = skills_fetch(Json(SkillFetchRequest {
+            id: id.clone(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fbody["ok"], json!(true));
+        assert_eq!(fbody["advisory"], json!(true));
+        assert_eq!(fbody["skill"]["id"], json!(id), "fetch echoes the queried id");
+        assert_eq!(fbody["skill"]["name"], json!("Blizzcorp Protocol"));
+        let returned_body = fbody["skill"]["body"].as_str().expect("body present");
+        assert!(
+            returned_body.contains("spin up the blizzcorp manifold")
+                && returned_body.contains("vent plasma"),
+            "fetch must return the FULL skill body, got {returned_body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_fetch_unknown_id_is_404() {
+        // An id the indexer never discovered (an arbitrary path) must 404, NOT be
+        // read off disk — the security contract that fetch can't be coerced into
+        // an arbitrary-file-read primitive. We point it at a real file outside any
+        // skills dir to prove the path being readable is irrelevant.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("secret.txt");
+        std::fs::write(&outside, "top secret, must never be returned").unwrap();
+
+        let (status, Json(body)) = skills_fetch(Json(SkillFetchRequest {
+            id: outside.to_string_lossy().into_owned(),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+        }))
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an id outside the skill index must 404, not be read"
+        );
+        assert_eq!(body["ok"], json!(false));
+        assert!(
+            body["error"].as_str().unwrap().contains("no skill with id"),
+            "typed not-found error, got {:?}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_fetch_empty_id_is_400() {
+        let (status, Json(body)) = skills_fetch(Json(SkillFetchRequest {
+            id: "   ".to_string(),
+            cwd: None,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// Both endpoints are reachable through the REAL `longhouse_routes()` table —
+    /// proves they're wired into the router `main()` mounts, not just callable
+    /// functions, and that an unregistered sibling under the same namespace 404s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skills_endpoints_are_wired_into_longhouse_routes() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let app = longhouse_routes().with_state(state);
+
+        async fn post_json(
+            app: Router,
+            path: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let req = axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri(path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        // query is a live route returning the librarian shape.
+        let (qs, qb) = post_json(
+            app.clone(),
+            "/v1/skills/query",
+            json!({ "query": "anything", "cwd": tmp.path().to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(qs, StatusCode::OK, "POST /v1/skills/query must be wired");
+        assert_eq!(qb["ok"], json!(true));
+        assert!(qb["skills"].is_array(), "query returns a skills array");
+
+        // fetch is a live route; an unknown id 404s through the router.
+        let (fs_status, fb) = post_json(
+            app.clone(),
+            "/v1/skills/fetch",
+            json!({ "id": "/definitely/not/a/skill" }),
+        )
+        .await;
+        assert_eq!(
+            fs_status,
+            StatusCode::NOT_FOUND,
+            "POST /v1/skills/fetch must be wired and 404 an unknown id"
+        );
+        assert_eq!(fb["ok"], json!(false));
+
+        // A sibling that was never registered still 404s: the routes are specific,
+        // not a wildcard swallowing the /v1/skills namespace.
+        let (miss, _) = post_json(app, "/v1/skills/nope", json!({})).await;
+        assert_eq!(miss, StatusCode::NOT_FOUND);
     }
 
     // ---- OCEAN-245: opt-in Longhouse pre-turn consult turn-hook ----------------
