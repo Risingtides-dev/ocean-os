@@ -18,6 +18,7 @@ members = [
   "crates/ocean-call",
   "crates/ocean-store",
   "crates/ocean-plugin",
+  "crates/ocean-context",
   "xtask",
 ]
 # xtask is a dev-only task runner (the cargo-xtask pattern). It compiles under
@@ -43,6 +44,7 @@ default-members = [
   "crates/ocean-call",
   "crates/ocean-store",
   "crates/ocean-plugin",
+  "crates/ocean-context",
 ]
 resolver = "2"
 
@@ -91,3 +93,5 @@ ocean-store = { path = "crates/ocean-store" }
 # coupling — matches the daemon's std::sync::Mutex room registry style.
 rusqlite = { version = "0.32", features = ["bundled"] }
 ocean-plugin = { path = "crates/ocean-plugin" }
+regex = "1"
+ocean-context = { path = "crates/ocean-context" }
