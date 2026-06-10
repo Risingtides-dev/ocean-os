@@ -5,5 +5,6 @@
 //! Spec: docs/specs/ocean-context-handoff-engine.md
 
 pub mod claim;
+pub mod extract;
 
 pub use claim::*;
