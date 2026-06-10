@@ -262,13 +262,6 @@ enum Action {
     StreamEvent(EventEnvelope),
     AgentTurnResponse(AgentTurnResponse),
     AgentStreamEvent(AgentTurnEvent),
-    /// OCEAN-305 (Codex P2): an agent event re-delivered by a `?replay=1`
-    /// full-history replay. The legacy `/v1/events` mirror already rendered
-    /// this turn's transcript/timeline lines live while the agent stream was
-    /// unscoped — so replayed events back-fill the PM chat pane (which WAS
-    /// blind) but must skip the shared transcript / tool-timeline / activity
-    /// surfaces to avoid doubling them.
-    AgentStreamReplayedEvent(AgentTurnEvent),
     /// OCEAN-305: a session id became known before the turn response (eager
     /// `POST /v1/agent/sessions` at submit time) — adopt it as the active
     /// session so the SSE stream re-scopes and later turns carry it.
@@ -2611,10 +2604,7 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
         Action::StreamStatus(status) => app.stream_status = status,
         Action::StreamEvent(envelope) => daemon_apply_stream_event(app, envelope),
         Action::AgentTurnResponse(response) => daemon_apply_agent_turn_response(app, response),
-        Action::AgentStreamEvent(event) => daemon_apply_agent_stream_event(app, event, false),
-        Action::AgentStreamReplayedEvent(event) => {
-            daemon_apply_agent_stream_event(app, event, true)
-        }
+        Action::AgentStreamEvent(event) => daemon_apply_agent_stream_event(app, event),
         Action::AgentSessionScoped(session_id) => {
             app.set_active_agent_session_id(Some(session_id));
             app.push_activity(format!(
@@ -3348,34 +3338,26 @@ fn daemon_apply_agent_turn_response(app: &mut DaemonApp, response: AgentTurnResp
     }
 }
 
-/// Apply an agent-stream event to the app. `replayed` is true for events
-/// re-delivered by a `?replay=1` full-history replay (OCEAN-305, Codex P2 on
-/// #202): while the agent stream was unscoped (and blind), the daemon's
-/// legacy `/v1/events` mirror already rendered that turn's assistant/tool
-/// lines into the shared transcript, tool timeline, activity rail, and diff
-/// sniffer via `daemon_apply_stream_event`. So replayed events back-fill the
-/// PM chat pane (which missed them) and keep state coherent (active session /
-/// turn ids, status), but SKIP the transcript / timeline / activity / diff
-/// pushes the legacy mirror already made — otherwise those panes show the
-/// same turn twice.
-fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, replayed: bool) {
-    if !replayed {
-        app.push_activity(summarize_agent_event(&event));
-    }
+/// Apply an agent-stream event to the app — the SINGLE writer of the shared
+/// render surfaces (transcript, tool timeline, diff capture) for agent-turn
+/// output (OCEAN-305, Codex round 3 on #202). The daemon marks every legacy
+/// `/v1/events` twin of agent output with `origin: "agent"`, and
+/// `daemon_apply_stream_event` skips rendering those mirrors, so events
+/// applied here — live or replayed via `?replay=1` — render unconditionally
+/// without double-drawing. Exactly-once application is guaranteed upstream by
+/// the stream thread's `ForwardedIds` (per SSE event id, across reconnects).
+fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
+    app.push_activity(summarize_agent_event(&event));
 
     // Longhouse council events ride on `AgentTurnEvent::Extension`. Fold them
     // into the tracked topics (OCEAN-42) before the by-value match consumes the
-    // event for the generic-extension fallback. (A session-scoped replay never
-    // carries Extension events — they are session-less and the daemon's scope
-    // filter drops them — so this stays effectively live-only.)
+    // event for the generic-extension fallback.
     if let Some(lh) = LonghouseEvent::from_turn_event(&event) {
         app.apply_longhouse_event(&lh);
-        if !replayed {
-            app.push_activity(format!(
-                "longhouse: {}",
-                compact_text(&summarize_longhouse_event(&lh), 72)
-            ));
-        }
+        app.push_activity(format!(
+            "longhouse: {}",
+            compact_text(&summarize_longhouse_event(&lh), 72)
+        ));
     }
 
     match event {
@@ -3385,13 +3367,11 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
             cwd,
         } => {
             app.set_active_agent_session_id(Some(session_id));
-            if !replayed {
-                app.push_transcript_if_new(format!(
-                    "agent session [{}] {}",
-                    short_id(session_id),
-                    compact_text(&title, 54)
-                ));
-            }
+            app.push_transcript_if_new(format!(
+                "agent session [{}] {}",
+                short_id(session_id),
+                compact_text(&title, 54)
+            ));
             app.status = format!(
                 "agent session {} · {}",
                 short_id(session_id),
@@ -3407,12 +3387,7 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
             app.active_agent_turn_id = Some(turn_id);
             app.streaming_agent_turn_id = None;
             app.status = format!("agent turn running: {}", short_id(turn_id));
-            if !replayed {
-                app.push_transcript_if_new(format!(
-                    "… agent turn [{}] started",
-                    short_id(turn_id)
-                ));
-            }
+            app.push_transcript_if_new(format!("… agent turn [{}] started", short_id(turn_id)));
         }
         AgentTurnEvent::AssistantTextDelta {
             turn_id,
@@ -3421,13 +3396,9 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
         } => {
             app.set_active_agent_session_id(Some(session_id));
             app.active_agent_turn_id = Some(turn_id);
-            if !replayed {
-                // The legacy mirror rendered this delta into the transcript
-                // (`AssistantDelta`) and fed the diff sniffer live.
-                app.append_agent_assistant_delta(turn_id, &delta);
-                app.capture_diff_excerpt(&delta);
-            }
+            app.append_agent_assistant_delta(turn_id, &delta);
             app.pm_append_assistant_text(turn_id, &delta);
+            app.capture_diff_excerpt(&delta);
         }
         AgentTurnEvent::ThinkingDelta {
             turn_id,
@@ -3446,29 +3417,27 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
             app.set_active_agent_session_id(Some(session_id));
             app.active_agent_turn_id = Some(turn_id);
             let args_text = humanize_tool_args(&call.name, &call.args_json);
-            if !replayed {
-                app.push_agent_tool_timeline(
-                    turn_id,
-                    &call.name,
-                    "started",
-                    compact_text(&args_text, 72),
-                );
-                app.push_transcript(format!(
-                    "Tool: {} started {}",
-                    call.name,
-                    compact_text(&args_text, 96)
-                ));
-                // The diff sniffer wants the raw args (it looks for diff/patch
-                // payloads), not the humanized header line.
-                app.capture_diff_excerpt(
-                    &serde_json::to_string(&call.args_json).unwrap_or_else(|_| "{}".to_string()),
-                );
-            }
+            app.push_agent_tool_timeline(
+                turn_id,
+                &call.name,
+                "started",
+                compact_text(&args_text, 72),
+            );
+            app.push_transcript(format!(
+                "Tool: {} started {}",
+                call.name,
+                compact_text(&args_text, 96)
+            ));
             app.pm_push_tool_started(
                 turn_id,
                 call.id.0.to_string(),
                 call.name.clone(),
                 compact_text(&args_text, 60),
+            );
+            // The diff sniffer wants the raw args (it looks for diff/patch
+            // payloads), not the humanized header line.
+            app.capture_diff_excerpt(
+                &serde_json::to_string(&call.args_json).unwrap_or_else(|_| "{}".to_string()),
             );
         }
         AgentTurnEvent::ToolCallChunk {
@@ -3479,21 +3448,19 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
         } => {
             app.set_active_agent_session_id(Some(session_id));
             app.active_agent_turn_id = Some(turn_id);
-            if !replayed {
-                app.push_agent_tool_timeline(
-                    turn_id,
-                    &format!("tool {}", short_id(&call_id)),
-                    "chunk",
-                    compact_text(&chunk, 72),
-                );
-                app.push_transcript(format!(
-                    "Tool: {} output {}",
-                    short_id(&call_id),
-                    compact_text(&chunk, 120)
-                ));
-                app.capture_diff_excerpt(&chunk);
-            }
+            app.push_agent_tool_timeline(
+                turn_id,
+                &format!("tool {}", short_id(&call_id)),
+                "chunk",
+                compact_text(&chunk, 72),
+            );
+            app.push_transcript(format!(
+                "Tool: {} output {}",
+                short_id(&call_id),
+                compact_text(&chunk, 120)
+            ));
             app.pm_append_tool_chunk(turn_id, &call_id.0.to_string(), &chunk);
+            app.capture_diff_excerpt(&chunk);
         }
         AgentTurnEvent::ToolCallFinished {
             turn_id,
@@ -3503,22 +3470,20 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
         } => {
             app.set_active_agent_session_id(Some(session_id));
             app.active_agent_turn_id = Some(turn_id);
-            if !replayed {
-                app.push_agent_tool_timeline(
-                    turn_id,
-                    &format!("tool {}", short_id(&call_id)),
-                    if result.ok { "finished" } else { "failed" },
-                    compact_text(&result.output, 72),
-                );
-                app.push_transcript(format!(
-                    "Tool: {} {} {}",
-                    short_id(&call_id),
-                    if result.ok { "done" } else { "failed" },
-                    compact_text(&result.output, 120)
-                ));
-                app.capture_diff_excerpt(&result.output);
-            }
+            app.push_agent_tool_timeline(
+                turn_id,
+                &format!("tool {}", short_id(&call_id)),
+                if result.ok { "finished" } else { "failed" },
+                compact_text(&result.output, 72),
+            );
+            app.push_transcript(format!(
+                "Tool: {} {} {}",
+                short_id(&call_id),
+                if result.ok { "done" } else { "failed" },
+                compact_text(&result.output, 120)
+            ));
             app.pm_finish_tool(turn_id, &call_id.0.to_string(), result.ok, &result.output);
+            app.capture_diff_excerpt(&result.output);
         }
         AgentTurnEvent::TurnFinished {
             turn_id,
@@ -3535,21 +3500,19 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
             app.streaming_agent_turn_id = None;
             let perf = format_agent_turn_perf(wall_ms, output_tokens, tokens_per_second);
             app.status = format!("agent turn {:?}: {}{}", status, short_id(turn_id), perf);
-            if !replayed {
-                match error {
-                    Some(error) if !error.trim().is_empty() => app.push_transcript(format!(
-                        "✗ agent turn [{}] {:?}: {}",
-                        short_id(turn_id),
-                        status,
-                        compact_text(&error, 72)
-                    )),
-                    _ => app.push_transcript(format!(
-                        "✓ agent turn [{}] {:?}{}",
-                        short_id(turn_id),
-                        status,
-                        perf
-                    )),
-                }
+            match error {
+                Some(error) if !error.trim().is_empty() => app.push_transcript(format!(
+                    "✗ agent turn [{}] {:?}: {}",
+                    short_id(turn_id),
+                    status,
+                    compact_text(&error, 72)
+                )),
+                _ => app.push_transcript(format!(
+                    "✓ agent turn [{}] {:?}{}",
+                    short_id(turn_id),
+                    status,
+                    perf
+                )),
             }
         }
         AgentTurnEvent::Extension {
@@ -3557,7 +3520,7 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
         } => {
             // Longhouse extensions are already handled above; only log the
             // generic fallback for other extensions.
-            if !replayed && extension != LonghouseEvent::EXTENSION {
+            if extension != LonghouseEvent::EXTENSION {
                 app.push_activity(format!(
                     "agent_extension: {} {}",
                     extension,
@@ -3572,47 +3535,37 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent, r
             props: _,
             replace,
         } => {
-            if !replayed {
-                app.push_transcript(format!(
-                    "component {op} **{kind}** `{component_id}`",
-                    op = if replace { "replaced" } else { "rendered" }
-                ));
-            }
+            app.push_transcript(format!(
+                "component {op} **{kind}** `{component_id}`",
+                op = if replace { "replaced" } else { "rendered" }
+            ));
         }
         AgentTurnEvent::ComponentUnmount {
             session_id: _,
             component_id,
         } => {
-            if !replayed {
-                app.push_transcript(format!("component unmounted `{component_id}`"));
-            }
+            app.push_transcript(format!("component unmounted `{component_id}`"));
         }
         AgentTurnEvent::BrowserActivity { active, .. } => {
             // The TUI isn't the browser cockpit; just note the handoff.
-            if !replayed {
-                app.push_transcript(if active {
-                    "🌊 Ocean is driving the browser…".to_string()
-                } else {
-                    "🌊 browser handoff released".to_string()
-                });
-            }
+            app.push_transcript(if active {
+                "🌊 Ocean is driving the browser…".to_string()
+            } else {
+                "🌊 browser handoff released".to_string()
+            });
         }
         AgentTurnEvent::SurfacePatch {
             canvas_id, patches, ..
         } => {
             // The TUI isn't the canvas surface (that's GPUI); just note it.
-            if !replayed {
-                app.push_transcript(format!(
-                    "🎨 surface patch ×{} on `{canvas_id}`",
-                    patches.len()
-                ));
-            }
+            app.push_transcript(format!(
+                "🎨 surface patch ×{} on `{canvas_id}`",
+                patches.len()
+            ));
         }
         AgentTurnEvent::SlackCanvas { op, .. } => {
             // The TUI isn't the Slack surface (the bridge fulfills these); note it.
-            if !replayed {
-                app.push_transcript(format!("🗒️ slack canvas `{}`", op.op_name()));
-            }
+            app.push_transcript(format!("🗒️ slack canvas `{}`", op.op_name()));
         }
     }
 }
@@ -3637,6 +3590,17 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
     let permission_id = envelope.permission_id;
     app.push_activity(summarize_event(&envelope));
 
+    // OCEAN-305 (single-writer ownership): the daemon marks every legacy-bus
+    // twin of agent-turn output with `origin: "agent"` — the `emit_agent`
+    // mirror AND the agent-turn completion announcements (full-stdout
+    // AssistantDelta / TurnFinished / Error / Cancelled). The agent rail
+    // (`daemon_apply_agent_stream_event`) is the SOLE writer of the shared
+    // render surfaces (transcript, tool timeline, diff capture) for agent
+    // turns, live or replayed. Mirrors here keep their bookkeeping (request
+    // state, tokens, status) and the activity line above (a debug surface
+    // that shows provenance), but never re-render those surfaces.
+    let mirror = envelope.is_agent_mirror();
+
     match &envelope.event {
         OceanEvent::SessionCreated => {
             app.status = "session created".to_string();
@@ -3645,57 +3609,65 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
             app.push_transcript_if_new(format!("> {text}"));
         }
         OceanEvent::AssistantDelta { text } => {
-            app.append_assistant_delta(request_id, text);
-            app.capture_diff_excerpt(text);
+            if !mirror {
+                app.append_assistant_delta(request_id, text);
+                app.capture_diff_excerpt(text);
+            }
         }
         OceanEvent::ToolStarted { tool, args } => {
-            let args_text = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
-            app.push_tool_timeline(
-                request_id,
-                tool,
-                "started",
-                compact_text(&args_text, 72),
-                envelope.at,
-            );
-            app.push_transcript(format!(
-                "Tool: {} started {}",
-                tool,
-                compact_text(&args_text, 96)
-            ));
-            app.capture_diff_excerpt(&args_text);
+            if !mirror {
+                let args_text = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+                app.push_tool_timeline(
+                    request_id,
+                    tool,
+                    "started",
+                    compact_text(&args_text, 72),
+                    envelope.at,
+                );
+                app.push_transcript(format!(
+                    "Tool: {} started {}",
+                    tool,
+                    compact_text(&args_text, 96)
+                ));
+                app.capture_diff_excerpt(&args_text);
+            }
         }
         OceanEvent::ToolOutput {
             tool,
             text,
             is_error,
         } => {
-            app.push_tool_timeline(
-                request_id,
-                tool,
-                if *is_error { "stderr" } else { "output" },
-                compact_text(text, 72),
-                envelope.at,
-            );
-            app.push_transcript(format!(
-                "Tool: {} {} {}",
-                tool,
-                if *is_error { "stderr" } else { "output" },
-                compact_text(text, 120)
-            ));
-            app.capture_diff_excerpt(text);
+            if !mirror {
+                app.push_tool_timeline(
+                    request_id,
+                    tool,
+                    if *is_error { "stderr" } else { "output" },
+                    compact_text(text, 72),
+                    envelope.at,
+                );
+                app.push_transcript(format!(
+                    "Tool: {} {} {}",
+                    tool,
+                    if *is_error { "stderr" } else { "output" },
+                    compact_text(text, 120)
+                ));
+                app.capture_diff_excerpt(text);
+            }
         }
         OceanEvent::ToolEnded { tool, is_error } => {
-            let message = if *is_error {
-                "tool exited with error".to_string()
-            } else {
-                "tool completed".to_string()
-            };
-            app.push_tool_timeline(request_id, tool, "ended", message.clone(), envelope.at);
-            app.push_transcript(format!(
-                "Tool: {} {}",
-                tool,
-                if *is_error { "failed" } else { "done" }
-            ));
+            if !mirror {
+                let message = if *is_error {
+                    "tool exited with error".to_string()
+                } else {
+                    "tool completed".to_string()
+                };
+                app.push_tool_timeline(request_id, tool, "ended", message.clone(), envelope.at);
+                app.push_transcript(format!(
+                    "Tool: {} {}",
+                    tool,
+                    if *is_error { "failed" } else { "done" }
+                ));
+            }
         }
         OceanEvent::PermissionRequest { tool, reason, args } => {
             app.streaming_request_id = None;
@@ -3766,14 +3738,16 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
                 app.decision_tokens.remove(&rid);
             }
             app.pending_submit_token = None;
-            app.push_transcript(format!(
-                "{} request {} finished in {}ms",
-                if *ok { "✓" } else { "✗" },
-                request_id
-                    .map(short_id)
-                    .unwrap_or_else(|| "stream".to_string()),
-                wall_ms
-            ));
+            if !mirror {
+                app.push_transcript(format!(
+                    "{} request {} finished in {}ms",
+                    if *ok { "✓" } else { "✗" },
+                    request_id
+                        .map(short_id)
+                        .unwrap_or_else(|| "stream".to_string()),
+                    wall_ms
+                ));
+            }
         }
         OceanEvent::Cancelled { reason } => {
             app.streaming_request_id = None;
@@ -3785,14 +3759,18 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
                 app.decision_tokens.remove(&rid);
             }
             app.pending_submit_token = None;
-            app.push_transcript(format!(
-                "✗ cancelled {}",
-                compact_text(reason.as_deref().unwrap_or("request cancelled"), 56)
-            ));
+            if !mirror {
+                app.push_transcript(format!(
+                    "✗ cancelled {}",
+                    compact_text(reason.as_deref().unwrap_or("request cancelled"), 56)
+                ));
+            }
         }
         OceanEvent::Error { message } => {
             app.streaming_request_id = None;
-            app.push_transcript(format!("✗ error {}", compact_text(message, 60)));
+            if !mirror {
+                app.push_transcript(format!("✗ error {}", compact_text(message, 60)));
+            }
             app.status = compact_text(message, 72);
         }
         OceanEvent::CallStarted { room_id, .. } => {
@@ -3892,39 +3870,16 @@ fn agent_events_url(
     }
 }
 
-/// SSE event name the daemon emits after a `?replay=1` batch, before the live
-/// stream (OCEAN-305). Everything before it on a replay connection was
-/// re-delivered history; everything after is live.
-const AGENT_REPLAY_COMPLETE_EVENT: &str = "replay_complete";
-
-/// How long after connect a `?replay=1` connection keeps classifying incoming
-/// events as replayed when no `replay_complete` marker has been seen — the
-/// defensive fallback for a daemon that predates the marker. The replay batch
-/// is flushed as one immediate burst at connect, so anything arriving later
-/// than this is live. 2s sits safely under the daemon's 3s keepalive.
-const AGENT_REPLAY_FALLBACK_WINDOW: Duration = Duration::from_secs(2);
-
-/// Classify an event dispatched on the agent stream as replayed-vs-live
-/// (OCEAN-305, Codex P2 on #202). Replayed events back-fill the PM chat pane
-/// but skip the transcript/timeline/activity surfaces the legacy `/v1/events`
-/// mirror already rendered live. An event is replayed only when ALL hold:
-/// the connection was opened with `?replay=1`, the `replay_complete` marker
-/// has not yet arrived, and we are still inside the immediate-burst window
-/// after connect (the fallback when an older daemon never sends the marker).
-fn agent_event_is_replayed(
-    opened_with_replay: bool,
-    replay_done: bool,
-    elapsed_since_connect: Duration,
-) -> bool {
-    opened_with_replay && !replay_done && elapsed_since_connect <= AGENT_REPLAY_FALLBACK_WINDOW
-}
-
 /// Bounded set of SSE event ids already forwarded to the action channel
 /// (OCEAN-305). The daemon's seam dedupe only covers replay-vs-live on ONE
 /// connection; a re-connect that full-replays history the pane already
 /// rendered (scope flip A→B→A, where B invalidated A's `Last-Event-ID`)
 /// would re-forward A's events and double-render text in the chat pane.
-/// Tracking recently-forwarded ids across reconnects closes that path.
+/// Tracking recently-forwarded ids across reconnects closes that path —
+/// every agent event is applied exactly once, which is what lets replayed
+/// events render identically to live ones (single-writer ownership: the
+/// agent rail owns transcript/timeline/diff for agent turns; the legacy
+/// mirror is provenance-marked and never writes them).
 ///
 /// Capacity mirrors the daemon's replay buffer (2048): only buffered events
 /// can ever be replayed, so anything older can be evicted safely.
@@ -4152,9 +4107,11 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
 /// OCEAN-305: the unscoped stream deliberately delivers nothing
 /// session-bearing, so the first scoped connect (no `Last-Event-ID` valid for
 /// the new scope) adds `?replay=1` — the daemon replays the session's buffered
-/// history, recovering everything that streamed while we were blind. A bounded
-/// forwarded-id set dedupes across reconnects so a replay can never
-/// double-render events the pane already drew.
+/// history, recovering everything that streamed while we were blind. Replayed
+/// events are forwarded exactly like live ones; a bounded forwarded-id set
+/// dedupes across reconnects so each event id is applied at most once, and
+/// the legacy `/v1/events` mirror never writes the surfaces this rail owns
+/// (transcript / tool timeline / diff) — see `EventEnvelope::is_agent_mirror`.
 fn spawn_daemon_agent_event_stream(
     url: String,
     scoped_session_id: Arc<Mutex<Option<AgentSessionId>>>,
@@ -4228,13 +4185,11 @@ fn spawn_daemon_agent_event_stream(
             // daemon for a full-history replay of this session's buffered
             // events — recovering whatever streamed while we were unscoped
             // (and therefore blind). With a valid anchor, `Last-Event-ID`
-            // replays exactly the gap instead.
+            // replays exactly the gap instead. Replayed events are handled
+            // exactly like live ones; `forwarded_ids` guarantees each event
+            // id is applied at most once across replays/reconnects.
             let events_url =
                 agent_events_url(&base_url, connection_scope, last_event_id.as_deref());
-            // Whether THIS connection asked for a full-history replay — only
-            // then can incoming events be the replayed batch (see
-            // `agent_event_is_replayed`).
-            let opened_with_replay = events_url.contains("replay=1");
 
             // After the guard, `last_event_id` is either an id valid for this
             // scope or `None`, so it can be sent directly.
@@ -4273,12 +4228,6 @@ fn spawn_daemon_agent_event_stream(
             // changed (not an error/EOF). A deliberate switch reconnects
             // immediately; only error/EOF backs off before retrying.
             let mut scope_changed = false;
-            // OCEAN-305: replay/live seam for this connection. The daemon ends
-            // a `?replay=1` batch with a `replay_complete` marker; until it
-            // arrives (or the fallback window lapses), events are classified
-            // as replayed and forwarded on the replay action variant.
-            let connected_at = Instant::now();
-            let mut replay_done = false;
 
             'read: loop {
                 // Forced reconnect on session switch: if the shared handle no
@@ -4306,15 +4255,6 @@ fn spawn_daemon_agent_event_stream(
                                 last_event_id = Some(id.clone());
                             }
                             if !data_lines.is_empty() {
-                                // OCEAN-305: the synthetic end-of-replay marker
-                                // is not an agent event — flip to live and drop
-                                // the frame instead of parsing/forwarding it.
-                                if event_name == AGENT_REPLAY_COMPLETE_EVENT {
-                                    replay_done = true;
-                                    data_lines.clear();
-                                    event_name.clear();
-                                    continue;
-                                }
                                 let payload = data_lines.join("\n");
                                 match parse_agent_turn_event(&payload) {
                                     Ok(Some(event)) => {
@@ -4347,21 +4287,11 @@ fn spawn_daemon_agent_event_stream(
                                                 Some(id) => forwarded_ids.record(id),
                                                 None => true,
                                             };
-                                            // Replayed events ride a distinct
-                                            // action so the handler back-fills
-                                            // the PM pane without re-pushing the
-                                            // transcript/timeline lines the
-                                            // legacy mirror already rendered.
-                                            let action = if agent_event_is_replayed(
-                                                opened_with_replay,
-                                                replay_done,
-                                                connected_at.elapsed(),
-                                            ) {
-                                                Action::AgentStreamReplayedEvent(event)
-                                            } else {
-                                                Action::AgentStreamEvent(event)
-                                            };
-                                            if fresh && tx.send(action).is_err() {
+                                            if fresh
+                                                && tx
+                                                    .send(Action::AgentStreamEvent(event))
+                                                    .is_err()
+                                            {
                                                 return;
                                             }
                                         }
@@ -7518,7 +7448,6 @@ mod tests {
                 turn_id,
                 delta: "streamed assistant text".to_string(),
             },
-            false,
         );
         daemon_apply_agent_stream_event(
             &mut app,
@@ -7532,7 +7461,6 @@ mod tests {
                     metadata_json: None,
                 },
             },
-            false,
         );
 
         assert!(app
@@ -7545,56 +7473,113 @@ mod tests {
             .any(|entry| entry.message.contains("tool output")));
     }
 
-    /// OCEAN-305 (Codex P2 on #202): a REPLAYED agent event back-fills the PM
-    /// chat pane (which was blind while the stream was unscoped) but must not
-    /// re-push the shared transcript / tool-timeline / activity lines — the
-    /// legacy `/v1/events` mirror already rendered those live.
+    /// OCEAN-305 (Codex round 3 on #202): the legacy `/v1/events` rail never
+    /// writes the surfaces the agent rail owns. An envelope marked
+    /// `origin: "agent"` (the daemon's mirror of agent-turn output) must not
+    /// push transcript / tool-timeline / diff lines — while an identical
+    /// GENUINE legacy event (no origin) still renders exactly as before.
     #[test]
-    fn replayed_agent_events_backfill_pm_but_skip_transcript_and_timeline() {
-        let turn_id = AgentTurnId::new_v4();
-        let session_id = AgentSessionId::new_v4();
-        let call_id = ocean_agent_sdk::ToolCallId::new_v4();
+    fn agent_mirror_legacy_events_do_not_render_but_genuine_ones_do() {
+        let request_id = RequestId::new_v4();
         let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
 
-        daemon_apply_agent_stream_event(
-            &mut app,
-            AgentTurnEvent::AssistantTextDelta {
-                session_id,
-                turn_id,
-                delta: "replayed assistant text".to_string(),
-            },
-            true,
+        // The daemon's agent-turn mirror: full-stdout delta + tool lines +
+        // turn-finished, all provenance-marked.
+        let mut mirror = EventEnvelope::new(OceanEvent::AssistantDelta {
+            text: "mirrored agent reply".to_string(),
+        });
+        mirror.request_id = Some(request_id);
+        mirror.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
+        assert!(mirror.is_agent_mirror());
+        daemon_apply_stream_event(&mut app, mirror);
+
+        let mut mirror_tool = EventEnvelope::new(OceanEvent::ToolStarted {
+            tool: "bash".to_string(),
+            args: json!({"command": "echo hi"}),
+        });
+        mirror_tool.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
+        daemon_apply_stream_event(&mut app, mirror_tool);
+
+        let mut mirror_finished =
+            EventEnvelope::new(OceanEvent::TurnFinished { ok: true, wall_ms: 12 });
+        mirror_finished.request_id = Some(request_id);
+        mirror_finished.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
+        daemon_apply_stream_event(&mut app, mirror_finished);
+
+        assert!(
+            app.transcript.is_empty(),
+            "agent-mirror legacy events must not write the transcript (agent rail owns it): {:?}",
+            app.transcript
         );
-        // A real replay re-delivers the whole turn: started then finished.
-        daemon_apply_agent_stream_event(
-            &mut app,
-            AgentTurnEvent::ToolCallStarted {
-                session_id,
-                turn_id,
-                call: ocean_agent_sdk::ToolCall {
-                    id: call_id.clone(),
-                    name: "bash".to_string(),
-                    args_json: json!({"command": "echo replayed"}),
-                },
-            },
-            true,
+        assert!(
+            app.tool_timeline.is_empty(),
+            "agent-mirror legacy events must not write the tool timeline"
         );
-        daemon_apply_agent_stream_event(
-            &mut app,
-            AgentTurnEvent::ToolCallFinished {
-                session_id,
-                turn_id,
-                call_id,
-                result: ocean_agent_sdk::ToolResult {
-                    ok: true,
-                    output: "replayed tool output".to_string(),
-                    metadata_json: None,
-                },
-            },
-            true,
+        assert!(
+            !app.activity.is_empty(),
+            "the activity/event rail still logs mirrors (debug surface, shows provenance)"
         );
 
-        // PM pane back-filled: chat blocks carry the replayed content.
+        // A GENUINE legacy event (no origin) renders exactly as before.
+        let mut genuine = EventEnvelope::new(OceanEvent::AssistantDelta {
+            text: "genuine legacy reply".to_string(),
+        });
+        genuine.request_id = Some(request_id);
+        daemon_apply_stream_event(&mut app, genuine);
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| line.contains("genuine legacy reply")),
+            "genuine legacy events still render the transcript"
+        );
+
+        let genuine_tool = EventEnvelope::new(OceanEvent::ToolStarted {
+            tool: "bash".to_string(),
+            args: json!({"command": "echo hi"}),
+        });
+        daemon_apply_stream_event(&mut app, genuine_tool);
+        assert!(
+            !app.tool_timeline.is_empty(),
+            "genuine legacy tool events still render the timeline"
+        );
+    }
+
+    /// OCEAN-305 (Codex round 3 on #202): replayed agent events render exactly
+    /// like live ones — the agent rail is the sole writer of transcript /
+    /// timeline — and exactly-once application across a scope flip A→B→A is
+    /// guaranteed by the stream thread's per-id `ForwardedIds` gate, which is
+    /// what decides whether the handler runs at all.
+    #[test]
+    fn agent_rail_replay_backfills_transcript_exactly_once_across_scope_flip() {
+        let turn_id = AgentTurnId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let mut forwarded = ForwardedIds::new(2048);
+        let sse_id = Uuid::new_v4().to_string();
+        let event = || AgentTurnEvent::AssistantTextDelta {
+            session_id,
+            turn_id,
+            delta: "replayed once".to_string(),
+        };
+
+        // First delivery (live or replayed — same path): forwarded + applied.
+        assert!(forwarded.record(&sse_id));
+        daemon_apply_agent_stream_event(&mut app, event());
+
+        // Scope flip A→B→A: A's anchor was invalidated, so the reconnect
+        // full-replays A's history — the same SSE id arrives again and the
+        // gate drops it before the handler ever runs.
+        assert!(
+            !forwarded.record(&sse_id),
+            "the replayed duplicate must be dropped by the per-id gate"
+        );
+
+        let occurrences = app
+            .transcript
+            .iter()
+            .filter(|line| line.contains("replayed once"))
+            .count();
+        assert_eq!(occurrences, 1, "transcript renders the delta exactly once");
         let pm_text: String = app
             .pm_turns
             .iter()
@@ -7602,52 +7587,9 @@ mod tests {
             .map(|block| format!("{block:?}"))
             .collect();
         assert!(
-            pm_text.contains("replayed assistant text"),
-            "PM pane must receive the replayed assistant text"
+            pm_text.contains("replayed once"),
+            "the PM chat pane is back-filled by the same single application"
         );
-        assert!(
-            pm_text.contains("replayed tool output"),
-            "PM pane must receive the replayed tool result"
-        );
-
-        // Shared surfaces untouched: the legacy mirror already rendered them.
-        assert!(
-            !app.transcript
-                .iter()
-                .any(|line| line.contains("replayed assistant text")),
-            "replayed delta must not double-render in the transcript"
-        );
-        assert!(
-            app.tool_timeline.is_empty(),
-            "replayed tool result must not double-render in the tool timeline"
-        );
-        assert!(
-            app.activity.is_empty(),
-            "replayed events must not push activity/event-rail lines"
-        );
-
-        // State coherence still applies.
-        assert_eq!(app.active_agent_session_id, Some(session_id));
-        assert_eq!(app.active_agent_turn_id, Some(turn_id));
-    }
-
-    /// OCEAN-305: replay/live classification on the agent stream thread. Only
-    /// a `?replay=1` connection, before the `replay_complete` marker, inside
-    /// the immediate-burst fallback window, classifies events as replayed.
-    #[test]
-    fn agent_event_replay_classification_flips_on_marker_or_window() {
-        let early = Duration::from_millis(50);
-        let late = AGENT_REPLAY_FALLBACK_WINDOW + Duration::from_millis(1);
-
-        // Replay connection, before marker, in window → replayed.
-        assert!(agent_event_is_replayed(true, false, early));
-        // Marker arrived → live, even right after connect.
-        assert!(!agent_event_is_replayed(true, true, early));
-        // Old daemon never sends the marker → flip to live after the window.
-        assert!(!agent_event_is_replayed(true, false, late));
-        // Connection opened without replay=1 → always live.
-        assert!(!agent_event_is_replayed(false, false, early));
-        assert!(!agent_event_is_replayed(false, true, late));
     }
 
     #[test]
@@ -7974,7 +7916,7 @@ mod tests {
         }
         .into_turn_event();
 
-        daemon_apply_agent_stream_event(&mut app, turn_event, false);
+        daemon_apply_agent_stream_event(&mut app, turn_event);
 
         assert_eq!(app.longhouse_topics.len(), 1);
         assert_eq!(app.longhouse_topics[0].title, "wire the F3 deck");
