@@ -2994,6 +2994,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "ocean-core"
 version = "0.1.0"
 dependencies = [
