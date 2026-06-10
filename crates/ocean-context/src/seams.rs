@@ -59,6 +59,13 @@ pub trait Borrower {
 /// File-exists resolver. Exact path → Resolves(1.0). Basename-only match
 /// elsewhere in the tree → Resolves(0.5) (corpus claims often anchor bare
 /// filenames like `input.rs`; handoff finding F5). Otherwise Dead.
+///
+/// Symbol-only anchors (`file == ""`, the other half of F5) are Stale, never
+/// Resolves: this resolver has no file evidence to attest with, and probing
+/// would spuriously succeed (`repo_root.join("")` is the repo dir itself;
+/// `git cat-file -e <rev>:` accepts the bare tree-ish). Stale = "could not
+/// verify, needs attention" until B1's symbol resolution exists — Dead would
+/// assert positive evidence of removal that we don't have.
 pub struct FileExistsResolver {
     pub repo_root: PathBuf,
 }
@@ -77,6 +84,11 @@ impl FileExistsResolver {
 
 impl Resolver for FileExistsResolver {
     fn resolve(&self, anchor: &Anchor, at_commit: &str) -> Resolution {
+        // Short-circuit BEFORE any filesystem/git probe: an empty file path
+        // would otherwise resolve against the repo root / bare tree-ish.
+        if anchor.file.is_empty() {
+            return Resolution::Stale;
+        }
         if at_commit == WORKTREE {
             if self.repo_root.join(&anchor.file).exists() {
                 return Resolution::Resolves(1.0);
@@ -191,6 +203,44 @@ mod tests {
     fn no_borrow_never_borrows() {
         let h = sample_handoff();
         assert!(NoBorrow.borrow(&h.claims[0], &h.claims).is_none());
+    }
+
+    /// Symbol-only anchors (empty file, F5) must NOT spuriously resolve in
+    /// either mode: `repo_root.join("")` is the repo dir itself and
+    /// `git cat-file -e <rev>:` accepts the bare tree-ish — both would lie.
+    #[test]
+    fn symbol_only_anchor_is_stale_in_both_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "c1"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        let r = FileExistsResolver { repo_root: root.to_path_buf() };
+        let symbol_only = Anchor {
+            file: String::new(),
+            symbol: Some("workspace.members".into()),
+            lines: vec![],
+            sig_hash: None,
+        };
+        assert_eq!(r.resolve(&symbol_only, WORKTREE), Resolution::Stale);
+        assert_eq!(r.resolve(&symbol_only, &head), Resolution::Stale);
     }
 
     #[test]
