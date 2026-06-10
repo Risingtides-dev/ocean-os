@@ -66,6 +66,11 @@ pub trait Borrower {
 /// `git cat-file -e <rev>:` accepts the bare tree-ish). Stale = "could not
 /// verify, needs attention" until B1's symbol resolution exists — Dead would
 /// assert positive evidence of removal that we don't have.
+///
+/// Anchors that are not repo-relative (absolute paths, `..` segments) take
+/// the same Stale arm: `PathBuf::join` would otherwise ignore or escape
+/// `repo_root`, verifying claims against files OUTSIDE the repository —
+/// breaking distrust-by-default for malformed or untrusted handoffs.
 pub struct FileExistsResolver {
     pub repo_root: PathBuf,
 }
@@ -82,11 +87,26 @@ impl FileExistsResolver {
     }
 }
 
+/// Lexical repo-relativity check (v1): reject absolute paths and any `..`
+/// component. Deliberately NOT filesystem canonicalization — resolving
+/// symlinks would itself touch paths outside the repo. A pure component walk
+/// is enough to keep `PathBuf::join` from replacing or escaping `repo_root`.
+fn is_repo_relative(file: &str) -> bool {
+    use std::path::Component;
+    let p = std::path::Path::new(file);
+    !p.is_absolute()
+        && p.components()
+            .all(|c| !matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+}
+
 impl Resolver for FileExistsResolver {
     fn resolve(&self, anchor: &Anchor, at_commit: &str) -> Resolution {
-        // Short-circuit BEFORE any filesystem/git probe: an empty file path
-        // would otherwise resolve against the repo root / bare tree-ish.
-        if anchor.file.is_empty() {
+        // One validation gate BEFORE any filesystem/git probe. Empty paths
+        // would resolve against the repo root / bare tree-ish; absolute or
+        // `..`-bearing paths would make `join` ignore or escape `repo_root`
+        // (and must not be handed to git either). All are anchors this
+        // resolver cannot attest → Stale, same arm as empty-file.
+        if anchor.file.is_empty() || !is_repo_relative(&anchor.file) {
             return Resolution::Stale;
         }
         if at_commit == WORKTREE {
@@ -241,6 +261,56 @@ mod tests {
         };
         assert_eq!(r.resolve(&symbol_only, WORKTREE), Resolution::Stale);
         assert_eq!(r.resolve(&symbol_only, &head), Resolution::Stale);
+    }
+
+    /// Anchors outside the repo (absolute path or `..` escape) must be Stale
+    /// in BOTH modes even when the outside file genuinely exists — otherwise
+    /// `join` ignores/escapes repo_root and we verify foreign files.
+    #[test]
+    fn outside_repo_anchors_are_stale_in_both_modes() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "c1"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        // A file that genuinely exists ABOVE the repo root.
+        std::fs::write(outer.path().join("escape.rs"), "fn outside() {}\n").unwrap();
+
+        let r = FileExistsResolver { repo_root: root.clone() };
+        let mk = |file: &str| Anchor {
+            file: file.into(),
+            symbol: None,
+            lines: vec![],
+            sig_hash: None,
+        };
+        let escape = mk("../escape.rs");
+        let nested_escape = mk("src/../../escape.rs");
+        let absolute = mk("/etc/hosts"); // exists on the host, but not ours to attest
+        for anchor in [&escape, &nested_escape, &absolute] {
+            assert_eq!(r.resolve(anchor, WORKTREE), Resolution::Stale, "{}", anchor.file);
+            assert_eq!(r.resolve(anchor, &head), Resolution::Stale, "{}", anchor.file);
+        }
+        // Sanity: the in-repo anchor still resolves, so the gate is not over-broad.
+        assert_eq!(r.resolve(&mk("a.rs"), WORKTREE), Resolution::Resolves(1.0));
+        assert_eq!(r.resolve(&mk("./a.rs"), &head), Resolution::Resolves(1.0));
     }
 
     #[test]
