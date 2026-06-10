@@ -1117,6 +1117,13 @@ pub enum OceanEvent {
     },
 }
 
+/// Value of [`EventEnvelope::origin`] marking an envelope as the legacy-bus
+/// twin of agent-turn output that ALSO streams (full fidelity) on
+/// `/v1/agent/events` (OCEAN-305). A client consuming both rails should let
+/// the agent rail be the single writer of shared render surfaces (transcript,
+/// tool timeline, diff capture) and skip re-rendering these mirrors.
+pub const EVENT_ORIGIN_AGENT: &str = "agent";
+
 /// Envelope shared by the SSE stream and persisted event logs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
@@ -1128,6 +1135,13 @@ pub struct EventEnvelope {
     pub request_id: Option<RequestId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_id: Option<PermissionId>,
+    /// Provenance marker (OCEAN-305): [`EVENT_ORIGIN_AGENT`] when this
+    /// envelope duplicates content the daemon also streams on the
+    /// full-fidelity `/v1/agent/events` rail (the `emit_agent` mirror and the
+    /// agent-turn completion announcements). Absent on genuine legacy request
+    /// events. Wire-additive: old clients deserialize fine and ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     #[serde(flatten)]
     pub event: OceanEvent,
 }
@@ -1141,8 +1155,16 @@ impl EventEnvelope {
             session_id: None,
             request_id: None,
             permission_id: None,
+            origin: None,
             event,
         }
+    }
+
+    /// True when this envelope is the legacy-bus mirror of agent-rail content
+    /// (see [`EVENT_ORIGIN_AGENT`]): a dual-rail client must not re-render it
+    /// on surfaces the agent rail owns.
+    pub fn is_agent_mirror(&self) -> bool {
+        self.origin.as_deref() == Some(EVENT_ORIGIN_AGENT)
     }
 }
 
@@ -1172,6 +1194,7 @@ mod tests {
             session_id: Some(session_id),
             request_id: Some(request_id),
             permission_id: Some(permission_id),
+            origin: None,
             event: OceanEvent::ToolStarted {
                 tool: "bash".to_string(),
                 args: serde_json::json!({"cmd": "ls"}),
@@ -1187,6 +1210,33 @@ mod tests {
 
         let roundtrip: EventEnvelope = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, envelope);
+    }
+
+    /// OCEAN-305: the `origin` provenance marker is wire-additive — absent
+    /// by default (old payloads deserialize with `None`, serialization skips
+    /// it) — and `is_agent_mirror` keys on the canonical `"agent"` value.
+    #[test]
+    fn event_envelope_origin_marks_agent_mirrors_and_stays_wire_additive() {
+        let mut envelope = EventEnvelope::new(OceanEvent::AssistantDelta {
+            text: "hi".into(),
+        });
+        assert!(!envelope.is_agent_mirror(), "default envelopes are genuine");
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert!(
+            json.get("origin").is_none(),
+            "None origin must not appear on the wire"
+        );
+
+        envelope.origin = Some(EVENT_ORIGIN_AGENT.to_string());
+        assert!(envelope.is_agent_mirror());
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["origin"], "agent");
+
+        // A pre-OCEAN-305 payload (no origin field) still deserializes.
+        let legacy: EventEnvelope =
+            serde_json::from_str(r#"{"id":"550e8400-e29b-41d4-a716-446655440000","at":"2026-01-01T00:00:00Z","type":"assistant_delta","text":"old"}"#)
+                .unwrap();
+        assert!(!legacy.is_agent_mirror());
     }
 
     #[test]

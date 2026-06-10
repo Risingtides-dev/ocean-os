@@ -22,8 +22,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ocean_agent_sdk::{
-    AgentSessionId, AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, Federation,
-    LonghouseEvent,
+    AgentSessionCreateRequest, AgentSessionCreateResponse, AgentSessionId, AgentTurnEvent,
+    AgentTurnId, AgentTurnRequest, AgentTurnResponse, Federation, LonghouseEvent,
 };
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
@@ -262,6 +262,10 @@ enum Action {
     StreamEvent(EventEnvelope),
     AgentTurnResponse(AgentTurnResponse),
     AgentStreamEvent(AgentTurnEvent),
+    /// OCEAN-305: a session id became known before the turn response (eager
+    /// `POST /v1/agent/sessions` at submit time) — adopt it as the active
+    /// session so the SSE stream re-scopes and later turns carry it.
+    AgentSessionScoped(AgentSessionId),
     MeshRefresh,
     MeshTogglePause,
     MeshNextTab,
@@ -2033,6 +2037,34 @@ impl DaemonClient {
             .map_err(|err| err.to_string())
     }
 
+    /// `POST /v1/agent/sessions` — mint a session explicitly BEFORE the first
+    /// turn (OCEAN-305 eager scoping). The synchronous `/v1/agent/turns`
+    /// response only reveals the session id after the turn already streamed,
+    /// so an implicitly-created first session leaves the SSE subscription
+    /// unscoped for the whole turn — and the scoped-events privacy fix means
+    /// an unscoped subscriber renders nothing. Creating the session up front
+    /// closes that window.
+    fn create_agent_session(
+        &self,
+        base_url: &str,
+        workspace_root: &str,
+    ) -> Result<AgentSessionCreateResponse, String> {
+        let url = format!("{}/v1/agent/sessions", base_url.trim_end_matches('/'));
+        let request = AgentSessionCreateRequest {
+            workspace_root: workspace_root.to_string(),
+            project_id: None,
+            client_type: Some("tui".into()),
+        };
+        self.http
+            .post(url)
+            .json(&request)
+            .send()
+            .and_then(|res| res.error_for_status())
+            .map_err(|err| err.to_string())?
+            .json::<AgentSessionCreateResponse>()
+            .map_err(|err| err.to_string())
+    }
+
     fn cancel_request(
         &self,
         base_url: &str,
@@ -2573,6 +2605,13 @@ fn handle_daemon_action(client: &DaemonClient, state: &mut AppState, action: Act
         Action::StreamEvent(envelope) => daemon_apply_stream_event(app, envelope),
         Action::AgentTurnResponse(response) => daemon_apply_agent_turn_response(app, response),
         Action::AgentStreamEvent(event) => daemon_apply_agent_stream_event(app, event),
+        Action::AgentSessionScoped(session_id) => {
+            app.set_active_agent_session_id(Some(session_id));
+            app.push_activity(format!(
+                "agent session scoped eagerly: {}",
+                short_id(session_id)
+            ));
+        }
         Action::PmFocusNextBlock => app.pm_focus_next(1),
         Action::PmFocusPrevBlock => app.pm_focus_next(-1),
         Action::PmToggleBlock => app.pm_toggle_focused(),
@@ -2885,17 +2924,49 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             compact_text(&instruction, 56)
         );
         let client = client.clone();
-        thread::spawn(move || match client.agent_turn(&url, &request) {
-            Ok(response) => {
-                let _ = action_tx.send(Action::AgentTurnResponse(response));
-                let _ = action_tx.send(Action::RefreshAll);
+        let scoped_session_id = app.scoped_agent_session_id.clone();
+        thread::spawn(move || {
+            let mut request = request;
+            // OCEAN-305 eager scoping: with no active session, the synchronous
+            // turn response would reveal the session id only AFTER the turn
+            // streamed — leaving the SSE subscription unscoped (and therefore
+            // blind to session-bearing events) for the entire first turn. Mint
+            // the session explicitly first, scope the stream to it, and send
+            // the turn already carrying the id. On failure fall back to the
+            // implicit create-on-turn path — the turn must never be lost.
+            if request.session_id.is_none() {
+                match client.create_agent_session(&url, &request.cwd) {
+                    Ok(created) => {
+                        request.session_id = Some(created.session_id);
+                        // Write the shared scope handle directly so the SSE
+                        // thread re-scopes on its next keepalive wake, without
+                        // waiting on the action loop; the action keeps the app
+                        // state (active session id for later turns) coherent.
+                        if let Ok(mut guard) = scoped_session_id.lock() {
+                            *guard = Some(created.session_id);
+                        }
+                        let _ = action_tx.send(Action::AgentSessionScoped(created.session_id));
+                    }
+                    Err(err) => {
+                        let _ = action_tx.send(Action::StreamStatus(format!(
+                            "eager session create failed (fallback to create-on-turn): {}",
+                            compact_text(&err, 72)
+                        )));
+                    }
+                }
             }
-            Err(err) => {
-                let _ = action_tx.send(Action::StreamStatus(format!(
-                    "agent turn submit error ({room_id}): {}",
-                    compact_text(&err, 72)
-                )));
-                let _ = action_tx.send(Action::RefreshAll);
+            match client.agent_turn(&url, &request) {
+                Ok(response) => {
+                    let _ = action_tx.send(Action::AgentTurnResponse(response));
+                    let _ = action_tx.send(Action::RefreshAll);
+                }
+                Err(err) => {
+                    let _ = action_tx.send(Action::StreamStatus(format!(
+                        "agent turn submit error ({room_id}): {}",
+                        compact_text(&err, 72)
+                    )));
+                    let _ = action_tx.send(Action::RefreshAll);
+                }
             }
         });
     } else {
@@ -3267,6 +3338,14 @@ fn daemon_apply_agent_turn_response(app: &mut DaemonApp, response: AgentTurnResp
     }
 }
 
+/// Apply an agent-stream event to the app — the SINGLE writer of the shared
+/// render surfaces (transcript, tool timeline, diff capture) for agent-turn
+/// output (OCEAN-305, Codex round 3 on #202). The daemon marks every legacy
+/// `/v1/events` twin of agent output with `origin: "agent"`, and
+/// `daemon_apply_stream_event` skips rendering those mirrors, so events
+/// applied here — live or replayed via `?replay=1` — render unconditionally
+/// without double-drawing. Exactly-once application is guaranteed upstream by
+/// the stream thread's `ForwardedIds` (per SSE event id, across reconnects).
 fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
     app.push_activity(summarize_agent_event(&event));
 
@@ -3511,6 +3590,17 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
     let permission_id = envelope.permission_id;
     app.push_activity(summarize_event(&envelope));
 
+    // OCEAN-305 (single-writer ownership): the daemon marks every legacy-bus
+    // twin of agent-turn output with `origin: "agent"` — the `emit_agent`
+    // mirror AND the agent-turn completion announcements (full-stdout
+    // AssistantDelta / TurnFinished / Error / Cancelled). The agent rail
+    // (`daemon_apply_agent_stream_event`) is the SOLE writer of the shared
+    // render surfaces (transcript, tool timeline, diff capture) for agent
+    // turns, live or replayed. Mirrors here keep their bookkeeping (request
+    // state, tokens, status) and the activity line above (a debug surface
+    // that shows provenance), but never re-render those surfaces.
+    let mirror = envelope.is_agent_mirror();
+
     match &envelope.event {
         OceanEvent::SessionCreated => {
             app.status = "session created".to_string();
@@ -3519,57 +3609,65 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
             app.push_transcript_if_new(format!("> {text}"));
         }
         OceanEvent::AssistantDelta { text } => {
-            app.append_assistant_delta(request_id, text);
-            app.capture_diff_excerpt(text);
+            if !mirror {
+                app.append_assistant_delta(request_id, text);
+                app.capture_diff_excerpt(text);
+            }
         }
         OceanEvent::ToolStarted { tool, args } => {
-            let args_text = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
-            app.push_tool_timeline(
-                request_id,
-                tool,
-                "started",
-                compact_text(&args_text, 72),
-                envelope.at,
-            );
-            app.push_transcript(format!(
-                "Tool: {} started {}",
-                tool,
-                compact_text(&args_text, 96)
-            ));
-            app.capture_diff_excerpt(&args_text);
+            if !mirror {
+                let args_text = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+                app.push_tool_timeline(
+                    request_id,
+                    tool,
+                    "started",
+                    compact_text(&args_text, 72),
+                    envelope.at,
+                );
+                app.push_transcript(format!(
+                    "Tool: {} started {}",
+                    tool,
+                    compact_text(&args_text, 96)
+                ));
+                app.capture_diff_excerpt(&args_text);
+            }
         }
         OceanEvent::ToolOutput {
             tool,
             text,
             is_error,
         } => {
-            app.push_tool_timeline(
-                request_id,
-                tool,
-                if *is_error { "stderr" } else { "output" },
-                compact_text(text, 72),
-                envelope.at,
-            );
-            app.push_transcript(format!(
-                "Tool: {} {} {}",
-                tool,
-                if *is_error { "stderr" } else { "output" },
-                compact_text(text, 120)
-            ));
-            app.capture_diff_excerpt(text);
+            if !mirror {
+                app.push_tool_timeline(
+                    request_id,
+                    tool,
+                    if *is_error { "stderr" } else { "output" },
+                    compact_text(text, 72),
+                    envelope.at,
+                );
+                app.push_transcript(format!(
+                    "Tool: {} {} {}",
+                    tool,
+                    if *is_error { "stderr" } else { "output" },
+                    compact_text(text, 120)
+                ));
+                app.capture_diff_excerpt(text);
+            }
         }
         OceanEvent::ToolEnded { tool, is_error } => {
-            let message = if *is_error {
-                "tool exited with error".to_string()
-            } else {
-                "tool completed".to_string()
-            };
-            app.push_tool_timeline(request_id, tool, "ended", message.clone(), envelope.at);
-            app.push_transcript(format!(
-                "Tool: {} {}",
-                tool,
-                if *is_error { "failed" } else { "done" }
-            ));
+            if !mirror {
+                let message = if *is_error {
+                    "tool exited with error".to_string()
+                } else {
+                    "tool completed".to_string()
+                };
+                app.push_tool_timeline(request_id, tool, "ended", message.clone(), envelope.at);
+                app.push_transcript(format!(
+                    "Tool: {} {}",
+                    tool,
+                    if *is_error { "failed" } else { "done" }
+                ));
+            }
         }
         OceanEvent::PermissionRequest { tool, reason, args } => {
             app.streaming_request_id = None;
@@ -3640,14 +3738,16 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
                 app.decision_tokens.remove(&rid);
             }
             app.pending_submit_token = None;
-            app.push_transcript(format!(
-                "{} request {} finished in {}ms",
-                if *ok { "✓" } else { "✗" },
-                request_id
-                    .map(short_id)
-                    .unwrap_or_else(|| "stream".to_string()),
-                wall_ms
-            ));
+            if !mirror {
+                app.push_transcript(format!(
+                    "{} request {} finished in {}ms",
+                    if *ok { "✓" } else { "✗" },
+                    request_id
+                        .map(short_id)
+                        .unwrap_or_else(|| "stream".to_string()),
+                    wall_ms
+                ));
+            }
         }
         OceanEvent::Cancelled { reason } => {
             app.streaming_request_id = None;
@@ -3659,14 +3759,18 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
                 app.decision_tokens.remove(&rid);
             }
             app.pending_submit_token = None;
-            app.push_transcript(format!(
-                "✗ cancelled {}",
-                compact_text(reason.as_deref().unwrap_or("request cancelled"), 56)
-            ));
+            if !mirror {
+                app.push_transcript(format!(
+                    "✗ cancelled {}",
+                    compact_text(reason.as_deref().unwrap_or("request cancelled"), 56)
+                ));
+            }
         }
         OceanEvent::Error { message } => {
             app.streaming_request_id = None;
-            app.push_transcript(format!("✗ error {}", compact_text(message, 60)));
+            if !mirror {
+                app.push_transcript(format!("✗ error {}", compact_text(message, 60)));
+            }
             app.status = compact_text(message, 72);
         }
         OceanEvent::CallStarted { room_id, .. } => {
@@ -3739,6 +3843,76 @@ fn agent_last_event_id_for_scope<'a>(
         last_event_id
     } else {
         None
+    }
+}
+
+/// Build the `/v1/agent/events` connect URL for a given scope (OCEAN-305).
+///
+/// A session-scoped connection with NO valid `Last-Event-ID` anchor (first
+/// connect under this scope — e.g. right after the first turn revealed the
+/// session id) adds `&replay=1`, asking the daemon to replay the session's
+/// buffered history. That recovers the events the pane missed while the
+/// connection was unscoped (the unscoped stream deliberately delivers nothing
+/// session-bearing, so the pane was blind — and holds no anchor id to
+/// reconnect from). With a valid anchor, `Last-Event-ID` is more precise, so
+/// no replay param is sent. The caller must pass `last_event_id` AFTER the
+/// cross-scope guard (`agent_last_event_id_for_scope`).
+fn agent_events_url(
+    base_url: &str,
+    connect_scope: Option<AgentSessionId>,
+    last_event_id: Option<&str>,
+) -> String {
+    let has_anchor = last_event_id.is_some_and(|id| !id.is_empty());
+    match connect_scope {
+        Some(sid) if !has_anchor => format!("{base_url}?session_id={sid}&replay=1"),
+        Some(sid) => format!("{base_url}?session_id={sid}"),
+        None => base_url.to_string(),
+    }
+}
+
+/// Bounded set of SSE event ids already forwarded to the action channel
+/// (OCEAN-305). The daemon's seam dedupe only covers replay-vs-live on ONE
+/// connection; a re-connect that full-replays history the pane already
+/// rendered (scope flip A→B→A, where B invalidated A's `Last-Event-ID`)
+/// would re-forward A's events and double-render text in the chat pane.
+/// Tracking recently-forwarded ids across reconnects closes that path —
+/// every agent event is applied exactly once, which is what lets replayed
+/// events render identically to live ones (single-writer ownership: the
+/// agent rail owns transcript/timeline/diff for agent turns; the legacy
+/// mirror is provenance-marked and never writes them).
+///
+/// Capacity mirrors the daemon's replay buffer (2048): only buffered events
+/// can ever be replayed, so anything older can be evicted safely.
+struct ForwardedIds {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl ForwardedIds {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: std::collections::HashSet::with_capacity(cap.min(256)),
+            order: std::collections::VecDeque::with_capacity(cap.min(256)),
+            cap,
+        }
+    }
+
+    /// Record an event id about to be forwarded. Returns `true` when the id is
+    /// new (forward the event) and `false` when it was already forwarded
+    /// (duplicate from a cross-connection replay — drop it).
+    fn record(&mut self, id: &str) -> bool {
+        if self.set.contains(id) {
+            return false;
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        while self.order.len() > self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        true
     }
 }
 
@@ -3929,6 +4103,15 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
 ///    session, so no foreign event is ever rendered even within the switch
 ///    window. The daemon-side scoping in (1) is the real win; this is
 ///    belt-and-suspenders.
+///
+/// OCEAN-305: the unscoped stream deliberately delivers nothing
+/// session-bearing, so the first scoped connect (no `Last-Event-ID` valid for
+/// the new scope) adds `?replay=1` — the daemon replays the session's buffered
+/// history, recovering everything that streamed while we were blind. Replayed
+/// events are forwarded exactly like live ones; a bounded forwarded-id set
+/// dedupes across reconnects so each event id is applied at most once, and
+/// the legacy `/v1/events` mirror never writes the surfaces this rail owns
+/// (transcript / tool timeline / diff) — see `EventEnvelope::is_agent_mirror`.
 fn spawn_daemon_agent_event_stream(
     url: String,
     scoped_session_id: Arc<Mutex<Option<AgentSessionId>>>,
@@ -3964,6 +4147,12 @@ fn spawn_daemon_agent_event_stream(
         let mut last_event_id: Option<String> = None;
         let mut agent_scope_for_last_event_id: Option<AgentSessionId> = None;
 
+        // OCEAN-305: ids already forwarded to the action channel, kept across
+        // reconnects so a full-history replay (`?replay=1`) after a scope flip
+        // can never double-render events the pane already drew. Sized to the
+        // daemon's replay buffer — nothing older can ever be replayed.
+        let mut forwarded_ids = ForwardedIds::new(2048);
+
         loop {
             // Re-read the active session on each (re)connect and pin THIS
             // connection to that scope. The read loop below watches for the
@@ -3992,10 +4181,15 @@ fn spawn_daemon_agent_event_stream(
                 agent_scope_for_last_event_id = connection_scope;
             }
 
-            let events_url = match connection_scope {
-                Some(sid) => format!("{base_url}?session_id={sid}"),
-                None => base_url.clone(),
-            };
+            // OCEAN-305: a scoped connection with no replay anchor asks the
+            // daemon for a full-history replay of this session's buffered
+            // events — recovering whatever streamed while we were unscoped
+            // (and therefore blind). With a valid anchor, `Last-Event-ID`
+            // replays exactly the gap instead. Replayed events are handled
+            // exactly like live ones; `forwarded_ids` guarantees each event
+            // id is applied at most once across replays/reconnects.
+            let events_url =
+                agent_events_url(&base_url, connection_scope, last_event_id.as_deref());
 
             // After the guard, `last_event_id` is either an id valid for this
             // scope or `None`, so it can be sent directly.
@@ -4056,8 +4250,9 @@ fn spawn_daemon_agent_event_stream(
                             // Per SSE, the last `id:` seen becomes the stream's
                             // last-event-id at dispatch — persist it across
                             // reconnects so the next connect replays from here.
-                            if let Some(id) = frame_id.take() {
-                                last_event_id = Some(id);
+                            let dispatched_id = frame_id.take();
+                            if let Some(id) = &dispatched_id {
+                                last_event_id = Some(id.clone());
                             }
                             if !data_lines.is_empty() {
                                 let payload = data_lines.join("\n");
@@ -4076,10 +4271,29 @@ fn spawn_daemon_agent_event_stream(
                                             // with no session id: pass through.
                                             (None, _) | (_, None) => true,
                                         };
-                                        if belongs
-                                            && tx.send(Action::AgentStreamEvent(event)).is_err()
-                                        {
-                                            return;
+                                        // Cross-connection dedupe (OCEAN-305): a
+                                        // full-history replay on a fresh scoped
+                                        // connection may resend events already
+                                        // rendered before an earlier scope flip —
+                                        // forward each event id at most once.
+                                        // Recorded only for events that pass the
+                                        // scope guard (a scope-dropped event was
+                                        // never rendered, so a later replay of it
+                                        // under its own scope must still pass).
+                                        // Frames without an id (daemon-side error
+                                        // notices) always pass.
+                                        if belongs {
+                                            let fresh = match dispatched_id.as_deref() {
+                                                Some(id) => forwarded_ids.record(id),
+                                                None => true,
+                                            };
+                                            if fresh
+                                                && tx
+                                                    .send(Action::AgentStreamEvent(event))
+                                                    .is_err()
+                                            {
+                                                return;
+                                            }
                                         }
                                     }
                                     Ok(None) => {}
@@ -6799,6 +7013,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_events_url_requests_full_replay_only_for_fresh_scope() {
+        // OCEAN-305: a scoped connection with no valid Last-Event-ID anchor —
+        // the first connect after the session id became known — must request
+        // `&replay=1` so the daemon resends the events the pane missed while
+        // the connection was unscoped (and therefore blind).
+        let base = "http://127.0.0.1:4780/v1/agent/events";
+        let sid = AgentSessionId::new_v4();
+
+        // Freshly scoped, no anchor → session scope + full replay.
+        assert_eq!(
+            agent_events_url(base, Some(sid), None),
+            format!("{base}?session_id={sid}&replay=1"),
+        );
+
+        // An empty anchor is the same as no anchor (with_last_event_id drops
+        // empty ids from the header too).
+        assert_eq!(
+            agent_events_url(base, Some(sid), Some("")),
+            format!("{base}?session_id={sid}&replay=1"),
+        );
+
+        // Scoped WITH a valid anchor → Last-Event-ID gap replay is more
+        // precise; no replay param.
+        assert_eq!(
+            agent_events_url(base, Some(sid), Some("550e8400-e29b-41d4-a716-446655440000")),
+            format!("{base}?session_id={sid}"),
+        );
+
+        // Unscoped → bare URL, never the replay param (the daemon would drop
+        // session-bearing events for an unscoped subscriber anyway).
+        assert_eq!(agent_events_url(base, None, None), base);
+        assert_eq!(
+            agent_events_url(base, None, Some("550e8400-e29b-41d4-a716-446655440000")),
+            base,
+        );
+    }
+
+    #[test]
+    fn forwarded_ids_dedupe_across_reconnects_and_stay_bounded() {
+        // OCEAN-305: a full-history replay on a fresh scoped connection may
+        // resend events already forwarded before a scope flip — each id passes
+        // exactly once. The set is bounded: old ids evict in insertion order.
+        let mut ids = ForwardedIds::new(3);
+
+        assert!(ids.record("a"), "first sight forwards");
+        assert!(!ids.record("a"), "replayed duplicate is dropped");
+        assert!(ids.record("b"));
+        assert!(ids.record("c"));
+
+        // Capacity 3 holds {a, b, c}; inserting d evicts a (oldest).
+        assert!(ids.record("d"));
+        assert!(!ids.record("b"), "b is still tracked");
+        assert!(!ids.record("c"), "c is still tracked");
+        assert!(!ids.record("d"), "d is still tracked");
+        assert!(
+            ids.record("a"),
+            "a aged out of the bounded window and may pass again"
+        );
+    }
+
     /// The collapsed tool header shows the salient argument bare — the bash
     /// command, the glob pattern, the file path — never raw JSON for the
     /// tools we ship; unknown (MCP) tools fall back to `key: value` pairs.
@@ -7196,6 +7471,125 @@ mod tests {
             .tool_timeline
             .iter()
             .any(|entry| entry.message.contains("tool output")));
+    }
+
+    /// OCEAN-305 (Codex round 3 on #202): the legacy `/v1/events` rail never
+    /// writes the surfaces the agent rail owns. An envelope marked
+    /// `origin: "agent"` (the daemon's mirror of agent-turn output) must not
+    /// push transcript / tool-timeline / diff lines — while an identical
+    /// GENUINE legacy event (no origin) still renders exactly as before.
+    #[test]
+    fn agent_mirror_legacy_events_do_not_render_but_genuine_ones_do() {
+        let request_id = RequestId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+
+        // The daemon's agent-turn mirror: full-stdout delta + tool lines +
+        // turn-finished, all provenance-marked.
+        let mut mirror = EventEnvelope::new(OceanEvent::AssistantDelta {
+            text: "mirrored agent reply".to_string(),
+        });
+        mirror.request_id = Some(request_id);
+        mirror.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
+        assert!(mirror.is_agent_mirror());
+        daemon_apply_stream_event(&mut app, mirror);
+
+        let mut mirror_tool = EventEnvelope::new(OceanEvent::ToolStarted {
+            tool: "bash".to_string(),
+            args: json!({"command": "echo hi"}),
+        });
+        mirror_tool.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
+        daemon_apply_stream_event(&mut app, mirror_tool);
+
+        let mut mirror_finished =
+            EventEnvelope::new(OceanEvent::TurnFinished { ok: true, wall_ms: 12 });
+        mirror_finished.request_id = Some(request_id);
+        mirror_finished.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
+        daemon_apply_stream_event(&mut app, mirror_finished);
+
+        assert!(
+            app.transcript.is_empty(),
+            "agent-mirror legacy events must not write the transcript (agent rail owns it): {:?}",
+            app.transcript
+        );
+        assert!(
+            app.tool_timeline.is_empty(),
+            "agent-mirror legacy events must not write the tool timeline"
+        );
+        assert!(
+            !app.activity.is_empty(),
+            "the activity/event rail still logs mirrors (debug surface, shows provenance)"
+        );
+
+        // A GENUINE legacy event (no origin) renders exactly as before.
+        let mut genuine = EventEnvelope::new(OceanEvent::AssistantDelta {
+            text: "genuine legacy reply".to_string(),
+        });
+        genuine.request_id = Some(request_id);
+        daemon_apply_stream_event(&mut app, genuine);
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| line.contains("genuine legacy reply")),
+            "genuine legacy events still render the transcript"
+        );
+
+        let genuine_tool = EventEnvelope::new(OceanEvent::ToolStarted {
+            tool: "bash".to_string(),
+            args: json!({"command": "echo hi"}),
+        });
+        daemon_apply_stream_event(&mut app, genuine_tool);
+        assert!(
+            !app.tool_timeline.is_empty(),
+            "genuine legacy tool events still render the timeline"
+        );
+    }
+
+    /// OCEAN-305 (Codex round 3 on #202): replayed agent events render exactly
+    /// like live ones — the agent rail is the sole writer of transcript /
+    /// timeline — and exactly-once application across a scope flip A→B→A is
+    /// guaranteed by the stream thread's per-id `ForwardedIds` gate, which is
+    /// what decides whether the handler runs at all.
+    #[test]
+    fn agent_rail_replay_backfills_transcript_exactly_once_across_scope_flip() {
+        let turn_id = AgentTurnId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let mut forwarded = ForwardedIds::new(2048);
+        let sse_id = Uuid::new_v4().to_string();
+        let event = || AgentTurnEvent::AssistantTextDelta {
+            session_id,
+            turn_id,
+            delta: "replayed once".to_string(),
+        };
+
+        // First delivery (live or replayed — same path): forwarded + applied.
+        assert!(forwarded.record(&sse_id));
+        daemon_apply_agent_stream_event(&mut app, event());
+
+        // Scope flip A→B→A: A's anchor was invalidated, so the reconnect
+        // full-replays A's history — the same SSE id arrives again and the
+        // gate drops it before the handler ever runs.
+        assert!(
+            !forwarded.record(&sse_id),
+            "the replayed duplicate must be dropped by the per-id gate"
+        );
+
+        let occurrences = app
+            .transcript
+            .iter()
+            .filter(|line| line.contains("replayed once"))
+            .count();
+        assert_eq!(occurrences, 1, "transcript renders the delta exactly once");
+        let pm_text: String = app
+            .pm_turns
+            .iter()
+            .flat_map(|turn| turn.blocks.iter())
+            .map(|block| format!("{block:?}"))
+            .collect();
+        assert!(
+            pm_text.contains("replayed once"),
+            "the PM chat pane is back-filled by the same single application"
+        );
     }
 
     #[test]

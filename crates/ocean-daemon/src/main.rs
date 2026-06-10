@@ -1171,6 +1171,30 @@ impl AgentEventBus {
         };
         (replay, rx)
     }
+
+    /// OCEAN-305: atomically subscribe to the live broadcast and snapshot the
+    /// ENTIRE replay buffer (in emission order) for replay — for a client that
+    /// has no `Last-Event-ID` anchor at all because it was previously connected
+    /// unscoped (and thus deliberately received nothing session-bearing it
+    /// could anchor on). The caller is expected to apply the same per-event
+    /// session scoping it applies to the live stream, so a session-scoped
+    /// subscriber only ever sees its own session's buffered events.
+    ///
+    /// Holding the `history` lock across `self.tx.subscribe()` preserves the
+    /// same seam guarantee as [`subscribe_with_replay`]: every event is either
+    /// in the snapshot (replayed) or arrives on the fresh live receiver —
+    /// never both, never neither.
+    fn subscribe_with_full_replay(
+        &self,
+    ) -> (Vec<AgentEventEnvelope>, broadcast::Receiver<AgentEventEnvelope>) {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let rx = self.tx.subscribe();
+        let replay = history.iter().cloned().collect();
+        (replay, rx)
+    }
 }
 
 /// Parse a `Last-Event-ID` SSE reconnect header (RFC: EventSource sets it to the
@@ -2215,7 +2239,7 @@ async fn prompt(
         req.decision_token.clone(),
     );
     let res = state.runtime.prompt(req, control).await;
-    record_prompt_result(&state, request_id, &res).await;
+    record_prompt_result(&state, request_id, &res, None).await;
 
     (StatusCode::OK, Json(res))
 }
@@ -2277,7 +2301,7 @@ async fn create_request(
         // releasing the turn slot on every exit path (OCEAN-304).
         let _turn_permit = permit;
         let res = task_state.runtime.prompt(req, control).await;
-        record_prompt_result(&task_state, request_id, &res).await;
+        record_prompt_result(&task_state, request_id, &res, None).await;
     });
     attach_request_handle(&state, request_id, handle).await;
 
@@ -6317,7 +6341,7 @@ fn spawn_room_agent_turn(
         );
 
         let res = state.runtime.prompt(prompt_req, control).await;
-        record_prompt_result(&state, request_id, &res).await;
+        record_prompt_result(&state, request_id, &res, None).await;
 
         // Post the agent's reply back into the room as the agent participant.
         // The lock is taken synchronously here, after the await completed.
@@ -7740,10 +7764,19 @@ fn emit_user_message(events: &EventBus, req: &PromptRequest, request_id: Request
     );
 }
 
+/// Close out a finished prompt/turn on the request registry and announce the
+/// outcome on the legacy event bus. `origin` is `Some(EVENT_ORIGIN_AGENT)`
+/// when the caller is the agent-turn path (OCEAN-305): there the full stdout
+/// already streamed delta-by-delta on `/v1/agent/events`, so the legacy
+/// announcements here are agent-rail twins and are provenance-marked so a
+/// dual-rail client doesn't render the same turn twice. The legacy
+/// `/v1/prompt` / `/v1/requests` paths pass `None` — for them these
+/// announcements are the only delivery and must render normally.
 async fn record_prompt_result(
     state: &AppState,
     request_id: RequestId,
     res: &ocean_core::PromptResponse,
+    origin: Option<&'static str>,
 ) {
     let desired_state = if res.ok {
         RequestState::Completed
@@ -7768,21 +7801,23 @@ async fn record_prompt_result(
     match final_state {
         Some(RequestState::Completed) => {
             if !res.stdout.trim().is_empty() {
-                emit(
+                emit_with_origin(
                     &state.events,
                     res.session_id,
                     Some(request_id),
                     None,
+                    origin,
                     OceanEvent::AssistantDelta {
                         text: res.stdout.clone(),
                     },
                 );
             }
-            emit(
+            emit_with_origin(
                 &state.events,
                 res.session_id,
                 Some(request_id),
                 None,
+                origin,
                 OceanEvent::TurnFinished {
                     ok: true,
                     wall_ms: res.wall_ms,
@@ -7790,22 +7825,24 @@ async fn record_prompt_result(
             );
         }
         Some(RequestState::Errored) => {
-            emit(
+            emit_with_origin(
                 &state.events,
                 res.session_id,
                 Some(request_id),
                 None,
+                origin,
                 OceanEvent::Error {
                     message: res.stderr.clone(),
                 },
             );
         }
         Some(RequestState::Cancelled) => {
-            emit(
+            emit_with_origin(
                 &state.events,
                 res.session_id,
                 Some(request_id),
                 None,
+                origin,
                 OceanEvent::Cancelled {
                     reason: Some("request marked cancelled after runtime returned".into()),
                 },
@@ -8719,7 +8756,17 @@ async fn agent_turn(
     } else {
         None
     };
-    record_prompt_result(&state, request_id, &res).await;
+    // OCEAN-305: the agent-turn path marks its legacy completion announcements
+    // (full-stdout AssistantDelta, TurnFinished, Error/Cancelled) as agent
+    // mirrors — the same content already streamed delta-by-delta on
+    // /v1/agent/events, and a dual-rail client must not render it twice.
+    record_prompt_result(
+        &state,
+        request_id,
+        &res,
+        Some(ocean_core::EVENT_ORIGIN_AGENT),
+    )
+    .await;
 
     tracing::info!(
         turn_id = %turn_id,
@@ -9469,18 +9516,41 @@ struct AgentEventsQuery {
     session_id: Option<AgentSessionId>,
     #[serde(default)]
     all: Option<String>,
+    /// OCEAN-305: `?replay=1` (with `?session_id=`) asks for a full-history
+    /// replay of the session's buffered events when the client carries no
+    /// `Last-Event-ID` anchor. This is the recovery path for a client that
+    /// was connected unscoped while its first turn streamed (the unscoped
+    /// stream deliberately delivers nothing session-bearing, so there is no
+    /// anchor id to reconnect from). Without a `session_id` this flag is a
+    /// no-op: the per-event scope filter drops all session-bearing events for
+    /// unscoped subscribers, so the firehose is never replayed to them.
+    #[serde(default)]
+    replay: Option<String>,
 }
 
+/// `GET /v1/agent/events` — the full-fidelity agent-turn SSE stream.
+///
+/// Scoping: `?session_id=<id>` delivers only that session's events; without it
+/// the stream deliberately omits session-bearing events unless the operator
+/// opts into the firehose with `?all=1`.
+///
+/// Replay: a `Last-Event-ID` header replays the buffered events newer than
+/// that id (OCEAN-129). `?replay=1` + `?session_id=` (and no `Last-Event-ID`)
+/// replays the session's events from the FULL history buffer — the first-turn
+/// recovery path for a client that connected unscoped, learned its session id
+/// from the turn response, and re-connected scoped after the events already
+/// streamed (OCEAN-305). Replayed frames are wire-identical to live ones; a
+/// dual-rail client renders them exactly like live events (the legacy
+/// `/v1/events` mirror of agent output is provenance-marked `origin: "agent"`
+/// so the agent rail stays the single writer of shared render surfaces).
 async fn agent_events(
     State(state): State<AppState>,
     Query(q): Query<AgentEventsQuery>,
     headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let want = q.session_id;
-    let all = q
-        .all
-        .as_deref()
-        .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"));
+    let all = query_flag_truthy(q.all.as_deref());
+    let replay_requested = query_flag_truthy(q.replay.as_deref());
 
     // OCEAN-129: honor `Last-Event-ID` on reconnect. Subscribe to the live
     // broadcast and snapshot the replay buffer under one lock so nothing falls
@@ -9488,28 +9558,31 @@ async fn agent_events(
     // last-seen id BEFORE the live stream. The same `?session_id=`/`?all=`
     // scoping is applied to replayed events, so a reconnecting client never
     // sees another session's events on replay.
+    //
+    // OCEAN-305: a session-scoped subscriber with NO `Last-Event-ID` may ask
+    // for a full-history replay (`?replay=1`) instead — recovering the events
+    // it missed while it was connected unscoped (where session-bearing events
+    // are deliberately withheld, so no anchor id ever reached it). The
+    // per-event `should_emit_agent_event` filter below scopes the replayed
+    // history to the requested session, exactly as it does for live events.
+    // A `?replay=1` without `?session_id=` keeps the existing behavior: the
+    // scope filter drops session-bearing events for unscoped subscribers, so
+    // we never snapshot the firehose for them.
     let last_event_id = parse_last_event_id(&headers);
-    let (replay, live_rx) = state.agent_events.subscribe_with_replay(last_event_id);
+    let full_replay = use_full_replay(replay_requested, last_event_id, want);
+    let (replay, live_rx) = if full_replay {
+        state.agent_events.subscribe_with_full_replay()
+    } else {
+        state.agent_events.subscribe_with_replay(last_event_id)
+    };
 
-    // Track replayed ids so any event that lands on the live receiver between
-    // the snapshot and now (there should be none, given the shared lock, but be
-    // defensive) is not delivered twice across the replay/live seam.
-    let mut replayed_ids: std::collections::HashSet<Uuid> =
-        std::collections::HashSet::with_capacity(replay.len());
-    let replay_events: Vec<Result<Event, Infallible>> = replay
+    // Scope-filter the snapshot into the replayed batch; `replayed_ids` lets
+    // the live tail drop anything delivered twice across the replay/live seam
+    // (there should be none, given the shared lock, but be defensive).
+    let (frames, mut replayed_ids) = agent_replay_frames(replay, want, all);
+    let replay_events: Vec<Result<Event, Infallible>> = frames
         .into_iter()
-        .filter_map(|envelope| {
-            if !should_emit_agent_event(want, all, &envelope.event) {
-                return None;
-            }
-            replayed_ids.insert(envelope.id);
-            let id = envelope.id.to_string();
-            let event_type = agent_event_type_name(&envelope.event);
-            let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
-                r#"{"type":"error","message":"serialize failed"}"#.to_string()
-            });
-            Some(Ok(Event::default().id(id).event(event_type).data(data)))
-        })
+        .map(|frame| Ok(frame.into_sse_event()))
         .collect();
 
     let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
@@ -9551,9 +9624,83 @@ async fn agent_events(
     // Replay first (in emission order), then the live broadcast. Terminate the
     // whole stream when the daemon shuts down so this connection can't pin
     // graceful shutdown open (OCEAN-300).
+    //
+    // OCEAN-305: a 3s keepalive (down from axum's 15s default) so the TUI's
+    // scope-change watcher — which only wakes on incoming lines, including
+    // keepalive comments — notices a session switch and re-scopes its
+    // subscription within ~3s instead of ~15s. Only this route; the legacy
+    // `/v1/events` rail keeps the default.
     let stream = tokio_stream::iter(replay_events).chain(live);
     let stream = sse_until_shutdown(stream, state.shutdown.clone());
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(3)))
+}
+
+/// Parse a truthy SSE query flag (`?all=`, `?replay=`): `1`/`true`/`yes`/`on`.
+fn query_flag_truthy(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"))
+}
+
+/// OCEAN-305: whether a `/v1/agent/events` subscribe should snapshot the FULL
+/// history buffer for replay. Only when the client explicitly asked
+/// (`?replay=1`), carries no `Last-Event-ID` anchor (an anchor is more precise
+/// — honor it instead), and is session-scoped (an unscoped subscriber gets no
+/// session-bearing events anyway; never snapshot the firehose for it).
+fn use_full_replay(
+    replay_requested: bool,
+    last_event_id: Option<Uuid>,
+    want: Option<AgentSessionId>,
+) -> bool {
+    replay_requested && last_event_id.is_none() && want.is_some()
+}
+
+/// A pre-serialization SSE frame for the `/v1/agent/events` replay batch,
+/// kept as plain data (not an opaque [`Event`]) so tests can assert the batch
+/// shape — ordering and scoping (OCEAN-305).
+struct AgentSseFrame {
+    /// The bus envelope id (becomes the SSE `id:` line).
+    id: Uuid,
+    event_type: &'static str,
+    data: String,
+}
+
+impl AgentSseFrame {
+    fn into_sse_event(self) -> Event {
+        Event::default()
+            .id(self.id.to_string())
+            .event(self.event_type)
+            .data(self.data)
+    }
+}
+
+/// Build the replayed SSE batch for an agent-events subscription: scope-filter
+/// the snapshot with [`should_emit_agent_event`] (exactly as the live tail
+/// does) and record the replayed ids for the seam dedupe. Replayed frames are
+/// wire-identical to live frames — clients treat them exactly like live
+/// events and rely on their own per-id dedupe for re-delivery.
+fn agent_replay_frames(
+    replay: Vec<AgentEventEnvelope>,
+    want: Option<AgentSessionId>,
+    all: bool,
+) -> (Vec<AgentSseFrame>, std::collections::HashSet<Uuid>) {
+    let mut replayed_ids: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::with_capacity(replay.len());
+    let frames: Vec<AgentSseFrame> = replay
+        .into_iter()
+        .filter_map(|envelope| {
+            if !should_emit_agent_event(want, all, &envelope.event) {
+                return None;
+            }
+            replayed_ids.insert(envelope.id);
+            Some(AgentSseFrame {
+                id: envelope.id,
+                event_type: agent_event_type_name(&envelope.event),
+                data: serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
+                    r#"{"type":"error","message":"serialize failed"}"#.to_string()
+                }),
+            })
+        })
+        .collect();
+    (frames, replayed_ids)
 }
 
 fn should_emit_agent_event(
@@ -9870,10 +10017,14 @@ fn emit_agent(
 ) {
     // Always publish on the AgentEventBus (full fidelity for SSE consumers).
     agent_events.emit(event.clone());
-    // Legacy OceanEvent bus mirror for any subscriber still on it.
+    // Legacy OceanEvent bus mirror for any subscriber still on it. Marked
+    // `origin: "agent"` (OCEAN-305) so a dual-rail client (the TUI) can keep
+    // the agent rail as the SINGLE writer of transcript/timeline surfaces and
+    // skip re-rendering this mirror.
     if let Some(inner) = agent_to_ocean_event(event) {
         let mut env = EventEnvelope::new(inner);
         env.session_id = Some(core_sid(session_id));
+        env.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
         events.emit(env);
     }
 }
@@ -10009,10 +10160,25 @@ fn emit(
     permission_id: Option<ocean_core::PermissionId>,
     event: OceanEvent,
 ) {
+    emit_with_origin(events, session_id, request_id, permission_id, None, event);
+}
+
+/// [`emit`] with an explicit provenance marker (OCEAN-305): pass
+/// `Some(EVENT_ORIGIN_AGENT)` for legacy-bus envelopes that duplicate content
+/// already streamed on `/v1/agent/events`, `None` for genuine legacy events.
+fn emit_with_origin(
+    events: &EventBus,
+    session_id: Option<ocean_core::SessionId>,
+    request_id: Option<ocean_core::RequestId>,
+    permission_id: Option<ocean_core::PermissionId>,
+    origin: Option<&'static str>,
+    event: OceanEvent,
+) {
     let mut envelope = EventEnvelope::new(event);
     envelope.session_id = session_id;
     envelope.request_id = request_id;
     envelope.permission_id = permission_id;
+    envelope.origin = origin.map(str::to_string);
     events.emit(envelope);
 }
 
@@ -10289,6 +10455,163 @@ mod tests {
                     && matches!(&env.event, AgentTurnEvent::AssistantTextDelta { delta, .. } if delta == "other-secret")),
             "other session's event must never pass the scope filter on replay"
         );
+    }
+
+    // ---- OCEAN-305: full-history replay for freshly-scoped clients ----
+
+    #[tokio::test]
+    async fn full_replay_returns_buffered_events_scoped_to_requested_session() {
+        // (a) `?session_id=X&replay=1` with no Last-Event-ID: the full history
+        // snapshot, after the handler's scope filter, yields X's buffered
+        // events (in emission order) and never Y's.
+        let bus = AgentEventBus::new(64);
+        let x = AgentSessionId::new_v4();
+        let y = AgentSessionId::new_v4();
+
+        bus.emit(delta_event(x, "x-1"));
+        bus.emit(delta_event(y, "y-secret"));
+        bus.emit(delta_event(x, "x-2"));
+
+        let (replay, _rx) = bus.subscribe_with_full_replay();
+        assert_eq!(replay.len(), 3, "full replay snapshots the entire buffer");
+
+        // Apply the SAME scoping the handler applies on replay.
+        let visible: Vec<String> = replay
+            .iter()
+            .filter(|env| should_emit_agent_event(Some(x), false, &env.event))
+            .filter_map(|env| match &env.event {
+                AgentTurnEvent::AssistantTextDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            visible,
+            vec!["x-1", "x-2"],
+            "scoped full replay yields only the requested session's events, in order"
+        );
+        assert!(
+            !replay
+                .iter()
+                .any(|env| should_emit_agent_event(Some(x), false, &env.event)
+                    && matches!(&env.event, AgentTurnEvent::AssistantTextDelta { delta, .. } if delta == "y-secret")),
+            "another session's event must never pass the scope filter on full replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_replay_without_session_delivers_nothing_session_bearing() {
+        // (b) `?replay=1` without `?session_id=`: even if a handler snapshotted
+        // the full buffer, the unscoped (non-`?all=1`) filter drops every
+        // session-bearing event — and `use_full_replay` refuses to snapshot at
+        // all for unscoped subscribers.
+        let bus = AgentEventBus::new(64);
+        let sid = AgentSessionId::new_v4();
+        bus.emit(delta_event(sid, "private"));
+        bus.emit(delta_event(sid, "still-private"));
+
+        let (replay, _rx) = bus.subscribe_with_full_replay();
+        let visible: Vec<&AgentEventEnvelope> = replay
+            .iter()
+            .filter(|env| should_emit_agent_event(None, false, &env.event))
+            .collect();
+        assert!(
+            visible.is_empty(),
+            "unscoped subscriber must receive nothing session-bearing on replay"
+        );
+
+        // And the handler never even takes the full snapshot for unscoped
+        // clients: `?replay=1` with no session_id keeps existing behavior.
+        assert!(!use_full_replay(true, None, None));
+    }
+
+    #[test]
+    fn full_replay_gating_preserves_last_event_id_behavior() {
+        // (c) Last-Event-ID behavior is unchanged: a client with an anchor id
+        // always takes the precise after-id replay path, never the full one.
+        let sid = AgentSessionId::new_v4();
+        let anchor = Uuid::new_v4();
+        assert!(
+            !use_full_replay(true, Some(anchor), Some(sid)),
+            "a Last-Event-ID anchor wins over ?replay=1"
+        );
+        assert!(
+            !use_full_replay(false, None, Some(sid)),
+            "no ?replay=1 => existing (empty) no-anchor replay"
+        );
+        assert!(
+            !use_full_replay(true, None, None),
+            "?replay=1 without session_id never snapshots the firehose"
+        );
+        assert!(
+            use_full_replay(true, None, Some(sid)),
+            "?replay=1 + session scope + no anchor => full-history replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_replay_batch_is_scoped_and_wire_identical_to_live() {
+        // Codex round 3 on #202: replayed frames carry no special marker —
+        // they are wire-identical to live frames (real bus ids, same event
+        // types), scoped to the requested session, and clients dedupe by id.
+        let bus = AgentEventBus::new(64);
+        let x = AgentSessionId::new_v4();
+        let y = AgentSessionId::new_v4();
+        bus.emit(delta_event(x, "x-1"));
+        bus.emit(delta_event(y, "y-other"));
+        bus.emit(delta_event(x, "x-2"));
+
+        let (replay, _rx) = bus.subscribe_with_full_replay();
+        let (frames, replayed_ids) = agent_replay_frames(replay, Some(x), false);
+
+        assert_eq!(frames.len(), 2, "only X's two events replay");
+        assert!(frames.iter().all(|f| f.event_type == "assistant_text_delta"));
+        assert!(frames.iter().all(|f| f.data.contains("x-")));
+        assert!(
+            !frames.iter().any(|f| f.data.contains("y-other")),
+            "Y's event must not leak into X's scoped batch"
+        );
+        assert_eq!(
+            replayed_ids.len(),
+            2,
+            "seam dedupe tracks exactly the replayed (scoped) envelope ids"
+        );
+
+        // An empty buffer replays nothing — no synthetic frames of any kind.
+        let (empty_replay, _rx) = AgentEventBus::new(8).subscribe_with_full_replay();
+        let (frames, _) = agent_replay_frames(empty_replay, Some(x), false);
+        assert!(frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn last_event_id_replay_batch_shape_is_unchanged() {
+        // Last-Event-ID gap replay through the same frame builder: exactly the
+        // missed events, nothing synthetic appended.
+        let bus = AgentEventBus::new(64);
+        let sid = AgentSessionId::new_v4();
+        bus.emit(delta_event(sid, "first"));
+        let anchor = {
+            let h = bus.history.lock().unwrap();
+            h.back().unwrap().id
+        };
+        bus.emit(delta_event(sid, "second"));
+
+        let (replay, _rx) = bus.subscribe_with_replay(Some(anchor));
+        let (frames, _) = agent_replay_frames(replay, Some(sid), false);
+        assert_eq!(frames.len(), 1, "gap replay yields just the missed event");
+        assert!(frames[0].data.contains("second"));
+        assert_eq!(frames[0].event_type, "assistant_text_delta");
+    }
+
+    #[test]
+    fn replay_query_flag_parses_like_all() {
+        // `?replay=` accepts the same truthy spellings as `?all=`.
+        for truthy in ["1", "true", "yes", "on"] {
+            assert!(query_flag_truthy(Some(truthy)), "{truthy} must be truthy");
+        }
+        for falsy in ["0", "false", "no", "off", "", "2", "TRUE"] {
+            assert!(!query_flag_truthy(Some(falsy)), "{falsy} must be falsy");
+        }
+        assert!(!query_flag_truthy(None));
     }
 
     // ---- OCEAN-150 (Gate B): surface_patch is session-scoped ----
