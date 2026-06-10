@@ -9517,6 +9517,15 @@ struct AgentEventsQuery {
 /// recovery path for a client that connected unscoped, learned its session id
 /// from the turn response, and re-connected scoped after the events already
 /// streamed (OCEAN-305).
+///
+/// On the full-replay path ONLY, the replayed batch is terminated by a
+/// synthetic `event: replay_complete` marker frame (empty `{}` data, no `id:`)
+/// before the live stream is chained. A client can use it to render replayed
+/// events differently from live ones — e.g. the TUI skips transcript/timeline
+/// lines its legacy `/v1/events` mirror already rendered live, while still
+/// back-filling the chat pane that was blind. `Last-Event-ID` gap replay does
+/// not emit the marker (behavior unchanged); unknown SSE event names are
+/// ignored by spec-conforming clients anyway.
 async fn agent_events(
     State(state): State<AppState>,
     Query(q): Query<AgentEventsQuery>,
@@ -9543,31 +9552,22 @@ async fn agent_events(
     // scope filter drops session-bearing events for unscoped subscribers, so
     // we never snapshot the firehose for them.
     let last_event_id = parse_last_event_id(&headers);
-    let (replay, live_rx) = if use_full_replay(replay_requested, last_event_id, want) {
+    let full_replay = use_full_replay(replay_requested, last_event_id, want);
+    let (replay, live_rx) = if full_replay {
         state.agent_events.subscribe_with_full_replay()
     } else {
         state.agent_events.subscribe_with_replay(last_event_id)
     };
 
-    // Track replayed ids so any event that lands on the live receiver between
-    // the snapshot and now (there should be none, given the shared lock, but be
-    // defensive) is not delivered twice across the replay/live seam.
-    let mut replayed_ids: std::collections::HashSet<Uuid> =
-        std::collections::HashSet::with_capacity(replay.len());
-    let replay_events: Vec<Result<Event, Infallible>> = replay
+    // Scope-filter the snapshot into the replayed batch and (on the
+    // full-replay path) terminate it with the `replay_complete` marker;
+    // `replayed_ids` lets the live tail drop anything delivered twice across
+    // the replay/live seam (there should be none, given the shared lock, but
+    // be defensive).
+    let (frames, mut replayed_ids) = agent_replay_frames(replay, want, all, full_replay);
+    let replay_events: Vec<Result<Event, Infallible>> = frames
         .into_iter()
-        .filter_map(|envelope| {
-            if !should_emit_agent_event(want, all, &envelope.event) {
-                return None;
-            }
-            replayed_ids.insert(envelope.id);
-            let id = envelope.id.to_string();
-            let event_type = agent_event_type_name(&envelope.event);
-            let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
-                r#"{"type":"error","message":"serialize failed"}"#.to_string()
-            });
-            Some(Ok(Event::default().id(id).event(event_type).data(data)))
-        })
+        .map(|frame| Ok(frame.into_sse_event()))
         .collect();
 
     let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
@@ -9636,6 +9636,76 @@ fn use_full_replay(
     want: Option<AgentSessionId>,
 ) -> bool {
     replay_requested && last_event_id.is_none() && want.is_some()
+}
+
+/// OCEAN-305: synthetic SSE event name marking the end of a full-replay batch
+/// on `/v1/agent/events?replay=1`. Emitted with empty `{}` data and NO `id:`
+/// line — it must never become a client's `Last-Event-ID` anchor (the bus has
+/// no such id in its history, so anchoring on it would void the gap replay).
+const AGENT_REPLAY_COMPLETE_EVENT: &str = "replay_complete";
+
+/// A pre-serialization SSE frame for the `/v1/agent/events` replay batch,
+/// kept as plain data (not an opaque [`Event`]) so tests can assert the batch
+/// shape — ordering, scoping, and marker placement (OCEAN-305).
+struct AgentSseFrame {
+    /// The bus envelope id (becomes the SSE `id:` line). `None` only for the
+    /// synthetic `replay_complete` marker.
+    id: Option<Uuid>,
+    event_type: &'static str,
+    data: String,
+}
+
+impl AgentSseFrame {
+    fn into_sse_event(self) -> Event {
+        let event = Event::default().event(self.event_type).data(self.data);
+        match self.id {
+            Some(id) => event.id(id.to_string()),
+            None => event,
+        }
+    }
+}
+
+/// Build the replayed SSE batch for an agent-events subscription: scope-filter
+/// the snapshot with [`should_emit_agent_event`] (exactly as the live tail
+/// does), record the replayed ids for the seam dedupe, and — on the
+/// full-replay path ONLY (OCEAN-305) — append the `replay_complete` marker
+/// frame after the batch, so a client can tell replayed events from the live
+/// stream that is chained behind it. The marker is emitted even when the
+/// scoped batch is empty: the client still needs the "you are live now"
+/// signal. `Last-Event-ID` gap replay (`full_replay == false`) never gets the
+/// marker — that path's behavior is unchanged.
+fn agent_replay_frames(
+    replay: Vec<AgentEventEnvelope>,
+    want: Option<AgentSessionId>,
+    all: bool,
+    full_replay: bool,
+) -> (Vec<AgentSseFrame>, std::collections::HashSet<Uuid>) {
+    let mut replayed_ids: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::with_capacity(replay.len());
+    let mut frames: Vec<AgentSseFrame> = replay
+        .into_iter()
+        .filter_map(|envelope| {
+            if !should_emit_agent_event(want, all, &envelope.event) {
+                return None;
+            }
+            replayed_ids.insert(envelope.id);
+            Some(AgentSseFrame {
+                id: Some(envelope.id),
+                event_type: agent_event_type_name(&envelope.event),
+                data: serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
+                    r#"{"type":"error","message":"serialize failed"}"#.to_string()
+                }),
+            })
+        })
+        .collect();
+    if full_replay {
+        frames.push(AgentSseFrame {
+            id: None,
+            event_type: AGENT_REPLAY_COMPLETE_EVENT,
+            data: "{}".to_string(),
+        });
+    }
+    (frames, replayed_ids)
 }
 
 fn should_emit_agent_event(
@@ -10461,6 +10531,88 @@ mod tests {
         assert!(
             use_full_replay(true, None, Some(sid)),
             "?replay=1 + session scope + no anchor => full-history replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_replay_batch_ends_with_replay_complete_marker() {
+        // Codex P2 on #202: the TUI's legacy /v1/events mirror already rendered
+        // the first turn's transcript/timeline lines live, so it must be able
+        // to tell the replayed batch from the live tail. The full-replay batch
+        // is terminated by a synthetic `replay_complete` frame — after every
+        // replayed event, before the live stream is chained.
+        let bus = AgentEventBus::new(64);
+        let x = AgentSessionId::new_v4();
+        let y = AgentSessionId::new_v4();
+        bus.emit(delta_event(x, "x-1"));
+        bus.emit(delta_event(y, "y-other"));
+        bus.emit(delta_event(x, "x-2"));
+
+        let (replay, _rx) = bus.subscribe_with_full_replay();
+        let (frames, replayed_ids) = agent_replay_frames(replay, Some(x), false, true);
+
+        // Marker is the LAST frame of the batch (the live stream is chained
+        // strictly after the batch, so "last in batch" == "before live").
+        let marker = frames.last().expect("batch must not be empty");
+        assert_eq!(marker.event_type, AGENT_REPLAY_COMPLETE_EVENT);
+        assert!(
+            marker.id.is_none(),
+            "the marker must carry no id — it must never become a Last-Event-ID anchor"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f.event_type == AGENT_REPLAY_COMPLETE_EVENT)
+                .count(),
+            1,
+            "exactly one marker per connection"
+        );
+
+        // Everything before the marker is X's scoped replay, with real ids.
+        let replayed: Vec<&AgentSseFrame> = frames[..frames.len() - 1].iter().collect();
+        assert_eq!(replayed.len(), 2, "only X's two events replay");
+        assert!(replayed.iter().all(|f| f.id.is_some()));
+        assert!(replayed.iter().all(|f| f.data.contains("x-")));
+        assert!(
+            !frames.iter().any(|f| f.data.contains("y-other")),
+            "Y's event must not leak into X's scoped batch"
+        );
+        assert_eq!(
+            replayed_ids.len(),
+            2,
+            "seam dedupe tracks only the replayed (scoped) envelope ids — not the marker"
+        );
+
+        // Even an EMPTY scoped batch still gets the marker: the client needs
+        // the "you are live now" signal regardless.
+        let (empty_replay, _rx) = AgentEventBus::new(8).subscribe_with_full_replay();
+        let (frames, _) = agent_replay_frames(empty_replay, Some(x), false, true);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event_type, AGENT_REPLAY_COMPLETE_EVENT);
+    }
+
+    #[tokio::test]
+    async fn last_event_id_replay_has_no_replay_complete_marker() {
+        // The marker is full-replay-only: Last-Event-ID gap replay keeps its
+        // exact pre-existing wire shape (limit blast radius).
+        let bus = AgentEventBus::new(64);
+        let sid = AgentSessionId::new_v4();
+        bus.emit(delta_event(sid, "first"));
+        let anchor = {
+            let h = bus.history.lock().unwrap();
+            h.back().unwrap().id
+        };
+        bus.emit(delta_event(sid, "second"));
+
+        let (replay, _rx) = bus.subscribe_with_replay(Some(anchor));
+        let (frames, _) = agent_replay_frames(replay, Some(sid), false, false);
+        assert_eq!(frames.len(), 1, "gap replay yields just the missed event");
+        assert!(frames[0].data.contains("second"));
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f.event_type == AGENT_REPLAY_COMPLETE_EVENT),
+            "Last-Event-ID replay must NOT emit the replay_complete marker"
         );
     }
 
