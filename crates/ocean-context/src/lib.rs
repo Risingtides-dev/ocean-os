@@ -6,5 +6,6 @@
 
 pub mod claim;
 pub mod extract;
+pub mod store;
 
 pub use claim::*;
