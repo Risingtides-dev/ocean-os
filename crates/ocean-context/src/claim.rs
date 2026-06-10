@@ -43,6 +43,26 @@ impl Claim {
     pub fn written_at(&self) -> Option<i64> {
         self.history.iter().find(|e| e.event == "written").map(|e| e.at)
     }
+
+    /// Derive write-time confidence from anchor richness instead of letting the
+    /// writer free-type a number (handoff finding F3). The extractor uses this;
+    /// hand-written claims should too.
+    ///
+    /// Deterministic and monotonic in evidence:
+    /// - base 0.25, or 0.50 when the surrounding doc section declared the fact
+    ///   verified (`declared_verified`);
+    /// - +0.10 per anchor, capped at 3 anchors;
+    /// - +0.10 if any anchor pins line numbers;
+    /// - +0.10 if any anchor names a symbol.
+    ///
+    /// Maximum is exactly 1.0 (0.5 + 0.3 + 0.1 + 0.1).
+    pub fn derive_confidence(anchors: &[Anchor], declared_verified: bool) -> f32 {
+        let base: f32 = if declared_verified { 0.50 } else { 0.25 };
+        let count_term = 0.10 * (anchors.len().min(3) as f32);
+        let line_term = if anchors.iter().any(|a| !a.lines.is_empty()) { 0.10 } else { 0.0 };
+        let symbol_term = if anchors.iter().any(|a| a.symbol.is_some()) { 0.10 } else { 0.0 };
+        (base + count_term + line_term + symbol_term).clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,9 +92,14 @@ pub enum ClaimStatus {
     Asserted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// WHERE a claim is knowable — orthogonal to `ClaimStatus` (handoff finding F2:
+/// tier = where it's knowable, status = whether it currently reproduces). The
+/// ENGINE computes the tier and defaults to `Individual`; writers are never
+/// asked for it. Layer B (B6) promotes via the epistemic similarity graph.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum KnowledgeTier {
     Common,
+    #[default]
     Individual,
     Distributed,
 }
@@ -154,5 +179,29 @@ pub(crate) mod tests {
     fn claim_written_at_reads_history() {
         let h = sample_handoff();
         assert_eq!(h.claims[0].written_at(), Some(1_780_980_000));
+    }
+
+    fn anchor(file: &str, symbol: Option<&str>, lines: Vec<u32>) -> Anchor {
+        Anchor { file: file.into(), symbol: symbol.map(Into::into), lines, sig_hash: None }
+    }
+
+    #[test]
+    fn derive_confidence_is_monotonic_in_evidence() {
+        let bare = [anchor("a.rs", None, vec![])];
+        let lined = [anchor("a.rs", None, vec![10])];
+        let symboled = [anchor("a.rs", Some("f"), vec![10])];
+        let asserted = Claim::derive_confidence(&bare, false);
+        let verified = Claim::derive_confidence(&bare, true);
+        assert!(verified > asserted);
+        assert!(Claim::derive_confidence(&lined, false) > asserted);
+        assert!(Claim::derive_confidence(&symboled, true) > Claim::derive_confidence(&lined, true));
+    }
+
+    #[test]
+    fn derive_confidence_caps_at_one_and_handles_no_anchors() {
+        let rich: Vec<Anchor> =
+            (0..5).map(|i| anchor(&format!("f{i}.rs"), Some("sym"), vec![1, 2])).collect();
+        assert!((Claim::derive_confidence(&rich, true) - 1.0).abs() < f32::EPSILON);
+        assert!((Claim::derive_confidence(&[], false) - 0.25).abs() < f32::EPSILON);
     }
 }

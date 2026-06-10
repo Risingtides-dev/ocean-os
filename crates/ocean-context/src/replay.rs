@@ -78,7 +78,7 @@ fn rev_list(repo_root: &Path, from: &str) -> Result<Vec<String>> {
         .output()
         .context("running git rev-list")?;
     if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim().to_string());
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
 }

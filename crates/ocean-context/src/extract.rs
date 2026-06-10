@@ -44,13 +44,6 @@ fn verified_hdr_re() -> &'static Regex {
     })
 }
 
-/// v1 confidence is DERIVED, never free-typed (handoff finding F3):
-/// base by section, small bump per extra anchor.
-fn derive_confidence(anchor_count: usize, declared_verified: bool) -> f32 {
-    let base = if declared_verified { 0.8 } else { 0.5 };
-    (base + 0.05 * anchor_count.min(4) as f32).min(1.0)
-}
-
 pub fn extract_claims(text: &str, ctx: &ExtractCtx) -> Vec<Claim> {
     let mut claims = Vec::new();
     let mut in_verified = false;
@@ -70,12 +63,13 @@ pub fn extract_claims(text: &str, ctx: &ExtractCtx) -> Vec<Claim> {
             if let Some(ls) = cap.get(2) {
                 for part in ls.as_str().split(',') {
                     let part = part.replace('–', "-");
-                    if let Some((a, b)) = part.split_once('-') {
-                        if let Ok(n) = a.parse::<u32>() {
-                            lines.push(n);
-                        }
-                        if let Ok(n) = b.parse::<u32>() {
-                            lines.push(n);
+                    if part.contains('-') {
+                        // Faithful to the prototype: a range contributes its
+                        // first two dash-separated endpoints ("10-20-30" → 10, 20).
+                        for end in part.split('-').take(2) {
+                            if let Ok(n) = end.parse::<u32>() {
+                                lines.push(n);
+                            }
                         }
                     } else if let Ok(n) = part.parse::<u32>() {
                         lines.push(n);
@@ -94,7 +88,8 @@ pub fn extract_claims(text: &str, ctx: &ExtractCtx) -> Vec<Claim> {
             anchor.symbol = Some(sym.clone());
         }
         let ticket = ticket_re().captures(l).map(|c| c[1].to_string());
-        let confidence = derive_confidence(anchors.len(), in_verified);
+        // F3: confidence is DERIVED from anchor richness, never free-typed.
+        let confidence = Claim::derive_confidence(&anchors, in_verified);
         claims.push(Claim {
             id: format!("c{}", claims.len() + 1),
             text: l.chars().take(280).collect(),

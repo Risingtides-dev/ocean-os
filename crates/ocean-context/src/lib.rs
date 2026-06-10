@@ -73,11 +73,13 @@ pub fn reverify(
             Resolution::Stale => ClaimStatus::Stale,
             Resolution::Dead => ClaimStatus::Dead,
         };
-        claim.history.push(ClaimEvent {
-            at: now,
-            event: format!("reverified:{best:?}"),
-            by_session: by_session.to_string(),
-        });
+        // Spec event vocabulary: "reverified" when the claim still stands in
+        // some form, "killed" when its anchors are gone.
+        let event = match best {
+            Resolution::Dead => "killed".to_string(),
+            _ => "reverified".to_string(),
+        };
+        claim.history.push(ClaimEvent { at: now, event, by_session: by_session.to_string() });
         out.push((claim.id.clone(), best));
     }
     out

@@ -43,9 +43,28 @@ pub fn to_markdown(h: &Handoff) -> Result<String> {
 pub fn from_markdown(text: &str) -> Result<Handoff> {
     let rest = text.strip_prefix(DELIM).context("missing opening +++ frontmatter delimiter")?;
     let rest = rest.strip_prefix('\n').unwrap_or(rest);
-    let (fm_str, body) =
-        rest.split_once("\n+++").context("missing closing +++ frontmatter delimiter")?;
-    let fm: FrontMatter = toml::from_str(fm_str).context("parsing handoff frontmatter")?;
+    // The closing "\n+++" could in principle also appear inside a TOML
+    // multi-line string (a claim text with a line starting "+++"), so try each
+    // candidate close in order and take the first prefix that parses as TOML.
+    let mut parsed: Option<(FrontMatter, &str)> = None;
+    let mut last_err: Option<toml::de::Error> = None;
+    for (idx, _) in rest.match_indices("\n+++") {
+        match toml::from_str::<FrontMatter>(&rest[..idx + 1]) {
+            Ok(fm) => {
+                parsed = Some((fm, &rest[idx + "\n+++".len()..]));
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let (fm, body) = parsed.ok_or_else(|| match last_err {
+        Some(e) => anyhow::Error::new(e).context("parsing handoff frontmatter"),
+        None => anyhow::anyhow!("missing closing +++ frontmatter delimiter"),
+    })?;
+    // The writer separates the closing delimiter from the narrative with
+    // exactly one blank line; strip exactly that, so narratives that
+    // themselves start with newlines round-trip losslessly.
+    let narrative = body.strip_prefix("\n\n").unwrap_or(body).to_string();
     Ok(Handoff {
         session_id: fm.session_id,
         parent_session: fm.parent_session,
@@ -55,18 +74,33 @@ pub fn from_markdown(text: &str) -> Result<Handoff> {
         scope_ring: fm.scope_ring,
         velocity_at_write: fm.velocity_at_write,
         written_at: fm.written_at,
-        narrative: body.trim_start_matches('\n').to_string(),
+        narrative,
         claims: fm.claims,
     })
 }
 
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect()
+}
+
+/// Filename convention: repo, branch and written_at are all encoded (plus the
+/// session id as a collision-breaker). `read_freshest` still trusts the parsed
+/// frontmatter, never the filename.
 fn file_name(h: &Handoff) -> String {
-    let safe: String = h
-        .session_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect();
-    format!("{}-{}.handoff.md", h.written_at, safe)
+    format!(
+        "{}__{}__{:012}-{}.handoff.md",
+        sanitize(&h.repo),
+        sanitize(&h.branch),
+        h.written_at.max(0),
+        sanitize(&h.session_id),
+    )
+}
+
+/// Default handoff directory for a repo: `<repo_root>/.ocean/handoffs`.
+pub fn default_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".ocean").join("handoffs")
 }
 
 /// Write a codified handoff into `dir`. Returns the path written.
@@ -115,6 +149,69 @@ mod tests {
         let md = to_markdown(&h).unwrap();
         assert!(md.starts_with("+++\n"));
         let back = from_markdown(&md).unwrap();
+        assert_eq!(h, back);
+    }
+
+    /// Acceptance #2: round-trip a handoff with ALL field variants populated —
+    /// parent_session, ps_anchor, borrowed_from, ticket, every status, an
+    /// empty-lines anchor and a symbol-only anchor (F5), multi-event history,
+    /// and a hostile narrative (leading newline, +++ line, fenced toml block).
+    #[test]
+    fn round_trip_with_all_field_variants_is_lossless() {
+        use crate::claim::{Anchor, Claim, ClaimEvent, ClaimStatus, KnowledgeTier, Provenance};
+        let mk_event = |at: i64, event: &str| ClaimEvent {
+            at,
+            event: event.into(),
+            by_session: "sess-a".into(),
+        };
+        let mut h = sample_handoff();
+        h.parent_session = Some("sess-parent".into());
+        h.velocity_at_write = Velocity { v_code: 0.25, v_sem: 0.125 };
+        h.narrative =
+            "\nleading newline kept\n+++\nnot a delimiter\n```toml\nx = 1\n```\ntrailing\n".into();
+        h.claims = vec![
+            Claim {
+                id: "v1".into(),
+                text: "file-only anchor, no lines (F5)".into(),
+                provenance: Provenance {
+                    anchors: vec![Anchor {
+                        file: "Cargo.toml".into(),
+                        symbol: None,
+                        lines: vec![],
+                        sig_hash: None,
+                    }],
+                    ticket: None,
+                    commit_sha: "d9a9bc9".into(),
+                },
+                status: ClaimStatus::Asserted,
+                knowledge_tier: KnowledgeTier::Common,
+                ps_anchor: Some(0.75),
+                confidence: 0.5,
+                borrowed_from: Some("v2".into()),
+                history: vec![mk_event(1, "written"), mk_event(2, "reverified")],
+            },
+            Claim {
+                id: "v2".into(),
+                text: "symbol-only anchor (F5) and a ticket".into(),
+                provenance: Provenance {
+                    anchors: vec![Anchor {
+                        file: String::new(),
+                        symbol: Some("workspace.members".into()),
+                        lines: vec![],
+                        sig_hash: Some("deadbeef".into()),
+                    }],
+                    ticket: Some("OCEAN-306".into()),
+                    commit_sha: "d9a9bc9".into(),
+                },
+                status: ClaimStatus::Dead,
+                knowledge_tier: KnowledgeTier::Distributed,
+                ps_anchor: None,
+                confidence: 0.85,
+                borrowed_from: None,
+                history: vec![mk_event(1, "written"), mk_event(3, "killed")],
+            },
+        ];
+        let back = from_markdown(&to_markdown(&h).unwrap()).unwrap();
         assert_eq!(h, back);
     }
 

@@ -1,3 +1,15 @@
+//! Regression lock against the validated Python prototype
+//! (`claude-monorepo/.superpowers/brainstorm/sim/extract_claims.py`).
+//!
+//! The two fixture docs are VENDORED byte-for-byte copies (md5-verified at
+//! vendoring time) of the real corpus, so CI never depends on external paths:
+//!   fixtures/ocean-os-HANDOFF.md            ← ocean-os/HANDOFF.md
+//!   fixtures/claude-monorepo-PHASE2_HANDOFF.md ← claude-monorepo/docs/PHASE2_HANDOFF.md
+//!
+//! Prototype ground truth (run 2026-06-10): 22 claims (15 declared-verified)
+//! from the ocean-os doc + 29 claims (0 declared-verified) from the
+//! claude-monorepo doc = the 51-claim corpus the schema was validated on.
+
 use ocean_context::claim::ClaimStatus;
 use ocean_context::extract::{extract_claims, ExtractCtx};
 
@@ -6,15 +18,53 @@ fn ctx() -> ExtractCtx<'static> {
 }
 
 #[test]
-fn ocean_os_handoff_yields_22_claims() {
+fn ocean_os_handoff_yields_22_claims_15_verified() {
     let text = include_str!("fixtures/ocean-os-HANDOFF.md");
-    assert_eq!(extract_claims(text, &ctx()).len(), 22);
+    let claims = extract_claims(text, &ctx());
+    assert_eq!(claims.len(), 22);
+    let verified = claims.iter().filter(|c| c.status == ClaimStatus::Verified).count();
+    assert_eq!(verified, 15); // prototype: declared_verified == 15
 }
 
 #[test]
-fn phase2_handoff_yields_29_claims() {
+fn phase2_handoff_yields_29_claims_0_verified() {
     let text = include_str!("fixtures/claude-monorepo-PHASE2_HANDOFF.md");
-    assert_eq!(extract_claims(text, &ctx()).len(), 29);
+    let claims = extract_claims(text, &ctx());
+    assert_eq!(claims.len(), 29);
+    assert!(claims.iter().all(|c| c.status == ClaimStatus::Asserted));
+}
+
+#[test]
+fn corpus_totals_51_claims() {
+    let a = extract_claims(include_str!("fixtures/ocean-os-HANDOFF.md"), &ctx());
+    let b = extract_claims(include_str!("fixtures/claude-monorepo-PHASE2_HANDOFF.md"), &ctx());
+    assert_eq!(a.len() + b.len(), 51);
+}
+
+#[test]
+fn prototype_quirks_are_preserved() {
+    // The prototype's leftmost-first alternation matches "manifest.json" as
+    // "manifest.js" (js before json in the extension alternation) — frozen.
+    let a = extract_claims(include_str!("fixtures/ocean-os-HANDOFF.md"), &ctx());
+    assert!(a.iter().any(|c| c.provenance.anchors.iter().any(|an| an.file == "manifest.js")));
+    // "~/.config/brain/config.toml" matches from the slash ("~" is not in the
+    // file char class) — frozen too.
+    let b = extract_claims(include_str!("fixtures/claude-monorepo-PHASE2_HANDOFF.md"), &ctx());
+    assert!(b
+        .iter()
+        .any(|c| c.provenance.anchors.iter().any(|an| an.file == "/.config/brain/config.toml")));
+}
+
+#[test]
+fn confidence_is_derived_not_free_typed() {
+    // F3: extractor confidence comes from Claim::derive_confidence.
+    use ocean_context::claim::Claim;
+    let claims = extract_claims(include_str!("fixtures/ocean-os-HANDOFF.md"), &ctx());
+    for c in &claims {
+        let expected =
+            Claim::derive_confidence(&c.provenance.anchors, c.status == ClaimStatus::Verified);
+        assert!((c.confidence - expected).abs() < f32::EPSILON, "claim {}", c.id);
+    }
 }
 
 #[test]
