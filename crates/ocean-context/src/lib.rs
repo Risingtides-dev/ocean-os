@@ -6,6 +6,11 @@
 
 pub mod claim;
 pub mod extract;
+pub mod seams;
 pub mod store;
 
 pub use claim::*;
+pub use seams::{
+    Borrowed, Borrower, ConfidenceRecencyTrust, FileExistsResolver, NoBorrow, Resolution,
+    Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel, WORKTREE,
+};
