@@ -115,9 +115,9 @@ pub fn normalize_e164(input: &str) -> Option<String> {
     } else if digits.len() == 10 {
         // Bare US number → assume +1.
         format!("+1{digits}")
-    } else if digits.len() == 11 && digits.starts_with('1') {
-        format!("+{digits}")
     } else {
+        // 11-digit "1XXXXXXXXXX" and anything else: prefix '+' and let the
+        // E.164 length check below decide.
         format!("+{digits}")
     };
     // E.164: '+' then 8..=15 digits.

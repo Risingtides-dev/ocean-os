@@ -4753,9 +4753,8 @@ async fn call_place(
 /// testable without LiveKit signatures or `AppState`:
 ///   - `JoinCall`  → `CallStarted` (room appeared; pipeline should attach)
 ///   - `EndCall`   → `CallEnded`   (room finished — clean hangup, crash, or
-///                                   partition — so the call lifecycle MUST
-///                                   close or the TUI/surface shows a phantom
-///                                   "in progress" call forever; OCEAN-207)
+///     partition — so the call lifecycle MUST close or the TUI/surface shows
+///     a phantom "in progress" call forever; OCEAN-207)
 ///   - `Ignore`    → `None`        (non-call room / non-lifecycle event)
 ///
 /// The room name is threaded through as the `call_id` so subscribers correlate
@@ -7225,7 +7224,7 @@ fn build_room_projection(input: &RoomProjectionInput, room_id: RoomId) -> RoomPr
     // --- turns + active_turn (REAL: from the tracked request registry) ---
     let mut ordered: Vec<&RequestStatus> = input.requests.iter().collect();
     // Most-recent activity first.
-    ordered.sort_by(|a, b| turn_recency(b).cmp(&turn_recency(a)));
+    ordered.sort_by_key(|status| std::cmp::Reverse(turn_recency(status)));
 
     let turns: Vec<RoomTurn> = ordered.iter().map(|status| request_to_turn(status)).collect();
 
@@ -9035,11 +9034,11 @@ const LONGHOUSE_PREP_DEADLINE: std::time::Duration = std::time::Duration::from_m
 ///   repo-local `./skills` when `cwd` is set) happens at most once per TTL window
 ///   per root-set, not once per turn. The steady-state cost is ranking an
 ///   already-loaded `Vec<SkillBrief>`.
-/// * **Time-bounded.** The whole consult (the cache check + any cold/stale reload
-///   + the rank) runs on `spawn_blocking` (filesystem I/O must never run on the
-///   async scheduler) AND under a [`LONGHOUSE_PREP_DEADLINE`] — if it overruns,
-///   we abandon it and inject nothing. So even a first cold load against a
-///   degraded disk caps the latency it can add to a turn.
+/// * **Time-bounded.** The whole consult (the cache check + any cold/stale
+///   reload + the rank) runs on `spawn_blocking` (filesystem I/O must never
+///   run on the async scheduler) AND under a [`LONGHOUSE_PREP_DEADLINE`] — if
+///   it overruns, we abandon it and inject nothing. So even a first cold load
+///   against a degraded disk caps the latency it can add to a turn.
 ///
 /// This performs no side effects and touches no permission gate: it reads the
 /// cached index and ranks it, nothing more.
@@ -10213,12 +10212,20 @@ mod tests {
     /// reads for the YOLO resolution (`OCEAN_YOLO`, `OCEAN_CONFIG_DIR`). Rust
     /// runs unit tests on parallel threads sharing one process env, so without
     /// this lock two env-touching yolo tests can interleave and read each
-    /// other's writes. Poison is swallowed — a panicking test should not cascade
-    /// into spurious failures here.
-    static YOLO_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// other's writes. A tokio (non-poisoning) mutex: async tests may hold the
+    /// guard across `.await` without tripping `clippy::await_holding_lock`, and
+    /// a panicking test never cascades poison into spurious failures here.
+    static YOLO_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn yolo_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        YOLO_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    /// Blocking flavor for non-async `#[test]`s (no runtime to stall).
+    fn yolo_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        YOLO_ENV_LOCK.blocking_lock()
+    }
+
+    /// Awaiting flavor for async contexts — `blocking_lock` panics inside a
+    /// tokio runtime.
+    async fn yolo_env_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
+        YOLO_ENV_LOCK.lock().await
     }
 
     /// An empty canvas-fulfillment store for the `gc_registries` tests that only
@@ -12461,9 +12468,9 @@ mod tests {
     async fn graceful_shutdown_completes_with_live_sse_connection() {
         // `permission_test_state` mutates process env (`OCEAN_CONFIG_DIR`,
         // `OCEAN_MODEL`); hold the env lock ONLY across that build, then drop it
-        // before any `.await` so we don't hold a std `MutexGuard` across awaits.
+        // before the SSE awaits below so the env stays free for other tests.
         let state = {
-            let _g = yolo_env_guard();
+            let _g = yolo_env_guard_async().await;
             permission_test_state()
         };
         let shutdown = state.shutdown.clone();
@@ -14137,9 +14144,7 @@ mod tests {
         // mutates `OCEAN_CONFIG_DIR`/`OCEAN_YOLO` process-globally. Acquire it
         // AFTER the yolo lock; no path takes these in the reverse order, so this
         // can't deadlock.
-        let _convene_guard = AUTO_CONVENE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.blocking_lock();
         let prior_yolo = env::var("OCEAN_YOLO").ok();
         let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
 
@@ -14220,10 +14225,8 @@ mod tests {
     /// fast, deterministic assertion of the no-silent-stall contract.
     #[tokio::test]
     async fn voice_turn_without_token_and_no_yolo_fails_fast_not_hang() {
-        let _guard = yolo_env_guard();
-        let _convene_guard = AUTO_CONVENE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _guard = yolo_env_guard_async().await;
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let prior_yolo = env::var("OCEAN_YOLO").ok();
         let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
 
@@ -14300,9 +14303,7 @@ mod tests {
     #[test]
     fn resolve_request_yolo_ignores_wire_flag() {
         let _guard = yolo_env_guard();
-        let _convene_guard = AUTO_CONVENE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.blocking_lock();
         let prior_yolo = env::var("OCEAN_YOLO").ok();
         let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
 
@@ -14686,7 +14687,9 @@ mod tests {
     /// Serialize the runtime-building auto-convene tests: they mutate process
     /// env (`OCEAN_MODEL`/`OCEAN_CONFIG_DIR`) to select the Fake provider, and
     /// env is process-global, so two of them racing would clobber each other.
-    static AUTO_CONVENE_ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// A tokio (non-poisoning) mutex so async tests can hold the guard across
+    /// `.await` without tripping `clippy::await_holding_lock`.
+    static AUTO_CONVENE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Build an `AppState` whose runtime is pinned to the Fake provider (so a
     /// turn runs synchronously and deterministically with no live LLM) and whose
@@ -14767,7 +14770,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn at_mention_queues_turn_and_posts_reply_back() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -14849,9 +14852,7 @@ mod tests {
     /// directory and its `owning_project` is the registered project.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_room_convene_resolves_its_project() {
-        let _guard = AUTO_CONVENE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -14963,9 +14964,7 @@ mod tests {
     /// This pins that unbound rooms are not silently swept into some project.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unbound_room_convene_falls_back_with_no_project() {
-        let _guard = AUTO_CONVENE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -15045,7 +15044,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_authored_message_does_not_self_trigger() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -15119,7 +15118,7 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt; // for `oneshot`
 
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         // Fake provider so the background `convene` task never touches a live LLM.
         let state = fake_convene_state(&tmp);
@@ -15551,7 +15550,7 @@ mod tests {
     /// handler at the turn-registration level (OCEAN-225).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mention_of_non_agent_queues_no_turn() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -15614,7 +15613,7 @@ mod tests {
     /// and an unknown room 404s rather than panics.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn room_snapshot_and_events_hydrate_persistent_room() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -15797,7 +15796,7 @@ mod tests {
     /// the final page reports `has_more=false` with a null cursor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn room_transcript_is_bounded_and_pageable() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -15899,7 +15898,7 @@ mod tests {
     /// the default cap (never an unbounded dump).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rooms_list_is_bounded_and_pageable() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -15986,7 +15985,7 @@ mod tests {
     /// cap applies with no limit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn projects_list_is_bounded_and_pageable() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -16064,7 +16063,7 @@ mod tests {
     /// session once, default cap applies with no limit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sessions_list_is_bounded_and_pageable() {
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
 
@@ -16466,9 +16465,17 @@ mod tests {
 
     /// Serializes tests that mutate the publish-token env var, like the yolo
     /// tests do for their env (parallel unit tests share one process env).
-    static PUBLISH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn publish_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        PUBLISH_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    /// A tokio (non-poisoning) mutex so async tests can hold the guard across
+    /// `.await` without tripping `clippy::await_holding_lock`.
+    static PUBLISH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Blocking flavor for non-async `#[test]`s (no runtime to stall).
+    fn publish_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        PUBLISH_ENV_LOCK.blocking_lock()
+    }
+    /// Awaiting flavor for `#[tokio::test]`s — `blocking_lock` panics inside a
+    /// tokio runtime.
+    async fn publish_env_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
+        PUBLISH_ENV_LOCK.lock().await
     }
 
     /// GATE 1 — the load-bearing rejection: a token request for a `call:` room
@@ -16956,7 +16963,7 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt; // for `oneshot`
 
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
         let app = longhouse_routes().with_state(state);
@@ -17157,7 +17164,7 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt; // for `oneshot`
 
-        let _guard = AUTO_CONVENE_ENV_LOCK.lock().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
         let app = longhouse_routes().with_state(state);
@@ -17201,13 +17208,19 @@ mod tests {
 
     /// Dedicated lock serializing the `OCEAN_LONGHOUSE_PREPARE` env mutation in the
     /// tests below (process env is global; parallel test threads would race it),
-    /// mirroring `YOLO_ENV_LOCK`.
-    static LONGHOUSE_PREPARE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// mirroring `YOLO_ENV_LOCK` (tokio mutex: async-holdable, non-poisoning).
+    static LONGHOUSE_PREPARE_ENV_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
-    fn longhouse_prepare_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        LONGHOUSE_PREPARE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    /// Blocking flavor for non-async `#[test]`s (no runtime to stall).
+    fn longhouse_prepare_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        LONGHOUSE_PREPARE_ENV_LOCK.blocking_lock()
+    }
+
+    /// Awaiting flavor for `#[tokio::test]`s — `blocking_lock` panics inside a
+    /// tokio runtime.
+    async fn longhouse_prepare_env_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
+        LONGHOUSE_PREPARE_ENV_LOCK.lock().await
     }
 
     /// Build a non-empty `TurnPrep` with the given (name, description) skills, for
@@ -17356,7 +17369,7 @@ mod tests {
 
     #[tokio::test]
     async fn longhouse_prep_for_turn_on_by_default_injects_relevant_brief() {
-        let _guard = longhouse_prepare_env_guard();
+        let _guard = longhouse_prepare_env_guard_async().await;
         let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
         let prior_ttl = env::var("OCEAN_LONGHOUSE_SKILL_TTL_SECS").ok();
         // TTL=0 so this test always cold-loads its planted skill, never a stale
@@ -17400,7 +17413,7 @@ mod tests {
 
     #[tokio::test]
     async fn longhouse_prep_for_turn_opted_out_injects_nothing() {
-        let _guard = longhouse_prepare_env_guard();
+        let _guard = longhouse_prepare_env_guard_async().await;
         let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
 
         // A planted, on-topic repo skill that WOULD match — proving the `None` is
@@ -17434,7 +17447,7 @@ mod tests {
 
     #[tokio::test]
     async fn longhouse_prep_for_turn_consults_when_enabled_and_is_fail_open() {
-        let _guard = longhouse_prepare_env_guard();
+        let _guard = longhouse_prepare_env_guard_async().await;
         let prior = env::var("OCEAN_LONGHOUSE_PREPARE").ok();
         let prior_ttl = env::var("OCEAN_LONGHOUSE_SKILL_TTL_SECS").ok();
         env::set_var("OCEAN_LONGHOUSE_PREPARE", "1");
@@ -17556,9 +17569,11 @@ mod tests {
     /// missing-creds 503. Distinct from `PUBLISH_ENV_LOCK` (which guards only
     /// `OCEAN_LIVEKIT_PUBLISH_TOKEN`); a test touching both acquires THIS lock
     /// first, then the publish lock, so the order is global and deadlock-free.
-    static LIVEKIT_CREDS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn livekit_creds_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        LIVEKIT_CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    /// A tokio (non-poisoning) mutex so async tests can hold the guard across
+    /// `.await` without tripping `clippy::await_holding_lock`.
+    static LIVEKIT_CREDS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    async fn livekit_creds_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        LIVEKIT_CREDS_ENV_LOCK.lock().await
     }
 
     /// Every env var either LiveKit handler reads, so a test can wipe the slate
@@ -17625,7 +17640,7 @@ mod tests {
     /// the 404 is the EXISTENCE gate firing, not a creds 503 masquerading as it.
     #[tokio::test]
     async fn token_handler_unknown_call_room_is_404() {
-        let _creds = livekit_creds_env_guard();
+        let _creds = livekit_creds_env_guard().await;
         set_livekit_token_env(); // creds present → 503 is off the table
 
         let state = permission_test_state();
@@ -17657,7 +17672,7 @@ mod tests {
     /// handler's own input guard, distinct from the 404 existence gate.
     #[tokio::test]
     async fn token_handler_blank_room_is_400() {
-        let _creds = livekit_creds_env_guard();
+        let _creds = livekit_creds_env_guard().await;
         set_livekit_token_env();
 
         let state = permission_test_state();
@@ -17682,8 +17697,8 @@ mod tests {
     /// could not observe.
     #[tokio::test]
     async fn token_handler_publish_denied_without_secret() {
-        let _creds = livekit_creds_env_guard();
-        let _publish = publish_env_guard();
+        let _creds = livekit_creds_env_guard().await;
+        let _publish = publish_env_guard_async().await;
         std::env::remove_var(PUBLISH_TOKEN_ENV); // no operator secret
         set_livekit_token_env();
 
@@ -17736,8 +17751,8 @@ mod tests {
     /// into the mint — the entitled-operator path that keeps in-room voice working.
     #[tokio::test]
     async fn token_handler_publish_granted_with_secret() {
-        let _creds = livekit_creds_env_guard();
-        let _publish = publish_env_guard();
+        let _creds = livekit_creds_env_guard().await;
+        let _publish = publish_env_guard_async().await;
         std::env::set_var(PUBLISH_TOKEN_ENV, "s3cret-operator-token");
         set_livekit_token_env();
 
@@ -17779,8 +17794,8 @@ mod tests {
     /// the request level.
     #[tokio::test]
     async fn token_handler_non_call_room_passes_through() {
-        let _creds = livekit_creds_env_guard();
-        let _publish = publish_env_guard();
+        let _creds = livekit_creds_env_guard().await;
+        let _publish = publish_env_guard_async().await;
         std::env::remove_var(PUBLISH_TOKEN_ENV);
         set_livekit_token_env();
 
@@ -17820,7 +17835,7 @@ mod tests {
     /// unambiguously the creds gate.
     #[tokio::test]
     async fn token_handler_missing_creds_is_503_with_shape() {
-        let _creds = livekit_creds_env_guard();
+        let _creds = livekit_creds_env_guard().await;
         clear_livekit_env(); // the load-bearing precondition: no creds at all
 
         let state = permission_test_state();
@@ -17858,7 +17873,7 @@ mod tests {
     /// the guard is hermetically testable, and this pins its contract.
     #[tokio::test]
     async fn call_place_missing_creds_is_503_naming_env() {
-        let _creds = livekit_creds_env_guard();
+        let _creds = livekit_creds_env_guard().await;
         clear_livekit_env();
 
         let state = permission_test_state();
@@ -17896,7 +17911,7 @@ mod tests {
     /// the number guard, not the creds gate firing first.
     #[tokio::test]
     async fn call_place_bad_number_is_400_before_creds() {
-        let _creds = livekit_creds_env_guard();
+        let _creds = livekit_creds_env_guard().await;
         // Provision creds so the ONLY thing that can reject is the number guard.
         set_livekit_token_env();
         std::env::set_var("OCEAN_CALL_OUTBOUND_TRUNK", "ST_devtrunk");
@@ -17929,7 +17944,7 @@ mod tests {
     /// guard with a 400 — the boundary case of `normalize_e164` returning None.
     #[tokio::test]
     async fn call_place_empty_number_is_400() {
-        let _creds = livekit_creds_env_guard();
+        let _creds = livekit_creds_env_guard().await;
         clear_livekit_env();
 
         let state = permission_test_state();
@@ -18138,9 +18153,9 @@ mod tests {
         use tower::ServiceExt; // for `oneshot`
 
         // `permission_test_state` mutates process env; hold the lock only across
-        // the build, then drop it before any `.await`.
+        // the build, then drop it before the awaits below.
         let state = {
-            let _g = yolo_env_guard();
+            let _g = yolo_env_guard_async().await;
             permission_test_state()
         };
 

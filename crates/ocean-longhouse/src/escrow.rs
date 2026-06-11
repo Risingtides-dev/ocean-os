@@ -1228,6 +1228,7 @@ pub fn claim_outcome_persisted(
 ///        (the council never reached a binding outcome for this title);
 ///      * bound to a *different* proposal than `claimed` →
 ///        [`ClaimError::WrongDecision`].
+///
 ///    The firekeeper still cannot manufacture a decision: it can only sign the
 ///    one the daemon already recorded as converged. The brake is preserved; only
 ///    its *source* moved from the in-memory engine to the durable column.

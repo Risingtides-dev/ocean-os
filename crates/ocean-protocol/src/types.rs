@@ -69,6 +69,7 @@ pub struct Usage {
     ///   - Gemini: `thoughtsTokenCount` ⊆ `totalTokenCount`
     ///   - Anthropic: thinking is billed inside `output_tokens`; there is no
     ///     separate usage field, so this stays 0 on Anthropic.
+    ///
     /// It is surfaced so the HUD can show how much of `output` was reasoning;
     /// it must NOT be added into `total_tokens` (that would double-count).
     #[serde(default)]

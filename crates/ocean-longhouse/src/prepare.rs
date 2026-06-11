@@ -20,6 +20,7 @@
 //!   - `~/.spawner/skills/**/skill.yaml` (spawner format),
 //!   - `~/.codex/skills/**/SKILL.md` (codex format, YAML frontmatter),
 //!   - repo-local `./skills/**` (either format).
+//!
 //!   Missing dirs are skipped, malformed files are skipped + logged — a bad
 //!   file never fails the whole load.
 //! * A [`SkillIndex`] that caches the loaded [`SkillBrief`]s once (not per-call).
@@ -197,9 +198,10 @@ impl SkillRoots {
     /// Roots scoped to a specific repo cwd: the documented home roots plus the
     /// repo's `./skills` dir. Used when the daemon knows the turn's cwd.
     pub fn for_cwd(cwd: impl AsRef<Path>) -> Self {
-        let mut roots = Self::default();
-        roots.repo = Some(cwd.as_ref().join("skills"));
-        roots
+        Self {
+            repo: Some(cwd.as_ref().join("skills")),
+            ..Self::default()
+        }
     }
 }
 
