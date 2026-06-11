@@ -98,6 +98,14 @@ struct Cli {
     /// current directory. You can also switch at runtime with `/cd <path>`.
     #[arg(long, env = "OCEAN_PROJECT")]
     project: Option<String>,
+
+    /// Resume an existing daemon session at startup by id — exact match or
+    /// unambiguous prefix (OCEAN-311). Unknown/ambiguous ids fail fast on
+    /// stderr; this flag never silently creates a new session. Unless
+    /// --project is given, the project root is adopted from the session's
+    /// recorded workspace so turns pass the daemon's cwd-binding guard.
+    #[arg(long, env = "OCEAN_SESSION")]
+    session: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2279,7 +2287,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Mesh(mesh)) => run_mesh(mesh),
-        None => run_daemon(cli.url, cli.project),
+        None => run_daemon(cli.url, cli.project, cli.session),
     }
 }
 
@@ -2295,16 +2303,48 @@ fn resolve_project_root(cli_project: Option<&str>) -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
+fn run_daemon(url: String, project: Option<String>, session: Option<String>) -> anyhow::Result<()> {
     let client = DaemonClient::new()?;
-    let root = resolve_project_root(project.as_deref());
+    // OCEAN-311: resolve --session/OCEAN_SESSION against the daemon's session
+    // list BEFORE any terminal setup, so an unknown/ambiguous id fails loudly
+    // on stderr instead of opening the TUI on a fresh session.
+    let resumed = match session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(wanted) => Some(resolve_resume_session(&client, &url, wanted)?),
+        None => None,
+    };
+    // Explicit --project (or OCEAN_PROJECT) wins; otherwise adopt the resumed
+    // session's recorded workspace root so turns pass the daemon's cwd-binding
+    // guard (OCEAN-52) instead of being rejected as cross-workspace.
+    let root = match resumed
+        .as_ref()
+        .filter(|_| project.is_none())
+        .and_then(|s| s.workspace_root.as_deref())
+    {
+        Some(workspace_root) => PathBuf::from(workspace_root),
+        None => resolve_project_root(project.as_deref()),
+    };
     let (action_tx, action_rx) = mpsc::channel();
     let mut state = AppState::new(
         UiMode::Daemon(Box::new(DaemonApp::new(url, root))),
         action_tx.clone(),
     );
 
-    if let UiMode::Daemon(app) = &state.mode {
+    if let UiMode::Daemon(app) = &mut state.mode {
+        if let Some(resumed) = &resumed {
+            // Scope the agent SSE stream to the resumed session BEFORE the
+            // stream thread spawns: its first connect then carries
+            // `?session_id=<sid>&replay=1` and hydrates the pane from the
+            // daemon's replay buffer — the same OCEAN-305 machinery the
+            // in-app picker rides on a live session switch.
+            app.set_active_agent_session_id(Some(AgentSessionId::from(resumed.id)));
+            app.push_transcript(format!(
+                "Ocean: resuming session {} · {} turns · {}",
+                short_id(resumed.id),
+                resumed.turns,
+                compact_text(&resumed.title, 30)
+            ));
+            app.status = format!("resumed session {}", short_id(resumed.id));
+        }
         spawn_daemon_event_stream(app.url.clone(), action_tx.clone());
         // Share the active-session handle with the agent event stream so it
         // subscribes to /v1/agent/events?session_id=<id> once a session is
@@ -2329,6 +2369,18 @@ fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
     terminal.clear().context("clear terminal")?;
 
     daemon_refresh_all(&client, &mut state);
+
+    // OCEAN-311: point the in-app picker at the resumed session so the
+    // composer label and support-pane detail match the scoped stream —
+    // the same select-then-refresh-detail path the picker keys drive.
+    if let Some(resumed) = &resumed {
+        if let UiMode::Daemon(app) = &mut state.mode {
+            if let Some(pos) = app.sessions.iter().position(|s| s.id == resumed.id) {
+                app.selected_session_index = pos + 1;
+                daemon_refresh_selected_session_detail(&client, app);
+            }
+        }
+    }
 
     loop {
         while let Ok(action) = action_rx.try_recv() {
@@ -2363,6 +2415,92 @@ fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Fetch the daemon's full session list and resolve a `--session <id>` launch
+/// argument against it (OCEAN-311). Lists across ALL workspaces — the whole
+/// point of the flag is resuming a session whose workspace differs from the
+/// launch cwd (the resolved root is then adopted from the session itself).
+fn resolve_resume_session(
+    client: &DaemonClient,
+    url: &str,
+    wanted: &str,
+) -> anyhow::Result<SessionSummary> {
+    let res = client.sessions(url, None, true).map_err(|err| {
+        anyhow::anyhow!("--session {wanted}: failed to list daemon sessions: {err}")
+    })?;
+    if !res.ok {
+        anyhow::bail!(
+            "--session {wanted}: daemon session list error: {}",
+            res.error.unwrap_or_default()
+        );
+    }
+    match_session_arg(&res.sessions, wanted)
+        .cloned()
+        .map_err(|err| anyhow::anyhow!(err))
+}
+
+/// Match a `--session` argument against the daemon's session list: exact id
+/// first, then unambiguous prefix (case-insensitive — uuids render lowercase).
+/// Ambiguous or missing ids are hard errors carrying the closest candidate
+/// ids + their workspaces, so the launcher can surface them. This NEVER falls
+/// through to creating a new session.
+fn match_session_arg<'a>(
+    sessions: &'a [SessionSummary],
+    wanted: &str,
+) -> Result<&'a SessionSummary, String> {
+    let wanted_norm = wanted.trim().to_ascii_lowercase();
+    if let Some(found) = sessions.iter().find(|s| s.id.to_string() == wanted_norm) {
+        return Ok(found);
+    }
+    let prefix_matches: Vec<&SessionSummary> = sessions
+        .iter()
+        .filter(|s| s.id.to_string().starts_with(&wanted_norm))
+        .collect();
+    match prefix_matches.as_slice() {
+        [only] => Ok(only),
+        [] => {
+            // Nothing matched: rank every session by shared prefix length so
+            // the error shows the closest ids, not arbitrary ones.
+            let mut ranked: Vec<&SessionSummary> = sessions.iter().collect();
+            ranked.sort_by_key(|s| {
+                std::cmp::Reverse(common_prefix_len(&s.id.to_string(), &wanted_norm))
+            });
+            Err(format!(
+                "session '{wanted}' not found on the daemon; closest sessions:\n{}",
+                session_candidate_lines(&ranked)
+            ))
+        }
+        _ => Err(format!(
+            "session id '{wanted}' is ambiguous ({} matches); candidates:\n{}",
+            prefix_matches.len(),
+            session_candidate_lines(&prefix_matches)
+        )),
+    }
+}
+
+/// Render candidate sessions for `--session` error messages: one
+/// `<id>  cwd: <workspace>` line each, capped at five.
+fn session_candidate_lines(candidates: &[&SessionSummary]) -> String {
+    if candidates.is_empty() {
+        return "  (the daemon has no sessions)".to_string();
+    }
+    candidates
+        .iter()
+        .take(5)
+        .map(|s| {
+            format!(
+                "  {}  cwd: {}",
+                s.id,
+                s.workspace_root.as_deref().unwrap_or("(unknown)")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 fn run_mesh(cli: MeshCli) -> anyhow::Result<()> {
@@ -7387,6 +7525,98 @@ mod tests {
 
         assert!(handle_slash_command(&mut app, "/help"));
         assert!(app.show_help);
+    }
+
+    fn resume_session_fixture(id: &str, workspace_root: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::parse_str(id).expect("fixture uuid"),
+            model: "test-model".to_string(),
+            turns: 2,
+            title: format!("session {id}"),
+            workspace_root: workspace_root.map(str::to_string),
+            git_branch: None,
+            updated_ms: Some(0),
+        }
+    }
+
+    fn resume_session_fixtures() -> Vec<SessionSummary> {
+        vec![
+            resume_session_fixture(
+                "11111111-1111-4111-8111-111111111111",
+                Some("/tmp/ws-alpha"),
+            ),
+            resume_session_fixture(
+                "11111111-2222-4222-8222-222222222222",
+                Some("/tmp/ws-bravo"),
+            ),
+            resume_session_fixture("99999999-9999-4999-8999-999999999999", None),
+        ]
+    }
+
+    #[test]
+    fn match_session_arg_exact_id_wins() {
+        let sessions = resume_session_fixtures();
+        let found = match_session_arg(&sessions, "11111111-2222-4222-8222-222222222222")
+            .expect("exact id must resolve");
+        assert_eq!(found.id, sessions[1].id);
+
+        // Case-insensitive: uuids render lowercase, operators paste uppercase.
+        let found = match_session_arg(&sessions, "99999999-9999-4999-8999-999999999999")
+            .expect("exact id must resolve");
+        assert_eq!(found.id, sessions[2].id);
+        let upper = "99999999-9999-4999-8999-999999999999".to_ascii_uppercase();
+        let found = match_session_arg(&sessions, &upper).expect("uppercase exact id must resolve");
+        assert_eq!(found.id, sessions[2].id);
+    }
+
+    #[test]
+    fn match_session_arg_unambiguous_prefix_resolves() {
+        let sessions = resume_session_fixtures();
+        let found = match_session_arg(&sessions, "9999").expect("unique prefix must resolve");
+        assert_eq!(found.id, sessions[2].id);
+        let found = match_session_arg(&sessions, "11111111-2").expect("unique prefix must resolve");
+        assert_eq!(found.id, sessions[1].id);
+        // Uppercase prefix normalizes too.
+        let found = match_session_arg(&sessions, "9999").expect("prefix must resolve");
+        assert_eq!(found.id, sessions[2].id);
+    }
+
+    #[test]
+    fn match_session_arg_ambiguous_prefix_errors_with_candidates() {
+        let sessions = resume_session_fixtures();
+        let err = match_session_arg(&sessions, "11111111")
+            .expect_err("shared prefix must NOT silently pick a session");
+        assert!(err.contains("ambiguous"), "got: {err}");
+        assert!(err.contains("11111111-1111-4111-8111-111111111111"));
+        assert!(err.contains("11111111-2222-4222-8222-222222222222"));
+        assert!(err.contains("/tmp/ws-alpha"));
+        assert!(err.contains("/tmp/ws-bravo"));
+    }
+
+    #[test]
+    fn match_session_arg_missing_errors_with_closest_ids_and_cwds() {
+        let sessions = resume_session_fixtures();
+        let err = match_session_arg(&sessions, "1111ffff")
+            .expect_err("unknown id must NOT fall through to a new session");
+        assert!(err.contains("not found"), "got: {err}");
+        // Closest-first: both 1111… sessions share a 4-byte prefix with the
+        // query, the 9999… session shares none — all listed, closest on top.
+        let alpha = err
+            .find("11111111-1111-4111-8111-111111111111")
+            .expect("closest id listed");
+        let distant = err
+            .find("99999999-9999-4999-8999-999999999999")
+            .expect("distant id still listed");
+        assert!(alpha < distant, "closest id must rank first: {err}");
+        assert!(err.contains("cwd: /tmp/ws-alpha"));
+        assert!(err.contains("cwd: (unknown)"));
+    }
+
+    #[test]
+    fn match_session_arg_empty_session_list_errors() {
+        let err = match_session_arg(&[], "deadbeef").expect_err("no sessions to match");
+        assert!(err.contains("not found"), "got: {err}");
+        assert!(err.contains("no sessions"), "got: {err}");
     }
 
     #[test]
