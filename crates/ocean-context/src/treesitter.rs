@@ -132,8 +132,8 @@ impl TreeSitterResolver {
         let Source::Text(text) = self.load(file, at_commit) else { return None };
         match anchor.symbol.as_deref() {
             Some(symbol) => match language_of(file)? {
-                Lang::Rust => rust_sig_hash(&text, symbol),
-                Lang::Toml => toml_sig_hash(&text, symbol),
+                Lang::Rust => rust_sig_hash(&text, symbol).found(),
+                Lang::Toml => toml_sig_hash(&text, symbol).found(),
             },
             None => Some(fnv1a64(&text)),
         }
@@ -196,8 +196,12 @@ impl Resolver for TreeSitterResolver {
                     Lang::Toml => toml_sig_hash(&text, symbol),
                 };
                 match current {
-                    None => Resolution::Dead, // file parsed, symbol gone
-                    Some(cur) => match anchor.sig_hash.as_deref() {
+                    // The revision doesn't parse: no evidence either way —
+                    // a mid-edit or merge-artifact blob must never read as
+                    // the symbol having been removed.
+                    SymbolProbe::Unparseable => Resolution::Unresolvable,
+                    SymbolProbe::Absent => Resolution::Dead, // file parsed, symbol gone
+                    SymbolProbe::Found(cur) => match anchor.sig_hash.as_deref() {
                         // No recorded baseline: presence is all we can attest.
                         None => Resolution::Resolves(1.0),
                         Some(recorded) if recorded == cur => Resolution::Resolves(1.0),
@@ -271,22 +275,49 @@ const NAMED_ITEM_KINDS: &[&str] = &[
 /// shape and hashes in full.
 const BODYLESS_SIG_KINDS: &[&str] = &["function_item", "mod_item", "impl_item"];
 
-/// Hash of the signature shapes of every item named `symbol` in `source`,
-/// in document order. `None` = no such symbol. A path-qualified symbol
-/// (`module::name`) matches on its last segment.
-fn rust_sig_hash(source: &str, symbol: &str) -> Option<String> {
+/// Three-way outcome of probing a source blob for a symbol: presence with a
+/// shape hash, attested absence, or a blob we cannot parse — which is no
+/// evidence at all (absence-of-evidence must never read as removal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SymbolProbe {
+    Found(String),
+    Absent,
+    Unparseable,
+}
+
+impl SymbolProbe {
+    fn found(self) -> Option<String> {
+        match self {
+            SymbolProbe::Found(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
+/// Probe for the signature shapes of every item named `symbol` in `source`,
+/// in document order. `Absent` = parsed clean, no such symbol; `Unparseable`
+/// = the source can't be parsed well enough to attest absence. A
+/// path-qualified symbol (`module::name`) matches on its last segment.
+fn rust_sig_hash(source: &str, symbol: &str) -> SymbolProbe {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .expect("tree-sitter-rust grammar version matches tree-sitter core");
-    let tree = parser.parse(source, None)?;
+    let Some(tree) = parser.parse(source, None) else {
+        return SymbolProbe::Unparseable;
+    };
     let want = symbol.rsplit("::").next().unwrap_or(symbol);
     let mut sigs: Vec<String> = Vec::new();
     collect_rust_sigs(tree.root_node(), source, want, &mut sigs);
     if sigs.is_empty() {
-        return None;
+        // tree-sitter recovers around syntax errors; a miss in a broken tree
+        // can be the breakage hiding the item, not evidence of removal.
+        if tree.root_node().has_error() {
+            return SymbolProbe::Unparseable;
+        }
+        return SymbolProbe::Absent;
     }
-    Some(fnv1a64(&sigs.join("\n")))
+    SymbolProbe::Found(fnv1a64(&sigs.join("\n")))
 }
 
 fn collect_rust_sigs(node: Node, source: &str, want: &str, sigs: &mut Vec<String>) {
@@ -359,18 +390,25 @@ fn node_text<'s>(node: Node, source: &'s str) -> &'s str {
 // TOML: dotted-key probe over the parsed value tree
 // ---------------------------------------------------------------------------
 
-/// Hash of the value at dotted key path `symbol` (e.g. `workspace.members`).
-/// `None` = path absent or the document doesn't parse as TOML.
-fn toml_sig_hash(source: &str, symbol: &str) -> Option<String> {
-    let doc: toml::Value = toml::from_str(source).ok()?;
+/// Probe for the value at dotted key path `symbol` (e.g. `workspace.members`):
+/// `Found(hash)` when present, `Absent` when the document parses but the path
+/// is missing, `Unparseable` when the document isn't valid TOML.
+fn toml_sig_hash(source: &str, symbol: &str) -> SymbolProbe {
+    let Ok(doc) = toml::from_str::<toml::Value>(source) else {
+        // Invalid TOML at this revision: cannot attest presence OR absence.
+        return SymbolProbe::Unparseable;
+    };
     let mut cur = &doc;
     for seg in symbol.split('.') {
-        cur = cur.get(seg)?;
+        match cur.get(seg) {
+            Some(v) => cur = v,
+            None => return SymbolProbe::Absent,
+        }
     }
     // The parsed value's Display is already canonical: two documents that
     // spell the same value differently (section vs dotted key, reflowed
     // arrays) print identically, so surface syntax never reads as change.
-    Some(fnv1a64(&cur.to_string()))
+    SymbolProbe::Found(fnv1a64(&cur.to_string()))
 }
 
 #[cfg(test)]
@@ -391,10 +429,10 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
 
     #[test]
     fn rust_symbol_found_and_hash_is_stable() {
-        let a = rust_sig_hash(RUST_SRC, "requires_permission").unwrap();
-        let b = rust_sig_hash(RUST_SRC, "requires_permission").unwrap();
+        let a = rust_sig_hash(RUST_SRC, "requires_permission").found().unwrap();
+        let b = rust_sig_hash(RUST_SRC, "requires_permission").found().unwrap();
         assert_eq!(a, b);
-        assert!(rust_sig_hash(RUST_SRC, "no_such_symbol").is_none());
+        assert_eq!(rust_sig_hash(RUST_SRC, "no_such_symbol"), SymbolProbe::Absent);
     }
 
     #[test]
@@ -462,11 +500,11 @@ edition = "2021"
 
     #[test]
     fn toml_dotted_path_found_and_value_change_changes_hash() {
-        let h = toml_sig_hash(TOML_SRC, "workspace.members").unwrap();
+        let h = toml_sig_hash(TOML_SRC, "workspace.members").found().unwrap();
         let grown = TOML_SRC.replace(r#""crates/b"]"#, r#""crates/b", "crates/c"]"#);
-        assert_ne!(h, toml_sig_hash(&grown, "workspace.members").unwrap());
-        assert!(toml_sig_hash(TOML_SRC, "workspace.nope").is_none());
-        assert!(toml_sig_hash(TOML_SRC, "nope").is_none());
+        assert_ne!(h, toml_sig_hash(&grown, "workspace.members").found().unwrap());
+        assert_eq!(toml_sig_hash(TOML_SRC, "workspace.nope"), SymbolProbe::Absent);
+        assert_eq!(toml_sig_hash(TOML_SRC, "nope"), SymbolProbe::Absent);
     }
 
     #[test]

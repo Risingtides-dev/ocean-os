@@ -152,8 +152,9 @@ fn at_commit_mode_tracks_a_rust_symbol_through_history() {
     assert_eq!(ts.resolve(&anchor, &c3), Resolution::Stale);
     assert_eq!(ts.resolve(&anchor, &c4), Resolution::Dead);
 
-    // worktree mode DOES see the dirty file: garbage parses to no `gate`
-    assert_eq!(ts.resolve(&anchor, WORKTREE), Resolution::Dead);
+    // worktree mode DOES see the dirty file — but a blob that doesn't parse
+    // is no evidence of removal: uncheckable, never Dead (Codex P2, PR #209).
+    assert_eq!(ts.resolve(&anchor, WORKTREE), Resolution::Unresolvable);
 
     // file missing at-commit → Dead; path traversal stays Unresolvable
     let gone =
@@ -201,4 +202,74 @@ fn at_commit_mode_tracks_a_toml_key() {
     assert_eq!(ts.resolve(&anchor, &c1), Resolution::Resolves(1.0));
     assert_eq!(ts.resolve(&anchor, &c2), Resolution::Resolves(1.0), "sibling churn is not change");
     assert_eq!(ts.resolve(&anchor, &c3), Resolution::Stale);
+}
+
+/// Codex P2 (PR #209): a revision where the file exists but does not parse
+/// is NO evidence — never `Dead`, and a transient unparseable commit in a
+/// replay walk must neither fail the claim nor mark it unresolvable when
+/// later revisions attest it held.
+#[test]
+fn unparseable_revision_is_unresolvable_not_dead_and_walk_survives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+
+    // c1: valid TOML, key present (anchor commit)
+    std::fs::write(root.join("Cargo.toml"), MEMBERS_V1).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1: valid"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    // c2: file present but invalid TOML (mid-edit / merge-artifact blob)
+    std::fs::write(root.join("Cargo.toml"), "[workspace\nmembers = = [\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c2: broken"]);
+    let c2 = git(root, &["rev-parse", "HEAD"]);
+
+    // c3: valid again, key still present (same content as c1)
+    std::fs::write(root.join("Cargo.toml"), MEMBERS_V1).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c3: valid again"]);
+
+    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let anchor = Anchor {
+        file: Some("Cargo.toml".into()),
+        symbol: Some("workspace.members".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+
+    // Resolve-level: the broken revision is uncheckable, not removal evidence.
+    assert_eq!(ts.resolve(&anchor, &c2), Resolution::Unresolvable);
+    // The parseable revisions still attest presence.
+    assert_eq!(ts.resolve(&anchor, &c1), Resolution::Resolves(1.0));
+
+    // Walk-level: c1 → c2(broken) → c3(held). The claim must come out HELD —
+    // no first_fail, no unresolvable flag (a held step outranks a transient
+    // uncheckable one).
+    let claims = vec![claim("t1", "Cargo.toml", Some("workspace.members"), &c1)];
+    let verdicts = replay(root, &claims, &ts).unwrap();
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].first_fail_commit.is_none(), "transient breakage must not fail the claim");
+    assert!(!verdicts[0].unresolvable, "held steps outrank transient uncheckability");
+
+    // Control: a genuinely removed key is still hard evidence.
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c4: members removed"]);
+    let c4 = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(ts.resolve(&anchor, &c4), Resolution::Dead);
+
+    // Rust mirror: a broken .rs blob is uncheckable, a clean one attests.
+    std::fs::write(root.join("lib.rs"), "fn gate( ((((\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c5: broken rust"]);
+    let c5 = git(root, &["rev-parse", "HEAD"]);
+    let rust_anchor = Anchor {
+        file: Some("lib.rs".into()),
+        symbol: Some("gate".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    assert_eq!(ts.resolve(&rust_anchor, &c5), Resolution::Unresolvable);
 }
