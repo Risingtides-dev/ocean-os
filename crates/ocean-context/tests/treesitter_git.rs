@@ -166,6 +166,61 @@ fn at_commit_mode_tracks_a_rust_symbol_through_history() {
     assert_eq!(ts.resolve(&escape, WORKTREE), Resolution::Unresolvable);
 }
 
+/// TypeScript at-commit (Codex round-5 P2: the spec's B1 row names
+/// rust/TYPESCRIPT grammars): a `.ts` anchor walks the same lifecycle as
+/// Rust — alive at c1, held through a body-only edit, Stale at the
+/// signature change, Dead at the rename — via `git show` blobs.
+#[test]
+fn at_commit_mode_tracks_a_typescript_symbol_through_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+
+    let v1 = "export class Auth {\n  requiresPermission(action: string): boolean {\n    return action !== \"read\";\n  }\n}\n";
+    std::fs::write(root.join("auth.ts"), v1).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    // body-only edit: same signature
+    std::fs::write(root.join("auth.ts"), v1.replace("!== \"read\"", "!== \"read\" && action !== \"list\"")).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c2: body only"]);
+    let c2 = git(root, &["rev-parse", "HEAD"]);
+
+    // signature change
+    std::fs::write(
+        root.join("auth.ts"),
+        v1.replace("requiresPermission(action: string)", "requiresPermission(action: string, strict: boolean)"),
+    )
+    .unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c3: signature change"]);
+    let c3 = git(root, &["rev-parse", "HEAD"]);
+
+    // rename: symbol gone
+    std::fs::write(root.join("auth.ts"), v1.replace("requiresPermission", "checkAccess")).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c4: rename"]);
+    let c4 = git(root, &["rev-parse", "HEAD"]);
+
+    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    // handoff-style qualified anchor: Class.method
+    let mut anchor = Anchor {
+        file: Some("auth.ts".into()),
+        symbol: Some("Auth.requiresPermission".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    anchor.sig_hash = ts.sig_hash_at(&anchor, &c1);
+    assert!(anchor.sig_hash.is_some(), "TS anchor must seed at its anchor commit");
+
+    assert_eq!(ts.resolve(&anchor, &c1), Resolution::Resolves(1.0));
+    assert_eq!(ts.resolve(&anchor, &c2), Resolution::Resolves(1.0), "body edit is not shape");
+    assert_eq!(ts.resolve(&anchor, &c3), Resolution::Stale);
+    assert_eq!(ts.resolve(&anchor, &c4), Resolution::Dead);
+}
+
 /// TOML at-commit: the dotted key holds while only siblings change, goes
 /// Stale when its value changes — same blindness-beating check, other lang.
 #[test]

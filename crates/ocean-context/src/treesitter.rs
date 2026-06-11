@@ -9,12 +9,18 @@
 //! |---------------------------------------------------------|-----------------|
 //! | no file (symbol-only), path outside repo                | `Unresolvable`  |
 //! | file missing (bare-basename match elsewhere)            | `Dead` (`Resolves(0.5)`) |
-//! | `.rs`/`.toml` + symbol, symbol found, hash matches/none | `Resolves(1.0)` |
-//! | `.rs`/`.toml` + symbol, symbol found, hash differs      | `Stale`         |
-//! | `.rs`/`.toml` + symbol, symbol gone                     | `Dead`          |
+//! | known language + symbol, symbol found, hash matches/none | `Resolves(1.0)` |
+//! | known language + symbol, symbol found, hash differs     | `Stale`         |
+//! | known language + symbol, symbol gone (clean parse)      | `Dead`          |
+//! | known language + symbol, revision doesn't parse         | `Unresolvable`  |
 //! | other language + symbol                                 | `Unresolvable`  |
 //! | no symbol, recorded file hash matches / differs         | `Resolves(1.0)` / `Stale` |
 //! | no symbol, no recorded hash, file present               | `Resolves(1.0)` |
+//!
+//! Known languages (the spec's B1 row names rust/typescript grammars):
+//! `.rs` (tree-sitter-rust), `.ts`/`.mts`/`.cts` and `.tsx`
+//! (tree-sitter-typescript, grammar picked by extension), `.toml` (structured
+//! key probe, below). `.js`/`.jsx` are NOT in B1 scope and stay Unresolvable.
 //!
 //! **Why `Stale` and not `Resolves(partial)` for a changed shape:** the spec's
 //! `S(c)` is *structural reproducibility* — "does the AST anchor still
@@ -30,7 +36,7 @@
 //!
 //! ## TOML: structured key probe, not a second grammar
 //!
-//! Rust goes through tree-sitter (`tree-sitter-rust`). For `.toml` anchors
+//! Rust and TypeScript go through tree-sitter grammars. For `.toml` anchors
 //! (dotted key paths like `workspace.members`) we deliberately use the `toml`
 //! crate the workspace already depends on, parsed to a real value tree,
 //! instead of adding a `tree-sitter-toml` grammar crate:
@@ -131,10 +137,7 @@ impl TreeSitterResolver {
         }
         let Source::Text(text) = self.load(file, at_commit) else { return None };
         match anchor.symbol.as_deref() {
-            Some(symbol) => match language_of(file)? {
-                Lang::Rust => rust_sig_hash(&text, symbol).found(),
-                Lang::Toml => toml_sig_hash(&text, symbol).found(),
-            },
+            Some(symbol) => probe_symbol(language_of(file)?, &text, symbol).found(),
             None => Some(fnv1a64(&text)),
         }
     }
@@ -191,11 +194,7 @@ impl Resolver for TreeSitterResolver {
                     // never evidence of life or death.
                     return Resolution::Unresolvable;
                 };
-                let current = match lang {
-                    Lang::Rust => rust_sig_hash(&text, symbol),
-                    Lang::Toml => toml_sig_hash(&text, symbol),
-                };
-                match current {
+                match probe_symbol(lang, &text, symbol) {
                     // The revision doesn't parse: no evidence either way —
                     // a mid-edit or merge-artifact blob must never read as
                     // the symbol having been removed.
@@ -225,6 +224,10 @@ impl Resolver for TreeSitterResolver {
 enum Lang {
     Rust,
     Toml,
+    /// `.ts`/`.mts`/`.cts` — the `typescript` grammar.
+    TypeScript,
+    /// `.tsx` — the `tsx` grammar (JSX-bearing).
+    Tsx,
 }
 
 fn language_of(file: &str) -> Option<Lang> {
@@ -232,7 +235,19 @@ fn language_of(file: &str) -> Option<Lang> {
     match ext {
         "rs" => Some(Lang::Rust),
         "toml" => Some(Lang::Toml),
+        "ts" | "mts" | "cts" => Some(Lang::TypeScript),
+        "tsx" => Some(Lang::Tsx),
+        // `.js`/`.jsx` are NOT in the spec's B1 row — honestly uncheckable.
         _ => None,
+    }
+}
+
+fn probe_symbol(lang: Lang, text: &str, symbol: &str) -> SymbolProbe {
+    match lang {
+        Lang::Rust => rust_sig_hash(text, symbol),
+        Lang::Toml => toml_sig_hash(text, symbol),
+        Lang::TypeScript => ts_sig_hash(text, symbol, false),
+        Lang::Tsx => ts_sig_hash(text, symbol, true),
     }
 }
 
@@ -426,7 +441,9 @@ fn collect_tokens<'s>(node: Node, source: &'s str, end_limit: usize, tokens: &mu
         return;
     }
     if node.child_count() == 0 {
-        if !matches!(node.kind(), "line_comment" | "block_comment") {
+        // `line_comment`/`block_comment` are Rust's kinds; `comment` is
+        // TypeScript's. Prose churn is not structure in either grammar.
+        if !matches!(node.kind(), "line_comment" | "block_comment" | "comment") {
             tokens.push(node_text(node, source));
         }
         return;
@@ -439,6 +456,152 @@ fn collect_tokens<'s>(node: Node, source: &'s str, end_limit: usize, tokens: &mu
 
 fn node_text<'s>(node: Node, source: &'s str) -> &'s str {
     &source[node.start_byte()..node.end_byte()]
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript / TSX: tree-sitter symbol location + signature shape
+// ---------------------------------------------------------------------------
+
+/// TS declaration kinds whose `name` field can match an anchor symbol.
+/// `variable_declarator`/`public_field_definition` cover the
+/// `const requiresPermission = (...) => ...` and class-property-arrow
+/// patterns; `method_definition` covers methods, getters and setters.
+const TS_NAMED_KINDS: &[&str] = &[
+    "function_declaration",
+    "generator_function_declaration",
+    "function_signature",
+    "class_declaration",
+    "abstract_class_declaration",
+    "interface_declaration",
+    "type_alias_declaration",
+    "enum_declaration",
+    "method_definition",
+    "method_signature",
+    "abstract_method_signature",
+    "variable_declarator",
+    "public_field_definition",
+    "internal_module",
+    "module",
+];
+
+/// TS kinds whose `body` is excluded from the shape — implementation churn
+/// inside a function/method/class/namespace must not read as a signature
+/// change. Interfaces, type aliases, enums and method signatures hash in
+/// full: their contents ARE the shape.
+const TS_BODYLESS_SIG_KINDS: &[&str] = &[
+    "function_declaration",
+    "generator_function_declaration",
+    "method_definition",
+    "class_declaration",
+    "abstract_class_declaration",
+    "internal_module",
+    "module",
+];
+
+/// TS scopes that qualify their contents for qualified anchors:
+/// `Class.method` / `ns.fn` (namespaces, modules, classes, interfaces).
+const TS_SCOPE_KINDS: &[&str] = &[
+    "class_declaration",
+    "abstract_class_declaration",
+    "interface_declaration",
+    "internal_module",
+    "module",
+];
+
+/// Probe TypeScript/TSX source for `symbol` — the exact mirror of
+/// [`rust_sig_hash`]'s three-state epistemics. Qualified anchors accept both
+/// `.` and `::` separators (handoffs write `Class.method`; the extractor
+/// emits `ns::name`); the qualifier matches enclosing namespace/module/class
+/// names via the same scope-chain walk as Rust.
+fn ts_sig_hash(source: &str, symbol: &str, tsx: bool) -> SymbolProbe {
+    let mut parser = Parser::new();
+    let grammar = if tsx {
+        tree_sitter_typescript::LANGUAGE_TSX
+    } else {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT
+    };
+    parser
+        .set_language(&grammar.into())
+        .expect("tree-sitter-typescript grammar version matches tree-sitter core");
+    let Some(tree) = parser.parse(source, None) else {
+        return SymbolProbe::Unparseable;
+    };
+    let dotted = symbol.replace("::", ".");
+    let segs: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
+    let (want, qual) = match segs.split_last() {
+        Some((w, q)) => (*w, q),
+        None => return SymbolProbe::Absent,
+    };
+    let mut sigs: Vec<String> = Vec::new();
+    let mut scope: Vec<String> = Vec::new();
+    collect_ts_sigs(tree.root_node(), source, want, qual, &mut scope, &mut sigs);
+    if sigs.is_empty() {
+        // Same epistemics as Rust: a miss inside an error-bearing tree can be
+        // the breakage hiding the item, not evidence of removal.
+        if tree.root_node().has_error() {
+            return SymbolProbe::Unparseable;
+        }
+        return SymbolProbe::Absent;
+    }
+    SymbolProbe::Found(fnv1a64(&sigs.join("\n")))
+}
+
+fn collect_ts_sigs(
+    node: Node,
+    source: &str,
+    want: &str,
+    qual: &[&str],
+    scope: &mut Vec<String>,
+    sigs: &mut Vec<String>,
+) {
+    let matched = TS_NAMED_KINDS.contains(&node.kind())
+        && node.child_by_field_name("name").is_some_and(|n| node_text(n, source) == want);
+    if matched && scope_matches(scope, qual) {
+        sigs.push(ts_signature_text(node, source));
+    }
+    let entered = if TS_SCOPE_KINDS.contains(&node.kind()) {
+        node.child_by_field_name("name").map(|n| node_text(n, source).to_string())
+    } else {
+        None
+    };
+    let pushed = entered.is_some();
+    if let Some(name) = entered {
+        scope.push(name);
+    }
+    // Always recurse: export statements wrap declarations, methods sit
+    // inside class bodies, namespaces nest.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_ts_sigs(child, source, want, qual, scope, sigs);
+    }
+    if pushed {
+        scope.pop();
+    }
+}
+
+/// TS shape end: like Rust's, the body is cut for function-like and
+/// container kinds; a declarator whose value is a function expression /
+/// arrow keeps the parameter list + return type but drops the function body
+/// (`const f = (a: A): B => …` hashes as `const f = (a: A): B =>`).
+fn ts_signature_text(node: Node, source: &str) -> String {
+    let mut end_limit = node.end_byte();
+    if TS_BODYLESS_SIG_KINDS.contains(&node.kind()) {
+        if let Some(body) = node.child_by_field_name("body") {
+            end_limit = body.start_byte();
+        }
+    } else if matches!(node.kind(), "variable_declarator" | "public_field_definition") {
+        if let Some(value) = node.child_by_field_name("value") {
+            if matches!(value.kind(), "arrow_function" | "function_expression" | "generator_function")
+            {
+                if let Some(body) = value.child_by_field_name("body") {
+                    end_limit = body.start_byte();
+                }
+            }
+        }
+    }
+    let mut tokens: Vec<&str> = Vec::new();
+    collect_tokens(node, source, end_limit, &mut tokens);
+    tokens.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +761,162 @@ edition = "2021"
         );
     }
 
+    const TS_SRC: &str = r#"
+export interface PermissionCheck {
+    action: string;
+    level: number;
+}
+
+export class Gate {
+    requiresPermission(action: string): boolean {
+        return action !== "read";
+    }
+    get level(): number {
+        return 1;
+    }
+}
+
+export class Portal {
+    requiresPermission(action: string): boolean {
+        return action !== "read";
+    }
+}
+
+export const checkAll = (actions: string[]): boolean => {
+    return actions.length > 0;
+};
+
+export function freeStanding(x: number): number {
+    return x + 1;
+}
+
+export type GateLevel = "low" | "high";
+
+export enum Mode { Open, Closed }
+"#;
+
+    #[test]
+    fn ts_symbol_found_and_hash_is_stable() {
+        let a = ts_sig_hash(TS_SRC, "requiresPermission", false).found().unwrap();
+        let b = ts_sig_hash(TS_SRC, "requiresPermission", false).found().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(ts_sig_hash(TS_SRC, "noSuchSymbol", false), SymbolProbe::Absent);
+        // every named-kind class is reachable
+        for sym in ["Gate", "PermissionCheck", "checkAll", "freeStanding", "GateLevel", "Mode", "level"] {
+            assert!(
+                matches!(ts_sig_hash(TS_SRC, sym, false), SymbolProbe::Found(_)),
+                "{sym} should be found"
+            );
+        }
+    }
+
+    #[test]
+    fn ts_body_edit_does_not_change_hash() {
+        let edited = TS_SRC.replace("action !== \"read\"", "action !== \"read\" && action !== \"list\"");
+        assert_eq!(
+            ts_sig_hash(TS_SRC, "Gate.requiresPermission", false),
+            ts_sig_hash(&edited, "Gate.requiresPermission", false),
+        );
+        // arrow-function body edit: declarator shape unchanged
+        let arrow_edited = TS_SRC.replace("actions.length > 0", "actions.length > 1");
+        assert_eq!(
+            ts_sig_hash(TS_SRC, "checkAll", false),
+            ts_sig_hash(&arrow_edited, "checkAll", false),
+        );
+    }
+
+    #[test]
+    fn ts_signature_edit_changes_hash() {
+        let edited = TS_SRC.replace(
+            "requiresPermission(action: string): boolean",
+            "requiresPermission(action: string, strict: boolean): boolean",
+        );
+        assert_ne!(
+            ts_sig_hash(TS_SRC, "requiresPermission", false),
+            ts_sig_hash(&edited, "requiresPermission", false),
+        );
+        // arrow param change flips the declarator shape
+        let arrow_edited =
+            TS_SRC.replace("(actions: string[]): boolean =>", "(actions: string[], max: number): boolean =>");
+        assert_ne!(
+            ts_sig_hash(TS_SRC, "checkAll", false),
+            ts_sig_hash(&arrow_edited, "checkAll", false),
+        );
+        // interface member change flips the interface shape (hashes in full)
+        let iface_edited = TS_SRC.replace("level: number;", "level: bigint;");
+        assert_ne!(
+            ts_sig_hash(TS_SRC, "PermissionCheck", false),
+            ts_sig_hash(&iface_edited, "PermissionCheck", false),
+        );
+    }
+
+    #[test]
+    fn ts_symbol_gone_is_absent_and_broken_source_is_unparseable() {
+        let gone = TS_SRC.replace("requiresPermission", "renamedGate");
+        assert_eq!(ts_sig_hash(&gone, "requiresPermission", false), SymbolProbe::Absent);
+        assert_eq!(
+            ts_sig_hash("export function broken( ((((\n", "requiresPermission", false),
+            SymbolProbe::Unparseable
+        );
+    }
+
+    #[test]
+    fn ts_qualified_anchor_scopes_to_its_class() {
+        // Same-named method on two classes: the qualified anchor must hash
+        // ONLY its own class's method — changing Portal's never flips Gate's.
+        let portal_changed = TS_SRC.replace(
+            "export class Portal {\n    requiresPermission(action: string): boolean {",
+            "export class Portal {\n    requiresPermission(action: string, strict: boolean): boolean {",
+        );
+        assert_ne!(TS_SRC, portal_changed, "replace must hit");
+        let gate = ts_sig_hash(TS_SRC, "Gate.requiresPermission", false);
+        assert!(matches!(gate, SymbolProbe::Found(_)));
+        assert_eq!(gate, ts_sig_hash(&portal_changed, "Gate.requiresPermission", false));
+        assert_ne!(
+            ts_sig_hash(TS_SRC, "Portal.requiresPermission", false),
+            ts_sig_hash(&portal_changed, "Portal.requiresPermission", false),
+        );
+        // unqualified anchor hashes both, so it DOES flip
+        assert_ne!(
+            ts_sig_hash(TS_SRC, "requiresPermission", false),
+            ts_sig_hash(&portal_changed, "requiresPermission", false),
+        );
+        // `::` is accepted as a separator alias for `.`
+        assert_eq!(gate, ts_sig_hash(TS_SRC, "Gate::requiresPermission", false));
+        // a qualifier that names the wrong scope: Absent
+        assert_eq!(ts_sig_hash(TS_SRC, "Nope.requiresPermission", false), SymbolProbe::Absent);
+    }
+
+    #[test]
+    fn ts_namespace_qualifies_like_a_module() {
+        let src = "namespace auth {\n  export function run(x: number): boolean { return x > 0; }\n}\n\
+                   namespace billing {\n  export function run(x: number): boolean { return x > 0; }\n}\n";
+        let billing_changed = src.replace(
+            "namespace billing {\n  export function run(x: number): boolean",
+            "namespace billing {\n  export function run(x: number, strict: boolean): boolean",
+        );
+        let auth = ts_sig_hash(src, "auth.run", false);
+        assert!(matches!(auth, SymbolProbe::Found(_)));
+        assert_eq!(auth, ts_sig_hash(&billing_changed, "auth.run", false));
+        assert_ne!(
+            ts_sig_hash(src, "billing.run", false),
+            ts_sig_hash(&billing_changed, "billing.run", false),
+        );
+    }
+
+    #[test]
+    fn tsx_variant_parses_jsx() {
+        let tsx = "export function Banner({ title }: { title: string }) {\n\
+                   return <div className=\"banner\">{title}</div>;\n}\n";
+        // the tsx grammar parses it…
+        assert!(matches!(ts_sig_hash(tsx, "Banner", true), SymbolProbe::Found(_)));
+        // …and a body-only JSX edit doesn't change the shape
+        let edited = tsx.replace("banner", "banner wide");
+        assert_eq!(ts_sig_hash(tsx, "Banner", true), ts_sig_hash(&edited, "Banner", true));
+        let sig_edited = tsx.replace("{ title }: { title: string }", "{ title, big }: { title: string; big: boolean }");
+        assert_ne!(ts_sig_hash(tsx, "Banner", true), ts_sig_hash(&sig_edited, "Banner", true));
+    }
+
     #[test]
     fn fnv1a64_matches_reference_vectors() {
         // Published FNV-1a 64 test vectors.
@@ -651,6 +970,12 @@ edition = "2021"
         assert_eq!(
             r.resolve(&anchor(Some("notes.md"), None, None), WORKTREE),
             Resolution::Resolves(1.0)
+        );
+        // .js/.jsx are NOT in B1 scope: a symbol there stays Unresolvable.
+        std::fs::write(dir.path().join("app.js"), "function gate() {}\n").unwrap();
+        assert_eq!(
+            r.resolve(&anchor(Some("app.js"), Some("gate"), None), WORKTREE),
+            Resolution::Unresolvable
         );
     }
 
