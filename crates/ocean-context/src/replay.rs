@@ -81,15 +81,14 @@ pub fn replay(
             verdicts.push(verdict);
             continue;
         }
-        let mut any_held = false;
-        let mut any_unresolvable = false;
+        let mut ends_unresolvable = false;
         for commit in &commits {
             match check_at(resolver, claim, commit) {
-                Step::Held => any_held = true,
+                Step::Held => ends_unresolvable = false,
                 // A single uncheckable revision (mid-edit blob, unparseable
                 // merge artifact) is no evidence — keep walking; later
                 // commits can still attest the claim either way.
-                Step::Unresolvable => any_unresolvable = true,
+                Step::Unresolvable => ends_unresolvable = true,
                 Step::Failed(r) => {
                     verdict.first_fail_commit = Some(commit.clone());
                     verdict.first_fail_resolution = Some(r);
@@ -97,10 +96,12 @@ pub fn replay(
                 }
             }
         }
-        // UNRESOLVABLE is reserved for claims NOTHING could check: any held
-        // step (or a concrete failure) outranks transient uncheckability.
-        verdict.unresolvable =
-            any_unresolvable && !any_held && verdict.first_fail_commit.is_none();
+        // What matters is the state the walk ENDS in: a transient
+        // uncheckable window inside the walk is absorbed by a later held
+        // step, but a claim whose tail through HEAD cannot be checked must
+        // not read HELD — its current state is unattested (and a claim
+        // nothing could ever check stays unresolvable end to end).
+        verdict.unresolvable = ends_unresolvable && verdict.first_fail_commit.is_none();
         verdicts.push(verdict);
     }
     Ok(verdicts)

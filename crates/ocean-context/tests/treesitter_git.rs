@@ -260,6 +260,27 @@ fn unparseable_revision_is_unresolvable_not_dead_and_walk_survives_it() {
     let c4 = git(root, &["rev-parse", "HEAD"]);
     assert_eq!(ts.resolve(&anchor, &c4), Resolution::Dead);
 
+    // Tail-of-walk honesty (Codex round-2): a claim that held mid-walk but
+    // whose file is broken from some commit through HEAD must NOT read HELD —
+    // the current state is unattested. (c4 removed the key — hard fail — so
+    // use a fresh claim anchored after c4, with only broken commits ahead.)
+    std::fs::write(root.join("Tail.toml"), MEMBERS_V1).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "t1: tail anchor, valid"]);
+    let t1 = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("Tail.toml"), "[workspace
+broken = = [
+").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "t2: broken through HEAD"]);
+    let tail_claims = vec![claim("t2", "Tail.toml", Some("workspace.members"), &t1)];
+    let tail_verdicts = replay(root, &tail_claims, &ts).unwrap();
+    assert!(tail_verdicts[0].first_fail_commit.is_none(), "breakage is not removal evidence");
+    assert!(
+        tail_verdicts[0].unresolvable,
+        "a tail unresolvable through HEAD must not report HELD"
+    );
+
     // Rust mirror: a broken .rs blob is uncheckable, a clean one attests.
     std::fs::write(root.join("lib.rs"), "fn gate( ((((\n").unwrap();
     git(root, &["add", "."]);
