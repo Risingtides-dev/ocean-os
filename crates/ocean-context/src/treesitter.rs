@@ -372,7 +372,7 @@ fn rust_sig_hash(source: &str, symbol: &str) -> SymbolProbe {
         None => return SymbolProbe::Absent,
     };
     let mut sigs: Vec<String> = Vec::new();
-    let mut scope: Vec<String> = Vec::new();
+    let mut scope: Vec<Vec<String>> = Vec::new();
     collect_rust_sigs(tree.root_node(), source, want, qual, &mut scope, &mut sigs);
     if sigs.is_empty() {
         // tree-sitter recovers around syntax errors; a miss in a broken tree
@@ -390,7 +390,7 @@ fn collect_rust_sigs(
     source: &str,
     want: &str,
     qual: &[&str],
-    scope: &mut Vec<String>,
+    scope: &mut Vec<Vec<String>>,
     sigs: &mut Vec<String>,
 ) {
     let mut matched = false;
@@ -411,19 +411,28 @@ fn collect_rust_sigs(
         sigs.push(signature_text(node, source));
     }
     // Entering a named scope? mods, impls, and traits qualify their contents.
-    let entered = match node.kind() {
+    // An impl scope answers to EVERY name it carries: `impl MyTrait for Gate`
+    // qualifies its methods as both `Gate::method` and `MyTrait::method` —
+    // recording only the implementor would kill trait-qualified anchors.
+    let entered: Option<Vec<String>> = match node.kind() {
         "mod_item" | "trait_item" => node
             .child_by_field_name("name")
-            .map(|n| node_text(n, source).to_string()),
-        "impl_item" => ["type", "trait"].iter().find_map(|f| {
-            node.child_by_field_name(f)
-                .map(|n| base_type_name(node_text(n, source)).to_string())
-        }),
+            .map(|n| vec![node_text(n, source).to_string()]),
+        "impl_item" => {
+            let names: Vec<String> = ["type", "trait"]
+                .iter()
+                .filter_map(|f| {
+                    node.child_by_field_name(f)
+                        .map(|n| base_type_name(node_text(n, source)).to_string())
+                })
+                .collect();
+            (!names.is_empty()).then_some(names)
+        }
         _ => None,
     };
     let pushed = entered.is_some();
-    if let Some(name) = entered {
-        scope.push(name);
+    if let Some(names) = entered {
+        scope.push(names);
     }
     // Always recurse: methods inside impls, items inside mods, nested fns.
     let mut cursor = node.walk();
@@ -437,8 +446,9 @@ fn collect_rust_sigs(
 
 /// True when `qual` is the innermost suffix of the current scope chain — an
 /// unqualified anchor (empty `qual`) matches anywhere, preserving the
-/// existing all-same-named-items hashing for bare symbols.
-fn scope_matches(scope: &[String], qual: &[&str]) -> bool {
+/// existing all-same-named-items hashing for bare symbols. Each scope level
+/// carries every name it answers to (an impl: implementor type AND trait).
+fn scope_matches(scope: &[Vec<String>], qual: &[&str]) -> bool {
     if qual.is_empty() {
         return true;
     }
@@ -448,7 +458,7 @@ fn scope_matches(scope: &[String], qual: &[&str]) -> bool {
     scope[scope.len() - qual.len()..]
         .iter()
         .zip(qual.iter())
-        .all(|(s, q)| s == q)
+        .all(|(names, q)| names.iter().any(|s| s == q))
 }
 
 /// `FileExistsResolver` from `FileExistsResolver<'a, T>` / `crate::seams::FileExistsResolver`.
@@ -571,7 +581,7 @@ fn ts_sig_hash(source: &str, symbol: &str, tsx: bool) -> SymbolProbe {
         None => return SymbolProbe::Absent,
     };
     let mut sigs: Vec<String> = Vec::new();
-    let mut scope: Vec<String> = Vec::new();
+    let mut scope: Vec<Vec<String>> = Vec::new();
     collect_ts_sigs(tree.root_node(), source, want, qual, &mut scope, &mut sigs);
     if sigs.is_empty() {
         // Same epistemics as Rust: a miss inside an error-bearing tree can be
@@ -589,7 +599,7 @@ fn collect_ts_sigs(
     source: &str,
     want: &str,
     qual: &[&str],
-    scope: &mut Vec<String>,
+    scope: &mut Vec<Vec<String>>,
     sigs: &mut Vec<String>,
 ) {
     let matched = TS_NAMED_KINDS.contains(&node.kind())
@@ -597,14 +607,16 @@ fn collect_ts_sigs(
     if matched && scope_matches(scope, qual) {
         sigs.push(ts_signature_text(node, source));
     }
+    // TS scopes are single-named (class/interface/namespace/enum) — one
+    // alternative per level, unlike Rust impls which answer to two.
     let entered = if TS_SCOPE_KINDS.contains(&node.kind()) {
-        node.child_by_field_name("name").map(|n| node_text(n, source).to_string())
+        node.child_by_field_name("name").map(|n| vec![node_text(n, source).to_string()])
     } else {
         None
     };
     let pushed = entered.is_some();
-    if let Some(name) = entered {
-        scope.push(name);
+    if let Some(names) = entered {
+        scope.push(names);
     }
     // Always recurse: export statements wrap declarations, methods sit
     // inside class bodies, namespaces nest.
@@ -750,6 +762,22 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
         // Impl-qualified methods: `Gate::requires_permission` matches the
         // method inside `impl Gate`, and only that.
         assert!(matches!(rust_sig_hash(RUST_SRC, "Gate::requires_permission"), SymbolProbe::Found(_)));
+    }
+
+    #[test]
+    fn trait_impl_methods_answer_to_both_trait_and_type_names() {
+        // Codex round-7 P2: `impl MyTrait for Gate` must qualify its methods
+        // as BOTH `MyTrait::check` and `Gate::check` — recording only the
+        // implementor type killed trait-qualified anchors.
+        let src = "trait MyTrait { fn check(&self) -> bool; }\n\
+                   struct Gate;\n\
+                   impl MyTrait for Gate { fn check(&self) -> bool { true } }\n";
+        assert!(matches!(rust_sig_hash(src, "MyTrait::check"), SymbolProbe::Found(_)));
+        assert!(matches!(rust_sig_hash(src, "Gate::check"), SymbolProbe::Found(_)));
+        assert_eq!(rust_sig_hash(src, "Other::check"), SymbolProbe::Absent);
+        // The trait's own signature item also answers to MyTrait::check —
+        // both the declaration and the impl hash together, stably.
+        assert_eq!(rust_sig_hash(src, "MyTrait::check"), rust_sig_hash(src, "MyTrait::check"));
     }
 
     #[test]
