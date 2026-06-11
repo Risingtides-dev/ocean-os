@@ -45,11 +45,12 @@ context engine. The crate is named `ocean-context` and lives in the ocean-os wor
 
 - id: c1
   text: "ocean-context is a NEW crate to be added at crates/ocean-context in the ocean-os workspace; it does not exist yet."
-  provenance: { anchors: [{ file: "Cargo.toml", symbol: "workspace.members", lines: [] }], ticket: null, commit_sha: d9a9bc9 }
-  status: Asserted        # this is a plan, not yet reproducible — correctly NOT Verified
-  knowledge_tier: Individual
+  provenance: { anchors: [{ file: "Cargo.toml", symbol: "workspace.members", lines: [] }], ticket: OCEAN-306, commit_sha: d9a9bc9 }
+  status: Verified        # the crate now EXISTS at crates/ocean-context (Layer A merged in PR #203, OCEAN-306) — the "does not exist yet" half of this claim is dead, the plan half reproduced
+  knowledge_tier: Common
   confidence: 1.0
-  history: [{ at: 1780980000, event: written, by_session: brainstorm-2026-06-09-ocean-context }]
+  history: [{ at: 1780980000, event: written, by_session: brainstorm-2026-06-09-ocean-context },
+            { at: 1781146468, event: reverified, by_session: layer-a-build-2026-06-10 }]
 
 - id: c2
   text: "The full design (Layer A build + Layer B backlog + master equation + theory provenance) is committed and is the source of truth."
@@ -135,3 +136,32 @@ These are the whole point of writing this by hand. Surface more as you consume i
   the narrative stays markdown. v1 `store.rs` should own this format so humans never hand-edit claims.
 - **F5 — anchors with empty `lines: []` are common** (many real claims reference a file/symbol with no
   line). The Resolver must handle symbol-only and file-only anchors gracefully, not assume line numbers.
+
+## Findings from the Layer A build (2026-06-10, the consuming session reporting back)
+
+Layer A shipped: PR #203 / OCEAN-306, `crates/ocean-context` on main. Resolutions and NEW friction:
+
+- **F1 RESOLVED as recommended.** The Layer-A `Resolver` stub stays file-exists (with a Resolves(0.5)
+  basename fallback for bare-filename anchors like `input.rs`); tree-sitter is B1, built first
+  against the unchanged seam.
+- **F3 RESOLVED.** `Claim::derive_confidence(anchors, declared_verified)` derives write-time
+  confidence from anchor richness; the extractor never free-types it.
+- **F4 RESOLVED.** `store.rs` owns the format: TOML frontmatter (`+++` fences) for metadata+claims,
+  markdown body for narrative. Round-trip is lossless, regression-tested incl. hostile narratives.
+- **F6 (NEW) — cross-repo anchors fail correctly but uninformatively.** First real replay (22 claims,
+  180 commits of ocean-os history): 21 HELD, 1 FAIL — and the FAIL (c16, anchoring
+  `crates/ocean-surface-ui/src/daemon.rs`) is a file that lives in the *ocean-surface* repo, never in
+  ocean-os. The verdict is technically right and epistemically wrong: the claim isn't Dead, it's
+  out-of-ring. Scope rings (`w_ring`) need to reach the Resolver, or replay verdicts must carry a
+  "foreign anchor?" hint. This is B6 territory surfacing early; at minimum B1 should not report
+  cross-repo anchors as Dead.
+- **F7 (NEW) — file-exists is too forgiving as a replay oracle.** 21/22 HELD over 180 commits is a
+  near-zero-signal verdict table; files rarely vanish, symbols and signatures churn constantly. This
+  empirically confirms John's instinct that tree-sitter (B1) is the real v1 oracle — file-exists was
+  the right *seam stub* but produces verdicts a human barely needs to judge.
+- **F8 (NEW) — prototype regex quirks are now frozen behavior.** The Python pass matches
+  `manifest.json` as `manifest.js` (alternation order) and `~/.config/brain/config.toml` as
+  `/.config/brain/config.toml` (`~` outside the file char class). The Rust port preserves both
+  (regression-tested as `prototype_quirks_are_preserved`) so the 51-claim corpus stays stable; B1's
+  resolver should treat them as basename-fallback cases, and pass-2 may fix the regex *with* a
+  corpus re-freeze.
