@@ -9,6 +9,7 @@ pub mod extract;
 pub mod replay;
 pub mod seams;
 pub mod store;
+pub mod treesitter;
 
 pub use claim::*;
 pub use extract::{extract_claims, ExtractCtx};
@@ -16,6 +17,7 @@ pub use seams::{
     Borrowed, Borrower, ConfidenceRecencyTrust, FileExistsResolver, NoBorrow, Resolution,
     Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel, WORKTREE,
 };
+pub use treesitter::TreeSitterResolver;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

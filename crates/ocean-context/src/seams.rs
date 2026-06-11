@@ -99,7 +99,7 @@ impl FileExistsResolver {
 /// resolving symlinks would itself touch paths outside the repo. A pure
 /// component walk is enough to keep `PathBuf::join` from replacing or
 /// escaping `repo_root`.
-fn is_repo_relative(file: &str) -> bool {
+pub(crate) fn is_repo_relative(file: &str) -> bool {
     use std::path::Component;
     let p = std::path::Path::new(file);
     !file.is_empty()

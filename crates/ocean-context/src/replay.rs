@@ -21,6 +21,10 @@ pub struct ReplayVerdict {
     /// HEAD. When the walk is empty (claim anchored at HEAD), this is the
     /// anchor commit itself, checked once.
     pub first_fail_commit: Option<String>,
+    /// HOW the claim failed at `first_fail_commit` — the most-alive checkable
+    /// resolution among its anchors there (`Stale` = anchor resolves to
+    /// changed structure, `Dead` = anchor gone). None while the claim holds.
+    pub first_fail_resolution: Option<Resolution>,
     /// True when the resolver could not check ANY of the claim's anchors
     /// (all `Resolution::Unresolvable`) — "cannot check" is a distinct
     /// verdict, never a FAIL (schema friction #2).
@@ -44,6 +48,7 @@ pub fn replay(
             anchor_commit: claim.provenance.commit_sha.clone(),
             commits_walked: 0,
             first_fail_commit: None,
+            first_fail_resolution: None,
             unresolvable: false,
             note: None,
         };
@@ -68,8 +73,9 @@ pub fn replay(
             match check_at(resolver, claim, &claim.provenance.commit_sha) {
                 Step::Held => {}
                 Step::Unresolvable => verdict.unresolvable = true,
-                Step::Failed => {
+                Step::Failed(r) => {
                     verdict.first_fail_commit = Some(claim.provenance.commit_sha.clone());
+                    verdict.first_fail_resolution = Some(r);
                 }
             }
             verdicts.push(verdict);
@@ -82,8 +88,9 @@ pub fn replay(
                     verdict.unresolvable = true;
                     break;
                 }
-                Step::Failed => {
+                Step::Failed(r) => {
                     verdict.first_fail_commit = Some(commit.clone());
+                    verdict.first_fail_resolution = Some(r);
                     break;
                 }
             }
@@ -100,20 +107,35 @@ enum Step {
     /// Every anchor is `Resolution::Unresolvable` — nothing this resolver can
     /// check, an honest non-verdict, never a FAIL (schema friction #2).
     Unresolvable,
-    /// No anchor resolves and at least one was checkable.
-    Failed,
+    /// No anchor resolves and at least one was checkable; carries the
+    /// most-alive checkable resolution (Renamed > Stale > Dead) so the
+    /// verdict can say HOW the claim broke, not just where.
+    Failed(Resolution),
 }
 
 fn check_at(resolver: &dyn Resolver, claim: &Claim, commit: &str) -> Step {
     let resolutions: Vec<Resolution> =
         claim.provenance.anchors.iter().map(|a| resolver.resolve(a, commit)).collect();
     if resolutions.iter().any(|r| matches!(r, Resolution::Resolves(_))) {
-        Step::Held
-    } else if resolutions.iter().all(|r| matches!(r, Resolution::Unresolvable)) {
-        Step::Unresolvable
-    } else {
-        Step::Failed
+        return Step::Held;
     }
+    if resolutions.iter().all(|r| matches!(r, Resolution::Unresolvable)) {
+        return Step::Unresolvable;
+    }
+    // Most-alive checkable resolution, mirroring `reverify`'s ranking.
+    let rank = |r: &Resolution| match r {
+        Resolution::Renamed => 3,
+        Resolution::Stale => 2,
+        Resolution::Dead => 1,
+        Resolution::Resolves(_) | Resolution::Unresolvable => 0,
+    };
+    let best = resolutions
+        .iter()
+        .filter(|r| !matches!(r, Resolution::Unresolvable))
+        .max_by_key(|r| rank(r))
+        .copied()
+        .unwrap_or(Resolution::Dead);
+    Step::Failed(best)
 }
 
 fn rev_list(repo_root: &Path, from: &str) -> Result<Vec<String>> {
