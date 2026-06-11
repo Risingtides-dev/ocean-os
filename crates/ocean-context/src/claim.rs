@@ -100,13 +100,27 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Anchor {
     /// `None` for symbol-only anchors (handoff finding F5) — there is no
-    /// empty-string sentinel; absence is typed (schema friction #1).
+    /// empty-string sentinel; absence is typed (schema friction #1). Legacy
+    /// handoffs encoded symbol-only anchors as `file = ""`; the compat
+    /// deserializer normalizes empty/whitespace to `None` on load, so the
+    /// old sentinel can never survive a read and violate the
+    /// `file.is_none() == symbol-only` contract downstream.
+    #[serde(default, deserialize_with = "file_compat")]
     pub file: Option<String>,
     pub symbol: Option<String>,
     /// May be empty — symbol-only and file-only anchors are common (handoff finding F5).
     pub lines: Vec<u32>,
     /// Layer B (tree-sitter signature hash). None in v1.
     pub sig_hash: Option<String>,
+}
+
+/// Map the legacy empty-string file sentinel (and whitespace-only noise) to
+/// typed absence on load.
+fn file_compat<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(de)?.filter(|s| !s.trim().is_empty()))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +223,29 @@ pub(crate) mod tests {
 
     fn anchor(file: &str, symbol: Option<&str>, lines: Vec<u32>) -> Anchor {
         Anchor { file: Some(file.into()), symbol: symbol.map(Into::into), lines, sig_hash: None }
+    }
+
+    #[test]
+    fn legacy_empty_file_sentinel_normalizes_to_none() {
+        // Codex P2 round 2 on PR #205: old handoffs encoded symbol-only
+        // anchors as `file = ""`. The sentinel must not survive a load —
+        // downstream relies on `file.is_none() == symbol-only`.
+        let a: Anchor =
+            serde_json::from_str(r#"{"file":"","symbol":"workspace.members","lines":[]}"#).unwrap();
+        assert_eq!(a.file, None);
+        let a: Anchor = toml::from_str("file = \"\"\nsymbol = \"workspace.members\"\nlines = []")
+            .unwrap();
+        assert_eq!(a.file, None);
+        // whitespace-only is equally meaningless
+        let a: Anchor = serde_json::from_str(r#"{"file":"  ","lines":[]}"#).unwrap();
+        assert_eq!(a.file, None);
+        // absent and null still mean None; real paths survive untouched
+        let a: Anchor = serde_json::from_str(r#"{"lines":[]}"#).unwrap();
+        assert_eq!(a.file, None);
+        let a: Anchor = serde_json::from_str(r#"{"file":null,"lines":[]}"#).unwrap();
+        assert_eq!(a.file, None);
+        let a: Anchor = serde_json::from_str(r#"{"file":"src/a.rs","lines":[]}"#).unwrap();
+        assert_eq!(a.file.as_deref(), Some("src/a.rs"));
     }
 
     #[test]

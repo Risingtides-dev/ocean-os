@@ -47,16 +47,19 @@ pub fn reverify(
     now: i64,
     by_session: &str,
 ) -> Vec<(String, Resolution)> {
-    // Most-alive-first; Unresolvable outranks Dead because "can't check" is
-    // not evidence of removal (schema friction #2), but ranks below Stale,
-    // which at least attests the anchor was checkable.
+    // Evidence-first ranking: any CHECKABLE resolution — positive (Resolves)
+    // or negative (Dead) — outranks Unresolvable, so an uncheckable sibling
+    // anchor can never mask a dead one. Unresolvable wins only when NO anchor
+    // produced evidence at all (schema friction #2). Among checkable
+    // resolutions, most-alive wins: a claim with one resolving anchor still
+    // holds, matching the replay harness's any-resolves semantics.
     fn rank(r: Resolution) -> u8 {
         match r {
             Resolution::Resolves(_) => 4,
             Resolution::Renamed => 3,
             Resolution::Stale => 2,
-            Resolution::Unresolvable => 1,
-            Resolution::Dead => 0,
+            Resolution::Dead => 1,
+            Resolution::Unresolvable => 0,
         }
     }
     let mut out = Vec::new();
@@ -64,7 +67,7 @@ pub fn reverify(
         if claim.provenance.anchors.is_empty() {
             continue;
         }
-        let mut best = Resolution::Dead;
+        let mut best = Resolution::Unresolvable;
         for anchor in &claim.provenance.anchors {
             let r = resolver.resolve(anchor, at_commit);
             if rank(r) > rank(best) {

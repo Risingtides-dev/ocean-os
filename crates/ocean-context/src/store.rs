@@ -332,15 +332,39 @@ lines = []
 at = 1780980000
 event = "written"
 by_session = "sess-1"
+
+[[claims]]
+id = "c2"
+text = "a legacy symbol-only claim with the empty-file sentinel"
+status = "Reverify"
+knowledge_tier = "Individual"
+confidence = 0.6
+
+[claims.provenance]
+commit_sha = "d9a9bc9"
+
+[[claims.provenance.anchors]]
+file = ""
+symbol = "workspace.members"
+lines = []
+
+[[claims.history]]
+at = 1780980000
+event = "written"
+by_session = "sess-1"
 +++
 
 The old prose narrative.
 "#;
         let h = from_markdown(old).unwrap();
         assert_eq!(h.session_id, "sess-1");
-        assert_eq!(h.claims.len(), 1);
+        assert_eq!(h.claims.len(), 2);
         assert_eq!(h.claims[0].provenance.tickets, vec!["OCEAN-16".to_string()]);
         assert_eq!(h.claims[0].provenance.anchors[0].file.as_deref(), Some("Cargo.toml"));
+        // Legacy `file = ""` sentinel normalizes to typed absence on load
+        // (Codex P2 round 2 on PR #205).
+        assert_eq!(h.claims[1].provenance.anchors[0].file, None);
+        assert_eq!(h.claims[1].provenance.anchors[0].symbol.as_deref(), Some("workspace.members"));
         assert_eq!(h.narrative, "The old prose narrative.\n");
         // Re-writing lands in the current format, fenced claims block intact.
         let rewritten = to_markdown(&h).unwrap();
