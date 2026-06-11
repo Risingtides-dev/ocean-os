@@ -306,9 +306,21 @@ fn rust_sig_hash(source: &str, symbol: &str) -> SymbolProbe {
     let Some(tree) = parser.parse(source, None) else {
         return SymbolProbe::Unparseable;
     };
-    let want = symbol.rsplit("::").next().unwrap_or(symbol);
+    // `a::run` anchors `run` inside a scope named `a` — the qualifier is
+    // matched against enclosing mod/impl/trait names, not discarded, so an
+    // unrelated same-named item in another module can never corrupt the
+    // hash (leading `crate`/`self` are path noise, not scopes).
+    let segs: Vec<&str> = symbol
+        .split("::")
+        .filter(|s| !s.is_empty() && *s != "crate" && *s != "self")
+        .collect();
+    let (want, qual) = match segs.split_last() {
+        Some((w, q)) => (*w, q),
+        None => return SymbolProbe::Absent,
+    };
     let mut sigs: Vec<String> = Vec::new();
-    collect_rust_sigs(tree.root_node(), source, want, &mut sigs);
+    let mut scope: Vec<String> = Vec::new();
+    collect_rust_sigs(tree.root_node(), source, want, qual, &mut scope, &mut sigs);
     if sigs.is_empty() {
         // tree-sitter recovers around syntax errors; a miss in a broken tree
         // can be the breakage hiding the item, not evidence of removal.
@@ -320,7 +332,14 @@ fn rust_sig_hash(source: &str, symbol: &str) -> SymbolProbe {
     SymbolProbe::Found(fnv1a64(&sigs.join("\n")))
 }
 
-fn collect_rust_sigs(node: Node, source: &str, want: &str, sigs: &mut Vec<String>) {
+fn collect_rust_sigs(
+    node: Node,
+    source: &str,
+    want: &str,
+    qual: &[&str],
+    scope: &mut Vec<String>,
+    sigs: &mut Vec<String>,
+) {
     let mut matched = false;
     if NAMED_ITEM_KINDS.contains(&node.kind()) {
         if let Some(name) = node.child_by_field_name("name") {
@@ -333,14 +352,50 @@ fn collect_rust_sigs(node: Node, source: &str, want: &str, sigs: &mut Vec<String
                 .is_some_and(|n| base_type_name(node_text(n, source)) == want)
         });
     }
-    if matched {
+    // A qualified anchor must sit in a scope whose innermost names spell the
+    // qualifier (`a::run` = `run` directly inside something named `a`).
+    if matched && scope_matches(scope, qual) {
         sigs.push(signature_text(node, source));
+    }
+    // Entering a named scope? mods, impls, and traits qualify their contents.
+    let entered = match node.kind() {
+        "mod_item" | "trait_item" => node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source).to_string()),
+        "impl_item" => ["type", "trait"].iter().find_map(|f| {
+            node.child_by_field_name(f)
+                .map(|n| base_type_name(node_text(n, source)).to_string())
+        }),
+        _ => None,
+    };
+    let pushed = entered.is_some();
+    if let Some(name) = entered {
+        scope.push(name);
     }
     // Always recurse: methods inside impls, items inside mods, nested fns.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_rust_sigs(child, source, want, sigs);
+        collect_rust_sigs(child, source, want, qual, scope, sigs);
     }
+    if pushed {
+        scope.pop();
+    }
+}
+
+/// True when `qual` is the innermost suffix of the current scope chain — an
+/// unqualified anchor (empty `qual`) matches anywhere, preserving the
+/// existing all-same-named-items hashing for bare symbols.
+fn scope_matches(scope: &[String], qual: &[&str]) -> bool {
+    if qual.is_empty() {
+        return true;
+    }
+    if qual.len() > scope.len() {
+        return false;
+    }
+    scope[scope.len() - qual.len()..]
+        .iter()
+        .zip(qual.iter())
+        .all(|(s, q)| s == q)
 }
 
 /// `FileExistsResolver` from `FileExistsResolver<'a, T>` / `crate::seams::FileExistsResolver`.
@@ -473,11 +528,27 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
     }
 
     #[test]
-    fn rust_path_qualified_symbol_matches_last_segment() {
-        assert_eq!(
-            rust_sig_hash(RUST_SRC, "free_standing"),
-            rust_sig_hash(RUST_SRC, "gate::free_standing"),
-        );
+    fn rust_qualified_symbol_scopes_to_its_module() {
+        // Codex round-4 P2 scenario: same-named `run` in two modules. The
+        // qualified anchor must hash ONLY its own module's item, so an
+        // unrelated change to `b::run` never flips an `a::run` claim.
+        let two = "mod a { pub fn run(x: u8) -> bool { x > 0 } }\n\
+                   mod b { pub fn run(x: u8) -> bool { x > 0 } }\n";
+        let b_changed = "mod a { pub fn run(x: u8) -> bool { x > 0 } }\n\
+                         mod b { pub fn run(x: u8, strict: bool) -> bool { x > 0 } }\n";
+        let a_hash = rust_sig_hash(two, "a::run");
+        assert!(matches!(a_hash, SymbolProbe::Found(_)));
+        assert_eq!(a_hash, rust_sig_hash(b_changed, "a::run"), "b::run noise must not leak into a::run");
+        assert_ne!(rust_sig_hash(two, "b::run"), rust_sig_hash(b_changed, "b::run"));
+        // The unqualified anchor still hashes every same-named item.
+        assert_ne!(rust_sig_hash(two, "run"), rust_sig_hash(b_changed, "run"));
+        // A qualifier naming a scope that doesn't contain the item: Absent.
+        assert_eq!(rust_sig_hash(RUST_SRC, "gate::free_standing"), SymbolProbe::Absent);
+        // Leading `crate::` is path noise, not a scope.
+        assert_eq!(rust_sig_hash(two, "crate::a::run"), rust_sig_hash(two, "a::run"));
+        // Impl-qualified methods: `Gate::requires_permission` matches the
+        // method inside `impl Gate`, and only that.
+        assert!(matches!(rust_sig_hash(RUST_SRC, "Gate::requires_permission"), SymbolProbe::Found(_)));
     }
 
     #[test]
