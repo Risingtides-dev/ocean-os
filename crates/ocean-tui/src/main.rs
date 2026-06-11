@@ -2284,15 +2284,27 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn resolve_project_root(cli_project: Option<&str>) -> PathBuf {
-    if let Some(path) = cli_project.filter(|p| !p.is_empty()) {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("OCEAN_PROJECT") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
+    let requested = cli_project
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("OCEAN_PROJECT")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+        });
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match requested {
+        Some(p) if p.is_absolute() => p,
+        // A relative --project/OCEAN_PROJECT is resolved against the launch
+        // cwd here, once — turns carry app.root verbatim, and a relative root
+        // would otherwise rebind against the daemon's own cwd.
+        Some(p) => {
+            let joined = cwd.join(p);
+            joined.canonicalize().unwrap_or(joined)
         }
+        None => cwd,
     }
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
@@ -8034,5 +8046,28 @@ mod tests {
         fs::remove_dir_all(&temp).ok();
 
         assert!(agents.iter().any(|agent| agent.agent == "PIXEL"));
+    }
+}
+
+#[cfg(test)]
+mod resolve_project_root_absolutize_tests {
+    use super::resolve_project_root;
+
+    #[test]
+    fn relative_project_is_resolved_against_launch_cwd() {
+        let root = resolve_project_root(Some("."));
+        assert!(
+            root.is_absolute(),
+            "relative --project must absolutize, got {root:?}"
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(root, cwd.canonicalize().unwrap_or(cwd));
+    }
+
+    #[test]
+    fn absolute_project_passes_through_verbatim() {
+        let here = std::env::current_dir().unwrap();
+        let root = resolve_project_root(Some(here.to_str().unwrap()));
+        assert_eq!(root, here);
     }
 }
