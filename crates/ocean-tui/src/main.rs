@@ -530,6 +530,16 @@ impl DaemonApp {
         }
     }
 
+    /// OCEAN-311: once the operator drives the picker, the picker is the
+    /// source of truth — re-point the active agent session at the picked
+    /// session (or clear it for the `new session` slot) so submits AND the
+    /// SSE scope (the OCEAN-15/OCEAN-305 re-scope machinery reads the shared
+    /// handle) follow the switch instead of staying pinned to a previously
+    /// active session, e.g. the `--session` startup target.
+    fn sync_active_session_to_picker(&mut self) {
+        self.set_active_agent_session_id(self.selected_session_id().map(AgentSessionId::from));
+    }
+
     fn selected_session_label(&self) -> String {
         match self.selected_session() {
             Some(session) => format!(
@@ -551,6 +561,7 @@ impl DaemonApp {
         let current = self.selected_session_slot() as isize;
         let next = (current + delta).clamp(0, self.sessions.len() as isize);
         self.selected_session_index = next as usize;
+        self.sync_active_session_to_picker();
         self.status = format!("session target: {}", self.selected_session_label());
     }
 
@@ -3405,6 +3416,7 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
                             app.selected_session_index = slot;
                             app.selected_session_label()
                         };
+                        app.sync_active_session_to_picker();
                         app.status = format!("session target: {label}");
                         app.push_transcript(format!("Ocean: switched to session {label}"));
                         return;
@@ -8225,6 +8237,73 @@ mod tests {
         assert_eq!(app.selected_session_id(), Some(session_id));
         app.cycle_session(-1);
         assert_eq!(app.selected_session_id(), None);
+    }
+
+    /// Builds an app in the post-`--session` startup state: session list
+    /// loaded, picker pointed at the first session, active agent session (and
+    /// the shared SSE scope handle) pinned to it — as `run_daemon` does.
+    fn app_with_startup_session() -> (DaemonApp, Vec<SessionSummary>) {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let sessions = resume_session_fixtures();
+        app.set_sessions(sessions.clone());
+        app.selected_session_index = 1;
+        app.set_active_agent_session_id(Some(AgentSessionId::from(sessions[0].id)));
+        (app, sessions)
+    }
+
+    #[test]
+    fn picker_switch_overrides_startup_session_scope() {
+        let (mut app, sessions) = app_with_startup_session();
+        assert_eq!(
+            app.selected_agent_session_id(),
+            Some(AgentSessionId::from(sessions[0].id))
+        );
+
+        // Operator picks the next session: submits must carry the NEW id,
+        // not stay pinned to the --session startup target...
+        app.cycle_session(1);
+        let expected = AgentSessionId::from(sessions[1].id);
+        assert_eq!(app.selected_agent_session_id(), Some(expected));
+        // ...and the shared handle the SSE thread reads must re-scope with it
+        // (the OCEAN-15/OCEAN-305 re-scope path keys off this handle).
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn picker_new_session_slot_clears_startup_session_scope() {
+        let (mut app, sessions) = app_with_startup_session();
+        assert_eq!(
+            app.selected_agent_session_id(),
+            Some(AgentSessionId::from(sessions[0].id))
+        );
+
+        // Cycling back to the `new session` slot must clear the pin: the next
+        // submit starts a fresh session instead of writing into the startup one.
+        app.cycle_session(-1);
+        assert_eq!(app.selected_session_id(), None);
+        assert_eq!(app.selected_agent_session_id(), None);
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_command_overrides_startup_session_scope() {
+        let (mut app, sessions) = app_with_startup_session();
+
+        // `/resume 2` is the slash-command flavor of the picker switch — same
+        // source-of-truth rule applies.
+        assert!(handle_slash_command(&mut app, "/resume 2"));
+        let expected = AgentSessionId::from(sessions[1].id);
+        assert_eq!(app.selected_agent_session_id(), Some(expected));
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            Some(expected)
+        );
     }
 
     #[test]
