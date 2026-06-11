@@ -368,3 +368,129 @@ broken = = [
     };
     assert_eq!(ts.resolve(&rust_anchor, &c5), Resolution::Unresolvable);
 }
+
+// ---------------------------------------------------------------------------
+// Codex round-6 P2: baselines are part of the claim LIFECYCLE — the first
+// reverify stamps them; they round-trip through the store; the second
+// reverify flags shape changes. Only the replay CLI seeded before this.
+// ---------------------------------------------------------------------------
+
+fn handoff_with_claims(claims: Vec<Claim>, branch: &str) -> ocean_context::Handoff {
+    ocean_context::Handoff {
+        session_id: "sess-b".into(),
+        parent_session: None,
+        repo: "fixture".into(),
+        branch: branch.into(),
+        commit_anchor: claims.first().map(|c| c.provenance.commit_sha.clone()).unwrap_or_default(),
+        scope_ring: ocean_context::ScopeRing::Repo,
+        velocity_at_write: ocean_context::Velocity { v_code: 0.0, v_sem: 0.0 },
+        written_at: 1_000,
+        narrative: "lifecycle fixture".into(),
+        claims,
+    }
+}
+
+/// THE round-6 regression pin: an unseeded symbol anchor (what
+/// extract_claims/write_handoff produce) must get its baseline stamped on
+/// the FIRST reverify, survive a store round-trip, and flag Stale on the
+/// SECOND reverify after the shape changes. Without the fix the second
+/// reverify says Verified — the symbol still resolves by name.
+#[test]
+fn reverify_stamps_baseline_on_first_pass_and_flags_shape_change_on_second() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let mut h = handoff_with_claims(vec![claim("c-gate", "lib.rs", Some("gate"), &c1)], "main");
+    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "arrives unseeded");
+
+    // FIRST reverify: stamps the baseline and verifies.
+    let r1 = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
+    assert_eq!(r1[0].1, Resolution::Resolves(1.0));
+    assert_eq!(h.claims[0].status, ClaimStatus::Verified);
+    let stamped = h.claims[0].provenance.anchors[0].sig_hash.clone();
+    assert!(stamped.is_some(), "first reverify must stamp the write-time baseline");
+
+    // The stamp round-trips through the store (caller persists).
+    let store_dir = root.join(".ocean/handoffs");
+    ocean_context::write_handoff(&store_dir, &h).unwrap();
+    let mut h2 = ocean_context::read_freshest(&store_dir, "fixture", "main", 2_000)
+        .unwrap()
+        .expect("stored handoff");
+    assert_eq!(h2.claims[0].provenance.anchors[0].sig_hash, stamped);
+
+    // Shape change in the working tree; SECOND reverify must flag Stale.
+    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8, strict: bool) -> bool { x > 0 }\n")
+        .unwrap();
+    let r2 = ocean_context::reverify(&mut h2, &resolver, WORKTREE, 3_000, "sess-2");
+    assert_eq!(r2[0].1, Resolution::Stale, "shape change after stamping must flag");
+    assert_eq!(h2.claims[0].status, ClaimStatus::Stale);
+}
+
+/// Birth-check epistemics in reverify: a symbol that was NOT attestable at
+/// its own anchor commit must never verify by name — even when a
+/// same-named symbol exists at the commit being reverified. An unparseable
+/// birth revision is an honest non-verdict (Reverify), not a death.
+#[test]
+fn reverify_birth_failures_never_verify_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(root.join("broken.rs"), "pub fn half( ((((\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1: ghost absent, broken.rs unparseable"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    // ghost arrives LATER — present by name at reverify time, absent at birth.
+    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\npub fn ghost() {}\n")
+        .unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c2: ghost appears"]);
+
+    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let mut h = handoff_with_claims(
+        vec![
+            claim("c-ghost", "lib.rs", Some("ghost"), &c1),
+            claim("c-broken", "broken.rs", Some("half"), &c1),
+        ],
+        "main",
+    );
+    let results = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
+
+    // absent at birth → Dead (killed), NOT verified-by-name
+    assert_eq!(results[0].1, Resolution::Dead);
+    assert_eq!(h.claims[0].status, ClaimStatus::Dead);
+    assert!(h.claims[0].history.iter().any(|e| e.event == "killed"));
+    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "no baseline laundered");
+
+    // unparseable at birth → Unresolvable (Reverify), no evidence either way
+    assert_eq!(results[1].1, Resolution::Unresolvable);
+    assert_eq!(h.claims[1].status, ClaimStatus::Reverify);
+    assert!(h.claims[1].history.iter().any(|e| e.event == "unresolvable"));
+}
+
+/// The v1 stub keeps its exact semantics: FileExistsResolver never stamps
+/// (Baseline::Unsupported default) and reverify behaves as before.
+#[test]
+fn reverify_with_file_exists_resolver_never_stamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    let resolver = FileExistsResolver { repo_root: root.to_path_buf() };
+    let mut h = handoff_with_claims(vec![claim("c-gate", "lib.rs", Some("gate"), &c1)], "main");
+    let results = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
+    assert_eq!(results[0].1, Resolution::Resolves(1.0));
+    assert_eq!(h.claims[0].status, ClaimStatus::Verified);
+    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "file-exists never stamps");
+}

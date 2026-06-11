@@ -14,8 +14,8 @@ pub mod treesitter;
 pub use claim::*;
 pub use extract::{extract_claims, ExtractCtx};
 pub use seams::{
-    Borrowed, Borrower, ConfidenceRecencyTrust, FileExistsResolver, NoBorrow, Resolution,
-    Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel, WORKTREE,
+    Baseline, Borrowed, Borrower, ConfidenceRecencyTrust, FileExistsResolver, NoBorrow,
+    Resolution, Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel, WORKTREE,
 };
 pub use treesitter::TreeSitterResolver;
 
@@ -42,6 +42,18 @@ pub fn read_freshest(dir: &Path, repo: &str, branch: &str, now: i64) -> Result<O
 /// Re-resolve every anchored claim at `at_commit` (or [`WORKTREE`]); update
 /// statuses and append history events. Anchorless claims are left untouched —
 /// there is nothing to check. Returns (claim id, resolution) per checked claim.
+///
+/// **The first reverify stamps baselines.** Every symbol-bearing anchor that
+/// arrived without a `sig_hash` (everything `extract_claims` and hand-written
+/// handoffs produce) gets its write-time shape hash computed at the claim's
+/// anchor commit via [`Resolver::baseline_at`] and stamped onto the in-memory
+/// handoff — the caller persists it (the store round-trips `sig_hash`), so
+/// the SECOND reverify can flag a shape change. Resolvers without baseline
+/// support (the v1 file-exists stub) return `Unsupported` and behave exactly
+/// as before. When the baseline CANNOT be computed at the anchor commit, the
+/// claim was never attestable — the birth-check analog: absent-at-birth is
+/// `Dead`, an unparseable birth revision is `Unresolvable`. It must never
+/// fall back to verified-by-name.
 pub fn reverify(
     handoff: &mut Handoff,
     resolver: &dyn Resolver,
@@ -69,9 +81,10 @@ pub fn reverify(
         if claim.provenance.anchors.is_empty() {
             continue;
         }
+        let birth_commit = claim.provenance.commit_sha.clone();
         let mut best = Resolution::Unresolvable;
-        for anchor in &claim.provenance.anchors {
-            let r = resolver.resolve(anchor, at_commit);
+        for anchor in &mut claim.provenance.anchors {
+            let r = resolve_stamping_baseline(resolver, anchor, &birth_commit, at_commit);
             if rank(r) > rank(best) {
                 best = r;
             }
@@ -98,4 +111,27 @@ pub fn reverify(
         out.push((claim.id.clone(), best));
     }
     out
+}
+
+/// Resolve one anchor, stamping its write-time baseline first when it is
+/// symbol-bearing and unseeded. An empty/unknown birth commit cannot be
+/// probed — skip seeding and resolve as before (never guess a baseline).
+fn resolve_stamping_baseline(
+    resolver: &dyn Resolver,
+    anchor: &mut claim::Anchor,
+    birth_commit: &str,
+    at_commit: &str,
+) -> Resolution {
+    if anchor.symbol.is_some() && anchor.sig_hash.is_none() && !birth_commit.is_empty() {
+        match resolver.baseline_at(anchor, birth_commit) {
+            Baseline::Unsupported => {}
+            Baseline::Stamped(hash) => anchor.sig_hash = Some(hash),
+            // Birth-check failure: the anchor never attested at its own
+            // anchor commit. Verified-by-name would launder a claim that was
+            // never reproducible — return the birth verdict instead.
+            Baseline::Unattestable => return Resolution::Dead,
+            Baseline::Unparseable => return Resolution::Unresolvable,
+        }
+    }
+    resolver.resolve(anchor, at_commit)
 }

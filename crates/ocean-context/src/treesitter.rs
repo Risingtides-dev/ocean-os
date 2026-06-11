@@ -54,7 +54,7 @@
 //! `workspace.members` changes the moment the members array changes.
 
 use crate::claim::{Anchor, Claim};
-use crate::seams::{is_repo_relative, Resolution, Resolver, WORKTREE};
+use crate::seams::{is_repo_relative, Baseline, Resolution, Resolver, WORKTREE};
 use std::path::PathBuf;
 use std::process::Command;
 use tree_sitter::{Node, Parser};
@@ -215,6 +215,44 @@ impl Resolver for TreeSitterResolver {
                 Some(_) => Resolution::Stale,
                 // No recorded state: file-exists semantics.
                 None => Resolution::Resolves(1.0),
+            },
+        }
+    }
+
+    /// Write-time baseline for a symbol-bearing anchor at its claim's anchor
+    /// commit — what `reverify` stamps on first pass so a later shape change
+    /// can flag (Codex round-6 P2: baselines are part of the claim
+    /// lifecycle, not a replay-CLI courtesy).
+    ///
+    /// Anchors this resolver can't baseline ANYWHERE (no file, traversal,
+    /// unknown language, directory, no symbol) are `Unsupported` — `resolve`
+    /// already gives those their honest verdict. A missing file or absent
+    /// symbol AT BIRTH is `Unattestable` (the birth-check analog: the claim
+    /// was never reproducible — it must not verify by name later); a bare
+    /// basename that matches elsewhere keeps its weak ambiguous-location
+    /// semantics instead. An unparseable birth revision is `Unparseable`.
+    fn baseline_at(&self, anchor: &Anchor, at_commit: &str) -> Baseline {
+        let Some(file) = anchor.file.as_deref() else { return Baseline::Unsupported };
+        if !is_repo_relative(file) {
+            return Baseline::Unsupported;
+        }
+        let Some(symbol) = anchor.symbol.as_deref() else { return Baseline::Unsupported };
+        let Some(lang) = language_of(file) else { return Baseline::Unsupported };
+        match self.load(file, at_commit) {
+            Source::Missing => {
+                if self.basename_resolves(file, at_commit) {
+                    // Ambiguous location: weak file-level evidence only —
+                    // defer to `resolve`'s 0.5 semantics, don't assert death.
+                    Baseline::Unsupported
+                } else {
+                    Baseline::Unattestable
+                }
+            }
+            Source::Opaque => Baseline::Unsupported,
+            Source::Text(text) => match probe_symbol(lang, &text, symbol) {
+                SymbolProbe::Found(hash) => Baseline::Stamped(hash),
+                SymbolProbe::Absent => Baseline::Unattestable,
+                SymbolProbe::Unparseable => Baseline::Unparseable,
             },
         }
     }
