@@ -10,12 +10,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// How Ocean should use Longhouse for this process/workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LonghouseMode {
     /// Do not consult Longhouse.
     Disabled,
     /// Use daemon-embedded Longhouse routes/logic.
+    #[default]
     Embedded,
     /// Connect to a separate local service, usually `127.0.0.1:4781`.
     Local,
@@ -32,12 +33,6 @@ impl LonghouseMode {
             "remote" => Some(Self::Remote),
             _ => None,
         }
-    }
-}
-
-impl Default for LonghouseMode {
-    fn default() -> Self {
-        Self::Embedded
     }
 }
 

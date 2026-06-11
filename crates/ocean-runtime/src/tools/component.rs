@@ -260,7 +260,7 @@ impl AgentTool for ComponentUnmountTool {
 /// In-memory registry of pending wait requests. The `component_wait` tool
 /// creates an entry here, and the `/v1/component/event` route resolves it.
 /// This is global state, but each entry is scoped by (session_id, component_id).
-
+///
 /// Global component-wait registry that both the tool and the
 /// `/v1/component/event` route access.
 ///

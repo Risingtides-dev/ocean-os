@@ -40,15 +40,13 @@ jobs:
       - name: Test (workspace)
         run: cargo test --workspace
 
-      # Plain clippy: correctness lints that are deny-by-default still fail the
-      # build, but pre-existing style warnings do not (no `-D warnings` yet).
-      - name: Clippy (workspace, all targets)
-        run: cargo clippy --workspace --all-targets
+      # OCEAN-309: the tree is warning-clean — `-D warnings` keeps it that way.
+      # Any new clippy warning (style or correctness, any target incl. tests)
+      # fails the build instead of eroding the baseline.
+      - name: Clippy (workspace, all targets, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # TODO(OCEAN-191 follow-up): add a `cargo fmt --all --check` step once a
       # one-time `cargo fmt --all` sweep is landed deliberately (~196 files —
       # separate PR, needs sign-off). The tree has never been formatted, so a fmt
       # gate would be red-on-arrival today.
-      # TODO(OCEAN-191 follow-up): tighten clippy to `-- -D warnings` once the
-      # tree is warning-clean (pre-existing style + await_holding_lock warnings
-      # remain across several crates).

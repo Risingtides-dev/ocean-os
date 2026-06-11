@@ -81,8 +81,8 @@ fn print_header(rec: &Recording) {
 
 fn print_table(rows: &[(QuorumConfig, ReplayResult)]) {
     println!(
-        "  {:<26} {:>8} {:>9} {:>10}  {}",
-        "config", "conv@", "winner", "lead net", "outcome"
+        "  {:<26} {:>8} {:>9} {:>10}  outcome",
+        "config", "conv@", "winner", "lead net"
     );
     println!("  {}", "─".repeat(72));
     for (cfg, res) in rows {

@@ -262,7 +262,7 @@ impl DaemonClient {
         // about `data:`.
         let byte_stream: IoByteStream = Box::pin(
             resp.bytes_stream()
-                .map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+                .map(|res| res.map_err(std::io::Error::other)),
         );
         let lines = BufReader::new(StreamReader::new(byte_stream)).lines();
         Ok(EventStream { lines })
@@ -288,7 +288,7 @@ impl DaemonClient {
 
         let byte_stream: IoByteStream = Box::pin(
             resp.bytes_stream()
-                .map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+                .map(|res| res.map_err(std::io::Error::other)),
         );
         let lines = BufReader::new(StreamReader::new(byte_stream)).lines();
         Ok(OceanEventStream { lines })
