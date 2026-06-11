@@ -44,13 +44,14 @@ context engine. The crate is named `ocean-context` and lives in the ocean-os wor
 ## Claims (the codified, machine-checkable state)
 
 - id: c1
-  text: "ocean-context is a NEW crate to be added at crates/ocean-context in the ocean-os workspace; it does not exist yet."
-  provenance: { anchors: [{ file: "Cargo.toml", symbol: "workspace.members", lines: [] }], ticket: OCEAN-306, commit_sha: d9a9bc9 }
-  status: Verified        # the crate now EXISTS at crates/ocean-context (Layer A merged in PR #203, OCEAN-306) — the "does not exist yet" half of this claim is dead, the plan half reproduced
+  text: "ocean-context now exists as a workspace crate at crates/ocean-context; this fulfills the original Layer A plan to add a new crate there."
+  provenance: { anchors: [{ file: "Cargo.toml", symbol: "workspace.members", lines: [] }, { file: "crates/ocean-context/Cargo.toml", symbol: null, lines: [] }], ticket: OCEAN-306, commit_sha: c6be580 }
+  status: Verified        # Layer A merged in PR #203 / OCEAN-306; historical note: the original handoff said the crate did not exist yet
   knowledge_tier: Common
   confidence: 1.0
   history: [{ at: 1780980000, event: written, by_session: brainstorm-2026-06-09-ocean-context },
-            { at: 1781146468, event: reverified, by_session: layer-a-build-2026-06-10 }]
+            { at: 1781146468, event: reverified, by_session: layer-a-build-2026-06-10 },
+            { at: 1781147900, event: text_updated_after_fulfillment, by_session: docs-loop-close-2026-06-11 }]
 
 - id: c2
   text: "The full design (Layer A build + Layer B backlog + master equation + theory provenance) is committed and is the source of truth."
