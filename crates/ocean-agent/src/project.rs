@@ -163,6 +163,7 @@ mod tests {
         upsert(&dir, p, 3000).unwrap();
         let all = load_all(&dir).unwrap();
         assert_eq!(all.len(), 1, "same id replaces, not appends");
+        assert_eq!(all[0].id, id, "replacement keeps the original id");
         assert_eq!(all[0].name, "new-name");
         assert_eq!(all[0].updated_ms, 3000);
     }

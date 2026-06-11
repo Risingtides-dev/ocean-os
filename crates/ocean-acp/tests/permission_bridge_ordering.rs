@@ -356,13 +356,11 @@ async fn new_order_receives_permission_and_turn_completes() {
     //    BEFORE the turn returns).
     let mut learned_request_id: Option<String> = None;
     for _ in 0..50 {
-        if let Ok(Some(ev)) =
+        if let Ok(Some(AgentTurnEvent::TurnStarted { turn_id, .. })) =
             tokio::time::timeout(Duration::from_millis(500), agent.next_event()).await.unwrap()
         {
-            if let AgentTurnEvent::TurnStarted { turn_id, .. } = ev {
-                learned_request_id = Some(turn_id.0.to_string());
-                break;
-            }
+            learned_request_id = Some(turn_id.0.to_string());
+            break;
         }
     }
     let request_id = learned_request_id.expect("must learn request id from TurnStarted pre-block");

@@ -1285,7 +1285,7 @@ impl DaemonApp {
             _ => {}
         }
         self.longhouse_topics
-            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            .sort_by_key(|t| std::cmp::Reverse(t.updated_at));
     }
 
     fn longhouse_topic_mut(&mut self, topic_id: Uuid) -> &mut LonghouseTopic {
@@ -3834,11 +3834,11 @@ fn with_last_event_id(
 /// we're connecting with now (`connect_scope`), returns the id to actually send:
 /// the same id when the scopes match, or `None` when they differ (including the
 /// offline-switch case, where the live read loop never ran to notice the change).
-fn agent_last_event_id_for_scope<'a>(
-    last_event_id: Option<&'a str>,
+fn agent_last_event_id_for_scope(
+    last_event_id: Option<&str>,
     id_scope: Option<AgentSessionId>,
     connect_scope: Option<AgentSessionId>,
-) -> Option<&'a str> {
+) -> Option<&str> {
     if id_scope == connect_scope {
         last_event_id
     } else {

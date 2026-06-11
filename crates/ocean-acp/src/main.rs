@@ -429,7 +429,7 @@ async fn main() -> AcpResult<()> {
                     // is isolated, so each window keeps its own model.
                     let model_id = req.mode_id.0.to_string();
                     let acp_session = req.session_id.clone();
-                    let known = sessions.set_model_id(&acp_session.0.to_string(), model_id.clone());
+                    let known = sessions.set_model_id(acp_session.0.as_ref(), model_id.clone());
                     if !known {
                         // set_mode before session/new — record nothing, but still
                         // ack so the editor isn't left waiting. The session map is

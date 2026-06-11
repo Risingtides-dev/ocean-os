@@ -2233,12 +2233,10 @@ mod session {
             let Ok(age) = now.duration_since(mtime) else {
                 continue; // mtime in the future — leave it alone
             };
-            if age > ttl {
-                if std::fs::remove_file(&path).is_ok() {
-                    pruned += 1;
-                    if oldest_age.map_or(true, |o| age > o) {
-                        oldest_age = Some(age);
-                    }
+            if age > ttl && std::fs::remove_file(&path).is_ok() {
+                pruned += 1;
+                if oldest_age.map_or(true, |o| age > o) {
+                    oldest_age = Some(age);
                 }
             }
         }
@@ -4749,6 +4747,31 @@ is the user's real, signed-in browser session.\n\n\
         format!("{prompt}\n\n## Current client\n\n{MOBILE_SURFACE_PROMPT}\n")
     }
 
+    fn load_project_prompt(start: &Path) -> String {
+        const FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".pi/instructions.md"];
+        let mut found = Vec::new();
+        for ancestor in start.ancestors() {
+            for name in FILES {
+                let path = ancestor.join(name);
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        found.push((path, trimmed.to_string()));
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for (path, content) in found {
+            out.push_str(&format!("\n\n----- {} -----\n", path.display()));
+            out.push_str(&content);
+        }
+        out
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{
@@ -5000,30 +5023,5 @@ is the user's real, signed-in browser session.\n\n\
             assert!(prompt.contains("Do not use `component_render`"));
             assert!(!prompt.contains("Leptos components from `component_render` events"));
         }
-    }
-
-    fn load_project_prompt(start: &Path) -> String {
-        const FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".pi/instructions.md"];
-        let mut found = Vec::new();
-        for ancestor in start.ancestors() {
-            for name in FILES {
-                let path = ancestor.join(name);
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let trimmed = content.trim();
-                    if !trimmed.is_empty() {
-                        found.push((path, trimmed.to_string()));
-                    }
-                }
-            }
-        }
-        if found.is_empty() {
-            return String::new();
-        }
-        let mut out = String::new();
-        for (path, content) in found {
-            out.push_str(&format!("\n\n----- {} -----\n", path.display()));
-            out.push_str(&content);
-        }
-        out
     }
 }
