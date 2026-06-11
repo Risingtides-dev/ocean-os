@@ -98,6 +98,14 @@ struct Cli {
     /// current directory. You can also switch at runtime with `/cd <path>`.
     #[arg(long, env = "OCEAN_PROJECT")]
     project: Option<String>,
+
+    /// Resume an existing daemon session at startup by id — exact match or
+    /// unambiguous prefix (OCEAN-311). Unknown/ambiguous ids fail fast on
+    /// stderr; this flag never silently creates a new session. Unless
+    /// --project is given, the project root is adopted from the session's
+    /// recorded workspace so turns pass the daemon's cwd-binding guard.
+    #[arg(long, env = "OCEAN_SESSION")]
+    session: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -231,6 +239,12 @@ struct SessionsResponse {
     sessions: Vec<SessionSummary>,
     #[serde(default)]
     error: Option<String>,
+    /// Pagination cursor (OCEAN-250): replay as `?cursor=` for the next page.
+    #[serde(default)]
+    next_cursor: Option<String>,
+    /// True when at least one more session exists beyond this page (OCEAN-250).
+    #[serde(default)]
+    has_more: bool,
 }
 
 #[derive(Debug)]
@@ -516,6 +530,16 @@ impl DaemonApp {
         }
     }
 
+    /// OCEAN-311: once the operator drives the picker, the picker is the
+    /// source of truth — re-point the active agent session at the picked
+    /// session (or clear it for the `new session` slot) so submits AND the
+    /// SSE scope (the OCEAN-15/OCEAN-305 re-scope machinery reads the shared
+    /// handle) follow the switch instead of staying pinned to a previously
+    /// active session, e.g. the `--session` startup target.
+    fn sync_active_session_to_picker(&mut self) {
+        self.set_active_agent_session_id(self.selected_session_id().map(AgentSessionId::from));
+    }
+
     fn selected_session_label(&self) -> String {
         match self.selected_session() {
             Some(session) => format!(
@@ -537,6 +561,7 @@ impl DaemonApp {
         let current = self.selected_session_slot() as isize;
         let next = (current + delta).clamp(0, self.sessions.len() as isize);
         self.selected_session_index = next as usize;
+        self.sync_active_session_to_picker();
         self.status = format!("session target: {}", self.selected_session_label());
     }
 
@@ -776,9 +801,45 @@ impl DaemonApp {
     }
 
     fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
-        self.sessions = sessions.into_iter().take(SESSION_CAP).collect();
+        let mut next: Vec<SessionSummary> = sessions.into_iter().take(SESSION_CAP).collect();
+        // OCEAN-311: a resumed `--session` target can live beyond the first
+        // `/v1/sessions` page (OCEAN-250), and the periodic refresh only
+        // fetches page 1 — without this guard it would evict the active
+        // session's row and break the picker's hold on the very session the
+        // operator launched into. Retain the existing row while active.
+        if let Some(active) = self.active_agent_session_id {
+            let has_active = next.iter().any(|s| AgentSessionId::from(s.id) == active);
+            if !has_active {
+                let retained = self
+                    .sessions
+                    .iter()
+                    .find(|s| AgentSessionId::from(s.id) == active)
+                    .cloned();
+                if let Some(row) = retained {
+                    next.insert(0, row);
+                    next.truncate(SESSION_CAP);
+                }
+            }
+        }
+        self.sessions = next;
         self.selected_session_index = self.selected_session_index.min(self.sessions.len());
         self.selected_session_detail = None;
+    }
+
+    /// OCEAN-311: give the picker a row for `session` (it may live beyond the
+    /// first `/v1/sessions` page, which is all `daemon_refresh_sessions`
+    /// fetches) and point the selection at it. Without a row, the position
+    /// lookup fails, `/resume` reports no selection, and the first picker
+    /// movement would re-scope away from the session the operator just
+    /// launched into. Dedups by id; injects at the front when missing.
+    fn select_session_row(&mut self, session: &SessionSummary) {
+        if !self.sessions.iter().any(|s| s.id == session.id) {
+            self.sessions.insert(0, session.clone());
+            self.sessions.truncate(SESSION_CAP);
+        }
+        if let Some(pos) = self.sessions.iter().position(|s| s.id == session.id) {
+            self.selected_session_index = pos + 1;
+        }
     }
 
     fn set_requests(&mut self, requests: Vec<RequestStatus>) {
@@ -1885,12 +1946,27 @@ impl DaemonClient {
         cwd: Option<&str>,
         all: bool,
     ) -> Result<SessionsResponse, String> {
+        self.sessions_page(base_url, cwd, all, None)
+    }
+
+    /// `GET /v1/sessions` with an optional pagination cursor (OCEAN-250):
+    /// replay the previous page's `next_cursor` to fetch the following page.
+    fn sessions_page(
+        &self,
+        base_url: &str,
+        cwd: Option<&str>,
+        all: bool,
+        cursor: Option<&str>,
+    ) -> Result<SessionsResponse, String> {
         let mut url = format!("{}/v1/sessions", base_url.trim_end_matches('/'));
         let mut qs: Vec<String> = Vec::new();
         if all {
             qs.push("all=1".to_string());
         } else if let Some(c) = cwd {
             qs.push(format!("cwd={}", urlencoding(c)));
+        }
+        if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
+            qs.push(format!("cursor={}", urlencoding(cursor)));
         }
         if !qs.is_empty() {
             url.push('?');
@@ -2279,7 +2355,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Mesh(mesh)) => run_mesh(mesh),
-        None => run_daemon(cli.url, cli.project),
+        None => run_daemon(cli.url, cli.project, cli.session),
     }
 }
 
@@ -2307,16 +2383,48 @@ fn resolve_project_root(cli_project: Option<&str>) -> PathBuf {
     }
 }
 
-fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
+fn run_daemon(url: String, project: Option<String>, session: Option<String>) -> anyhow::Result<()> {
     let client = DaemonClient::new()?;
-    let root = resolve_project_root(project.as_deref());
+    // OCEAN-311: resolve --session/OCEAN_SESSION against the daemon's session
+    // list BEFORE any terminal setup, so an unknown/ambiguous id fails loudly
+    // on stderr instead of opening the TUI on a fresh session.
+    let resumed = match session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(wanted) => Some(resolve_resume_session(&client, &url, wanted)?),
+        None => None,
+    };
+    // Explicit --project (or OCEAN_PROJECT) wins; otherwise adopt the resumed
+    // session's recorded workspace root so turns pass the daemon's cwd-binding
+    // guard (OCEAN-52) instead of being rejected as cross-workspace.
+    let root = match resumed
+        .as_ref()
+        .filter(|_| project.is_none())
+        .and_then(|s| s.workspace_root.as_deref())
+    {
+        Some(workspace_root) => PathBuf::from(workspace_root),
+        None => resolve_project_root(project.as_deref()),
+    };
     let (action_tx, action_rx) = mpsc::channel();
     let mut state = AppState::new(
         UiMode::Daemon(Box::new(DaemonApp::new(url, root))),
         action_tx.clone(),
     );
 
-    if let UiMode::Daemon(app) = &state.mode {
+    if let UiMode::Daemon(app) = &mut state.mode {
+        if let Some(resumed) = &resumed {
+            // Scope the agent SSE stream to the resumed session BEFORE the
+            // stream thread spawns: its first connect then carries
+            // `?session_id=<sid>&replay=1` and hydrates the pane from the
+            // daemon's replay buffer — the same OCEAN-305 machinery the
+            // in-app picker rides on a live session switch.
+            app.set_active_agent_session_id(Some(AgentSessionId::from(resumed.id)));
+            app.push_transcript(format!(
+                "Ocean: resuming session {} · {} turns · {}",
+                short_id(resumed.id),
+                resumed.turns,
+                compact_text(&resumed.title, 30)
+            ));
+            app.status = format!("resumed session {}", short_id(resumed.id));
+        }
         spawn_daemon_event_stream(app.url.clone(), action_tx.clone());
         // Share the active-session handle with the agent event stream so it
         // subscribes to /v1/agent/events?session_id=<id> once a session is
@@ -2341,6 +2449,19 @@ fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
     terminal.clear().context("clear terminal")?;
 
     daemon_refresh_all(&client, &mut state);
+
+    // OCEAN-311: point the in-app picker at the resumed session so the
+    // composer label and support-pane detail match the scoped stream —
+    // the same select-then-refresh-detail path the picker keys drive. The
+    // session may live beyond the first /v1/sessions page the refresh just
+    // fetched, so inject its (already resolved) row when missing rather
+    // than leaving the picker on the `new session` slot.
+    if let Some(resumed) = &resumed {
+        if let UiMode::Daemon(app) = &mut state.mode {
+            app.select_session_row(resumed);
+            daemon_refresh_selected_session_detail(&client, app);
+        }
+    }
 
     loop {
         while let Ok(action) = action_rx.try_recv() {
@@ -2375,6 +2496,181 @@ fn run_daemon(url: String, project: Option<String>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Upper bound on how many sessions the `--session` startup lookup will pull
+/// while paging `GET /v1/sessions`. An exact-id hit short-circuits earlier;
+/// only prefix matching needs the full set, so against a pathological daemon
+/// (endless `has_more`) the lookup stops here with a clear error instead of
+/// looping forever.
+const RESUME_SESSION_SCAN_CAP: usize = 4096;
+
+/// Fetch the daemon's session list and resolve a `--session <id>` launch
+/// argument against it (OCEAN-311). Lists across ALL workspaces — the whole
+/// point of the flag is resuming a session whose workspace differs from the
+/// launch cwd (the resolved root is then adopted from the session itself).
+/// `GET /v1/sessions` is bounded + paginated (OCEAN-250), so the lookup
+/// follows `next_cursor` until the list is exhausted — a session on a later
+/// page must NOT produce a false "not found".
+fn resolve_resume_session(
+    client: &DaemonClient,
+    url: &str,
+    wanted: &str,
+) -> anyhow::Result<SessionSummary> {
+    // A full session id needs no scan: hit `GET /v1/sessions/{id}` directly,
+    // so an exact resume works no matter how deep the session sits in
+    // history — the paged-scan cap below must never block a full id. A
+    // not-found here still falls through to the scan for its candidate
+    // listing in the error.
+    if let Ok(id) = wanted.trim().parse::<SessionId>() {
+        if let Ok(res) = client.session_detail(url, id) {
+            if res.ok {
+                if let Some(detail) = res.session {
+                    return Ok(summary_from_detail(detail));
+                }
+            }
+        }
+    }
+    resolve_session_paged(
+        |cursor| {
+            client
+                .sessions_page(url, None, true, cursor)
+                .map_err(|err| format!("failed to list daemon sessions: {err}"))
+        },
+        wanted,
+    )
+    .map_err(|err| anyhow::anyhow!("--session {wanted}: {err}"))
+}
+
+/// Project a full `SessionDetail` (the `GET /v1/sessions/{id}` shape) onto
+/// the `SessionSummary` the resume path carries — the by-id shortcut for full
+/// ids, where paging through history would be wasted work (and a scan cap
+/// must never make an exact id unresumable).
+fn summary_from_detail(detail: ocean_core::SessionDetail) -> SessionSummary {
+    SessionSummary {
+        id: detail.id,
+        model: detail.model,
+        turns: detail.turns,
+        title: detail.title,
+        workspace_root: detail.workspace_root,
+        git_branch: detail.git_branch,
+        updated_ms: Some(detail.updated_ms),
+    }
+}
+
+/// Pure pagination driver behind [`resolve_resume_session`]: pulls pages from
+/// `fetch_page` (a `?cursor=` replay per call), short-circuits on an exact id
+/// match (ids are unique — no later page can make it ambiguous), and otherwise
+/// accumulates every page so prefix matching sees the full set. Read-only.
+fn resolve_session_paged<F>(mut fetch_page: F, wanted: &str) -> Result<SessionSummary, String>
+where
+    F: FnMut(Option<&str>) -> Result<SessionsResponse, String>,
+{
+    let wanted_norm = wanted.trim().to_ascii_lowercase();
+    let mut sessions: Vec<SessionSummary> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = fetch_page(cursor.as_deref())?;
+        if !page.ok {
+            return Err(format!(
+                "daemon session list error: {}",
+                page.error.unwrap_or_default()
+            ));
+        }
+        if let Some(found) = page
+            .sessions
+            .iter()
+            .find(|s| s.id.to_string() == wanted_norm)
+        {
+            return Ok(found.clone());
+        }
+        sessions.extend(page.sessions);
+        if !page.has_more {
+            break;
+        }
+        if sessions.len() >= RESUME_SESSION_SCAN_CAP {
+            return Err(format!(
+                "session '{wanted}' not found in the first {RESUME_SESSION_SCAN_CAP} sessions and \
+                 the daemon reports more; pass the full session id"
+            ));
+        }
+        cursor = match page.next_cursor {
+            // A missing or stuck cursor alongside `has_more` would page the
+            // same sessions forever — bail instead of trusting a broken
+            // paginator.
+            Some(next) if cursor.as_deref() != Some(next.as_str()) => Some(next),
+            _ => {
+                return Err(format!(
+                    "session '{wanted}': daemon reported more sessions but returned no usable \
+                     pagination cursor"
+                ));
+            }
+        };
+    }
+    match_session_arg(&sessions, wanted).cloned()
+}
+
+/// Match a `--session` argument against the daemon's session list: exact id
+/// first, then unambiguous prefix (case-insensitive — uuids render lowercase).
+/// Ambiguous or missing ids are hard errors carrying the closest candidate
+/// ids + their workspaces, so the launcher can surface them. This NEVER falls
+/// through to creating a new session.
+fn match_session_arg<'a>(
+    sessions: &'a [SessionSummary],
+    wanted: &str,
+) -> Result<&'a SessionSummary, String> {
+    let wanted_norm = wanted.trim().to_ascii_lowercase();
+    if let Some(found) = sessions.iter().find(|s| s.id.to_string() == wanted_norm) {
+        return Ok(found);
+    }
+    let prefix_matches: Vec<&SessionSummary> = sessions
+        .iter()
+        .filter(|s| s.id.to_string().starts_with(&wanted_norm))
+        .collect();
+    match prefix_matches.as_slice() {
+        [only] => Ok(only),
+        [] => {
+            // Nothing matched: rank every session by shared prefix length so
+            // the error shows the closest ids, not arbitrary ones.
+            let mut ranked: Vec<&SessionSummary> = sessions.iter().collect();
+            ranked.sort_by_key(|s| {
+                std::cmp::Reverse(common_prefix_len(&s.id.to_string(), &wanted_norm))
+            });
+            Err(format!(
+                "session '{wanted}' not found on the daemon; closest sessions:\n{}",
+                session_candidate_lines(&ranked)
+            ))
+        }
+        _ => Err(format!(
+            "session id '{wanted}' is ambiguous ({} matches); candidates:\n{}",
+            prefix_matches.len(),
+            session_candidate_lines(&prefix_matches)
+        )),
+    }
+}
+
+/// Render candidate sessions for `--session` error messages: one
+/// `<id>  cwd: <workspace>` line each, capped at five.
+fn session_candidate_lines(candidates: &[&SessionSummary]) -> String {
+    if candidates.is_empty() {
+        return "  (the daemon has no sessions)".to_string();
+    }
+    candidates
+        .iter()
+        .take(5)
+        .map(|s| {
+            format!(
+                "  {}  cwd: {}",
+                s.id,
+                s.workspace_root.as_deref().unwrap_or("(unknown)")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 fn run_mesh(cli: MeshCli) -> anyhow::Result<()> {
@@ -3187,6 +3483,7 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
                             app.selected_session_index = slot;
                             app.selected_session_label()
                         };
+                        app.sync_active_session_to_picker();
                         app.status = format!("session target: {label}");
                         app.push_transcript(format!("Ocean: switched to session {label}"));
                         return;
@@ -7398,6 +7695,268 @@ mod tests {
         assert!(app.show_help);
     }
 
+    fn resume_session_fixture(id: &str, workspace_root: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::parse_str(id).expect("fixture uuid"),
+            model: "test-model".to_string(),
+            turns: 2,
+            title: format!("session {id}"),
+            workspace_root: workspace_root.map(str::to_string),
+            git_branch: None,
+            updated_ms: Some(0),
+        }
+    }
+
+    fn resume_session_fixtures() -> Vec<SessionSummary> {
+        vec![
+            resume_session_fixture(
+                "11111111-1111-4111-8111-111111111111",
+                Some("/tmp/ws-alpha"),
+            ),
+            resume_session_fixture(
+                "11111111-2222-4222-8222-222222222222",
+                Some("/tmp/ws-bravo"),
+            ),
+            resume_session_fixture("99999999-9999-4999-8999-999999999999", None),
+        ]
+    }
+
+    #[test]
+    fn match_session_arg_exact_id_wins() {
+        let sessions = resume_session_fixtures();
+        let found = match_session_arg(&sessions, "11111111-2222-4222-8222-222222222222")
+            .expect("exact id must resolve");
+        assert_eq!(found.id, sessions[1].id);
+
+        // Case-insensitive: uuids render lowercase, operators paste uppercase.
+        let found = match_session_arg(&sessions, "99999999-9999-4999-8999-999999999999")
+            .expect("exact id must resolve");
+        assert_eq!(found.id, sessions[2].id);
+        let upper = "99999999-9999-4999-8999-999999999999".to_ascii_uppercase();
+        let found = match_session_arg(&sessions, &upper).expect("uppercase exact id must resolve");
+        assert_eq!(found.id, sessions[2].id);
+    }
+
+    #[test]
+    fn match_session_arg_unambiguous_prefix_resolves() {
+        let sessions = resume_session_fixtures();
+        let found = match_session_arg(&sessions, "9999").expect("unique prefix must resolve");
+        assert_eq!(found.id, sessions[2].id);
+        let found = match_session_arg(&sessions, "11111111-2").expect("unique prefix must resolve");
+        assert_eq!(found.id, sessions[1].id);
+        // Uppercase prefix normalizes too.
+        let found = match_session_arg(&sessions, "9999").expect("prefix must resolve");
+        assert_eq!(found.id, sessions[2].id);
+    }
+
+    #[test]
+    fn match_session_arg_ambiguous_prefix_errors_with_candidates() {
+        let sessions = resume_session_fixtures();
+        let err = match_session_arg(&sessions, "11111111")
+            .expect_err("shared prefix must NOT silently pick a session");
+        assert!(err.contains("ambiguous"), "got: {err}");
+        assert!(err.contains("11111111-1111-4111-8111-111111111111"));
+        assert!(err.contains("11111111-2222-4222-8222-222222222222"));
+        assert!(err.contains("/tmp/ws-alpha"));
+        assert!(err.contains("/tmp/ws-bravo"));
+    }
+
+    #[test]
+    fn match_session_arg_missing_errors_with_closest_ids_and_cwds() {
+        let sessions = resume_session_fixtures();
+        let err = match_session_arg(&sessions, "1111ffff")
+            .expect_err("unknown id must NOT fall through to a new session");
+        assert!(err.contains("not found"), "got: {err}");
+        // Closest-first: both 1111… sessions share a 4-byte prefix with the
+        // query, the 9999… session shares none — all listed, closest on top.
+        let alpha = err
+            .find("11111111-1111-4111-8111-111111111111")
+            .expect("closest id listed");
+        let distant = err
+            .find("99999999-9999-4999-8999-999999999999")
+            .expect("distant id still listed");
+        assert!(alpha < distant, "closest id must rank first: {err}");
+        assert!(err.contains("cwd: /tmp/ws-alpha"));
+        assert!(err.contains("cwd: (unknown)"));
+    }
+
+    #[test]
+    fn match_session_arg_empty_session_list_errors() {
+        let err = match_session_arg(&[], "deadbeef").expect_err("no sessions to match");
+        assert!(err.contains("not found"), "got: {err}");
+        assert!(err.contains("no sessions"), "got: {err}");
+    }
+
+    /// Page server for `resolve_session_paged` tests: serves `pages` one per
+    /// call (cursor = next page index, as the daemon's opaque cursor), counts
+    /// fetches so tests can assert short-circuit vs exhaustion.
+    fn paged_fetcher(
+        pages: Vec<Vec<SessionSummary>>,
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+    ) -> impl FnMut(Option<&str>) -> Result<SessionsResponse, String> {
+        move |cursor| {
+            calls.set(calls.get() + 1);
+            let idx: usize = cursor.map_or(0, |c| c.parse().expect("test cursor"));
+            let total = pages.len();
+            Ok(SessionsResponse {
+                ok: true,
+                sessions: pages.get(idx).cloned().unwrap_or_default(),
+                error: None,
+                next_cursor: (idx + 1 < total).then(|| (idx + 1).to_string()),
+                has_more: idx + 1 < total,
+            })
+        }
+    }
+
+    #[test]
+    fn summary_from_detail_carries_resume_critical_fields() {
+        let id = SessionId::new_v4();
+        let detail = ocean_core::SessionDetail {
+            id,
+            created_ms: 1,
+            updated_ms: 42,
+            model: "m".into(),
+            provider: "p".into(),
+            turns: 7,
+            title: "t".into(),
+            state: ocean_core::SessionRunState::Stored,
+            resumable: true,
+            active_requests: vec![],
+            pending_permissions: vec![],
+            transcript: vec![],
+            tool_context: vec![],
+            messages: vec![],
+            workspace_root: Some("/repo".into()),
+            cwd: Some("/repo/sub".into()),
+            git_branch: Some("main".into()),
+            git_commit: None,
+            client_type: None,
+            owning_project: None,
+        };
+        let s = summary_from_detail(detail);
+        assert_eq!(s.id, id);
+        // workspace_root drives --session root adoption; losing it would
+        // break the daemon's cwd binding guard on the first turn.
+        assert_eq!(s.workspace_root.as_deref(), Some("/repo"));
+        assert_eq!(s.updated_ms, Some(42));
+        assert_eq!(s.turns, 7);
+    }
+
+    #[test]
+    fn resolve_session_paged_exact_match_on_later_page_resolves() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pages = vec![
+            vec![sessions[0].clone()],
+            vec![sessions[1].clone()],
+            vec![sessions[2].clone()],
+        ];
+        let found = resolve_session_paged(
+            paged_fetcher(pages, calls.clone()),
+            "11111111-2222-4222-8222-222222222222",
+        )
+        .expect("exact id on page 2 must resolve, not 404 after page 1");
+        assert_eq!(found.id, sessions[1].id);
+        // Exact ids are unique — must short-circuit without pulling page 3.
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn resolve_session_paged_prefix_unique_across_pages_resolves() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        // The only 9999… session sits on the last page.
+        let pages = vec![
+            vec![sessions[0].clone(), sessions[1].clone()],
+            vec![sessions[2].clone()],
+        ];
+        let found = resolve_session_paged(paged_fetcher(pages, calls.clone()), "9999")
+            .expect("prefix unique across the full set must resolve");
+        assert_eq!(found.id, sessions[2].id);
+        assert_eq!(calls.get(), 2, "prefix match needs every page");
+    }
+
+    #[test]
+    fn resolve_session_paged_prefix_ambiguous_across_pages_errors() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        // The two 11111111… sessions live on DIFFERENT pages — ambiguity is
+        // only visible once both pages are fetched.
+        let pages = vec![
+            vec![sessions[0].clone()],
+            vec![sessions[2].clone()],
+            vec![sessions[1].clone()],
+        ];
+        let err = resolve_session_paged(paged_fetcher(pages, calls.clone()), "11111111")
+            .expect_err("cross-page shared prefix must NOT silently pick a session");
+        assert!(err.contains("ambiguous"), "got: {err}");
+        assert!(err.contains("11111111-1111-4111-8111-111111111111"));
+        assert!(err.contains("11111111-2222-4222-8222-222222222222"));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn resolve_session_paged_missing_errors_only_after_exhausting_pages() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pages = vec![
+            vec![sessions[0].clone()],
+            vec![sessions[1].clone()],
+            vec![sessions[2].clone()],
+        ];
+        let err = resolve_session_paged(paged_fetcher(pages, calls.clone()), "deadbeef")
+            .expect_err("unknown id must not resolve");
+        assert!(err.contains("not found"), "got: {err}");
+        assert_eq!(
+            calls.get(),
+            3,
+            "must exhaust every page before declaring missing"
+        );
+        // Candidates from later pages still show up in the error.
+        assert!(err.contains("99999999-9999-4999-8999-999999999999"));
+    }
+
+    #[test]
+    fn resolve_session_paged_caps_pathological_pagination() {
+        // A broken daemon that always reports another page: full pages with an
+        // ever-advancing cursor. The scan must stop at the cap with a clear
+        // error instead of looping forever.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_in = calls.clone();
+        let err = resolve_session_paged(
+            move |cursor| {
+                calls_in.set(calls_in.get() + 1);
+                let idx: usize = cursor.map_or(0, |c| c.parse().expect("test cursor"));
+                let sessions = (0..512)
+                    .map(|_| {
+                        resume_session_fixture(
+                            &SessionId::new_v4().to_string(),
+                            Some("/tmp/ws-endless"),
+                        )
+                    })
+                    .collect();
+                Ok(SessionsResponse {
+                    ok: true,
+                    sessions,
+                    error: None,
+                    next_cursor: Some((idx + 1).to_string()),
+                    has_more: true,
+                })
+            },
+            "deadbeef",
+        )
+        .expect_err("endless pagination must hit the scan cap");
+        assert!(
+            err.contains("4096"),
+            "cap must be named in the error: {err}"
+        );
+        assert_eq!(
+            calls.get(),
+            RESUME_SESSION_SCAN_CAP / 512,
+            "must stop as soon as the cap is reached"
+        );
+    }
+
     #[test]
     fn agent_turn_event_parser_accepts_product_stream_event() {
         let turn_id = AgentTurnId::new_v4();
@@ -7779,6 +8338,149 @@ mod tests {
         assert_eq!(app.selected_session_id(), Some(session_id));
         app.cycle_session(-1);
         assert_eq!(app.selected_session_id(), None);
+    }
+
+    /// Builds an app in the post-`--session` startup state: session list
+    /// loaded, picker pointed at the first session, active agent session (and
+    /// the shared SSE scope handle) pinned to it — as `run_daemon` does.
+    fn app_with_startup_session() -> (DaemonApp, Vec<SessionSummary>) {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let sessions = resume_session_fixtures();
+        app.set_sessions(sessions.clone());
+        app.selected_session_index = 1;
+        app.set_active_agent_session_id(Some(AgentSessionId::from(sessions[0].id)));
+        (app, sessions)
+    }
+
+    #[test]
+    fn picker_switch_overrides_startup_session_scope() {
+        let (mut app, sessions) = app_with_startup_session();
+        assert_eq!(
+            app.selected_agent_session_id(),
+            Some(AgentSessionId::from(sessions[0].id))
+        );
+
+        // Operator picks the next session: submits must carry the NEW id,
+        // not stay pinned to the --session startup target...
+        app.cycle_session(1);
+        let expected = AgentSessionId::from(sessions[1].id);
+        assert_eq!(app.selected_agent_session_id(), Some(expected));
+        // ...and the shared handle the SSE thread reads must re-scope with it
+        // (the OCEAN-15/OCEAN-305 re-scope path keys off this handle).
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn picker_new_session_slot_clears_startup_session_scope() {
+        let (mut app, sessions) = app_with_startup_session();
+        assert_eq!(
+            app.selected_agent_session_id(),
+            Some(AgentSessionId::from(sessions[0].id))
+        );
+
+        // Cycling back to the `new session` slot must clear the pin: the next
+        // submit starts a fresh session instead of writing into the startup one.
+        app.cycle_session(-1);
+        assert_eq!(app.selected_session_id(), None);
+        assert_eq!(app.selected_agent_session_id(), None);
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_command_overrides_startup_session_scope() {
+        let (mut app, sessions) = app_with_startup_session();
+
+        // `/resume 2` is the slash-command flavor of the picker switch — same
+        // source-of-truth rule applies.
+        assert!(handle_slash_command(&mut app, "/resume 2"));
+        let expected = AgentSessionId::from(sessions[1].id);
+        assert_eq!(app.selected_agent_session_id(), Some(expected));
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            Some(expected)
+        );
+    }
+
+    /// Builds the post-startup state for a `--session` target that lives
+    /// BEYOND the first `/v1/sessions` page, in `run_daemon` order: active
+    /// session pinned first, then the startup refresh lands page 1 (which
+    /// does NOT contain the resumed session), then the picker row is
+    /// injected + selected.
+    fn app_with_off_page_resumed() -> (DaemonApp, Vec<SessionSummary>, SessionSummary) {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let sessions = resume_session_fixtures();
+        let resumed = sessions[2].clone();
+        app.set_active_agent_session_id(Some(AgentSessionId::from(resumed.id)));
+        app.set_sessions(vec![sessions[0].clone(), sessions[1].clone()]);
+        app.select_session_row(&resumed);
+        (app, sessions, resumed)
+    }
+
+    #[test]
+    fn resumed_session_off_first_page_gets_picker_row() {
+        let (mut app, _sessions, resumed) = app_with_off_page_resumed();
+
+        // The picker must show and select the resumed session, not sit on
+        // the `new session` slot just because page 1 didn't carry the row.
+        assert_eq!(app.selected_session_id(), Some(resumed.id));
+        assert_eq!(
+            app.selected_agent_session_id(),
+            Some(AgentSessionId::from(resumed.id))
+        );
+
+        // `/resume` with no args must report the resumed selection instead
+        // of "no session selected".
+        assert!(handle_slash_command(&mut app, "/resume"));
+        assert!(
+            app.status.contains("ready to resume"),
+            "got: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn first_picker_movement_does_not_rescope_away_from_off_page_resume() {
+        let (mut app, _sessions, resumed) = app_with_off_page_resumed();
+        let resumed_id = AgentSessionId::from(resumed.id);
+
+        // Movement starts anchored on the resumed row: down is the
+        // `new session` slot, back up lands on the resumed session again —
+        // never silently on an unrelated page-1 row.
+        app.cycle_session(-1);
+        assert_eq!(app.selected_agent_session_id(), None);
+        app.cycle_session(1);
+        assert_eq!(app.selected_agent_session_id(), Some(resumed_id));
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            Some(resumed_id)
+        );
+    }
+
+    #[test]
+    fn refresh_retains_active_off_page_session_row() {
+        let (mut app, sessions, resumed) = app_with_off_page_resumed();
+
+        // A periodic refresh re-fetches page 1 only — while the off-page
+        // session is active, its row must survive the refresh.
+        app.set_sessions(vec![sessions[0].clone(), sessions[1].clone()]);
+        assert!(
+            app.sessions.iter().any(|s| s.id == resumed.id),
+            "active off-page row must be retained across refreshes"
+        );
+
+        // Once the operator moves on, the next refresh may drop the row.
+        app.set_active_agent_session_id(Some(AgentSessionId::from(sessions[0].id)));
+        app.set_sessions(vec![sessions[0].clone(), sessions[1].clone()]);
+        assert!(
+            !app.sessions.iter().any(|s| s.id == resumed.id),
+            "row retention must end when the session is no longer active"
+        );
     }
 
     #[test]
