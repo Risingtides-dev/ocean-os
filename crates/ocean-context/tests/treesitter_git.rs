@@ -281,6 +281,25 @@ broken = = [
         "a tail unresolvable through HEAD must not report HELD"
     );
 
+    // Birth check (Codex round-3): an anchor that never resolved at its own
+    // anchor commit (misspelled symbol, unseedable baseline) must FAIL at the
+    // anchor — not read HELD because a same-named symbol shows up later in
+    // the walk with no baseline to compare against.
+    std::fs::write(root.join("Birth.toml"), "[workspace]\nresolver = \"2\"\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "b1: key never existed here"]);
+    let b1 = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("Birth.toml"), MEMBERS_V1).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "b2: same-named key appears later"]);
+    let birth_claims = vec![claim("b1", "Birth.toml", Some("workspace.members"), &b1)];
+    let birth_verdicts = replay(root, &birth_claims, &ts).unwrap();
+    assert_eq!(
+        birth_verdicts[0].first_fail_commit.as_deref(),
+        Some(b1.as_str()),
+        "a claim that was never true at its anchor must fail AT the anchor"
+    );
+
     // Rust mirror: a broken .rs blob is uncheckable, a clean one attests.
     std::fs::write(root.join("lib.rs"), "fn gate( ((((\n").unwrap();
     git(root, &["add", "."]);

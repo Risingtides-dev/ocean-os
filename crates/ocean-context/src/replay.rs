@@ -66,22 +66,28 @@ pub fn replay(
             }
         };
         verdict.commits_walked = commits.len();
-        if commits.is_empty() {
-            // Anchored at HEAD — nothing later to walk. Still check ONCE at
-            // the anchor commit itself: an uncheckable claim must not pass
-            // as silently held just because the walk was empty.
-            match check_at(resolver, claim, &claim.provenance.commit_sha) {
-                Step::Held => {}
-                Step::Unresolvable => verdict.unresolvable = true,
-                Step::Failed(r) => {
-                    verdict.first_fail_commit = Some(claim.provenance.commit_sha.clone());
-                    verdict.first_fail_resolution = Some(r);
-                }
+        // Birth check: a claim must be attestable at its OWN anchor commit.
+        // An anchor that never resolved at birth (misspelled symbol, file not
+        // yet committed when the handoff was written) must fail there — not
+        // read HELD because a same-named symbol appears later in the walk
+        // with no baseline to compare against. This also covers claims
+        // anchored at HEAD, where there is nothing later to walk at all.
+        let mut ends_unresolvable = false;
+        match check_at(resolver, claim, &claim.provenance.commit_sha) {
+            Step::Held => {}
+            Step::Unresolvable => ends_unresolvable = true,
+            Step::Failed(r) => {
+                verdict.first_fail_commit = Some(claim.provenance.commit_sha.clone());
+                verdict.first_fail_resolution = Some(r);
+                verdicts.push(verdict);
+                continue;
             }
+        }
+        if commits.is_empty() {
+            verdict.unresolvable = ends_unresolvable;
             verdicts.push(verdict);
             continue;
         }
-        let mut ends_unresolvable = false;
         for commit in &commits {
             match check_at(resolver, claim, commit) {
                 Step::Held => ends_unresolvable = false,
