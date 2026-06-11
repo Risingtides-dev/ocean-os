@@ -77,6 +77,85 @@ fn reverify_skips_anchorless_claims() {
 #[test]
 fn anchors_can_be_file_only() {
     // F5: the resolver path must not assume line numbers.
-    let a = Anchor { file: "src/real.rs".into(), symbol: None, lines: vec![], sig_hash: None };
+    let a = Anchor { file: Some("src/real.rs".into()), symbol: None, lines: vec![], sig_hash: None };
     assert!(a.lines.is_empty());
+}
+
+#[test]
+fn anchors_can_be_symbol_only() {
+    // F5 / schema friction #1: absence of a file anchor is typed, not an
+    // empty-string sentinel.
+    let a = Anchor { file: None, symbol: Some("workspace.members".into()), lines: vec![], sig_hash: None };
+    assert!(a.file.is_none());
+}
+
+/// Codex P2 round 2 on PR #205: with mixed anchors, an uncheckable sibling
+/// must never mask a dead anchor — checkable negative evidence outranks
+/// "can't check".
+#[test]
+fn reverify_dead_anchor_kills_claim_despite_unresolvable_sibling() {
+    let mut h = handoff_with(&["A claim anchored at src/gone.rs that vanished entirely."]);
+    h.claims[0].provenance.anchors.push(Anchor {
+        file: None,
+        symbol: Some("apply_input".into()),
+        lines: vec![],
+        sig_hash: None,
+    });
+
+    let dir = tempfile::tempdir().unwrap(); // empty repo: src/gone.rs is Dead
+    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
+
+    assert!(matches!(results[0].1, Resolution::Dead));
+    assert_eq!(h.claims[0].status, ClaimStatus::Dead);
+    assert_eq!(h.claims[0].history.last().unwrap().event, "killed");
+}
+
+/// The flip side, per the replay harness's any-resolves semantics: one
+/// RESOLVING anchor holds the claim even when a sibling is uncheckable —
+/// positive checkable evidence outranks "can't check" too.
+#[test]
+fn reverify_resolving_anchor_holds_claim_despite_unresolvable_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/real.rs"), "// here\n").unwrap();
+
+    let mut h = handoff_with(&["A live claim anchored at src/real.rs in this repo."]);
+    h.claims[0].provenance.anchors.push(Anchor {
+        file: None,
+        symbol: Some("apply_input".into()),
+        lines: vec![],
+        sig_hash: None,
+    });
+
+    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
+
+    assert!(matches!(results[0].1, Resolution::Resolves(_)));
+    assert_eq!(h.claims[0].status, ClaimStatus::Verified);
+    assert_eq!(h.claims[0].history.last().unwrap().event, "reverified");
+}
+
+#[test]
+fn reverify_marks_uncheckable_claims_unresolvable_not_dead() {
+    // Schema friction #2: a claim whose only anchor the resolver CANNOT check
+    // (symbol-only) must not be conflated with Stale/Dead.
+    let mut h = handoff_with(&["A live claim anchored at src/real.rs in this repo."]);
+    let mut sym = h.claims[0].clone();
+    sym.id = "c-sym".into();
+    sym.provenance.anchors =
+        vec![Anchor { file: None, symbol: Some("apply_input".into()), lines: vec![], sig_hash: None }];
+    h.claims.push(sym);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/real.rs"), "// here\n").unwrap();
+    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
+
+    assert_eq!(results.len(), 2);
+    assert!(matches!(results[1].1, Resolution::Unresolvable));
+    assert_eq!(h.claims[1].status, ClaimStatus::Reverify);
+    // History records the honest non-verdict — neither "reverified" nor "killed".
+    assert_eq!(h.claims[1].history.last().unwrap().event, "unresolvable");
 }

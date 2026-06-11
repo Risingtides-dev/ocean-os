@@ -17,8 +17,14 @@ pub struct ReplayVerdict {
     pub claim_text: String,
     pub anchor_commit: String,
     pub commits_walked: usize,
-    /// First commit (full sha) at which no anchor resolved. None = held to HEAD.
+    /// First commit (full sha) at which no anchor resolved. None = held to
+    /// HEAD. When the walk is empty (claim anchored at HEAD), this is the
+    /// anchor commit itself, checked once.
     pub first_fail_commit: Option<String>,
+    /// True when the resolver could not check ANY of the claim's anchors
+    /// (all `Resolution::Unresolvable`) — "cannot check" is a distinct
+    /// verdict, never a FAIL (schema friction #2).
+    pub unresolvable: bool,
     /// Set when the claim couldn't be replayed (no anchors, bad anchor commit).
     pub note: Option<String>,
 }
@@ -38,6 +44,7 @@ pub fn replay(
             anchor_commit: claim.provenance.commit_sha.clone(),
             commits_walked: 0,
             first_fail_commit: None,
+            unresolvable: false,
             note: None,
         };
         if claim.provenance.anchors.is_empty() {
@@ -54,20 +61,59 @@ pub fn replay(
             }
         };
         verdict.commits_walked = commits.len();
+        if commits.is_empty() {
+            // Anchored at HEAD — nothing later to walk. Still check ONCE at
+            // the anchor commit itself: an uncheckable claim must not pass
+            // as silently held just because the walk was empty.
+            match check_at(resolver, claim, &claim.provenance.commit_sha) {
+                Step::Held => {}
+                Step::Unresolvable => verdict.unresolvable = true,
+                Step::Failed => {
+                    verdict.first_fail_commit = Some(claim.provenance.commit_sha.clone());
+                }
+            }
+            verdicts.push(verdict);
+            continue;
+        }
         for commit in &commits {
-            let resolves = claim
-                .provenance
-                .anchors
-                .iter()
-                .any(|a| matches!(resolver.resolve(a, commit), Resolution::Resolves(_)));
-            if !resolves {
-                verdict.first_fail_commit = Some(commit.clone());
-                break;
+            match check_at(resolver, claim, commit) {
+                Step::Held => continue,
+                Step::Unresolvable => {
+                    verdict.unresolvable = true;
+                    break;
+                }
+                Step::Failed => {
+                    verdict.first_fail_commit = Some(commit.clone());
+                    break;
+                }
             }
         }
         verdicts.push(verdict);
     }
     Ok(verdicts)
+}
+
+/// Outcome of resolving one claim's anchors at one commit.
+enum Step {
+    /// At least one anchor resolves.
+    Held,
+    /// Every anchor is `Resolution::Unresolvable` — nothing this resolver can
+    /// check, an honest non-verdict, never a FAIL (schema friction #2).
+    Unresolvable,
+    /// No anchor resolves and at least one was checkable.
+    Failed,
+}
+
+fn check_at(resolver: &dyn Resolver, claim: &Claim, commit: &str) -> Step {
+    let resolutions: Vec<Resolution> =
+        claim.provenance.anchors.iter().map(|a| resolver.resolve(a, commit)).collect();
+    if resolutions.iter().any(|r| matches!(r, Resolution::Resolves(_))) {
+        Step::Held
+    } else if resolutions.iter().all(|r| matches!(r, Resolution::Unresolvable)) {
+        Step::Unresolvable
+    } else {
+        Step::Failed
+    }
 }
 
 fn rev_list(repo_root: &Path, from: &str) -> Result<Vec<String>> {

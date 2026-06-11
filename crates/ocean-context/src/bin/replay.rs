@@ -71,24 +71,38 @@ fn main() -> Result<()> {
     let resolver = FileExistsResolver { repo_root: args.repo.clone() };
     let verdicts = replay(&args.repo, &claims, &resolver)?;
 
-    let (mut held, mut failed, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut held, mut failed, mut skipped, mut unresolvable) = (0usize, 0usize, 0usize, 0usize);
     for v in &verdicts {
-        let fate = match (&v.first_fail_commit, &v.note) {
-            (_, Some(n)) => {
+        let fate = match (&v.first_fail_commit, v.unresolvable, &v.note) {
+            (_, _, Some(n)) => {
                 skipped += 1;
                 format!("SKIP  ({n})")
             }
-            (Some(c), _) => {
+            (_, true, _) => {
+                unresolvable += 1;
+                if v.commits_walked == 0 {
+                    "UNRESOLVABLE  (no later commits; unresolvable at anchor)".to_string()
+                } else {
+                    "UNRESOLVABLE  (no anchor this resolver can check)".to_string()
+                }
+            }
+            (Some(c), _, _) => {
                 failed += 1;
                 format!("FAIL @ {}", &c[..10.min(c.len())])
             }
-            (None, _) => {
+            (None, _, _) => {
                 held += 1;
-                format!("HELD  through {} commits", v.commits_walked)
+                if v.commits_walked == 0 {
+                    "HELD  at anchor (no later commits)".to_string()
+                } else {
+                    format!("HELD  through {} commits", v.commits_walked)
+                }
             }
         };
         println!("{:<5} {:<62} {fate}", v.claim_id, v.claim_text);
     }
-    eprintln!("\n{held} held, {failed} failed, {skipped} skipped — judge the FAILs against reality.");
+    eprintln!(
+        "\n{held} held, {failed} failed, {unresolvable} unresolvable, {skipped} skipped — judge the FAILs against reality."
+    );
     Ok(())
 }
