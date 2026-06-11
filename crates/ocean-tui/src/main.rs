@@ -801,9 +801,45 @@ impl DaemonApp {
     }
 
     fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
-        self.sessions = sessions.into_iter().take(SESSION_CAP).collect();
+        let mut next: Vec<SessionSummary> = sessions.into_iter().take(SESSION_CAP).collect();
+        // OCEAN-311: a resumed `--session` target can live beyond the first
+        // `/v1/sessions` page (OCEAN-250), and the periodic refresh only
+        // fetches page 1 — without this guard it would evict the active
+        // session's row and break the picker's hold on the very session the
+        // operator launched into. Retain the existing row while active.
+        if let Some(active) = self.active_agent_session_id {
+            let has_active = next.iter().any(|s| AgentSessionId::from(s.id) == active);
+            if !has_active {
+                let retained = self
+                    .sessions
+                    .iter()
+                    .find(|s| AgentSessionId::from(s.id) == active)
+                    .cloned();
+                if let Some(row) = retained {
+                    next.insert(0, row);
+                    next.truncate(SESSION_CAP);
+                }
+            }
+        }
+        self.sessions = next;
         self.selected_session_index = self.selected_session_index.min(self.sessions.len());
         self.selected_session_detail = None;
+    }
+
+    /// OCEAN-311: give the picker a row for `session` (it may live beyond the
+    /// first `/v1/sessions` page, which is all `daemon_refresh_sessions`
+    /// fetches) and point the selection at it. Without a row, the position
+    /// lookup fails, `/resume` reports no selection, and the first picker
+    /// movement would re-scope away from the session the operator just
+    /// launched into. Dedups by id; injects at the front when missing.
+    fn select_session_row(&mut self, session: &SessionSummary) {
+        if !self.sessions.iter().any(|s| s.id == session.id) {
+            self.sessions.insert(0, session.clone());
+            self.sessions.truncate(SESSION_CAP);
+        }
+        if let Some(pos) = self.sessions.iter().position(|s| s.id == session.id) {
+            self.selected_session_index = pos + 1;
+        }
     }
 
     fn set_requests(&mut self, requests: Vec<RequestStatus>) {
@@ -2416,13 +2452,14 @@ fn run_daemon(url: String, project: Option<String>, session: Option<String>) -> 
 
     // OCEAN-311: point the in-app picker at the resumed session so the
     // composer label and support-pane detail match the scoped stream —
-    // the same select-then-refresh-detail path the picker keys drive.
+    // the same select-then-refresh-detail path the picker keys drive. The
+    // session may live beyond the first /v1/sessions page the refresh just
+    // fetched, so inject its (already resolved) row when missing rather
+    // than leaving the picker on the `new session` slot.
     if let Some(resumed) = &resumed {
         if let UiMode::Daemon(app) = &mut state.mode {
-            if let Some(pos) = app.sessions.iter().position(|s| s.id == resumed.id) {
-                app.selected_session_index = pos + 1;
-                daemon_refresh_selected_session_detail(&client, app);
-            }
+            app.select_session_row(resumed);
+            daemon_refresh_selected_session_detail(&client, app);
         }
     }
 
@@ -8303,6 +8340,82 @@ mod tests {
         assert_eq!(
             *app.scoped_agent_session_id.lock().expect("scope handle"),
             Some(expected)
+        );
+    }
+
+    /// Builds the post-startup state for a `--session` target that lives
+    /// BEYOND the first `/v1/sessions` page, in `run_daemon` order: active
+    /// session pinned first, then the startup refresh lands page 1 (which
+    /// does NOT contain the resumed session), then the picker row is
+    /// injected + selected.
+    fn app_with_off_page_resumed() -> (DaemonApp, Vec<SessionSummary>, SessionSummary) {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let sessions = resume_session_fixtures();
+        let resumed = sessions[2].clone();
+        app.set_active_agent_session_id(Some(AgentSessionId::from(resumed.id)));
+        app.set_sessions(vec![sessions[0].clone(), sessions[1].clone()]);
+        app.select_session_row(&resumed);
+        (app, sessions, resumed)
+    }
+
+    #[test]
+    fn resumed_session_off_first_page_gets_picker_row() {
+        let (mut app, _sessions, resumed) = app_with_off_page_resumed();
+
+        // The picker must show and select the resumed session, not sit on
+        // the `new session` slot just because page 1 didn't carry the row.
+        assert_eq!(app.selected_session_id(), Some(resumed.id));
+        assert_eq!(
+            app.selected_agent_session_id(),
+            Some(AgentSessionId::from(resumed.id))
+        );
+
+        // `/resume` with no args must report the resumed selection instead
+        // of "no session selected".
+        assert!(handle_slash_command(&mut app, "/resume"));
+        assert!(
+            app.status.contains("ready to resume"),
+            "got: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn first_picker_movement_does_not_rescope_away_from_off_page_resume() {
+        let (mut app, _sessions, resumed) = app_with_off_page_resumed();
+        let resumed_id = AgentSessionId::from(resumed.id);
+
+        // Movement starts anchored on the resumed row: down is the
+        // `new session` slot, back up lands on the resumed session again —
+        // never silently on an unrelated page-1 row.
+        app.cycle_session(-1);
+        assert_eq!(app.selected_agent_session_id(), None);
+        app.cycle_session(1);
+        assert_eq!(app.selected_agent_session_id(), Some(resumed_id));
+        assert_eq!(
+            *app.scoped_agent_session_id.lock().expect("scope handle"),
+            Some(resumed_id)
+        );
+    }
+
+    #[test]
+    fn refresh_retains_active_off_page_session_row() {
+        let (mut app, sessions, resumed) = app_with_off_page_resumed();
+
+        // A periodic refresh re-fetches page 1 only — while the off-page
+        // session is active, its row must survive the refresh.
+        app.set_sessions(vec![sessions[0].clone(), sessions[1].clone()]);
+        assert!(
+            app.sessions.iter().any(|s| s.id == resumed.id),
+            "active off-page row must be retained across refreshes"
+        );
+
+        // Once the operator moves on, the next refresh may drop the row.
+        app.set_active_agent_session_id(Some(AgentSessionId::from(sessions[0].id)));
+        app.set_sessions(vec![sessions[0].clone(), sessions[1].clone()]);
+        assert!(
+            !app.sessions.iter().any(|s| s.id == resumed.id),
+            "row retention must end when the session is no longer active"
         );
     }
 
