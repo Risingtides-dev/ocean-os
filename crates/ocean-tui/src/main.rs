@@ -239,6 +239,12 @@ struct SessionsResponse {
     sessions: Vec<SessionSummary>,
     #[serde(default)]
     error: Option<String>,
+    /// Pagination cursor (OCEAN-250): replay as `?cursor=` for the next page.
+    #[serde(default)]
+    next_cursor: Option<String>,
+    /// True when at least one more session exists beyond this page (OCEAN-250).
+    #[serde(default)]
+    has_more: bool,
 }
 
 #[derive(Debug)]
@@ -1893,12 +1899,27 @@ impl DaemonClient {
         cwd: Option<&str>,
         all: bool,
     ) -> Result<SessionsResponse, String> {
+        self.sessions_page(base_url, cwd, all, None)
+    }
+
+    /// `GET /v1/sessions` with an optional pagination cursor (OCEAN-250):
+    /// replay the previous page's `next_cursor` to fetch the following page.
+    fn sessions_page(
+        &self,
+        base_url: &str,
+        cwd: Option<&str>,
+        all: bool,
+        cursor: Option<&str>,
+    ) -> Result<SessionsResponse, String> {
         let mut url = format!("{}/v1/sessions", base_url.trim_end_matches('/'));
         let mut qs: Vec<String> = Vec::new();
         if all {
             qs.push("all=1".to_string());
         } else if let Some(c) = cwd {
             qs.push(format!("cwd={}", urlencoding(c)));
+        }
+        if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
+            qs.push(format!("cursor={}", urlencoding(cursor)));
         }
         if !qs.is_empty() {
             url.push('?');
@@ -2429,27 +2450,86 @@ fn run_daemon(url: String, project: Option<String>, session: Option<String>) -> 
     Ok(())
 }
 
-/// Fetch the daemon's full session list and resolve a `--session <id>` launch
+/// Upper bound on how many sessions the `--session` startup lookup will pull
+/// while paging `GET /v1/sessions`. An exact-id hit short-circuits earlier;
+/// only prefix matching needs the full set, so against a pathological daemon
+/// (endless `has_more`) the lookup stops here with a clear error instead of
+/// looping forever.
+const RESUME_SESSION_SCAN_CAP: usize = 4096;
+
+/// Fetch the daemon's session list and resolve a `--session <id>` launch
 /// argument against it (OCEAN-311). Lists across ALL workspaces — the whole
 /// point of the flag is resuming a session whose workspace differs from the
 /// launch cwd (the resolved root is then adopted from the session itself).
+/// `GET /v1/sessions` is bounded + paginated (OCEAN-250), so the lookup
+/// follows `next_cursor` until the list is exhausted — a session on a later
+/// page must NOT produce a false "not found".
 fn resolve_resume_session(
     client: &DaemonClient,
     url: &str,
     wanted: &str,
 ) -> anyhow::Result<SessionSummary> {
-    let res = client.sessions(url, None, true).map_err(|err| {
-        anyhow::anyhow!("--session {wanted}: failed to list daemon sessions: {err}")
-    })?;
-    if !res.ok {
-        anyhow::bail!(
-            "--session {wanted}: daemon session list error: {}",
-            res.error.unwrap_or_default()
-        );
+    resolve_session_paged(
+        |cursor| {
+            client
+                .sessions_page(url, None, true, cursor)
+                .map_err(|err| format!("failed to list daemon sessions: {err}"))
+        },
+        wanted,
+    )
+    .map_err(|err| anyhow::anyhow!("--session {wanted}: {err}"))
+}
+
+/// Pure pagination driver behind [`resolve_resume_session`]: pulls pages from
+/// `fetch_page` (a `?cursor=` replay per call), short-circuits on an exact id
+/// match (ids are unique — no later page can make it ambiguous), and otherwise
+/// accumulates every page so prefix matching sees the full set. Read-only.
+fn resolve_session_paged<F>(mut fetch_page: F, wanted: &str) -> Result<SessionSummary, String>
+where
+    F: FnMut(Option<&str>) -> Result<SessionsResponse, String>,
+{
+    let wanted_norm = wanted.trim().to_ascii_lowercase();
+    let mut sessions: Vec<SessionSummary> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = fetch_page(cursor.as_deref())?;
+        if !page.ok {
+            return Err(format!(
+                "daemon session list error: {}",
+                page.error.unwrap_or_default()
+            ));
+        }
+        if let Some(found) = page
+            .sessions
+            .iter()
+            .find(|s| s.id.to_string() == wanted_norm)
+        {
+            return Ok(found.clone());
+        }
+        sessions.extend(page.sessions);
+        if !page.has_more {
+            break;
+        }
+        if sessions.len() >= RESUME_SESSION_SCAN_CAP {
+            return Err(format!(
+                "session '{wanted}' not found in the first {RESUME_SESSION_SCAN_CAP} sessions and \
+                 the daemon reports more; pass the full session id"
+            ));
+        }
+        cursor = match page.next_cursor {
+            // A missing or stuck cursor alongside `has_more` would page the
+            // same sessions forever — bail instead of trusting a broken
+            // paginator.
+            Some(next) if cursor.as_deref() != Some(next.as_str()) => Some(next),
+            _ => {
+                return Err(format!(
+                    "session '{wanted}': daemon reported more sessions but returned no usable \
+                     pagination cursor"
+                ));
+            }
+        };
     }
-    match_session_arg(&res.sessions, wanted)
-        .cloned()
-        .map_err(|err| anyhow::anyhow!(err))
+    match_session_arg(&sessions, wanted).cloned()
 }
 
 /// Match a `--session` argument against the daemon's session list: exact id
@@ -7626,6 +7706,142 @@ mod tests {
         let err = match_session_arg(&[], "deadbeef").expect_err("no sessions to match");
         assert!(err.contains("not found"), "got: {err}");
         assert!(err.contains("no sessions"), "got: {err}");
+    }
+
+    /// Page server for `resolve_session_paged` tests: serves `pages` one per
+    /// call (cursor = next page index, as the daemon's opaque cursor), counts
+    /// fetches so tests can assert short-circuit vs exhaustion.
+    fn paged_fetcher(
+        pages: Vec<Vec<SessionSummary>>,
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+    ) -> impl FnMut(Option<&str>) -> Result<SessionsResponse, String> {
+        move |cursor| {
+            calls.set(calls.get() + 1);
+            let idx: usize = cursor.map_or(0, |c| c.parse().expect("test cursor"));
+            let total = pages.len();
+            Ok(SessionsResponse {
+                ok: true,
+                sessions: pages.get(idx).cloned().unwrap_or_default(),
+                error: None,
+                next_cursor: (idx + 1 < total).then(|| (idx + 1).to_string()),
+                has_more: idx + 1 < total,
+            })
+        }
+    }
+
+    #[test]
+    fn resolve_session_paged_exact_match_on_later_page_resolves() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pages = vec![
+            vec![sessions[0].clone()],
+            vec![sessions[1].clone()],
+            vec![sessions[2].clone()],
+        ];
+        let found = resolve_session_paged(
+            paged_fetcher(pages, calls.clone()),
+            "11111111-2222-4222-8222-222222222222",
+        )
+        .expect("exact id on page 2 must resolve, not 404 after page 1");
+        assert_eq!(found.id, sessions[1].id);
+        // Exact ids are unique — must short-circuit without pulling page 3.
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn resolve_session_paged_prefix_unique_across_pages_resolves() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        // The only 9999… session sits on the last page.
+        let pages = vec![
+            vec![sessions[0].clone(), sessions[1].clone()],
+            vec![sessions[2].clone()],
+        ];
+        let found = resolve_session_paged(paged_fetcher(pages, calls.clone()), "9999")
+            .expect("prefix unique across the full set must resolve");
+        assert_eq!(found.id, sessions[2].id);
+        assert_eq!(calls.get(), 2, "prefix match needs every page");
+    }
+
+    #[test]
+    fn resolve_session_paged_prefix_ambiguous_across_pages_errors() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        // The two 11111111… sessions live on DIFFERENT pages — ambiguity is
+        // only visible once both pages are fetched.
+        let pages = vec![
+            vec![sessions[0].clone()],
+            vec![sessions[2].clone()],
+            vec![sessions[1].clone()],
+        ];
+        let err = resolve_session_paged(paged_fetcher(pages, calls.clone()), "11111111")
+            .expect_err("cross-page shared prefix must NOT silently pick a session");
+        assert!(err.contains("ambiguous"), "got: {err}");
+        assert!(err.contains("11111111-1111-4111-8111-111111111111"));
+        assert!(err.contains("11111111-2222-4222-8222-222222222222"));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn resolve_session_paged_missing_errors_only_after_exhausting_pages() {
+        let sessions = resume_session_fixtures();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pages = vec![
+            vec![sessions[0].clone()],
+            vec![sessions[1].clone()],
+            vec![sessions[2].clone()],
+        ];
+        let err = resolve_session_paged(paged_fetcher(pages, calls.clone()), "deadbeef")
+            .expect_err("unknown id must not resolve");
+        assert!(err.contains("not found"), "got: {err}");
+        assert_eq!(
+            calls.get(),
+            3,
+            "must exhaust every page before declaring missing"
+        );
+        // Candidates from later pages still show up in the error.
+        assert!(err.contains("99999999-9999-4999-8999-999999999999"));
+    }
+
+    #[test]
+    fn resolve_session_paged_caps_pathological_pagination() {
+        // A broken daemon that always reports another page: full pages with an
+        // ever-advancing cursor. The scan must stop at the cap with a clear
+        // error instead of looping forever.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_in = calls.clone();
+        let err = resolve_session_paged(
+            move |cursor| {
+                calls_in.set(calls_in.get() + 1);
+                let idx: usize = cursor.map_or(0, |c| c.parse().expect("test cursor"));
+                let sessions = (0..512)
+                    .map(|_| {
+                        resume_session_fixture(
+                            &SessionId::new_v4().to_string(),
+                            Some("/tmp/ws-endless"),
+                        )
+                    })
+                    .collect();
+                Ok(SessionsResponse {
+                    ok: true,
+                    sessions,
+                    error: None,
+                    next_cursor: Some((idx + 1).to_string()),
+                    has_more: true,
+                })
+            },
+            "deadbeef",
+        )
+        .expect_err("endless pagination must hit the scan cap");
+        assert!(
+            err.contains("4096"),
+            "cap must be named in the error: {err}"
+        );
+        assert_eq!(
+            calls.get(),
+            RESUME_SESSION_SCAN_CAP / 512,
+            "must stop as soon as the cap is reached"
+        );
     }
 
     #[test]
