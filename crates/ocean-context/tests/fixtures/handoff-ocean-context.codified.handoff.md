@@ -9,7 +9,9 @@ written_at = 1780980000
 [velocity_at_write]
 v_code = 0.0
 v_sem = 0.0
++++
 
+```toml ocean-context-claims
 [[claims]]
 id = "c1"
 text = "ocean-context is a NEW crate to be added at crates/ocean-context in the ocean-os workspace; it does not exist yet."
@@ -18,6 +20,7 @@ knowledge_tier = "Individual"
 confidence = 1.0
 
 [claims.provenance]
+tickets = []
 commit_sha = "d9a9bc9"
 
 [[claims.provenance.anchors]]
@@ -38,6 +41,7 @@ knowledge_tier = "Common"
 confidence = 1.0
 
 [claims.provenance]
+tickets = []
 commit_sha = "d9a9bc9"
 
 [[claims.provenance.anchors]]
@@ -54,9 +58,10 @@ id = "c4"
 text = "Schema validated against reality: regex anchor extraction pulled 51 real anchored claims from 2 root HANDOFF.md docs."
 status = "Verified"
 knowledge_tier = "Individual"
-confidence = 0.85
+confidence = 0.8500000238418579
 
 [claims.provenance]
+tickets = []
 commit_sha = "d9a9bc9"
 
 [[claims.provenance.anchors]]
@@ -76,6 +81,7 @@ knowledge_tier = "Common"
 confidence = 1.0
 
 [claims.provenance]
+tickets = []
 commit_sha = "d9a9bc9"
 
 [[claims.provenance.anchors]]
@@ -93,9 +99,10 @@ id = "c7"
 text = "The 80 worktree HANDOFF.md files are byte-identical (one md5) — NOT 80 distinct handoffs. The real distinct corpus is 2 root docs. Do not treat worktree handoffs as data."
 status = "Verified"
 knowledge_tier = "Individual"
-confidence = 0.9
+confidence = 0.8999999761581421
 
 [claims.provenance]
+tickets = []
 commit_sha = "d9a9bc9"
 
 [[claims.provenance.anchors]]
@@ -106,7 +113,7 @@ lines = []
 at = 1780980000
 event = "written"
 by_session = "brainstorm-2026-06-09-ocean-context"
-+++
+```
 
 Codified subset of docs/specs/HANDOFF-ocean-context.md (claims c1, c2, c4, c5, c7),
 used as the acceptance-4 replay input: walk ocean-os history forward from d9a9bc9

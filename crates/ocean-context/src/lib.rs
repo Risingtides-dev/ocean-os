@@ -32,7 +32,7 @@ pub fn read_freshest(dir: &Path, repo: &str, branch: &str, now: i64) -> Result<O
         return Ok(None);
     };
     let trust = ConfidenceRecencyTrust::default();
-    let ctx = TrustContext { now };
+    let ctx = TrustContext { now, handoff_written_at: h.written_at };
     h.claims.sort_by(|a, b| trust.trust(b, &ctx).total_cmp(&trust.trust(a, &ctx)));
     Ok(Some(h))
 }
@@ -47,11 +47,15 @@ pub fn reverify(
     now: i64,
     by_session: &str,
 ) -> Vec<(String, Resolution)> {
+    // Most-alive-first; Unresolvable outranks Dead because "can't check" is
+    // not evidence of removal (schema friction #2), but ranks below Stale,
+    // which at least attests the anchor was checkable.
     fn rank(r: Resolution) -> u8 {
         match r {
-            Resolution::Resolves(_) => 3,
-            Resolution::Renamed => 2,
-            Resolution::Stale => 1,
+            Resolution::Resolves(_) => 4,
+            Resolution::Renamed => 3,
+            Resolution::Stale => 2,
+            Resolution::Unresolvable => 1,
             Resolution::Dead => 0,
         }
     }
@@ -71,12 +75,18 @@ pub fn reverify(
             Resolution::Resolves(_) => ClaimStatus::Verified,
             Resolution::Renamed => ClaimStatus::Reverify,
             Resolution::Stale => ClaimStatus::Stale,
+            // No anchor this resolver can check: flag for attention — the
+            // machine neither confirmed nor refuted anything.
+            Resolution::Unresolvable => ClaimStatus::Reverify,
             Resolution::Dead => ClaimStatus::Dead,
         };
-        // Spec event vocabulary: "reverified" when the claim still stands in
-        // some form, "killed" when its anchors are gone.
+        // Event vocabulary: "reverified" when the claim still stands in some
+        // form, "killed" when its anchors are gone, "unresolvable" when the
+        // resolver could not check it (an honest non-verdict; never recorded
+        // as a reverification).
         let event = match best {
             Resolution::Dead => "killed".to_string(),
+            Resolution::Unresolvable => "unresolvable".to_string(),
             _ => "reverified".to_string(),
         };
         claim.history.push(ClaimEvent { at: now, event, by_session: by_session.to_string() });

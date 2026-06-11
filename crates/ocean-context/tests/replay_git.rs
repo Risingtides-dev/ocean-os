@@ -1,3 +1,4 @@
+use ocean_context::claim::Anchor;
 use ocean_context::extract::{extract_claims, ExtractCtx};
 use ocean_context::replay::replay;
 use ocean_context::seams::FileExistsResolver;
@@ -53,6 +54,42 @@ fn replay_finds_the_commit_where_an_anchor_dies() {
     // b.rs survives the whole walk
     assert_eq!(verdicts[1].first_fail_commit, None);
     assert_eq!(verdicts[1].commits_walked, 2); // c2 and c3
+}
+
+/// Schema friction #2 in the harness: a claim whose anchors the resolver
+/// cannot check (symbol-only, untracked/escape paths) is UNRESOLVABLE, not a
+/// FAIL — "can't check" must never read as "anchor died here".
+#[test]
+fn replay_marks_uncheckable_claims_unresolvable_not_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c2"]);
+
+    let ctx = ExtractCtx { commit_sha: &c1, now: 0, by_session: "replay-test" };
+    let mut claims = extract_claims("A checkable claim about a.rs that holds fine.", &ctx);
+    assert_eq!(claims.len(), 1);
+    let mut symbol_only = claims[0].clone();
+    symbol_only.id = "c-sym".into();
+    symbol_only.provenance.anchors =
+        vec![Anchor { file: None, symbol: Some("a".into()), lines: vec![], sig_hash: None }];
+    claims.push(symbol_only);
+
+    let resolver = FileExistsResolver { repo_root: root.to_path_buf() };
+    let verdicts = replay(root, &claims, &resolver).unwrap();
+    assert_eq!(verdicts.len(), 2);
+    // checkable claim held, untouched by the unresolvable arm
+    assert!(!verdicts[0].unresolvable);
+    assert_eq!(verdicts[0].first_fail_commit, None);
+    // symbol-only claim: unresolvable, NOT failed
+    assert!(verdicts[1].unresolvable);
+    assert_eq!(verdicts[1].first_fail_commit, None);
 }
 
 #[test]

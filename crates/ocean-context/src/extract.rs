@@ -58,6 +58,7 @@ pub fn extract_claims(text: &str, ctx: &ExtractCtx) -> Vec<Claim> {
             continue;
         }
         let mut anchors = Vec::new();
+        let mut anchor_spans: Vec<(usize, usize)> = Vec::new();
         for cap in anchor_re().captures_iter(l) {
             let mut lines = Vec::new();
             if let Some(ls) = cap.get(2) {
@@ -76,24 +77,34 @@ pub fn extract_claims(text: &str, ctx: &ExtractCtx) -> Vec<Claim> {
                     }
                 }
             }
-            anchors.push(Anchor { file: cap[1].to_string(), symbol: None, lines, sig_hash: None });
+            let whole = cap.get(0).expect("capture 0");
+            anchor_spans.push((whole.start(), whole.end()));
+            anchors.push(Anchor {
+                file: Some(cap[1].to_string()),
+                symbol: None,
+                lines,
+                sig_hash: None,
+            });
         }
         if anchors.is_empty() {
             continue; // pass-1: only structurally-anchored claims
         }
-        // v1 heuristic: pair the i-th backticked symbol with the i-th anchor.
-        let symbols: Vec<String> =
-            symbol_re().captures_iter(l).map(|c| c[1].to_string()).take(6).collect();
-        for (anchor, sym) in anchors.iter_mut().zip(symbols.iter()) {
-            anchor.symbol = Some(sym.clone());
+        pair_symbols(l, &mut anchors, &anchor_spans);
+        // A line can carry several tickets — keep them all, first-seen order,
+        // deduped (schema friction #3).
+        let mut tickets: Vec<String> = Vec::new();
+        for cap in ticket_re().captures_iter(l) {
+            let t = cap[1].to_string();
+            if !tickets.contains(&t) {
+                tickets.push(t);
+            }
         }
-        let ticket = ticket_re().captures(l).map(|c| c[1].to_string());
         // F3: confidence is DERIVED from anchor richness, never free-typed.
         let confidence = Claim::derive_confidence(&anchors, in_verified);
         claims.push(Claim {
             id: format!("c{}", claims.len() + 1),
             text: l.chars().take(280).collect(),
-            provenance: Provenance { anchors, ticket, commit_sha: ctx.commit_sha.to_string() },
+            provenance: Provenance { anchors, tickets, commit_sha: ctx.commit_sha.to_string() },
             status: if in_verified { ClaimStatus::Verified } else { ClaimStatus::Asserted },
             knowledge_tier: KnowledgeTier::Individual,
             ps_anchor: None,
@@ -107,4 +118,41 @@ pub fn extract_claims(text: &str, ctx: &ExtractCtx) -> Vec<Claim> {
         });
     }
     claims
+}
+
+/// Pair backticked symbols with anchors by PROXIMITY in the source line, not
+/// by blind index-zipping (schema friction #4: zip-pairing mispairs as soon as
+/// symbol and anchor counts diverge — e.g. `nav.rs` + `input.rs` with five
+/// symbols). Each symbol attaches to the nearest anchor span; when several
+/// symbols compete for one anchor, the closest wins; anchors with no nearby
+/// symbol stay symbol-less. Caps at 6 symbols like the prototype's
+/// claim-level list.
+fn pair_symbols(line: &str, anchors: &mut [Anchor], anchor_spans: &[(usize, usize)]) {
+    debug_assert_eq!(anchors.len(), anchor_spans.len());
+    // Gap between two half-open spans; 0 when they overlap.
+    let gap = |a: (usize, usize), b: (usize, usize)| -> usize {
+        if a.1 <= b.0 {
+            b.0 - a.1
+        } else {
+            a.0.saturating_sub(b.1)
+        }
+    };
+    // distance of the symbol currently held by each anchor
+    let mut held: Vec<Option<usize>> = vec![None; anchors.len()];
+    for cap in symbol_re().captures_iter(line).take(6) {
+        let whole = cap.get(0).expect("capture 0");
+        let span = (whole.start(), whole.end());
+        let Some((idx, dist)) = anchor_spans
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| (i, gap(span, a)))
+            .min_by_key(|&(_, d)| d)
+        else {
+            return; // no anchors (callers guarantee otherwise)
+        };
+        if held[idx].map_or(true, |d| dist < d) {
+            held[idx] = Some(dist);
+            anchors[idx].symbol = Some(cap[1].to_string());
+        }
+    }
 }

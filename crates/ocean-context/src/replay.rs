@@ -19,6 +19,10 @@ pub struct ReplayVerdict {
     pub commits_walked: usize,
     /// First commit (full sha) at which no anchor resolved. None = held to HEAD.
     pub first_fail_commit: Option<String>,
+    /// True when the resolver could not check ANY of the claim's anchors
+    /// (all `Resolution::Unresolvable`) — "cannot check" is a distinct
+    /// verdict, never a FAIL (schema friction #2).
+    pub unresolvable: bool,
     /// Set when the claim couldn't be replayed (no anchors, bad anchor commit).
     pub note: Option<String>,
 }
@@ -38,6 +42,7 @@ pub fn replay(
             anchor_commit: claim.provenance.commit_sha.clone(),
             commits_walked: 0,
             first_fail_commit: None,
+            unresolvable: false,
             note: None,
         };
         if claim.provenance.anchors.is_empty() {
@@ -55,15 +60,23 @@ pub fn replay(
         };
         verdict.commits_walked = commits.len();
         for commit in &commits {
-            let resolves = claim
+            let resolutions: Vec<Resolution> = claim
                 .provenance
                 .anchors
                 .iter()
-                .any(|a| matches!(resolver.resolve(a, commit), Resolution::Resolves(_)));
-            if !resolves {
-                verdict.first_fail_commit = Some(commit.clone());
-                break;
+                .map(|a| resolver.resolve(a, commit))
+                .collect();
+            if resolutions.iter().any(|r| matches!(r, Resolution::Resolves(_))) {
+                continue; // held at this commit
             }
+            if resolutions.iter().all(|r| matches!(r, Resolution::Unresolvable)) {
+                // Nothing this resolver can check — an honest non-verdict,
+                // not a FAIL (schema friction #2).
+                verdict.unresolvable = true;
+            } else {
+                verdict.first_fail_commit = Some(commit.clone());
+            }
+            break;
         }
         verdicts.push(verdict);
     }

@@ -69,13 +69,39 @@ impl Claim {
 pub struct Provenance {
     /// What reverification re-resolves.
     pub anchors: Vec<Anchor>,
-    pub ticket: Option<String>,
+    /// A line can carry several tickets (schema friction #3). Old handoffs
+    /// stored a single optional `ticket`; the alias + compat deserializer
+    /// still accept that shape.
+    #[serde(alias = "ticket", default, deserialize_with = "tickets_compat")]
+    pub tickets: Vec<String>,
     pub commit_sha: String,
+}
+
+/// Accept the legacy singular `ticket` (string or null) as well as the
+/// current `tickets` list, so handoffs stored before the schema-friction
+/// round still parse.
+fn tickets_compat<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Compat {
+        Many(Vec<String>),
+        One(String),
+    }
+    Ok(match Option::<Compat>::deserialize(de)? {
+        Some(Compat::Many(v)) => v,
+        Some(Compat::One(s)) => vec![s],
+        None => Vec::new(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Anchor {
-    pub file: String,
+    /// `None` for symbol-only anchors (handoff finding F5) — there is no
+    /// empty-string sentinel; absence is typed (schema friction #1).
+    pub file: Option<String>,
     pub symbol: Option<String>,
     /// May be empty — symbol-only and file-only anchors are common (handoff finding F5).
     pub lines: Vec<u32>,
@@ -145,12 +171,12 @@ pub(crate) mod tests {
                 text: "mutators implement requires_permission".into(),
                 provenance: Provenance {
                     anchors: vec![Anchor {
-                        file: "crates/ocean-runtime/src/tools/browser/input.rs".into(),
+                        file: Some("crates/ocean-runtime/src/tools/browser/input.rs".into()),
                         symbol: Some("requires_permission".into()),
                         lines: vec![29, 67, 97, 130],
                         sig_hash: None,
                     }],
-                    ticket: Some("OCEAN-16".into()),
+                    tickets: vec!["OCEAN-16".into()],
                     commit_sha: "d9a9bc9".into(),
                 },
                 status: ClaimStatus::Verified,
@@ -182,7 +208,25 @@ pub(crate) mod tests {
     }
 
     fn anchor(file: &str, symbol: Option<&str>, lines: Vec<u32>) -> Anchor {
-        Anchor { file: file.into(), symbol: symbol.map(Into::into), lines, sig_hash: None }
+        Anchor { file: Some(file.into()), symbol: symbol.map(Into::into), lines, sig_hash: None }
+    }
+
+    #[test]
+    fn legacy_singular_ticket_still_parses() {
+        // Wire-compat (schema friction #3): old stored handoffs carry
+        // `ticket = "OCEAN-16"` (or null in JSON); both map onto `tickets`.
+        let p: Provenance =
+            serde_json::from_str(r#"{"anchors":[],"ticket":"OCEAN-16","commit_sha":"abc"}"#)
+                .unwrap();
+        assert_eq!(p.tickets, vec!["OCEAN-16".to_string()]);
+        let p: Provenance =
+            serde_json::from_str(r#"{"anchors":[],"ticket":null,"commit_sha":"abc"}"#).unwrap();
+        assert!(p.tickets.is_empty());
+        let p: Provenance = serde_json::from_str(r#"{"anchors":[],"commit_sha":"abc"}"#).unwrap();
+        assert!(p.tickets.is_empty());
+        let p: Provenance = toml::from_str("anchors = []\nticket = \"OCEAN-9\"\ncommit_sha = \"abc\"")
+            .unwrap();
+        assert_eq!(p.tickets, vec!["OCEAN-9".to_string()]);
     }
 
     #[test]
