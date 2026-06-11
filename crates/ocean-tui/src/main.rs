@@ -2517,6 +2517,20 @@ fn resolve_resume_session(
     url: &str,
     wanted: &str,
 ) -> anyhow::Result<SessionSummary> {
+    // A full session id needs no scan: hit `GET /v1/sessions/{id}` directly,
+    // so an exact resume works no matter how deep the session sits in
+    // history — the paged-scan cap below must never block a full id. A
+    // not-found here still falls through to the scan for its candidate
+    // listing in the error.
+    if let Ok(id) = wanted.trim().parse::<SessionId>() {
+        if let Ok(res) = client.session_detail(url, id) {
+            if res.ok {
+                if let Some(detail) = res.session {
+                    return Ok(summary_from_detail(detail));
+                }
+            }
+        }
+    }
     resolve_session_paged(
         |cursor| {
             client
@@ -2526,6 +2540,22 @@ fn resolve_resume_session(
         wanted,
     )
     .map_err(|err| anyhow::anyhow!("--session {wanted}: {err}"))
+}
+
+/// Project a full `SessionDetail` (the `GET /v1/sessions/{id}` shape) onto
+/// the `SessionSummary` the resume path carries — the by-id shortcut for full
+/// ids, where paging through history would be wasted work (and a scan cap
+/// must never make an exact id unresumable).
+fn summary_from_detail(detail: ocean_core::SessionDetail) -> SessionSummary {
+    SessionSummary {
+        id: detail.id,
+        model: detail.model,
+        turns: detail.turns,
+        title: detail.title,
+        workspace_root: detail.workspace_root,
+        git_branch: detail.git_branch,
+        updated_ms: Some(detail.updated_ms),
+    }
 }
 
 /// Pure pagination driver behind [`resolve_resume_session`]: pulls pages from
@@ -7776,6 +7806,40 @@ mod tests {
                 has_more: idx + 1 < total,
             })
         }
+    }
+
+    #[test]
+    fn summary_from_detail_carries_resume_critical_fields() {
+        let id = SessionId::new_v4();
+        let detail = ocean_core::SessionDetail {
+            id,
+            created_ms: 1,
+            updated_ms: 42,
+            model: "m".into(),
+            provider: "p".into(),
+            turns: 7,
+            title: "t".into(),
+            state: ocean_core::SessionRunState::Stored,
+            resumable: true,
+            active_requests: vec![],
+            pending_permissions: vec![],
+            transcript: vec![],
+            tool_context: vec![],
+            messages: vec![],
+            workspace_root: Some("/repo".into()),
+            cwd: Some("/repo/sub".into()),
+            git_branch: Some("main".into()),
+            git_commit: None,
+            client_type: None,
+            owning_project: None,
+        };
+        let s = summary_from_detail(detail);
+        assert_eq!(s.id, id);
+        // workspace_root drives --session root adoption; losing it would
+        // break the daemon's cwd binding guard on the first turn.
+        assert_eq!(s.workspace_root.as_deref(), Some("/repo"));
+        assert_eq!(s.updated_ms, Some(42));
+        assert_eq!(s.turns, 7);
     }
 
     #[test]
