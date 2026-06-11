@@ -2893,10 +2893,7 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
         let request = AgentTurnRequest {
             session_id: app.selected_agent_session_id(),
             prompt: instruction.clone(),
-            cwd: std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            cwd: app.root.to_string_lossy().into_owned(),
             guidance: None,
             room_id: Some(room_id.to_string()),
             // The TUI always sends its real cwd, so it never needs a project to
