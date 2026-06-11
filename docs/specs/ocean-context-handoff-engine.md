@@ -1,7 +1,8 @@
 ---
 spec: ocean-context
-status: draft
+status: layer-a-shipped   # Layer A merged 2026-06-10 (PR #203, OCEAN-306); Layer B is backlog
 date: 2026-06-09
+updated: 2026-06-10
 author: john + Claude (brainstorm session)
 crate: crates/ocean-context
 ---
@@ -17,6 +18,15 @@ This spec is deliberately in **two layers**. Build Layer A. Layer B is the named
 primitives that grow A into the full engine *without changing A's shape*. The whole architectural
 bet is the **trait seams** between them: get those right and the context engine is just the doc
 engine with better organs.
+
+> **Status (2026-06-10): Layer A is SHIPPED** — `crates/ocean-context` on main via PR #203
+> (OCEAN-306). All five acceptance criteria below are met: the 51-claim corpus is
+> regression-locked (22+29), store round-trips losslessly, `read_freshest` sorts by the stub
+> TrustModel, the replay binary walked real ocean-os history, tests + clippy clean, zero LLM calls.
+> First real replay (22 claims × ~180 commits): 21 HELD, 1 FAIL — the FAIL being a *cross-repo*
+> anchor, which is correct-but-uninformative (out-of-ring, not Dead). Build findings F6–F8 live in
+> `HANDOFF-ocean-context.md`; F7 (file-exists is too forgiving an oracle to produce judgeable
+> verdicts) makes **B1 the confirmed next step**.
 
 ---
 
@@ -68,7 +78,7 @@ contract, not the day-one implementation.
 
 ---
 
-## Layer A — the Handoff Doc Engine (build this now)
+## Layer A — the Handoff Doc Engine (SHIPPED — PR #203)
 
 Small, real, useful day one. Replaces hand-written `HANDOFF.md` with typed, anchored claim-sets.
 **No tree-sitter, no embeddings, no graph.** Just: write a handoff, read the freshest, with
@@ -188,7 +198,7 @@ order; each is shippable alone and earns its complexity.
 
 | # | Primitive | Fills | Paper / basis | Earns its place when |
 |---|-----------|-------|---------------|----------------------|
-| B1 | **Tree-sitter resolver** | `Resolver` | tree-sitter `rust`/`typescript` grammars | symbol-presence + sig-hash beats file-exists on the replay |
+| B1 | **Tree-sitter resolver** ← NEXT (confirmed by F7: file-exists held 21/22 over 180 commits — no signal) | `Resolver` | tree-sitter `rust`/`typescript` grammars | symbol-presence + sig-hash beats file-exists on the replay |
 | B2 | **Velocity + decay** | `TrustModel` (the e^−λΔt term) | self-tapering half-life | the auto-taper fires at the right maturity on real history |
 | B3 | **BM25 + embedding retrieval** | `Retriever` | Lucene → BM25, RRF; pgvector (brain) | hybrid retrieval ranks the right ancestor first |
 | B4 | **Parallelism score** | the `PS` term + concept labels | Wang-Fusi (similarity graphs / abstract reps) | PS gates borrowing safely (entangled concepts throttled) |
@@ -257,3 +267,7 @@ as a first-class case, not a quirk.
 2. Drift-detection trigger (B7): PreCompact hook vs. periodic vs. Stop hook — pick when B7 starts.
 3. Session-relaunch mechanism (B8): in-place `/clear`+inject vs. exec a new `claude` — the riskiest
    primitive, spec it separately when we get there.
+4. *(added 2026-06-10, from F6)* Cross-repo anchors: should scope rings reach the `Resolver`
+   (a ring-aware `resolve`) so out-of-ring anchors report "foreign", or do replay verdicts just
+   carry a foreign-anchor hint until B6? Decide at B1, since the tree-sitter resolver will
+   otherwise inherit the same correct-but-wrong "Dead" verdict for them.
