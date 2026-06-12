@@ -22,10 +22,39 @@ pub enum Resolution {
     Unresolvable,
 }
 
+/// Outcome of computing a write-time baseline (signature/shape hash) for an
+/// anchor at its claim's anchor commit. `Option<String>` would be too coarse:
+/// "this resolver doesn't do baselines" (file-exists), "the anchor was never
+/// attestable at birth" and "the birth revision doesn't parse" demand three
+/// different verdicts downstream — collapsing them either changes
+/// file-exists behavior or lets a never-attestable claim verify by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Baseline {
+    /// This resolver does not compute baselines (the default). `reverify`
+    /// proceeds exactly as before — no behavior change for v1 resolvers.
+    Unsupported,
+    /// Baseline computed: stamp it on the anchor, then resolve normally.
+    Stamped(String),
+    /// The anchor was NOT attestable at its own anchor commit (file or
+    /// symbol absent at birth) — the claim was never reproducible.
+    Unattestable,
+    /// The birth revision doesn't parse: no evidence either way.
+    Unparseable,
+}
+
 /// Does this claim's anchor still resolve? v1 stub: file-exists.
 /// Layer B (B1): tree-sitter AST + signature hash.
 pub trait Resolver {
     fn resolve(&self, anchor: &Anchor, at_commit: &str) -> Resolution;
+
+    /// Write-time baseline for `anchor` as of `at_commit` (the claim's
+    /// anchor commit). Default: [`Baseline::Unsupported`] — the resolver has
+    /// no notion of shape, and `reverify` must not alter its semantics.
+    /// B1 overrides this so the FIRST reverify stamps baselines on anchors
+    /// that arrived without one (everything `extract_claims` produces).
+    fn baseline_at(&self, _anchor: &Anchor, _at_commit: &str) -> Baseline {
+        Baseline::Unsupported
+    }
 }
 
 pub struct TrustContext {
@@ -99,7 +128,7 @@ impl FileExistsResolver {
 /// resolving symlinks would itself touch paths outside the repo. A pure
 /// component walk is enough to keep `PathBuf::join` from replacing or
 /// escaping `repo_root`.
-fn is_repo_relative(file: &str) -> bool {
+pub(crate) fn is_repo_relative(file: &str) -> bool {
     use std::path::Component;
     let p = std::path::Path::new(file);
     !file.is_empty()

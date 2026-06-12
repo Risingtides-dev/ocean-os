@@ -95,3 +95,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ocean-plugin = { path = "crates/ocean-plugin" }
 regex = "1"
 ocean-context = { path = "crates/ocean-context" }
+# B1 tree-sitter resolver (OCEAN-307). Pinned: grammar ABI and node-kind names
+# must not drift under us — sig-hashes are persisted in handoffs.
+tree-sitter = "=0.26.9"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "=0.23.2"
