@@ -68,13 +68,18 @@ pub struct TreeSitterResolver {
 
 /// What the repo has at (commit, path).
 enum Source {
-    /// Not in the tree / working copy.
+    /// The path is genuinely absent at a READABLE commit (or working tree) —
+    /// real evidence the file isn't there.
     Missing,
     /// Present with blob content.
     Text(String),
     /// Present but not a readable blob (a directory). File-exists evidence
     /// only — nothing to parse or hash.
     Opaque,
+    /// The revision itself could not be read — an unknown/pruned commit in a
+    /// shallow or partial clone. This is "can't see the past", NOT "the file
+    /// is gone": it must never be read as death, only as uncheckable.
+    Unreadable,
 }
 
 impl TreeSitterResolver {
@@ -118,8 +123,21 @@ impl TreeSitterResolver {
                 None => Source::Missing,
             },
             Some(_) => Source::Opaque,
-            None => Source::Missing,
+            // `<rev>:<path>` failed: the path is absent OR the revision itself
+            // is unreadable (unknown/pruned commit in a shallow clone). These
+            // demand opposite verdicts — absent is evidence of death, an
+            // unreadable past is not — so disambiguate by probing the commit.
+            None if self.commit_is_readable(at_commit) => Source::Missing,
+            None => Source::Unreadable,
         }
+    }
+
+    /// Whether `rev` resolves to a commit object in this clone. `WORKTREE` is
+    /// always readable; a real rev that `cat-file -e <rev>^{commit}` rejects is
+    /// an unknown/pruned commit (shallow or partial history), not a deleted
+    /// file.
+    fn commit_is_readable(&self, rev: &str) -> bool {
+        rev == WORKTREE || self.git(&["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_some()
     }
 
     /// True if any component of the repo-relative `file` (the leaf or an
@@ -223,6 +241,10 @@ impl Resolver for TreeSitterResolver {
                     _ => Resolution::Unresolvable,
                 };
             }
+            // The revision itself is unreadable (unknown/pruned commit): we
+            // can't see this point in history at all — never evidence of life
+            // or death, so uncheckable, never Dead.
+            Source::Unreadable => return Resolution::Unresolvable,
         };
         match anchor.symbol.as_deref() {
             Some(symbol) => {
@@ -286,6 +308,12 @@ impl Resolver for TreeSitterResolver {
                 }
             }
             Source::Opaque => Baseline::Unsupported,
+            // The birth revision is unreadable (shallow/pruned clone): we
+            // cannot establish a baseline, but a missing PAST is not a dead
+            // symbol. Unparseable → reverify maps it to Unresolvable, never
+            // Dead, so a currently-valid symbol is not killed for lack of
+            // history.
+            Source::Unreadable => Baseline::Unparseable,
             Source::Text(text) => match probe_symbol(lang, &text, symbol) {
                 SymbolProbe::Found(hash) => Baseline::Stamped(hash),
                 SymbolProbe::Absent => Baseline::Unattestable,

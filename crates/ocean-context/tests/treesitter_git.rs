@@ -634,3 +634,42 @@ fn excluded_anchor_negative_result_does_not_become_the_claim_verdict() {
     );
     assert!(!v[0].unresolvable, "the walk ends on a valid A, so the claim holds");
 }
+
+/// Codex P2 (PR #209): when a claim's birth commit is unreadable — a shallow
+/// or pruned clone where `provenance.commit_sha` isn't present — the resolver
+/// cannot establish a write-time baseline. That is "can't see the past", NOT
+/// "the symbol is dead": a currently-valid symbol must NOT be killed for lack
+/// of history. baseline_at returns Unparseable (→ reverify Unresolvable →
+/// status Reverify), never Unattestable (→ Dead).
+#[test]
+fn unreadable_birth_commit_does_not_kill_a_currently_valid_symbol() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1"]);
+
+    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+
+    // A well-formed SHA that is NOT in this clone — the birth commit can't be
+    // read, but `gate` is alive in the working tree right now.
+    let phantom_birth = "0123456789abcdef0123456789abcdef01234567";
+    let mut h = handoff_with_claims(
+        vec![claim("c-gate", "lib.rs", Some("gate"), phantom_birth)],
+        "main",
+    );
+    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "arrives unseeded");
+
+    let r = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
+    // Must NOT be Dead — an unreadable birth is uncheckable, not death.
+    assert_ne!(r[0].1, Resolution::Dead, "unreadable birth must never kill a live symbol");
+    assert_eq!(r[0].1, Resolution::Unresolvable, "no baseline establishable → uncheckable");
+    assert_eq!(h.claims[0].status, ClaimStatus::Reverify, "flag for attention, not killed");
+    // And nothing was stamped from a revision we couldn't read.
+    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "no baseline from unreadable history");
+
+    // Direct resolver check at the phantom commit: Unresolvable, not Dead.
+    let anchor = Anchor { file: Some("lib.rs".into()), symbol: Some("gate".into()), lines: vec![], sig_hash: None };
+    assert_eq!(resolver.resolve(&anchor, phantom_birth), Resolution::Unresolvable);
+}
