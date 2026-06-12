@@ -91,6 +91,19 @@ impl TreeSitterResolver {
             if !path.exists() {
                 return Source::Missing;
             }
+            // The lexical `is_repo_relative` guard rejects `..`/absolute paths,
+            // but a symlink whose *string* is repo-relative (`link.rs ->
+            // /etc/passwd`, or a symlinked parent dir) still points outside the
+            // trust boundary. Following it with `fs::read` would let trust be
+            // derived from non-repo content — and at-commit mode can't do this
+            // (it reads the tracked link blob, i.e. the target path as text).
+            // Treat any symlink on the in-repo path as opaque: we can't attest
+            // a symbol through it without leaving the repo, so symbol anchors
+            // go Unresolvable, never trusted. (`symlink_metadata` does NOT
+            // follow the final component.)
+            if self.has_symlink_within_repo(file) {
+                return Source::Opaque;
+            }
             return match std::fs::read(&path) {
                 Ok(bytes) => Source::Text(String::from_utf8_lossy(&bytes).into_owned()),
                 Err(_) => Source::Opaque, // exists but unreadable as a blob (directory)
@@ -107,6 +120,30 @@ impl TreeSitterResolver {
             Some(_) => Source::Opaque,
             None => Source::Missing,
         }
+    }
+
+    /// True if any component of the repo-relative `file` (the leaf or an
+    /// intervening directory) is a symlink. Walks `repo_root` down one segment
+    /// at a time with `symlink_metadata`, which reports the link itself rather
+    /// than its target — so a symlinked dir mid-path is caught before its
+    /// contents are ever read. Callers pass only `is_repo_relative` paths, so
+    /// the accumulated path cannot escape `repo_root` during the walk.
+    fn has_symlink_within_repo(&self, file: &str) -> bool {
+        let mut acc = self.repo_root.clone();
+        for comp in std::path::Path::new(file).components() {
+            // `is_repo_relative` already excludes RootDir/Prefix/ParentDir;
+            // CurDir contributes nothing. Only Normal components advance.
+            if let std::path::Component::Normal(seg) = comp {
+                acc.push(seg);
+                match std::fs::symlink_metadata(&acc) {
+                    Ok(md) if md.file_type().is_symlink() => return true,
+                    Ok(_) => {}
+                    // Vanished mid-walk: let the caller's read decide (Missing).
+                    Err(_) => return false,
+                }
+            }
+        }
+        false
     }
 
     /// Same bare-basename fallback as the file-exists resolver: corpus claims
@@ -1069,6 +1106,51 @@ export enum Mode { Open, Closed }
         std::fs::write(&path, RUST_SRC.replace("requires_permission", "renamed_gate")).unwrap();
         assert_eq!(r.resolve(&pinned, WORKTREE), Resolution::Dead);
         assert_eq!(r.resolve(&plain, WORKTREE), Resolution::Dead);
+    }
+
+    /// Codex P2 (PR #209): a repo-relative anchor whose path crosses a symlink
+    /// in WORKTREE mode must NOT have its symbol verified or baselined from the
+    /// link target — that would derive trust from content outside the repo,
+    /// which at-commit mode (reading the tracked link blob) never does. The
+    /// link points at a real outside file that genuinely defines the symbol;
+    /// the resolver must still refuse to attest it.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_symlinks_do_not_leak_trust_from_outside_the_repo() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // An outside file that DOES define `requires_permission`.
+        let target = outside.path().join("outside.rs");
+        std::fs::write(&target, RUST_SRC).unwrap();
+
+        let r = resolver_in(repo.path());
+        let sym = anchor(Some("link.rs"), Some("requires_permission"), None);
+
+        // 1. Leaf symlink: link.rs -> /outside/outside.rs
+        symlink(&target, repo.path().join("link.rs")).unwrap();
+        // The symbol is reachable THROUGH the link, but we must not follow it:
+        // opaque content + symbol anchor → Unresolvable, never Resolves.
+        assert_eq!(r.resolve(&sym, WORKTREE), Resolution::Unresolvable);
+        // And the baseline path refuses to stamp from it (no laundering on
+        // first reverify): not Stamped — Unsupported (opaque, no shape).
+        assert_eq!(r.baseline_at(&sym, WORKTREE), Baseline::Unsupported);
+        // sig_hash_at (used by seed_sig_hashes) yields nothing through it.
+        assert!(r.sig_hash_at(&sym, WORKTREE).is_none());
+
+        // 2. Symlinked parent directory: sub -> /outside, anchor sub/outside.rs.
+        symlink(outside.path(), repo.path().join("sub")).unwrap();
+        let via_dir = anchor(Some("sub/outside.rs"), Some("requires_permission"), None);
+        assert_eq!(r.resolve(&via_dir, WORKTREE), Resolution::Unresolvable);
+        assert_eq!(r.baseline_at(&via_dir, WORKTREE), Baseline::Unsupported);
+
+        // 3. Control: a real in-repo file with the same symbol DOES resolve —
+        // the guard only fires on symlinked paths, not every read.
+        std::fs::write(repo.path().join("real.rs"), RUST_SRC).unwrap();
+        let real = anchor(Some("real.rs"), Some("requires_permission"), None);
+        assert_eq!(r.resolve(&real, WORKTREE), Resolution::Resolves(1.0));
     }
 
     #[test]
