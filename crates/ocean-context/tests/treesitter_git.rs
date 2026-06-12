@@ -673,3 +673,45 @@ fn unreadable_birth_commit_does_not_kill_a_currently_valid_symbol() {
     let anchor = Anchor { file: Some("lib.rs".into()), symbol: Some("gate".into()), lines: vec![], sig_hash: None };
     assert_eq!(resolver.resolve(&anchor, phantom_birth), Resolution::Unresolvable);
 }
+
+/// Codex P2 (PR #209): the absent-at-birth exclusion must hold in the
+/// production `reverify` path too, not only `replay`. A multi-anchor claim
+/// with A (valid at birth) and B (symbol absent at birth): if A is temporarily
+/// unparseable at reverify time, B's birth-check `Dead` must NOT become the
+/// claim verdict — B is non-attesting in either direction once A is the real
+/// subject. The claim flags Reverify, not killed.
+#[test]
+fn reverify_absent_at_birth_sibling_does_not_kill_a_multi_anchor_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    // Birth: A valid; B absent.
+    std::fs::write(root.join("a.rs"), "pub fn alpha(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1: A valid, B absent"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    // Reverify time (working tree): A is temporarily UNPARSEABLE; B still absent.
+    std::fs::write(root.join("a.rs"), "pub fn alpha( (((( broken\n").unwrap();
+
+    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let a = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
+    let b = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let mut h = handoff_with_claims(vec![multi_anchor_claim("ab", vec![a, b], &c1)], "main");
+
+    let r = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
+    // NOT Dead: B's absent-at-birth death is excluded because A (attestable at
+    // birth) is the real subject and is merely uncheckable right now.
+    assert_ne!(r[0].1, Resolution::Dead, "an absent-at-birth sibling must not kill the claim");
+    assert_eq!(r[0].1, Resolution::Unresolvable);
+    assert_eq!(h.claims[0].status, ClaimStatus::Reverify, "flag for attention, not killed");
+    assert!(h.claims[0].history.iter().any(|e| e.event == "unresolvable"));
+
+    // Control: a LONE absent-at-birth anchor (no attestable sibling) is still
+    // killed — the birth verdict stands when nothing else attests.
+    let lone = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let mut h2 = handoff_with_claims(vec![multi_anchor_claim("lone", vec![lone], &c1)], "main");
+    let r2 = ocean_context::reverify(&mut h2, &resolver, WORKTREE, 2_000, "sess-1");
+    assert_eq!(r2[0].1, Resolution::Dead, "a lone never-true-at-birth anchor is still Dead");
+    assert_eq!(h2.claims[0].status, ClaimStatus::Dead);
+}
