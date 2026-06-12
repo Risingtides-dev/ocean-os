@@ -589,3 +589,48 @@ fn ghost_symbol_at_an_absent_at_birth_anchor_cannot_hold_a_multi_anchor_claim() 
         "a real-at-birth sibling anchor still holds the claim after the other dies"
     );
 }
+
+/// Codex follow-up (PR #209): an excluded (absent-at-birth) anchor must be
+/// non-attesting for ALL outcomes, not only positive ones. If a valid anchor A
+/// goes temporarily unparseable while the excluded anchor B is Dead/absent,
+/// `check_at` must report Unresolvable for that step — NOT Failed(Dead) from B,
+/// which was already deemed non-attestable. The walk then continues and a later
+/// valid A still holds the claim.
+#[test]
+fn excluded_anchor_negative_result_does_not_become_the_claim_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+
+    // c1 (birth): A = a.rs#alpha exists; B = b.rs#beta absent (excluded).
+    std::fs::write(root.join("a.rs"), "pub fn alpha(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1: A exists, B absent"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    // c2: A becomes temporarily UNPARSEABLE; B still absent (b.rs not present →
+    // Dead). Excluded B's Dead must not surface as the claim's failure.
+    std::fs::write(root.join("a.rs"), "pub fn alpha( (((( broken\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c2: A unparseable, B still absent"]);
+
+    // c3: A valid again (same shape as birth).
+    std::fs::write(root.join("a.rs"), "pub fn alpha(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c3: A valid again"]);
+
+    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let a = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
+    let b = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let claim = multi_anchor_claim("neg", vec![a, b], &c1);
+
+    let v = replay(root, &[claim], &ts).unwrap();
+    // The c2 step is Unresolvable (A uncheckable, B excluded), NOT a Dead
+    // failure — so the claim never fails, and c3's valid A leaves it HELD.
+    assert!(
+        v[0].first_fail_commit.is_none(),
+        "an excluded anchor's Dead must not become the claim's verdict; got {:?}",
+        v[0].first_fail_resolution
+    );
+    assert!(!v[0].unresolvable, "the walk ends on a valid A, so the claim holds");
+}

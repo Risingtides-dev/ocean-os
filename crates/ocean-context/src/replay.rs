@@ -111,8 +111,14 @@ pub fn replay(
         // read HELD because a same-named symbol appears later in the walk
         // with no baseline to compare against. This also covers claims
         // anchored at HEAD, where there is nothing later to walk at all.
+        //
+        // The birth check uses the RAW resolver verdict (no exclusion): the
+        // anchor commit is precisely where an unattestable anchor's Dead/
+        // Unresolvable must register. Exclusion suppresses only LATER ghosts,
+        // so it applies to the post-birth walk below, never here.
+        let no_exclusion = std::collections::HashSet::new();
         let mut ends_unresolvable = false;
-        match check_at(resolver, claim, &claim.provenance.commit_sha, excluded) {
+        match check_at(resolver, claim, &claim.provenance.commit_sha, &no_exclusion) {
             Step::Held => {}
             Step::Unresolvable => ends_unresolvable = true,
             Step::Failed(r) => {
@@ -177,15 +183,16 @@ fn check_at(
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            let r = resolver.resolve(a, commit);
-            // An anchor that never attested at birth cannot attest later: a
-            // name match is a ghost. Downgrade its positive resolution to
-            // Unresolvable so it neither holds the claim nor masks a real
-            // failure on a sibling — it stays "can't trust this", not Dead.
-            if excluded.contains(&i) && matches!(r, Resolution::Resolves(_)) {
+            // An anchor that never attested at its own birth commit carries no
+            // evidence later — in EITHER direction. A name match is a ghost
+            // (must not hold the claim), and a Dead/Stale on the same anchor is
+            // not a real failure either (must not become the claim's verdict
+            // when a sibling is merely uncheckable). Force it Unresolvable for
+            // every outcome: "can't trust this anchor", full stop.
+            if excluded.contains(&i) {
                 Resolution::Unresolvable
             } else {
-                r
+                resolver.resolve(a, commit)
             }
         })
         .collect();
