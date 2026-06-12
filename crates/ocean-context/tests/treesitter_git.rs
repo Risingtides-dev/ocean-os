@@ -715,3 +715,35 @@ fn reverify_absent_at_birth_sibling_does_not_kill_a_multi_anchor_claim() {
     assert_eq!(r2[0].1, Resolution::Dead, "a lone never-true-at-birth anchor is still Dead");
     assert_eq!(h2.claims[0].status, ClaimStatus::Dead);
 }
+
+/// Codex P2 (PR #209): an Unsupported/uncheckable sibling must NOT count as the
+/// "real subject" that licenses excluding an absent-at-birth anchor's death.
+/// Under TreeSitterResolver, `app.js#foo` is Unsupported→Unresolvable (B1 does
+/// not parse .js) while `lib.rs#missing` is Unattestable→Dead. The uncheckable
+/// JS anchor attested nothing, so the Rust anchor's Dead must STILL kill the
+/// claim — not get suppressed into Reverify.
+#[test]
+fn reverify_unsupported_sibling_does_not_rescue_an_absent_at_birth_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    // app.js exists (so it's not file-missing) but JS is unparseable by B1;
+    // lib.rs exists but never defines `missing`.
+    std::fs::write(root.join("app.js"), "function foo() { return 1; }\n").unwrap();
+    std::fs::write(root.join("lib.rs"), "pub fn other() -> bool { true }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1: app.js present, lib.rs lacks `missing`"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let js = Anchor { file: Some("app.js".into()), symbol: Some("foo".into()), lines: vec![], sig_hash: None };
+    let rs = Anchor { file: Some("lib.rs".into()), symbol: Some("missing".into()), lines: vec![], sig_hash: None };
+    let mut h = handoff_with_claims(vec![multi_anchor_claim("js-rs", vec![js, rs], &c1)], "main");
+
+    let r = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
+    // The uncheckable JS anchor attests nothing; the Rust anchor was never true
+    // at birth → the claim is Dead, not rescued to Reverify.
+    assert_eq!(r[0].1, Resolution::Dead, "an uncheckable sibling must not rescue a never-true anchor");
+    assert_eq!(h.claims[0].status, ClaimStatus::Dead);
+    assert!(h.claims[0].history.iter().any(|e| e.event == "killed"));
+}

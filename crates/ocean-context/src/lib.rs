@@ -88,14 +88,15 @@ pub fn reverify(
             .iter_mut()
             .map(|anchor| resolve_stamping_baseline(resolver, anchor, &birth_commit, at_commit))
             .collect();
-        // Does the claim have an anchor that WAS attestable at birth (the real
-        // subject)? If so, anchors that were unattestable at birth are
+        // Does the claim have an anchor that genuinely ATTESTED at birth (the
+        // real subject)? If so, anchors that were unattestable at birth are
         // non-attesting in either direction — excluded to Unresolvable, exactly
         // as the replay walk does — so a ghost neither holds the claim nor lets
-        // its `Dead` become the verdict. If EVERY anchor was unattestable at
-        // birth, none is excluded: their birth verdict stands, so a lone
-        // never-true anchor is still Dead.
-        let has_attestable_sibling = outcomes.iter().any(|o| !o.birth_unattestable);
+        // its `Dead` become the verdict. If NO anchor attested at birth, none
+        // is excluded: birth verdicts stand, so a lone never-true anchor is
+        // still Dead. Note: an Unsupported/uncheckable anchor (e.g. a B1 anchor
+        // on a language it can't parse) attested nothing and does NOT count.
+        let has_attestable_sibling = outcomes.iter().any(|o| o.attested_at_birth);
         let mut best = Resolution::Unresolvable;
         for o in &outcomes {
             let r = if o.birth_unattestable && has_attestable_sibling {
@@ -131,15 +132,23 @@ pub fn reverify(
     out
 }
 
-/// One anchor's reverify outcome: its resolution at `at_commit`, plus whether
-/// it was NOT attestable at its own birth commit. An absent/unparseable-at-
-/// birth anchor cannot attest the claim later (its `resolve` would be a ghost,
-/// and its `Dead` is not the claim's death) — but only when a SIBLING is the
-/// real subject. A claim whose every anchor is unattestable-at-birth keeps its
-/// birth verdict, so a lone never-true anchor is still Dead.
+/// One anchor's reverify outcome.
+///
+/// - `resolution`: its resolution at `at_commit`.
+/// - `birth_unattestable`: the anchor was NOT attestable at its own birth
+///   commit (absent symbol, or unreadable/unparseable birth blob). Its later
+///   `resolve` is a ghost and its `Dead` is not the claim's death — but only
+///   when a SIBLING genuinely attested at birth (see below).
+/// - `attested_at_birth`: the anchor genuinely had evidence at birth — a
+///   stamped symbol baseline, or a non-symbol/Unsupported anchor that still
+///   resolves to a CHECKABLE result now. This is the "real subject" test: an
+///   `Unsupported` anchor that only resolves `Unresolvable` (e.g. a
+///   `TreeSitterResolver` anchor on a language B1 can't parse) attested
+///   nothing and must NOT license suppressing a sibling's real `Dead`.
 struct AnchorOutcome {
     resolution: Resolution,
     birth_unattestable: bool,
+    attested_at_birth: bool,
 }
 
 /// Resolve one anchor, stamping its write-time baseline first when it is
@@ -151,24 +160,42 @@ fn resolve_stamping_baseline(
     birth_commit: &str,
     at_commit: &str,
 ) -> AnchorOutcome {
+    // `stamped_baseline` is true when this anchor got a real write-time shape
+    // hash at birth — it attested regardless of how it resolves now.
+    let mut stamped_baseline = false;
     if anchor.symbol.is_some() && anchor.sig_hash.is_none() && !birth_commit.is_empty() {
         match resolver.baseline_at(anchor, birth_commit) {
             Baseline::Unsupported => {}
-            Baseline::Stamped(hash) => anchor.sig_hash = Some(hash),
+            Baseline::Stamped(hash) => {
+                anchor.sig_hash = Some(hash);
+                stamped_baseline = true;
+            }
             // Never attestable at its own anchor commit. The birth verdict
             // (Dead / Unresolvable) holds if this is the claim's only kind of
-            // anchor, but a sibling that DOES attest must not be dragged down
-            // by it — the caller decides, using `birth_unattestable`.
+            // anchor, but a sibling that DID attest must not be dragged down by
+            // it — the caller decides, using `birth_unattestable`.
             Baseline::Unattestable => {
-                return AnchorOutcome { resolution: Resolution::Dead, birth_unattestable: true }
+                return AnchorOutcome {
+                    resolution: Resolution::Dead,
+                    birth_unattestable: true,
+                    attested_at_birth: false,
+                }
             }
             Baseline::Unparseable => {
                 return AnchorOutcome {
                     resolution: Resolution::Unresolvable,
                     birth_unattestable: true,
+                    attested_at_birth: false,
                 }
             }
         }
     }
-    AnchorOutcome { resolution: resolver.resolve(anchor, at_commit), birth_unattestable: false }
+    let resolution = resolver.resolve(anchor, at_commit);
+    // Attested at birth iff: a symbol baseline was stamped (B1), OR this is a
+    // non-symbol / Unsupported anchor that still produces CHECKABLE evidence
+    // now (a live file-only anchor). An Unsupported anchor that only resolves
+    // Unresolvable attested nothing and is not the claim's "real subject".
+    let attested_at_birth =
+        stamped_baseline || !matches!(resolution, Resolution::Unresolvable);
+    AnchorOutcome { resolution, birth_unattestable: false, attested_at_birth }
 }

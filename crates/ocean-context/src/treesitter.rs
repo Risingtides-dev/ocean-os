@@ -748,6 +748,23 @@ fn toml_sig_hash(source: &str, symbol: &str) -> SymbolProbe {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ts_const_function_expression_excludes_its_body() {
+        // tree-sitter-typescript emits `function_expression` (with a `function`
+        // keyword child) for `const f = function(){}`. That kind is already in
+        // the body-exclusion list, so an implementation-only edit must NOT
+        // change the sig-hash — same as arrow functions and fn declarations.
+        let a = "const requiresPermission = function(action: string): boolean { return action != \"read\"; }\n";
+        let b = "const requiresPermission = function(action: string): boolean { return action === \"write\"; }\n";
+        let ha = ts_sig_hash(a, "requiresPermission", false);
+        let hb = ts_sig_hash(b, "requiresPermission", false);
+        assert!(matches!(ha, SymbolProbe::Found(_)));
+        assert_eq!(ha, hb, "function-expression body churn must not flip the hash");
+        // A signature change (return type) MUST flip it.
+        let c = "const requiresPermission = function(action: string): number { return 1; }\n";
+        assert_ne!(ha, ts_sig_hash(c, "requiresPermission", false));
+    }
+
     const RUST_SRC: &str = r#"
 pub struct Gate { pub level: u8 }
 
