@@ -156,6 +156,24 @@ fn at_commit_mode_tracks_a_rust_symbol_through_history() {
     // is no evidence of removal: uncheckable, never Dead (Codex P2, PR #209).
     assert_eq!(ts.resolve(&anchor, WORKTREE), Resolution::Unresolvable);
 
+    // Library-path seeding (Codex round-8): replay() called directly with
+    // unseeded claims (extraction's shape) must stamp baselines itself — a
+    // signature change after the anchor commit has to FAIL the walk even
+    // though nobody called seed_sig_hashes. Reuses the c1→c3 history above:
+    // gate's signature changed at c3, so an unseeded claim anchored at c1
+    // must fail there instead of holding by name.
+    {
+        let unseeded = vec![claim("r8", "lib.rs", Some("gate"), &c1)];
+        assert!(unseeded[0].provenance.anchors[0].sig_hash.is_none());
+        let v = replay(root, &unseeded, &ts).unwrap();
+        assert_eq!(
+            v[0].first_fail_commit.as_deref(),
+            Some(c3.as_str()),
+            "unseeded symbol must not verify by name through a shape change"
+        );
+        assert_eq!(v[0].first_fail_resolution, Some(Resolution::Stale));
+    }
+
     // file missing at-commit → Dead; path traversal stays Unresolvable
     let gone =
         Anchor { file: Some("nope.rs".into()), symbol: None, lines: vec![], sig_hash: None };

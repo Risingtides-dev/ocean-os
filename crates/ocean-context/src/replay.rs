@@ -5,7 +5,7 @@
 //! replay; the thing you tuned is the engine.
 
 use crate::claim::Claim;
-use crate::seams::{Resolution, Resolver};
+use crate::seams::{Baseline, Resolution, Resolver};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -40,8 +40,29 @@ pub fn replay(
     claims: &[Claim],
     resolver: &dyn Resolver,
 ) -> Result<Vec<ReplayVerdict>> {
+    // Stamp write-time baselines before walking — same lifecycle rule as
+    // `reverify`: a symbol-bearing anchor that arrived unseeded (everything
+    // extraction produces) must compare shapes against its birth state, not
+    // verify by name through the whole walk. Resolvers without a notion of
+    // shape return `Unsupported` and are untouched. Anchors whose baseline
+    // is unattestable/unparseable at birth stay unseeded — the birth check
+    // below independently yields Dead/Unresolvable for them at the anchor.
+    let mut claims: Vec<Claim> = claims.to_vec();
+    for claim in claims.iter_mut() {
+        let birth = claim.provenance.commit_sha.clone();
+        if birth.is_empty() {
+            continue;
+        }
+        for anchor in claim.provenance.anchors.iter_mut() {
+            if anchor.symbol.is_some() && anchor.sig_hash.is_none() {
+                if let Baseline::Stamped(hash) = resolver.baseline_at(anchor, &birth) {
+                    anchor.sig_hash = Some(hash);
+                }
+            }
+        }
+    }
     let mut verdicts = Vec::new();
-    for claim in claims {
+    for claim in &claims {
         let mut verdict = ReplayVerdict {
             claim_id: claim.id.clone(),
             claim_text: claim.text.chars().take(60).collect(),
