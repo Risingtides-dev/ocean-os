@@ -512,3 +512,80 @@ fn reverify_with_file_exists_resolver_never_stamps() {
     assert_eq!(h.claims[0].status, ClaimStatus::Verified);
     assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "file-exists never stamps");
 }
+
+/// A claim with two anchors: A (valid file at birth) and B (a symbol absent at
+/// the anchor commit). Codex P2 (PR #209): the claim-level birth check passes
+/// because A resolves, leaving B unseeded. If A is later removed and a
+/// same-named GHOST symbol appears where B points, B must NOT verify the claim
+/// by name — it never attested at birth. Anchor-level exclusion bars it.
+fn multi_anchor_claim(id: &str, anchors: Vec<Anchor>, commit: &str) -> Claim {
+    Claim {
+        id: id.into(),
+        text: format!("multi-anchor claim {id}"),
+        provenance: Provenance { anchors, tickets: vec![], commit_sha: commit.into() },
+        status: ClaimStatus::Verified,
+        knowledge_tier: KnowledgeTier::Individual,
+        ps_anchor: None,
+        confidence: 0.9,
+        borrowed_from: None,
+        history: vec![ClaimEvent { at: 0, event: "written".into(), by_session: "t".into() }],
+    }
+}
+
+#[test]
+fn ghost_symbol_at_an_absent_at_birth_anchor_cannot_hold_a_multi_anchor_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+
+    // c1 (birth): A = a.rs#alpha exists; B = b.rs#beta does NOT (file absent).
+    std::fs::write(root.join("a.rs"), "pub fn alpha(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c1: only A exists"]);
+    let c1 = git(root, &["rev-parse", "HEAD"]);
+
+    // c2: A removed, and a ghost `beta` appears at b.rs for the first time.
+    git(root, &["rm", "-q", "a.rs"]);
+    std::fs::write(root.join("b.rs"), "pub fn beta(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "c2: A dies, ghost beta is born"]);
+    let c2 = git(root, &["rev-parse", "HEAD"]);
+
+    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let anchor_a = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
+    let anchor_b = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let claim = multi_anchor_claim("ghost", vec![anchor_a, anchor_b], &c1);
+
+    let v = replay(root, &[claim], &ts).unwrap();
+    // The claim must FAIL at c2: A genuinely died (Dead), and B is excluded as
+    // a ghost (Unresolvable, not a hold). It must NOT read HELD by name.
+    assert_eq!(
+        v[0].first_fail_commit.as_deref(),
+        Some(c2.as_str()),
+        "a ghost symbol at an absent-at-birth anchor must not hold the claim"
+    );
+    assert_eq!(v[0].first_fail_resolution, Some(Resolution::Dead));
+
+    // Control: if B's symbol DID exist at birth, B legitimately holds the
+    // claim after A dies — exclusion fires only on absent-at-birth anchors.
+    let dir2 = tempfile::tempdir().unwrap();
+    let root2 = dir2.path();
+    git(root2, &["init", "-q"]);
+    std::fs::write(root2.join("a.rs"), "pub fn alpha(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(root2.join("b.rs"), "pub fn beta(x: u8) -> bool { x > 0 }\n").unwrap();
+    git(root2, &["add", "."]);
+    git(root2, &["commit", "-qm", "c1: BOTH exist"]);
+    let c1b = git(root2, &["rev-parse", "HEAD"]);
+    git(root2, &["rm", "-q", "a.rs"]);
+    git(root2, &["commit", "-qm", "c2: A dies, B persists"]);
+
+    let ts2 = TreeSitterResolver { repo_root: root2.to_path_buf() };
+    let a2 = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
+    let b2 = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let claim2 = multi_anchor_claim("legit", vec![a2, b2], &c1b);
+    let v2 = replay(root2, &[claim2], &ts2).unwrap();
+    assert!(
+        v2[0].first_fail_commit.is_none(),
+        "a real-at-birth sibling anchor still holds the claim after the other dies"
+    );
+}

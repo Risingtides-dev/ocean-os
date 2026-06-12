@@ -44,25 +44,43 @@ pub fn replay(
     // `reverify`: a symbol-bearing anchor that arrived unseeded (everything
     // extraction produces) must compare shapes against its birth state, not
     // verify by name through the whole walk. Resolvers without a notion of
-    // shape return `Unsupported` and are untouched. Anchors whose baseline
-    // is unattestable/unparseable at birth stay unseeded — the birth check
-    // below independently yields Dead/Unresolvable for them at the anchor.
+    // shape return `Unsupported` and are untouched.
+    //
+    // Stamping is claim-level via the birth check, but EXCLUSION is
+    // anchor-level: in a multi-anchor claim, one valid anchor passes the birth
+    // check while an absent-at-birth sibling stays unseeded. If that valid
+    // anchor later dies and a same-named ghost symbol appears at the sibling,
+    // `resolve` would return `Resolves(1.0)` by name and the claim would read
+    // HELD. An anchor that never attested at its own birth commit is not
+    // evidence later — record it per claim and bar it from holding the claim
+    // for the rest of the walk.
     let mut claims: Vec<Claim> = claims.to_vec();
+    let mut excluded_per_claim: Vec<std::collections::HashSet<usize>> =
+        Vec::with_capacity(claims.len());
     for claim in claims.iter_mut() {
         let birth = claim.provenance.commit_sha.clone();
-        if birth.is_empty() {
-            continue;
-        }
-        for anchor in claim.provenance.anchors.iter_mut() {
-            if anchor.symbol.is_some() && anchor.sig_hash.is_none() {
-                if let Baseline::Stamped(hash) = resolver.baseline_at(anchor, &birth) {
-                    anchor.sig_hash = Some(hash);
+        let mut excluded = std::collections::HashSet::new();
+        if !birth.is_empty() {
+            for (i, anchor) in claim.provenance.anchors.iter_mut().enumerate() {
+                if anchor.symbol.is_some() && anchor.sig_hash.is_none() {
+                    match resolver.baseline_at(anchor, &birth) {
+                        Baseline::Stamped(hash) => anchor.sig_hash = Some(hash),
+                        // Never attestable at birth → a later name match is a
+                        // ghost, not the originally-claimed symbol.
+                        Baseline::Unattestable | Baseline::Unparseable => {
+                            excluded.insert(i);
+                        }
+                        // Unsupported (v1 resolvers, no-shape anchors): keep the
+                        // pre-baseline semantics — nothing to exclude.
+                        Baseline::Unsupported => {}
+                    }
                 }
             }
         }
+        excluded_per_claim.push(excluded);
     }
     let mut verdicts = Vec::new();
-    for claim in &claims {
+    for (claim, excluded) in claims.iter().zip(excluded_per_claim.iter()) {
         let mut verdict = ReplayVerdict {
             claim_id: claim.id.clone(),
             claim_text: claim.text.chars().take(60).collect(),
@@ -94,7 +112,7 @@ pub fn replay(
         // with no baseline to compare against. This also covers claims
         // anchored at HEAD, where there is nothing later to walk at all.
         let mut ends_unresolvable = false;
-        match check_at(resolver, claim, &claim.provenance.commit_sha) {
+        match check_at(resolver, claim, &claim.provenance.commit_sha, excluded) {
             Step::Held => {}
             Step::Unresolvable => ends_unresolvable = true,
             Step::Failed(r) => {
@@ -110,7 +128,7 @@ pub fn replay(
             continue;
         }
         for commit in &commits {
-            match check_at(resolver, claim, commit) {
+            match check_at(resolver, claim, commit, excluded) {
                 Step::Held => ends_unresolvable = false,
                 // A single uncheckable revision (mid-edit blob, unparseable
                 // merge artifact) is no evidence — keep walking; later
@@ -147,9 +165,30 @@ enum Step {
     Failed(Resolution),
 }
 
-fn check_at(resolver: &dyn Resolver, claim: &Claim, commit: &str) -> Step {
-    let resolutions: Vec<Resolution> =
-        claim.provenance.anchors.iter().map(|a| resolver.resolve(a, commit)).collect();
+fn check_at(
+    resolver: &dyn Resolver,
+    claim: &Claim,
+    commit: &str,
+    excluded: &std::collections::HashSet<usize>,
+) -> Step {
+    let resolutions: Vec<Resolution> = claim
+        .provenance
+        .anchors
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let r = resolver.resolve(a, commit);
+            // An anchor that never attested at birth cannot attest later: a
+            // name match is a ghost. Downgrade its positive resolution to
+            // Unresolvable so it neither holds the claim nor masks a real
+            // failure on a sibling — it stays "can't trust this", not Dead.
+            if excluded.contains(&i) && matches!(r, Resolution::Resolves(_)) {
+                Resolution::Unresolvable
+            } else {
+                r
+            }
+        })
+        .collect();
     if resolutions.iter().any(|r| matches!(r, Resolution::Resolves(_))) {
         return Step::Held;
     }
