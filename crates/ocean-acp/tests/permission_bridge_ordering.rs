@@ -160,6 +160,11 @@ async fn agent_turn(
                 status: AgentTurnStatus::Failed,
                 event_id_prefix: String::new(),
                 error: Some("permission never decided".into()),
+                output_tokens: None,
+                input_tokens: None,
+                cache_read_tokens: None,
+                tokens_per_second: None,
+                wall_ms: None,
             });
         }
     };
@@ -183,6 +188,11 @@ async fn agent_turn(
         status: AgentTurnStatus::Completed,
         event_id_prefix: String::new(),
         error: None,
+        output_tokens: None,
+        input_tokens: None,
+        cache_read_tokens: None,
+        tokens_per_second: None,
+        wall_ms: None,
     })
 }
 

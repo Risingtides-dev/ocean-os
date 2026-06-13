@@ -279,6 +279,26 @@ pub struct AgentTurnResponse {
     pub event_id_prefix: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Output token count for the turn. Real provider usage when available,
+    /// else an estimate from visible text. `None` on pre-turn error paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Input (prompt) token count for the turn, summed across rounds.
+    /// `None` when the provider reported none or on pre-turn error paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Cache-read tokens for the turn, when reported by the provider.
+    /// `None` on pre-turn error paths or when not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Output tokens per second (output_tokens / wall time).
+    /// `None` on pre-turn error paths or when wall_ms is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second: Option<f64>,
+    /// Wall-clock duration for the turn in milliseconds.
+    /// `None` on pre-turn error paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_ms: Option<u64>,
 }
 
 /// Request payload for `POST /v1/agent/sessions`.
