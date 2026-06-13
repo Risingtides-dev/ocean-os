@@ -165,6 +165,35 @@ fn out_of_tree_and_symlinked_anchors_measure_zero() {
     }
 }
 
+/// Codex P2 (PR #210): an anchor carrying Git pathspec magic must NOT be
+/// interpreted as a pattern. `:(glob)**/*.rs` would otherwise match every Rust
+/// file in the repo and inflate velocity (decaying trust prematurely for an
+/// untrusted handoff). The literal-pathspec guard makes such a string match no
+/// file → zero, while the real molten file still measures hot.
+#[test]
+fn pathspec_magic_anchors_measure_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let head = build_repo(root); // hot.rs is molten, frozen.rs is frozen
+    let meter = VelocityMeter::new(root.to_path_buf());
+
+    // Sanity: the real molten file measures > 0, so a repo-wide glob WOULD
+    // inflate velocity if the magic were honored.
+    assert!(meter.measure(&anchored_claim("hot", "hot.rs", &head)).v_sem > 0.0);
+
+    for magic in [
+        ":(glob)**/*.rs",
+        ":(top)hot.rs",
+        ":/hot.rs",
+        ":!frozen.rs",
+        ":(icase)HOT.RS",
+    ] {
+        let v = meter.measure(&anchored_claim("m", magic, &head));
+        assert_eq!(v.v_sem, 0.0, "pathspec magic {magic:?} must not glob the repo");
+        assert_eq!(v.v_code, 0.0, "pathspec magic {magic:?} must not glob the repo");
+    }
+}
+
 #[test]
 fn anchorless_and_empty_commit_claims_measure_zero() {
     let dir = tempfile::tempdir().unwrap();

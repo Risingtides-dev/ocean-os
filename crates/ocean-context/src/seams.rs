@@ -446,8 +446,14 @@ impl VelocityMeter {
         }
         let Some(end) = self.commit_time(at_commit) else { return (0, 0) };
         let lo = end - self.window_days * 86_400;
-        // `--follow` needs a single pathspec; `--no-renames` off so the rename
-        // chain is walked. `%ct` per commit, then numstat rows for that commit.
+        // `--` separates options from paths but does NOT disable pathspec
+        // magic: an untrusted anchor like `:(glob)**/*.rs` would otherwise
+        // glob the whole repo and inflate velocity, prematurely decaying
+        // trust. Force the anchor to a LITERAL pathspec so git takes it
+        // verbatim — a magic string then matches no such file and measures
+        // zero, the safe direction. `:(literal)` is a single pathspec, which
+        // `--follow` requires.
+        let literal = format!(":(literal){file}");
         let Some(out) = self.git(&[
             "log",
             "--follow",
@@ -455,7 +461,7 @@ impl VelocityMeter {
             "--numstat",
             at_commit,
             "--",
-            file,
+            &literal,
         ]) else {
             return (0, 0);
         };
