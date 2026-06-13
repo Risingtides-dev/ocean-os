@@ -7994,6 +7994,11 @@ async fn agent_voice(
                      turn and use it to approve."
                         .to_string(),
                 ),
+                output_tokens: None,
+                input_tokens: None,
+                cache_read_tokens: None,
+                tokens_per_second: None,
+                wall_ms: None,
             }),
         );
     }
@@ -8226,6 +8231,11 @@ async fn agent_turn(
                     error: Some(
                         "daemon at concurrent-turn capacity; busy, try again shortly".to_string(),
                     ),
+                    output_tokens: None,
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    wall_ms: None,
                 }),
             );
         }
@@ -8259,6 +8269,11 @@ async fn agent_turn(
                     status: AgentTurnStatus::Failed,
                     event_id_prefix: String::new(),
                     error: Some(error.to_string()),
+                    output_tokens: None,
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    wall_ms: None,
                 }),
             );
         }
@@ -8332,6 +8347,11 @@ async fn agent_turn(
                     status: AgentTurnStatus::Failed,
                     event_id_prefix: event_prefix,
                     error: Some(binding_error.message()),
+                    output_tokens: None,
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    wall_ms: None,
                 }),
             );
         }
@@ -8363,6 +8383,11 @@ async fn agent_turn(
                     status: AgentTurnStatus::Failed,
                     event_id_prefix: event_prefix,
                     error: Some(error),
+                    output_tokens: None,
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    wall_ms: None,
                 }),
             );
         }
@@ -8831,7 +8856,7 @@ async fn agent_turn(
     (
         http_status,
         Json(AgentTurnResponse {
-            ok: true,
+            ok: res.ok,
             turn_id,
             session_id,
             status: if res.ok {
@@ -8841,6 +8866,11 @@ async fn agent_turn(
             },
             event_id_prefix: event_prefix,
             error: if res.ok { None } else { Some(res.stderr) },
+            output_tokens: Some(output_tokens),
+            input_tokens,
+            cache_read_tokens,
+            tokens_per_second,
+            wall_ms: Some(res.wall_ms),
         }),
     )
 }
