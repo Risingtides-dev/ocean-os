@@ -16939,7 +16939,10 @@ mod tests {
         // SOPs remain empty (no on-disk SOP source). Workflows are populated by
         // WorkflowIndex when a docs/orchestrator/workflows/ dir exists in the cwd;
         // this test's cwd has none, so workflows is also empty here.
-        assert!(prep.sops.is_empty(), "SOPs must remain empty — no on-disk source");
+        assert!(
+            prep.sops.is_empty(),
+            "SOPs must remain empty — no on-disk source"
+        );
         // Workflows: this test cwd has no workflow dir, so must be empty.
         assert!(
             prep.workflows.is_empty(),

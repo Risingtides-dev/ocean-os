@@ -540,8 +540,7 @@ impl WorkflowIndex {
         });
 
         // De-dupe by (name, source_path) — same discipline as skills.
-        let mut seen: std::collections::HashSet<(&str, &Path)> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
         scored
             .into_iter()
             .filter(|(_, wf)| seen.insert((wf.name.as_str(), wf.source_path.as_path())))
@@ -1512,7 +1511,10 @@ mod tests {
             dir: Some(PathBuf::from("/nonexistent/docs/orchestrator/workflows")),
         };
         let index = WorkflowIndex::load_from(&roots);
-        assert!(index.is_empty(), "missing dir must yield empty, not an error");
+        assert!(
+            index.is_empty(),
+            "missing dir must yield empty, not an error"
+        );
     }
 
     /// A workflow .md with no frontmatter (or a `name:` that's empty) is skipped.
@@ -1533,7 +1535,10 @@ mod tests {
         );
         let roots = WorkflowRoots::for_cwd(tmp.path());
         let index = WorkflowIndex::load_from(&roots);
-        assert!(index.is_empty(), "workflow docs without a name must be skipped");
+        assert!(
+            index.is_empty(),
+            "workflow docs without a name must be skipped"
+        );
     }
 
     /// `prepare()` with a cwd that contains a matching workflow doc populates
