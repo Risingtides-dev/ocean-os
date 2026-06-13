@@ -77,10 +77,13 @@ one checkout collide.
 **Git hygiene.** After every merge: return the main checkout to `main`, pull,
 delete the merged branch, remove its worktree. Branches do not accumulate.
 
-**Deploy discipline.** Build and deploy only from up-to-date `main`. Never restart
-the daemon while turns are in flight — and check **agent turns** (the events/log
-activity), not just the legacy `/v1/requests` endpoint, which misses them. Deploy
-only when John authorizes it or has granted standing authorization.
+**Deploy discipline.** Build and deploy only from up-to-date `main`. Standing
+authorization is granted: the loop may build, deploy, and **restart/redeploy the
+daemon** freely from main after merges — no per-deploy approval needed. Prefer a
+moment with no agent turn mid-render (check **agent turns** via events/log activity
+or `/metrics ocean_turns_in_flight`, not the legacy `/v1/requests` which misses
+them), but a restart that drops an in-flight turn is an acceptable cost, not a
+blocker. Keep moving.
 
 **Honest verification.** Before reporting anything done: run the verification
 (tests, health checks, ticket state read-back) and report what actually happened,
