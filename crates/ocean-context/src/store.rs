@@ -67,8 +67,10 @@ pub fn to_markdown(h: &Handoff) -> Result<String> {
         claims: Vec::new(), // never serialized; see FrontMatter
     };
     let scalar_toml = toml::to_string(&fm).context("serializing handoff frontmatter")?;
-    let claims_toml = toml::to_string(&ClaimsBlock { claims: h.claims.clone() })
-        .context("serializing handoff claims")?;
+    let claims_toml = toml::to_string(&ClaimsBlock {
+        claims: h.claims.clone(),
+    })
+    .context("serializing handoff claims")?;
     let fence = fence_for(&claims_toml);
     Ok(format!(
         "{DELIM}\n{scalar_toml}{DELIM}\n\n{fence}{CLAIMS_FENCE_TAG}\n{claims_toml}{fence}\n\n{}",
@@ -81,8 +83,12 @@ pub fn to_markdown(h: &Handoff) -> Result<String> {
 /// (old format); a present-but-unparseable block is a hard error, never
 /// silently demoted to narrative.
 fn split_claims_block(body: &str) -> Result<Option<(Vec<Claim>, String)>> {
-    let Some(rest) = body.strip_prefix("\n\n") else { return Ok(None) };
-    let Some(line_end) = rest.find('\n') else { return Ok(None) };
+    let Some(rest) = body.strip_prefix("\n\n") else {
+        return Ok(None);
+    };
+    let Some(line_end) = rest.find('\n') else {
+        return Ok(None);
+    };
     let first_line = &rest[..line_end];
     let ticks = first_line.len() - first_line.trim_start_matches('`').len();
     if ticks < 3 || &first_line[ticks..] != CLAIMS_FENCE_TAG {
@@ -93,7 +99,9 @@ fn split_claims_block(body: &str) -> Result<Option<(Vec<Claim>, String)>> {
     // The writer guarantees no content line starts with `ticks` backticks, so
     // the first line equal to the fence is the close.
     let close = format!("\n{fence}\n");
-    let close_idx = content.find(&close).context("missing closing claims fence")?;
+    let close_idx = content
+        .find(&close)
+        .context("missing closing claims fence")?;
     let block: ClaimsBlock =
         toml::from_str(&content[..close_idx + 1]).context("parsing handoff claims block")?;
     // The writer separates the closing fence from the narrative with exactly
@@ -105,7 +113,9 @@ fn split_claims_block(body: &str) -> Result<Option<(Vec<Claim>, String)>> {
 }
 
 pub fn from_markdown(text: &str) -> Result<Handoff> {
-    let rest = text.strip_prefix(DELIM).context("missing opening +++ frontmatter delimiter")?;
+    let rest = text
+        .strip_prefix(DELIM)
+        .context("missing opening +++ frontmatter delimiter")?;
     let rest = rest.strip_prefix('\n').unwrap_or(rest);
     // In the old format the closing "\n+++" could also appear inside a TOML
     // multi-line string (a claim text with a line starting "+++"), so try each
@@ -129,7 +139,10 @@ pub fn from_markdown(text: &str) -> Result<Handoff> {
         Some((claims, narrative)) => (claims, narrative),
         // Old format: claims lived in the frontmatter, narrative follows the
         // closing delimiter after exactly one blank line.
-        None => (fm.claims, body.strip_prefix("\n\n").unwrap_or(body).to_string()),
+        None => (
+            fm.claims,
+            body.strip_prefix("\n\n").unwrap_or(body).to_string(),
+        ),
     };
     Ok(Handoff {
         session_id: fm.session_id,
@@ -147,7 +160,13 @@ pub fn from_markdown(text: &str) -> Result<Handoff> {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -187,7 +206,10 @@ pub fn read_freshest(dir: &Path, repo: &str, branch: &str) -> Result<Option<Hand
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".handoff.md")) {
+        if !path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(".handoff.md"))
+        {
             continue;
         }
         let text = fs::read_to_string(&path)?;
@@ -198,7 +220,10 @@ pub fn read_freshest(dir: &Path, repo: &str, branch: &str) -> Result<Option<Hand
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("ocean-context: skipping unparseable {}: {e}", path.display()),
+            Err(e) => eprintln!(
+                "ocean-context: skipping unparseable {}: {e}",
+                path.display()
+            ),
         }
     }
     Ok(best)
@@ -233,7 +258,10 @@ mod tests {
         };
         let mut h = sample_handoff();
         h.parent_session = Some("sess-parent".into());
-        h.velocity_at_write = Velocity { v_code: 0.25, v_sem: 0.125 };
+        h.velocity_at_write = Velocity {
+            v_code: 0.25,
+            v_sem: 0.125,
+        };
         h.narrative =
             "\nleading newline kept\n+++\nnot a delimiter\n```toml\nx = 1\n```\ntrailing\n".into();
         h.claims = vec![
@@ -360,11 +388,17 @@ The old prose narrative.
         assert_eq!(h.session_id, "sess-1");
         assert_eq!(h.claims.len(), 2);
         assert_eq!(h.claims[0].provenance.tickets, vec!["OCEAN-16".to_string()]);
-        assert_eq!(h.claims[0].provenance.anchors[0].file.as_deref(), Some("Cargo.toml"));
+        assert_eq!(
+            h.claims[0].provenance.anchors[0].file.as_deref(),
+            Some("Cargo.toml")
+        );
         // Legacy `file = ""` sentinel normalizes to typed absence on load
         // (Codex P2 round 2 on PR #205).
         assert_eq!(h.claims[1].provenance.anchors[0].file, None);
-        assert_eq!(h.claims[1].provenance.anchors[0].symbol.as_deref(), Some("workspace.members"));
+        assert_eq!(
+            h.claims[1].provenance.anchors[0].symbol.as_deref(),
+            Some("workspace.members")
+        );
         assert_eq!(h.narrative, "The old prose narrative.\n");
         // Re-writing lands in the current format, fenced claims block intact.
         let rewritten = to_markdown(&h).unwrap();
@@ -401,8 +435,12 @@ The old prose narrative.
         write_handoff(dir.path(), &new).unwrap();
         write_handoff(dir.path(), &other_branch).unwrap();
 
-        let got = read_freshest(dir.path(), "ocean-os", "main").unwrap().unwrap();
+        let got = read_freshest(dir.path(), "ocean-os", "main")
+            .unwrap()
+            .unwrap();
         assert_eq!(got.session_id, "sess-new");
-        assert!(read_freshest(dir.path(), "ocean-os", "nope").unwrap().is_none());
+        assert!(read_freshest(dir.path(), "ocean-os", "nope")
+            .unwrap()
+            .is_none());
     }
 }

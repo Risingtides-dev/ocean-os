@@ -59,9 +59,7 @@ pub const MAX_LIST_LIMIT: usize = 1000;
 /// ⇒ [`DEFAULT_LIST_LIMIT`]; any value is capped at [`MAX_LIST_LIMIT`] and
 /// floored at 1 so `0` can never request an empty-yet-`has_more` page.
 pub fn clamp_list_limit(limit: Option<usize>) -> usize {
-    limit
-        .unwrap_or(DEFAULT_LIST_LIMIT)
-        .clamp(1, MAX_LIST_LIMIT)
+    limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT)
 }
 
 /// One bounded page of a collection list (OCEAN-250).
@@ -321,10 +319,7 @@ impl AgentRuntime {
     ///    the registry lock is released, so a concurrent `session_lock` call
     ///    can't prune it out from under us either.
     fn session_lock(&self, id: SessionId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self
-            .session_locks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut map = self.session_locks.lock().unwrap_or_else(|p| p.into_inner());
         // Drop entries no active turn holds. Safe to run before inserting `id`:
         // it only ever touches OTHER entries (an existing `id` entry is, by
         // definition, currently held by this caller's in-flight turn and so has
@@ -490,8 +485,7 @@ impl AgentRuntime {
             None => None,
         };
         let global_snapshot = self.snapshot();
-        let turn_snapshot: RuntimeState =
-            turn_state.unwrap_or_else(|| global_snapshot.clone());
+        let turn_snapshot: RuntimeState = turn_state.unwrap_or_else(|| global_snapshot.clone());
 
         // Resolve the environment ONCE for the whole failover decision (selection
         // + connect-failure), so the fallback list is computed against a single
@@ -659,7 +653,10 @@ impl AgentRuntime {
         env: &ProviderEnv,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         let failed_provider = state.provider_config.selection.provider.clone();
-        match self.dispatch_turn(req.clone(), control.clone(), &state).await {
+        match self
+            .dispatch_turn(req.clone(), control.clone(), &state)
+            .await
+        {
             Ok(ok) => Ok(ok),
             Err(e) => {
                 if !failover_eligible(&e) {
@@ -1137,9 +1134,7 @@ impl AgentRuntime {
         if snapshot.provider_config.selection.provider == ProviderId::Fake
             && snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL
         {
-            cfg = cfg.with_provider(std::sync::Arc::new(
-                ocean_runtime::FakeToolProvider::new(),
-            ));
+            cfg = cfg.with_provider(std::sync::Arc::new(ocean_runtime::FakeToolProvider::new()));
         }
         // OCEAN-150: the keyless `fake-surface` model scripts one `surface_patch`
         // tool call through the same seam, so the daemon SurfacePatch SSE bridge
@@ -1240,7 +1235,7 @@ impl AgentRuntime {
                     // to the concrete `AgentError`/protocol cause.
                     error: anyhow::Error::new(e),
                 }
-                .into())
+                .into());
             }
         };
         // Cap what we persist. The agent loop already trims per-send to the
@@ -1606,9 +1601,10 @@ async fn discover_plugin_providers(config_dir: &Path) -> Vec<Arc<dyn CapabilityP
         // connect() never errors on plugin-side failure: a plugin that can't
         // list tools becomes an empty, Unavailable provider rather than aborting
         // discovery.
-        let provider =
-            ocean_plugin::PluginProvider::connect(Arc::new(plugin) as Arc<dyn ocean_plugin::Plugin>)
-                .await;
+        let provider = ocean_plugin::PluginProvider::connect(
+            Arc::new(plugin) as Arc<dyn ocean_plugin::Plugin>
+        )
+        .await;
         providers.push(Arc::new(provider));
     }
 
@@ -2557,8 +2553,8 @@ mod tests {
 
     /// Backdate a file's mtime by `days` so the GC sees it as aged.
     fn backdate(path: &Path, days: u64) {
-        let when = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        let when =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
         let f = std::fs::File::options().write(true).open(path).unwrap();
         f.set_modified(when).unwrap();
     }
@@ -3546,7 +3542,10 @@ done
         // Both deepseek and anthropic are credentialed; override puts deepseek
         // first, so it must win over the default anthropic-first order.
         let env = provider_env(&[
-            ("OCEAN_PROVIDER_FALLBACK", "deepseek-v4-pro, claude-opus-4-7"),
+            (
+                "OCEAN_PROVIDER_FALLBACK",
+                "deepseek-v4-pro, claude-opus-4-7",
+            ),
             ("ANTHROPIC_API_KEY", "sk-ant"),
             ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
         ]);
@@ -3560,12 +3559,10 @@ done
     fn failover_eligible_for_prestream_availability_error() {
         let err: anyhow::Error = TurnFailure {
             streamed_output: false,
-            error: anyhow::Error::new(AgentError::Provider(
-                ocean_protocol::Error::ProviderError {
-                    status: 503,
-                    body: "overloaded".into(),
-                },
-            )),
+            error: anyhow::Error::new(AgentError::Provider(ocean_protocol::Error::ProviderError {
+                status: 503,
+                body: "overloaded".into(),
+            })),
         }
         .into();
         assert!(failover_eligible(&err));
@@ -3578,12 +3575,10 @@ done
     fn no_failover_after_output_streamed_even_on_availability_error() {
         let err: anyhow::Error = TurnFailure {
             streamed_output: true,
-            error: anyhow::Error::new(AgentError::Provider(
-                ocean_protocol::Error::ProviderError {
-                    status: 503,
-                    body: "overloaded".into(),
-                },
-            )),
+            error: anyhow::Error::new(AgentError::Provider(ocean_protocol::Error::ProviderError {
+                status: 503,
+                body: "overloaded".into(),
+            })),
         }
         .into();
         assert!(
@@ -3598,12 +3593,10 @@ done
     fn no_failover_on_user_error() {
         let err: anyhow::Error = TurnFailure {
             streamed_output: false,
-            error: anyhow::Error::new(AgentError::Provider(
-                ocean_protocol::Error::ProviderError {
-                    status: 400,
-                    body: "bad request".into(),
-                },
-            )),
+            error: anyhow::Error::new(AgentError::Provider(ocean_protocol::Error::ProviderError {
+                status: 400,
+                body: "bad request".into(),
+            })),
         }
         .into();
         assert!(!failover_eligible(&err));
@@ -3772,7 +3765,10 @@ done
         assert_eq!(deltas[0].1, "OCEAN_FAKE_OK");
         // The delta must carry the turn's session id so the daemon bridge can
         // scope the AssistantTextDelta to the `?session_id=` subscriber.
-        assert_eq!(deltas[0].0.as_deref(), Some(session_id.to_string().as_str()));
+        assert_eq!(
+            deltas[0].0.as_deref(),
+            Some(session_id.to_string().as_str())
+        );
 
         let _ = std::fs::remove_dir_all(config_dir);
     }
@@ -4236,7 +4232,9 @@ done
         let mut names: Vec<String> = page1.items.iter().map(|p| p.name.clone()).collect();
         let mut after = Some(cursor);
         loop {
-            let page = runtime.list_projects_page(after.as_deref(), Some(2)).unwrap();
+            let page = runtime
+                .list_projects_page(after.as_deref(), Some(2))
+                .unwrap();
             names.extend(page.items.iter().map(|p| p.name.clone()));
             match page.next_cursor {
                 Some(c) => after = Some(c),
@@ -4277,7 +4275,11 @@ done
         let page2 = runtime
             .list_sessions_page(None, Some(&cursor), Some(2))
             .unwrap();
-        assert_eq!(page2.items.len(), 1, "one session left after the first page");
+        assert_eq!(
+            page2.items.len(),
+            1,
+            "one session left after the first page"
+        );
         assert!(!page2.has_more);
         assert_eq!(page2.next_cursor, None);
 

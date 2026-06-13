@@ -341,7 +341,8 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         if n >= 2 {
             if let Some(arr) = body["messages"].as_array_mut() {
                 let target = n - 2;
-                if let Some(content) = arr[target].get_mut("content").and_then(Value::as_array_mut) {
+                if let Some(content) = arr[target].get_mut("content").and_then(Value::as_array_mut)
+                {
                     if let Some(last_block) = content.last_mut() {
                         if let Some(obj) = last_block.as_object_mut() {
                             obj.insert("cache_control".into(), cache_control());
@@ -747,7 +748,11 @@ mod tests {
     // prefix caches and only the freshest turn is re-billed.
     #[test]
     fn anthropic_build_body_emits_cache_control_at_intended_positions() {
-        let body = build_body(&anthropic_model(), &ctx_with_history(), &StreamOptions::default());
+        let body = build_body(
+            &anthropic_model(),
+            &ctx_with_history(),
+            &StreamOptions::default(),
+        );
 
         // (1) Last tool carries the breakpoint; earlier tools do not.
         let tools = body["tools"].as_array().expect("tools array");
@@ -762,7 +767,9 @@ mod tests {
         );
 
         // (2) System prompt became a text-block array with a breakpoint.
-        let system = body["system"].as_array().expect("system must be a block array");
+        let system = body["system"]
+            .as_array()
+            .expect("system must be a block array");
         assert_eq!(system[0]["type"], "text");
         assert_eq!(system[0]["text"], "You are a helpful assistant.");
         assert_eq!(
@@ -790,14 +797,21 @@ mod tests {
         // Never exceed Anthropic's 4-breakpoint limit.
         let serialized = serde_json::to_string(&body).unwrap();
         let count = serialized.matches("\"cache_control\"").count();
-        assert!(count <= 4, "must not exceed 4 cache breakpoints, found {count}: {body}");
+        assert!(
+            count <= 4,
+            "must not exceed 4 cache breakpoints, found {count}: {body}"
+        );
     }
 
     // Non-Anthropic models must get a clean body with no cache_control anywhere,
     // and the system prompt stays a plain string (no array conversion).
     #[test]
     fn non_anthropic_build_body_emits_no_cache_control() {
-        let body = build_body(&non_anthropic_model(), &ctx_with_history(), &StreamOptions::default());
+        let body = build_body(
+            &non_anthropic_model(),
+            &ctx_with_history(),
+            &StreamOptions::default(),
+        );
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(
             !serialized.contains("cache_control"),
@@ -859,8 +873,14 @@ mod tests {
         let u: UsageDelta = serde_json::from_str(wire).expect("partial usage decodes");
         assert_eq!(u.input_tokens, 42);
         assert_eq!(u.output_tokens, 7);
-        assert_eq!(u.cache_read_input_tokens, 0, "missing cache_read must default to 0");
-        assert_eq!(u.cache_creation_input_tokens, 0, "missing cache_write must default to 0");
+        assert_eq!(
+            u.cache_read_input_tokens, 0,
+            "missing cache_read must default to 0"
+        );
+        assert_eq!(
+            u.cache_creation_input_tokens, 0,
+            "missing cache_write must default to 0"
+        );
     }
 
     // OCEAN-198: an entirely empty usage object still decodes (all defaults) —
@@ -879,8 +899,12 @@ mod tests {
     #[test]
     fn anthropic_unknown_sse_event_decodes_to_other() {
         let wire = r#"{"type": "message_resume", "foo": 1}"#;
-        let ev: SseEvent = serde_json::from_str(wire).expect("unknown event must not fail to parse");
-        assert!(matches!(ev, SseEvent::Other), "unknown event type must map to Other");
+        let ev: SseEvent =
+            serde_json::from_str(wire).expect("unknown event must not fail to parse");
+        assert!(
+            matches!(ev, SseEvent::Other),
+            "unknown event type must map to Other"
+        );
     }
 
     // OCEAN-101 / OCEAN-198: an unmapped content_block_start kind (e.g.
@@ -893,12 +917,18 @@ mod tests {
         // A redacted_thinking block_start is an Other block (no Content variant).
         let block = r#"{"type": "redacted_thinking", "data": "xyz"}"#;
         let bs: BlockStart = serde_json::from_str(block).expect("unmapped block kind decodes");
-        assert!(matches!(bs, BlockStart::Other), "unmapped block kind must map to Other");
+        assert!(
+            matches!(bs, BlockStart::Other),
+            "unmapped block kind must map to Other"
+        );
 
         // An unmapped block_delta kind likewise decodes to Other, not an error.
         let delta = r#"{"type": "citations_delta", "citation": {}}"#;
         let bd: BlockDelta = serde_json::from_str(delta).expect("unmapped delta kind decodes");
-        assert!(matches!(bd, BlockDelta::Other), "unmapped delta kind must map to Other");
+        assert!(
+            matches!(bd, BlockDelta::Other),
+            "unmapped delta kind must map to Other"
+        );
     }
 
     // OCEAN-198: a tool_use input_json_delta assembled across multiple fragments
@@ -936,13 +966,21 @@ mod tests {
         } else {
             serde_json::from_str(&empty).unwrap_or(Value::Object(Default::default()))
         };
-        assert_eq!(args, json!({}), "empty tool args must finalize to an empty object");
+        assert_eq!(
+            args,
+            json!({}),
+            "empty tool args must finalize to an empty object"
+        );
 
         // Truncated/malformed JSON → {} (no panic), exactly like the loop's
         // unwrap_or fallback.
         let bad = "{\"path\": \"/tmp".to_string();
         let args2: Value = serde_json::from_str(&bad).unwrap_or(Value::Object(Default::default()));
-        assert_eq!(args2, json!({}), "malformed tool args must fall back to an empty object, not panic");
+        assert_eq!(
+            args2,
+            json!({}),
+            "malformed tool args must fall back to an empty object, not panic"
+        );
     }
 
     // With a single message there is no stable history yet, so the rolling

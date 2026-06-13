@@ -49,7 +49,10 @@ fn main() {
             "invoke_tool" => {
                 let params = msg.get("params").cloned().unwrap_or_default();
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let args = params.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                let args = params
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 if name == "echo" {
                     serde_json::json!({
                         "jsonrpc": "2.0",

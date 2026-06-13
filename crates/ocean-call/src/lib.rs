@@ -52,7 +52,7 @@ pub use stt_deepgram::{
     build_ws_url, parse_results, pcm_to_le_bytes, DeepgramConfig, SpeechActivity,
     SpeechActivityTracker, CLOSE_STREAM_MSG, DEEPGRAM_WS_URL,
 };
-pub use summarizer::{SummaryAction, SummaryPolicy, Summarizer};
+pub use summarizer::{Summarizer, SummaryAction, SummaryPolicy};
 pub use task_detector::{detect as detect_task, DetectedTask};
 pub use token::{
     mint_join_token, LiveKitTokenConfig, LiveKitTokenRequest, LiveKitTokenResponse, PublishGrant,

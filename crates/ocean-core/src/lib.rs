@@ -1217,9 +1217,7 @@ mod tests {
     /// it) — and `is_agent_mirror` keys on the canonical `"agent"` value.
     #[test]
     fn event_envelope_origin_marks_agent_mirrors_and_stays_wire_additive() {
-        let mut envelope = EventEnvelope::new(OceanEvent::AssistantDelta {
-            text: "hi".into(),
-        });
+        let mut envelope = EventEnvelope::new(OceanEvent::AssistantDelta { text: "hi".into() });
         assert!(!envelope.is_agent_mirror(), "default envelopes are genuine");
         let json = serde_json::to_value(&envelope).unwrap();
         assert!(

@@ -84,8 +84,15 @@ enum Source {
 
 impl TreeSitterResolver {
     fn git(&self, args: &[&str]) -> Option<String> {
-        let out = Command::new("git").arg("-C").arg(&self.repo_root).args(args).output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Fetch the anchor's blob at `at_commit` (or the working tree). At-commit
@@ -117,7 +124,10 @@ impl TreeSitterResolver {
         let spec = format!("{at_commit}:{file}");
         // Only blobs are hashable content; a tracked directory resolves as a
         // tree object — present, but opaque to parsing.
-        match self.git(&["cat-file", "-t", &spec]).map(|t| t.trim().to_string()) {
+        match self
+            .git(&["cat-file", "-t", &spec])
+            .map(|t| t.trim().to_string())
+        {
             Some(t) if t == "blob" => match self.git(&["show", &spec]) {
                 Some(text) => Source::Text(text),
                 None => Source::Missing,
@@ -137,7 +147,10 @@ impl TreeSitterResolver {
     /// an unknown/pruned commit (shallow or partial history), not a deleted
     /// file.
     fn commit_is_readable(&self, rev: &str) -> bool {
-        rev == WORKTREE || self.git(&["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_some()
+        rev == WORKTREE
+            || self
+                .git(&["cat-file", "-e", &format!("{rev}^{{commit}}")])
+                .is_some()
     }
 
     /// True if any component of the repo-relative `file` (the leaf or an
@@ -190,7 +203,9 @@ impl TreeSitterResolver {
         if !is_repo_relative(file) {
             return None;
         }
-        let Source::Text(text) = self.load(file, at_commit) else { return None };
+        let Source::Text(text) = self.load(file, at_commit) else {
+            return None;
+        };
         match anchor.symbol.as_deref() {
             Some(symbol) => probe_symbol(language_of(file)?, &text, symbol).found(),
             None => Some(fnv1a64(&text)),
@@ -291,12 +306,18 @@ impl Resolver for TreeSitterResolver {
     /// basename that matches elsewhere keeps its weak ambiguous-location
     /// semantics instead. An unparseable birth revision is `Unparseable`.
     fn baseline_at(&self, anchor: &Anchor, at_commit: &str) -> Baseline {
-        let Some(file) = anchor.file.as_deref() else { return Baseline::Unsupported };
+        let Some(file) = anchor.file.as_deref() else {
+            return Baseline::Unsupported;
+        };
         if !is_repo_relative(file) {
             return Baseline::Unsupported;
         }
-        let Some(symbol) = anchor.symbol.as_deref() else { return Baseline::Unsupported };
-        let Some(lang) = language_of(file) else { return Baseline::Unsupported };
+        let Some(symbol) = anchor.symbol.as_deref() else {
+            return Baseline::Unsupported;
+        };
+        let Some(lang) = language_of(file) else {
+            return Baseline::Unsupported;
+        };
         match self.load(file, at_commit) {
             Source::Missing => {
                 if self.basename_resolves(file, at_commit) {
@@ -365,7 +386,6 @@ fn fnv1a64(s: &str) -> String {
     }
     format!("{h:016x}")
 }
-
 
 // ---------------------------------------------------------------------------
 // Rust: tree-sitter symbol location + signature shape
@@ -540,7 +560,8 @@ fn base_type_name(type_text: &str) -> &str {
 /// skipped: prose churn is not structure.
 fn signature_text(node: Node, source: &str) -> String {
     let end_limit = if BODYLESS_SIG_KINDS.contains(&node.kind()) {
-        node.child_by_field_name("body").map_or(node.end_byte(), |b| b.start_byte())
+        node.child_by_field_name("body")
+            .map_or(node.end_byte(), |b| b.start_byte())
     } else {
         node.end_byte()
     };
@@ -668,14 +689,17 @@ fn collect_ts_sigs(
     sigs: &mut Vec<String>,
 ) {
     let matched = TS_NAMED_KINDS.contains(&node.kind())
-        && node.child_by_field_name("name").is_some_and(|n| node_text(n, source) == want);
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|n| node_text(n, source) == want);
     if matched && scope_matches(scope, qual) {
         sigs.push(ts_signature_text(node, source));
     }
     // TS scopes are single-named (class/interface/namespace/enum) — one
     // alternative per level, unlike Rust impls which answer to two.
     let entered = if TS_SCOPE_KINDS.contains(&node.kind()) {
-        node.child_by_field_name("name").map(|n| vec![node_text(n, source).to_string()])
+        node.child_by_field_name("name")
+            .map(|n| vec![node_text(n, source).to_string()])
     } else {
         None
     };
@@ -704,10 +728,15 @@ fn ts_signature_text(node: Node, source: &str) -> String {
         if let Some(body) = node.child_by_field_name("body") {
             end_limit = body.start_byte();
         }
-    } else if matches!(node.kind(), "variable_declarator" | "public_field_definition") {
+    } else if matches!(
+        node.kind(),
+        "variable_declarator" | "public_field_definition"
+    ) {
         if let Some(value) = node.child_by_field_name("value") {
-            if matches!(value.kind(), "arrow_function" | "function_expression" | "generator_function")
-            {
+            if matches!(
+                value.kind(),
+                "arrow_function" | "function_expression" | "generator_function"
+            ) {
                 if let Some(body) = value.child_by_field_name("body") {
                     end_limit = body.start_byte();
                 }
@@ -759,7 +788,10 @@ mod tests {
         let ha = ts_sig_hash(a, "requiresPermission", false);
         let hb = ts_sig_hash(b, "requiresPermission", false);
         assert!(matches!(ha, SymbolProbe::Found(_)));
-        assert_eq!(ha, hb, "function-expression body churn must not flip the hash");
+        assert_eq!(
+            ha, hb,
+            "function-expression body churn must not flip the hash"
+        );
         // A signature change (return type) MUST flip it.
         let c = "const requiresPermission = function(action: string): number { return 1; }\n";
         assert_ne!(ha, ts_sig_hash(c, "requiresPermission", false));
@@ -779,10 +811,17 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
 
     #[test]
     fn rust_symbol_found_and_hash_is_stable() {
-        let a = rust_sig_hash(RUST_SRC, "requires_permission").found().unwrap();
-        let b = rust_sig_hash(RUST_SRC, "requires_permission").found().unwrap();
+        let a = rust_sig_hash(RUST_SRC, "requires_permission")
+            .found()
+            .unwrap();
+        let b = rust_sig_hash(RUST_SRC, "requires_permission")
+            .found()
+            .unwrap();
         assert_eq!(a, b);
-        assert_eq!(rust_sig_hash(RUST_SRC, "no_such_symbol"), SymbolProbe::Absent);
+        assert_eq!(
+            rust_sig_hash(RUST_SRC, "no_such_symbol"),
+            SymbolProbe::Absent
+        );
     }
 
     #[test]
@@ -796,8 +835,10 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
 
     #[test]
     fn rust_signature_edit_changes_the_hash() {
-        let edited = RUST_SRC
-            .replace("requires_permission(&self, action: &str)", "requires_permission(&self)");
+        let edited = RUST_SRC.replace(
+            "requires_permission(&self, action: &str)",
+            "requires_permission(&self)",
+        );
         assert_ne!(
             rust_sig_hash(RUST_SRC, "requires_permission"),
             rust_sig_hash(&edited, "requires_permission"),
@@ -819,7 +860,10 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
     #[test]
     fn rust_struct_field_change_changes_the_hash() {
         let edited = RUST_SRC.replace("pub level: u8", "pub level: u32");
-        assert_ne!(rust_sig_hash(RUST_SRC, "Gate"), rust_sig_hash(&edited, "Gate"));
+        assert_ne!(
+            rust_sig_hash(RUST_SRC, "Gate"),
+            rust_sig_hash(&edited, "Gate")
+        );
     }
 
     #[test]
@@ -833,17 +877,33 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
                          mod b { pub fn run(x: u8, strict: bool) -> bool { x > 0 } }\n";
         let a_hash = rust_sig_hash(two, "a::run");
         assert!(matches!(a_hash, SymbolProbe::Found(_)));
-        assert_eq!(a_hash, rust_sig_hash(b_changed, "a::run"), "b::run noise must not leak into a::run");
-        assert_ne!(rust_sig_hash(two, "b::run"), rust_sig_hash(b_changed, "b::run"));
+        assert_eq!(
+            a_hash,
+            rust_sig_hash(b_changed, "a::run"),
+            "b::run noise must not leak into a::run"
+        );
+        assert_ne!(
+            rust_sig_hash(two, "b::run"),
+            rust_sig_hash(b_changed, "b::run")
+        );
         // The unqualified anchor still hashes every same-named item.
         assert_ne!(rust_sig_hash(two, "run"), rust_sig_hash(b_changed, "run"));
         // A qualifier naming a scope that doesn't contain the item: Absent.
-        assert_eq!(rust_sig_hash(RUST_SRC, "gate::free_standing"), SymbolProbe::Absent);
+        assert_eq!(
+            rust_sig_hash(RUST_SRC, "gate::free_standing"),
+            SymbolProbe::Absent
+        );
         // Leading `crate::` is path noise, not a scope.
-        assert_eq!(rust_sig_hash(two, "crate::a::run"), rust_sig_hash(two, "a::run"));
+        assert_eq!(
+            rust_sig_hash(two, "crate::a::run"),
+            rust_sig_hash(two, "a::run")
+        );
         // Impl-qualified methods: `Gate::requires_permission` matches the
         // method inside `impl Gate`, and only that.
-        assert!(matches!(rust_sig_hash(RUST_SRC, "Gate::requires_permission"), SymbolProbe::Found(_)));
+        assert!(matches!(
+            rust_sig_hash(RUST_SRC, "Gate::requires_permission"),
+            SymbolProbe::Found(_)
+        ));
     }
 
     #[test]
@@ -854,12 +914,21 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
         let src = "trait MyTrait { fn check(&self) -> bool; }\n\
                    struct Gate;\n\
                    impl MyTrait for Gate { fn check(&self) -> bool { true } }\n";
-        assert!(matches!(rust_sig_hash(src, "MyTrait::check"), SymbolProbe::Found(_)));
-        assert!(matches!(rust_sig_hash(src, "Gate::check"), SymbolProbe::Found(_)));
+        assert!(matches!(
+            rust_sig_hash(src, "MyTrait::check"),
+            SymbolProbe::Found(_)
+        ));
+        assert!(matches!(
+            rust_sig_hash(src, "Gate::check"),
+            SymbolProbe::Found(_)
+        ));
         assert_eq!(rust_sig_hash(src, "Other::check"), SymbolProbe::Absent);
         // The trait's own signature item also answers to MyTrait::check —
         // both the declaration and the impl hash together, stably.
-        assert_eq!(rust_sig_hash(src, "MyTrait::check"), rust_sig_hash(src, "MyTrait::check"));
+        assert_eq!(
+            rust_sig_hash(src, "MyTrait::check"),
+            rust_sig_hash(src, "MyTrait::check")
+        );
     }
 
     #[test]
@@ -868,7 +937,10 @@ pub fn free_standing(x: i32) -> i32 { x + 1 }
         // method to the impl must NOT change the hash (impl body excluded).
         let with_method =
             RUST_SRC.replace("}\n\npub fn", "    pub fn extra(&self) {}\n}\n\npub fn");
-        assert_eq!(rust_sig_hash(RUST_SRC, "Gate"), rust_sig_hash(&with_method, "Gate"));
+        assert_eq!(
+            rust_sig_hash(RUST_SRC, "Gate"),
+            rust_sig_hash(&with_method, "Gate")
+        );
     }
 
     const TOML_SRC: &str = r#"
@@ -882,10 +954,18 @@ edition = "2021"
 
     #[test]
     fn toml_dotted_path_found_and_value_change_changes_hash() {
-        let h = toml_sig_hash(TOML_SRC, "workspace.members").found().unwrap();
+        let h = toml_sig_hash(TOML_SRC, "workspace.members")
+            .found()
+            .unwrap();
         let grown = TOML_SRC.replace(r#""crates/b"]"#, r#""crates/b", "crates/c"]"#);
-        assert_ne!(h, toml_sig_hash(&grown, "workspace.members").found().unwrap());
-        assert_eq!(toml_sig_hash(TOML_SRC, "workspace.nope"), SymbolProbe::Absent);
+        assert_ne!(
+            h,
+            toml_sig_hash(&grown, "workspace.members").found().unwrap()
+        );
+        assert_eq!(
+            toml_sig_hash(TOML_SRC, "workspace.nope"),
+            SymbolProbe::Absent
+        );
         assert_eq!(toml_sig_hash(TOML_SRC, "nope"), SymbolProbe::Absent);
     }
 
@@ -945,12 +1025,27 @@ export enum Mode { Open, Closed }
 
     #[test]
     fn ts_symbol_found_and_hash_is_stable() {
-        let a = ts_sig_hash(TS_SRC, "requiresPermission", false).found().unwrap();
-        let b = ts_sig_hash(TS_SRC, "requiresPermission", false).found().unwrap();
+        let a = ts_sig_hash(TS_SRC, "requiresPermission", false)
+            .found()
+            .unwrap();
+        let b = ts_sig_hash(TS_SRC, "requiresPermission", false)
+            .found()
+            .unwrap();
         assert_eq!(a, b);
-        assert_eq!(ts_sig_hash(TS_SRC, "noSuchSymbol", false), SymbolProbe::Absent);
+        assert_eq!(
+            ts_sig_hash(TS_SRC, "noSuchSymbol", false),
+            SymbolProbe::Absent
+        );
         // every named-kind class is reachable
-        for sym in ["Gate", "PermissionCheck", "checkAll", "freeStanding", "GateLevel", "Mode", "level"] {
+        for sym in [
+            "Gate",
+            "PermissionCheck",
+            "checkAll",
+            "freeStanding",
+            "GateLevel",
+            "Mode",
+            "level",
+        ] {
             assert!(
                 matches!(ts_sig_hash(TS_SRC, sym, false), SymbolProbe::Found(_)),
                 "{sym} should be found"
@@ -960,7 +1055,10 @@ export enum Mode { Open, Closed }
 
     #[test]
     fn ts_body_edit_does_not_change_hash() {
-        let edited = TS_SRC.replace("action !== \"read\"", "action !== \"read\" && action !== \"list\"");
+        let edited = TS_SRC.replace(
+            "action !== \"read\"",
+            "action !== \"read\" && action !== \"list\"",
+        );
         assert_eq!(
             ts_sig_hash(TS_SRC, "Gate.requiresPermission", false),
             ts_sig_hash(&edited, "Gate.requiresPermission", false),
@@ -984,8 +1082,10 @@ export enum Mode { Open, Closed }
             ts_sig_hash(&edited, "requiresPermission", false),
         );
         // arrow param change flips the declarator shape
-        let arrow_edited =
-            TS_SRC.replace("(actions: string[]): boolean =>", "(actions: string[], max: number): boolean =>");
+        let arrow_edited = TS_SRC.replace(
+            "(actions: string[]): boolean =>",
+            "(actions: string[], max: number): boolean =>",
+        );
         assert_ne!(
             ts_sig_hash(TS_SRC, "checkAll", false),
             ts_sig_hash(&arrow_edited, "checkAll", false),
@@ -1001,9 +1101,16 @@ export enum Mode { Open, Closed }
     #[test]
     fn ts_symbol_gone_is_absent_and_broken_source_is_unparseable() {
         let gone = TS_SRC.replace("requiresPermission", "renamedGate");
-        assert_eq!(ts_sig_hash(&gone, "requiresPermission", false), SymbolProbe::Absent);
         assert_eq!(
-            ts_sig_hash("export function broken( ((((\n", "requiresPermission", false),
+            ts_sig_hash(&gone, "requiresPermission", false),
+            SymbolProbe::Absent
+        );
+        assert_eq!(
+            ts_sig_hash(
+                "export function broken( ((((\n",
+                "requiresPermission",
+                false
+            ),
             SymbolProbe::Unparseable
         );
     }
@@ -1019,7 +1126,10 @@ export enum Mode { Open, Closed }
         assert_ne!(TS_SRC, portal_changed, "replace must hit");
         let gate = ts_sig_hash(TS_SRC, "Gate.requiresPermission", false);
         assert!(matches!(gate, SymbolProbe::Found(_)));
-        assert_eq!(gate, ts_sig_hash(&portal_changed, "Gate.requiresPermission", false));
+        assert_eq!(
+            gate,
+            ts_sig_hash(&portal_changed, "Gate.requiresPermission", false)
+        );
         assert_ne!(
             ts_sig_hash(TS_SRC, "Portal.requiresPermission", false),
             ts_sig_hash(&portal_changed, "Portal.requiresPermission", false),
@@ -1032,7 +1142,10 @@ export enum Mode { Open, Closed }
         // `::` is accepted as a separator alias for `.`
         assert_eq!(gate, ts_sig_hash(TS_SRC, "Gate::requiresPermission", false));
         // a qualifier that names the wrong scope: Absent
-        assert_eq!(ts_sig_hash(TS_SRC, "Nope.requiresPermission", false), SymbolProbe::Absent);
+        assert_eq!(
+            ts_sig_hash(TS_SRC, "Nope.requiresPermission", false),
+            SymbolProbe::Absent
+        );
     }
 
     #[test]
@@ -1057,12 +1170,24 @@ export enum Mode { Open, Closed }
         let tsx = "export function Banner({ title }: { title: string }) {\n\
                    return <div className=\"banner\">{title}</div>;\n}\n";
         // the tsx grammar parses it…
-        assert!(matches!(ts_sig_hash(tsx, "Banner", true), SymbolProbe::Found(_)));
+        assert!(matches!(
+            ts_sig_hash(tsx, "Banner", true),
+            SymbolProbe::Found(_)
+        ));
         // …and a body-only JSX edit doesn't change the shape
         let edited = tsx.replace("banner", "banner wide");
-        assert_eq!(ts_sig_hash(tsx, "Banner", true), ts_sig_hash(&edited, "Banner", true));
-        let sig_edited = tsx.replace("{ title }: { title: string }", "{ title, big }: { title: string; big: boolean }");
-        assert_ne!(ts_sig_hash(tsx, "Banner", true), ts_sig_hash(&sig_edited, "Banner", true));
+        assert_eq!(
+            ts_sig_hash(tsx, "Banner", true),
+            ts_sig_hash(&edited, "Banner", true)
+        );
+        let sig_edited = tsx.replace(
+            "{ title }: { title: string }",
+            "{ title, big }: { title: string; big: boolean }",
+        );
+        assert_ne!(
+            ts_sig_hash(tsx, "Banner", true),
+            ts_sig_hash(&sig_edited, "Banner", true)
+        );
     }
 
     #[test]
@@ -1076,7 +1201,9 @@ export enum Mode { Open, Closed }
     // ---- worktree-mode resolver semantics (no git history needed) ----
 
     fn resolver_in(dir: &std::path::Path) -> TreeSitterResolver {
-        TreeSitterResolver { repo_root: dir.to_path_buf() }
+        TreeSitterResolver {
+            repo_root: dir.to_path_buf(),
+        }
     }
 
     fn anchor(file: Option<&str>, symbol: Option<&str>, sig_hash: Option<&str>) -> Anchor {
@@ -1099,7 +1226,12 @@ export enum Mode { Open, Closed }
             anchor(Some("/etc/hosts"), None, None),
             anchor(Some(""), Some("x"), None),
         ] {
-            assert_eq!(r.resolve(&a, WORKTREE), Resolution::Unresolvable, "{:?}", a.file);
+            assert_eq!(
+                r.resolve(&a, WORKTREE),
+                Resolution::Unresolvable,
+                "{:?}",
+                a.file
+            );
         }
     }
 
@@ -1108,10 +1240,16 @@ export enum Mode { Open, Closed }
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.md"), "# Proof / tuning method\n").unwrap();
         let r = resolver_in(dir.path());
-        assert_eq!(r.resolve(&anchor(Some("gone.rs"), None, None), WORKTREE), Resolution::Dead);
+        assert_eq!(
+            r.resolve(&anchor(Some("gone.rs"), None, None), WORKTREE),
+            Resolution::Dead
+        );
         // .md with a symbol: can't check the symbol — honest non-verdict.
         assert_eq!(
-            r.resolve(&anchor(Some("notes.md"), Some("Proof / tuning method"), None), WORKTREE),
+            r.resolve(
+                &anchor(Some("notes.md"), Some("Proof / tuning method"), None),
+                WORKTREE
+            ),
             Resolution::Unresolvable
         );
         // .md without a symbol: plain existence.
@@ -1148,7 +1286,11 @@ export enum Mode { Open, Closed }
         assert_eq!(r.resolve(&pinned, WORKTREE), Resolution::Stale);
 
         // symbol gone → Dead
-        std::fs::write(&path, RUST_SRC.replace("requires_permission", "renamed_gate")).unwrap();
+        std::fs::write(
+            &path,
+            RUST_SRC.replace("requires_permission", "renamed_gate"),
+        )
+        .unwrap();
         assert_eq!(r.resolve(&pinned, WORKTREE), Resolution::Dead);
         assert_eq!(r.resolve(&plain, WORKTREE), Resolution::Dead);
     }
@@ -1208,12 +1350,19 @@ export enum Mode { Open, Closed }
         assert_eq!(r.resolve(&plain, WORKTREE), Resolution::Resolves(1.0));
 
         let recorded = r.sig_hash_at(&plain, WORKTREE).unwrap();
-        let pinned = anchor(Some("Cargo.toml"), Some("workspace.members"), Some(&recorded));
+        let pinned = anchor(
+            Some("Cargo.toml"),
+            Some("workspace.members"),
+            Some(&recorded),
+        );
         assert_eq!(r.resolve(&pinned, WORKTREE), Resolution::Resolves(1.0));
 
         // THE Cargo.toml case: members content changes, file still exists.
-        std::fs::write(&path, TOML_SRC.replace(r#""crates/b"]"#, r#""crates/b", "crates/c"]"#))
-            .unwrap();
+        std::fs::write(
+            &path,
+            TOML_SRC.replace(r#""crates/b"]"#, r#""crates/b", "crates/c"]"#),
+        )
+        .unwrap();
         assert_eq!(r.resolve(&pinned, WORKTREE), Resolution::Stale);
 
         // key gone → Dead

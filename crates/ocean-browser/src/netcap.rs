@@ -65,9 +65,7 @@ impl BrowserHandle {
     /// `responseReceived` event. Idempotent-ish: calling again starts a fresh
     /// capture on the (current) active page. `cap` bounds the ring buffer.
     pub async fn start_netcap(&self, cap: usize) -> Result<()> {
-        use chromiumoxide::cdp::browser_protocol::network::{
-            EnableParams, EventResponseReceived,
-        };
+        use chromiumoxide::cdp::browser_protocol::network::{EnableParams, EventResponseReceived};
 
         let page = self.active_page().await?;
         // Turn on the Network domain so responseReceived events flow.
@@ -116,9 +114,7 @@ impl BrowserHandle {
     /// aren't buffered automatically (they can be huge) — fetch the ones you
     /// need by id from [`captured_requests`].
     pub async fn response_body(&self, request_id: &str) -> Result<String> {
-        use chromiumoxide::cdp::browser_protocol::network::{
-            GetResponseBodyParams, RequestId,
-        };
+        use chromiumoxide::cdp::browser_protocol::network::{GetResponseBodyParams, RequestId};
         let page = self.active_page().await?;
         let params = GetResponseBodyParams::new(RequestId::new(request_id));
         let body = page

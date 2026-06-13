@@ -138,7 +138,11 @@ fn parse_env_u64(key: &str) -> Option<u64> {
     match trimmed.parse::<u64>() {
         Ok(v) => Some(v),
         Err(_) => {
-            tracing::warn!(env = key, value = trimmed, "ignoring unparseable retry env var");
+            tracing::warn!(
+                env = key,
+                value = trimmed,
+                "ignoring unparseable retry env var"
+            );
             None
         }
     }
@@ -363,7 +367,10 @@ mod tests {
     fn retry_config_caches_once() {
         let a = retry_config();
         let b = retry_config();
-        assert!(std::ptr::eq(a, b), "accessor must return the cached instance");
+        assert!(
+            std::ptr::eq(a, b),
+            "accessor must return the cached instance"
+        );
         assert_eq!(a.max_attempts, b.max_attempts);
     }
 }

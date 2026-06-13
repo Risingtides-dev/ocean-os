@@ -308,7 +308,11 @@ impl BrowserHandle {
             use futures::StreamExt;
             while let Some(ev) = begins.next().await {
                 begin_sink
-                    .begin(ev.guid.clone(), ev.url.clone(), ev.suggested_filename.clone())
+                    .begin(
+                        ev.guid.clone(),
+                        ev.url.clone(),
+                        ev.suggested_filename.clone(),
+                    )
                     .await;
             }
         });
@@ -386,7 +390,10 @@ mod tests {
     fn collision_index_parses_chrome_renames() {
         // "report (1).pdf" → 1, against stem "report" / ext ".pdf".
         assert_eq!(collision_index("report (1).pdf", "report", ".pdf"), Some(1));
-        assert_eq!(collision_index("report (12).pdf", "report", ".pdf"), Some(12));
+        assert_eq!(
+            collision_index("report (12).pdf", "report", ".pdf"),
+            Some(12)
+        );
         // The exact name is not a collision variant.
         assert_eq!(collision_index("report.pdf", "report", ".pdf"), None);
         // Non-numeric / malformed.
@@ -437,7 +444,11 @@ mod tests {
         let now = std::time::SystemTime::now();
         // (2) is the fresher file; (1) is older. mtime resolution should land on
         // (2) regardless, and the index tiebreak agrees.
-        write_at(&dir.join("data (1).csv"), b"a", now - std::time::Duration::from_secs(60));
+        write_at(
+            &dir.join("data (1).csv"),
+            b"a",
+            now - std::time::Duration::from_secs(60),
+        );
         write_at(&dir.join("data (2).csv"), b"b", now);
 
         let tracker = DownloadTracker::new(dir.clone());
@@ -496,7 +507,7 @@ mod tests {
         let dir = scratch_dir("stale");
         let now = std::time::SystemTime::now();
         let old = now - std::time::Duration::from_secs(3600); // an hour ago
-        // Stale prior download — old mtime, base name.
+                                                              // Stale prior download — old mtime, base name.
         write_at(&dir.join("report.pdf"), b"OLD-stale-content", old);
         // This download — fresh mtime, collision variant.
         write_at(&dir.join("report (1).pdf"), b"NEW-this-download", now);
@@ -581,7 +592,11 @@ mod tests {
 
         let tracker = DownloadTracker::new(dir.clone());
         tracker
-            .begin("g".into(), "https://x/explicit.bin".into(), "explicit.bin".into())
+            .begin(
+                "g".into(),
+                "https://x/explicit.bin".into(),
+                "explicit.bin".into(),
+            )
             .await;
         // CDP handed us the exact final path.
         tracker
@@ -597,10 +612,7 @@ mod tests {
         let snap = tracker.snapshot().await;
         let info = &snap[0];
         assert!(info.exists);
-        assert_eq!(
-            std::path::Path::new(info.file_path.as_ref().unwrap()),
-            real
-        );
+        assert_eq!(std::path::Path::new(info.file_path.as_ref().unwrap()), real);
 
         std::fs::remove_dir_all(&dir).ok();
     }

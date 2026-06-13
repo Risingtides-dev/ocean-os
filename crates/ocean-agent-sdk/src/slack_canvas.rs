@@ -192,8 +192,7 @@ pub enum SlackCanvasOp {
 impl SlackCanvasOp {
     /// The `op` discriminants accepted by the tool, mirrored into the JSON schema
     /// so the model sees the closed set up front.
-    pub const VALID_OPS: &'static [&'static str] =
-        &["create", "read", "update", "append", "list"];
+    pub const VALID_OPS: &'static [&'static str] = &["create", "read", "update", "append", "list"];
 
     /// Whether this op mutates the canvas. `create`/`update`/`append` mutate;
     /// `read`/`list` are read-only (the awareness side). The runtime uses this to
@@ -588,7 +587,10 @@ mod tests {
         assert_eq!(res.op, "read");
         assert_eq!(res.fetch_status, CanvasFetchStatus::PendingBridge);
         assert!(!res.bridged);
-        assert!(res.contents.is_none(), "pending read must not fabricate contents");
+        assert!(
+            res.contents.is_none(),
+            "pending read must not fabricate contents"
+        );
         assert!(!res.fetch_status.is_fetched());
 
         let v = serde_json::to_value(&res).unwrap();

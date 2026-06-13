@@ -70,12 +70,9 @@ impl Provider for MockProvider {
         _options: &StreamOptions,
     ) -> ocean_protocol::Result<AssistantMessageEventStream> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let turn = self
-            .turns
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("MockProvider ran out of scripted turns — loop requested more rounds than scripted");
+        let turn = self.turns.lock().unwrap().pop_front().expect(
+            "MockProvider ran out of scripted turns — loop requested more rounds than scripted",
+        );
         let events: Vec<ocean_protocol::Result<AssistantMessageEvent>> =
             turn.into_iter().map(Ok).collect();
         Ok(Box::pin(stream::iter(events)))
@@ -282,7 +279,8 @@ async fn truncated_tool_use_is_paired_with_error_result_no_orphan() {
         ),
     ]]));
 
-    let cfg = base_config(provider.clone()).with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
+    let cfg =
+        base_config(provider.clone()).with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
 
     let run = ocean_runtime::run_agent(&cfg, user("do a thing"), None)
         .await
@@ -290,7 +288,11 @@ async fn truncated_tool_use_is_paired_with_error_result_no_orphan() {
 
     // The tool was NOT executed (its args may be truncated, and the stop reason
     // was not ToolUse).
-    assert_eq!(ran.load(Ordering::SeqCst), 0, "truncated tool_use must not run the tool");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "truncated tool_use must not run the tool"
+    );
 
     // Transcript is provider-valid: the orphan tool_use got a paired result.
     assert_no_orphan_tool_use(&run.messages);
@@ -298,7 +300,10 @@ async fn truncated_tool_use_is_paired_with_error_result_no_orphan() {
     // That paired result is a flagged error so the model sees the call didn't
     // run (not a fake success).
     let Some(Message::ToolResult(tr)) = run.messages.last() else {
-        panic!("last message must be the synthetic paired tool result, got {:#?}", run.messages.last());
+        panic!(
+            "last message must be the synthetic paired tool result, got {:#?}",
+            run.messages.last()
+        );
     };
     assert!(tr.is_error, "truncated tool_use result must be is_error");
     assert_eq!(tr.tool_call_id, "call-trunc");
@@ -404,7 +409,11 @@ async fn multi_round_tool_loop_runs_tool_then_completes() {
     let provider = Arc::new(MockProvider::new(vec![
         // Round 1: a tool call.
         vec![done(
-            vec![tool_call("call-1", "echo", serde_json::json!({ "msg": "hi" }))],
+            vec![tool_call(
+                "call-1",
+                "echo",
+                serde_json::json!({ "msg": "hi" }),
+            )],
             StopReason::ToolUse,
         )],
         // Round 2: final answer.
@@ -415,7 +424,8 @@ async fn multi_round_tool_loop_runs_tool_then_completes() {
         ],
     ]));
 
-    let cfg = base_config(provider.clone()).with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
+    let cfg =
+        base_config(provider.clone()).with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let run = ocean_runtime::run_agent(&cfg, user("use the tool"), Some(tx))
@@ -423,7 +433,11 @@ async fn multi_round_tool_loop_runs_tool_then_completes() {
         .expect("multi-round tool loop must complete cleanly");
 
     // The tool ran exactly once.
-    assert_eq!(ran.load(Ordering::SeqCst), 1, "echo tool should have run once");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "echo tool should have run once"
+    );
     // Two provider rounds: the tool-call round and the final-text round.
     assert_eq!(provider.call_count(), 2);
     // Transcript is provider-valid — the tool_use has its matching result.
@@ -447,9 +461,9 @@ async fn multi_round_tool_loop_runs_tool_then_completes() {
     // Event stream carried a ToolExecutionStart + End pair for the call.
     let events = collect_events(&mut rx);
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolExecutionStart { tool_name, .. } if tool_name == "echo")),
+        events.iter().any(
+            |e| matches!(e, AgentEvent::ToolExecutionStart { tool_name, .. } if tool_name == "echo")
+        ),
         "expected a ToolExecutionStart for echo"
     );
     assert!(
@@ -460,7 +474,9 @@ async fn multi_round_tool_loop_runs_tool_then_completes() {
     );
     // And the streamed text deltas reached the bus.
     assert!(
-        events.iter().any(|e| matches!(e, AgentEvent::TextDelta { delta, .. } if delta == "all ")),
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { delta, .. } if delta == "all ")),
         "expected the streamed text delta to be emitted"
     );
 }
@@ -511,7 +527,10 @@ async fn cancel_after_tool_round_unwinds_clean_no_orphan() {
         // Round 2 should NEVER be requested — the cancel check fires first. If
         // the loop did request it, MockProvider has a scripted turn to give, so
         // we'd see call_count == 2 (and the test below catches that).
-        vec![done(vec![Content::text("should not happen")], StopReason::Stop)],
+        vec![done(
+            vec![Content::text("should not happen")],
+            StopReason::Stop,
+        )],
     ]));
 
     let mut cfg = base_config(provider.clone()).with_tools(vec![Arc::new(CancellingTool {
@@ -609,7 +628,10 @@ async fn cancel_during_long_tool_aborts_promptly_without_awaiting_completion() {
         )],
         // Round 2 must NEVER run — the tool is aborted mid-flight and the loop
         // unwinds with Cancelled before requesting another round.
-        vec![done(vec![Content::text("should not happen")], StopReason::Stop)],
+        vec![done(
+            vec![Content::text("should not happen")],
+            StopReason::Stop,
+        )],
     ]));
 
     let mut cfg = base_config(provider.clone()).with_tools(vec![Arc::new(SlowTool {
@@ -720,13 +742,20 @@ async fn denied_tool_does_not_run_and_emits_no_execution_start() {
     let provider = Arc::new(MockProvider::new(vec![
         // Round 1: the model calls the gated tool.
         vec![done(
-            vec![tool_call("call-deny", "gated", serde_json::json!({ "x": 1 }))],
+            vec![tool_call(
+                "call-deny",
+                "gated",
+                serde_json::json!({ "x": 1 }),
+            )],
             StopReason::ToolUse,
         )],
         // Round 2: after the denial result is fed back, the model wraps up. (The
         // loop continues the turn — denial is not a hard stop — so it needs a
         // final round to terminate cleanly.)
-        vec![done(vec![Content::text("understood, stopping")], StopReason::Stop)],
+        vec![done(
+            vec![Content::text("understood, stopping")],
+            StopReason::Stop,
+        )],
     ]));
 
     let cfg = base_config(provider.clone())
@@ -739,9 +768,17 @@ async fn denied_tool_does_not_run_and_emits_no_execution_start() {
         .expect("a denied tool does not error the run — it pairs a denial result");
 
     // 1. The policy WAS consulted for the gated call.
-    assert_eq!(checks.load(Ordering::SeqCst), 1, "the Deny gate must be consulted once");
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        1,
+        "the Deny gate must be consulted once"
+    );
     // 2. The tool was NEVER executed — no side effect.
-    assert_eq!(ran.load(Ordering::SeqCst), 0, "a denied tool must not execute");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a denied tool must not execute"
+    );
     // 3. Transcript is provider-valid: the tool_use got a matching (error) result.
     assert_no_orphan_tool_use(&run.messages);
     let denial = run
@@ -752,7 +789,10 @@ async fn denied_tool_does_not_run_and_emits_no_execution_start() {
             _ => None,
         })
         .expect("the denied call must have a paired tool_result");
-    assert!(denial.is_error, "the denial tool_result must be flagged is_error");
+    assert!(
+        denial.is_error,
+        "the denial tool_result must be flagged is_error"
+    );
 
     let events = collect_events(&mut rx);
     // 4. A PermissionDenied event was emitted for the gated tool.
@@ -827,7 +867,11 @@ async fn allow_session_caches_decision_across_calls() {
         .expect("AllowSession run must complete cleanly");
 
     // Both calls executed.
-    assert_eq!(ran.load(Ordering::SeqCst), 2, "both gated calls should have run");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        2,
+        "both gated calls should have run"
+    );
     // The cache works: the policy was consulted exactly ONCE across two calls.
     assert_eq!(
         checks.load(Ordering::SeqCst),
@@ -869,8 +913,16 @@ async fn allow_lets_gated_tool_run_normally() {
         .await
         .expect("Allow run must complete cleanly");
 
-    assert_eq!(checks.load(Ordering::SeqCst), 1, "the Allow gate must be consulted once");
-    assert_eq!(ran.load(Ordering::SeqCst), 1, "an allowed gated tool must run");
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        1,
+        "the Allow gate must be consulted once"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "an allowed gated tool must run"
+    );
     assert_no_orphan_tool_use(&run.messages);
 
     let events = collect_events(&mut rx);

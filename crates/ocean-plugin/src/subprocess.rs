@@ -89,20 +89,17 @@ impl SubprocessPlugin {
         args: &[String],
         env: &[(String, String)],
     ) -> Result<Self, PluginError> {
-        let transport = StdioTransport::spawn(command, args, env).map_err(|e| PluginError::Spawn {
-            entry: command.to_string(),
-            reason: e.to_string(),
-        })?;
+        let transport =
+            StdioTransport::spawn(command, args, env).map_err(|e| PluginError::Spawn {
+                entry: command.to_string(),
+                reason: e.to_string(),
+            })?;
         Ok(Self::with_transport(name, version, Box::new(transport)))
     }
 
     /// Build a plugin over an arbitrary transport. Used by [`launch_command`] and
     /// directly by tests with an in-process transport.
-    pub fn with_transport(
-        name: &str,
-        version: &str,
-        transport: Box<dyn Transport + Send>,
-    ) -> Self {
+    pub fn with_transport(name: &str, version: &str, transport: Box<dyn Transport + Send>) -> Self {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<String>();
         spawn_io_task(transport, outbound_rx, pending.clone());

@@ -98,9 +98,7 @@ impl FrameChunker {
             self.num_channels = frame.num_channels.max(1);
             let spc = (self.sample_rate / 1000) * self.window_ms;
             self.window_len = spc as usize * self.num_channels as usize;
-        } else if frame.sample_rate != self.sample_rate
-            || frame.num_channels != self.num_channels
-        {
+        } else if frame.sample_rate != self.sample_rate || frame.num_channels != self.num_channels {
             return Vec::new();
         }
         if self.window_len == 0 {
@@ -196,7 +194,9 @@ mod tests {
         let mut total = 0;
         // Ten 32-sample frames = 320 = exactly one window.
         for _ in 0..10 {
-            total += chunker.push(&PcmFrame::new(vec![1i16; 32], 16_000, 1)).len();
+            total += chunker
+                .push(&PcmFrame::new(vec![1i16; 32], 16_000, 1))
+                .len();
         }
         assert_eq!(total, 1);
     }

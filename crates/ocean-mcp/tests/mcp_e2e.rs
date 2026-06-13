@@ -196,7 +196,10 @@ async fn list_changed_refresh_retries_then_updates_when_relist_is_flaky() {
         .iter()
         .find(|t| t.name() == "mcp__fake__grow_flaky")
         .expect("grow_flaky tool present");
-    grow_flaky.execute("call-grow-flaky", json!({})).await.unwrap();
+    grow_flaky
+        .execute("call-grow-flaky", json!({}))
+        .await
+        .unwrap();
 
     // First two re-list attempts fail; the watcher backs off (~200ms + ~400ms)
     // and the third succeeds. Poll generously past that window.

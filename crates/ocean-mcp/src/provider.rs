@@ -511,7 +511,9 @@ mod tests {
 
         let err = result.expect_err("should give up and return the last error");
         // Last error is surfaced, not a generic one.
-        assert!(err.to_string().contains(&format!("#{REFETCH_MAX_ATTEMPTS}")));
+        assert!(err
+            .to_string()
+            .contains(&format!("#{REFETCH_MAX_ATTEMPTS}")));
         // Bounded: exactly MAX attempts, capped — never spins forever.
         assert_eq!(calls.get(), REFETCH_MAX_ATTEMPTS);
         // No sleep after the final attempt.

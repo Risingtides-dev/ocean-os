@@ -39,10 +39,7 @@ impl AgentTool for BrowserCaptureNetworkTool {
         false
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let cap = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(200) as usize;
+        let cap = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
         self.ctx
             .lazy
             .get()

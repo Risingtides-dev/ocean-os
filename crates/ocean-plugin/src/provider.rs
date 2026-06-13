@@ -114,9 +114,7 @@ fn build_tools(
             let tool: SharedTool = Arc::new(PluginAgentTool {
                 namespaced_name: format!("plugin{NS}{plugin_name}{NS}{}", def.name),
                 remote_name: def.name,
-                description: def
-                    .description
-                    .unwrap_or_else(|| "plugin tool".to_string()),
+                description: def.description.unwrap_or_else(|| "plugin tool".to_string()),
                 parameters: normalize_schema(def.input_schema),
                 plugin: plugin.clone(),
             });

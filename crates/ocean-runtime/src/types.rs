@@ -373,7 +373,11 @@ mod tests {
     fn with_turn_timeout_secs_overrides_the_default() {
         let c = cfg().with_turn_timeout_secs(Some(45));
         assert_eq!(c.turn_timeout_secs, Some(45));
-        assert_eq!(c.turn_timeout_secs(), 45, "explicit value wins over default");
+        assert_eq!(
+            c.turn_timeout_secs(),
+            45,
+            "explicit value wins over default"
+        );
     }
 
     #[test]
@@ -381,6 +385,9 @@ mod tests {
         // Passing None (e.g. OCEAN_TURN_TIMEOUT_SECS unset upstream) must keep
         // the resolved deadline at the default, never zero.
         let c = cfg().with_turn_timeout_secs(None);
-        assert_eq!(c.turn_timeout_secs(), AgentConfig::DEFAULT_TURN_TIMEOUT_SECS);
+        assert_eq!(
+            c.turn_timeout_secs(),
+            AgentConfig::DEFAULT_TURN_TIMEOUT_SECS
+        );
     }
 }

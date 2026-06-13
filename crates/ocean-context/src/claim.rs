@@ -41,7 +41,10 @@ pub struct Claim {
 impl Claim {
     /// Unix time of the original `written` event, if recorded.
     pub fn written_at(&self) -> Option<i64> {
-        self.history.iter().find(|e| e.event == "written").map(|e| e.at)
+        self.history
+            .iter()
+            .find(|e| e.event == "written")
+            .map(|e| e.at)
     }
 
     /// Derive write-time confidence from anchor richness instead of letting the
@@ -59,8 +62,16 @@ impl Claim {
     pub fn derive_confidence(anchors: &[Anchor], declared_verified: bool) -> f32 {
         let base: f32 = if declared_verified { 0.50 } else { 0.25 };
         let count_term = 0.10 * (anchors.len().min(3) as f32);
-        let line_term = if anchors.iter().any(|a| !a.lines.is_empty()) { 0.10 } else { 0.0 };
-        let symbol_term = if anchors.iter().any(|a| a.symbol.is_some()) { 0.10 } else { 0.0 };
+        let line_term = if anchors.iter().any(|a| !a.lines.is_empty()) {
+            0.10
+        } else {
+            0.0
+        };
+        let symbol_term = if anchors.iter().any(|a| a.symbol.is_some()) {
+            0.10
+        } else {
+            0.0
+        };
         (base + count_term + line_term + symbol_term).clamp(0.0, 1.0)
     }
 }
@@ -177,7 +188,10 @@ pub(crate) mod tests {
             branch: "main".into(),
             commit_anchor: "d9a9bc9".into(),
             scope_ring: ScopeRing::Repo,
-            velocity_at_write: Velocity { v_code: 0.0, v_sem: 0.0 },
+            velocity_at_write: Velocity {
+                v_code: 0.0,
+                v_sem: 0.0,
+            },
             written_at: 1_780_980_000,
             narrative: "The prose handoff.\n".into(),
             claims: vec![Claim {
@@ -222,7 +236,12 @@ pub(crate) mod tests {
     }
 
     fn anchor(file: &str, symbol: Option<&str>, lines: Vec<u32>) -> Anchor {
-        Anchor { file: Some(file.into()), symbol: symbol.map(Into::into), lines, sig_hash: None }
+        Anchor {
+            file: Some(file.into()),
+            symbol: symbol.map(Into::into),
+            lines,
+            sig_hash: None,
+        }
     }
 
     #[test]
@@ -233,8 +252,8 @@ pub(crate) mod tests {
         let a: Anchor =
             serde_json::from_str(r#"{"file":"","symbol":"workspace.members","lines":[]}"#).unwrap();
         assert_eq!(a.file, None);
-        let a: Anchor = toml::from_str("file = \"\"\nsymbol = \"workspace.members\"\nlines = []")
-            .unwrap();
+        let a: Anchor =
+            toml::from_str("file = \"\"\nsymbol = \"workspace.members\"\nlines = []").unwrap();
         assert_eq!(a.file, None);
         // whitespace-only is equally meaningless
         let a: Anchor = serde_json::from_str(r#"{"file":"  ","lines":[]}"#).unwrap();
@@ -261,8 +280,8 @@ pub(crate) mod tests {
         assert!(p.tickets.is_empty());
         let p: Provenance = serde_json::from_str(r#"{"anchors":[],"commit_sha":"abc"}"#).unwrap();
         assert!(p.tickets.is_empty());
-        let p: Provenance = toml::from_str("anchors = []\nticket = \"OCEAN-9\"\ncommit_sha = \"abc\"")
-            .unwrap();
+        let p: Provenance =
+            toml::from_str("anchors = []\nticket = \"OCEAN-9\"\ncommit_sha = \"abc\"").unwrap();
         assert_eq!(p.tickets, vec!["OCEAN-9".to_string()]);
     }
 
@@ -280,8 +299,9 @@ pub(crate) mod tests {
 
     #[test]
     fn derive_confidence_caps_at_one_and_handles_no_anchors() {
-        let rich: Vec<Anchor> =
-            (0..5).map(|i| anchor(&format!("f{i}.rs"), Some("sym"), vec![1, 2])).collect();
+        let rich: Vec<Anchor> = (0..5)
+            .map(|i| anchor(&format!("f{i}.rs"), Some("sym"), vec![1, 2]))
+            .collect();
         assert!((Claim::derive_confidence(&rich, true) - 1.0).abs() < f32::EPSILON);
         assert!((Claim::derive_confidence(&[], false) - 0.25).abs() < f32::EPSILON);
     }

@@ -25,7 +25,11 @@ fn git_at(dir: &Path, when: &str, args: &[&str]) -> String {
         .env("GIT_COMMITTER_DATE", when)
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -52,7 +56,11 @@ fn anchored_claim(id: &str, file: &str, commit: &str) -> Claim {
         ps_anchor: None,
         confidence: 1.0,
         borrowed_from: None,
-        history: vec![ClaimEvent { at: 0, event: "written".into(), by_session: "t".into() }],
+        history: vec![ClaimEvent {
+            at: 0,
+            event: "written".into(),
+            by_session: "t".into(),
+        }],
     }
 }
 
@@ -67,14 +75,24 @@ fn build_repo(root: &Path) -> String {
     std::fs::write(root.join("frozen.rs"), "fn frozen() { /* v1 */ }\n").unwrap();
     std::fs::write(root.join("hot.rs"), "fn hot() { let x = 0; }\n").unwrap();
     git_at(root, "2026-06-01T12:00:00 +0000", &["add", "."]);
-    git_at(root, "2026-06-01T12:00:00 +0000", &["commit", "-qm", "day1: born"]);
+    git_at(
+        root,
+        "2026-06-01T12:00:00 +0000",
+        &["commit", "-qm", "day1: born"],
+    );
     // Days 16..=21: hot.rs rewritten substantially each day; frozen.rs untouched.
     for day in 16..=21 {
         let when = format!("2026-06-{day:02}T12:00:00 +0000");
-        let body: String = (0..day * 8).map(|i| format!("    let v{i} = {i};\n")).collect();
+        let body: String = (0..day * 8)
+            .map(|i| format!("    let v{i} = {i};\n"))
+            .collect();
         std::fs::write(root.join("hot.rs"), format!("fn hot() {{\n{body}}}\n")).unwrap();
         git_at(root, &when, &["add", "hot.rs"]);
-        git_at(root, &when, &["commit", "-qm", &format!("day{day}: churn hot")]);
+        git_at(
+            root,
+            &when,
+            &["commit", "-qm", &format!("day{day}: churn hot")],
+        );
     }
     git(root, &["rev-parse", "HEAD"])
 }
@@ -97,10 +115,23 @@ fn molten_file_measures_higher_velocity_than_frozen() {
     // Hot file: six commits in the window ⇒ a real positive rate, and v_sem
     // (churn-weighted) exceeds v_code (raw rate) because each commit moved many
     // lines.
-    assert!(hot.v_code > 0.0, "hot file has recent commits, got {}", hot.v_code);
-    assert!(hot.v_sem > hot.v_code, "v_sem ({}) weights churn above v_code ({})", hot.v_sem, hot.v_code);
+    assert!(
+        hot.v_code > 0.0,
+        "hot file has recent commits, got {}",
+        hot.v_code
+    );
+    assert!(
+        hot.v_sem > hot.v_code,
+        "v_sem ({}) weights churn above v_code ({})",
+        hot.v_sem,
+        hot.v_code
+    );
     // 6 commits / 7-day window.
-    assert!((hot.v_code - 6.0 / 7.0).abs() < 1e-6, "v_code = commits/window, got {}", hot.v_code);
+    assert!(
+        (hot.v_code - 6.0 / 7.0).abs() < 1e-6,
+        "v_code = commits/window, got {}",
+        hot.v_code
+    );
 }
 
 #[test]
@@ -119,7 +150,10 @@ fn velocity_shortens_the_half_life_for_the_molten_anchor() {
     let h_frozen = b2.half_life_secs(frozen_v.v_sem);
     let h_hot = b2.half_life_secs(hot_v.v_sem);
     assert!((h_frozen - b2.h0_secs).abs() < 1e-6, "frozen ⇒ H₀");
-    assert!(h_hot < h_frozen, "molten half-life {h_hot} !< frozen {h_frozen}");
+    assert!(
+        h_hot < h_frozen,
+        "molten half-life {h_hot} !< frozen {h_frozen}"
+    );
 
     // End to end through trust(): one claim on each file, written at HEAD's
     // date, scored a week later. The molten claim has lost far more trust.
@@ -132,7 +166,10 @@ fn velocity_shortens_the_half_life_for_the_molten_anchor() {
     let ctx_frozen = TrustContext::new(now, written).with_velocity(frozen_v);
     let t_hot = b2.trust(&c, &ctx_hot);
     let t_frozen = b2.trust(&c, &ctx_frozen);
-    assert!(t_frozen > t_hot, "frozen trust {t_frozen} !> molten {t_hot}");
+    assert!(
+        t_frozen > t_hot,
+        "frozen trust {t_frozen} !> molten {t_hot}"
+    );
 }
 
 #[test]
@@ -157,7 +194,10 @@ fn out_of_tree_and_symlinked_anchors_measure_zero() {
         use std::os::unix::fs::symlink;
         symlink(root.join("hot.rs"), root.join("link.rs")).unwrap();
         let v = meter.measure(&anchored_claim("link", "link.rs", &head));
-        assert_eq!(v.v_sem, 0.0, "symlinked anchor must measure zero (no trust laundering)");
+        assert_eq!(
+            v.v_sem, 0.0,
+            "symlinked anchor must measure zero (no trust laundering)"
+        );
         assert_eq!(v.v_code, 0.0);
         // Control: the real file behind it still measures hot.
         let real = meter.measure(&anchored_claim("hot", "hot.rs", &head));
@@ -189,8 +229,14 @@ fn pathspec_magic_anchors_measure_zero() {
         ":(icase)HOT.RS",
     ] {
         let v = meter.measure(&anchored_claim("m", magic, &head));
-        assert_eq!(v.v_sem, 0.0, "pathspec magic {magic:?} must not glob the repo");
-        assert_eq!(v.v_code, 0.0, "pathspec magic {magic:?} must not glob the repo");
+        assert_eq!(
+            v.v_sem, 0.0,
+            "pathspec magic {magic:?} must not glob the repo"
+        );
+        assert_eq!(
+            v.v_code, 0.0,
+            "pathspec magic {magic:?} must not glob the repo"
+        );
     }
 }
 
@@ -226,7 +272,10 @@ fn deleted_at_anchor_commit_measures_zero_velocity() {
     // once it's gone).
     let meter = VelocityMeter::new(root.to_path_buf());
     assert!(
-        meter.measure(&anchored_claim("hot", "hot.rs", &churned_head)).v_sem > 0.0,
+        meter
+            .measure(&anchored_claim("hot", "hot.rs", &churned_head))
+            .v_sem
+            > 0.0,
         "hot.rs is molten while present"
     );
 
@@ -234,14 +283,24 @@ fn deleted_at_anchor_commit_measures_zero_velocity() {
     // deletion itself — hot.rs no longer exists in that tree.
     std::fs::remove_file(root.join("hot.rs")).unwrap();
     git_at(root, "2026-06-21T18:00:00 +0000", &["add", "-A"]);
-    git_at(root, "2026-06-21T18:00:00 +0000", &["commit", "-qm", "day21: delete hot"]);
+    git_at(
+        root,
+        "2026-06-21T18:00:00 +0000",
+        &["commit", "-qm", "day21: delete hot"],
+    );
     let deletion_head = git(root, &["rev-parse", "HEAD"]);
 
     // Anchored at the deletion commit: hot.rs is absent there → no signal,
     // despite a full window of churn in its `git log` history.
     let v = meter.measure(&anchored_claim("hot", "hot.rs", &deletion_head));
-    assert_eq!(v.v_sem, 0.0, "a file absent at its anchor commit measures zero velocity");
-    assert_eq!(v.v_code, 0.0, "a file absent at its anchor commit measures zero velocity");
+    assert_eq!(
+        v.v_sem, 0.0,
+        "a file absent at its anchor commit measures zero velocity"
+    );
+    assert_eq!(
+        v.v_code, 0.0,
+        "a file absent at its anchor commit measures zero velocity"
+    );
 
     // Control: frozen.rs still exists at the deletion commit, so the meter
     // still functions there (it's just frozen → zero by window, not by gate).
@@ -266,7 +325,9 @@ fn historical_velocity_ignores_current_worktree_symlink() {
 
     // Sanity: hot.rs is molten as a normal blob at its anchor commit.
     let meter = VelocityMeter::new(root.to_path_buf());
-    let hot_v = meter.measure(&anchored_claim("hot", "hot.rs", &molten_head)).v_sem;
+    let hot_v = meter
+        .measure(&anchored_claim("hot", "hot.rs", &molten_head))
+        .v_sem;
     assert!(hot_v > 0.0, "hot.rs is molten as a tracked blob");
 
     // Now replace hot.rs with a symlink in a NEW commit (so HEAD moves on),
@@ -274,12 +335,18 @@ fn historical_velocity_ignores_current_worktree_symlink() {
     std::fs::remove_file(root.join("hot.rs")).unwrap();
     symlink(root.join("frozen.rs"), root.join("hot.rs")).unwrap();
     git_at(root, "2026-06-21T20:00:00 +0000", &["add", "-A"]);
-    git_at(root, "2026-06-21T20:00:00 +0000", &["commit", "-qm", "day21: hot.rs -> symlink"]);
+    git_at(
+        root,
+        "2026-06-21T20:00:00 +0000",
+        &["commit", "-qm", "day21: hot.rs -> symlink"],
+    );
 
     // The working tree now has hot.rs as a symlink, but the anchor commit
     // `molten_head` still has it as the real, churned blob. Velocity there is
     // unchanged — it does NOT collapse to zero because of HEAD's symlink.
-    let still_hot = meter.measure(&anchored_claim("hot", "hot.rs", &molten_head)).v_sem;
+    let still_hot = meter
+        .measure(&anchored_claim("hot", "hot.rs", &molten_head))
+        .v_sem;
     assert_eq!(
         still_hot, hot_v,
         "historical velocity must not depend on the current checkout's symlink"
@@ -302,7 +369,11 @@ fn historical_symlink_blob_measures_zero_velocity() {
     std::fs::write(root.join("real_a.rs"), "fn a() {}\n").unwrap();
     std::fs::write(root.join("real_b.rs"), "fn b() {}\n").unwrap();
     git_at(root, "2026-06-15T12:00:00 +0000", &["add", "."]);
-    git_at(root, "2026-06-15T12:00:00 +0000", &["commit", "-qm", "born"]);
+    git_at(
+        root,
+        "2026-06-15T12:00:00 +0000",
+        &["commit", "-qm", "born"],
+    );
     // Create a committed symlink and re-point it several times so its blob
     // (the target string) churns — `--numstat` would see edits if accepted.
     for (day, target) in [(16, "real_a.rs"), (18, "real_b.rs"), (20, "real_a.rs")] {
@@ -310,16 +381,26 @@ fn historical_symlink_blob_measures_zero_velocity() {
         symlink(root.join(target), root.join("link.rs")).unwrap();
         let when = format!("2026-06-{day:02}T12:00:00 +0000");
         git_at(root, &when, &["add", "-A"]);
-        git_at(root, &when, &["commit", "-qm", &format!("day{day}: repoint link")]);
+        git_at(
+            root,
+            &when,
+            &["commit", "-qm", &format!("day{day}: repoint link")],
+        );
     }
     let head = git(root, &["rev-parse", "HEAD"]);
     // Confirm link.rs is a 120000 blob at HEAD.
     let mode = git(root, &["ls-tree", &head, "--", "link.rs"]);
-    assert!(mode.starts_with("120000"), "fixture: link.rs must be a symlink blob, got {mode:?}");
+    assert!(
+        mode.starts_with("120000"),
+        "fixture: link.rs must be a symlink blob, got {mode:?}"
+    );
 
     let meter = VelocityMeter::new(root.to_path_buf());
     let v = meter.measure(&anchored_claim("link", "link.rs", &head));
-    assert_eq!(v.v_sem, 0.0, "a historical symlink blob must measure zero (trust boundary)");
+    assert_eq!(
+        v.v_sem, 0.0,
+        "a historical symlink blob must measure zero (trust boundary)"
+    );
     assert_eq!(v.v_code, 0.0);
 }
 
@@ -338,7 +419,10 @@ fn worktree_anchor_dates_the_window_from_head() {
     // the recent churn is in range and velocity is non-zero (not the silent
     // (0,0) baseline the broken commit_time("WORKTREE") produced).
     let v = meter.measure(&anchored_claim("hot", "hot.rs", WORKTREE));
-    assert!(v.v_sem > 0.0, "a worktree anchor must measure real velocity via HEAD-dated window");
+    assert!(
+        v.v_sem > 0.0,
+        "a worktree anchor must measure real velocity via HEAD-dated window"
+    );
 }
 
 /// Codex P2 (PR #210): a WORKTREE anchor whose file has been deleted locally
@@ -355,32 +439,50 @@ fn worktree_anchor_deleted_locally_measures_zero_even_if_in_head() {
 
     // Sanity: while present on disk, the WORKTREE anchor measures hot.
     assert!(
-        meter.measure(&anchored_claim("hot", "hot.rs", WORKTREE)).v_sem > 0.0,
+        meter
+            .measure(&anchored_claim("hot", "hot.rs", WORKTREE))
+            .v_sem
+            > 0.0,
         "present worktree file is molten"
     );
 
     // Delete hot.rs from the working tree WITHOUT committing — it still exists
     // in HEAD, so `git log HEAD -- hot.rs` would still report its churn.
     std::fs::remove_file(root.join("hot.rs")).unwrap();
-    assert!(root.join("frozen.rs").exists(), "control file still on disk");
+    assert!(
+        root.join("frozen.rs").exists(),
+        "control file still on disk"
+    );
 
     // The WORKTREE anchor is now absent on disk → no signal, despite HEAD
     // history. (Matches B1 resolving a missing WORKTREE file Dead.)
     let v = meter.measure(&anchored_claim("hot", "hot.rs", WORKTREE));
-    assert_eq!(v.v_sem, 0.0, "a locally-deleted worktree anchor measures zero");
+    assert_eq!(
+        v.v_sem, 0.0,
+        "a locally-deleted worktree anchor measures zero"
+    );
     assert_eq!(v.v_code, 0.0);
 }
 
 /// Set author and committer dates independently for the next commit.
 fn git_split_dates(dir: &Path, author: &str, committer: &str, args: &[&str]) {
     let out = std::process::Command::new("git")
-        .arg("-C").arg(dir).args(args)
-        .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
         .env("GIT_AUTHOR_DATE", author)
         .env("GIT_COMMITTER_DATE", committer)
-        .output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Codex P2 (PR #210): the churn window is dated by AUTHOR time (%at), not
@@ -402,17 +504,32 @@ fn churn_window_uses_author_time_not_committer_time() {
 
     // Five churn commits AUTHORED in Jan 2026 but COMMITTED in Jun 2026.
     std::fs::write(root.join("rebased.rs"), "fn r() {}\n").unwrap();
-    git_split_dates(root, "2026-01-01T00:00:00 +0000", "2026-06-20T12:00:00 +0000",
-        &["add", "."]);
-    git_split_dates(root, "2026-01-01T00:00:00 +0000", "2026-06-20T12:00:00 +0000",
-        &["commit", "-qm", "born"]);
+    git_split_dates(
+        root,
+        "2026-01-01T00:00:00 +0000",
+        "2026-06-20T12:00:00 +0000",
+        &["add", "."],
+    );
+    git_split_dates(
+        root,
+        "2026-01-01T00:00:00 +0000",
+        "2026-06-20T12:00:00 +0000",
+        &["commit", "-qm", "born"],
+    );
     for day in 2..=6 {
-        let body: String = (0..day * 8).map(|i| format!("    let v{i} = {i};\n")).collect();
+        let body: String = (0..day * 8)
+            .map(|i| format!("    let v{i} = {i};\n"))
+            .collect();
         std::fs::write(root.join("rebased.rs"), format!("fn r() {{\n{body}}}\n")).unwrap();
         let author = format!("2026-01-{day:02}T00:00:00 +0000");
         let committer = format!("2026-06-{:02}T12:00:00 +0000", 19 + day);
         git_split_dates(root, &author, &committer, &["add", "rebased.rs"]);
-        git_split_dates(root, &author, &committer, &["commit", "-qm", &format!("churn {day}")]);
+        git_split_dates(
+            root,
+            &author,
+            &committer,
+            &["commit", "-qm", &format!("churn {day}")],
+        );
     }
 
     // A FINAL commit authored AND committed "now" (Jun 26), touching another
@@ -422,10 +539,18 @@ fn churn_window_uses_author_time_not_committer_time() {
     // (Under %ct the window would be the same Jun range AND the churn's Jun
     // committer dates would land inside → positive. The two disagree.)
     std::fs::write(root.join("head.rs"), "fn h() {}\n").unwrap();
-    git_split_dates(root, "2026-06-26T12:00:00 +0000", "2026-06-26T12:00:00 +0000",
-        &["add", "head.rs"]);
-    git_split_dates(root, "2026-06-26T12:00:00 +0000", "2026-06-26T12:00:00 +0000",
-        &["commit", "-qm", "head: recent"]);
+    git_split_dates(
+        root,
+        "2026-06-26T12:00:00 +0000",
+        "2026-06-26T12:00:00 +0000",
+        &["add", "head.rs"],
+    );
+    git_split_dates(
+        root,
+        "2026-06-26T12:00:00 +0000",
+        "2026-06-26T12:00:00 +0000",
+        &["commit", "-qm", "head: recent"],
+    );
     let head = git(root, &["rev-parse", "HEAD"]);
 
     let meter = VelocityMeter::new(root.to_path_buf()); // 7-day window
@@ -451,34 +576,57 @@ fn bare_basename_anchor_measures_the_unique_nested_file() {
     std::fs::write(root.join(nested), "fn input() {}\n").unwrap();
     std::fs::write(root.join("frozen.rs"), "fn frozen() {}\n").unwrap();
     git_at(root, "2026-06-01T12:00:00 +0000", &["add", "."]);
-    git_at(root, "2026-06-01T12:00:00 +0000", &["commit", "-qm", "born"]);
+    git_at(
+        root,
+        "2026-06-01T12:00:00 +0000",
+        &["commit", "-qm", "born"],
+    );
     // Churn the nested input.rs across the trailing window.
     for day in 16..=21 {
         let when = format!("2026-06-{day:02}T12:00:00 +0000");
-        let body: String = (0..day * 8).map(|i| format!("    let v{i} = {i};\n")).collect();
+        let body: String = (0..day * 8)
+            .map(|i| format!("    let v{i} = {i};\n"))
+            .collect();
         std::fs::write(root.join(nested), format!("fn input() {{\n{body}}}\n")).unwrap();
         git_at(root, &when, &["add", nested]);
-        git_at(root, &when, &["commit", "-qm", &format!("day{day}: churn input")]);
+        git_at(
+            root,
+            &when,
+            &["commit", "-qm", &format!("day{day}: churn input")],
+        );
     }
     let head = git(root, &["rev-parse", "HEAD"]);
     let meter = VelocityMeter::new(root.to_path_buf());
 
     // Bare `input.rs` resolves to the unique nested file → measures its churn.
     let bare = meter.measure(&anchored_claim("i", "input.rs", &head));
-    assert!(bare.v_sem > 0.0, "a bare basename must inherit the unique nested file's velocity");
+    assert!(
+        bare.v_sem > 0.0,
+        "a bare basename must inherit the unique nested file's velocity"
+    );
     // Identical to anchoring the full path.
     let full = meter.measure(&anchored_claim("i", nested, &head));
-    assert_eq!(bare.v_code, full.v_code, "bare basename measures the same as the full path");
+    assert_eq!(
+        bare.v_code, full.v_code,
+        "bare basename measures the same as the full path"
+    );
 
     // Ambiguity: add a SECOND input.rs elsewhere. Now the bare basename can't
     // be attributed to one file → zero (stricter than B1's weak 0.5).
     std::fs::create_dir_all(root.join("crates/other/src")).unwrap();
     std::fs::write(root.join("crates/other/src/input.rs"), "fn other() {}\n").unwrap();
     git_at(root, "2026-06-21T13:00:00 +0000", &["add", "-A"]);
-    git_at(root, "2026-06-21T13:00:00 +0000", &["commit", "-qm", "second input.rs"]);
+    git_at(
+        root,
+        "2026-06-21T13:00:00 +0000",
+        &["commit", "-qm", "second input.rs"],
+    );
     let head2 = git(root, &["rev-parse", "HEAD"]);
     let ambiguous = meter.measure(&anchored_claim("i", "input.rs", &head2));
-    assert_eq!(ambiguous.v_sem, 0.0, "an ambiguous basename has no attributable churn");
+    assert_eq!(
+        ambiguous.v_sem, 0.0,
+        "an ambiguous basename has no attributable churn"
+    );
     assert_eq!(ambiguous.v_code, 0.0);
 }
 
@@ -486,18 +634,31 @@ fn bare_basename_anchor_measures_the_unique_nested_file() {
 fn multi_file_claim(id: &str, files: &[&str], commit: &str) -> Claim {
     let anchors = files
         .iter()
-        .map(|f| Anchor { file: Some((*f).into()), symbol: None, lines: vec![], sig_hash: None })
+        .map(|f| Anchor {
+            file: Some((*f).into()),
+            symbol: None,
+            lines: vec![],
+            sig_hash: None,
+        })
         .collect();
     Claim {
         id: id.into(),
         text: format!("claim {id}"),
-        provenance: Provenance { anchors, tickets: vec![], commit_sha: commit.into() },
+        provenance: Provenance {
+            anchors,
+            tickets: vec![],
+            commit_sha: commit.into(),
+        },
         status: ClaimStatus::Verified,
         knowledge_tier: KnowledgeTier::Individual,
         ps_anchor: None,
         confidence: 1.0,
         borrowed_from: None,
-        history: vec![ClaimEvent { at: 0, event: "written".into(), by_session: "t".into() }],
+        history: vec![ClaimEvent {
+            at: 0,
+            event: "written".into(),
+            by_session: "t".into(),
+        }],
     }
 }
 
@@ -515,10 +676,16 @@ fn two_anchors_for_one_resolved_file_count_once() {
     let nested = "crates/core/src/input.rs";
     std::fs::write(root.join(nested), "fn input() {}\n").unwrap();
     git_at(root, "2026-06-01T12:00:00 +0000", &["add", "."]);
-    git_at(root, "2026-06-01T12:00:00 +0000", &["commit", "-qm", "born"]);
+    git_at(
+        root,
+        "2026-06-01T12:00:00 +0000",
+        &["commit", "-qm", "born"],
+    );
     for day in 16..=21 {
         let when = format!("2026-06-{day:02}T12:00:00 +0000");
-        let body: String = (0..day * 8).map(|i| format!("    let v{i} = {i};\n")).collect();
+        let body: String = (0..day * 8)
+            .map(|i| format!("    let v{i} = {i};\n"))
+            .collect();
         std::fs::write(root.join(nested), format!("fn input() {{\n{body}}}\n")).unwrap();
         git_at(root, &when, &["add", nested]);
         git_at(root, &when, &["commit", "-qm", &format!("churn {day}")]);
@@ -533,7 +700,10 @@ fn two_anchors_for_one_resolved_file_count_once() {
     // Two anchors pointing at the SAME resolved file (bare + full): identical
     // to the single-anchor measurement — NOT doubled.
     let two = meter.measure(&multi_file_claim("two", &["input.rs", nested], &head));
-    assert_eq!(two.v_code, single.v_code, "same file via two anchors must not double-count");
+    assert_eq!(
+        two.v_code, single.v_code,
+        "same file via two anchors must not double-count"
+    );
     assert_eq!(two.v_sem, single.v_sem);
     // Order-independent.
     let two_rev = meter.measure(&multi_file_claim("two_rev", &[nested, "input.rs"], &head));

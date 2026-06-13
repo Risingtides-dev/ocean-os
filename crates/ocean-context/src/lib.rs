@@ -14,9 +14,9 @@ pub mod treesitter;
 pub use claim::*;
 pub use extract::{extract_claims, ExtractCtx};
 pub use seams::{
-    Baseline, Borrowed, Borrower, ConfidenceRecencyTrust, FileExistsResolver, NoBorrow,
-    Resolution, Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel,
-    VelocityDecayTrust, VelocityMeter, VELOCITY_WINDOW_DAYS, WORKTREE,
+    Baseline, Borrowed, Borrower, ConfidenceRecencyTrust, FileExistsResolver, NoBorrow, Resolution,
+    Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel, VelocityDecayTrust,
+    VelocityMeter, VELOCITY_WINDOW_DAYS, WORKTREE,
 };
 pub use treesitter::TreeSitterResolver;
 
@@ -36,7 +36,8 @@ pub fn read_freshest(dir: &Path, repo: &str, branch: &str, now: i64) -> Result<O
     };
     let trust = ConfidenceRecencyTrust::default();
     let ctx = TrustContext::new(now, h.written_at);
-    h.claims.sort_by(|a, b| trust.trust(b, &ctx).total_cmp(&trust.trust(a, &ctx)));
+    h.claims
+        .sort_by(|a, b| trust.trust(b, &ctx).total_cmp(&trust.trust(a, &ctx)));
     Ok(Some(h))
 }
 
@@ -127,7 +128,11 @@ pub fn reverify(
             Resolution::Unresolvable => "unresolvable".to_string(),
             _ => "reverified".to_string(),
         };
-        claim.history.push(ClaimEvent { at: now, event, by_session: by_session.to_string() });
+        claim.history.push(ClaimEvent {
+            at: now,
+            event,
+            by_session: by_session.to_string(),
+        });
         out.push((claim.id.clone(), best));
     }
     out
@@ -196,7 +201,10 @@ fn resolve_stamping_baseline(
     // non-symbol / Unsupported anchor that still produces CHECKABLE evidence
     // now (a live file-only anchor). An Unsupported anchor that only resolves
     // Unresolvable attested nothing and is not the claim's "real subject".
-    let attested_at_birth =
-        stamped_baseline || !matches!(resolution, Resolution::Unresolvable);
-    AnchorOutcome { resolution, birth_unattestable: false, attested_at_birth }
+    let attested_at_birth = stamped_baseline || !matches!(resolution, Resolution::Unresolvable);
+    AnchorOutcome {
+        resolution,
+        birth_unattestable: false,
+        attested_at_birth,
+    }
 }

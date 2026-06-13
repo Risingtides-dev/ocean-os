@@ -175,7 +175,9 @@ impl TitleStatus {
             "live" => Ok(TitleStatus::Live),
             "revoked" => Ok(TitleStatus::Revoked),
             "released" => Ok(TitleStatus::Released),
-            other => Err(EscrowError::Encode(format!("unknown title status: {other}"))),
+            other => Err(EscrowError::Encode(format!(
+                "unknown title status: {other}"
+            ))),
         }
     }
 }
@@ -674,11 +676,7 @@ impl SqliteTitleRegistry {
     }
 
     /// The current escrow state for one `(topic, validator)`, if staked.
-    pub fn stake_state(
-        &self,
-        topic_id: Uuid,
-        validator_id: Uuid,
-    ) -> Result<Option<EscrowState>> {
+    pub fn stake_state(&self, topic_id: Uuid, validator_id: Uuid) -> Result<Option<EscrowState>> {
         self.conn
             .query_row(
                 "SELECT state FROM escrow_stakes WHERE topic_id = ?1 AND validator_id = ?2",
@@ -718,7 +716,9 @@ impl EscrowState {
             "held" => Ok(EscrowState::Held),
             "released" => Ok(EscrowState::Released),
             "forfeited" => Ok(EscrowState::Forfeited),
-            other => Err(EscrowError::Encode(format!("unknown escrow state: {other}"))),
+            other => Err(EscrowError::Encode(format!(
+                "unknown escrow state: {other}"
+            ))),
         }
     }
 }
@@ -1372,13 +1372,19 @@ mod tests {
         // Turn 2 (fresh process): re-open the SAME db. The title is still there,
         // and the persisted verifier authorizes the original secret token.
         let reg = SqliteTitleRegistry::open(&path).unwrap();
-        let found = reg.lookup(title_id).unwrap().expect("title survived reopen");
+        let found = reg
+            .lookup(title_id)
+            .unwrap()
+            .expect("title survived reopen");
         assert_eq!(found.agent_id, agent);
         assert_eq!(found.role, AgentRole::Firekeeper);
         assert_eq!(found.status, TitleStatus::Live);
 
         // The right token verifies across the turn boundary; a wrong one does not.
-        assert_eq!(reg.verify_title(title_id, agent, Some(&secret_token)), Ok(()));
+        assert_eq!(
+            reg.verify_title(title_id, agent, Some(&secret_token)),
+            Ok(())
+        );
         assert_eq!(
             reg.verify_title(title_id, agent, Some("forged")),
             Err(ClaimError::ForgedFirekeeper)
@@ -1412,7 +1418,9 @@ mod tests {
         // Persistence-without-leaking, at the storage layer: read the raw columns
         // and assert the token is absent and only salt+digest are stored.
         let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
-        let (persisted, secret) = reg.grant(uid(1), uid(10), AgentRole::Firekeeper, 0).unwrap();
+        let (persisted, secret) = reg
+            .grant(uid(1), uid(10), AgentRole::Firekeeper, 0)
+            .unwrap();
         let (salt, digest): (String, String) = reg
             .conn
             .query_row(
@@ -1432,7 +1440,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("titles.db");
         let mut reg = SqliteTitleRegistry::open(&path).unwrap();
-        let (p, _s) = reg.grant(uid(1), uid(10), AgentRole::Firekeeper, 0).unwrap();
+        let (p, _s) = reg
+            .grant(uid(1), uid(10), AgentRole::Firekeeper, 0)
+            .unwrap();
         reg.migrate().unwrap();
         reg.migrate().unwrap();
         assert!(reg.lookup(p.title_id).unwrap().is_some());
@@ -1548,11 +1558,15 @@ mod tests {
 
         // Soft strikes accrue (graduated path).
         assert_eq!(
-            revoker.warn(&mut reg, Some(key.secret()), title.title_id, "degraded").unwrap(),
+            revoker
+                .warn(&mut reg, Some(key.secret()), title.title_id, "degraded")
+                .unwrap(),
             1
         );
         assert_eq!(
-            revoker.warn(&mut reg, Some(key.secret()), title.title_id, "tool error").unwrap(),
+            revoker
+                .warn(&mut reg, Some(key.secret()), title.title_id, "tool error")
+                .unwrap(),
             2
         );
         assert_eq!(reg.lookup(title.title_id).unwrap().unwrap().strikes, 2);
@@ -1638,8 +1652,14 @@ mod tests {
         )
         .expect("legit claim succeeds");
         assert_eq!(released, 2, "both validator stakes released");
-        assert_eq!(reg.stake_state(topic, v1).unwrap(), Some(EscrowState::Released));
-        assert_eq!(reg.stake_state(topic, v2).unwrap(), Some(EscrowState::Released));
+        assert_eq!(
+            reg.stake_state(topic, v1).unwrap(),
+            Some(EscrowState::Released)
+        );
+        assert_eq!(
+            reg.stake_state(topic, v2).unwrap(),
+            Some(EscrowState::Released)
+        );
         assert_eq!(reg.held_total(topic).unwrap(), 0);
         // And the title was released as part of the close.
         assert_eq!(
@@ -1657,7 +1677,10 @@ mod tests {
         assert_eq!(reg.stake_state(topic, v1).unwrap(), Some(EscrowState::Held));
         let n = reg.forfeit_stakes(topic, 5).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(reg.stake_state(topic, v1).unwrap(), Some(EscrowState::Forfeited));
+        assert_eq!(
+            reg.stake_state(topic, v1).unwrap(),
+            Some(EscrowState::Forfeited)
+        );
         assert_eq!(reg.held_total(topic).unwrap(), 0);
     }
 
@@ -1845,9 +1868,8 @@ mod tests {
 
         // Turn 2 (fresh process, NO engine): the persisted bound title ratifies.
         let mut reg = SqliteTitleRegistry::open(&path).unwrap();
-        let released =
-            claim_bound_outcome(&mut reg, title_id, agent, Some(&token), decision, 1)
-                .expect("legit cross-turn claim succeeds against the persisted bound title");
+        let released = claim_bound_outcome(&mut reg, title_id, agent, Some(&token), decision, 1)
+            .expect("legit cross-turn claim succeeds against the persisted bound title");
         assert_eq!(released, 1, "the topic's one validator stake is released");
         // The title is now released (its convening closed) and cannot re-claim.
         assert_eq!(
@@ -1867,7 +1889,9 @@ mod tests {
     #[test]
     fn bound_claim_rejects_forged_no_token_without_leaking_decision() {
         let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
-        let (p, _secret) = reg.grant(uid(1), uid(10), AgentRole::Firekeeper, 0).unwrap();
+        let (p, _secret) = reg
+            .grant(uid(1), uid(10), AgentRole::Firekeeper, 0)
+            .unwrap();
         reg.bind_decision(p.title_id, uid(2)).unwrap();
         assert_eq!(
             claim_bound_outcome(&mut reg, p.title_id, uid(10), None, uid(2), 0),
@@ -1908,7 +1932,14 @@ mod tests {
             .expect("authorized revoke");
 
         assert_eq!(
-            claim_bound_outcome(&mut reg, p.title_id, agent, Some(secret.token()), decision, 6),
+            claim_bound_outcome(
+                &mut reg,
+                p.title_id,
+                agent,
+                Some(secret.token()),
+                decision,
+                6
+            ),
             Err(ClaimError::ForgedFirekeeper),
             "a revoked title must be rejected even with the right token + decision"
         );
@@ -1974,12 +2005,17 @@ mod tests {
         let topic = uid(1);
         let decision = uid(2);
         let firekeeper = uid(10);
-        let (title, secret) = reg.grant(topic, firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let (title, secret) = reg
+            .grant(topic, firekeeper, AgentRole::Firekeeper, 0)
+            .unwrap();
         reg.bind_decision(title.title_id, decision).unwrap();
 
         // Sanity: before recall, the correct token + bound decision authorizes a
         // claim (proves the rejection below is caused by the recall, not a bad token).
-        assert_eq!(reg.verify_title(title.title_id, firekeeper, Some(secret.token())), Ok(()));
+        assert_eq!(
+            reg.verify_title(title.title_id, firekeeper, Some(secret.token())),
+            Ok(())
+        );
 
         let revoker = Revoker::new();
         let key = revoker.key();
@@ -2005,7 +2041,14 @@ mod tests {
         // … and a subsequent claim with the CORRECT token + bound decision is now
         // refused as forged (the load-bearing revocation property on the claim path).
         assert_eq!(
-            claim_bound_outcome(&mut reg, title.title_id, firekeeper, Some(secret.token()), decision, 10),
+            claim_bound_outcome(
+                &mut reg,
+                title.title_id,
+                firekeeper,
+                Some(secret.token()),
+                decision,
+                10
+            ),
             Err(ClaimError::ForgedFirekeeper),
             "a recalled title must fail claim even with the right token"
         );
@@ -2019,7 +2062,9 @@ mod tests {
         let topic = uid(1);
         let decision = uid(2);
         let firekeeper = uid(10);
-        let (title, secret) = reg.grant(topic, firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let (title, secret) = reg
+            .grant(topic, firekeeper, AgentRole::Firekeeper, 0)
+            .unwrap();
         reg.bind_decision(title.title_id, decision).unwrap();
 
         let revoker = Revoker::new();
@@ -2028,12 +2073,21 @@ mod tests {
         // One lone vote against a threshold-3 recall: NOT carried.
         let mut recall = RecallVote::new(title.title_id, 3);
         let pending = recall.cast(uid(20));
-        assert_eq!(pending, RecallOutcome::Pending { votes: 1, threshold: 3 });
+        assert_eq!(
+            pending,
+            RecallOutcome::Pending {
+                votes: 1,
+                threshold: 3
+            }
+        );
 
         // Executing it is refused — and the title is untouched.
         assert_eq!(
             recall_to_revocation(&revoker, &mut reg, Some(key.secret()), &pending, 5),
-            Err(TriggerRefused::RecallNotCarried { votes: 1, threshold: 3 })
+            Err(TriggerRefused::RecallNotCarried {
+                votes: 1,
+                threshold: 3
+            })
         );
         assert_eq!(
             reg.lookup(title.title_id).unwrap().unwrap().status,
@@ -2042,7 +2096,14 @@ mod tests {
         );
         // The legitimate firekeeper can still ratify: its authority is intact.
         assert_eq!(
-            claim_bound_outcome(&mut reg, title.title_id, firekeeper, Some(secret.token()), decision, 6),
+            claim_bound_outcome(
+                &mut reg,
+                title.title_id,
+                firekeeper,
+                Some(secret.token()),
+                decision,
+                6
+            ),
             Ok(0)
         );
     }
@@ -2053,7 +2114,9 @@ mod tests {
     fn carried_recall_without_revoker_key_is_refused() {
         let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
         let firekeeper = uid(10);
-        let (title, _secret) = reg.grant(uid(1), firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let (title, _secret) = reg
+            .grant(uid(1), firekeeper, AgentRole::Firekeeper, 0)
+            .unwrap();
 
         let revoker = Revoker::new();
         let mut recall = RecallVote::new(title.title_id, 1);
@@ -2086,7 +2149,9 @@ mod tests {
         let topic = uid(1);
         let decision = uid(2);
         let firekeeper = uid(10);
-        let (title, secret) = reg.grant(topic, firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let (title, secret) = reg
+            .grant(topic, firekeeper, AgentRole::Firekeeper, 0)
+            .unwrap();
         reg.bind_decision(title.title_id, decision).unwrap();
 
         let revoker = Revoker::new();
@@ -2095,32 +2160,76 @@ mod tests {
 
         // Breach 1 and 2: graduated strikes accrue, title stays live.
         assert_eq!(
-            ledger.report(&revoker, &mut reg, Some(key.secret()), title.title_id, "acted outside bound decision", 1),
-            Ok(BreachAction::Warned { strikes: 1, threshold: 3 })
+            ledger.report(
+                &revoker,
+                &mut reg,
+                Some(key.secret()),
+                title.title_id,
+                "acted outside bound decision",
+                1
+            ),
+            Ok(BreachAction::Warned {
+                strikes: 1,
+                threshold: 3
+            })
         );
         assert_eq!(
-            ledger.report(&revoker, &mut reg, Some(key.secret()), title.title_id, "claim failed verification", 2),
-            Ok(BreachAction::Warned { strikes: 2, threshold: 3 })
+            ledger.report(
+                &revoker,
+                &mut reg,
+                Some(key.secret()),
+                title.title_id,
+                "claim failed verification",
+                2
+            ),
+            Ok(BreachAction::Warned {
+                strikes: 2,
+                threshold: 3
+            })
         );
         assert_eq!(reg.lookup(title.title_id).unwrap().unwrap().strikes, 2);
-        assert_eq!(reg.lookup(title.title_id).unwrap().unwrap().status, TitleStatus::Live);
+        assert_eq!(
+            reg.lookup(title.title_id).unwrap().unwrap().status,
+            TitleStatus::Live
+        );
 
         // Breach 3: the gradient tips to a hard revoke (StrikeThreshold path).
         let action = ledger
-            .report(&revoker, &mut reg, Some(key.secret()), title.title_id, "unsafe tool call", 3)
+            .report(
+                &revoker,
+                &mut reg,
+                Some(key.secret()),
+                title.title_id,
+                "unsafe tool call",
+                3,
+            )
             .unwrap();
         match action {
             BreachAction::Revoked(rev) => {
                 assert_eq!(rev.agent_id, firekeeper);
-                assert!(rev.reason.contains("graduated recall"), "got: {}", rev.reason);
+                assert!(
+                    rev.reason.contains("graduated recall"),
+                    "got: {}",
+                    rev.reason
+                );
             }
             other => panic!("expected revoke at threshold, got {other:?}"),
         }
-        assert_eq!(reg.lookup(title.title_id).unwrap().unwrap().status, TitleStatus::Revoked);
+        assert_eq!(
+            reg.lookup(title.title_id).unwrap().unwrap().status,
+            TitleStatus::Revoked
+        );
 
         // The revoked title fails a claim even with the right token.
         assert_eq!(
-            claim_bound_outcome(&mut reg, title.title_id, firekeeper, Some(secret.token()), decision, 4),
+            claim_bound_outcome(
+                &mut reg,
+                title.title_id,
+                firekeeper,
+                Some(secret.token()),
+                decision,
+                4
+            ),
             Err(ClaimError::ForgedFirekeeper)
         );
     }
@@ -2130,14 +2239,26 @@ mod tests {
     fn single_breach_below_threshold_does_not_revoke() {
         let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
         let firekeeper = uid(10);
-        let (title, _secret) = reg.grant(uid(1), firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let (title, _secret) = reg
+            .grant(uid(1), firekeeper, AgentRole::Firekeeper, 0)
+            .unwrap();
         let revoker = Revoker::new();
         let key = revoker.key();
         let ledger = PolicyBreachLedger::new(3);
 
         assert_eq!(
-            ledger.report(&revoker, &mut reg, Some(key.secret()), title.title_id, "one breach", 1),
-            Ok(BreachAction::Warned { strikes: 1, threshold: 3 })
+            ledger.report(
+                &revoker,
+                &mut reg,
+                Some(key.secret()),
+                title.title_id,
+                "one breach",
+                1
+            ),
+            Ok(BreachAction::Warned {
+                strikes: 1,
+                threshold: 3
+            })
         );
         assert_eq!(
             reg.lookup(title.title_id).unwrap().unwrap().status,
@@ -2152,13 +2273,22 @@ mod tests {
     fn forged_breach_report_accrues_no_strike() {
         let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
         let firekeeper = uid(10);
-        let (title, _secret) = reg.grant(uid(1), firekeeper, AgentRole::Firekeeper, 0).unwrap();
+        let (title, _secret) = reg
+            .grant(uid(1), firekeeper, AgentRole::Firekeeper, 0)
+            .unwrap();
         let revoker = Revoker::new();
         let ledger = PolicyBreachLedger::new(2);
 
         // No key → refused before any strike accrues.
         assert_eq!(
-            ledger.report(&revoker, &mut reg, None, title.title_id, "spoofed breach", 1),
+            ledger.report(
+                &revoker,
+                &mut reg,
+                None,
+                title.title_id,
+                "spoofed breach",
+                1
+            ),
             Err(RevokeError::Unauthorized)
         );
         assert_eq!(
@@ -2177,12 +2307,21 @@ mod tests {
         assert_eq!(ledger.strike_threshold(), 1);
 
         let mut reg = SqliteTitleRegistry::open_in_memory().unwrap();
-        let (title, _secret) = reg.grant(uid(1), uid(10), AgentRole::Firekeeper, 0).unwrap();
+        let (title, _secret) = reg
+            .grant(uid(1), uid(10), AgentRole::Firekeeper, 0)
+            .unwrap();
         let revoker = Revoker::new();
         let key = revoker.key();
         // First (and only) breach: strike 1 == threshold 1 → revoke.
         let action = ledger
-            .report(&revoker, &mut reg, Some(key.secret()), title.title_id, "breach", 1)
+            .report(
+                &revoker,
+                &mut reg,
+                Some(key.secret()),
+                title.title_id,
+                "breach",
+                1,
+            )
             .unwrap();
         assert!(matches!(action, BreachAction::Revoked(_)));
     }

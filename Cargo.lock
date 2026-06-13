@@ -2936,6 +2936,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "ocean-core",
  "ocean-protocol",
  "serde",
  "serde_json",

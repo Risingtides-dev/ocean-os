@@ -430,7 +430,10 @@ mod tests {
             .expect("list succeeds");
         let listed_text = result_text(&listed);
         assert!(listed_text.contains("seeded topic"), "got: {listed_text}");
-        assert!(listed_text.contains(&topic.to_string()), "got: {listed_text}");
+        assert!(
+            listed_text.contains(&topic.to_string()),
+            "got: {listed_text}"
+        );
 
         // Read one by id — same topic, by snapshot.
         let one = board_read

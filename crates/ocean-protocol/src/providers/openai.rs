@@ -209,16 +209,12 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
             Message::User { content, .. } => {
                 // If any image is present, emit the content-array form so vision
                 // turns survive. Otherwise keep the simple string form.
-                let has_image = content
-                    .iter()
-                    .any(|c| matches!(c, Content::Image { .. }));
+                let has_image = content.iter().any(|c| matches!(c, Content::Image { .. }));
                 if has_image {
                     let parts: Vec<Value> = content
                         .iter()
                         .filter_map(|c| match c {
-                            Content::Text { text } => {
-                                Some(json!({"type": "text", "text": text}))
-                            }
+                            Content::Text { text } => Some(json!({"type": "text", "text": text})),
                             Content::Image { data, mime_type } => Some(json!({
                                 "type": "image_url",
                                 "image_url": {
@@ -345,9 +341,10 @@ fn openai_reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
 fn deepseek_reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
     match level {
         ThinkingLevel::Off => None,
-        ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium | ThinkingLevel::High => {
-            Some("high")
-        }
+        ThinkingLevel::Minimal
+        | ThinkingLevel::Low
+        | ThinkingLevel::Medium
+        | ThinkingLevel::High => Some("high"),
         ThinkingLevel::Xhigh => Some("max"),
     }
 }
@@ -865,8 +862,7 @@ mod tests {
             .find(|p| p["type"] == "image_url")
             .expect("image_url part missing — image was dropped");
         assert_eq!(
-            image["image_url"]["url"],
-            "data:image/png;base64,AAECAwQ=",
+            image["image_url"]["url"], "data:image/png;base64,AAECAwQ=",
             "image_url data-URL malformed"
         );
     }
@@ -902,7 +898,11 @@ mod tests {
 
         let out = convert_messages(None, &messages);
         // Two messages: the tool message, then a following user image message.
-        assert_eq!(out.len(), 2, "expected tool message + user image message, got {out:?}");
+        assert_eq!(
+            out.len(),
+            2,
+            "expected tool message + user image message, got {out:?}"
+        );
 
         // The tool message keeps the text, unchanged.
         assert_eq!(out[0]["role"], "tool");
@@ -920,8 +920,7 @@ mod tests {
             .find(|p| p["type"] == "image_url")
             .expect("image_url part missing — tool-result image was dropped");
         assert_eq!(
-            image["image_url"]["url"],
-            "data:image/png;base64,AAECAwQ=",
+            image["image_url"]["url"], "data:image/png;base64,AAECAwQ=",
             "image_url data-URL malformed"
         );
     }
@@ -939,7 +938,11 @@ mod tests {
         })];
 
         let out = convert_messages(None, &messages);
-        assert_eq!(out.len(), 1, "text-only tool result must not add a user message");
+        assert_eq!(
+            out.len(),
+            1,
+            "text-only tool result must not add a user message"
+        );
         assert_eq!(out[0]["role"], "tool");
         assert_eq!(out[0]["content"], "file contents");
     }
@@ -1003,7 +1006,9 @@ mod tests {
     fn in_stream_error_frame_is_captured() {
         let raw = r#"{"error":{"message":"rate limited","type":"rate_limit_error","code":429}}"#;
         let chunk: Chunk = serde_json::from_str(raw).expect("chunk parses");
-        let err = chunk.error.expect("error object must be captured, not dropped");
+        let err = chunk
+            .error
+            .expect("error object must be captured, not dropped");
         let desc = err.describe();
         assert!(desc.contains("rate limited"), "message lost: {desc}");
         assert!(desc.contains("rate_limit_error"), "type lost: {desc}");
@@ -1087,12 +1092,19 @@ mod tests {
 
     #[test]
     fn build_body_omits_reasoning_when_unset() {
-        let body = build_body(&openai_model(), &Context::default(), &StreamOptions::default());
+        let body = build_body(
+            &openai_model(),
+            &Context::default(),
+            &StreamOptions::default(),
+        );
         assert!(
             body.get("reasoning_effort").is_none(),
             "reasoning_effort must not be sent when options.reasoning is None: {body}"
         );
-        assert!(body.get("thinking").is_none(), "thinking must not be sent: {body}");
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking must not be sent: {body}"
+        );
     }
 
     #[test]
@@ -1120,7 +1132,10 @@ mod tests {
             "OpenAI o-series must receive top-level reasoning_effort: {body}"
         );
         // OpenAI does not use the DeepSeek `thinking` toggle.
-        assert!(body.get("thinking").is_none(), "thinking toggle is DeepSeek-only: {body}");
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking toggle is DeepSeek-only: {body}"
+        );
     }
 
     #[test]
@@ -1137,7 +1152,10 @@ mod tests {
                 ..Default::default()
             };
             let body = build_body(&openai_model(), &Context::default(), &opts);
-            assert_eq!(body["reasoning_effort"], expected, "level {level:?} mismapped: {body}");
+            assert_eq!(
+                body["reasoning_effort"], expected,
+                "level {level:?} mismapped: {body}"
+            );
         }
     }
 
@@ -1167,7 +1185,10 @@ mod tests {
             ..Default::default()
         };
         let body = build_body(&deepseek_model(), &Context::default(), &opts);
-        assert_eq!(body["reasoning_effort"], "max", "DeepSeek xhigh must map to max: {body}");
+        assert_eq!(
+            body["reasoning_effort"], "max",
+            "DeepSeek xhigh must map to max: {body}"
+        );
     }
 
     #[test]
@@ -1190,7 +1211,10 @@ mod tests {
             body.get("reasoning_effort").is_none(),
             "unknown backend must not receive reasoning_effort: {body}"
         );
-        assert!(body.get("thinking").is_none(), "unknown backend must not receive thinking: {body}");
+        assert!(
+            body.get("thinking").is_none(),
+            "unknown backend must not receive thinking: {body}"
+        );
     }
 
     // OCEAN-141: token-cap param parity. Real api.openai.com models (o-series,
@@ -1239,8 +1263,15 @@ mod tests {
     // No token cap set → neither param is emitted.
     #[test]
     fn build_body_omits_token_cap_when_unset() {
-        let body = build_body(&openai_model(), &Context::default(), &StreamOptions::default());
-        assert!(body.get("max_tokens").is_none(), "max_tokens must be absent when unset: {body}");
+        let body = build_body(
+            &openai_model(),
+            &Context::default(),
+            &StreamOptions::default(),
+        );
+        assert!(
+            body.get("max_tokens").is_none(),
+            "max_tokens must be absent when unset: {body}"
+        );
         assert!(
             body.get("max_completion_tokens").is_none(),
             "max_completion_tokens must be absent when unset: {body}"
@@ -1279,7 +1310,9 @@ mod tests {
         let chunk: Chunk = serde_json::from_str(raw).expect("usage chunk parses");
         let u = chunk.usage.expect("usage present");
         assert_eq!(
-            u.prompt_tokens_details.expect("details present").cached_tokens,
+            u.prompt_tokens_details
+                .expect("details present")
+                .cached_tokens,
             1024,
             "cached_tokens must decode from prompt_tokens_details"
         );
@@ -1423,8 +1456,13 @@ mod tests {
         assert_eq!(args, json!({}), "empty args finalize to an empty object");
 
         let truncated = "{\"q\": \"ru".to_string();
-        let args2: Value = serde_json::from_str(&truncated).unwrap_or(Value::Object(Default::default()));
-        assert_eq!(args2, json!({}), "malformed args fall back to an empty object, not panic");
+        let args2: Value =
+            serde_json::from_str(&truncated).unwrap_or(Value::Object(Default::default()));
+        assert_eq!(
+            args2,
+            json!({}),
+            "malformed args fall back to an empty object, not panic"
+        );
     }
 
     // OCEAN-198: a chunk with NO usage field decodes cleanly to `None` (not an
@@ -1434,7 +1472,10 @@ mod tests {
     fn chunk_without_usage_decodes_to_none() {
         let raw = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
         let chunk: Chunk = serde_json::from_str(raw).expect("usage-less chunk parses");
-        assert!(chunk.usage.is_none(), "absent usage must decode to None, not error");
+        assert!(
+            chunk.usage.is_none(),
+            "absent usage must decode to None, not error"
+        );
     }
 
     // OCEAN-198: a usage object with no detail sub-objects decodes with both
@@ -1446,8 +1487,14 @@ mod tests {
         let chunk: Chunk = serde_json::from_str(raw).expect("usage chunk parses");
         let u = chunk.usage.expect("usage present");
         assert_eq!(u.prompt_tokens, 10);
-        assert!(u.prompt_tokens_details.is_none(), "no cached-token detail → None");
-        assert!(u.completion_tokens_details.is_none(), "no reasoning detail → None");
+        assert!(
+            u.prompt_tokens_details.is_none(),
+            "no cached-token detail → None"
+        );
+        assert!(
+            u.completion_tokens_details.is_none(),
+            "no reasoning detail → None"
+        );
     }
 
     // OCEAN-101 / OCEAN-198: StreamError.describe must produce a useful string
@@ -1460,13 +1507,19 @@ mod tests {
         let raw = r#"{"error":{"message":"boom","type":"server_error","code":"e_500"}}"#;
         let chunk: Chunk = serde_json::from_str(raw).expect("parses");
         let d = chunk.error.unwrap().describe();
-        assert!(d.contains("server_error") && d.contains("boom") && d.contains("e_500"), "full: {d}");
+        assert!(
+            d.contains("server_error") && d.contains("boom") && d.contains("e_500"),
+            "full: {d}"
+        );
 
         // Message only — no type, no code.
         let raw = r#"{"error":{"message":"just a message"}}"#;
         let chunk: Chunk = serde_json::from_str(raw).expect("parses");
         let d = chunk.error.unwrap().describe();
-        assert_eq!(d, "just a message", "message-only must be exactly the message: {d}");
+        assert_eq!(
+            d, "just a message",
+            "message-only must be exactly the message: {d}"
+        );
 
         // Completely empty error object — must still produce a non-empty,
         // human-readable fallback, not "".
@@ -1474,7 +1527,10 @@ mod tests {
         let chunk: Chunk = serde_json::from_str(raw).expect("parses");
         let d = chunk.error.unwrap().describe();
         assert!(!d.is_empty(), "empty error must still describe itself");
-        assert!(d.contains("in-stream error"), "empty error falls back to a generic message: {d}");
+        assert!(
+            d.contains("in-stream error"),
+            "empty error falls back to a generic message: {d}"
+        );
     }
 
     // OCEAN-198: a structurally unexpected/garbage frame is NOT a hard failure —

@@ -27,7 +27,7 @@ jobs:
       - name: Install Rust toolchain (stable + clippy)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
@@ -46,7 +46,7 @@ jobs:
       - name: Clippy (workspace, all targets, deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # TODO(OCEAN-191 follow-up): add a `cargo fmt --all --check` step once a
-      # one-time `cargo fmt --all` sweep is landed deliberately (~196 files —
-      # separate PR, needs sign-off). The tree has never been formatted, so a fmt
-      # gate would be red-on-arrival today.
+      # OCEAN-191 follow-up: the one-time fmt sweep landed in OCEAN-323.
+      # The tree is now formatted — enforce it in CI.
+      - name: Format check
+        run: cargo fmt --all -- --check

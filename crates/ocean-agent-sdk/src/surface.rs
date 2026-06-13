@@ -495,10 +495,7 @@ mod tests {
             applied: 3,
             canvas_id: CanvasId::new("canvas:main"),
             revision: 12,
-            component_ids: vec![
-                ComponentId::new("brief-1"),
-                ComponentId::new("proposal-1"),
-            ],
+            component_ids: vec![ComponentId::new("brief-1"), ComponentId::new("proposal-1")],
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -637,7 +634,10 @@ mod tests {
         let s = serde_json::to_string(&env).unwrap();
         // The optional merge `version` must be omitted entirely when None, so
         // pre-OCEAN-258 consumers and the ocean-surface mirror still parse it.
-        assert!(!s.contains("version"), "unversioned envelope must not emit a version field");
+        assert!(
+            !s.contains("version"),
+            "unversioned envelope must not emit a version field"
+        );
         let back: SurfacePatchEnvelope = serde_json::from_str(&s).unwrap();
         assert_eq!(back, env);
 

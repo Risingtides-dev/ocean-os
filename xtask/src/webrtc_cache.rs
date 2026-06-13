@@ -126,7 +126,10 @@ fn maybe_rebuild(rebuild: bool, release: bool) -> ExitCode {
     if release {
         cmd.arg("--release");
     }
-    println!("\nRebuilding: cargo build -p ocean-call --features livekit-tap{}", if release { " --release" } else { "" });
+    println!(
+        "\nRebuilding: cargo build -p ocean-call --features livekit-tap{}",
+        if release { " --release" } else { "" }
+    );
 
     match cmd.status() {
         Ok(s) if s.success() => {

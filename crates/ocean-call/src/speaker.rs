@@ -119,10 +119,7 @@ pub mod live {
     /// shared state left half-written. `BargeInVoice` relies on exactly this: when
     /// a barge-in `Onset` fires it drops the in-flight `speak` future, cutting
     /// Ocean off mid-utterance with no further audio reaching the room.
-    pub async fn speak_pcm(
-        source: &NativeAudioSource,
-        pcm: PcmFrame,
-    ) -> anyhow::Result<()> {
+    pub async fn speak_pcm(source: &NativeAudioSource, pcm: PcmFrame) -> anyhow::Result<()> {
         let mut pacer = PcmPacer::new();
         for frame in pacer.push(&pcm) {
             capture(source, &frame).await?;

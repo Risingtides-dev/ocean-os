@@ -35,14 +35,9 @@ fn manifest_fixture_parses() {
 #[tokio::test]
 async fn subprocess_round_trip() {
     // Launch the real echo plugin as a child process and speak JSON-RPC to it.
-    let plugin = SubprocessPlugin::launch_command(
-        "echo-pack",
-        "0.1.0",
-        &echo_plugin_bin(),
-        &[],
-        &[],
-    )
-    .expect("launch echo plugin");
+    let plugin =
+        SubprocessPlugin::launch_command("echo-pack", "0.1.0", &echo_plugin_bin(), &[], &[])
+            .expect("launch echo plugin");
 
     assert_eq!(plugin.name(), "echo-pack");
     assert_eq!(plugin.version(), "0.1.0");
@@ -72,14 +67,9 @@ async fn subprocess_round_trip() {
 
 #[tokio::test]
 async fn subprocess_rpc_error_surfaces() {
-    let plugin = SubprocessPlugin::launch_command(
-        "echo-pack",
-        "0.1.0",
-        &echo_plugin_bin(),
-        &[],
-        &[],
-    )
-    .expect("launch echo plugin");
+    let plugin =
+        SubprocessPlugin::launch_command("echo-pack", "0.1.0", &echo_plugin_bin(), &[], &[])
+            .expect("launch echo plugin");
 
     let err = plugin
         .invoke_tool("nope", json!({}))

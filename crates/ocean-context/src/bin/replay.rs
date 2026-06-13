@@ -79,7 +79,11 @@ fn main() -> Result<()> {
                     args.handoff.display()
                 );
             };
-            let ctx = ExtractCtx { commit_sha: anchor, now: 0, by_session: "replay-bin" };
+            let ctx = ExtractCtx {
+                commit_sha: anchor,
+                now: 0,
+                by_session: "replay-bin",
+            };
             let claims = extract_claims(&text, &ctx);
             eprintln!(
                 "prose doc: extracted {} anchored claims from {}",
@@ -121,11 +125,15 @@ fn run(args: &Args, claims: &[Claim], kind: ResolverKind) -> Result<Vec<ReplayVe
     let mut claims = claims.to_vec();
     match kind {
         ResolverKind::FileExists => {
-            let resolver = FileExistsResolver { repo_root: args.repo.clone() };
+            let resolver = FileExistsResolver {
+                repo_root: args.repo.clone(),
+            };
             replay(&args.repo, &claims, &resolver)
         }
         ResolverKind::TreeSitter => {
-            let resolver = TreeSitterResolver { repo_root: args.repo.clone() };
+            let resolver = TreeSitterResolver {
+                repo_root: args.repo.clone(),
+            };
             resolver.seed_sig_hashes(&mut claims);
             replay(&args.repo, &claims, &resolver)
         }
@@ -174,7 +182,14 @@ fn print_comparison(fe: &[ReplayVerdict], ts: &[ReplayVerdict]) {
         if fa != fb {
             diffs += 1;
         }
-        println!("| {} | {} | {} | {} | {} |", a.claim_id, a.claim_text.trim(), fa, fb, marker);
+        println!(
+            "| {} | {} | {} | {} | {} |",
+            a.claim_id,
+            a.claim_text.trim(),
+            fa,
+            fb,
+            marker
+        );
     }
     eprintln!("\n{diffs} verdict(s) differ — judge each ≠ against reality.");
 }

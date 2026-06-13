@@ -11,8 +11,8 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -324,7 +324,10 @@ impl HttpTransport {
             }
         } else {
             // Single JSON body (the common case for a stateless server).
-            let body = resp.text().await.context("reading MCP HTTP response body")?;
+            let body = resp
+                .text()
+                .await
+                .context("reading MCP HTTP response body")?;
             if !body.trim().is_empty() {
                 let _ = self.inbound_tx.send(body);
             }

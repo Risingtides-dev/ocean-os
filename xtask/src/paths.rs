@@ -81,7 +81,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("xtask-paths-test-{tag}-{nanos}-{}", std::process::id()));
+        p.push(format!(
+            "xtask-paths-test-{tag}-{nanos}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&p).unwrap();
         p
     }
