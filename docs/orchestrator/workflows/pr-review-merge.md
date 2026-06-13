@@ -1,3 +1,8 @@
+---
+name: ocean-os-pr-review-merge
+description: Daemon-mediated PR gate for Ocean OS repos — verifies ticket scope, CI, and review findings before merge, then cleans up branch and worktree state.
+---
+
 # Workflow: Ocean OS PR Review and Merge
 
 This workflow handles open PRs for Ocean OS repos using Ocean itself. It replaces external orchestrator review loops with an in-repo, daemon-mediated protocol.

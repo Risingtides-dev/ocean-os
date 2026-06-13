@@ -1,3 +1,8 @@
+---
+name: ocean-os-factory-tick
+description: Ocean-native factory loop for keeping ocean-os, ocean-surface, and ocean-agents moving through daemon-mediated tools without depending on any external orchestrator.
+---
+
 # Workflow: Ocean OS Factory Tick
 
 This is the Ocean-native factory loop for keeping `ocean-os`, `ocean-surface`, and `ocean-agents` moving without depending on any external orchestrator repository. The Ocean agent runs this workflow directly through normal daemon-mediated tools. Longhouse may surface this workflow as advisory context, but the daemon remains the execution authority for filesystem, shell, browser, GitHub, Linear, and any gated action.

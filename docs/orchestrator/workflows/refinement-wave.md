@@ -1,3 +1,8 @@
+---
+name: ocean-os-refinement-wave
+description: Discover verified, ticketable improvements across the Ocean ecosystem by scanning divisions and synthesizing findings into real Linear tickets.
+---
+
 # Workflow: Ocean OS Refinement Wave
 
 This is the Ocean-native discovery/refinement workflow for finding the next real work in Ocean OS without relying on external workflow files. The Ocean agent runs it through normal daemon tools. Longhouse may recommend divisions, skills, or subagent specs; it does not execute local side effects.
