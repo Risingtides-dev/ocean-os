@@ -202,15 +202,12 @@ pub struct AgentTurn {
 /// each `TurnImage` into a `Content::Image` block on the first user message,
 /// which the provider encoders (OCEAN-99: Anthropic/OpenAI/Gemini/Codex) already
 /// know how to serialize.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnImage {
-    /// MIME type of the image data, e.g. `"image/png"` or `"image/jpeg"`.
-    pub mime_type: String,
-    /// The image payload — base64-encoded bytes, or a `data:` URL (the daemon
-    /// strips a `data:<mime>;base64,` prefix if present, keeping only the
-    /// base64 body that `Content::Image` expects).
-    pub data: String,
-}
+///
+/// `TurnImage` is a re-export of `ocean_core::PromptImage` (OCEAN-320). Both
+/// types are structurally identical (`mime_type` + `data`); unifying them removes
+/// the manual field-by-field conversion in the daemon's `agent_turn` handler.
+/// `ocean-core` is the dep-free leaf crate — `sdk → core` is a legal arrow.
+pub use ocean_core::PromptImage as TurnImage;
 
 /// Request payload for `POST /v1/agent/turns`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

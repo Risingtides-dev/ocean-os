@@ -31,7 +31,7 @@ use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectRef,
-    ProjectResponse, ProjectsResponse, PromptImage, PromptRequest, RequestControlResponse,
+    ProjectResponse, ProjectsResponse, PromptRequest, RequestControlResponse,
     RequestCreateResponse,
     RequestId,
     evaluate_trigger_policy, RequestState, RequestStatus, RequestsResponse, RoomEventsResponse,
@@ -8231,18 +8231,10 @@ async fn agent_turn(
         }
     };
 
-    // OCEAN-115: map the wire-level `TurnImage`s onto `ocean-core`'s `PromptImage`
-    // (kept separate so ocean-core stays free of an ocean-protocol dependency).
-    // The agent layer turns each into a `Content::Image` block on the first user
-    // message. `None`/empty leaves the turn text-only, unchanged.
-    let images: Option<Vec<PromptImage>> = images.map(|imgs| {
-        imgs.into_iter()
-            .map(|img| PromptImage {
-                mime_type: img.mime_type,
-                data: img.data,
-            })
-            .collect()
-    });
+    // OCEAN-320: `TurnImage` is now `pub use ocean_core::PromptImage as TurnImage`
+    // in ocean-agent-sdk, so the `images` binding from the destructured
+    // `AgentTurnRequest` is already `Option<Vec<PromptImage>>` — no manual
+    // field-by-field conversion needed. The identity mapping is gone.
 
     // Resolve the working directory: a non-empty cwd wins; else the project's
     // workspace_root; else an explicit error — never the daemon's own launch
