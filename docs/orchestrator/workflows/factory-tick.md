@@ -80,12 +80,13 @@ If Linear writes fail:
 
 Each implementation lane gets its own git worktree. Never run two code agents in the same checkout.
 
-### Live daemon safety
+### Live daemon
 
-- Do not kill, restart, or redeploy the live daemon unless John explicitly authorizes it for this session.
-- Do not run broad kill commands such as `pkill -f ocean-daemon`.
-- Test daemon work on an alternate port with an isolated config dir.
-- Verify daemon health with `GET /health`.
+- Standing authorization: the loop may kill, restart, and redeploy the live daemon from main as part of normal deploy — no per-restart approval.
+- Still build/deploy only from up-to-date `main`.
+- Prefer restarting when no agent turn is mid-render (check `/metrics ocean_turns_in_flight` or log activity), but dropping an in-flight turn is acceptable, not a blocker.
+- Use a specific PID kill, not blind broad sweeps, so you don't take down unrelated processes; re-check supervision (launchd vs hand-launched) before each restart since the box gets reconfigured.
+- Verify daemon health with `GET /health` after restart.
 
 ### Git hygiene
 

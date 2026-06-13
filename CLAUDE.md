@@ -48,9 +48,9 @@ cargo build --workspace --release
 
 The `ocean` binary is a symlink to the release build — after any TUI change, run `cargo build -p ocean-tui --release`.
 
-## Don't kill a running daemon
+## Daemon restarts
 
-The daemon is often live while the operator works. **Do not restart or kill it** to apply a fix unless explicitly told to — source fixes don't touch the running process, and a surprise restart drops whatever session is in flight. Stage the fix, tell the operator, let them restart.
+Standing authorization (set 2026-06-13): the factory loop may restart/redeploy the daemon from main without asking. A restart drops whatever session is in flight, so prefer a quiet moment (no agent turn mid-render), but that's a judgment call, not a hard stop — keep the project moving. Always build/deploy from up-to-date `main`. Use a specific-PID kill, not blind `pkill` sweeps.
 
 ## More context
 
