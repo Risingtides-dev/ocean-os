@@ -1941,7 +1941,6 @@ async fn root() -> Json<serde_json::Value> {
             "GET /v1/agent/sessions/{id}",
             "GET /v1/events",
             "POST /v1/prompt",
-            "POST /v1/agent/sessions",
             "GET /v1/requests",
             "POST /v1/requests",
             "POST /v1/requests/{id}/cancel",
