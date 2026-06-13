@@ -86,6 +86,14 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
   id. Returns `{ "ok": true, "topic": {...} }`; `400` with a typed `{ ok, error }`
   body when `topic_id` is not a valid UUID, `404` when the id is unknown. Mirrors
   the `GET /v1/rooms/{room_id}` error shape — never a panic.
+- `POST /v1/longhouse/claim` — daemon-held `claim_outcome` gate (OCEAN-272).
+- `POST /v1/longhouse/board` — `board_post` append note/evidence (OCEAN-272).
+- `POST /v1/longhouse/revoke` — hard recall of a persisted title (OCEAN-272).
+- `POST /v1/longhouse/recall` — no-confidence vote against a seated firekeeper (OCEAN-272).
+- `POST /v1/longhouse/breach` — breach-of-conduct report (OCEAN-272).
+- `POST /v1/skills/query` — skill-librarian prefilter (OCEAN-281).
+- `POST /v1/skills/fetch` — fetch one skill's full body by id (OCEAN-281).
+- `POST /v1/subagents/spec` — assemble a subagent spec from skills + defaults (OCEAN-282).
 
 Local/remote service shape now starts with:
 
@@ -97,10 +105,7 @@ Local/remote service shape now starts with:
 
 Future Longhouse APIs should add:
 
-- `GET /v1/skills/query` or `POST /v1/skills/query`
-- `GET /v1/skills/fetch`
-- `POST /v1/workflows/prepare`
-- `POST /v1/subagents/spec`
+- `POST /v1/workflows/prepare` — workflow preparation step (tracked as OCEAN-340; not yet registered in the daemon).
 
 Keep the daemon-side embedded routes working while adding the standalone service; clients and daemons can bridge versions during migration.
 
@@ -222,11 +227,10 @@ and emits `Converged`/`Aborted`.
     titles) **then** the engine's agreement, then releases escrow.
 
   **Scope-noted follow-ups (deliberately not in OCEAN-246):** (1) *daemon wiring*
-  — like `ocean-store` when it landed, this is an additive library; the daemon
-  holds no `SqliteTitleRegistry` on `AppState` yet, and `convene` still mints the
-  ephemeral in-frame `FirekeeperTitle`. Wiring the persisted registry into the
-  daemon + exposing `claim_outcome`/`board_post` as the tools
-  `longhouse_provider.rs` defers is the next ticket. (2) *staking economics* —
+  — completed in OCEAN-272 (commit 668aa70): `SqliteTitleRegistry` is now wired
+  into `AppState` (main.rs line 98, 448, 1498–1510), and `claim_outcome`/`board_post`
+  and the full governance route set are live embedded daemon routes (see the
+  embedded route list above). (2) *staking economics* —
   the escrow data structure + release/forfeit hooks are built, but where bond
   amounts come from, slashing curves, and sybil-cost calibration are policy and
   remain future work.
