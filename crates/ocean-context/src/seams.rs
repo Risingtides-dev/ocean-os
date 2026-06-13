@@ -458,6 +458,94 @@ impl VelocityMeter {
             .any(|mode| mode == "100644" || mode == "100755")
     }
 
+    /// The repo-relative path whose churn should be measured for anchor `file`,
+    /// or `None` when the anchor carries no attributable velocity signal.
+    ///
+    /// - Exact path present as a regular file → itself.
+    /// - Bare basename (no `/`) absent at the exact path but matching exactly
+    ///   ONE regular file elsewhere → that file (B1's corpus basename
+    ///   fallback: `input.rs` anchors a nested `crates/.../input.rs`). A basename
+    ///   that matches zero or MULTIPLE files yields `None` — churn can't be
+    ///   attributed to one of several candidates (stricter than B1's weak
+    ///   `Resolves(0.5)`, because averaging churn across files is meaningless).
+    /// - Symlinks, directories, out-of-tree, deleted-at-anchor → `None`.
+    ///
+    /// `at_commit == WORKTREE` resolves against the live checkout; otherwise
+    /// against the tree at `at_commit` (object reads, no filesystem traversal).
+    fn effective_path(&self, file: &str, at_commit: &str, time_rev: &str) -> Option<String> {
+        if at_commit == WORKTREE {
+            // Live filesystem: the same symlink guard B1 applies in WORKTREE
+            // mode (a symlinked path points out of the trust boundary).
+            if self.crosses_symlink(file) {
+                return None;
+            }
+            // Exact path present as a regular file (not a symlink/dir/missing —
+            // a locally-deleted file still in HEAD must NOT borrow HEAD churn).
+            if matches!(
+                std::fs::symlink_metadata(self.repo_root.join(file)),
+                Ok(md) if md.file_type().is_file()
+            ) {
+                return Some(file.to_string());
+            }
+            // Bare-basename fallback: unique tracked match in the working tree
+            // that ALSO exists on disk as a regular file. `ls-files` reflects
+            // the index, which still lists a locally-deleted file — so the
+            // candidate must be re-checked on disk, or a deleted bare-basename
+            // anchor would borrow HEAD churn (regressing the deletion gate).
+            if !file.contains('/') {
+                if let Some(listing) = self.git(&["ls-files"]) {
+                    if let Some(cand) = self.unique_basename(&listing, file) {
+                        if matches!(
+                            std::fs::symlink_metadata(self.repo_root.join(&cand)),
+                            Ok(md) if md.file_type().is_file()
+                        ) {
+                            return Some(cand);
+                        }
+                    }
+                }
+            }
+            None
+        } else {
+            // At-commit: accept only a REGULAR tracked blob. `ls-tree` lists
+            // nothing for an absent path and reports the mode for a present
+            // one, so existence + mode in one probe — a symlink blob (120000)
+            // or tree (040000) would otherwise have its blob/edits counted as
+            // churn (the symlink trust boundary in the past tense).
+            if self.is_regular_blob_at(file, at_commit) {
+                return Some(file.to_string());
+            }
+            // Bare-basename fallback against the tree: unique regular-file
+            // match. `-r` recurses; rows are `<mode> <type> <obj>\t<path>`.
+            if !file.contains('/') {
+                if let Some(listing) = self.git(&["ls-tree", "-r", time_rev]) {
+                    let regulars: String = listing
+                        .lines()
+                        .filter(|row| {
+                            let mode = row.split_whitespace().next().unwrap_or("");
+                            mode == "100644" || mode == "100755"
+                        })
+                        .filter_map(|row| row.split('\t').nth(1))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return self.unique_basename(&regulars, file);
+                }
+            }
+            None
+        }
+    }
+
+    /// The single listing path whose basename equals `file`, or `None` if zero
+    /// or more than one match (ambiguous location → no attributable churn).
+    fn unique_basename(&self, listing: &str, file: &str) -> Option<String> {
+        let needle = format!("/{file}");
+        let mut hits = listing.lines().filter(|l| *l == file || l.ends_with(&needle));
+        let first = hits.next()?;
+        match hits.next() {
+            None => Some(first.to_string()), // exactly one
+            Some(_) => None,                 // ambiguous
+        }
+    }
+
     /// Raw counts for one anchor file over the trailing window ending at
     /// `at_commit`: `(commits, churn_lines)` where `churn_lines` is summed
     /// added+deleted across those commits. `--follow` keeps a rename's earlier
@@ -472,60 +560,21 @@ impl VelocityMeter {
         // for a working-tree measurement (WORKTREE is not a revision, so it
         // can't date the window directly).
         let time_rev = if at_commit == WORKTREE { "HEAD" } else { at_commit };
-        if at_commit == WORKTREE {
-            // Working-tree measurement reads the live filesystem, so the same
-            // symlink guard B1 applies in WORKTREE mode holds: a symlinked path
-            // points out of the trust boundary → no signal.
-            if self.crosses_symlink(file) {
-                return (0, 0);
-            }
-            // The anchor must EXIST as a regular file in the working tree to
-            // carry a signal. Without this, a file deleted locally but still
-            // present in HEAD would skip to `git log HEAD -- <file>` and get
-            // HEAD's churn — a positive velocity for an anchor that is absent
-            // (B1 resolves a missing WORKTREE file Dead), and inconsistent with
-            // the historical branch's existence gate below. `symlink_metadata`
-            // does not follow the leaf; the component walk above already
-            // excluded symlinked parents.
-            match std::fs::symlink_metadata(self.repo_root.join(file)) {
-                Ok(md) if md.file_type().is_file() => {}
-                _ => return (0, 0),
-            }
-        } else {
-            // At-commit measurement: the anchor must be a REGULAR tracked blob
-            // at its own commit to carry a velocity signal.
-            //
-            // - Existence: `git log -- <path>` still returns a deleted file's
-            //   deletion + prior edits, so a file removed at/before `at_commit`
-            //   would otherwise read as "recently churned" when the anchor is
-            //   unattestable there (B1 resolves it Dead).
-            // - Mode: git stores a symlink as a 120000 blob, so an existence-
-            //   only probe (`cat-file -e`) would ACCEPT a historical symlink
-            //   and `--numstat` would count edits to the link-target string as
-            //   churn — the symlink trust boundary, breached in the past tense.
-            //
-            // `ls-tree` checks both at once: it lists nothing for an absent
-            // path and reports the mode for a present one. We accept only
-            // regular-file modes (100644 / 100755); symlink (120000) and tree
-            // (040000) yield no signal. The worktree symlink guard is
-            // deliberately NOT consulted here — history reads go through
-            // `<rev>:<path>` (object syntax, no filesystem traversal), so a
-            // file that was a real blob at its anchor commit but is a symlink
-            // at HEAD still measures its real historical velocity.
-            if !self.is_regular_blob_at(file, at_commit) {
-                return (0, 0);
-            }
-        }
+        // Resolve the path whose churn we measure: the exact anchor when it is
+        // a present regular file, else the UNIQUE bare-basename match (B1's
+        // corpus fallback). Ambiguous / absent / non-regular → no signal.
+        let Some(path) = self.effective_path(file, at_commit, time_rev) else {
+            return (0, 0);
+        };
         let Some(end) = self.commit_time(time_rev) else { return (0, 0) };
         let lo = end - self.window_days * 86_400;
         // `--` separates options from paths but does NOT disable pathspec
         // magic: an untrusted anchor like `:(glob)**/*.rs` would otherwise
         // glob the whole repo and inflate velocity, prematurely decaying
-        // trust. Force the anchor to a LITERAL pathspec so git takes it
-        // verbatim — a magic string then matches no such file and measures
-        // zero, the safe direction. `:(literal)` is a single pathspec, which
-        // `--follow` requires.
-        let literal = format!(":(literal){file}");
+        // trust. Force the (resolved) path to a LITERAL pathspec so git takes
+        // it verbatim. `:(literal)` is a single pathspec, which `--follow`
+        // requires.
+        let literal = format!(":(literal){path}");
         // Walk from `time_rev` (HEAD for a working-tree measurement — WORKTREE
         // is not a revision; committed history is what `git log` can read).
         let Some(out) = self.git(&[

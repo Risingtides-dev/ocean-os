@@ -436,3 +436,48 @@ fn churn_window_uses_author_time_not_committer_time() {
     );
     assert_eq!(v.v_sem, 0.0);
 }
+
+/// Codex P2 (PR #210): a bare-basename anchor that resolves to a hot NESTED
+/// file (B1's corpus fallback — `input.rs` anchoring `crates/.../input.rs`)
+/// must get that file's velocity, not the no-velocity baseline. An ambiguous
+/// basename (multiple matches) stays zero — churn can't be attributed.
+#[test]
+fn bare_basename_anchor_measures_the_unique_nested_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+    let nested = "crates/core/src/input.rs";
+    std::fs::write(root.join(nested), "fn input() {}\n").unwrap();
+    std::fs::write(root.join("frozen.rs"), "fn frozen() {}\n").unwrap();
+    git_at(root, "2026-06-01T12:00:00 +0000", &["add", "."]);
+    git_at(root, "2026-06-01T12:00:00 +0000", &["commit", "-qm", "born"]);
+    // Churn the nested input.rs across the trailing window.
+    for day in 16..=21 {
+        let when = format!("2026-06-{day:02}T12:00:00 +0000");
+        let body: String = (0..day * 8).map(|i| format!("    let v{i} = {i};\n")).collect();
+        std::fs::write(root.join(nested), format!("fn input() {{\n{body}}}\n")).unwrap();
+        git_at(root, &when, &["add", nested]);
+        git_at(root, &when, &["commit", "-qm", &format!("day{day}: churn input")]);
+    }
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let meter = VelocityMeter::new(root.to_path_buf());
+
+    // Bare `input.rs` resolves to the unique nested file → measures its churn.
+    let bare = meter.measure(&anchored_claim("i", "input.rs", &head));
+    assert!(bare.v_sem > 0.0, "a bare basename must inherit the unique nested file's velocity");
+    // Identical to anchoring the full path.
+    let full = meter.measure(&anchored_claim("i", nested, &head));
+    assert_eq!(bare.v_code, full.v_code, "bare basename measures the same as the full path");
+
+    // Ambiguity: add a SECOND input.rs elsewhere. Now the bare basename can't
+    // be attributed to one file → zero (stricter than B1's weak 0.5).
+    std::fs::create_dir_all(root.join("crates/other/src")).unwrap();
+    std::fs::write(root.join("crates/other/src/input.rs"), "fn other() {}\n").unwrap();
+    git_at(root, "2026-06-21T13:00:00 +0000", &["add", "-A"]);
+    git_at(root, "2026-06-21T13:00:00 +0000", &["commit", "-qm", "second input.rs"]);
+    let head2 = git(root, &["rev-parse", "HEAD"]);
+    let ambiguous = meter.measure(&anchored_claim("i", "input.rs", &head2));
+    assert_eq!(ambiguous.v_sem, 0.0, "an ambiguous basename has no attributable churn");
+    assert_eq!(ambiguous.v_code, 0.0);
+}
