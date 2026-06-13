@@ -436,12 +436,26 @@ impl VelocityMeter {
     /// `at_commit`: `(commits, churn_lines)` where `churn_lines` is summed
     /// added+deleted across those commits. `--follow` keeps a rename's earlier
     /// history attached. Returns `(0, 0)` for an unattestable path (out of
-    /// tree, symlinked, unreadable commit) — silence, never error.
+    /// tree, symlinked, unreadable commit, or absent AT the anchor commit) —
+    /// silence, never error.
     fn counts_for_file(&self, file: &str, at_commit: &str) -> (u32, u64) {
         if !is_repo_relative(file) {
             return (0, 0);
         }
         if self.crosses_symlink(file) {
+            return (0, 0);
+        }
+        // The anchor must EXIST at its own commit to carry a velocity signal.
+        // `git log -- <path>` still returns a deleted file's deletion + prior
+        // edits, so a file removed at/before `at_commit` would otherwise read
+        // as "recently churned" and decay trust — when the anchor is actually
+        // unattestable there (B1 resolves it Dead). Same existence probe the
+        // resolver uses: absent at the commit → no signal. (`<rev>:<path>` is
+        // git's object syntax: the path is already a literal tree path, no
+        // pathspec magic; a degenerate path just fails the probe → 0, safe.)
+        if at_commit != WORKTREE
+            && self.git(&["cat-file", "-e", &format!("{at_commit}:{file}")]).is_none()
+        {
             return (0, 0);
         }
         let Some(end) = self.commit_time(at_commit) else { return (0, 0) };

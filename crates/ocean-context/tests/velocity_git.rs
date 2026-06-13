@@ -210,3 +210,41 @@ fn anchorless_and_empty_commit_claims_measure_zero() {
     let no_commit = anchored_claim("nc", "hot.rs", "");
     assert_eq!(meter.measure(&no_commit).v_sem, 0.0);
 }
+
+/// Codex P2 (PR #210): a file that does NOT exist at the anchor commit must
+/// carry NO velocity signal, even though `git log -- <path>` still returns its
+/// deletion + prior churn. An anchor to a file deleted at/before its claim's
+/// commit is unattestable there (B1 resolves it Dead); measuring its
+/// pre-deletion churn would decay trust as if a live region were hot.
+#[test]
+fn deleted_at_anchor_commit_measures_zero_velocity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let churned_head = build_repo(root); // hot.rs is molten through day 21
+
+    // Confirm hot.rs IS molten while it exists (the signal we must suppress
+    // once it's gone).
+    let meter = VelocityMeter::new(root.to_path_buf());
+    assert!(
+        meter.measure(&anchored_claim("hot", "hot.rs", &churned_head)).v_sem > 0.0,
+        "hot.rs is molten while present"
+    );
+
+    // Day 21: delete hot.rs in a final commit. The anchor commit is the
+    // deletion itself — hot.rs no longer exists in that tree.
+    std::fs::remove_file(root.join("hot.rs")).unwrap();
+    git_at(root, "2026-06-21T18:00:00 +0000", &["add", "-A"]);
+    git_at(root, "2026-06-21T18:00:00 +0000", &["commit", "-qm", "day21: delete hot"]);
+    let deletion_head = git(root, &["rev-parse", "HEAD"]);
+
+    // Anchored at the deletion commit: hot.rs is absent there → no signal,
+    // despite a full window of churn in its `git log` history.
+    let v = meter.measure(&anchored_claim("hot", "hot.rs", &deletion_head));
+    assert_eq!(v.v_sem, 0.0, "a file absent at its anchor commit measures zero velocity");
+    assert_eq!(v.v_code, 0.0, "a file absent at its anchor commit measures zero velocity");
+
+    // Control: frozen.rs still exists at the deletion commit, so the meter
+    // still functions there (it's just frozen → zero by window, not by gate).
+    let frozen = meter.measure(&anchored_claim("frozen", "frozen.rs", &deletion_head));
+    assert_eq!(frozen.v_sem, 0.0);
+}
