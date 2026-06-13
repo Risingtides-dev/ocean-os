@@ -442,21 +442,34 @@ impl VelocityMeter {
         if !is_repo_relative(file) {
             return (0, 0);
         }
-        if self.crosses_symlink(file) {
-            return (0, 0);
-        }
-        // The anchor must EXIST at its own commit to carry a velocity signal.
-        // `git log -- <path>` still returns a deleted file's deletion + prior
-        // edits, so a file removed at/before `at_commit` would otherwise read
-        // as "recently churned" and decay trust — when the anchor is actually
-        // unattestable there (B1 resolves it Dead). Same existence probe the
-        // resolver uses: absent at the commit → no signal. (`<rev>:<path>` is
-        // git's object syntax: the path is already a literal tree path, no
-        // pathspec magic; a degenerate path just fails the probe → 0, safe.)
-        if at_commit != WORKTREE
-            && self.git(&["cat-file", "-e", &format!("{at_commit}:{file}")]).is_none()
-        {
-            return (0, 0);
+        if at_commit == WORKTREE {
+            // Working-tree measurement reads the live filesystem, so the same
+            // symlink guard B1 applies in WORKTREE mode holds: a symlinked path
+            // points out of the trust boundary → no signal.
+            if self.crosses_symlink(file) {
+                return (0, 0);
+            }
+        } else {
+            // At-commit measurement: the anchor must EXIST at its own commit to
+            // carry a velocity signal. `git log -- <path>` still returns a
+            // deleted file's deletion + prior edits, so a file removed
+            // at/before `at_commit` would otherwise read as "recently churned"
+            // and decay trust — when the anchor is unattestable there (B1
+            // resolves it Dead). Same existence probe the resolver uses.
+            //
+            // Crucially, the symlink guard above is NOT applied here: it
+            // consults the CURRENT checkout, but history reads go through
+            // `<rev>:<path>` (git's object syntax — a literal tree path, no
+            // filesystem traversal, no pathspec magic), exactly like
+            // `TreeSitterResolver::load`'s at-commit path. Gating historical
+            // churn on what HEAD happens to symlink now would make decay depend
+            // on the current checkout — a file that was a real blob at its
+            // anchor commit but is a symlink at HEAD must still measure its
+            // real historical velocity. A degenerate path just fails the
+            // existence probe → 0, the safe direction.
+            if self.git(&["cat-file", "-e", &format!("{at_commit}:{file}")]).is_none() {
+                return (0, 0);
+            }
         }
         let Some(end) = self.commit_time(at_commit) else { return (0, 0) };
         let lo = end - self.window_days * 86_400;

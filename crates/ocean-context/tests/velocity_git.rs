@@ -248,3 +248,41 @@ fn deleted_at_anchor_commit_measures_zero_velocity() {
     let frozen = meter.measure(&anchored_claim("frozen", "frozen.rs", &deletion_head));
     assert_eq!(frozen.v_sem, 0.0);
 }
+
+/// Codex P2 (PR #210): a historical (at-commit) velocity measurement must NOT
+/// be gated on the CURRENT worktree's symlinks. A file that was a real tracked
+/// blob at its anchor commit but is replaced by a symlink at HEAD must still
+/// measure its real historical churn — git reads it via `<rev>:<path>` (object
+/// syntax, no filesystem traversal), exactly like TreeSitterResolver::load's
+/// at-commit path. Gating on HEAD's symlink would make decay depend on the
+/// current checkout.
+#[cfg(unix)]
+#[test]
+fn historical_velocity_ignores_current_worktree_symlink() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let molten_head = build_repo(root); // hot.rs is a real, molten blob at HEAD
+
+    // Sanity: hot.rs is molten as a normal blob at its anchor commit.
+    let meter = VelocityMeter::new(root.to_path_buf());
+    let hot_v = meter.measure(&anchored_claim("hot", "hot.rs", &molten_head)).v_sem;
+    assert!(hot_v > 0.0, "hot.rs is molten as a tracked blob");
+
+    // Now replace hot.rs with a symlink in a NEW commit (so HEAD moves on),
+    // but keep measuring at the ORIGINAL commit where it was a real blob.
+    std::fs::remove_file(root.join("hot.rs")).unwrap();
+    symlink(root.join("frozen.rs"), root.join("hot.rs")).unwrap();
+    git_at(root, "2026-06-21T20:00:00 +0000", &["add", "-A"]);
+    git_at(root, "2026-06-21T20:00:00 +0000", &["commit", "-qm", "day21: hot.rs -> symlink"]);
+
+    // The working tree now has hot.rs as a symlink, but the anchor commit
+    // `molten_head` still has it as the real, churned blob. Velocity there is
+    // unchanged — it does NOT collapse to zero because of HEAD's symlink.
+    let still_hot = meter.measure(&anchored_claim("hot", "hot.rs", &molten_head)).v_sem;
+    assert_eq!(
+        still_hot, hot_v,
+        "historical velocity must not depend on the current checkout's symlink"
+    );
+    assert!(still_hot > 0.0);
+}
