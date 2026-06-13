@@ -16936,9 +16936,16 @@ mod tests {
             "the planted repo skill must surface in the ranked brief, got {:?}",
             prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
-        // SOPs / workflows are always empty in phase 1 — assert the contract holds
-        // through the endpoint, not just at the library boundary.
-        assert!(prep.sops.is_empty() && prep.workflows.is_empty());
+        // SOPs remain empty (no on-disk SOP source). Workflows are populated by
+        // WorkflowIndex when a docs/orchestrator/workflows/ dir exists in the cwd;
+        // this test's cwd has none, so workflows is also empty here.
+        assert!(prep.sops.is_empty(), "SOPs must remain empty — no on-disk source");
+        // Workflows: this test cwd has no workflow dir, so must be empty.
+        assert!(
+            prep.workflows.is_empty(),
+            "no workflow dir in test cwd, expected empty workflows, got {:?}",
+            prep.workflows.iter().map(|w| &w.name).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
