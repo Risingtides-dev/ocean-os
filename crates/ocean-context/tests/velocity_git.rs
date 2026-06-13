@@ -370,3 +370,69 @@ fn worktree_anchor_deleted_locally_measures_zero_even_if_in_head() {
     assert_eq!(v.v_sem, 0.0, "a locally-deleted worktree anchor measures zero");
     assert_eq!(v.v_code, 0.0);
 }
+
+/// Set author and committer dates independently for the next commit.
+fn git_split_dates(dir: &Path, author: &str, committer: &str, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(dir).args(args)
+        .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+        .env("GIT_AUTHOR_DATE", author)
+        .env("GIT_COMMITTER_DATE", committer)
+        .output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Codex P2 (PR #210): the churn window is dated by AUTHOR time (%at), not
+/// committer time (%ct). A rebased/imported history rewrites committer dates to
+/// the rewrite moment; using %ct would pull long-ago-authored churn into a
+/// recent window and prematurely shorten trust.
+///
+/// Discriminator: the churn is AUTHORED long ago but COMMITTED recently (a
+/// rebase), and HEAD is AUTHORED recently. With %at the window ends at HEAD's
+/// recent author time and the old-authored churn falls OUTSIDE → ~zero recent
+/// velocity. With %ct it would end at the recent committer time and the
+/// recently-committed churn would fall inside → positive velocity. The two
+/// answers differ, so the assertion pins author-time semantics.
+#[test]
+fn churn_window_uses_author_time_not_committer_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+
+    // Five churn commits AUTHORED in Jan 2026 but COMMITTED in Jun 2026.
+    std::fs::write(root.join("rebased.rs"), "fn r() {}\n").unwrap();
+    git_split_dates(root, "2026-01-01T00:00:00 +0000", "2026-06-20T12:00:00 +0000",
+        &["add", "."]);
+    git_split_dates(root, "2026-01-01T00:00:00 +0000", "2026-06-20T12:00:00 +0000",
+        &["commit", "-qm", "born"]);
+    for day in 2..=6 {
+        let body: String = (0..day * 8).map(|i| format!("    let v{i} = {i};\n")).collect();
+        std::fs::write(root.join("rebased.rs"), format!("fn r() {{\n{body}}}\n")).unwrap();
+        let author = format!("2026-01-{day:02}T00:00:00 +0000");
+        let committer = format!("2026-06-{:02}T12:00:00 +0000", 19 + day);
+        git_split_dates(root, &author, &committer, &["add", "rebased.rs"]);
+        git_split_dates(root, &author, &committer, &["commit", "-qm", &format!("churn {day}")]);
+    }
+
+    // A FINAL commit authored AND committed "now" (Jun 26), touching another
+    // file — this is HEAD, and we measure rebased.rs at HEAD. HEAD's author
+    // time is Jun 26, so the 7-day author-time window is ~Jun 19..26: the Jan-
+    // AUTHORED churn of rebased.rs is far outside it → zero recent velocity.
+    // (Under %ct the window would be the same Jun range AND the churn's Jun
+    // committer dates would land inside → positive. The two disagree.)
+    std::fs::write(root.join("head.rs"), "fn h() {}\n").unwrap();
+    git_split_dates(root, "2026-06-26T12:00:00 +0000", "2026-06-26T12:00:00 +0000",
+        &["add", "head.rs"]);
+    git_split_dates(root, "2026-06-26T12:00:00 +0000", "2026-06-26T12:00:00 +0000",
+        &["commit", "-qm", "head: recent"]);
+    let head = git(root, &["rev-parse", "HEAD"]);
+
+    let meter = VelocityMeter::new(root.to_path_buf()); // 7-day window
+    let v = meter.measure(&anchored_claim("r", "rebased.rs", &head));
+    assert_eq!(
+        v.v_code, 0.0,
+        "Jan-authored churn must fall outside a Jun author-time window (%at, not %ct)"
+    );
+    assert_eq!(v.v_sem, 0.0);
+}

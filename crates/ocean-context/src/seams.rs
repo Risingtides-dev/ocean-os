@@ -404,9 +404,15 @@ impl VelocityMeter {
 
     /// Author time (unix seconds) of `rev`, or `None` if it can't be read
     /// (unknown/pruned commit in a shallow clone — uncheckable, never an
-    /// error).
+    /// error). `%at` (author), NOT `%ct` (committer): a rebased / cherry-picked
+    /// / imported history rewrites committer dates to the rewrite time, which
+    /// would make old churn look recent and prematurely shorten trust. The
+    /// window end uses this, and the in-window filter below uses `%at` too, so
+    /// both bounds are in the same (author) time base. Erring toward intrinsic
+    /// authoring time keeps trust longer under history rewrites — the safe
+    /// direction.
     fn commit_time(&self, rev: &str) -> Option<i64> {
-        self.git(&["log", "-1", "--format=%ct", rev])
+        self.git(&["log", "-1", "--format=%at", rev])
             .and_then(|s| s.trim().parse::<i64>().ok())
     }
 
@@ -525,7 +531,9 @@ impl VelocityMeter {
         let Some(out) = self.git(&[
             "log",
             "--follow",
-            "--format=COMMIT %ct",
+            // `%at` (author time), matching `commit_time`'s window bounds — a
+            // rewritten committer date must not pull old churn into the window.
+            "--format=COMMIT %at",
             "--numstat",
             time_rev,
             "--",
