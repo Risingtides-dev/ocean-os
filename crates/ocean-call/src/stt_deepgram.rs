@@ -230,10 +230,7 @@ pub fn parse_results(body: &[u8], base_ms: u64) -> anyhow::Result<Option<Transcr
         return Ok(None);
     }
 
-    let is_final = v
-        .get("is_final")
-        .and_then(|f| f.as_bool())
-        .unwrap_or(false);
+    let is_final = v.get("is_final").and_then(|f| f.as_bool()).unwrap_or(false);
 
     // `start` is seconds-from-stream-start as a float; convert to ms and offset
     // by the call-relative base so timelines align.
@@ -307,10 +304,9 @@ pub mod live {
         ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamEvent>)> {
             let url = build_ws_url(cfg);
             let mut request = url.into_client_request()?;
-            request.headers_mut().insert(
-                "Authorization",
-                format!("Token {api_key}").parse()?,
-            );
+            request
+                .headers_mut()
+                .insert("Authorization", format!("Token {api_key}").parse()?);
 
             let (ws, _resp) = tokio_tungstenite::connect_async(request).await?;
             let (write, mut read) = ws.split();
@@ -553,7 +549,8 @@ mod tests {
 
     #[test]
     fn parse_missing_alternatives_is_none() {
-        let body = br#"{ "type": "Results", "is_final": false, "channel": { "alternatives": [] } }"#;
+        let body =
+            br#"{ "type": "Results", "is_final": false, "channel": { "alternatives": [] } }"#;
         assert!(parse_results(body, 0).unwrap().is_none());
     }
 
@@ -566,7 +563,8 @@ mod tests {
     fn parse_default_is_final_false_when_absent() {
         // A Results frame without is_final defaults to interim (revisable), per
         // the "never block the lane — mark final:false" rule.
-        let body = br#"{ "type": "Results", "channel": { "alternatives": [ { "transcript": "hi" } ] } }"#;
+        let body =
+            br#"{ "type": "Results", "channel": { "alternatives": [ { "transcript": "hi" } ] } }"#;
         let seg = parse_results(body, 0).unwrap().unwrap();
         assert!(!seg.is_final);
     }

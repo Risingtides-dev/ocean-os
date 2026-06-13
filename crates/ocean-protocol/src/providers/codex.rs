@@ -62,9 +62,7 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
                 let parts: Vec<Value> = content
                     .iter()
                     .filter_map(|c| match c {
-                        Content::Text { text } => {
-                            Some(json!({"type": "input_text", "text": text}))
-                        }
+                        Content::Text { text } => Some(json!({"type": "input_text", "text": text})),
                         Content::Image { data, mime_type } => Some(json!({
                             "type": "input_image",
                             "image_url": format!("data:{};base64,{}", mime_type, data),
@@ -417,7 +415,11 @@ impl ToolCalls {
     /// Ensure a block exists for `item_id`, assigning the next block index and
     /// recording stream order the first time. Returns whether it was just started.
     fn ensure(&mut self, item_id: &str, next_block_index: &mut usize) -> bool {
-        let exists_started = self.by_item.get(item_id).map(|e| e.started).unwrap_or(false);
+        let exists_started = self
+            .by_item
+            .get(item_id)
+            .map(|e| e.started)
+            .unwrap_or(false);
         if exists_started {
             return false;
         }
@@ -888,9 +890,7 @@ mod tests {
 
         let out = convert_input(&messages);
         assert_eq!(out.len(), 1);
-        let parts = out[0]["content"]
-            .as_array()
-            .expect("content array missing");
+        let parts = out[0]["content"].as_array().expect("content array missing");
 
         let has_text = parts
             .iter()
@@ -961,7 +961,11 @@ mod tests {
 
         let out = convert_input(&messages);
 
-        assert_eq!(out.len(), 1, "expected only the function_call_output: {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "expected only the function_call_output: {out:?}"
+        );
         assert_eq!(out[0]["type"], "function_call_output");
         assert_eq!(out[0]["call_id"], "call_7");
         assert_eq!(out[0]["output"], "file contents");
@@ -1148,10 +1152,7 @@ mod tests {
                 "incomplete_details": { "reason": "content_filter" }
             }
         });
-        assert_eq!(
-            incomplete_reason(&frame).as_deref(),
-            Some("content_filter")
-        );
+        assert_eq!(incomplete_reason(&frame).as_deref(), Some("content_filter"));
         assert!(
             !incomplete_is_length_cap(Some("content_filter")),
             "non-length incomplete reasons must keep erroring"
@@ -1203,7 +1204,11 @@ mod tests {
         );
 
         let finals = tc.finalize();
-        assert_eq!(finals.len(), 2, "both parallel calls must survive: {finals:?}");
+        assert_eq!(
+            finals.len(),
+            2,
+            "both parallel calls must survive: {finals:?}"
+        );
 
         // Stream order preserved: A was added first, so it stays block 0.
         let a = &finals[0];
@@ -1226,10 +1231,7 @@ mod tests {
         let mut tc = ToolCalls::default();
         let mut next: usize = 0;
 
-        tc.on_done(
-            &fc_item("fc_X", "call_X", "noop", "{\"k\":1}"),
-            &mut next,
-        );
+        tc.on_done(&fc_item("fc_X", "call_X", "noop", "{\"k\":1}"), &mut next);
 
         let finals = tc.finalize();
         assert_eq!(finals.len(), 1);
@@ -1272,7 +1274,9 @@ mod tests {
         }"#;
         let u: ResponsesUsage = serde_json::from_str(raw).expect("responses usage parses");
         assert_eq!(
-            u.input_tokens_details.expect("details present").cached_tokens,
+            u.input_tokens_details
+                .expect("details present")
+                .cached_tokens,
             1792,
             "cached_tokens must decode from input_tokens_details"
         );
@@ -1331,7 +1335,8 @@ mod tests {
         assert!(incomplete_reason(&json!({"response": {"incomplete_details": {}}})).is_none());
         // `reason` present but not a string → None (as_str fails), no panic.
         assert!(
-            incomplete_reason(&json!({"response": {"incomplete_details": {"reason": 42}}})).is_none()
+            incomplete_reason(&json!({"response": {"incomplete_details": {"reason": 42}}}))
+                .is_none()
         );
         // A wholly empty value is fine too.
         assert!(incomplete_reason(&json!({})).is_none());
@@ -1347,7 +1352,10 @@ mod tests {
         let mut next: usize = 0;
 
         let s1 = tc.on_args_delta("fc_1", "{\"path\":", &mut next);
-        assert!(s1.started.is_some(), "first delta with no prior `added` must start the call");
+        assert!(
+            s1.started.is_some(),
+            "first delta with no prior `added` must start the call"
+        );
         let s2 = tc.on_args_delta("fc_1", "\"/etc/hosts\",", &mut next);
         assert!(s2.started.is_none(), "subsequent deltas must not re-start");
         tc.on_args_delta("fc_1", "\"mode\":", &mut next);
@@ -1374,7 +1382,10 @@ mod tests {
         tc.on_done(&fc_item("fc_e", "call_e", "noop", ""), &mut next);
         let finals = tc.finalize();
         assert_eq!(finals.len(), 1);
-        assert!(finals[0].args.is_empty(), "no streamed args → empty arg buffer");
+        assert!(
+            finals[0].args.is_empty(),
+            "no streamed args → empty arg buffer"
+        );
         let args: Value = if finals[0].args.is_empty() {
             Value::Object(Default::default())
         } else {
@@ -1385,7 +1396,11 @@ mod tests {
         // Malformed buffer → {} via unwrap_or, no panic.
         let bad = "{\"path\": \"/tmp".to_string();
         let args2: Value = serde_json::from_str(&bad).unwrap_or(Value::Object(Default::default()));
-        assert_eq!(args2, json!({}), "malformed args fall back to an empty object");
+        assert_eq!(
+            args2,
+            json!({}),
+            "malformed args fall back to an empty object"
+        );
     }
 
     // OCEAN-198: the completed-event usage decode must tolerate a usage object
@@ -1399,7 +1414,10 @@ mod tests {
         assert_eq!(u.output_tokens, 20);
         assert_eq!(u.total_tokens, 120);
         assert!(u.input_tokens_details.is_none(), "no cached detail → None");
-        assert!(u.output_tokens_details.is_none(), "no reasoning detail → None");
+        assert!(
+            u.output_tokens_details.is_none(),
+            "no reasoning detail → None"
+        );
     }
 
     // OCEAN-198: the completed event reports total_tokens=0 on some backends; the
@@ -1409,9 +1427,19 @@ mod tests {
     fn responses_usage_zero_total_is_preserved_for_fallback() {
         let raw = r#"{"input_tokens": 7, "output_tokens": 3, "total_tokens": 0}"#;
         let u: ResponsesUsage = serde_json::from_str(raw).expect("decodes");
-        assert_eq!(u.total_tokens, 0, "zero total must survive so the loop can fall back to input+output");
-        let effective = if u.total_tokens > 0 { u.total_tokens } else { u.input_tokens + u.output_tokens };
-        assert_eq!(effective, 10, "loop fallback must yield input+output when total is 0");
+        assert_eq!(
+            u.total_tokens, 0,
+            "zero total must survive so the loop can fall back to input+output"
+        );
+        let effective = if u.total_tokens > 0 {
+            u.total_tokens
+        } else {
+            u.input_tokens + u.output_tokens
+        };
+        assert_eq!(
+            effective, 10,
+            "loop fallback must yield input+output when total is 0"
+        );
     }
 
     // OCEAN-198: the failed/incomplete error envelope must decode even when the
@@ -1423,7 +1451,10 @@ mod tests {
         let frame = json!({"type": "response.failed", "response": {}});
         let parsed: Option<FailedEvent> = serde_json::from_value(frame).ok();
         let err = parsed.and_then(|f| f.response.error);
-        assert!(err.is_none(), "a failed frame with no error body must yield None, not panic");
+        assert!(
+            err.is_none(),
+            "a failed frame with no error body must yield None, not panic"
+        );
     }
 
     // OCEAN-198: an `output_item.done` for a NON-function item (e.g. a message or
@@ -1439,7 +1470,10 @@ mod tests {
         });
         let env: OutputItemEnvelope =
             serde_json::from_value(frame).expect("non-function item envelope decodes");
-        assert_eq!(env.item.r#type, "message", "the loop's function_call guard reads this type");
+        assert_eq!(
+            env.item.r#type, "message",
+            "the loop's function_call guard reads this type"
+        );
         assert_ne!(env.item.r#type, "function_call");
     }
 }

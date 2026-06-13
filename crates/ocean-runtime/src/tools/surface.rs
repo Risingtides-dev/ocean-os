@@ -115,10 +115,7 @@ impl AgentTool for SurfacePatchTool {
         }
 
         // --- collect the component ids touched by the accepted patches ---
-        let component_ids: Vec<String> = patches
-            .iter()
-            .filter_map(component_id_of)
-            .collect();
+        let component_ids: Vec<String> = patches.iter().filter_map(component_id_of).collect();
 
         // The GPUI ledger owns the real revision (Slice 4/6). Echo an optional
         // caller-supplied revision; otherwise report 0.
@@ -147,10 +144,7 @@ impl AgentTool for SurfacePatchTool {
             content: vec![ocean_protocol::Content::text(summary)],
             details: result,
             terminate: false,
-            side_effects: vec![ToolSideEffect::SurfacePatch {
-                canvas_id,
-                patches,
-            }],
+            side_effects: vec![ToolSideEffect::SurfacePatch { canvas_id, patches }],
         })
     }
 }
@@ -248,7 +242,10 @@ mod tests {
             ]
         });
 
-        let res = tool.execute("call-2", args).await.expect("§6 shape accepted");
+        let res = tool
+            .execute("call-2", args)
+            .await
+            .expect("§6 shape accepted");
         assert_eq!(res.details["applied"], 1);
         assert_eq!(res.details["component_ids"], json!(["brief-1"]));
 

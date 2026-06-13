@@ -160,7 +160,10 @@ mod tests {
             inputSchema = { type = "object" }
         "#;
         let m = PluginManifest::parse(src).unwrap();
-        assert_eq!(m.tools[0].input_schema, Some(serde_json::json!({"type":"object"})));
+        assert_eq!(
+            m.tools[0].input_schema,
+            Some(serde_json::json!({"type":"object"}))
+        );
     }
 
     #[test]

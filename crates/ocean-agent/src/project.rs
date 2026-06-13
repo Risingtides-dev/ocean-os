@@ -143,7 +143,10 @@ mod tests {
 
         assert_eq!(find_by_id(&dir, id).unwrap().unwrap().id, id);
         assert_eq!(
-            find_by_workspace(&dir, "/dev/ocean-os").unwrap().unwrap().id,
+            find_by_workspace(&dir, "/dev/ocean-os")
+                .unwrap()
+                .unwrap()
+                .id,
             id
         );
         assert!(find_by_workspace(&dir, "/nope").unwrap().is_none());

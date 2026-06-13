@@ -1050,7 +1050,10 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
-        assert!(!events.is_empty(), "loop should emit at least UserMessage + AgentStart");
+        assert!(
+            !events.is_empty(),
+            "loop should emit at least UserMessage + AgentStart"
+        );
         for ev in &events {
             assert_eq!(
                 ev.session_id(),
@@ -1080,7 +1083,11 @@ mod tests {
         let _ = run_agent(&cfg, user("hi"), Some(tx)).await;
 
         while let Ok(ev) = rx.try_recv() {
-            assert_eq!(ev.session_id(), None, "unset session must stay None: {ev:?}");
+            assert_eq!(
+                ev.session_id(),
+                None,
+                "unset session must stay None: {ev:?}"
+            );
         }
     }
 }

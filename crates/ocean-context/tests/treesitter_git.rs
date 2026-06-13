@@ -22,7 +22,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -45,7 +49,11 @@ fn claim(id: &str, file: &str, symbol: Option<&str>, commit: &str) -> Claim {
         ps_anchor: None,
         confidence: 0.9,
         borrowed_from: None,
-        history: vec![ClaimEvent { at: 0, event: "written".into(), by_session: "t".into() }],
+        history: vec![ClaimEvent {
+            at: 0,
+            event: "written".into(),
+            by_session: "t".into(),
+        }],
     }
 }
 
@@ -83,23 +91,48 @@ fn tree_sitter_flags_the_members_change_file_exists_misses() {
     ];
 
     // file-exists: blind to the members change, sees only the spec death.
-    let fe = FileExistsResolver { repo_root: root.to_path_buf() };
+    let fe = FileExistsResolver {
+        repo_root: root.to_path_buf(),
+    };
     let fe_verdicts = replay(root, &claims, &fe).unwrap();
-    assert_eq!(fe_verdicts[0].first_fail_commit, None, "file-exists HELD through the change");
-    assert_eq!(fe_verdicts[1].first_fail_commit.as_deref(), Some(c3.as_str()));
+    assert_eq!(
+        fe_verdicts[0].first_fail_commit, None,
+        "file-exists HELD through the change"
+    );
+    assert_eq!(
+        fe_verdicts[1].first_fail_commit.as_deref(),
+        Some(c3.as_str())
+    );
 
     // tree-sitter: seed write-time baselines, then walk the same history.
-    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let ts = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
     ts.seed_sig_hashes(&mut claims);
-    assert!(claims[0].provenance.anchors[0].sig_hash.is_some(), "symbol anchor seeded at c1");
-    assert!(claims[1].provenance.anchors[0].sig_hash.is_none(), "file-only anchor NOT seeded");
+    assert!(
+        claims[0].provenance.anchors[0].sig_hash.is_some(),
+        "symbol anchor seeded at c1"
+    );
+    assert!(
+        claims[1].provenance.anchors[0].sig_hash.is_none(),
+        "file-only anchor NOT seeded"
+    );
     let ts_verdicts = replay(root, &claims, &ts).unwrap();
 
     // flags the content change AT the commit it happened, as Stale
-    assert_eq!(ts_verdicts[0].first_fail_commit.as_deref(), Some(c2.as_str()));
-    assert_eq!(ts_verdicts[0].first_fail_resolution, Some(Resolution::Stale));
+    assert_eq!(
+        ts_verdicts[0].first_fail_commit.as_deref(),
+        Some(c2.as_str())
+    );
+    assert_eq!(
+        ts_verdicts[0].first_fail_resolution,
+        Some(Resolution::Stale)
+    );
     // and does NOT regress the verdict file-exists got right
-    assert_eq!(ts_verdicts[1].first_fail_commit.as_deref(), Some(c3.as_str()));
+    assert_eq!(
+        ts_verdicts[1].first_fail_commit.as_deref(),
+        Some(c3.as_str())
+    );
     assert_eq!(ts_verdicts[1].first_fail_resolution, Some(Resolution::Dead));
 }
 
@@ -120,27 +153,44 @@ fn at_commit_mode_tracks_a_rust_symbol_through_history() {
     let c1 = git(root, &["rev-parse", "HEAD"]);
 
     // body-only edit: same signature
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 1 }\n").unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8) -> bool { x > 1 }\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c2: body only"]);
     let c2 = git(root, &["rev-parse", "HEAD"]);
 
     // signature change
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8, strict: bool) -> bool { x > 0 }\n")
-        .unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8, strict: bool) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c3: signature change"]);
     let c3 = git(root, &["rev-parse", "HEAD"]);
 
     // rename: symbol gone
-    std::fs::write(root.join("lib.rs"), "pub fn portal(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn portal(x: u8) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c4: rename"]);
     let c4 = git(root, &["rev-parse", "HEAD"]);
 
-    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
-    let mut anchor =
-        Anchor { file: Some("lib.rs".into()), symbol: Some("gate".into()), lines: vec![], sig_hash: None };
+    let ts = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
+    let mut anchor = Anchor {
+        file: Some("lib.rs".into()),
+        symbol: Some("gate".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     anchor.sig_hash = ts.sig_hash_at(&anchor, &c1);
     assert!(anchor.sig_hash.is_some());
 
@@ -148,7 +198,11 @@ fn at_commit_mode_tracks_a_rust_symbol_through_history() {
     std::fs::write(root.join("lib.rs"), "not even rust ((((\n").unwrap();
 
     assert_eq!(ts.resolve(&anchor, &c1), Resolution::Resolves(1.0));
-    assert_eq!(ts.resolve(&anchor, &c2), Resolution::Resolves(1.0), "body edit is not shape");
+    assert_eq!(
+        ts.resolve(&anchor, &c2),
+        Resolution::Resolves(1.0),
+        "body edit is not shape"
+    );
     assert_eq!(ts.resolve(&anchor, &c3), Resolution::Stale);
     assert_eq!(ts.resolve(&anchor, &c4), Resolution::Dead);
 
@@ -175,11 +229,19 @@ fn at_commit_mode_tracks_a_rust_symbol_through_history() {
     }
 
     // file missing at-commit → Dead; path traversal stays Unresolvable
-    let gone =
-        Anchor { file: Some("nope.rs".into()), symbol: None, lines: vec![], sig_hash: None };
+    let gone = Anchor {
+        file: Some("nope.rs".into()),
+        symbol: None,
+        lines: vec![],
+        sig_hash: None,
+    };
     assert_eq!(ts.resolve(&gone, &c1), Resolution::Dead);
-    let escape =
-        Anchor { file: Some("../x.rs".into()), symbol: Some("gate".into()), lines: vec![], sig_hash: None };
+    let escape = Anchor {
+        file: Some("../x.rs".into()),
+        symbol: Some("gate".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     assert_eq!(ts.resolve(&escape, &c1), Resolution::Unresolvable);
     assert_eq!(ts.resolve(&escape, WORKTREE), Resolution::Unresolvable);
 }
@@ -201,7 +263,11 @@ fn at_commit_mode_tracks_a_typescript_symbol_through_history() {
     let c1 = git(root, &["rev-parse", "HEAD"]);
 
     // body-only edit: same signature
-    std::fs::write(root.join("auth.ts"), v1.replace("!== \"read\"", "!== \"read\" && action !== \"list\"")).unwrap();
+    std::fs::write(
+        root.join("auth.ts"),
+        v1.replace("!== \"read\"", "!== \"read\" && action !== \"list\""),
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c2: body only"]);
     let c2 = git(root, &["rev-parse", "HEAD"]);
@@ -209,7 +275,10 @@ fn at_commit_mode_tracks_a_typescript_symbol_through_history() {
     // signature change
     std::fs::write(
         root.join("auth.ts"),
-        v1.replace("requiresPermission(action: string)", "requiresPermission(action: string, strict: boolean)"),
+        v1.replace(
+            "requiresPermission(action: string)",
+            "requiresPermission(action: string, strict: boolean)",
+        ),
     )
     .unwrap();
     git(root, &["add", "."]);
@@ -217,12 +286,18 @@ fn at_commit_mode_tracks_a_typescript_symbol_through_history() {
     let c3 = git(root, &["rev-parse", "HEAD"]);
 
     // rename: symbol gone
-    std::fs::write(root.join("auth.ts"), v1.replace("requiresPermission", "checkAccess")).unwrap();
+    std::fs::write(
+        root.join("auth.ts"),
+        v1.replace("requiresPermission", "checkAccess"),
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c4: rename"]);
     let c4 = git(root, &["rev-parse", "HEAD"]);
 
-    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let ts = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
     // handoff-style qualified anchor: Class.method
     let mut anchor = Anchor {
         file: Some("auth.ts".into()),
@@ -231,10 +306,17 @@ fn at_commit_mode_tracks_a_typescript_symbol_through_history() {
         sig_hash: None,
     };
     anchor.sig_hash = ts.sig_hash_at(&anchor, &c1);
-    assert!(anchor.sig_hash.is_some(), "TS anchor must seed at its anchor commit");
+    assert!(
+        anchor.sig_hash.is_some(),
+        "TS anchor must seed at its anchor commit"
+    );
 
     assert_eq!(ts.resolve(&anchor, &c1), Resolution::Resolves(1.0));
-    assert_eq!(ts.resolve(&anchor, &c2), Resolution::Resolves(1.0), "body edit is not shape");
+    assert_eq!(
+        ts.resolve(&anchor, &c2),
+        Resolution::Resolves(1.0),
+        "body edit is not shape"
+    );
     assert_eq!(ts.resolve(&anchor, &c3), Resolution::Stale);
     assert_eq!(ts.resolve(&anchor, &c4), Resolution::Dead);
 }
@@ -253,7 +335,11 @@ fn at_commit_mode_tracks_a_toml_key() {
     let c1 = git(root, &["rev-parse", "HEAD"]);
 
     // sibling-only change: members untouched
-    std::fs::write(root.join("Cargo.toml"), MEMBERS_V1.replace("\"2\"", "\"3\"")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        MEMBERS_V1.replace("\"2\"", "\"3\""),
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c2: sibling"]);
     let c2 = git(root, &["rev-parse", "HEAD"]);
@@ -263,7 +349,9 @@ fn at_commit_mode_tracks_a_toml_key() {
     git(root, &["commit", "-qm", "c3: members"]);
     let c3 = git(root, &["rev-parse", "HEAD"]);
 
-    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let ts = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
     let mut anchor = Anchor {
         file: Some("Cargo.toml".into()),
         symbol: Some("workspace.members".into()),
@@ -273,7 +361,11 @@ fn at_commit_mode_tracks_a_toml_key() {
     anchor.sig_hash = ts.sig_hash_at(&anchor, &c1);
 
     assert_eq!(ts.resolve(&anchor, &c1), Resolution::Resolves(1.0));
-    assert_eq!(ts.resolve(&anchor, &c2), Resolution::Resolves(1.0), "sibling churn is not change");
+    assert_eq!(
+        ts.resolve(&anchor, &c2),
+        Resolution::Resolves(1.0),
+        "sibling churn is not change"
+    );
     assert_eq!(ts.resolve(&anchor, &c3), Resolution::Stale);
 }
 
@@ -304,7 +396,9 @@ fn unparseable_revision_is_unresolvable_not_dead_and_walk_survives_it() {
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c3: valid again"]);
 
-    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let ts = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
     let anchor = Anchor {
         file: Some("Cargo.toml".into()),
         symbol: Some("workspace.members".into()),
@@ -323,8 +417,14 @@ fn unparseable_revision_is_unresolvable_not_dead_and_walk_survives_it() {
     let claims = vec![claim("t1", "Cargo.toml", Some("workspace.members"), &c1)];
     let verdicts = replay(root, &claims, &ts).unwrap();
     assert_eq!(verdicts.len(), 1);
-    assert!(verdicts[0].first_fail_commit.is_none(), "transient breakage must not fail the claim");
-    assert!(!verdicts[0].unresolvable, "held steps outrank transient uncheckability");
+    assert!(
+        verdicts[0].first_fail_commit.is_none(),
+        "transient breakage must not fail the claim"
+    );
+    assert!(
+        !verdicts[0].unresolvable,
+        "held steps outrank transient uncheckability"
+    );
 
     // Control: a genuinely removed key is still hard evidence.
     std::fs::write(root.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n").unwrap();
@@ -341,14 +441,21 @@ fn unparseable_revision_is_unresolvable_not_dead_and_walk_survives_it() {
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "t1: tail anchor, valid"]);
     let t1 = git(root, &["rev-parse", "HEAD"]);
-    std::fs::write(root.join("Tail.toml"), "[workspace
+    std::fs::write(
+        root.join("Tail.toml"),
+        "[workspace
 broken = = [
-").unwrap();
+",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "t2: broken through HEAD"]);
     let tail_claims = vec![claim("t2", "Tail.toml", Some("workspace.members"), &t1)];
     let tail_verdicts = replay(root, &tail_claims, &ts).unwrap();
-    assert!(tail_verdicts[0].first_fail_commit.is_none(), "breakage is not removal evidence");
+    assert!(
+        tail_verdicts[0].first_fail_commit.is_none(),
+        "breakage is not removal evidence"
+    );
     assert!(
         tail_verdicts[0].unresolvable,
         "a tail unresolvable through HEAD must not report HELD"
@@ -399,9 +506,15 @@ fn handoff_with_claims(claims: Vec<Claim>, branch: &str) -> ocean_context::Hando
         parent_session: None,
         repo: "fixture".into(),
         branch: branch.into(),
-        commit_anchor: claims.first().map(|c| c.provenance.commit_sha.clone()).unwrap_or_default(),
+        commit_anchor: claims
+            .first()
+            .map(|c| c.provenance.commit_sha.clone())
+            .unwrap_or_default(),
         scope_ring: ocean_context::ScopeRing::Repo,
-        velocity_at_write: ocean_context::Velocity { v_code: 0.0, v_sem: 0.0 },
+        velocity_at_write: ocean_context::Velocity {
+            v_code: 0.0,
+            v_sem: 0.0,
+        },
         written_at: 1_000,
         narrative: "lifecycle fixture".into(),
         claims,
@@ -418,21 +531,33 @@ fn reverify_stamps_baseline_on_first_pass_and_flags_shape_change_on_second() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c1"]);
     let c1 = git(root, &["rev-parse", "HEAD"]);
 
-    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let resolver = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
     let mut h = handoff_with_claims(vec![claim("c-gate", "lib.rs", Some("gate"), &c1)], "main");
-    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "arrives unseeded");
+    assert!(
+        h.claims[0].provenance.anchors[0].sig_hash.is_none(),
+        "arrives unseeded"
+    );
 
     // FIRST reverify: stamps the baseline and verifies.
     let r1 = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
     assert_eq!(r1[0].1, Resolution::Resolves(1.0));
     assert_eq!(h.claims[0].status, ClaimStatus::Verified);
     let stamped = h.claims[0].provenance.anchors[0].sig_hash.clone();
-    assert!(stamped.is_some(), "first reverify must stamp the write-time baseline");
+    assert!(
+        stamped.is_some(),
+        "first reverify must stamp the write-time baseline"
+    );
 
     // The stamp round-trips through the store (caller persists).
     let store_dir = root.join(".ocean/handoffs");
@@ -443,10 +568,17 @@ fn reverify_stamps_baseline_on_first_pass_and_flags_shape_change_on_second() {
     assert_eq!(h2.claims[0].provenance.anchors[0].sig_hash, stamped);
 
     // Shape change in the working tree; SECOND reverify must flag Stale.
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8, strict: bool) -> bool { x > 0 }\n")
-        .unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8, strict: bool) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     let r2 = ocean_context::reverify(&mut h2, &resolver, WORKTREE, 3_000, "sess-2");
-    assert_eq!(r2[0].1, Resolution::Stale, "shape change after stamping must flag");
+    assert_eq!(
+        r2[0].1,
+        Resolution::Stale,
+        "shape change after stamping must flag"
+    );
     assert_eq!(h2.claims[0].status, ClaimStatus::Stale);
 }
 
@@ -459,19 +591,31 @@ fn reverify_birth_failures_never_verify_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     std::fs::write(root.join("broken.rs"), "pub fn half( ((((\n").unwrap();
     git(root, &["add", "."]);
-    git(root, &["commit", "-qm", "c1: ghost absent, broken.rs unparseable"]);
+    git(
+        root,
+        &["commit", "-qm", "c1: ghost absent, broken.rs unparseable"],
+    );
     let c1 = git(root, &["rev-parse", "HEAD"]);
 
     // ghost arrives LATER — present by name at reverify time, absent at birth.
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\npub fn ghost() {}\n")
-        .unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8) -> bool { x > 0 }\npub fn ghost() {}\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c2: ghost appears"]);
 
-    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let resolver = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
     let mut h = handoff_with_claims(
         vec![
             claim("c-ghost", "lib.rs", Some("ghost"), &c1),
@@ -485,12 +629,18 @@ fn reverify_birth_failures_never_verify_by_name() {
     assert_eq!(results[0].1, Resolution::Dead);
     assert_eq!(h.claims[0].status, ClaimStatus::Dead);
     assert!(h.claims[0].history.iter().any(|e| e.event == "killed"));
-    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "no baseline laundered");
+    assert!(
+        h.claims[0].provenance.anchors[0].sig_hash.is_none(),
+        "no baseline laundered"
+    );
 
     // unparseable at birth → Unresolvable (Reverify), no evidence either way
     assert_eq!(results[1].1, Resolution::Unresolvable);
     assert_eq!(h.claims[1].status, ClaimStatus::Reverify);
-    assert!(h.claims[1].history.iter().any(|e| e.event == "unresolvable"));
+    assert!(h.claims[1]
+        .history
+        .iter()
+        .any(|e| e.event == "unresolvable"));
 }
 
 /// The v1 stub keeps its exact semantics: FileExistsResolver never stamps
@@ -500,17 +650,26 @@ fn reverify_with_file_exists_resolver_never_stamps() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c1"]);
     let c1 = git(root, &["rev-parse", "HEAD"]);
 
-    let resolver = FileExistsResolver { repo_root: root.to_path_buf() };
+    let resolver = FileExistsResolver {
+        repo_root: root.to_path_buf(),
+    };
     let mut h = handoff_with_claims(vec![claim("c-gate", "lib.rs", Some("gate"), &c1)], "main");
     let results = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
     assert_eq!(results[0].1, Resolution::Resolves(1.0));
     assert_eq!(h.claims[0].status, ClaimStatus::Verified);
-    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "file-exists never stamps");
+    assert!(
+        h.claims[0].provenance.anchors[0].sig_hash.is_none(),
+        "file-exists never stamps"
+    );
 }
 
 /// A claim with two anchors: A (valid file at birth) and B (a symbol absent at
@@ -522,13 +681,21 @@ fn multi_anchor_claim(id: &str, anchors: Vec<Anchor>, commit: &str) -> Claim {
     Claim {
         id: id.into(),
         text: format!("multi-anchor claim {id}"),
-        provenance: Provenance { anchors, tickets: vec![], commit_sha: commit.into() },
+        provenance: Provenance {
+            anchors,
+            tickets: vec![],
+            commit_sha: commit.into(),
+        },
         status: ClaimStatus::Verified,
         knowledge_tier: KnowledgeTier::Individual,
         ps_anchor: None,
         confidence: 0.9,
         borrowed_from: None,
-        history: vec![ClaimEvent { at: 0, event: "written".into(), by_session: "t".into() }],
+        history: vec![ClaimEvent {
+            at: 0,
+            event: "written".into(),
+            by_session: "t".into(),
+        }],
     }
 }
 
@@ -551,9 +718,21 @@ fn ghost_symbol_at_an_absent_at_birth_anchor_cannot_hold_a_multi_anchor_claim() 
     git(root, &["commit", "-qm", "c2: A dies, ghost beta is born"]);
     let c2 = git(root, &["rev-parse", "HEAD"]);
 
-    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
-    let anchor_a = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
-    let anchor_b = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let ts = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
+    let anchor_a = Anchor {
+        file: Some("a.rs".into()),
+        symbol: Some("alpha".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    let anchor_b = Anchor {
+        file: Some("b.rs".into()),
+        symbol: Some("beta".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     let claim = multi_anchor_claim("ghost", vec![anchor_a, anchor_b], &c1);
 
     let v = replay(root, &[claim], &ts).unwrap();
@@ -571,7 +750,11 @@ fn ghost_symbol_at_an_absent_at_birth_anchor_cannot_hold_a_multi_anchor_claim() 
     let dir2 = tempfile::tempdir().unwrap();
     let root2 = dir2.path();
     git(root2, &["init", "-q"]);
-    std::fs::write(root2.join("a.rs"), "pub fn alpha(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(
+        root2.join("a.rs"),
+        "pub fn alpha(x: u8) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     std::fs::write(root2.join("b.rs"), "pub fn beta(x: u8) -> bool { x > 0 }\n").unwrap();
     git(root2, &["add", "."]);
     git(root2, &["commit", "-qm", "c1: BOTH exist"]);
@@ -579,9 +762,21 @@ fn ghost_symbol_at_an_absent_at_birth_anchor_cannot_hold_a_multi_anchor_claim() 
     git(root2, &["rm", "-q", "a.rs"]);
     git(root2, &["commit", "-qm", "c2: A dies, B persists"]);
 
-    let ts2 = TreeSitterResolver { repo_root: root2.to_path_buf() };
-    let a2 = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
-    let b2 = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let ts2 = TreeSitterResolver {
+        repo_root: root2.to_path_buf(),
+    };
+    let a2 = Anchor {
+        file: Some("a.rs".into()),
+        symbol: Some("alpha".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    let b2 = Anchor {
+        file: Some("b.rs".into()),
+        symbol: Some("beta".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     let claim2 = multi_anchor_claim("legit", vec![a2, b2], &c1b);
     let v2 = replay(root2, &[claim2], &ts2).unwrap();
     assert!(
@@ -612,16 +807,31 @@ fn excluded_anchor_negative_result_does_not_become_the_claim_verdict() {
     // Dead). Excluded B's Dead must not surface as the claim's failure.
     std::fs::write(root.join("a.rs"), "pub fn alpha( (((( broken\n").unwrap();
     git(root, &["add", "."]);
-    git(root, &["commit", "-qm", "c2: A unparseable, B still absent"]);
+    git(
+        root,
+        &["commit", "-qm", "c2: A unparseable, B still absent"],
+    );
 
     // c3: A valid again (same shape as birth).
     std::fs::write(root.join("a.rs"), "pub fn alpha(x: u8) -> bool { x > 0 }\n").unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c3: A valid again"]);
 
-    let ts = TreeSitterResolver { repo_root: root.to_path_buf() };
-    let a = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
-    let b = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let ts = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
+    let a = Anchor {
+        file: Some("a.rs".into()),
+        symbol: Some("alpha".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    let b = Anchor {
+        file: Some("b.rs".into()),
+        symbol: Some("beta".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     let claim = multi_anchor_claim("neg", vec![a, b], &c1);
 
     let v = replay(root, &[claim], &ts).unwrap();
@@ -632,7 +842,10 @@ fn excluded_anchor_negative_result_does_not_become_the_claim_verdict() {
         "an excluded anchor's Dead must not become the claim's verdict; got {:?}",
         v[0].first_fail_resolution
     );
-    assert!(!v[0].unresolvable, "the walk ends on a valid A, so the claim holds");
+    assert!(
+        !v[0].unresolvable,
+        "the walk ends on a valid A, so the claim holds"
+    );
 }
 
 /// Codex P2 (PR #209): when a claim's birth commit is unreadable — a shallow
@@ -646,11 +859,17 @@ fn unreadable_birth_commit_does_not_kill_a_currently_valid_symbol() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
-    std::fs::write(root.join("lib.rs"), "pub fn gate(x: u8) -> bool { x > 0 }\n").unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn gate(x: u8) -> bool { x > 0 }\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "c1"]);
 
-    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
+    let resolver = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
 
     // A well-formed SHA that is NOT in this clone — the birth commit can't be
     // read, but `gate` is alive in the working tree right now.
@@ -659,19 +878,45 @@ fn unreadable_birth_commit_does_not_kill_a_currently_valid_symbol() {
         vec![claim("c-gate", "lib.rs", Some("gate"), phantom_birth)],
         "main",
     );
-    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "arrives unseeded");
+    assert!(
+        h.claims[0].provenance.anchors[0].sig_hash.is_none(),
+        "arrives unseeded"
+    );
 
     let r = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
     // Must NOT be Dead — an unreadable birth is uncheckable, not death.
-    assert_ne!(r[0].1, Resolution::Dead, "unreadable birth must never kill a live symbol");
-    assert_eq!(r[0].1, Resolution::Unresolvable, "no baseline establishable → uncheckable");
-    assert_eq!(h.claims[0].status, ClaimStatus::Reverify, "flag for attention, not killed");
+    assert_ne!(
+        r[0].1,
+        Resolution::Dead,
+        "unreadable birth must never kill a live symbol"
+    );
+    assert_eq!(
+        r[0].1,
+        Resolution::Unresolvable,
+        "no baseline establishable → uncheckable"
+    );
+    assert_eq!(
+        h.claims[0].status,
+        ClaimStatus::Reverify,
+        "flag for attention, not killed"
+    );
     // And nothing was stamped from a revision we couldn't read.
-    assert!(h.claims[0].provenance.anchors[0].sig_hash.is_none(), "no baseline from unreadable history");
+    assert!(
+        h.claims[0].provenance.anchors[0].sig_hash.is_none(),
+        "no baseline from unreadable history"
+    );
 
     // Direct resolver check at the phantom commit: Unresolvable, not Dead.
-    let anchor = Anchor { file: Some("lib.rs".into()), symbol: Some("gate".into()), lines: vec![], sig_hash: None };
-    assert_eq!(resolver.resolve(&anchor, phantom_birth), Resolution::Unresolvable);
+    let anchor = Anchor {
+        file: Some("lib.rs".into()),
+        symbol: Some("gate".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    assert_eq!(
+        resolver.resolve(&anchor, phantom_birth),
+        Resolution::Unresolvable
+    );
 }
 
 /// Codex P2 (PR #209): the absent-at-birth exclusion must hold in the
@@ -694,25 +939,57 @@ fn reverify_absent_at_birth_sibling_does_not_kill_a_multi_anchor_claim() {
     // Reverify time (working tree): A is temporarily UNPARSEABLE; B still absent.
     std::fs::write(root.join("a.rs"), "pub fn alpha( (((( broken\n").unwrap();
 
-    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
-    let a = Anchor { file: Some("a.rs".into()), symbol: Some("alpha".into()), lines: vec![], sig_hash: None };
-    let b = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let resolver = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
+    let a = Anchor {
+        file: Some("a.rs".into()),
+        symbol: Some("alpha".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    let b = Anchor {
+        file: Some("b.rs".into()),
+        symbol: Some("beta".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     let mut h = handoff_with_claims(vec![multi_anchor_claim("ab", vec![a, b], &c1)], "main");
 
     let r = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
     // NOT Dead: B's absent-at-birth death is excluded because A (attestable at
     // birth) is the real subject and is merely uncheckable right now.
-    assert_ne!(r[0].1, Resolution::Dead, "an absent-at-birth sibling must not kill the claim");
+    assert_ne!(
+        r[0].1,
+        Resolution::Dead,
+        "an absent-at-birth sibling must not kill the claim"
+    );
     assert_eq!(r[0].1, Resolution::Unresolvable);
-    assert_eq!(h.claims[0].status, ClaimStatus::Reverify, "flag for attention, not killed");
-    assert!(h.claims[0].history.iter().any(|e| e.event == "unresolvable"));
+    assert_eq!(
+        h.claims[0].status,
+        ClaimStatus::Reverify,
+        "flag for attention, not killed"
+    );
+    assert!(h.claims[0]
+        .history
+        .iter()
+        .any(|e| e.event == "unresolvable"));
 
     // Control: a LONE absent-at-birth anchor (no attestable sibling) is still
     // killed — the birth verdict stands when nothing else attests.
-    let lone = Anchor { file: Some("b.rs".into()), symbol: Some("beta".into()), lines: vec![], sig_hash: None };
+    let lone = Anchor {
+        file: Some("b.rs".into()),
+        symbol: Some("beta".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     let mut h2 = handoff_with_claims(vec![multi_anchor_claim("lone", vec![lone], &c1)], "main");
     let r2 = ocean_context::reverify(&mut h2, &resolver, WORKTREE, 2_000, "sess-1");
-    assert_eq!(r2[0].1, Resolution::Dead, "a lone never-true-at-birth anchor is still Dead");
+    assert_eq!(
+        r2[0].1,
+        Resolution::Dead,
+        "a lone never-true-at-birth anchor is still Dead"
+    );
     assert_eq!(h2.claims[0].status, ClaimStatus::Dead);
 }
 
@@ -732,18 +1009,41 @@ fn reverify_unsupported_sibling_does_not_rescue_an_absent_at_birth_anchor() {
     std::fs::write(root.join("app.js"), "function foo() { return 1; }\n").unwrap();
     std::fs::write(root.join("lib.rs"), "pub fn other() -> bool { true }\n").unwrap();
     git(root, &["add", "."]);
-    git(root, &["commit", "-qm", "c1: app.js present, lib.rs lacks `missing`"]);
+    git(
+        root,
+        &[
+            "commit",
+            "-qm",
+            "c1: app.js present, lib.rs lacks `missing`",
+        ],
+    );
     let c1 = git(root, &["rev-parse", "HEAD"]);
 
-    let resolver = TreeSitterResolver { repo_root: root.to_path_buf() };
-    let js = Anchor { file: Some("app.js".into()), symbol: Some("foo".into()), lines: vec![], sig_hash: None };
-    let rs = Anchor { file: Some("lib.rs".into()), symbol: Some("missing".into()), lines: vec![], sig_hash: None };
+    let resolver = TreeSitterResolver {
+        repo_root: root.to_path_buf(),
+    };
+    let js = Anchor {
+        file: Some("app.js".into()),
+        symbol: Some("foo".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
+    let rs = Anchor {
+        file: Some("lib.rs".into()),
+        symbol: Some("missing".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     let mut h = handoff_with_claims(vec![multi_anchor_claim("js-rs", vec![js, rs], &c1)], "main");
 
     let r = ocean_context::reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-1");
     // The uncheckable JS anchor attests nothing; the Rust anchor was never true
     // at birth → the claim is Dead, not rescued to Reverify.
-    assert_eq!(r[0].1, Resolution::Dead, "an uncheckable sibling must not rescue a never-true anchor");
+    assert_eq!(
+        r[0].1,
+        Resolution::Dead,
+        "an uncheckable sibling must not rescue a never-true anchor"
+    );
     assert_eq!(h.claims[0].status, ClaimStatus::Dead);
     assert!(h.claims[0].history.iter().any(|e| e.event == "killed"));
 }

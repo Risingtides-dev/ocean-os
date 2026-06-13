@@ -169,7 +169,9 @@ pub fn run(args: &[String]) -> ExitCode {
             poisoned.len()
         );
         eprintln!("  \"could not find native static library `webrtc`\"");
-        eprintln!("Run `cargo xtask clear-webrtc-cache` (or `cargo xtask check-webrtc-cache --fix`)");
+        eprintln!(
+            "Run `cargo xtask clear-webrtc-cache` (or `cargo xtask check-webrtc-cache --fix`)"
+        );
         eprintln!("to remove the partial cache so the next build re-downloads it cleanly.");
         return ExitCode::FAILURE;
     }
@@ -187,7 +189,10 @@ pub fn run(args: &[String]) -> ExitCode {
         // Also clear webrtc-sys-* build outputs + fingerprints in this profile;
         // otherwise cargo's fingerprint still says "built" and skips the script.
         to_remove.extend(dirs_with_prefix(&profile_dir.join("build"), "webrtc-sys-"));
-        to_remove.extend(dirs_with_prefix(&profile_dir.join(".fingerprint"), "webrtc-sys-"));
+        to_remove.extend(dirs_with_prefix(
+            &profile_dir.join(".fingerprint"),
+            "webrtc-sys-",
+        ));
 
         for dir in to_remove {
             match fs::remove_dir_all(&dir) {
@@ -324,7 +329,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("xtask-check-test-{tag}-{nanos}-{}", std::process::id()));
+        p.push(format!(
+            "xtask-check-test-{tag}-{nanos}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -374,10 +382,7 @@ mod tests {
         make_cache(&root, "release", "scratch-bbb", None);
         let findings = scan(&root);
         assert_eq!(findings.len(), 1);
-        assert_eq!(
-            findings[0].health,
-            Health::Poisoned(PoisonKind::LibMissing)
-        );
+        assert_eq!(findings[0].health, Health::Poisoned(PoisonKind::LibMissing));
         fs::remove_dir_all(&root).unwrap();
     }
 

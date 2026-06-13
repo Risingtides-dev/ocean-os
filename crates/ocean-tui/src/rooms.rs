@@ -244,7 +244,12 @@ fn draw_room_workops(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
         workops_queue_lines(app, queue_width),
     );
 
-    draw_lines_pane(frame, cols[1], "WorkOps — ops console", workops_console_lines(app));
+    draw_lines_pane(
+        frame,
+        cols[1],
+        "WorkOps — ops console",
+        workops_console_lines(app),
+    );
 }
 
 /// Left WorkOps pane: requests currently in flight, then a tail of the most
@@ -280,21 +285,15 @@ fn workops_queue_lines(app: &DaemonApp, width: usize) -> Vec<Line<'static>> {
     if app.tool_timeline.is_empty() {
         lines.push(Line::from("  none yet — waiting on SSE tool events"));
     } else {
-        lines.extend(
-            app.tool_timeline
-                .iter()
-                .rev()
-                .take(6)
-                .map(|entry| {
-                    Line::from(format!(
-                        "  {:>4} {:<12} {:<9} {}",
-                        crate::time_ago(Some(&entry.at.to_rfc3339())),
-                        crate::compact_text(&entry.tool, 12),
-                        crate::compact_text(&entry.phase, 9),
-                        crate::compact_text(&entry.message, width.saturating_sub(32))
-                    ))
-                }),
-        );
+        lines.extend(app.tool_timeline.iter().rev().take(6).map(|entry| {
+            Line::from(format!(
+                "  {:>4} {:<12} {:<9} {}",
+                crate::time_ago(Some(&entry.at.to_rfc3339())),
+                crate::compact_text(&entry.tool, 12),
+                crate::compact_text(&entry.phase, 9),
+                crate::compact_text(&entry.message, width.saturating_sub(32))
+            ))
+        }));
     }
 
     lines
@@ -367,7 +366,12 @@ fn draw_room_worldmap(frame: &mut Frame<'_>, area: Rect, app: &DaemonApp) {
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(area);
 
-    draw_lines_pane(frame, cols[0], "WorldMap — daemon topology", worldmap_topology_lines(app));
+    draw_lines_pane(
+        frame,
+        cols[0],
+        "WorldMap — daemon topology",
+        worldmap_topology_lines(app),
+    );
 
     let width = cols[1].width.saturating_sub(2) as usize;
     draw_lines_pane(

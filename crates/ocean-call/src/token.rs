@@ -318,8 +318,8 @@ mod tests {
         let claims = TokenVerifier::with_api_key(&cfg.api_key, &cfg.api_secret)
             .verify(&resp.token)
             .unwrap();
-        let exp = chrono::DateTime::from_timestamp(claims.exp as i64, 0)
-            .expect("exp is a valid instant");
+        let exp =
+            chrono::DateTime::from_timestamp(claims.exp as i64, 0).expect("exp is a valid instant");
         assert!(
             (parsed - exp).num_seconds().abs() <= 2,
             "advertised expires_at {parsed} must match the JWT exp {exp}"
@@ -332,8 +332,13 @@ mod tests {
         // payload that omits it fails to deserialize there. Lock that the wire
         // shape we emit always includes the field (OCEAN-240).
         let cfg = config();
-        let resp =
-            mint_join_token(&cfg, "r", &LiveKitTokenRequest::default(), PublishGrant::Deny).unwrap();
+        let resp = mint_join_token(
+            &cfg,
+            "r",
+            &LiveKitTokenRequest::default(),
+            PublishGrant::Deny,
+        )
+        .unwrap();
         let json = serde_json::to_value(&resp).unwrap();
         assert!(
             json.get("expires_at").and_then(|v| v.as_str()).is_some(),

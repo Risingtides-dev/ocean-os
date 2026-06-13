@@ -19,7 +19,7 @@
 use ocean_core::OceanEvent;
 
 use crate::stt::{SegmentAssembler, SegmentUpdate, TranscriptSegment};
-use crate::summarizer::{SummaryAction, Summarizer};
+use crate::summarizer::{Summarizer, SummaryAction};
 use crate::task_detector;
 use crate::wake::{WakeAction, WakeGate};
 
@@ -242,7 +242,11 @@ mod tests {
     fn final_segment_emits_transcript() {
         let mut s = session();
         let mut sink = CapturingSink::default();
-        s.on_segment(TranscriptSegment::final_("s0", "hello there", 0), 0, &mut sink);
+        s.on_segment(
+            TranscriptSegment::final_("s0", "hello there", 0),
+            0,
+            &mut sink,
+        );
         assert!(ev_types(&sink).contains(&"segment"));
     }
 
@@ -262,7 +266,12 @@ mod tests {
             .iter()
             .find(|e| matches!(e, OceanEvent::CallTaskDetected { .. }))
             .unwrap();
-        if let OceanEvent::CallTaskDetected { task_id, source_quote, .. } = task {
+        if let OceanEvent::CallTaskDetected {
+            task_id,
+            source_quote,
+            ..
+        } = task
+        {
             assert_eq!(task_id, "call-1-task-1");
             assert!(source_quote.as_ref().unwrap().contains("master"));
         }
@@ -272,7 +281,11 @@ mod tests {
     fn summary_due_returned_after_threshold_not_emitted() {
         let mut s = session(); // every_n_segments = 2
         let mut sink = CapturingSink::default();
-        let o1 = s.on_segment(TranscriptSegment::final_("s0", "first point", 0), 0, &mut sink);
+        let o1 = s.on_segment(
+            TranscriptSegment::final_("s0", "first point", 0),
+            0,
+            &mut sink,
+        );
         assert_eq!(o1.summary_due, None, "below threshold: no summary due yet");
         let o2 = s.on_segment(
             TranscriptSegment::final_("s0", "second point", 100),
@@ -300,7 +313,11 @@ mod tests {
             WakeGate::new(false, 2_000),
         );
         let mut sink = CapturingSink::default();
-        let o = s.on_segment(TranscriptSegment::final_("s0", "lonely point", 1_000), 1_000, &mut sink);
+        let o = s.on_segment(
+            TranscriptSegment::final_("s0", "lonely point", 1_000),
+            1_000,
+            &mut sink,
+        );
         assert_eq!(o.summary_due, None);
         // Not enough silence yet.
         assert_eq!(s.on_tick(3_000), None);
@@ -351,7 +368,11 @@ mod tests {
         let mut s = session();
         let mut sink = CapturingSink::default();
         s.start(&mut sink, "call:room", vec![]);
-        s.on_segment(TranscriptSegment::final_("s0", "let's kick off", 0), 0, &mut sink);
+        s.on_segment(
+            TranscriptSegment::final_("s0", "let's kick off", 0),
+            0,
+            &mut sink,
+        );
         s.on_segment(
             TranscriptSegment::final_("s0", "I'll follow up with Atlantic", 1_000),
             1_000,

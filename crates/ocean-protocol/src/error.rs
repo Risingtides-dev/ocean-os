@@ -63,9 +63,7 @@ impl Error {
             // Upstream said it's overloaded (429) or broke (5xx). A 4xx other than
             // 429 is the caller's request being rejected — not an availability
             // problem — and must NOT fail over.
-            Self::ProviderError { status, .. } => {
-                *status == 429 || (500..=599).contains(status)
-            }
+            Self::ProviderError { status, .. } => *status == 429 || (500..=599).contains(status),
             // The retry helper already exhausted its budget; classify by the
             // wrapped cause so an exhausted transient stays "availability".
             Self::RetryExhausted { source, .. } => source.is_retryable_availability(),

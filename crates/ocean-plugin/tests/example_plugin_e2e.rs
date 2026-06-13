@@ -40,13 +40,11 @@ fn example_plugin_bin() -> PathBuf {
         .parent()
         .and_then(|deps| deps.parent())
         .expect("profile dir");
-    let bin = profile_dir
-        .join("examples")
-        .join(if cfg!(windows) {
-            "ocean-example-plugin.exe"
-        } else {
-            "ocean-example-plugin"
-        });
+    let bin = profile_dir.join("examples").join(if cfg!(windows) {
+        "ocean-example-plugin.exe"
+    } else {
+        "ocean-example-plugin"
+    });
     assert!(
         bin.exists(),
         "example binary not built at {}; run `cargo build --example ocean-example-plugin -p ocean-plugin` first",
@@ -65,7 +63,11 @@ fn example_manifest_parses() {
     assert_eq!(manifest.entry, "ocean-example-plugin");
 
     let tools = manifest.plugin_tools();
-    assert_eq!(tools.len(), 2, "example advertises reverse_text + current_time");
+    assert_eq!(
+        tools.len(),
+        2,
+        "example advertises reverse_text + current_time"
+    );
     assert_eq!(tools[0].name, "reverse_text");
     assert_eq!(tools[0].input_schema["required"][0], "text");
     assert_eq!(tools[1].name, "current_time");
@@ -103,8 +105,13 @@ async fn example_subprocess_round_trip() {
         .invoke_tool("current_time", json!({}))
         .await
         .expect("current_time round-trips");
-    let secs = res["unix_seconds"].as_u64().expect("unix_seconds is a number");
-    assert!(secs > 1_700_000_000, "expected a recent timestamp, got {secs}");
+    let secs = res["unix_seconds"]
+        .as_u64()
+        .expect("unix_seconds is a number");
+    assert!(
+        secs > 1_700_000_000,
+        "expected a recent timestamp, got {secs}"
+    );
 }
 
 #[cfg(feature = "runtime")]
@@ -158,5 +165,8 @@ async fn example_loads_through_runtime() {
         Content::Text { text } => text.clone(),
         other => panic!("expected text content, got {other:?}"),
     };
-    assert!(text.contains("emitnur"), "reversed result reaches model: {text}");
+    assert!(
+        text.contains("emitnur"),
+        "reversed result reaches model: {text}"
+    );
 }

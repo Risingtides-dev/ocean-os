@@ -646,9 +646,7 @@ mod tests {
 
         let out = convert_messages(&messages);
         assert_eq!(out.len(), 1);
-        let parts = out[0]["parts"]
-            .as_array()
-            .expect("parts array missing");
+        let parts = out[0]["parts"].as_array().expect("parts array missing");
 
         let has_text = parts.iter().any(|p| p["text"] == "describe this");
         assert!(has_text, "text part missing: {:?}", parts);
@@ -928,9 +926,7 @@ mod tests {
     fn build_body_omits_max_output_tokens_when_unset() {
         let body = build_body(&empty_context(), &StreamOptions::default());
         assert!(
-            body["generationConfig"]
-                .get("maxOutputTokens")
-                .is_none(),
+            body["generationConfig"].get("maxOutputTokens").is_none(),
             "maxOutputTokens must not be sent when options.max_tokens is None: {body}"
         );
     }
@@ -1005,8 +1001,7 @@ mod tests {
 
         let out = convert_messages(&messages);
         assert_eq!(
-            out[0]["parts"][0]["functionResponse"]["response"]["output"],
-            "ok",
+            out[0]["parts"][0]["functionResponse"]["response"]["output"], "ok",
             "successful result output must be untouched (no ERROR prefix)"
         );
     }
@@ -1055,11 +1050,7 @@ mod tests {
             serde_json::from_str(wire).expect("real Gemini camelCase chunk must deserialize");
 
         // The functionCall part decoded from the REAL wire key (not defaulted away).
-        let part = &chunk.candidates[0]
-            .content
-            .as_ref()
-            .expect("content")
-            .parts[0];
+        let part = &chunk.candidates[0].content.as_ref().expect("content").parts[0];
         let fc = part
             .function_call
             .as_ref()
@@ -1234,7 +1225,10 @@ mod tests {
     fn function_call_without_id_decodes_to_none() {
         let wire = r#"{"name": "get_temp", "args": {"city": "Paris"}}"#;
         let fc: FunctionCall = serde_json::from_str(wire).expect("idless functionCall decodes");
-        assert!(fc.id.is_none(), "an absent functionCall.id must decode to None");
+        assert!(
+            fc.id.is_none(),
+            "an absent functionCall.id must decode to None"
+        );
         assert_eq!(fc.name, "get_temp");
         assert_eq!(fc.args["city"], "Paris");
 
@@ -1246,7 +1240,10 @@ mod tests {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("call_{}", existing_calls + 1));
-        assert_eq!(synthesized, "call_1", "idless call must synthesize a deterministic ordered id");
+        assert_eq!(
+            synthesized, "call_1",
+            "idless call must synthesize a deterministic ordered id"
+        );
     }
 
     // OCEAN-198: an empty-string functionCall.id must ALSO fall back to the
@@ -1264,7 +1261,10 @@ mod tests {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("call_{}", existing_calls + 1));
-        assert_eq!(id, "call_3", "an empty id must be replaced by the synthesized ordered id");
+        assert_eq!(
+            id, "call_3",
+            "an empty id must be replaced by the synthesized ordered id"
+        );
     }
 
     // OCEAN-198: a functionCall with NO `args` key decodes `args` to JSON null
@@ -1275,7 +1275,10 @@ mod tests {
         let wire = r#"{"name": "ping"}"#;
         let fc: FunctionCall = serde_json::from_str(wire).expect("argless functionCall decodes");
         assert_eq!(fc.name, "ping");
-        assert!(fc.args.is_null(), "a missing args field defaults to JSON null");
+        assert!(
+            fc.args.is_null(),
+            "a missing args field defaults to JSON null"
+        );
     }
 
     // OCEAN-198: usageMetadata that OMITS the cache + thoughts fields decodes them
@@ -1310,8 +1313,14 @@ mod tests {
     fn chunk_without_candidates_decodes_to_empty_vec() {
         let wire = r#"{"usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5}}"#;
         let chunk: Chunk = serde_json::from_str(wire).expect("candidate-less chunk decodes");
-        assert!(chunk.candidates.is_empty(), "absent candidates → empty Vec, not error");
-        assert!(chunk.usage_metadata.is_some(), "usage-only tail chunk still carries usage");
+        assert!(
+            chunk.candidates.is_empty(),
+            "absent candidates → empty Vec, not error"
+        );
+        assert!(
+            chunk.usage_metadata.is_some(),
+            "usage-only tail chunk still carries usage"
+        );
     }
 
     // OCEAN-198: a malformed/garbage SSE frame must surface as a decode Err so the

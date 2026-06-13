@@ -12,8 +12,8 @@
 //!   (Pending), chunk/finished → `ToolCallUpdate` (InProgress/Completed/Failed).
 
 use agent_client_protocol::schema::{
-    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use ocean_agent_sdk::{AgentTurnEvent, AgentTurnStatus, ToolCall as OceanToolCall, ToolResult};
 
@@ -37,17 +37,27 @@ fn tool_kind(name: &str) -> ToolKind {
     let n = name.to_ascii_lowercase();
     if n.contains("read") || n.contains("cat") || n.contains("view") || n.contains("ls") {
         ToolKind::Read
-    } else if n.contains("write") || n.contains("edit") || n.contains("apply") || n.contains("patch") {
+    } else if n.contains("write")
+        || n.contains("edit")
+        || n.contains("apply")
+        || n.contains("patch")
+    {
         ToolKind::Edit
     } else if n.contains("delete") || n.contains("rm") || n.contains("remove") {
         ToolKind::Delete
     } else if n.contains("move") || n.contains("rename") || n.contains("mv") {
         ToolKind::Move
-    } else if n.contains("search") || n.contains("grep") || n.contains("find") || n.contains("glob") {
+    } else if n.contains("search") || n.contains("grep") || n.contains("find") || n.contains("glob")
+    {
         ToolKind::Search
     } else if n.contains("fetch") || n.contains("http") || n.contains("web") || n.contains("curl") {
         ToolKind::Fetch
-    } else if n.contains("bash") || n.contains("exec") || n.contains("run") || n.contains("shell") || n.contains("cmd") {
+    } else if n.contains("bash")
+        || n.contains("exec")
+        || n.contains("run")
+        || n.contains("shell")
+        || n.contains("cmd")
+    {
         ToolKind::Execute
     } else {
         ToolKind::Other
@@ -82,9 +92,11 @@ pub fn event_to_update(event: &AgentTurnEvent) -> Option<SessionUpdate> {
             )))
         }
 
-        AgentTurnEvent::ToolCallFinished { call_id, result, .. } => {
-            Some(SessionUpdate::ToolCallUpdate(tool_result_update(call_id, result)))
-        }
+        AgentTurnEvent::ToolCallFinished {
+            call_id, result, ..
+        } => Some(SessionUpdate::ToolCallUpdate(tool_result_update(
+            call_id, result,
+        ))),
 
         // Components: summarize as Markdown so the content survives in editors
         // that can't render the live component.
@@ -112,7 +124,10 @@ fn ocean_tool_to_acp(call: &OceanToolCall) -> ToolCall {
     tc
 }
 
-fn tool_result_update(call_id: &ocean_agent_sdk::ToolCallId, result: &ToolResult) -> ToolCallUpdate {
+fn tool_result_update(
+    call_id: &ocean_agent_sdk::ToolCallId,
+    result: &ToolResult,
+) -> ToolCallUpdate {
     let status = if result.ok {
         ToolCallStatus::Completed
     } else {
@@ -153,7 +168,10 @@ fn render_component_markdown(kind: &str, props: &serde_json::Value) -> String {
         "table" => render_table(props).unwrap_or_else(|| fenced_json(kind, props)),
 
         "callout" => {
-            let variant = props.get("variant").and_then(|v| v.as_str()).unwrap_or("info");
+            let variant = props
+                .get("variant")
+                .and_then(|v| v.as_str())
+                .unwrap_or("info");
             let title = props.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let body = props
                 .get("body")
@@ -201,7 +219,13 @@ fn render_table(props: &serde_json::Value) -> Option<String> {
     let mut out = String::from("\n| ");
     out.push_str(&headers.join(" | "));
     out.push_str(" |\n| ");
-    out.push_str(&headers.iter().map(|_| "---").collect::<Vec<_>>().join(" | "));
+    out.push_str(
+        &headers
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | "),
+    );
     out.push_str(" |\n");
 
     for row in rows {

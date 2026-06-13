@@ -196,10 +196,16 @@ fn check_at(
             }
         })
         .collect();
-    if resolutions.iter().any(|r| matches!(r, Resolution::Resolves(_))) {
+    if resolutions
+        .iter()
+        .any(|r| matches!(r, Resolution::Resolves(_)))
+    {
         return Step::Held;
     }
-    if resolutions.iter().all(|r| matches!(r, Resolution::Unresolvable)) {
+    if resolutions
+        .iter()
+        .all(|r| matches!(r, Resolution::Unresolvable))
+    {
         return Step::Unresolvable;
     }
     // Most-alive checkable resolution, mirroring `reverify`'s ranking.
@@ -228,5 +234,8 @@ fn rev_list(repo_root: &Path, from: &str) -> Result<Vec<String>> {
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
 }

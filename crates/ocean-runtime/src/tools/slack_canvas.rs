@@ -131,7 +131,12 @@ impl CanvasFulfillmentRegistry {
     /// daemon when the bridge POSTs a fulfillment, so a later `read`/`list` of
     /// the same canvas in the same session surfaces real content. Stamps the
     /// entry with the current time for TTL eviction (OCEAN-273).
-    pub fn put(&self, session_id: impl Into<String>, canvas_key: impl Into<String>, result: SlackCanvasResult) {
+    pub fn put(
+        &self,
+        session_id: impl Into<String>,
+        canvas_key: impl Into<String>,
+        result: SlackCanvasResult,
+    ) {
         self.put_at(session_id, canvas_key, result, Utc::now());
     }
 
@@ -438,7 +443,9 @@ impl AgentTool for SlackCanvasTool {
                     format!("read-back requested for Slack canvas '{canvas_id}'")
                 }
             }
-            SlackCanvasOp::Update { canvas_id, mode, .. } => {
+            SlackCanvasOp::Update {
+                canvas_id, mode, ..
+            } => {
                 format!("queued {mode:?} update of Slack canvas '{canvas_id}'")
             }
             SlackCanvasOp::Append { canvas_id, .. } => {
@@ -615,7 +622,10 @@ mod tests {
             json!({ "op": "append", "canvas_id": "F1", "markdown": "x" }),
         ] {
             let op = args["op"].as_str().unwrap().to_string();
-            let res = tool.execute("call-na", args).await.expect("valid mutating op");
+            let res = tool
+                .execute("call-na", args)
+                .await
+                .expect("valid mutating op");
             assert_eq!(
                 res.details["fetch_status"], "not_applicable",
                 "{op} should be not_applicable: {}",
@@ -759,7 +769,10 @@ mod tests {
 
         let tool = SlackCanvasTool::for_session(Some(session.to_string()));
         let res = tool
-            .execute("call-271-a", json!({ "op": "read", "canvas_id": "F_FULFILLED_1" }))
+            .execute(
+                "call-271-a",
+                json!({ "op": "read", "canvas_id": "F_FULFILLED_1" }),
+            )
             .await
             .expect("valid read");
 
@@ -793,7 +806,10 @@ mod tests {
         let session = "sess-271-read-pending";
         let tool = SlackCanvasTool::for_session(Some(session.to_string()));
         let res = tool
-            .execute("call-271-b", json!({ "op": "read", "canvas_id": "F_NEVER_FETCHED" }))
+            .execute(
+                "call-271-b",
+                json!({ "op": "read", "canvas_id": "F_NEVER_FETCHED" }),
+            )
             .await
             .expect("valid read");
 
@@ -824,7 +840,10 @@ mod tests {
         // A different session reading the same canvas id sees only pending.
         let tool = SlackCanvasTool::for_session(Some("sess-271-other".to_string()));
         let res = tool
-            .execute("call-271-c", json!({ "op": "read", "canvas_id": "F_SCOPED" }))
+            .execute(
+                "call-271-c",
+                json!({ "op": "read", "canvas_id": "F_SCOPED" }),
+            )
             .await
             .expect("valid read");
         assert_eq!(res.details["fetch_status"], "pending_bridge");
@@ -847,7 +866,10 @@ mod tests {
 
         let tool = SlackCanvasTool::new(); // unbound
         let res = tool
-            .execute("call-271-d", json!({ "op": "read", "canvas_id": "F_UNBOUND" }))
+            .execute(
+                "call-271-d",
+                json!({ "op": "read", "canvas_id": "F_UNBOUND" }),
+            )
             .await
             .expect("valid read");
         assert_eq!(res.details["fetch_status"], "pending_bridge");
@@ -876,7 +898,10 @@ mod tests {
 
         let tool = SlackCanvasTool::for_session(Some(session.to_string()));
         let res = tool
-            .execute("call-271-e", json!({ "op": "list", "channel_id": "C_LIST" }))
+            .execute(
+                "call-271-e",
+                json!({ "op": "list", "channel_id": "C_LIST" }),
+            )
             .await
             .expect("valid list");
 
@@ -939,9 +964,17 @@ mod tests {
     fn gc_keeps_entry_exactly_at_ttl_boundary() {
         let reg = CanvasFulfillmentRegistry::new();
         let now = Utc::now();
-        reg.put_at("sess", "F_EDGE", fulfilled("edge"), now - CANVAS_FULFILLMENT_TTL);
+        reg.put_at(
+            "sess",
+            "F_EDGE",
+            fulfilled("edge"),
+            now - CANVAS_FULFILLMENT_TTL,
+        );
         reg.gc(now, CANVAS_FULFILLMENT_TTL, CANVAS_FULFILLMENT_MAX_ENTRIES);
-        assert!(reg.get("sess", "F_EDGE").is_some(), "boundary entry retained");
+        assert!(
+            reg.get("sess", "F_EDGE").is_some(),
+            "boundary entry retained"
+        );
     }
 
     /// The hard cap bounds a burst that arrives within a single TTL window:
@@ -952,14 +985,32 @@ mod tests {
         let now = Utc::now();
         // All within TTL, so only the cap can evict. Distinct ages so "oldest" is
         // unambiguous.
-        reg.put_at("sess", "F_OLDEST", fulfilled("a"), now - chrono::Duration::minutes(3));
-        reg.put_at("sess", "F_MID", fulfilled("b"), now - chrono::Duration::minutes(2));
-        reg.put_at("sess", "F_NEWEST", fulfilled("c"), now - chrono::Duration::minutes(1));
+        reg.put_at(
+            "sess",
+            "F_OLDEST",
+            fulfilled("a"),
+            now - chrono::Duration::minutes(3),
+        );
+        reg.put_at(
+            "sess",
+            "F_MID",
+            fulfilled("b"),
+            now - chrono::Duration::minutes(2),
+        );
+        reg.put_at(
+            "sess",
+            "F_NEWEST",
+            fulfilled("c"),
+            now - chrono::Duration::minutes(1),
+        );
 
         reg.gc(now, CANVAS_FULFILLMENT_TTL, 2);
 
         assert_eq!(reg.len(), 2, "cap holds the map at max_entries");
-        assert!(reg.get("sess", "F_OLDEST").is_none(), "oldest evicted by the cap");
+        assert!(
+            reg.get("sess", "F_OLDEST").is_none(),
+            "oldest evicted by the cap"
+        );
         assert!(reg.get("sess", "F_MID").is_some());
         assert!(reg.get("sess", "F_NEWEST").is_some());
     }

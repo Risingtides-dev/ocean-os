@@ -104,8 +104,16 @@ pub fn extract_claims(text: &str, ctx: &ExtractCtx) -> Vec<Claim> {
         claims.push(Claim {
             id: format!("c{}", claims.len() + 1),
             text: l.chars().take(280).collect(),
-            provenance: Provenance { anchors, tickets, commit_sha: ctx.commit_sha.to_string() },
-            status: if in_verified { ClaimStatus::Verified } else { ClaimStatus::Asserted },
+            provenance: Provenance {
+                anchors,
+                tickets,
+                commit_sha: ctx.commit_sha.to_string(),
+            },
+            status: if in_verified {
+                ClaimStatus::Verified
+            } else {
+                ClaimStatus::Asserted
+            },
             knowledge_tier: KnowledgeTier::Individual,
             ps_anchor: None,
             confidence,

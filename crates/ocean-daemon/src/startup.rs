@@ -239,7 +239,11 @@ fn warn_partial_features() {
     // LiveKit auth pair: one half without the other mints nothing (in-room voice
     // tokens AND the call tap both need both halves).
     if lk_key != lk_secret {
-        let missing = if lk_key { "LIVEKIT_API_SECRET" } else { "LIVEKIT_API_KEY" };
+        let missing = if lk_key {
+            "LIVEKIT_API_SECRET"
+        } else {
+            "LIVEKIT_API_KEY"
+        };
         tracing::warn!(
             missing,
             "LiveKit partially configured: in-room voice tokens and the call tap \
@@ -371,7 +375,10 @@ fn log_readiness_summary() {
 /// summary, so it intentionally avoids pulling `ocean-providers` as a dep.
 fn configured_providers() -> Vec<&'static str> {
     const PROVIDER_CREDS: &[(&str, &[&str])] = &[
-        ("anthropic", &["OCEAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]),
+        (
+            "anthropic",
+            &["OCEAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+        ),
         ("openai", &["OCEAN_OPENAI_API_KEY", "OPENAI_API_KEY"]),
         (
             "google",

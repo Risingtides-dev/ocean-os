@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::stream;
 use ocean_protocol::{
-    AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Content, Context, Message,
-    Model, Provider, StopReason, StreamOptions, Usage,
+    AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Content, Context,
+    Message, Model, Provider, StopReason, StreamOptions, Usage,
 };
 use ocean_runtime::types::{AgentConfig, AgentTool, AgentToolResult};
 use serde_json::Value;
@@ -184,7 +184,11 @@ async fn turn_id_and_span_tree_render_in_subscriber_output() {
     let provider = Arc::new(MockProvider::new(vec![
         // Round 1: a tool call.
         vec![done(
-            vec![tool_call("call-1", "echo", serde_json::json!({ "msg": "hi" }))],
+            vec![tool_call(
+                "call-1",
+                "echo",
+                serde_json::json!({ "msg": "hi" }),
+            )],
             StopReason::ToolUse,
         )],
         // Round 2: final text.
@@ -205,7 +209,10 @@ async fn turn_id_and_span_tree_render_in_subscriber_output() {
     assert!(!run.stopped_at_turn_limit);
 
     let output = buf.contents();
-    assert!(!output.is_empty(), "subscriber must have rendered something");
+    assert!(
+        !output.is_empty(),
+        "subscriber must have rendered something"
+    );
 
     // 1. The turn_id is attached to the log lines — this is the whole point:
     //    every line emitted while the turn runs carries its turn_id, so
@@ -312,7 +319,10 @@ async fn tool_args_are_not_leaked_into_span_fields() {
 
     let output = buf.contents();
     // The tool_exec span must be present (so we know the path ran)…
-    assert!(output.contains("tool_exec"), "tool_exec span expected:\n{output}");
+    assert!(
+        output.contains("tool_exec"),
+        "tool_exec span expected:\n{output}"
+    );
     // …but the secret tool argument must NOT appear anywhere in the span output.
     assert!(
         !output.contains(SECRET),

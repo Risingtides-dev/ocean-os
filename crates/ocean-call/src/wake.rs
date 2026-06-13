@@ -198,10 +198,7 @@ mod tests {
         ));
         g.mark_replied(1_200);
         // An utterance during cooldown (e.g. Ocean's own TTS) is ignored.
-        assert_eq!(
-            g.on_utterance("hey ocean hi", 2_000),
-            WakeAction::Silent
-        );
+        assert_eq!(g.on_utterance("hey ocean hi", 2_000), WakeAction::Silent);
         // After cooldown elapses, it works again.
         assert!(matches!(
             g.on_utterance("hey ocean status", 3_500),

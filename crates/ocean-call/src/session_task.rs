@@ -47,7 +47,7 @@ use tokio::sync::Notify;
 
 use crate::frame::PcmFrame;
 use crate::orchestrator::{ActiveOutcome, CallSession, EventSink};
-use crate::stt::{SegmentUpdate, SttProvider, StreamEvent, TranscriptSegment};
+use crate::stt::{SegmentUpdate, StreamEvent, SttProvider, TranscriptSegment};
 use crate::stt_deepgram::SpeechActivity;
 use crate::stt_xai::UtteranceBuffer;
 
@@ -84,9 +84,7 @@ impl From<crate::room_tap::TapLifecycle> for SourceEnd {
     fn from(life: crate::room_tap::TapLifecycle) -> Self {
         match life {
             crate::room_tap::TapLifecycle::Ended => SourceEnd::Ended,
-            crate::room_tap::TapLifecycle::Disconnected { reason } => {
-                SourceEnd::Dropped { reason }
-            }
+            crate::room_tap::TapLifecycle::Disconnected { reason } => SourceEnd::Dropped { reason },
         }
     }
 }
@@ -167,7 +165,10 @@ Reply with the summary only — no preamble, no labels, no quoting the transcrip
 
 /// Build the summary-turn prompt from the raw joined transcript.
 fn summary_prompt(transcript: &str) -> String {
-    format!("{SUMMARY_INSTRUCTION}\n\nTranscript:\n{}", transcript.trim())
+    format!(
+        "{SUMMARY_INSTRUCTION}\n\nTranscript:\n{}",
+        transcript.trim()
+    )
 }
 
 /// Hard ceiling on a single summary turn (OCEAN-254). The summary turn issues an
@@ -193,7 +194,10 @@ const ANSWER_TURN_TIMEOUT: Duration = Duration::from_secs(25);
 /// A missing/blank/unparseable/zero value falls back to `default`, so a fat-
 /// fingered env can never *disable* the bound — the whole point of OCEAN-254.
 fn turn_timeout(env: &str, default: Duration) -> Duration {
-    match std::env::var(env).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+    match std::env::var(env)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
         Some(ms) if ms > 0 => Duration::from_millis(ms),
         _ => default,
     }
@@ -499,10 +503,7 @@ where
         tracing::warn!("call summary turn returned empty text; keeping prior summary");
         return;
     }
-    sink.emit(ocean_core::OceanEvent::CallSummaryUpdated {
-        summary,
-        as_of_ms,
-    });
+    sink.emit(ocean_core::OceanEvent::CallSummaryUpdated { summary, as_of_ms });
 }
 
 // ===========================================================================
@@ -1005,8 +1006,7 @@ async fn handle_stream_event<R, V, K, A>(
                 // Run the answer concurrently with continued event draining so a
                 // mid-utterance Onset reaches the canceller and cuts the TTS.
                 run_answer_barge_in(
-                    command, stt_events, session, runner, voice, sink, activity, started_ms,
-                    clock,
+                    command, stt_events, session, runner, voice, sink, activity, started_ms, clock,
                 )
                 .await;
             }
@@ -1123,7 +1123,16 @@ async fn run_answer_barge_in<R, V, K, A>(
     // (the edges were already forwarded live above, so don't re-forward them) so a
     // `Final` that arrived during the speak window is still committed in order.
     for event in pending {
-        handle_segment_update(event.update, session, runner, voice, sink, started_ms, clock).await;
+        handle_segment_update(
+            event.update,
+            session,
+            runner,
+            voice,
+            sink,
+            started_ms,
+            clock,
+        )
+        .await;
     }
 }
 
@@ -1398,7 +1407,7 @@ pub mod live {
 mod tests {
     use super::*;
     use crate::orchestrator::CapturingSink;
-    use crate::summarizer::{SummaryPolicy, Summarizer};
+    use crate::summarizer::{Summarizer, SummaryPolicy};
     use crate::wake::WakeGate;
     use ocean_core::OceanEvent;
     use std::collections::VecDeque;
@@ -1711,7 +1720,11 @@ mod tests {
         // joined transcript (2nd final crossed the threshold), then the wake
         // command. The summary prompt carries the instruction + raw transcript.
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "runner drives summary + answer; got {seen:?}");
+        assert_eq!(
+            seen.len(),
+            2,
+            "runner drives summary + answer; got {seen:?}"
+        );
         assert!(
             seen[0].starts_with(SUMMARY_INSTRUCTION),
             "first turn is the summary turn; got {:?}",
@@ -1922,7 +1935,10 @@ mod tests {
             seen[0]
         );
         // A summary is never spoken aloud.
-        assert!(spoken.lock().unwrap().is_empty(), "summary must not be spoken");
+        assert!(
+            spoken.lock().unwrap().is_empty(),
+            "summary must not be spoken"
+        );
         // The emitted CallSummaryUpdated carries the LLM summary, not the raw join.
         let summary = out
             .events
@@ -2082,7 +2098,11 @@ mod tests {
         let types = ev_types(&out);
         // Teardown completed: CallEnded is non-negotiable even with a hung turn.
         assert_eq!(types.first(), Some(&"started"));
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded must fire; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded must fire; got {types:?}"
+        );
         // Graceful degradation: a timed-out summary emits NO summary event (the
         // prior summary stands), and certainly never the raw transcript.
         assert!(
@@ -2138,9 +2158,16 @@ mod tests {
         );
         let types = ev_types(&out);
         // Wake fired, the call ended cleanly...
-        assert!(types.contains(&"wake"), "wake should still trigger; got {types:?}");
+        assert!(
+            types.contains(&"wake"),
+            "wake should still trigger; got {types:?}"
+        );
         assert_eq!(types.first(), Some(&"started"));
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded must fire; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded must fire; got {types:?}"
+        );
         // ...but the timed-out answer spoke nothing and emitted no spoke event.
         assert!(
             !types.contains(&"spoke"),
@@ -2239,7 +2266,10 @@ mod tests {
         .await;
 
         // The STT was actually driven (the utterance reached transcribe)...
-        assert!(attempts.load(Ordering::SeqCst) >= 1, "STT must have been called");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 1,
+            "STT must have been called"
+        );
         // ...but the failure produced no transcript and the call still bracketed.
         assert_eq!(
             ev_types(&out),
@@ -2247,8 +2277,14 @@ mod tests {
             "STT error must drop the utterance, not the call"
         );
         // No downstream lane ran off a failed transcription.
-        assert!(seen.lock().unwrap().is_empty(), "no agent turn off failed STT");
-        assert!(spoken.lock().unwrap().is_empty(), "nothing spoken off failed STT");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no agent turn off failed STT"
+        );
+        assert!(
+            spoken.lock().unwrap().is_empty(),
+            "nothing spoken off failed STT"
+        );
     }
 
     #[tokio::test]
@@ -2329,15 +2365,24 @@ mod tests {
 
         let types = ev_types(&out);
         // Wake fired and the runner WAS driven over the command...
-        assert!(types.contains(&"wake"), "wake should still trigger; got {types:?}");
+        assert!(
+            types.contains(&"wake"),
+            "wake should still trigger; got {types:?}"
+        );
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             &["what did we decide".to_string()],
             "the agent turn was attempted over the wake command"
         );
         // ...but the failed turn spoke nothing and emitted no CallAgentSpoke...
-        assert!(!types.contains(&"spoke"), "failed turn must not emit spoke; got {types:?}");
-        assert!(spoken.lock().unwrap().is_empty(), "failed turn speaks nothing");
+        assert!(
+            !types.contains(&"spoke"),
+            "failed turn must not emit spoke; got {types:?}"
+        );
+        assert!(
+            spoken.lock().unwrap().is_empty(),
+            "failed turn speaks nothing"
+        );
         // ...and the call still closed cleanly (no panic, no abort).
         assert_eq!(types.first(), Some(&"started"));
         assert_eq!(types.last(), Some(&"ended"));
@@ -2379,12 +2424,18 @@ mod tests {
         );
         // ...and despite the transport failure, CallAgentSpoke still fired with
         // the reply text (the load-bearing contract for the operator rail)...
-        assert!(types.contains(&"spoke"), "spoke must fire even when TTS fails; got {types:?}");
+        assert!(
+            types.contains(&"spoke"),
+            "spoke must fire even when TTS fails; got {types:?}"
+        );
         let spoke_text = out.events.iter().find_map(|e| match e {
             OceanEvent::CallAgentSpoke { text } => Some(text.clone()),
             _ => None,
         });
-        assert_eq!(spoke_text.as_deref(), Some("Here is the summary you asked for."));
+        assert_eq!(
+            spoke_text.as_deref(),
+            Some("Here is the summary you asked for.")
+        );
         // ...and the call survived the TTS failure and closed cleanly.
         assert_eq!(types.first(), Some(&"started"));
         assert_eq!(types.last(), Some(&"ended"));
@@ -2421,8 +2472,14 @@ mod tests {
         assert!(types.contains(&"wake"), "wake should fire; got {types:?}");
         assert_eq!(seen.lock().unwrap().len(), 1, "the answer turn ran");
         // ...but an empty reply produces no speech and no spoke event...
-        assert!(spoken.lock().unwrap().is_empty(), "empty reply must not be spoken");
-        assert!(!types.contains(&"spoke"), "empty reply must not emit spoke; got {types:?}");
+        assert!(
+            spoken.lock().unwrap().is_empty(),
+            "empty reply must not be spoken"
+        );
+        assert!(
+            !types.contains(&"spoke"),
+            "empty reply must not emit spoke; got {types:?}"
+        );
         // ...and the call still closes cleanly.
         assert_eq!(types.last(), Some(&"ended"));
     }
@@ -2464,7 +2521,10 @@ mod tests {
         // call brackets cleanly. CallEnded is non-negotiable.
         assert_eq!(types.first(), Some(&"started"));
         assert_eq!(types.last(), Some(&"ended"));
-        assert!(!types.contains(&"spoke"), "no successful speak amid failures; got {types:?}");
+        assert!(
+            !types.contains(&"spoke"),
+            "no successful speak amid failures; got {types:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2520,22 +2580,42 @@ mod tests {
         }
 
         // (1) None branch: init runs once, borrow yields the inserted value.
-        let mut v = LazySource { source: None, inits: 0, fail: false };
+        let mut v = LazySource {
+            source: None,
+            inits: 0,
+            fail: false,
+        };
         let first = v.ensure().await.expect("first ensure must succeed");
-        assert_eq!(first, "track-published", "None arm must return the inserted source");
+        assert_eq!(
+            first, "track-published",
+            "None arm must return the inserted source"
+        );
         assert_eq!(v.inits, 1, "init must run exactly once on first use");
 
         // (2) Some branch: no re-init, same value, still no panic.
         let again = v.ensure().await.expect("second ensure must succeed");
         assert_eq!(again, "track-published");
-        assert_eq!(v.inits, 1, "subsequent calls must not re-publish the source");
+        assert_eq!(
+            v.inits, 1,
+            "subsequent calls must not re-publish the source"
+        );
 
         // (3) Init failure propagates via `?` as Err — never a panic. A live
         // publish failure fails the one speak attempt; the call keeps running.
-        let mut bad = LazySource { source: None, inits: 0, fail: true };
+        let mut bad = LazySource {
+            source: None,
+            inits: 0,
+            fail: true,
+        };
         let err = bad.ensure().await;
-        assert!(err.is_err(), "a publish failure must surface as Err, not a panic");
-        assert!(bad.source.is_none(), "a failed init must leave the source unset");
+        assert!(
+            err.is_err(),
+            "a publish failure must surface as Err, not a panic"
+        );
+        assert!(
+            bad.source.is_none(),
+            "a failed init must leave the source unset"
+        );
     }
 
     // =======================================================================
@@ -2584,7 +2664,12 @@ mod tests {
         fn new(
             during: Vec<StreamEvent>,
             trailing: Vec<StreamEvent>,
-        ) -> (Arc<Self>, UnboundedReceiver<StreamEvent>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        ) -> (
+            Arc<Self>,
+            UnboundedReceiver<StreamEvent>,
+            Arc<AtomicU64>,
+            Arc<AtomicU64>,
+        ) {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let pushes = Arc::new(AtomicU64::new(0));
             let finished = Arc::new(AtomicU64::new(0));
@@ -2709,8 +2794,15 @@ mod tests {
         .await;
 
         // The provider was actually driven: frames pushed in, finish() called once.
-        assert!(pushes.load(Ordering::SeqCst) >= 1, "frames must be pushed to the provider");
-        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() must be called exactly once on source end");
+        assert!(
+            pushes.load(Ordering::SeqCst) >= 1,
+            "frames must be pushed to the provider"
+        );
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "finish() must be called exactly once on source end"
+        );
 
         let types = ev_types(&out);
         // Lifecycle brackets the call.
@@ -2731,19 +2823,34 @@ mod tests {
             e,
             OceanEvent::CallTranscriptSegment { text, is_final: false, .. } if text == "I'll send the"
         ));
-        assert!(interim_rendered, "interim must surface as a non-final transcript line");
-        let final_rendered = out.events.iter().any(|e| matches!(
-            e,
-            OceanEvent::CallTranscriptSegment { text, is_final: true, .. }
-                if text == "I'll send the master to Atlantic tonight"
-        ));
-        assert!(final_rendered, "the final segment must reach the orchestrator and render as final");
+        assert!(
+            interim_rendered,
+            "interim must surface as a non-final transcript line"
+        );
+        let final_rendered = out.events.iter().any(|e| {
+            matches!(
+                e,
+                OceanEvent::CallTranscriptSegment { text, is_final: true, .. }
+                    if text == "I'll send the master to Atlantic tonight"
+            )
+        });
+        assert!(
+            final_rendered,
+            "the final segment must reach the orchestrator and render as final"
+        );
 
         // The summary turn ran over the JOINED FINALS (not the interim), and the
         // wake command ran — proving finals (only) fed the summary + wake lanes.
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "runner drives summary + answer; got {seen:?}");
-        assert!(seen[0].starts_with(SUMMARY_INSTRUCTION), "first turn is the summary turn");
+        assert_eq!(
+            seen.len(),
+            2,
+            "runner drives summary + answer; got {seen:?}"
+        );
+        assert!(
+            seen[0].starts_with(SUMMARY_INSTRUCTION),
+            "first turn is the summary turn"
+        );
         assert!(
             seen[0].contains("I'll send the master to Atlantic tonight")
                 && seen[0].contains("the release is locked for friday"),
@@ -2762,7 +2869,10 @@ mod tests {
             ),
             "summary transcript must be exactly the two joined finals — no interim line",
         );
-        assert_eq!(seen[1], "what did we agree to", "second turn is the wake command, stripped");
+        assert_eq!(
+            seen[1], "what did we agree to",
+            "second turn is the wake command, stripped"
+        );
         assert_eq!(
             spoken.lock().unwrap().as_slice(),
             &["You agreed to send the master.".to_string()],
@@ -2814,9 +2924,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() must run on source end");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "finish() must run on source end"
+        );
         let seg = out.events.iter().find_map(|e| match e {
-            OceanEvent::CallTranscriptSegment { text, is_final: true, .. } => Some(text.clone()),
+            OceanEvent::CallTranscriptSegment {
+                text,
+                is_final: true,
+                ..
+            } => Some(text.clone()),
             _ => None,
         });
         assert_eq!(
@@ -2824,7 +2942,10 @@ mod tests {
             Some("just a closing thought"),
             "the trailing final flushed on finish() must be drained into the orchestrator"
         );
-        assert!(ev_types(&out).contains(&"ended"), "the call must still close");
+        assert!(
+            ev_types(&out).contains(&"ended"),
+            "the call must still close"
+        );
     }
 
     #[tokio::test]
@@ -2882,11 +3003,26 @@ mod tests {
         .await;
 
         let types = ev_types(&out);
-        assert!(types.contains(&"segment"), "transcript flows even when muted; got {types:?}");
-        assert!(!types.contains(&"wake"), "muted call must not trigger wake; got {types:?}");
-        assert!(!types.contains(&"spoke"), "muted call must not speak; got {types:?}");
-        assert!(seen.lock().unwrap().is_empty(), "muted call must not run a turn");
-        assert!(spoken.lock().unwrap().is_empty(), "muted call must not speak");
+        assert!(
+            types.contains(&"segment"),
+            "transcript flows even when muted; got {types:?}"
+        );
+        assert!(
+            !types.contains(&"wake"),
+            "muted call must not trigger wake; got {types:?}"
+        );
+        assert!(
+            !types.contains(&"spoke"),
+            "muted call must not speak; got {types:?}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "muted call must not run a turn"
+        );
+        assert!(
+            spoken.lock().unwrap().is_empty(),
+            "muted call must not speak"
+        );
     }
 
     #[tokio::test]
@@ -2912,7 +3048,10 @@ mod tests {
         )
         .await;
 
-        assert!(ev_types(&out).contains(&"ended"), "dropped streaming call must close");
+        assert!(
+            ev_types(&out).contains(&"ended"),
+            "dropped streaming call must close"
+        );
     }
 
     // =======================================================================
@@ -2996,7 +3135,10 @@ mod tests {
         // Drive the parking speak on its own task so this test can observe it park
         // (started, not finished) and then trip the barge-in.
         let speak = tokio::spawn(async move {
-            voice.speak("a long sentence Ocean is saying").await.unwrap();
+            voice
+                .speak("a long sentence Ocean is saying")
+                .await
+                .unwrap();
         });
 
         // Let the speak reach its park point. `started` is bumped synchronously at
@@ -3006,8 +3148,15 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(started.load(Ordering::SeqCst), 1, "speak must have started");
-        assert_eq!(finished.load(Ordering::SeqCst), 0, "speak must not have finished yet");
-        assert!(!speak.is_finished(), "the parked speak must not have returned");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            0,
+            "speak must not have finished yet"
+        );
+        assert!(
+            !speak.is_finished(),
+            "the parked speak must not have returned"
+        );
 
         // Human starts talking → Onset → canceller trips the signal.
         canceller.on_activity(SpeechActivity::Onset);
@@ -3142,14 +3291,21 @@ mod tests {
         // so assert on the normalized forms it actually produces.)
         assert_eq!(
             wake_turns,
-            vec!["give me the long version".to_string(), "what s next".to_string()],
+            vec![
+                "give me the long version".to_string(),
+                "what s next".to_string()
+            ],
             "both wake commands drove a turn, in order; got {seen:?}"
         );
 
         // Two speaks STARTED (one per answer), but the first was CUT — only the
         // second ran to completion. started=2, finished=1 is the load-bearing
         // proof that barge-in cancelled the first utterance mid-stream.
-        assert_eq!(started.load(Ordering::SeqCst), 2, "both answers began speaking");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "both answers began speaking"
+        );
         assert_eq!(
             finished.load(Ordering::SeqCst),
             1,
@@ -3163,8 +3319,15 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, OceanEvent::CallAgentSpoke { .. }))
             .count();
-        assert_eq!(spoke_count, 2, "each answer emits CallAgentSpoke; got {types:?}");
-        assert_eq!(finished_calls.load(Ordering::SeqCst), 1, "finish() runs once on source end");
+        assert_eq!(
+            spoke_count, 2,
+            "each answer emits CallAgentSpoke; got {types:?}"
+        );
+        assert_eq!(
+            finished_calls.load(Ordering::SeqCst),
+            1,
+            "finish() runs once on source end"
+        );
     }
 
     #[tokio::test]
@@ -3200,7 +3363,10 @@ mod tests {
         .await;
 
         let types = ev_types(&out);
-        assert!(types.contains(&"spoke"), "Ocean must speak when not barged; got {types:?}");
+        assert!(
+            types.contains(&"spoke"),
+            "Ocean must speak when not barged; got {types:?}"
+        );
         assert_eq!(started.load(Ordering::SeqCst), 1, "the answer spoke once");
         assert_eq!(
             finished.load(Ordering::SeqCst),
@@ -3409,12 +3575,19 @@ mod tests {
         let types = ev_types(&out);
         // Exactly one CallEnded, and it is the very last event (after the spoke).
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded is last; got {types:?}"
+        );
         // The answer ran to completion before teardown — spoke is present and
         // strictly precedes ended.
         let spoke_idx = types.iter().position(|t| *t == "spoke");
         let ended_idx = types.iter().rposition(|t| *t == "ended");
-        assert!(spoke_idx.is_some(), "the trailing answer must have spoken; got {types:?}");
+        assert!(
+            spoke_idx.is_some(),
+            "the trailing answer must have spoken; got {types:?}"
+        );
         assert!(
             spoke_idx < ended_idx,
             "the in-flight answer must finish before CallEnded; got {types:?}"
@@ -3462,11 +3635,21 @@ mod tests {
 
         let types = ev_types(&out);
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded is last; got {types:?}"
+        );
         // The trailing utterance was transcribed (segment), woke Ocean, and was
         // answered — none of it lost to the race with teardown.
-        assert!(types.contains(&"segment"), "trailing audio must commit a segment; got {types:?}");
-        assert!(types.contains(&"wake"), "trailing wake must fire; got {types:?}");
+        assert!(
+            types.contains(&"segment"),
+            "trailing audio must commit a segment; got {types:?}"
+        );
+        assert!(
+            types.contains(&"wake"),
+            "trailing wake must fire; got {types:?}"
+        );
         assert_eq!(
             spoken.lock().unwrap().as_slice(),
             &["Here is the summary.".to_string()],
@@ -3537,7 +3720,10 @@ mod tests {
 
         std::env::remove_var("OCEAN_CALL_SUMMARY_TIMEOUT_MS");
 
-        assert!(res.is_ok(), "a hung summary must not strand the trailing wake answer or teardown");
+        assert!(
+            res.is_ok(),
+            "a hung summary must not strand the trailing wake answer or teardown"
+        );
         assert!(
             summary_entered.load(Ordering::SeqCst) >= 1,
             "the summary turn must have been attempted (then timed out)"
@@ -3549,14 +3735,21 @@ mod tests {
             !types.contains(&"summary"),
             "a timed-out summary emits no summary; got {types:?}"
         );
-        assert!(types.contains(&"wake"), "the trailing wake still fired; got {types:?}");
+        assert!(
+            types.contains(&"wake"),
+            "the trailing wake still fired; got {types:?}"
+        );
         assert_eq!(
             spoken.lock().unwrap().as_slice(),
             &["The plan is to ship Friday.".to_string()],
             "the wake answer ran after the summary timed out"
         );
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded is last; got {types:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3637,10 +3830,18 @@ mod tests {
         let types = ev_types(&out);
         assert_eq!(types.first(), Some(&"started"));
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded is last; got {types:?}"
+        );
 
         // The wake answer spoke to completion (released, not cancelled).
-        assert_eq!(started.load(Ordering::SeqCst), 1, "the wake answer started speaking");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the wake answer started speaking"
+        );
         assert_eq!(
             finished_speaks.load(Ordering::SeqCst),
             1,
@@ -3652,17 +3853,23 @@ mod tests {
         let replayed = out
             .events
             .iter()
-            .filter(|e| matches!(
-                e,
-                OceanEvent::CallTranscriptSegment { text, is_final: true, .. }
-                    if text == "by the way the invoice is approved"
-            ))
+            .filter(|e| {
+                matches!(
+                    e,
+                    OceanEvent::CallTranscriptSegment { text, is_final: true, .. }
+                        if text == "by the way the invoice is approved"
+                )
+            })
             .count();
         assert_eq!(
             replayed, 1,
             "the mid-answer final must be replayed exactly once (not dropped, not doubled); got {types:?}"
         );
-        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "finish() ran once on source end"
+        );
     }
 
     #[tokio::test]
@@ -3688,7 +3895,7 @@ mod tests {
             // Close the STT stream mid-answer: drop the provider's sender. The pump
             // in run_answer_barge_in hits its `None` arm and awaits the answer.
             let _ = stt_for_driver.finish().await; // drops the event sender
-            // Let a few ticks pass so the pump observes the disconnect while parked.
+                                                   // Let a few ticks pass so the pump observes the disconnect while parked.
             for _ in 0..16 {
                 tokio::task::yield_now().await;
             }
@@ -3714,15 +3921,30 @@ mod tests {
         driver.await.expect("driver task should not panic");
 
         let types = ev_types(&out);
-        assert_eq!(count_ended(&out), 1, "exactly one CallEnded even with stream closed mid-answer; got {types:?}");
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
-        assert_eq!(started.load(Ordering::SeqCst), 1, "the answer started before the stream closed");
+        assert_eq!(
+            count_ended(&out),
+            1,
+            "exactly one CallEnded even with stream closed mid-answer; got {types:?}"
+        );
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded is last; got {types:?}"
+        );
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the answer started before the stream closed"
+        );
         assert_eq!(
             finished_speaks.load(Ordering::SeqCst),
             1,
             "the answer ran to completion after the stream closed mid-flight"
         );
-        assert!(types.contains(&"spoke"), "the answer still emitted CallAgentSpoke; got {types:?}");
+        assert!(
+            types.contains(&"spoke"),
+            "the answer still emitted CallAgentSpoke; got {types:?}"
+        );
         // finish() was called by the driver; the loop's own finish() is a harmless
         // second call (sender already None) — at least one, never a panic.
         assert!(finished.load(Ordering::SeqCst) >= 1, "finish() was invoked");
@@ -3766,7 +3988,10 @@ mod tests {
         let sig2 = signal.clone();
         let waiter = tokio::spawn(async move { sig2.barged().await });
         tokio::task::yield_now().await;
-        assert!(!waiter.is_finished(), "after rearm, barged() must park — no leftover wake from the burst");
+        assert!(
+            !waiter.is_finished(),
+            "after rearm, barged() must park — no leftover wake from the burst"
+        );
         signal.trigger();
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
@@ -3823,15 +4048,27 @@ mod tests {
         .await;
 
         let types = ev_types(&out);
-        assert_eq!(types.last(), Some(&"ended"), "the call must end cleanly after an onset burst; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "the call must end cleanly after an onset burst; got {types:?}"
+        );
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(started.load(Ordering::SeqCst), 2, "both wake answers began speaking despite the burst");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "both wake answers began speaking despite the burst"
+        );
         assert_eq!(
             finished_speaks.load(Ordering::SeqCst),
             1,
             "first answer cut by the burst, second answer spoke to completion (rearm survived)"
         );
-        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "finish() ran once on source end"
+        );
     }
 
     #[tokio::test]
@@ -3905,7 +4142,11 @@ mod tests {
 
         let types = ev_types(&out);
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(started.load(Ordering::SeqCst), 2, "both answers started speaking");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "both answers started speaking"
+        );
         assert_eq!(
             finished_speaks.load(Ordering::SeqCst),
             2,
@@ -3916,8 +4157,15 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, OceanEvent::CallAgentSpoke { .. }))
             .count();
-        assert_eq!(spoke_count, 2, "both answers emit CallAgentSpoke; got {types:?}");
-        assert_eq!(finished_calls.load(Ordering::SeqCst), 1, "finish() ran once");
+        assert_eq!(
+            spoke_count, 2,
+            "both answers emit CallAgentSpoke; got {types:?}"
+        );
+        assert_eq!(
+            finished_calls.load(Ordering::SeqCst),
+            1,
+            "finish() ran once"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3971,9 +4219,19 @@ mod tests {
         let types = ev_types(&out);
         assert_eq!(types.first(), Some(&"started"));
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
-        assert!(types.contains(&"wake"), "the wake final must fire; got {types:?}");
-        assert!(types.contains(&"spoke"), "the wake answer must speak; got {types:?}");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded is last; got {types:?}"
+        );
+        assert!(
+            types.contains(&"wake"),
+            "the wake final must fire; got {types:?}"
+        );
+        assert!(
+            types.contains(&"spoke"),
+            "the wake answer must speak; got {types:?}"
+        );
 
         // The FINAL transcript lines committed in stream order — including the
         // trailing-on-finish "talk soon" (last words not lost), with the wake
@@ -3982,7 +4240,11 @@ mod tests {
             .events
             .iter()
             .filter_map(|e| match e {
-                OceanEvent::CallTranscriptSegment { text, is_final: true, .. } => Some(text.clone()),
+                OceanEvent::CallTranscriptSegment {
+                    text,
+                    is_final: true,
+                    ..
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -4001,7 +4263,11 @@ mod tests {
             .events
             .iter()
             .filter_map(|e| match e {
-                OceanEvent::CallTranscriptSegment { text, is_final: false, .. } => Some(text.clone()),
+                OceanEvent::CallTranscriptSegment {
+                    text,
+                    is_final: false,
+                    ..
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -4014,7 +4280,11 @@ mod tests {
             &["Confirmed.".to_string()],
             "exactly the one wake answer was spoken"
         );
-        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "finish() ran once on source end"
+        );
     }
 
     #[tokio::test]
@@ -4092,8 +4362,16 @@ mod tests {
             "a timed-out summary emits no summary on the streaming path; got {types:?}"
         );
         assert_eq!(count_ended(&out), 1, "exactly one CallEnded; got {types:?}");
-        assert_eq!(types.last(), Some(&"ended"), "CallEnded is last; got {types:?}");
-        assert_eq!(finished.load(Ordering::SeqCst), 1, "finish() ran once on source end");
+        assert_eq!(
+            types.last(),
+            Some(&"ended"),
+            "CallEnded is last; got {types:?}"
+        );
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "finish() ran once on source end"
+        );
     }
 
     /// OCEAN-287: a poisoned `CapturingActivitySink` edges lock must be recovered,
@@ -4117,7 +4395,10 @@ mod tests {
             let _guard = edges.lock().expect("first lock is not yet poisoned");
             panic!("intentional panic to poison the activity edges mutex");
         });
-        assert!(poisoner.join().is_err(), "the poisoning thread must have panicked");
+        assert!(
+            poisoner.join().is_err(),
+            "the poisoning thread must have panicked"
+        );
         assert!(
             sink.edges.lock().is_err(),
             "precondition: the mutex is now poisoned",

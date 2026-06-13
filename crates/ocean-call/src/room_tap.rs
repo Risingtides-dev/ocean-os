@@ -138,8 +138,7 @@ pub mod live {
         mpsc::UnboundedReceiver<PcmFrame>,
         tokio::sync::oneshot::Receiver<super::TapLifecycle>,
     )> {
-        let (room, mut room_events) =
-            Room::connect(url, token, RoomOptions::default()).await?;
+        let (room, mut room_events) = Room::connect(url, token, RoomOptions::default()).await?;
         let room = std::sync::Arc::new(room);
         let (tx, rx) = mpsc::unbounded_channel::<PcmFrame>();
         let (life_tx, life_rx) = tokio::sync::oneshot::channel::<super::TapLifecycle>();
@@ -184,8 +183,7 @@ pub mod live {
         use futures_util::StreamExt;
         // Signature verified against libwebrtc 0.3.35 audio_stream.rs:62 (the
         // livekit re-export): new(track, sample_rate, num_channels) — 3 args.
-        let mut stream =
-            NativeAudioStream::new(audio.rtc_track(), TAP_SAMPLE_RATE, TAP_CHANNELS);
+        let mut stream = NativeAudioStream::new(audio.rtc_track(), TAP_SAMPLE_RATE, TAP_CHANNELS);
         let mut chunker = FrameChunker::new_20ms();
         while let Some(frame) = stream.next().await {
             let pcm = PcmFrame::new(

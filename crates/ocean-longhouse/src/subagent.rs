@@ -441,9 +441,9 @@ fn derive_allowed_tools(
         // 2–3-char prefix can't greedily match "prepare"/"runtime"/"fixture".
         // Either way the match is word-bounded, never a mid-word substring — which
         // is what stops "audit" from tripping "edit".
-        let hit = tokens.iter().any(|tok| {
-            tok == keyword || (keyword.len() >= 4 && tok.starts_with(keyword))
-        });
+        let hit = tokens
+            .iter()
+            .any(|tok| tok == keyword || (keyword.len() >= 4 && tok.starts_with(keyword)));
         if hit {
             for tool in *unlocked {
                 tools.insert((*tool).to_string());
@@ -545,7 +545,10 @@ mod tests {
     #[test]
     fn review_role_gets_read_leaning_tools_no_write() {
         let index = sample_index();
-        let spec = assemble_spec(&SubagentRequest::from_role("review this pull request"), &index);
+        let spec = assemble_spec(
+            &SubagentRequest::from_role("review this pull request"),
+            &index,
+        );
         // Baseline read tools present.
         assert!(spec.allowed_tools.iter().any(|t| t == "read_file"));
         assert!(spec.allowed_tools.iter().any(|t| t == "skills_fetch"));

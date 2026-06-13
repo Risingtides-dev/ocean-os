@@ -490,7 +490,9 @@ fn map_content(tool_name: &str, blocks: &[Value]) -> Vec<Content> {
                         tool = %tool_name,
                         "MCP image result block missing `data`/`mimeType`; dropping it"
                     );
-                    out.push(Content::text("[image content omitted: malformed image block]"));
+                    out.push(Content::text(
+                        "[image content omitted: malformed image block]",
+                    ));
                 }
             },
             Some(other) => {
@@ -597,7 +599,10 @@ mod tests {
         ];
         let content = map_content("t", &blocks);
         assert_eq!(content.len(), 2);
-        assert!(content[0].as_text().unwrap().contains("audio content omitted"));
+        assert!(content[0]
+            .as_text()
+            .unwrap()
+            .contains("audio content omitted"));
         assert_eq!(content[1].as_text(), Some("caption"));
     }
 

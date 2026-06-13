@@ -44,20 +44,20 @@ pub mod replay;
 pub mod subagent;
 
 pub use agent::ModelHandle;
-pub use longhouse_provider::{LonghouseProvider, LonghouseRegistryHandle};
 pub use config::{LonghouseConfig, LonghouseMode};
-pub use prepare::{
-    cached_index, cached_index_for, clear_index_cache, SkillBrief, SkillIndex, SkillRoots,
-    SkillSource, SopBrief, TurnBrief, TurnPrep, WorkflowBrief, CACHE_TTL, DEFAULT_TOP_N,
-};
 pub use convene::{
-    claim_outcome, ClaimError, Clock, ConveneOutcome, ConveneRequest, FirekeeperTitle, SystemClock,
-    convene,
+    claim_outcome, convene, ClaimError, Clock, ConveneOutcome, ConveneRequest, FirekeeperTitle,
+    SystemClock,
 };
 pub use escrow::{
     claim_bound_outcome, claim_outcome_persisted, recall_to_revocation, BreachAction, EscrowError,
     EscrowState, PersistedTitle, PolicyBreachLedger, Revocation, RevokeAuthorization, RevokeError,
     Revoker, RevokerKey, SqliteTitleRegistry, TitleStatus, TitleVerifier, TriggerRefused,
+};
+pub use longhouse_provider::{LonghouseProvider, LonghouseRegistryHandle};
+pub use prepare::{
+    cached_index, cached_index_for, clear_index_cache, SkillBrief, SkillIndex, SkillRoots,
+    SkillSource, SopBrief, TurnBrief, TurnPrep, WorkflowBrief, CACHE_TTL, DEFAULT_TOP_N,
 };
 pub use quorum::{
     QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule, RecallOutcome, RecallVote,

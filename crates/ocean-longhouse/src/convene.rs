@@ -885,14 +885,7 @@ mod tests {
         );
 
         // The firekeeper jumps the gun and tries to ratify Converged anyway.
-        let result = claim_outcome(
-            &mut eng,
-            &title,
-            proposer,
-            Some(title.token()),
-            proposal,
-            t,
-        );
+        let result = claim_outcome(&mut eng, &title, proposer, Some(title.token()), proposal, t);
         assert_eq!(
             result,
             Err(ClaimError::NotConverged),
@@ -914,10 +907,7 @@ mod tests {
 
         eng.propose(proposal, a, t); // net 1.0
         eng.endorse(proposal, b, None, t); // net 2.0 -> crosses cutoff, no rival
-        assert!(matches!(
-            eng.evaluate(t),
-            QuorumOutcome::Converged { .. }
-        ));
+        assert!(matches!(eng.evaluate(t), QuorumOutcome::Converged { .. }));
 
         // The firekeeper ratifies the engine's own decision with its token: accepted.
         assert_eq!(
@@ -940,10 +930,7 @@ mod tests {
         eng.propose(winner, a, t);
         eng.endorse(winner, b, None, t); // winner net 2.0 -> converges on `winner`
         eng.propose(other, uid(20), t); // a rival proposal exists but didn't win
-        assert!(matches!(
-            eng.evaluate(t),
-            QuorumOutcome::Converged { .. }
-        ));
+        assert!(matches!(eng.evaluate(t), QuorumOutcome::Converged { .. }));
 
         let result = claim_outcome(&mut eng, &title, a, Some(title.token()), other, t);
         assert_eq!(
@@ -1079,14 +1066,7 @@ mod tests {
         assert!(matches!(eng.evaluate(t), QuorumOutcome::Converged { .. }));
 
         // Imposter id `99` presents the *real* token but is not the titled agent.
-        let result = claim_outcome(
-            &mut eng,
-            &title,
-            imposter,
-            Some(title.token()),
-            proposal,
-            t,
-        );
+        let result = claim_outcome(&mut eng, &title, imposter, Some(title.token()), proposal, t);
         assert_eq!(
             result,
             Err(ClaimError::ForgedFirekeeper),

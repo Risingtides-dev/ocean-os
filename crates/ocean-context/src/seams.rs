@@ -78,7 +78,11 @@ impl TrustContext {
     /// `written_at` fallback. [`VelocityDecayTrust`] on this is byte-for-byte
     /// [`ConfidenceRecencyTrust`].
     pub fn new(now: i64, handoff_written_at: i64) -> Self {
-        Self { now, handoff_written_at, velocity: None }
+        Self {
+            now,
+            handoff_written_at,
+            velocity: None,
+        }
     }
 
     /// Attach a measured velocity (B2). Builder-style so existing call sites
@@ -135,8 +139,15 @@ pub struct FileExistsResolver {
 
 impl FileExistsResolver {
     fn git(&self, args: &[&str]) -> Option<String> {
-        let out = Command::new("git").arg("-C").arg(&self.repo_root).args(args).output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     fn basename_match(&self, listing: &str, file: &str) -> bool {
@@ -156,8 +167,12 @@ pub(crate) fn is_repo_relative(file: &str) -> bool {
     let p = std::path::Path::new(file);
     !file.is_empty()
         && !p.is_absolute()
-        && p.components()
-            .all(|c| !matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        && p.components().all(|c| {
+            !matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
 }
 
 impl Resolver for FileExistsResolver {
@@ -209,7 +224,9 @@ pub struct ConfidenceRecencyTrust {
 
 impl Default for ConfidenceRecencyTrust {
     fn default() -> Self {
-        Self { half_life_secs: 30.0 * 24.0 * 3600.0 }
+        Self {
+            half_life_secs: 30.0 * 24.0 * 3600.0,
+        }
     }
 }
 
@@ -274,7 +291,10 @@ pub struct VelocityDecayTrust {
 impl Default for VelocityDecayTrust {
     fn default() -> Self {
         // κ = ln2 / v_inflect, v_inflect = 5.27 (measured anthropic.rs v_sem).
-        Self { h0_secs: 30.0 * 24.0 * 3600.0, kappa: std::f64::consts::LN_2 / 5.27 }
+        Self {
+            h0_secs: 30.0 * 24.0 * 3600.0,
+            kappa: std::f64::consts::LN_2 / 5.27,
+        }
     }
 }
 
@@ -308,8 +328,11 @@ pub struct SubstringRetriever;
 
 impl Retriever for SubstringRetriever {
     fn rank(&self, query: &str, claims: &[Claim]) -> Vec<(usize, f32)> {
-        let words: Vec<String> =
-            query.to_lowercase().split_whitespace().map(str::to_string).collect();
+        let words: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
         if words.is_empty() {
             return Vec::new();
         }
@@ -394,12 +417,22 @@ pub struct VelocityMeter {
 
 impl VelocityMeter {
     pub fn new(repo_root: PathBuf) -> Self {
-        Self { repo_root, window_days: VELOCITY_WINDOW_DAYS }
+        Self {
+            repo_root,
+            window_days: VELOCITY_WINDOW_DAYS,
+        }
     }
 
     fn git(&self, args: &[&str]) -> Option<String> {
-        let out = Command::new("git").arg("-C").arg(&self.repo_root).args(args).output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Author time (unix seconds) of `rev`, or `None` if it can't be read
@@ -538,7 +571,9 @@ impl VelocityMeter {
     /// or more than one match (ambiguous location → no attributable churn).
     fn unique_basename(&self, listing: &str, file: &str) -> Option<String> {
         let needle = format!("/{file}");
-        let mut hits = listing.lines().filter(|l| *l == file || l.ends_with(&needle));
+        let mut hits = listing
+            .lines()
+            .filter(|l| *l == file || l.ends_with(&needle));
         let first = hits.next()?;
         match hits.next() {
             None => Some(first.to_string()), // exactly one
@@ -562,7 +597,11 @@ impl VelocityMeter {
         // The trailing window's end time: a real commit's timestamp, or HEAD's
         // for a working-tree measurement (WORKTREE is not a revision, so it
         // can't date the window directly).
-        let time_rev = if at_commit == WORKTREE { "HEAD" } else { at_commit };
+        let time_rev = if at_commit == WORKTREE {
+            "HEAD"
+        } else {
+            at_commit
+        };
         // Resolve the path whose churn we measure: the exact anchor when it is
         // a present regular file, else the UNIQUE bare-basename match (B1's
         // corpus fallback). Ambiguous / absent / non-regular → no signal.
@@ -629,7 +668,10 @@ impl VelocityMeter {
     pub fn measure(&self, claim: &Claim) -> Velocity {
         let commit = claim.provenance.commit_sha.as_str();
         if commit.is_empty() {
-            return Velocity { v_code: 0.0, v_sem: 0.0 };
+            return Velocity {
+                v_code: 0.0,
+                v_sem: 0.0,
+            };
         }
         // Dedup by RESOLVED path, not by the raw anchor string: two anchors
         // that name the same file differently (bare `input.rs` + full
@@ -640,7 +682,9 @@ impl VelocityMeter {
         let mut seen: std::collections::HashMap<String, (u32, u64)> =
             std::collections::HashMap::new();
         for anchor in &claim.provenance.anchors {
-            let Some(file) = anchor.file.as_deref() else { continue };
+            let Some(file) = anchor.file.as_deref() else {
+                continue;
+            };
             if let Some((path, c, churn)) = self.counts_for_file(file, commit) {
                 seen.entry(path).or_insert((c, churn));
             }
@@ -695,7 +739,10 @@ mod tests {
         let trust = ConfidenceRecencyTrust::default();
         let one_half_life = ctx_at(1_780_980_000 + 30 * 24 * 3600);
         let got = trust.trust(&claim, &one_half_life);
-        assert!((got - 0.45).abs() < 1e-3, "decays from handoff written_at, got {got}");
+        assert!(
+            (got - 0.45).abs() < 1e-3,
+            "decays from handoff written_at, got {got}"
+        );
     }
 
     // ---- B2: velocity-modulated decay (OCEAN-313) ----
@@ -714,7 +761,11 @@ mod tests {
             let ctx = ctx_at(t0 + days * 24 * 3600); // velocity: None
             let a = baseline.trust(claim, &ctx);
             let b = b2.trust(claim, &ctx);
-            assert_eq!(a.to_bits(), b.to_bits(), "diverged at day {days}: {a} vs {b}");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "diverged at day {days}: {a} vs {b}"
+            );
         }
     }
 
@@ -726,9 +777,14 @@ mod tests {
         let claim = &h.claims[0];
         let baseline = ConfidenceRecencyTrust::default();
         let b2 = VelocityDecayTrust::default();
-        let ctx = ctx_at(1_780_980_000 + 30 * 24 * 3600)
-            .with_velocity(Velocity { v_code: 0.0, v_sem: 0.0 });
-        assert_eq!(baseline.trust(claim, &ctx).to_bits(), b2.trust(claim, &ctx).to_bits());
+        let ctx = ctx_at(1_780_980_000 + 30 * 24 * 3600).with_velocity(Velocity {
+            v_code: 0.0,
+            v_sem: 0.0,
+        });
+        assert_eq!(
+            baseline.trust(claim, &ctx).to_bits(),
+            b2.trust(claim, &ctx).to_bits()
+        );
     }
 
     /// The taper: higher churn ⇒ shorter half-life ⇒ less surviving trust at a
@@ -739,8 +795,7 @@ mod tests {
         let claim = &h.claims[0];
         let b2 = VelocityDecayTrust::default();
         let dt_ctx = |v_sem: f32| {
-            ctx_at(1_780_980_000 + 7 * 24 * 3600)
-                .with_velocity(Velocity { v_code: 0.0, v_sem })
+            ctx_at(1_780_980_000 + 7 * 24 * 3600).with_velocity(Velocity { v_code: 0.0, v_sem })
         };
         let frozen = b2.trust(claim, &dt_ctx(0.0));
         let mature = b2.trust(claim, &dt_ctx(5.27));
@@ -775,8 +830,10 @@ mod tests {
         let h = sample_handoff();
         let claim = &h.claims[0];
         let b2 = VelocityDecayTrust::default();
-        let past = ctx_at(1_780_980_000 - 10 * 24 * 3600)
-            .with_velocity(Velocity { v_code: 1.0, v_sem: 5.0 });
+        let past = ctx_at(1_780_980_000 - 10 * 24 * 3600).with_velocity(Velocity {
+            v_code: 1.0,
+            v_sem: 5.0,
+        });
         assert!((b2.trust(claim, &past) - claim.confidence).abs() < 1e-6);
     }
 
@@ -825,7 +882,9 @@ mod tests {
         git(&["commit", "-qm", "c1"]);
         let head = git(&["rev-parse", "HEAD"]);
 
-        let r = FileExistsResolver { repo_root: root.to_path_buf() };
+        let r = FileExistsResolver {
+            repo_root: root.to_path_buf(),
+        };
         let symbol_only = Anchor {
             file: None,
             symbol: Some("workspace.members".into()),
@@ -836,7 +895,10 @@ mod tests {
         assert_eq!(r.resolve(&symbol_only, &head), Resolution::Unresolvable);
         // A degenerate Some("") is equally uncheckable — `join("")` is the
         // repo dir and `cat-file -e <rev>:` accepts the bare tree-ish.
-        let empty_file = Anchor { file: Some(String::new()), ..symbol_only.clone() };
+        let empty_file = Anchor {
+            file: Some(String::new()),
+            ..symbol_only.clone()
+        };
         assert_eq!(r.resolve(&empty_file, WORKTREE), Resolution::Unresolvable);
         assert_eq!(r.resolve(&empty_file, &head), Resolution::Unresolvable);
     }
@@ -872,7 +934,9 @@ mod tests {
         // A file that genuinely exists ABOVE the repo root.
         std::fs::write(outer.path().join("escape.rs"), "fn outside() {}\n").unwrap();
 
-        let r = FileExistsResolver { repo_root: root.clone() };
+        let r = FileExistsResolver {
+            repo_root: root.clone(),
+        };
         let mk = |file: &str| Anchor {
             file: Some(file.into()),
             symbol: None,
@@ -884,7 +948,11 @@ mod tests {
         let absolute = mk("/etc/hosts"); // exists on the host, but not ours to attest
         for anchor in [&escape, &nested_escape, &absolute] {
             let file = anchor.file.as_deref().unwrap();
-            assert_eq!(r.resolve(anchor, WORKTREE), Resolution::Unresolvable, "{file}");
+            assert_eq!(
+                r.resolve(anchor, WORKTREE),
+                Resolution::Unresolvable,
+                "{file}"
+            );
             assert_eq!(r.resolve(anchor, &head), Resolution::Unresolvable, "{file}");
         }
         // Sanity: the in-repo anchor still resolves, so the gate is not over-broad.
@@ -897,12 +965,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/a.rs"), "fn main() {}\n").unwrap();
-        let r = FileExistsResolver { repo_root: dir.path().to_path_buf() };
-        let present =
-            Anchor { file: Some("src/a.rs".into()), symbol: None, lines: vec![], sig_hash: None };
-        let missing =
-            Anchor { file: Some("src/gone.rs".into()), symbol: None, lines: vec![], sig_hash: None };
-        assert!(matches!(r.resolve(&present, WORKTREE), Resolution::Resolves(_)));
+        let r = FileExistsResolver {
+            repo_root: dir.path().to_path_buf(),
+        };
+        let present = Anchor {
+            file: Some("src/a.rs".into()),
+            symbol: None,
+            lines: vec![],
+            sig_hash: None,
+        };
+        let missing = Anchor {
+            file: Some("src/gone.rs".into()),
+            symbol: None,
+            lines: vec![],
+            sig_hash: None,
+        };
+        assert!(matches!(
+            r.resolve(&present, WORKTREE),
+            Resolution::Resolves(_)
+        ));
         assert!(matches!(r.resolve(&missing, WORKTREE), Resolution::Dead));
     }
 }

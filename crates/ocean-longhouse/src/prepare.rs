@@ -693,12 +693,62 @@ fn tokenize(text: &str) -> Vec<String> {
 fn is_stop_word(word: &str) -> bool {
     matches!(
         word,
-        "the" | "and" | "for" | "you" | "your" | "with" | "this" | "that" | "from" | "into"
-            | "can" | "will" | "would" | "should" | "could" | "have" | "has" | "are" | "was"
-            | "were" | "but" | "not" | "use" | "using" | "used" | "via" | "per" | "out" | "get"
-            | "got" | "let" | "lets" | "make" | "made" | "want" | "need" | "help" | "please"
-            | "now" | "then" | "than" | "when" | "what" | "which" | "how" | "who" | "why"
-            | "all" | "any" | "some" | "here" | "there" | "about" | "over" | "under" | "more"
+        "the"
+            | "and"
+            | "for"
+            | "you"
+            | "your"
+            | "with"
+            | "this"
+            | "that"
+            | "from"
+            | "into"
+            | "can"
+            | "will"
+            | "would"
+            | "should"
+            | "could"
+            | "have"
+            | "has"
+            | "are"
+            | "was"
+            | "were"
+            | "but"
+            | "not"
+            | "use"
+            | "using"
+            | "used"
+            | "via"
+            | "per"
+            | "out"
+            | "get"
+            | "got"
+            | "let"
+            | "lets"
+            | "make"
+            | "made"
+            | "want"
+            | "need"
+            | "help"
+            | "please"
+            | "now"
+            | "then"
+            | "than"
+            | "when"
+            | "what"
+            | "which"
+            | "how"
+            | "who"
+            | "why"
+            | "all"
+            | "any"
+            | "some"
+            | "here"
+            | "there"
+            | "about"
+            | "over"
+            | "under"
+            | "more"
     )
 }
 
@@ -940,7 +990,9 @@ mod tests {
     #[test]
     fn empty_index_or_prompt_is_fail_open() {
         let empty = SkillIndex::default();
-        assert!(empty.prepare(&TurnBrief::from_prompt("anything")).is_empty());
+        assert!(empty
+            .prepare(&TurnBrief::from_prompt("anything"))
+            .is_empty());
 
         let index = sample_index();
         assert!(index.prepare(&TurnBrief::from_prompt("")).is_empty());
@@ -1014,11 +1066,10 @@ mod tests {
             ),
             brief("Coverer", "render a programmatic video composition"),
         ]);
-        let prep = index.prepare(&TurnBrief::from_prompt(
-            "render a programmatic video",
-        ));
+        let prep = index.prepare(&TurnBrief::from_prompt("render a programmatic video"));
         assert_eq!(
-            prep.skills[0].name, "Coverer",
+            prep.skills[0].name,
+            "Coverer",
             "two distinct matched terms beat one term repeated, got {:?}",
             prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
@@ -1043,9 +1094,7 @@ mod tests {
             "Invoicing",
             "Use this to help you with the billing please",
         )]);
-        let prep = index.prepare(&TurnBrief::from_prompt(
-            "please help me with the thing",
-        ));
+        let prep = index.prepare(&TurnBrief::from_prompt("please help me with the thing"));
         assert!(
             prep.skills.is_empty(),
             "stop-word-only overlap must not surface a skill, got {:?}",
@@ -1098,7 +1147,11 @@ mod tests {
         // Now disable caching → the next call re-walks and sees the deletion.
         std::env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
         let third = cached_index_for(&roots);
-        assert_eq!(third.len(), 0, "with caching off, the re-walk sees the gone dir");
+        assert_eq!(
+            third.len(),
+            0,
+            "with caching off, the re-walk sees the gone dir"
+        );
 
         clear_index_cache();
         drop(guard);

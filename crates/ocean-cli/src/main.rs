@@ -599,8 +599,8 @@ mod tests {
 
         // Scripted allow (operator chose allow-session) → wire body the daemon
         // decision endpoint expects.
-        let decision = resolve_permission(PermissionMode::Allow, true)
-            .expect("allow resolves without asking");
+        let decision =
+            resolve_permission(PermissionMode::Allow, true).expect("allow resolves without asking");
         let token = ocean_core::mint_decision_token();
         let body = PermissionDecisionRequest {
             permission_id,

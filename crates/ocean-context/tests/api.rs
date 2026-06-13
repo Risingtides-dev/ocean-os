@@ -5,7 +5,11 @@ use ocean_context::{read_freshest, reverify, write_handoff, Handoff, ScopeRing, 
 
 fn handoff_with(claim_texts: &[&str]) -> Handoff {
     let prose = claim_texts.join("\n");
-    let ctx = ExtractCtx { commit_sha: "abc1234", now: 1_000, by_session: "test" };
+    let ctx = ExtractCtx {
+        commit_sha: "abc1234",
+        now: 1_000,
+        by_session: "test",
+    };
     Handoff {
         session_id: "sess-api".into(),
         parent_session: None,
@@ -13,7 +17,10 @@ fn handoff_with(claim_texts: &[&str]) -> Handoff {
         branch: "main".into(),
         commit_anchor: "abc1234".into(),
         scope_ring: ScopeRing::Repo,
-        velocity_at_write: Velocity { v_code: 0.0, v_sem: 0.0 },
+        velocity_at_write: Velocity {
+            v_code: 0.0,
+            v_sem: 0.0,
+        },
         written_at: 1_000,
         narrative: prose.clone(),
         claims: extract_claims(&prose, &ctx),
@@ -31,7 +38,9 @@ fn write_then_read_freshest_sorts_claims_by_trust() {
     h.claims[0].confidence = 0.2;
     h.claims[1].confidence = 0.9;
     write_handoff(dir.path(), &h).unwrap();
-    let got = read_freshest(dir.path(), "ocean-os", "main", 1_000).unwrap().unwrap();
+    let got = read_freshest(dir.path(), "ocean-os", "main", 1_000)
+        .unwrap()
+        .unwrap();
     assert_eq!(got.claims[0].confidence, 0.9); // most trusted first
 }
 
@@ -45,7 +54,9 @@ fn reverify_updates_status_and_history_via_resolver() {
         "A live claim anchored at src/real.rs in this repo.",
         "A dead claim anchored at src/vanished.rs long gone.",
     ]);
-    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let resolver = FileExistsResolver {
+        repo_root: dir.path().to_path_buf(),
+    };
     let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
 
     assert_eq!(results.len(), 2);
@@ -54,7 +65,10 @@ fn reverify_updates_status_and_history_via_resolver() {
     assert_eq!(h.claims[0].status, ClaimStatus::Verified);
     assert_eq!(h.claims[1].status, ClaimStatus::Dead);
     // history gained a reverified event
-    assert!(h.claims[0].history.iter().any(|e| e.event.starts_with("reverified")));
+    assert!(h.claims[0]
+        .history
+        .iter()
+        .any(|e| e.event.starts_with("reverified")));
 }
 
 #[test]
@@ -68,7 +82,9 @@ fn reverify_skips_anchorless_claims() {
     h.claims.push(plan);
 
     let dir = tempfile::tempdir().unwrap();
-    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let resolver = FileExistsResolver {
+        repo_root: dir.path().to_path_buf(),
+    };
     let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
     assert_eq!(results.len(), 1); // anchorless claim untouched
     assert_eq!(h.claims[1].status, ClaimStatus::Asserted);
@@ -77,7 +93,12 @@ fn reverify_skips_anchorless_claims() {
 #[test]
 fn anchors_can_be_file_only() {
     // F5: the resolver path must not assume line numbers.
-    let a = Anchor { file: Some("src/real.rs".into()), symbol: None, lines: vec![], sig_hash: None };
+    let a = Anchor {
+        file: Some("src/real.rs".into()),
+        symbol: None,
+        lines: vec![],
+        sig_hash: None,
+    };
     assert!(a.lines.is_empty());
 }
 
@@ -85,7 +106,12 @@ fn anchors_can_be_file_only() {
 fn anchors_can_be_symbol_only() {
     // F5 / schema friction #1: absence of a file anchor is typed, not an
     // empty-string sentinel.
-    let a = Anchor { file: None, symbol: Some("workspace.members".into()), lines: vec![], sig_hash: None };
+    let a = Anchor {
+        file: None,
+        symbol: Some("workspace.members".into()),
+        lines: vec![],
+        sig_hash: None,
+    };
     assert!(a.file.is_none());
 }
 
@@ -103,7 +129,9 @@ fn reverify_dead_anchor_kills_claim_despite_unresolvable_sibling() {
     });
 
     let dir = tempfile::tempdir().unwrap(); // empty repo: src/gone.rs is Dead
-    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let resolver = FileExistsResolver {
+        repo_root: dir.path().to_path_buf(),
+    };
     let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
 
     assert!(matches!(results[0].1, Resolution::Dead));
@@ -128,7 +156,9 @@ fn reverify_resolving_anchor_holds_claim_despite_unresolvable_sibling() {
         sig_hash: None,
     });
 
-    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let resolver = FileExistsResolver {
+        repo_root: dir.path().to_path_buf(),
+    };
     let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
 
     assert!(matches!(results[0].1, Resolution::Resolves(_)));
@@ -143,14 +173,20 @@ fn reverify_marks_uncheckable_claims_unresolvable_not_dead() {
     let mut h = handoff_with(&["A live claim anchored at src/real.rs in this repo."]);
     let mut sym = h.claims[0].clone();
     sym.id = "c-sym".into();
-    sym.provenance.anchors =
-        vec![Anchor { file: None, symbol: Some("apply_input".into()), lines: vec![], sig_hash: None }];
+    sym.provenance.anchors = vec![Anchor {
+        file: None,
+        symbol: Some("apply_input".into()),
+        lines: vec![],
+        sig_hash: None,
+    }];
     h.claims.push(sym);
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/real.rs"), "// here\n").unwrap();
-    let resolver = FileExistsResolver { repo_root: dir.path().to_path_buf() };
+    let resolver = FileExistsResolver {
+        repo_root: dir.path().to_path_buf(),
+    };
     let results = reverify(&mut h, &resolver, WORKTREE, 2_000, "sess-next");
 
     assert_eq!(results.len(), 2);

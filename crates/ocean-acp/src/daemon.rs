@@ -112,10 +112,7 @@ impl DaemonClient {
     /// instead of silently forking a fresh one. Without this, the bridge minted
     /// a *local* id the daemon never knew, and the daemon→ACP mapping (learned
     /// lazily, held only in memory) was lost on restart.
-    pub async fn create_session(
-        &self,
-        cwd: &str,
-    ) -> Result<AgentSessionCreateResponse> {
+    pub async fn create_session(&self, cwd: &str) -> Result<AgentSessionCreateResponse> {
         let url = format!("{}/v1/agent/sessions", self.base_url);
         let body = AgentSessionCreateRequest {
             workspace_root: cwd.to_string(),
@@ -318,7 +315,10 @@ impl DaemonClient {
             decision,
             decision_token,
         };
-        let url = format!("{}/v1/permissions/{}/decision", self.base_url, permission_id);
+        let url = format!(
+            "{}/v1/permissions/{}/decision",
+            self.base_url, permission_id
+        );
         self.http
             .post(&url)
             .json(&body)

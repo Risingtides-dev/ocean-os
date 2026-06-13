@@ -175,9 +175,7 @@ pub struct RoomPage {
 /// that also reports `has_more = true`. The sibling of [`clamp_transcript_limit`]
 /// for list endpoints.
 pub fn clamp_list_limit(limit: Option<usize>) -> usize {
-    limit
-        .unwrap_or(DEFAULT_LIST_LIMIT)
-        .clamp(1, MAX_LIST_LIMIT)
+    limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT)
 }
 
 /// Error returned by store operations.
@@ -486,7 +484,14 @@ impl SqliteRoomStore {
                 let workspace_root: Option<String> = row.get(3)?;
                 let created_at: String = row.get(4)?;
                 let updated_at: String = row.get(5)?;
-                Ok((id, name, policy_json, workspace_root, created_at, updated_at))
+                Ok((
+                    id,
+                    name,
+                    policy_json,
+                    workspace_root,
+                    created_at,
+                    updated_at,
+                ))
             })
             .optional()?;
         let Some((id, name, policy_json, workspace_root, created_at, updated_at)) = room else {
@@ -591,7 +596,11 @@ impl SqliteRoomStore {
         if has_more {
             out.truncate(effective_limit);
         }
-        let next_seq = if has_more { out.last().map(|m| m.seq) } else { None };
+        let next_seq = if has_more {
+            out.last().map(|m| m.seq)
+        } else {
+            None
+        };
         Ok(TranscriptPage {
             messages: out,
             next_seq,
@@ -788,11 +797,7 @@ impl RoomStore for SqliteRoomStore {
         } else {
             &keys[..]
         };
-        let next_cursor = if has_more {
-            kept.last().cloned()
-        } else {
-            None
-        };
+        let next_cursor = if has_more { kept.last().cloned() } else { None };
 
         let mut rooms = Vec::with_capacity(kept.len());
         for k in kept {
@@ -1130,7 +1135,10 @@ fn unquote(v: &str) -> Result<String> {
 }
 
 fn json_string(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
     format!("\"{escaped}\"")
 }
 
@@ -1151,7 +1159,11 @@ fn decode_participant_kind(s: &str) -> Result<RoomParticipantKind> {
         "bot" => RoomParticipantKind::Bot,
         "tool" => RoomParticipantKind::Tool,
         "system" => RoomParticipantKind::System,
-        other => return Err(RoomStoreError::Encode(format!("unknown participant kind: {other}"))),
+        other => {
+            return Err(RoomStoreError::Encode(format!(
+                "unknown participant kind: {other}"
+            )))
+        }
     })
 }
 
@@ -1170,7 +1182,11 @@ fn decode_message_kind(s: &str) -> Result<RoomMessageKind> {
         "participant_joined" => RoomMessageKind::ParticipantJoined,
         "participant_left" => RoomMessageKind::ParticipantLeft,
         "system" => RoomMessageKind::System,
-        other => return Err(RoomStoreError::Encode(format!("unknown message kind: {other}"))),
+        other => {
+            return Err(RoomStoreError::Encode(format!(
+                "unknown message kind: {other}"
+            )))
+        }
     })
 }
 
@@ -1520,7 +1536,11 @@ mod tests {
         let mut s = store_with_rooms(3); // room-000..room-002
         s.close(&RoomKey::new("room-001")).unwrap();
         let page = s.list_page(None, Some(10)).unwrap();
-        let ids: Vec<String> = page.rooms.iter().map(|r| r.id.as_str().to_string()).collect();
+        let ids: Vec<String> = page
+            .rooms
+            .iter()
+            .map(|r| r.id.as_str().to_string())
+            .collect();
         assert_eq!(ids, vec!["room-002".to_string(), "room-000".to_string()]);
         assert!(!page.has_more);
     }
@@ -1531,7 +1551,9 @@ mod tests {
         let key = RoomKey::new("r1");
         s.create(key.clone(), "R1", None, now()).unwrap();
 
-        let rec = s.add_participant(&key, human("john", "John"), now()).unwrap();
+        let rec = s
+            .add_participant(&key, human("john", "John"), now())
+            .unwrap();
         assert_eq!(rec.room.participants.len(), 1);
         assert_eq!(rec.transcript.len(), 1);
         assert_eq!(rec.transcript[0].seq, 0);
@@ -1539,7 +1561,8 @@ mod tests {
         assert_eq!(rec.transcript[0].body, "John joined");
 
         // Re-adding same id does not duplicate the roster entry.
-        s.add_participant(&key, human("john", "John"), now()).unwrap();
+        s.add_participant(&key, human("john", "John"), now())
+            .unwrap();
         assert_eq!(s.get(&key).unwrap().unwrap().room.participants.len(), 1);
 
         let rec = s.remove_participant(&key, "john", now()).unwrap();
@@ -1658,7 +1681,10 @@ mod tests {
             }
         }
         let expected: Vec<u64> = (0..total as u64).collect();
-        assert_eq!(collected, expected, "every row retrieved once, in seq order");
+        assert_eq!(
+            collected, expected,
+            "every row retrieved once, in seq order"
+        );
     }
 
     #[test]
@@ -1699,12 +1725,13 @@ mod tests {
         // rows than the cap we still get them all and has_more is false; the point
         // is the request can't be coerced into an unbounded scan.
         let (s, key) = store_with_messages(3);
-        let page = s
-            .transcript_page(&key, None, Some(usize::MAX))
-            .unwrap();
+        let page = s.transcript_page(&key, None, Some(usize::MAX)).unwrap();
         assert_eq!(page.messages.len(), 3);
         assert!(!page.has_more);
-        assert_eq!(clamp_transcript_limit(Some(usize::MAX)), MAX_TRANSCRIPT_LIMIT);
+        assert_eq!(
+            clamp_transcript_limit(Some(usize::MAX)),
+            MAX_TRANSCRIPT_LIMIT
+        );
         assert_eq!(clamp_transcript_limit(None), DEFAULT_TRANSCRIPT_LIMIT);
         // A 0 limit floors to 1 so it can never report an empty-yet-has_more page.
         assert_eq!(clamp_transcript_limit(Some(0)), 1);
@@ -1740,7 +1767,8 @@ mod tests {
         let mut s = store();
         let key = RoomKey::new("r1");
         s.create(key.clone(), "R1", None, now()).unwrap();
-        s.add_participant(&key, human("john", "John"), now()).unwrap(); // seq 0
+        s.add_participant(&key, human("john", "John"), now())
+            .unwrap(); // seq 0
         s.append_message(
             &key,
             "john",
@@ -1751,7 +1779,12 @@ mod tests {
         )
         .unwrap(); // seq 1
         s.remove_participant(&key, "john", now()).unwrap(); // seq 2
-        let seqs: Vec<u64> = s.transcript(&key, None).unwrap().iter().map(|m| m.seq).collect();
+        let seqs: Vec<u64> = s
+            .transcript(&key, None)
+            .unwrap()
+            .iter()
+            .map(|m| m.seq)
+            .collect();
         assert_eq!(seqs, vec![0, 1, 2]);
     }
 
@@ -1812,10 +1845,7 @@ mod tests {
         assert!(s.get_including_closed(&key).unwrap().is_some());
 
         // Closing again errors (no open room).
-        assert!(matches!(
-            s.close(&key),
-            Err(RoomStoreError::UnknownRoom(_))
-        ));
+        assert!(matches!(s.close(&key), Err(RoomStoreError::UnknownRoom(_))));
     }
 
     #[test]
@@ -1881,7 +1911,11 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rooms_before, rooms_after, "no extra/leaked room row");
-        assert_eq!(msgs_before, count(&s, "messages", &key), "transcript intact");
+        assert_eq!(
+            msgs_before,
+            count(&s, "messages", &key),
+            "transcript intact"
+        );
 
         // The name + (absent) policy of the original survive untouched.
         let rec = s.get(&key).unwrap().unwrap();
@@ -1898,16 +1932,24 @@ mod tests {
         let mut s = store();
         let key = RoomKey::new("r1");
         s.create(key.clone(), "R1", None, now()).unwrap();
-        s.add_participant(&key, human("john", "John"), now()).unwrap(); // seq 0
+        s.add_participant(&key, human("john", "John"), now())
+            .unwrap(); // seq 0
 
         let msgs_before = count(&s, "messages", &key);
         let parts_before = count(&s, "participants", &key);
 
         let err = s.remove_participant(&key, "ghost", now());
-        assert!(matches!(err, Err(RoomStoreError::UnknownParticipant { .. })));
+        assert!(matches!(
+            err,
+            Err(RoomStoreError::UnknownParticipant { .. })
+        ));
 
         assert_eq!(msgs_before, count(&s, "messages", &key), "no leaked marker");
-        assert_eq!(parts_before, count(&s, "participants", &key), "roster intact");
+        assert_eq!(
+            parts_before,
+            count(&s, "participants", &key),
+            "roster intact"
+        );
         // seq did not skip: next real append is seq 1, not 2.
         let m = s
             .append_message(
@@ -1979,7 +2021,10 @@ mod tests {
             .conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(fk_on, 1, "foreign_keys pragma must be ON or FK clauses are inert");
+        assert_eq!(
+            fk_on, 1,
+            "foreign_keys pragma must be ON or FK clauses are inert"
+        );
     }
 
     #[test]
@@ -2026,7 +2071,11 @@ mod tests {
 
         // Children must be gone — proving the cascade fired (only true with the
         // pragma ON; this test fails loudly if FK enforcement regresses).
-        assert_eq!(count(&s, "participants", &key), 0, "participants must cascade");
+        assert_eq!(
+            count(&s, "participants", &key),
+            0,
+            "participants must cascade"
+        );
         assert_eq!(count(&s, "messages", &key), 0, "messages must cascade");
     }
 
@@ -2051,7 +2100,8 @@ mod tests {
         let mut s = store();
         let key = RoomKey::new("r1");
         s.create(key.clone(), "R1", None, now()).unwrap();
-        s.add_participant(&key, human("john", "John"), now()).unwrap();
+        s.add_participant(&key, human("john", "John"), now())
+            .unwrap();
         s.append_message(
             &key,
             "john",
@@ -2071,8 +2121,16 @@ mod tests {
         // Hidden from the open view...
         assert!(s.get(&key).unwrap().is_none());
         // ...but every row is retained (soft-close, no cascade).
-        assert_eq!(count(&s, "participants", &key), parts_before, "roster retained");
-        assert_eq!(count(&s, "messages", &key), msgs_before, "transcript retained");
+        assert_eq!(
+            count(&s, "participants", &key),
+            parts_before,
+            "roster retained"
+        );
+        assert_eq!(
+            count(&s, "messages", &key),
+            msgs_before,
+            "transcript retained"
+        );
         // closed_at is set.
         let closed_at: Option<String> = s
             .conn
@@ -2249,7 +2307,10 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_join_marker;")
             .unwrap();
         let rec = s.add_participant(&key, human("p", "P"), now()).unwrap();
-        assert_eq!(rec.transcript[0].seq, 0, "rolled-back op must not consume a seq");
+        assert_eq!(
+            rec.transcript[0].seq, 0,
+            "rolled-back op must not consume a seq"
+        );
         assert_no_torn_row(&s, &key);
     }
 

@@ -14,7 +14,11 @@ use ocean_context::claim::ClaimStatus;
 use ocean_context::extract::{extract_claims, ExtractCtx};
 
 fn ctx() -> ExtractCtx<'static> {
-    ExtractCtx { commit_sha: "d9a9bc9", now: 1_780_980_000, by_session: "regression-test" }
+    ExtractCtx {
+        commit_sha: "d9a9bc9",
+        now: 1_780_980_000,
+        by_session: "regression-test",
+    }
 }
 
 #[test]
@@ -22,7 +26,10 @@ fn ocean_os_handoff_yields_22_claims_15_verified() {
     let text = include_str!("fixtures/ocean-os-HANDOFF.md");
     let claims = extract_claims(text, &ctx());
     assert_eq!(claims.len(), 22);
-    let verified = claims.iter().filter(|c| c.status == ClaimStatus::Verified).count();
+    let verified = claims
+        .iter()
+        .filter(|c| c.status == ClaimStatus::Verified)
+        .count();
     assert_eq!(verified, 15); // prototype: declared_verified == 15
 }
 
@@ -37,7 +44,10 @@ fn phase2_handoff_yields_29_claims_0_verified() {
 #[test]
 fn corpus_totals_51_claims() {
     let a = extract_claims(include_str!("fixtures/ocean-os-HANDOFF.md"), &ctx());
-    let b = extract_claims(include_str!("fixtures/claude-monorepo-PHASE2_HANDOFF.md"), &ctx());
+    let b = extract_claims(
+        include_str!("fixtures/claude-monorepo-PHASE2_HANDOFF.md"),
+        &ctx(),
+    );
     assert_eq!(a.len() + b.len(), 51);
 }
 
@@ -46,12 +56,17 @@ fn prototype_quirks_are_preserved() {
     // The prototype's leftmost-first alternation matches "manifest.json" as
     // "manifest.js" (js before json in the extension alternation) — frozen.
     let a = extract_claims(include_str!("fixtures/ocean-os-HANDOFF.md"), &ctx());
-    assert!(a
+    assert!(a.iter().any(|c| c
+        .provenance
+        .anchors
         .iter()
-        .any(|c| c.provenance.anchors.iter().any(|an| an.file.as_deref() == Some("manifest.js"))));
+        .any(|an| an.file.as_deref() == Some("manifest.js"))));
     // "~/.config/brain/config.toml" matches from the slash ("~" is not in the
     // file char class) — frozen too.
-    let b = extract_claims(include_str!("fixtures/claude-monorepo-PHASE2_HANDOFF.md"), &ctx());
+    let b = extract_claims(
+        include_str!("fixtures/claude-monorepo-PHASE2_HANDOFF.md"),
+        &ctx(),
+    );
     assert!(b.iter().any(|c| c
         .provenance
         .anchors
@@ -67,7 +82,11 @@ fn confidence_is_derived_not_free_typed() {
     for c in &claims {
         let expected =
             Claim::derive_confidence(&c.provenance.anchors, c.status == ClaimStatus::Verified);
-        assert!((c.confidence - expected).abs() < f32::EPSILON, "claim {}", c.id);
+        assert!(
+            (c.confidence - expected).abs() < f32::EPSILON,
+            "claim {}",
+            c.id
+        );
     }
 }
 
@@ -86,21 +105,31 @@ fn input_rs_anchor_parses_line_list_and_verified_section() {
                 .any(|a| a.file.as_deref() == Some("input.rs") && !a.lines.is_empty())
         })
         .expect("input.rs claim with line list present");
-    let a =
-        c.provenance.anchors.iter().find(|a| a.file.as_deref() == Some("input.rs")).unwrap();
+    let a = c
+        .provenance
+        .anchors
+        .iter()
+        .find(|a| a.file.as_deref() == Some("input.rs"))
+        .unwrap();
     assert_eq!(a.lines, vec![29, 67, 97, 130]);
     assert_eq!(c.status, ClaimStatus::Verified);
 }
 
 #[test]
 fn unanchored_lines_are_skipped() {
-    let claims = extract_claims("This long sentence mentions no file anchors at all.", &ctx());
+    let claims = extract_claims(
+        "This long sentence mentions no file anchors at all.",
+        &ctx(),
+    );
     assert!(claims.is_empty());
 }
 
 #[test]
 fn range_lines_normalize_en_dash() {
-    let claims = extract_claims("Single browser + single active page: lib.rs:37–82 holds it.", &ctx());
+    let claims = extract_claims(
+        "Single browser + single active page: lib.rs:37–82 holds it.",
+        &ctx(),
+    );
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].provenance.anchors[0].lines, vec![37, 82]);
 }
@@ -113,7 +142,10 @@ fn ticket_and_symbol_are_captured() {
     );
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].provenance.tickets, vec!["OCEAN-16".to_string()]);
-    assert_eq!(claims[0].provenance.anchors[0].symbol.as_deref(), Some("append_client_type"));
+    assert_eq!(
+        claims[0].provenance.anchors[0].symbol.as_deref(),
+        Some("append_client_type")
+    );
 }
 
 #[test]
@@ -125,7 +157,10 @@ fn multiple_tickets_on_one_line_are_all_kept() {
         &ctx(),
     );
     assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].provenance.tickets, vec!["OCEAN-16".to_string(), "OCEAN-23".to_string()]);
+    assert_eq!(
+        claims[0].provenance.tickets,
+        vec!["OCEAN-16".to_string(), "OCEAN-23".to_string()]
+    );
 }
 
 #[test]
@@ -139,10 +174,19 @@ fn symbols_pair_by_proximity_not_blind_zip() {
     assert_eq!(claims.len(), 1);
     let anchors = &claims[0].provenance.anchors;
     assert_eq!(anchors.len(), 2);
-    let nav = anchors.iter().find(|a| a.file.as_deref() == Some("nav.rs")).unwrap();
-    let input = anchors.iter().find(|a| a.file.as_deref() == Some("input.rs")).unwrap();
+    let nav = anchors
+        .iter()
+        .find(|a| a.file.as_deref() == Some("nav.rs"))
+        .unwrap();
+    let input = anchors
+        .iter()
+        .find(|a| a.file.as_deref() == Some("input.rs"))
+        .unwrap();
     assert_eq!(input.symbol.as_deref(), Some("handle_input"));
-    assert_eq!(nav.symbol, None, "far-away symbol must not be zipped onto nav.rs");
+    assert_eq!(
+        nav.symbol, None,
+        "far-away symbol must not be zipped onto nav.rs"
+    );
 }
 
 #[test]
@@ -154,8 +198,14 @@ fn adjacent_symbol_anchor_pairs_attach_correctly() {
     );
     assert_eq!(claims.len(), 1);
     let anchors = &claims[0].provenance.anchors;
-    let nav = anchors.iter().find(|a| a.file.as_deref() == Some("nav.rs")).unwrap();
-    let input = anchors.iter().find(|a| a.file.as_deref() == Some("input.rs")).unwrap();
+    let nav = anchors
+        .iter()
+        .find(|a| a.file.as_deref() == Some("nav.rs"))
+        .unwrap();
+    let input = anchors
+        .iter()
+        .find(|a| a.file.as_deref() == Some("input.rs"))
+        .unwrap();
     assert_eq!(input.symbol.as_deref(), Some("requires_permission"));
     assert_eq!(nav.symbol.as_deref(), Some("route_event"));
 }

@@ -33,11 +33,10 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, CurrentModeUpdate, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason,
-    ToolCallUpdate, ToolCallUpdateFields,
+    NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionMode,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    StopReason, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result as AcpResult, Stdio};
 use anyhow::Context;
@@ -47,7 +46,10 @@ use convert::{event_to_update, stop_reason_for, text_block};
 use daemon::{DaemonClient, DEFAULT_BASE_URL};
 
 #[derive(Parser, Debug)]
-#[command(name = "ocean-acp", about = "ACP bridge exposing the Ocean daemon to Zed and other ACP editors")]
+#[command(
+    name = "ocean-acp",
+    about = "ACP bridge exposing the Ocean daemon to Zed and other ACP editors"
+)]
 struct Cli {
     /// Base URL of the running Ocean daemon.
     #[arg(long, env = "OCEAN_ACP_DAEMON_URL", default_value = DEFAULT_BASE_URL)]
@@ -1158,11 +1160,7 @@ mod tests {
         let acp_id = "22222222-2222-4222-8222-222222222222";
         assert_eq!(sessions.daemon_id(acp_id), None);
 
-        sessions.insert_with_daemon_id(
-            acp_id.into(),
-            "/work/repo".into(),
-            Some(acp_id.into()),
-        );
+        sessions.insert_with_daemon_id(acp_id.into(), "/work/repo".into(), Some(acp_id.into()));
 
         // daemon_id is restored → run_turn submits it → daemon RESUMES.
         assert_eq!(
@@ -1251,8 +1249,14 @@ mod tests {
         assert!(sessions.set_model_id("acp-b", "deepseek-v4-pro".into()));
 
         // Neither selection bleeds into the other.
-        assert_eq!(sessions.model_id("acp-a").as_deref(), Some("claude-opus-4-7"));
-        assert_eq!(sessions.model_id("acp-b").as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(
+            sessions.model_id("acp-a").as_deref(),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(
+            sessions.model_id("acp-b").as_deref(),
+            Some("deepseek-v4-pro")
+        );
     }
 
     #[test]
@@ -1359,7 +1363,10 @@ mod tests {
         };
         // This is THE event the bridge keys off — it must yield the turn id, and
         // that turn id IS the daemon's per-turn request id.
-        assert_eq!(event_turn_id(&ev).as_deref(), Some(tid.0.to_string().as_str()));
+        assert_eq!(
+            event_turn_id(&ev).as_deref(),
+            Some(tid.0.to_string().as_str())
+        );
     }
 
     #[test]

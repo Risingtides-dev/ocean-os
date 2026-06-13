@@ -329,7 +329,10 @@ mod tests {
             .execute("c2", json!({ "id": "x", "timeout_ms": 1 }))
             .await
             .expect_err("missing session arg with no binding errors");
-        assert!(err.contains("session_id"), "expected session_id error, got: {err}");
+        assert!(
+            err.contains("session_id"),
+            "expected session_id error, got: {err}"
+        );
     }
 
     /// OCEAN-271: the built-in provider rebinds `slack_canvas` to the turn's

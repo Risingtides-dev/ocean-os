@@ -39,7 +39,10 @@ impl AgentTool for WriteTool {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).await.map_err(|e| {
-                    format!("could not create parent directory {}: {e}", parent.display())
+                    format!(
+                        "could not create parent directory {}: {e}",
+                        parent.display()
+                    )
                 })?;
             }
         }

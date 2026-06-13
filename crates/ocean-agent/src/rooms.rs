@@ -124,11 +124,7 @@ impl RoomRegistry {
     /// most-recently-updated first, ties broken by key for determinism.
     pub fn list(&self) -> Vec<Room> {
         let mut out: Vec<Room> = self.rooms.values().map(|r| r.room.clone()).collect();
-        out.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then(a.id.0.cmp(&b.id.0))
-        });
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.0.cmp(&b.id.0)));
         out
     }
 
@@ -181,10 +177,7 @@ impl RoomRegistry {
         let body = format!("{} joined", participant.display_name);
         {
             let record = self.rooms.get_mut(key).expect("checked above");
-            record
-                .room
-                .participants
-                .retain(|p| p.id != participant.id);
+            record.room.participants.retain(|p| p.id != participant.id);
             record.room.participants.push(participant.clone());
             record.room.updated_at = now;
         }
@@ -254,7 +247,8 @@ impl RoomRegistry {
         if !self.rooms.contains_key(key) {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        let msg = self.append_message_inner(key, author_id.into(), author_kind, kind, body.into(), now)?;
+        let msg =
+            self.append_message_inner(key, author_id.into(), author_kind, kind, body.into(), now)?;
         if let Some(record) = self.rooms.get_mut(key) {
             record.room.updated_at = now;
         }
@@ -363,7 +357,8 @@ mod tests {
         ));
 
         // A second room shows up in the list.
-        reg.create(RoomKey::new("docs"), "Docs", None, now()).unwrap();
+        reg.create(RoomKey::new("docs"), "Docs", None, now())
+            .unwrap();
         assert_eq!(reg.list().len(), 2);
     }
 

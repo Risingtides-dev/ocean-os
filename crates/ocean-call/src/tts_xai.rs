@@ -214,9 +214,9 @@ pub fn resample_linear(samples: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16
     }
 
     // Output length scales by the rate ratio (round to nearest frame).
-    let dst_len =
-        (((src_len as u64) * (dst_rate as u64) + (src_rate as u64) / 2) / (src_rate as u64)).max(1)
-            as usize;
+    let dst_len = (((src_len as u64) * (dst_rate as u64) + (src_rate as u64) / 2)
+        / (src_rate as u64))
+        .max(1) as usize;
 
     let mut out = Vec::with_capacity(dst_len);
     // Map each output index back to a fractional source position. Using
@@ -488,7 +488,7 @@ mod tests {
         wav.extend_from_slice(&22u16.to_le_bytes()); // cbSize
         wav.extend_from_slice(&16u16.to_le_bytes()); // valid bits per sample
         wav.extend_from_slice(&0u32.to_le_bytes()); // channel mask
-        // sub-format GUID: first two bytes = real format tag (1 = PCM).
+                                                    // sub-format GUID: first two bytes = real format tag (1 = PCM).
         wav.extend_from_slice(&WAV_FMT_PCM.to_le_bytes());
         wav.extend_from_slice(&[0u8; 14]); // rest of the GUID
         wav.extend_from_slice(b"data");

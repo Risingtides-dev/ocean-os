@@ -809,10 +809,24 @@ mod tests {
         eng.endorse(pa, worker, None, t);
         {
             let tallies = eng.tallies(t);
-            let net_a = tallies.iter().find(|x| x.proposal == pa).unwrap().net_weight;
-            let net_b = tallies.iter().find(|x| x.proposal == pb).unwrap().net_weight;
-            assert!((net_a - 2.0).abs() < 1e-3, "A should be 2.0 after worker endorse, got {net_a}");
-            assert!((net_b - 1.0).abs() < 1e-3, "B should still be 1.0, got {net_b}");
+            let net_a = tallies
+                .iter()
+                .find(|x| x.proposal == pa)
+                .unwrap()
+                .net_weight;
+            let net_b = tallies
+                .iter()
+                .find(|x| x.proposal == pb)
+                .unwrap()
+                .net_weight;
+            assert!(
+                (net_a - 2.0).abs() < 1e-3,
+                "A should be 2.0 after worker endorse, got {net_a}"
+            );
+            assert!(
+                (net_b - 1.0).abs() < 1e-3,
+                "B should still be 1.0, got {net_b}"
+            );
         }
 
         // Later round: the same worker switches its support to B (endorse B).
@@ -822,8 +836,16 @@ mod tests {
         // pa_author left) and B rises to 2.0 (pb_author + worker).
         eng.endorse(pb, worker, None, t);
         let tallies = eng.tallies(t);
-        let net_a = tallies.iter().find(|x| x.proposal == pa).unwrap().net_weight;
-        let net_b = tallies.iter().find(|x| x.proposal == pb).unwrap().net_weight;
+        let net_a = tallies
+            .iter()
+            .find(|x| x.proposal == pa)
+            .unwrap()
+            .net_weight;
+        let net_b = tallies
+            .iter()
+            .find(|x| x.proposal == pb)
+            .unwrap()
+            .net_weight;
         assert!(
             (net_a - 1.0).abs() < 1e-3,
             "A must drop to 1.0 once the worker leaves it; got {net_a} (double-counting bug)"
@@ -837,8 +859,16 @@ mod tests {
         // the worker's prior endorse on B must go, leaving B at pb_author - worker.
         eng.inhibit(pa, worker, None, t); // worker now inhibits A
         let tallies = eng.tallies(t);
-        let net_a = tallies.iter().find(|x| x.proposal == pa).unwrap().net_weight;
-        let net_b = tallies.iter().find(|x| x.proposal == pb).unwrap().net_weight;
+        let net_a = tallies
+            .iter()
+            .find(|x| x.proposal == pa)
+            .unwrap()
+            .net_weight;
+        let net_b = tallies
+            .iter()
+            .find(|x| x.proposal == pb)
+            .unwrap()
+            .net_weight;
         assert!(
             (net_a - 0.0).abs() < 1e-3,
             "A should be 0.0 (pa_author 1.0 - worker inhibit 1.0), got {net_a}"
@@ -903,18 +933,27 @@ mod tests {
         // First two distinct votes: still pending (2 < 3).
         assert_eq!(
             recall.cast(uid(10)),
-            RecallOutcome::Pending { votes: 1, threshold: 3 }
+            RecallOutcome::Pending {
+                votes: 1,
+                threshold: 3
+            }
         );
         assert_eq!(
             recall.cast(uid(11)),
-            RecallOutcome::Pending { votes: 2, threshold: 3 }
+            RecallOutcome::Pending {
+                votes: 2,
+                threshold: 3
+            }
         );
         assert!(!recall.is_carried());
 
         // Third DISTINCT vote crosses the threshold -> carried.
         assert_eq!(
             recall.cast(uid(12)),
-            RecallOutcome::Carried { title_id: title, votes: 3 }
+            RecallOutcome::Carried {
+                title_id: title,
+                votes: 3
+            }
         );
         assert!(recall.is_carried());
 
@@ -934,7 +973,10 @@ mod tests {
             let out = recall.cast(lone);
             assert_eq!(
                 out,
-                RecallOutcome::Pending { votes: 1, threshold: 3 },
+                RecallOutcome::Pending {
+                    votes: 1,
+                    threshold: 3
+                },
                 "one voter is one credential no matter how many casts"
             );
         }
@@ -955,10 +997,16 @@ mod tests {
         // No votes yet -> pending, not carried (the empty tally cannot depose).
         assert_eq!(
             recall.evaluate(),
-            RecallOutcome::Pending { votes: 0, threshold: 1 }
+            RecallOutcome::Pending {
+                votes: 0,
+                threshold: 1
+            }
         );
         // One genuine vote then carries.
-        assert!(matches!(recall.cast(uid(10)), RecallOutcome::Carried { .. }));
+        assert!(matches!(
+            recall.cast(uid(10)),
+            RecallOutcome::Carried { .. }
+        ));
     }
 
     // A voter can recant before quorum, dropping the count back below threshold.
@@ -969,17 +1017,26 @@ mod tests {
         recall.cast(uid(10));
         assert_eq!(
             recall.cast(uid(11)),
-            RecallOutcome::Carried { title_id: title, votes: 2 }
+            RecallOutcome::Carried {
+                title_id: title,
+                votes: 2
+            }
         );
         // Already carried: withdrawing does NOT un-latch a reached deposition.
-        assert!(matches!(recall.withdraw(uid(11)), RecallOutcome::Carried { .. }));
+        assert!(matches!(
+            recall.withdraw(uid(11)),
+            RecallOutcome::Carried { .. }
+        ));
 
         // But on a fresh recall, withdrawing before quorum drops the count.
         let mut recall2 = RecallVote::new(title, 2);
         recall2.cast(uid(10));
         assert_eq!(
             recall2.withdraw(uid(10)),
-            RecallOutcome::Pending { votes: 0, threshold: 2 }
+            RecallOutcome::Pending {
+                votes: 0,
+                threshold: 2
+            }
         );
         assert!(!recall2.is_carried());
     }

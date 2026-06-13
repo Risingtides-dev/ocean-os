@@ -385,7 +385,10 @@ mod tests {
     #[test]
     fn identical_version_does_not_supersede_itself() {
         let v = ComponentVersion::new(3, agent("sage"));
-        assert!(!v.supersedes(&v.clone()), "a replay must not win (idempotent)");
+        assert!(
+            !v.supersedes(&v.clone()),
+            "a replay must not win (idempotent)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -406,7 +409,11 @@ mod tests {
         c.tick(); // 1
         c.observe(9); // jump to 9
         assert_eq!(c.now(), 9);
-        assert_eq!(c.tick(), 10, "next local write is strictly greater than any seen");
+        assert_eq!(
+            c.tick(),
+            10,
+            "next local write is strictly greater than any seen"
+        );
         // Observing something smaller never rewinds.
         c.observe(3);
         assert_eq!(c.now(), 10);
@@ -488,7 +495,9 @@ mod tests {
         let mut s = CanvasMergeState::new();
 
         assert!(s.merge(&a, ComponentVersion::new(1, human())).applied());
-        assert!(s.merge(&b, ComponentVersion::new(1, agent("sage"))).applied());
+        assert!(s
+            .merge(&b, ComponentVersion::new(1, agent("sage")))
+            .applied());
 
         assert_eq!(s.len(), 2, "both components are tracked");
         assert_eq!(s.version(&a).unwrap().actor, human());
@@ -552,12 +561,19 @@ mod tests {
     fn max_rev_seeds_a_resuming_clock() {
         let mut s = CanvasMergeState::new();
         s.merge(&ComponentId::new("a"), ComponentVersion::new(4, human()));
-        s.merge(&ComponentId::new("b"), ComponentVersion::new(7, agent("sage")));
+        s.merge(
+            &ComponentId::new("b"),
+            ComponentVersion::new(7, agent("sage")),
+        );
         assert_eq!(s.max_rev(), 7);
 
         // A resuming actor seeds its clock past the whole replayed history.
         let mut clock = LamportClock::at(s.max_rev());
-        assert_eq!(clock.tick(), 8, "fresh writes are strictly greater than history");
+        assert_eq!(
+            clock.tick(),
+            8,
+            "fresh writes are strictly greater than history"
+        );
     }
 
     #[test]
@@ -588,7 +604,12 @@ mod tests {
             surface_id: SurfaceId::new("gpui:local"),
             canvas_id: CanvasId::new("canvas:main"),
             actor: ActorRef {
-                kind: actor.as_str().split(':').next().unwrap_or("system").to_string(),
+                kind: actor
+                    .as_str()
+                    .split(':')
+                    .next()
+                    .unwrap_or("system")
+                    .to_string(),
                 id: actor.as_str().split_once(':').map(|(_, i)| i.to_string()),
                 label: None,
             },
@@ -607,7 +628,9 @@ mod tests {
     /// land in `applied` (here: the component's resulting `x`); losers are
     /// skipped. Returns the converged (component -> x) map. Unversioned or
     /// non-component-targeting patches always apply (legacy / view-state path).
-    fn simulate_ledger(envelopes: &[SurfacePatchEnvelope]) -> std::collections::BTreeMap<String, f32> {
+    fn simulate_ledger(
+        envelopes: &[SurfacePatchEnvelope],
+    ) -> std::collections::BTreeMap<String, f32> {
         let mut merge = CanvasMergeState::new();
         let mut applied: std::collections::BTreeMap<String, f32> = Default::default();
         for env in envelopes {
@@ -617,7 +640,10 @@ mod tests {
                 _ => true,
             };
             if winner {
-                if let SurfacePatch::MoveComponent { component_id, x, .. } = &env.patch {
+                if let SurfacePatch::MoveComponent {
+                    component_id, x, ..
+                } = &env.patch
+                {
                     applied.insert(component_id.as_str().to_string(), *x);
                 }
             }
@@ -651,7 +677,11 @@ mod tests {
         let ag = versioned_move("card-b", 60.0, 1, agent("sage"));
 
         let result = simulate_ledger(&[op, ag]);
-        assert_eq!(result.get("card-a"), Some(&50.0), "operator's card-a landed");
+        assert_eq!(
+            result.get("card-a"),
+            Some(&50.0),
+            "operator's card-a landed"
+        );
         assert_eq!(result.get("card-b"), Some(&60.0), "agent's card-b landed");
         assert_eq!(result.len(), 2, "both edits survived — no clobber");
     }

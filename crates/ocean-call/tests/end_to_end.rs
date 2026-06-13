@@ -15,7 +15,7 @@
 //! John's Twilio + LiveKit accounts.
 
 use ocean_call::{
-    CallSession, CapturingSink, FrameChunker, PcmFrame, SummaryPolicy, Summarizer,
+    CallSession, CapturingSink, FrameChunker, PcmFrame, Summarizer, SummaryPolicy,
     TranscriptSegment, WakeGate,
 };
 use ocean_core::OceanEvent;
@@ -25,9 +25,21 @@ use ocean_core::OceanEvent;
 /// proving the audio→frame seam below.
 fn call_script() -> Vec<(&'static str, &'static str, u64)> {
     vec![
-        ("caller", "hey thanks for hopping on about the Warner Q3 push", 0),
-        ("caller", "I'll send the master over to Atlantic tonight", 3_000),
-        ("caller", "and we need to verify the toll-free number by Friday", 6_500),
+        (
+            "caller",
+            "hey thanks for hopping on about the Warner Q3 push",
+            0,
+        ),
+        (
+            "caller",
+            "I'll send the master over to Atlantic tonight",
+            3_000,
+        ),
+        (
+            "caller",
+            "and we need to verify the toll-free number by Friday",
+            6_500,
+        ),
         ("ocean-op", "sounds good", 9_000),
         ("caller", "hey Ocean what did we just agree to", 11_000),
         ("caller", "great talk to you tomorrow", 14_000),
@@ -65,7 +77,8 @@ fn full_call_emits_expected_event_sequence() {
     // here at the orchestrator seam.
     let mut summary_due_count = 0usize;
     for (speaker, text, ms) in call_script() {
-        let outcome = session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+        let outcome =
+            session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
         if outcome.summary_due.is_some() {
             summary_due_count += 1;
         }

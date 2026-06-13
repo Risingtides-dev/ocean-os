@@ -21,24 +21,22 @@ use ocean_agent::{room_guidance, AgentRuntime, PromptControl};
 use ocean_agent_sdk::{
     AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse, AgentSessionId,
     AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurn, AgentTurnEvent,
-    AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
-    ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
-    ToolCall, ToolCallId, ToolResult,
+    AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus, ConveneTrigger, Federation,
+    LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally, ToolCall, ToolCallId,
+    ToolResult,
 };
 // OCEAN-277: surface-patch op vocabulary the per-room component ledger folds.
 use ocean_agent_sdk::surface::{CanvasId, ComponentId, SurfacePatch};
 use ocean_core::{
-    EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
+    evaluate_trigger_policy, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectRef,
     ProjectResponse, ProjectsResponse, PromptRequest, RequestControlResponse,
-    RequestCreateResponse,
-    RequestId,
-    evaluate_trigger_policy, RequestState, RequestStatus, RequestsResponse, RoomEventsResponse,
-    RoomId, RoomKey, RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind,
-    RoomProjectedMessage, RoomProjection, RoomProjectionProvenance, RoomProjectionResponse,
-    RoomSnapshot, RoomTriggerEvent, RoomTriggerPolicy, RoomTurn, RoomsResponse, SessionDetail,
-    SessionId, SessionResponse, SessionRunState, SessionSummary,
+    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse,
+    RoomEventsResponse, RoomId, RoomKey, RoomMessageKind, RoomPanelSnapshot, RoomParticipant,
+    RoomParticipantKind, RoomProjectedMessage, RoomProjection, RoomProjectionProvenance,
+    RoomProjectionResponse, RoomSnapshot, RoomTriggerEvent, RoomTriggerPolicy, RoomTurn,
+    RoomsResponse, SessionDetail, SessionId, SessionResponse, SessionRunState, SessionSummary,
 };
 use ocean_runtime::{
     tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
@@ -179,8 +177,9 @@ struct AppState {
 /// equal"). The implicit `+Inf` bucket is the total turn count and is emitted
 /// separately. Chosen to span sub-second turns through multi-minute agent loops:
 /// 50ms / 100ms / 250ms / 500ms / 1s / 2.5s / 5s / 10s / 30s / 60s / 120s.
-const TURN_LATENCY_BUCKETS_MS: [u64; 11] =
-    [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000];
+const TURN_LATENCY_BUCKETS_MS: [u64; 11] = [
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000,
+];
 
 /// Daemon-wide turn metrics (OCEAN-303). Every field is a relaxed `AtomicU64`;
 /// reads (the `/metrics` render) and writes (the turn hot path) are all
@@ -228,7 +227,10 @@ impl TurnMetrics {
             self.turns_error.fetch_add(1, Relaxed);
         }
         self.latency_sum_ms.fetch_add(wall_ms, Relaxed);
-        for (bound, bucket) in TURN_LATENCY_BUCKETS_MS.iter().zip(self.latency_buckets.iter()) {
+        for (bound, bucket) in TURN_LATENCY_BUCKETS_MS
+            .iter()
+            .zip(self.latency_buckets.iter())
+        {
             if wall_ms <= *bound {
                 bucket.fetch_add(1, Relaxed);
             }
@@ -269,7 +271,10 @@ impl TurnMetrics {
             "# HELP ocean_turn_duration_seconds Agent turn wall-clock duration in seconds.\n",
         );
         out.push_str("# TYPE ocean_turn_duration_seconds histogram\n");
-        for (bound_ms, bucket) in TURN_LATENCY_BUCKETS_MS.iter().zip(self.latency_buckets.iter()) {
+        for (bound_ms, bucket) in TURN_LATENCY_BUCKETS_MS
+            .iter()
+            .zip(self.latency_buckets.iter())
+        {
             let count = bucket.load(Relaxed);
             let le_seconds = (*bound_ms as f64) / 1000.0;
             let _ = writeln!(
@@ -323,12 +328,11 @@ impl Drop for InFlightGuard {
         let mut cur = self.metrics.in_flight.load(Relaxed);
         loop {
             let next = cur.saturating_sub(1);
-            match self.metrics.in_flight.compare_exchange_weak(
-                cur,
-                next,
-                Relaxed,
-                Relaxed,
-            ) {
+            match self
+                .metrics
+                .in_flight
+                .compare_exchange_weak(cur, next, Relaxed, Relaxed)
+            {
                 Ok(_) => break,
                 Err(observed) => cur = observed,
             }
@@ -667,11 +671,8 @@ async fn gc_registries(
 /// Trim `map` down to [`REGISTRY_MAX_ENTRIES`]. Removes oldest-terminal entries
 /// first; if still over the cap (all remaining are live), removes the oldest
 /// entries regardless of state. Generic over the registry value type.
-fn evict_overflow<K, V, FTerm, FAt>(
-    map: &mut HashMap<K, V>,
-    is_terminal: FTerm,
-    terminal_at: FAt,
-) where
+fn evict_overflow<K, V, FTerm, FAt>(map: &mut HashMap<K, V>, is_terminal: FTerm, terminal_at: FAt)
+where
     K: std::hash::Hash + Eq + Clone,
     FTerm: Fn(&V) -> bool,
     FAt: Fn(&V) -> DateTime<Utc>,
@@ -907,9 +908,7 @@ fn gc_room_canvas(store: &RoomCanvasStore, now: DateTime<Utc>) {
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     let ttl = ROOM_CANVAS_TTL;
     for ledger in store.values_mut() {
-        ledger
-            .components
-            .retain(|_, c| (now - c.updated_at) <= ttl);
+        ledger.components.retain(|_, c| (now - c.updated_at) <= ttl);
         if ledger.components.len() > ROOM_CANVAS_MAX_PER_ROOM {
             evict_overflow_to(&mut ledger.components, ROOM_CANVAS_MAX_PER_ROOM, |c| {
                 c.updated_at
@@ -939,8 +938,7 @@ where
         return;
     }
     let overflow = map.len() - max;
-    let mut ranked: Vec<(K, DateTime<Utc>)> =
-        map.iter().map(|(k, v)| (k.clone(), at(v))).collect();
+    let mut ranked: Vec<(K, DateTime<Utc>)> = map.iter().map(|(k, v)| (k.clone(), at(v))).collect();
     ranked.sort_by_key(|(_, at)| *at);
     for (key, _) in ranked.into_iter().take(overflow) {
         map.remove(&key);
@@ -1154,7 +1152,10 @@ impl AgentEventBus {
     fn subscribe_with_replay(
         &self,
         last_event_id: Option<Uuid>,
-    ) -> (Vec<AgentEventEnvelope>, broadcast::Receiver<AgentEventEnvelope>) {
+    ) -> (
+        Vec<AgentEventEnvelope>,
+        broadcast::Receiver<AgentEventEnvelope>,
+    ) {
         let history = self
             .history
             .lock()
@@ -1186,7 +1187,10 @@ impl AgentEventBus {
     /// never both, never neither.
     fn subscribe_with_full_replay(
         &self,
-    ) -> (Vec<AgentEventEnvelope>, broadcast::Receiver<AgentEventEnvelope>) {
+    ) -> (
+        Vec<AgentEventEnvelope>,
+        broadcast::Receiver<AgentEventEnvelope>,
+    ) {
         let history = self
             .history
             .lock()
@@ -1439,7 +1443,10 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive("ocean_agent=info".parse()?)
                 .add_directive("ocean_protocol=info".parse()?),
         )
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW | tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        )
         .init();
 
     // OCEAN-276: validate config ONCE at boot, before building the runtime / DBs
@@ -1463,8 +1470,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Built-ins first, then connect any configured MCP servers (non-fatally)
     // and fold their tools into the capability registry before sharing it.
-    let runtime =
-        Arc::new(AgentRuntime::from_env()?.with_extensions(Some(longhouse.clone())).await);
+    let runtime = Arc::new(
+        AgentRuntime::from_env()?
+            .with_extensions(Some(longhouse.clone()))
+            .await,
+    );
 
     // Persistent rooms (OCEAN-107): open the durable SQLite store at startup so
     // rooms + transcripts survive a daemon restart. The DB lives under the same
@@ -1474,9 +1484,8 @@ async fn main() -> anyhow::Result<()> {
     // idempotently, so this is safe on a fresh or an existing DB.
     let rooms_db_path = room_db_path();
     if let Some(parent) = rooms_db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating rooms DB directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating rooms DB directory {}", parent.display()))?;
     }
     let room_store = ocean_store::SqliteRoomStore::open(&rooms_db_path)
         .with_context(|| format!("opening rooms DB at {}", rooms_db_path.display()))?;
@@ -1491,9 +1500,8 @@ async fn main() -> anyhow::Result<()> {
     // key it holds is never emitted on the wire, so revocation is unforgeable.
     let titles_db_path = titles_db_path();
     if let Some(parent) = titles_db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating titles DB directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating titles DB directory {}", parent.display()))?;
     }
     let title_registry = ocean_longhouse::SqliteTitleRegistry::open(&titles_db_path)
         .with_context(|| format!("opening titles DB at {}", titles_db_path.display()))?;
@@ -1625,10 +1633,7 @@ async fn main() -> anyhow::Result<()> {
             get(rooms_list_persistent).post(room_create),
         )
         .route("/v1/rooms/persistent/{key}", get(room_get))
-        .route(
-            "/v1/rooms/persistent/{key}/participants",
-            post(room_join),
-        )
+        .route("/v1/rooms/persistent/{key}/participants", post(room_join))
         .route(
             "/v1/rooms/persistent/{key}/participants/{participant_id}",
             axum::routing::delete(room_leave),
@@ -1645,14 +1650,8 @@ async fn main() -> anyhow::Result<()> {
         // "load full state on room switch" the collaboration model calls for;
         // `events` is its live-tail companion (`?after_seq=`). Both sit in the
         // persistent block beside `transcript` since they read the same store.
-        .route(
-            "/v1/rooms/persistent/{key}/snapshot",
-            get(room_snapshot),
-        )
-        .route(
-            "/v1/rooms/persistent/{key}/events",
-            get(room_events),
-        )
+        .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
+        .route("/v1/rooms/persistent/{key}/events", get(room_events))
         .route("/v1/rooms/{room_id}", get(room))
         // OCEAN-256: the richer Track-0 projection. `snapshot` carries per-room
         // turns / active_turn / message feed computed live from runtime state;
@@ -1664,10 +1663,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/rooms/{room_id}/snapshot",
             get(room_projection_snapshot),
         )
-        .route(
-            "/v1/rooms/{room_id}/events",
-            get(room_projection_events),
-        )
+        .route("/v1/rooms/{room_id}/events", get(room_projection_events))
         // OCEAN-137: mint a LiveKit join token for a room. The proxy + web
         // surface already POST to this path; the daemon honors it here so
         // in-room voice/video connects on web instead of 404ing.
@@ -1684,7 +1680,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
-        .route("/v1/settings/yolo", get(yolo_setting_get).post(yolo_setting_set))
+        .route(
+            "/v1/settings/yolo",
+            get(yolo_setting_get).post(yolo_setting_set),
+        )
         .route("/v1/component/event", post(component_event))
         // Longhouse + council convene routes (incl. the `/v1/council/convene`
         // alias and the read-only `/v1/longhouse/prepare` prep step) live in one
@@ -2582,9 +2581,7 @@ impl PermissionPolicy for DaemonPermissionPolicy {
                 .seen_permissions
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            *seen
-                .entry(dedupe_key)
-                .or_insert_with(PermissionId::new_v4)
+            *seen.entry(dedupe_key).or_insert_with(PermissionId::new_v4)
         };
         let reason = format!("permission required for {tool_name}");
         let status = PermissionStatus {
@@ -2830,7 +2827,11 @@ async fn yolo_setting_set(Json(req): Json<YoloSetRequest>) -> Json<serde_json::V
     let config_dir = ocean_agent::config_dir_from_env();
     ocean_agent::persist_yolo_pref(&config_dir, req.enabled);
     let env_override = yolo_env_pref();
-    tracing::info!(persisted = req.enabled, ?env_override, "yolo default persisted");
+    tracing::info!(
+        persisted = req.enabled,
+        ?env_override,
+        "yolo default persisted"
+    );
     Json(json!({
         "ok": true,
         "persisted": req.enabled,
@@ -3287,9 +3288,7 @@ struct LonghousePrepareRequest {
 ///
 /// The disk scan runs on a blocking thread (`spawn_blocking`) so the index walk
 /// never stalls the async scheduler; the cheap keyword ranking then runs inline.
-async fn longhouse_prepare(
-    Json(req): Json<LonghousePrepareRequest>,
-) -> Json<serde_json::Value> {
+async fn longhouse_prepare(Json(req): Json<LonghousePrepareRequest>) -> Json<serde_json::Value> {
     let brief = ocean_longhouse::TurnBrief {
         session_id: req.session_id.unwrap_or_default(),
         prompt: req.prompt,
@@ -3498,9 +3497,7 @@ struct SkillFetchRequest {
 /// `spawn_blocking`. Errors map to typed `{ ok: false, error }` bodies:
 /// `404` for an unknown id, `500` only if the matched file became unreadable
 /// between index + read (a TOCTOU race) — mirrors the topic-fetch error shape.
-async fn skills_fetch(
-    Json(req): Json<SkillFetchRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<serde_json::Value>) {
     let SkillFetchRequest { id, cwd } = req;
 
     if id.trim().is_empty() {
@@ -4450,14 +4447,18 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
         // to publish Ocean's TTS). It is entitled by construction — it never
         // crosses the HTTP trust boundary — so it explicitly asks for publish
         // (OCEAN-220). The wire authz gate lives on `room_livekit_token`.
-        let token =
-            match ocean_call::mint_join_token(&token_config, room, &token_req, ocean_call::PublishGrant::Allow) {
-                Ok(t) => t.token,
-                Err(e) => {
-                    tracing::warn!(room = %room, error = %e, "call-session token mint failed");
-                    return;
-                }
-            };
+        let token = match ocean_call::mint_join_token(
+            &token_config,
+            room,
+            &token_req,
+            ocean_call::PublishGrant::Allow,
+        ) {
+            Ok(t) => t.token,
+            Err(e) => {
+                tracing::warn!(room = %room, error = %e, "call-session token mint failed");
+                return;
+            }
+        };
         let url = token_config.url.clone();
 
         // Persistence-enabled sink: a live call's transcript both streams onto the
@@ -4518,16 +4519,17 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                 let cfg = DeepgramConfig::default();
                 let clock_arc: Arc<dyn Fn() -> u64 + Send + Sync> =
                     Arc::new(|| ocean_protocol::now_ms() as u64);
-                let (provider, events_rx) =
-                    match DeepgramStt::connect(&cfg, &dg_key, clock_arc).await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            tracing::warn!(room = %room_owned, error = %e, "deepgram connect failed");
-                            // Close the lifecycle so no phantom in-progress call lingers.
-                            state_emit_call_ended(&sink, &room_owned);
-                            return;
-                        }
-                    };
+                let (provider, events_rx) = match DeepgramStt::connect(&cfg, &dg_key, clock_arc)
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(room = %room_owned, error = %e, "deepgram connect failed");
+                        // Close the lifecycle so no phantom in-progress call lingers.
+                        state_emit_call_ended(&sink, &room_owned);
+                        return;
+                    }
+                };
                 tracing::info!(room = %room_owned, "call-session: streaming STT (deepgram) active");
                 // Barge-in (OCEAN-243): a `BargeInCanceller` (the ActivitySink) and
                 // a `BargeInVoice` wrapping the TTS share one signal. When Deepgram
@@ -4639,11 +4641,16 @@ async fn call_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
         ("caller", "hey thanks for jumping on", 0u64),
         ("caller", "so for the Warner Q3 push", 2_000),
         ("caller", "I'll send the master to Atlantic tonight", 4_000),
-        ("caller", "and we need to verify the toll-free number by Friday", 7_000),
+        (
+            "caller",
+            "and we need to verify the toll-free number by Friday",
+            7_000,
+        ),
         ("caller", "hey Ocean what did we just agree to", 10_000),
     ];
     for (speaker, text, ms) in script {
-        let outcome = session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
+        let outcome =
+            session.on_segment(TranscriptSegment::final_(speaker, text, ms), ms, &mut sink);
         // Offline demo path: there's no agent runtime here to run the real summary
         // turn (that lives in the live `run_call_session` loop), so the debounced
         // raw transcript is emitted directly as the summary to exercise the
@@ -4836,7 +4843,10 @@ async fn call_webhook(
             // running session task so Ocean joins, transcribes, and (on wake)
             // answers. Inert without the `livekit-tap` feature / live creds.
             spawn_call_session(&state, &room, vec![]);
-            (StatusCode::OK, Json(json!({ "ok": true, "action": "join", "room": room })))
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "action": "join", "room": room })),
+            )
         }
         Ok(action @ ocean_call::WebhookAction::EndCall { .. }) => {
             let room = match &action {
@@ -4847,15 +4857,22 @@ async fn call_webhook(
                 state.events.emit(ocean_core::EventEnvelope::new(event));
             }
             tracing::info!(%room, "call room finished — emitting CallEnded");
-            (StatusCode::OK, Json(json!({ "ok": true, "action": "end", "room": room })))
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "action": "end", "room": room })),
+            )
         }
-        Ok(ocean_call::WebhookAction::Ignore) => {
-            (StatusCode::OK, Json(json!({ "ok": true, "action": "ignore" })))
-        }
+        Ok(ocean_call::WebhookAction::Ignore) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "action": "ignore" })),
+        ),
         Err(e) => {
             // Verification failed — do NOT act. Log and 200 so LiveKit doesn't retry-storm.
             tracing::warn!(error = %e, "rejected livekit webhook");
-            (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() })))
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            )
         }
     }
 }
@@ -5002,8 +5019,9 @@ async fn room_livekit_token(
     // OCEAN-220 gate 1: a `call:` room must be one the SERVER authored and that
     // is still open. Minting for an unknown/closed call room is refused (404),
     // so a caller cannot get any token for an arbitrary in-progress call id.
-    let call_room_known =
-        with_rooms(&state, |store| call_room_token_allowed(store, room_id_trimmed));
+    let call_room_known = with_rooms(&state, |store| {
+        call_room_token_allowed(store, room_id_trimmed)
+    });
     if !call_room_known {
         tracing::warn!(
             room = %room_id_trimmed,
@@ -5046,9 +5064,9 @@ async fn room_livekit_token(
     match ocean_call::mint_join_token(&config, room_id_trimmed, &req, publish) {
         Ok(resp) => (
             StatusCode::OK,
-            Json(serde_json::to_value(resp).unwrap_or_else(|_| {
-                json!({ "ok": false, "error": "failed to encode token response" })
-            })),
+            Json(serde_json::to_value(resp).unwrap_or_else(
+                |_| json!({ "ok": false, "error": "failed to encode token response" }),
+            )),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5171,8 +5189,7 @@ async fn longhouse_claim(
     Json(req): Json<LonghouseClaimRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let parse = |label: &str, raw: &str| {
-        Uuid::parse_str(raw.trim())
-            .map_err(|_| format!("`{label}` is not a valid UUID: {raw:?}"))
+        Uuid::parse_str(raw.trim()).map_err(|_| format!("`{label}` is not a valid UUID: {raw:?}"))
     };
     let (title_id, agent_id, decision) = match (
         parse("title_id", &req.title_id),
@@ -5530,13 +5547,15 @@ async fn longhouse_recall(
         }
         // The tally carried but the title was already pulled (a race with another
         // trigger). Treat as a benign already-revoked outcome.
-        Err(ocean_longhouse::TriggerRefused::Revoke(ocean_longhouse::RevokeError::NotLive(id))) => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "ok": false,
-                "error": format!("title '{id}' is already revoked/released"),
-            })),
-        ),
+        Err(ocean_longhouse::TriggerRefused::Revoke(ocean_longhouse::RevokeError::NotLive(id))) => {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("title '{id}' is already revoked/released"),
+                })),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "ok": false, "error": format!("recall execution failed: {e}") })),
@@ -5866,7 +5885,13 @@ async fn room_create(
         .map(|w| w.trim().to_string())
         .filter(|w| !w.is_empty());
     let result = with_rooms(&state, |reg| {
-        reg.create_in_workspace(key, &req.name, workspace_root, req.trigger_policy, Utc::now())
+        reg.create_in_workspace(
+            key,
+            &req.name,
+            workspace_root,
+            req.trigger_policy,
+            Utc::now(),
+        )
     });
     match result {
         Ok(rec) => (
@@ -5966,8 +5991,9 @@ async fn room_join(
         kind: req.kind,
         display_name: req.display_name,
     };
-    let result =
-        with_rooms(&state, |reg| reg.add_participant(&key, participant, Utc::now()));
+    let result = with_rooms(&state, |reg| {
+        reg.add_participant(&key, participant, Utc::now())
+    });
     match result {
         Ok(rec) => (
             StatusCode::OK,
@@ -6229,7 +6255,11 @@ were mentioned.\n\n",
     ));
     out.push_str("--- recent room transcript ---\n");
     for m in tail {
-        let marker = if m.seq == triggered_by_seq { "  «— mention" } else { "" };
+        let marker = if m.seq == triggered_by_seq {
+            "  «— mention"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "[#{seq}] {author}: {body}{marker}\n",
             seq = m.seq,
@@ -6267,7 +6297,10 @@ fn spawn_room_agent_turn(
         // a project's workspace are still associated back to that project on read,
         // via `find_by_workspace` in `enrich_session_detail`.)
         let room_workspace = with_rooms(&state, |reg| {
-            reg.get(&room).ok().flatten().and_then(|rec| rec.room.workspace_root)
+            reg.get(&room)
+                .ok()
+                .flatten()
+                .and_then(|rec| rec.room.workspace_root)
         });
 
         let (cwd, project_id) = match room_workspace {
@@ -6297,8 +6330,7 @@ fn spawn_room_agent_turn(
 
         // Read the recent transcript tail (read-before-answer context). Lock is
         // dropped when `with_rooms` returns, before any await below.
-        let tail = with_rooms(&state, |reg| reg.transcript(&room, None))
-            .unwrap_or_default();
+        let tail = with_rooms(&state, |reg| reg.transcript(&room, None)).unwrap_or_default();
         let tail: Vec<_> = tail
             .into_iter()
             .rev()
@@ -6313,10 +6345,7 @@ fn spawn_room_agent_turn(
         // otherwise we create it under the deterministic id. This mirrors the
         // create-if-missing logic in `agent_turn`. `session_detail` errors on a
         // missing/corrupt session, so `Ok` ⇒ exists ⇒ resume.
-        let is_new = state
-            .runtime
-            .session_detail(core_sid(session_id))
-            .is_err();
+        let is_new = state.runtime.session_detail(core_sid(session_id)).is_err();
 
         let request_id = Uuid::new_v4();
         // Auto-convene has no per-request flag, so the effective posture is the
@@ -6444,7 +6473,11 @@ fn read_transcript_page(
                     if has_more {
                         msgs.truncate(effective_limit);
                     }
-                    let next_seq = if has_more { msgs.last().map(|m| m.seq) } else { None };
+                    let next_seq = if has_more {
+                        msgs.last().map(|m| m.seq)
+                    } else {
+                        None
+                    };
                     Ok(ocean_store::TranscriptPage {
                         messages: msgs,
                         next_seq,
@@ -6478,8 +6511,9 @@ async fn room_transcript(
     Query(q): Query<TranscriptQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
-    let result =
-        with_rooms(&state, |reg| read_transcript_page(reg, &key, q.after_seq, q.limit));
+    let result = with_rooms(&state, |reg| {
+        read_transcript_page(reg, &key, q.after_seq, q.limit)
+    });
     match result {
         Ok(page) => (
             StatusCode::OK,
@@ -6589,8 +6623,9 @@ async fn room_events(
     Query(q): Query<TranscriptQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
-    let result =
-        with_rooms(&state, |reg| read_transcript_page(reg, &key, q.after_seq, q.limit));
+    let result = with_rooms(&state, |reg| {
+        read_transcript_page(reg, &key, q.after_seq, q.limit)
+    });
     match result {
         Ok(page) => {
             let last_seq = page.messages.last().map(|m| m.seq);
@@ -7244,7 +7279,10 @@ fn build_room_projection(input: &RoomProjectionInput, room_id: RoomId) -> RoomPr
     // Most-recent activity first.
     ordered.sort_by_key(|status| std::cmp::Reverse(turn_recency(status)));
 
-    let turns: Vec<RoomTurn> = ordered.iter().map(|status| request_to_turn(status)).collect();
+    let turns: Vec<RoomTurn> = ordered
+        .iter()
+        .map(|status| request_to_turn(status))
+        .collect();
 
     // The active turn is the most-recently-active non-terminal request. Track-0
     // does not enforce one-active-turn-per-room, so we surface the freshest live
@@ -8491,7 +8529,12 @@ async fn agent_turn(
     // its patches are attributed to no Track-0 room (there is none to attribute to).
     let bridge_room_id = room_id;
     if let Some(room) = bridge_room_id {
-        bind_room_session(&state.room_canvas, room, core_sid(bridge_session_id), Utc::now());
+        bind_room_session(
+            &state.room_canvas,
+            room,
+            core_sid(bridge_session_id),
+            Utc::now(),
+        );
     }
     let bridge_room_canvas = state.room_canvas.clone();
 
@@ -8761,14 +8804,14 @@ async fn agent_turn(
         decision_token,
     )
     .with_event_sink(event_tx)
-            // Per-turn reasoning override (OCEAN-28/41): threads the optional
-            // request `thinking_level` into this turn's config only, leaving the
-            // runtime's global thinking_level untouched.
-            .with_thinking_level(thinking_level)
-            // Per-turn model override (OCEAN-36): threads the optional request
-            // `model_id` into this turn's config only, leaving the runtime's
-            // global model selection untouched.
-            .with_model_id(model_id.clone());
+    // Per-turn reasoning override (OCEAN-28/41): threads the optional
+    // request `thinking_level` into this turn's config only, leaving the
+    // runtime's global thinking_level untouched.
+    .with_thinking_level(thinking_level)
+    // Per-turn model override (OCEAN-36): threads the optional request
+    // `model_id` into this turn's config only, leaving the runtime's
+    // global model selection untouched.
+    .with_model_id(model_id.clone());
     // Run the turn inside the turn-root span (OCEAN-274): the runtime's
     // `runtime.prompt` span (and every child — agent_loop, provider_stream,
     // tool_exec, persist) nests under `turn`, so the full lifecycle of this turn
@@ -9243,19 +9286,17 @@ fn fulfilled_result_from_bridge(
                 _ => SlackCanvasResult::pending_read(canvas_id.clone()),
             }
         }
-        SlackCanvasOp::List { .. } => {
-            match result.get("canvases") {
-                Some(canvases) if bridge_ok => {
-                    let summaries: Vec<SlackCanvasSummary> =
-                        serde_json::from_value(canvases.clone()).unwrap_or_default();
-                    SlackCanvasResult::fulfilled_list(
-                        summaries,
-                        result.get("raw").cloned().unwrap_or(Value::Null),
-                    )
-                }
-                _ => SlackCanvasResult::pending_list(),
+        SlackCanvasOp::List { .. } => match result.get("canvases") {
+            Some(canvases) if bridge_ok => {
+                let summaries: Vec<SlackCanvasSummary> =
+                    serde_json::from_value(canvases.clone()).unwrap_or_default();
+                SlackCanvasResult::fulfilled_list(
+                    summaries,
+                    result.get("raw").cloned().unwrap_or(Value::Null),
+                )
             }
-        }
+            _ => SlackCanvasResult::pending_list(),
+        },
         // Mutating ops: the bridge's effect is already live in Slack. Re-emit a
         // `bridged: true` result, carrying the real `canvas_id` the bridge minted
         // for `create` (the agent's create had none until now).
@@ -9655,9 +9696,8 @@ async fn agent_events(
             }
             let id = envelope.id.to_string();
             let event_type = agent_event_type_name(&envelope.event);
-            let data = serde_json::to_string(&envelope.event).unwrap_or_else(|_| {
-                r#"{"type":"error","message":"serialize failed"}"#.to_string()
-            });
+            let data = serde_json::to_string(&envelope.event)
+                .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
             Some(Ok(Event::default().id(id).event(event_type).data(data)))
         }
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
@@ -9669,9 +9709,8 @@ async fn agent_events(
                 skipped,
                 "agent_events SSE subscriber lagged; dropped events"
             );
-            let data =
-                json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
-                    .to_string();
+            let data = json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
+                .to_string();
             Some(Ok(Event::default().event("error").data(data)))
         }
     });
@@ -9811,10 +9850,7 @@ async fn agent_sessions(
             cwd: s.workspace_root.clone().unwrap_or_default(),
             // Real per-session updated-at from metadata; fall back to now only
             // for legacy sessions that predate the timestamp field.
-            updated_at: s
-                .updated_ms
-                .map(ms_to_datetime)
-                .unwrap_or_else(Utc::now),
+            updated_at: s.updated_ms.map(ms_to_datetime).unwrap_or_else(Utc::now),
             active_turn: active_turn_for_session(&requests, s.id),
             turn_count: s.turns,
         })
@@ -10006,7 +10042,9 @@ fn sdk_sid(core_id: SessionId) -> AgentSessionId {
 /// Convert an epoch-millisecond timestamp into a `DateTime<Utc>`, falling back
 /// to `Utc::now()` if the value is out of range (never expected for real data).
 fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 /// Derive the SDK `AgentTurn` list from a persisted session transcript.
@@ -10391,7 +10429,9 @@ mod tests {
         let room = "call_anon_xyz";
         let action = ocean_call::decide_webhook("room_started", room);
         match webhook_action_to_event(action) {
-            Some(OceanEvent::CallStarted { call_id, room_id, .. }) => {
+            Some(OceanEvent::CallStarted {
+                call_id, room_id, ..
+            }) => {
                 assert_eq!(call_id, room);
                 assert_eq!(room_id, room);
             }
@@ -10465,7 +10505,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(texts, vec!["second", "third"], "replay events after last id");
+        assert_eq!(
+            texts,
+            vec!["second", "third"],
+            "replay events after last id"
+        );
     }
 
     #[tokio::test]
@@ -10627,7 +10671,9 @@ mod tests {
         let (frames, replayed_ids) = agent_replay_frames(replay, Some(x), false);
 
         assert_eq!(frames.len(), 2, "only X's two events replay");
-        assert!(frames.iter().all(|f| f.event_type == "assistant_text_delta"));
+        assert!(frames
+            .iter()
+            .all(|f| f.event_type == "assistant_text_delta"));
         assert!(frames.iter().all(|f| f.data.contains("x-")));
         assert!(
             !frames.iter().any(|f| f.data.contains("y-other")),
@@ -10681,8 +10727,8 @@ mod tests {
 
     fn surface_patch_event(session_id: AgentSessionId, canvas: &str) -> AgentTurnEvent {
         use ocean_agent_sdk::surface::{
-            ActorRef, CanvasComponentPatch, CanvasId, ComponentId, PatchId, SurfaceId, SurfacePatch,
-            SurfacePatchEnvelope,
+            ActorRef, CanvasComponentPatch, CanvasId, ComponentId, PatchId, SurfaceId,
+            SurfacePatch, SurfacePatchEnvelope,
         };
         let canvas_id = CanvasId::new(canvas);
         let patch = SurfacePatch::UpsertComponent {
@@ -10775,10 +10821,10 @@ mod tests {
 
         let (replay, _rx) = bus.subscribe_with_replay(Some(anchor));
         // B's scoped replay sees only B's text, never A's surface_patch.
-        let leaked_patch = replay
-            .iter()
-            .any(|env| should_emit_agent_event(Some(b), false, &env.event)
-                && matches!(&env.event, AgentTurnEvent::SurfacePatch { .. }));
+        let leaked_patch = replay.iter().any(|env| {
+            should_emit_agent_event(Some(b), false, &env.event)
+                && matches!(&env.event, AgentTurnEvent::SurfacePatch { .. })
+        });
         assert!(
             !leaked_patch,
             "session B's replay must never include session A's surface_patch"
@@ -10944,7 +10990,10 @@ mod tests {
         let bridge_result = json!({ "ok": false, "op": "read", "error": "slack 404" });
         let res = fulfilled_result_from_bridge(&op, &bridge_result);
         assert_eq!(res.fetch_status, CanvasFetchStatus::PendingBridge);
-        assert!(res.contents.is_none(), "a failed read must not fabricate contents");
+        assert!(
+            res.contents.is_none(),
+            "a failed read must not fabricate contents"
+        );
     }
 
     /// A fulfilled `list` carries the resolved canvases.
@@ -10976,10 +11025,14 @@ mod tests {
             markdown: None,
             channel_id: None,
         };
-        let bridge_result = json!({ "ok": true, "op": "create", "canvas_id": "Fnew", "bridged": true });
+        let bridge_result =
+            json!({ "ok": true, "op": "create", "canvas_id": "Fnew", "bridged": true });
         let res = fulfilled_result_from_bridge(&op, &bridge_result);
         assert!(res.bridged);
-        assert_eq!(res.canvas_id.map(|c| c.into_inner()), Some("Fnew".to_string()));
+        assert_eq!(
+            res.canvas_id.map(|c| c.into_inner()),
+            Some("Fnew".to_string())
+        );
     }
 
     /// END TO END: the bridge POSTs a fulfilled `read`; the daemon stores it and
@@ -11001,8 +11054,7 @@ mod tests {
             }
         });
 
-        let (status, resp) =
-            canvas_fulfillment_post(State(state.clone()), Json(body)).await;
+        let (status, resp) = canvas_fulfillment_post(State(state.clone()), Json(body)).await;
         assert_eq!(status, StatusCode::OK, "valid fulfillment must be accepted");
         assert_eq!(resp.0["stored"], true);
         assert_eq!(resp.0["canvas_key"], "F0123ABCD");
@@ -11082,7 +11134,10 @@ mod tests {
 
         // A different canvas in the same session is still honestly pending.
         let pending = tool
-            .execute("e2e-read-2", json!({ "op": "read", "canvas_id": "F_NOT_FETCHED_271" }))
+            .execute(
+                "e2e-read-2",
+                json!({ "op": "read", "canvas_id": "F_NOT_FETCHED_271" }),
+            )
             .await
             .expect("read executes");
         assert_eq!(pending.details["fetch_status"], "pending_bridge");
@@ -11163,9 +11218,9 @@ mod tests {
 
         let bad_bodies = vec![
             json!({ "op": { "op": "read", "canvas_id": "F1" }, "result": {} }), // no session_id
-            json!({ "session_id": sid, "result": {} }),                          // no op
+            json!({ "session_id": sid, "result": {} }),                         // no op
             json!({ "session_id": sid, "op": { "op": "obliterate" }, "result": {} }), // bad op
-            json!({ "session_id": sid, "op": { "op": "read", "canvas_id": "F1" } }),   // no result
+            json!({ "session_id": sid, "op": { "op": "read", "canvas_id": "F1" } }), // no result
             json!({ "session_id": sid, "op": { "op": "read", "canvas_id": "F1" }, "result": "nope" }), // result not object
         ];
         for body in bad_bodies {
@@ -11522,7 +11577,10 @@ mod tests {
     #[test]
     fn turn_guidance_absent_or_blank_leaves_the_prompt_untouched() {
         // No guidance field at all → bare prompt (legacy turn shape).
-        assert_eq!(apply_turn_guidance(None, None, "do the thing"), "do the thing");
+        assert_eq!(
+            apply_turn_guidance(None, None, "do the thing"),
+            "do the thing"
+        );
         // Empty list → nothing to inject.
         assert_eq!(
             apply_turn_guidance(None, Some(&[]), "do the thing"),
@@ -11555,8 +11613,14 @@ mod tests {
         let op = guided.find("Operator guidance for this turn:").unwrap();
         let room_at = guided.find("Review Room").unwrap();
         let prompt_at = guided.find("verify the diff").unwrap();
-        assert!(op < room_at, "operator guidance should precede room guidance");
-        assert!(room_at < prompt_at, "room guidance should precede the prompt");
+        assert!(
+            op < room_at,
+            "operator guidance should precede room guidance"
+        );
+        assert!(
+            room_at < prompt_at,
+            "room guidance should precede the prompt"
+        );
     }
 
     #[test]
@@ -11587,11 +11651,7 @@ mod tests {
 
     /// A `RequestStatus` fixture for projection tests, with explicit timestamps so
     /// recency ordering is deterministic.
-    fn projection_request(
-        state: RequestState,
-        updated_secs: i64,
-        message: &str,
-    ) -> RequestStatus {
+    fn projection_request(state: RequestState, updated_secs: i64, message: &str) -> RequestStatus {
         let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let updated = base + chrono::Duration::seconds(updated_secs);
         RequestStatus {
@@ -11602,7 +11662,11 @@ mod tests {
             message: Some(message.into()),
             started_at: Some(base),
             updated_at: Some(updated),
-            finished_at: if state.is_terminal() { Some(updated) } else { None },
+            finished_at: if state.is_terminal() {
+                Some(updated)
+            } else {
+                None
+            },
         }
     }
 
@@ -11673,7 +11737,10 @@ mod tests {
         };
         let proj = build_room_projection(&input, RoomId::Review);
         assert_eq!(proj.turns.len(), 1);
-        assert!(proj.active_turn.is_none(), "no live turn ⇒ active_turn is null");
+        assert!(
+            proj.active_turn.is_none(),
+            "no live turn ⇒ active_turn is null"
+        );
     }
 
     #[test]
@@ -11698,7 +11765,10 @@ mod tests {
         let proj = build_room_projection(&input, RoomId::OrchMesh);
         assert_eq!(proj.messages.len(), 3);
         assert_eq!(proj.messages[0].seq, 1);
-        assert!(proj.messages[0].summary.contains("first"), "oldest is seq 1");
+        assert!(
+            proj.messages[0].summary.contains("first"),
+            "oldest is seq 1"
+        );
         assert_eq!(proj.messages[2].seq, 3);
         assert!(proj.messages[2].summary.contains("third"), "newest is last");
         assert_eq!(proj.last_seq, Some(3));
@@ -11836,9 +11906,18 @@ mod tests {
         let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let s1 = SessionId::new_v4();
         bind_room_session(&store, RoomId::Writers, s1, t0);
-        bind_room_session(&store, RoomId::Writers, s1, t0 + chrono::Duration::seconds(5));
+        bind_room_session(
+            &store,
+            RoomId::Writers,
+            s1,
+            t0 + chrono::Duration::seconds(5),
+        );
         let (_c, participants) = room_canvas_snapshot(&store, RoomId::Writers);
-        assert_eq!(participants.len(), 1, "re-binding the same session is idempotent");
+        assert_eq!(
+            participants.len(),
+            1,
+            "re-binding the same session is idempotent"
+        );
     }
 
     #[test]
@@ -11858,7 +11937,11 @@ mod tests {
         gc_room_canvas(&store, now);
 
         let (pm_components, _) = room_canvas_snapshot(&store, RoomId::Pm);
-        assert_eq!(pm_components.len(), 1, "only the fresh component survives TTL");
+        assert_eq!(
+            pm_components.len(),
+            1,
+            "only the fresh component survives TTL"
+        );
         assert_eq!(pm_components[0]["component_id"], "fresh");
 
         let guard = store.lock().unwrap();
@@ -11876,12 +11959,22 @@ mod tests {
         // Insert cap + 5 components, each fresh but at strictly increasing times.
         for i in 0..(ROOM_CANVAS_MAX_PER_ROOM + 5) {
             let at = base + chrono::Duration::milliseconds(i as i64);
-            apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert(&format!("c{i}"), "card"), at);
+            apply_room_surface_patch(
+                &store,
+                RoomId::Pm,
+                &canvas,
+                &upsert(&format!("c{i}"), "card"),
+                at,
+            );
         }
         // GC at a time within TTL: nothing expires, so only the cap trims.
         gc_room_canvas(&store, base + chrono::Duration::seconds(1));
         let (components, _) = room_canvas_snapshot(&store, RoomId::Pm);
-        assert_eq!(components.len(), ROOM_CANVAS_MAX_PER_ROOM, "trimmed to the per-room cap");
+        assert_eq!(
+            components.len(),
+            ROOM_CANVAS_MAX_PER_ROOM,
+            "trimmed to the per-room cap"
+        );
         // Oldest were evicted: c0..c4 gone, the snapshot's oldest is c5.
         assert_eq!(components[0]["component_id"], "c5");
     }
@@ -11913,7 +12006,11 @@ mod tests {
         assert!(resp.ok);
         let room = resp.room.expect("projection present");
         assert_eq!(room.room_id, RoomId::Pm);
-        assert_eq!(room.turns.len(), 1, "the seeded request projects as one turn");
+        assert_eq!(
+            room.turns.len(),
+            1,
+            "the seeded request projects as one turn"
+        );
         assert_eq!(room.turns[0].turn_id, running_id);
         assert_eq!(
             room.active_turn.map(|t| t.turn_id),
@@ -11942,7 +12039,9 @@ mod tests {
                 component: ocean_agent_sdk::surface::CanvasComponentPatch {
                     id: ComponentId::new("brief-1"),
                     kind: "brief_card".into(),
-                    rect: Some(ocean_agent_sdk::surface::Rect::new(10.0, 20.0, 300.0, 200.0)),
+                    rect: Some(ocean_agent_sdk::surface::Rect::new(
+                        10.0, 20.0, 300.0, 200.0,
+                    )),
                     z_index: None,
                     content: json!({ "title": "Sales Brief" }),
                     metadata: json!({ "source": "longhouse.sales" }),
@@ -11967,8 +12066,14 @@ mod tests {
         let (_s, Json(resp3)) =
             room_projection_snapshot(State(state.clone()), Path("review".to_string())).await;
         let review = resp3.room.expect("review projection");
-        assert!(review.components.is_empty(), "components don't bleed across rooms");
-        assert!(review.participants.is_empty(), "participants don't bleed across rooms");
+        assert!(
+            review.components.is_empty(),
+            "components don't bleed across rooms"
+        );
+        assert!(
+            review.participants.is_empty(),
+            "participants don't bleed across rooms"
+        );
     }
 
     #[tokio::test]
@@ -11985,7 +12090,10 @@ mod tests {
         let (status, Json(all)) = room_projection_events(
             State(state.clone()),
             Path("orch_mesh".to_string()),
-            Query(TranscriptQuery { after_seq: None, limit: None }),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -11997,18 +12105,27 @@ mod tests {
         let (status, Json(tail)) = room_projection_events(
             State(state.clone()),
             Path("orch_mesh".to_string()),
-            Query(TranscriptQuery { after_seq: Some(2), limit: None }),
+            Query(TranscriptQuery {
+                after_seq: Some(2),
+                limit: None,
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(tail.events.is_empty(), "after_seq at the head returns nothing");
+        assert!(
+            tail.events.is_empty(),
+            "after_seq at the head returns nothing"
+        );
         assert!(tail.last_seq.is_none());
 
         // after_seq = 1 ⇒ only the newer half.
         let (_, Json(some)) = room_projection_events(
             State(state.clone()),
             Path("orch_mesh".to_string()),
-            Query(TranscriptQuery { after_seq: Some(1), limit: None }),
+            Query(TranscriptQuery {
+                after_seq: Some(1),
+                limit: None,
+            }),
         )
         .await;
         assert_eq!(some.events.len(), 1);
@@ -12029,7 +12146,10 @@ mod tests {
         let (status, Json(ev)) = room_projection_events(
             State(state.clone()),
             Path("nope".to_string()),
-            Query(TranscriptQuery { after_seq: None, limit: None }),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -12136,9 +12256,7 @@ mod tests {
         assert_eq!(turns[0].prompt, "second ask");
         assert_eq!(turns[1].prompt, "first ask");
         // A completed session has all turns completed.
-        assert!(turns
-            .iter()
-            .all(|t| t.status == AgentTurnStatus::Completed));
+        assert!(turns.iter().all(|t| t.status == AgentTurnStatus::Completed));
     }
 
     #[test]
@@ -12153,10 +12271,7 @@ mod tests {
 
     // --- OCEAN-205: active_turn shared between LIST and DETAIL ----------------
 
-    fn request_status_for(
-        session_id: Option<SessionId>,
-        state: RequestState,
-    ) -> RequestStatus {
+    fn request_status_for(session_id: Option<SessionId>, state: RequestState) -> RequestStatus {
         RequestStatus {
             request_id: RequestId::new_v4(),
             session_id,
@@ -12205,7 +12320,10 @@ mod tests {
             Some(SessionId::new_v4()),
             RequestState::Running,
         )];
-        assert_eq!(active_turn_for_session(&registry, SessionId::new_v4()), None);
+        assert_eq!(
+            active_turn_for_session(&registry, SessionId::new_v4()),
+            None
+        );
     }
 
     #[test]
@@ -12213,13 +12331,9 @@ mod tests {
         // A turn paused on a permission gate is still in-flight, so it must
         // surface as the active turn (parity with enrich_session_detail).
         let session = SessionId::new_v4();
-        let waiting =
-            request_status_for(Some(session), RequestState::WaitingForPermission);
+        let waiting = request_status_for(Some(session), RequestState::WaitingForPermission);
         let want = AgentTurnId(waiting.request_id);
-        assert_eq!(
-            active_turn_for_session(&[waiting], session),
-            Some(want)
-        );
+        assert_eq!(active_turn_for_session(&[waiting], session), Some(want));
     }
 
     // --- OCEAN-12: registry GC ----------------------------------------------
@@ -12274,7 +12388,10 @@ mod tests {
         let reqs = requests.read().await;
         assert!(!reqs.contains_key(&old_terminal), "old terminal evicted");
         assert!(reqs.contains_key(&fresh_terminal), "recent terminal kept");
-        assert!(reqs.contains_key(&live), "live request kept regardless of age");
+        assert!(
+            reqs.contains_key(&live),
+            "live request kept regardless of age"
+        );
     }
 
     #[tokio::test]
@@ -12336,10 +12453,7 @@ mod tests {
         let term = RequestId::new_v4();
         map.insert(live_a, status(live_a, RequestState::Running));
         map.insert(live_b, status(live_b, RequestState::Running));
-        map.insert(
-            term,
-            terminal_status_at(term, RequestState::Completed, now),
-        );
+        map.insert(term, terminal_status_at(term, RequestState::Completed, now));
 
         // Directly exercise the ranking: remove 1 entry.
         // (REGISTRY_MAX_ENTRIES is 10k, so call the ranker via a manual trim.)
@@ -12464,11 +12578,8 @@ mod tests {
 
         // Before shutdown: the stream is live and yields nothing, so `next()`
         // must still be pending. A short timeout proves it has not ended.
-        let pending = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            stream.next(),
-        )
-        .await;
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
         assert!(
             pending.is_err(),
             "stream ended or yielded before shutdown — it must stay open while live"
@@ -12478,11 +12589,7 @@ mod tests {
         // the OCEAN-300 fix this `next()` would pend forever and the timeout
         // would fire — which is exactly the daemon hang we are guarding against.
         token.cancel();
-        let ended = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream.next(),
-        )
-        .await;
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await;
         assert!(
             matches!(ended, Ok(None)),
             "stream did not terminate within 2s of the shutdown signal (got {ended:?}) — \
@@ -12504,8 +12611,7 @@ mod tests {
         let stream = sse_until_shutdown(live, token);
         tokio::pin!(stream);
 
-        let ended =
-            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await;
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await;
         assert!(
             matches!(ended, Ok(None)),
             "already-cancelled stream must end immediately (got {ended:?})"
@@ -12576,13 +12682,11 @@ mod tests {
             let mut buf = [0u8; 1024];
             let mut seen = Vec::new();
             loop {
-                let read = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    sock.read(&mut buf),
-                )
-                .await
-                .expect("timed out reading SSE response head")
-                .expect("read SSE response");
+                let read =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut buf))
+                        .await
+                        .expect("timed out reading SSE response head")
+                        .expect("read SSE response");
                 assert!(read > 0, "server closed before sending response head");
                 seen.extend_from_slice(&buf[..read]);
                 if seen.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -12926,11 +13030,9 @@ mod tests {
         use ocean_store::RoomStoreError;
         let (s, _) = room_store_error_response(RoomStoreError::BadKey("".into()));
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        let (s, _) =
-            room_store_error_response(RoomStoreError::UnknownRoom(RoomKey::new("x")));
+        let (s, _) = room_store_error_response(RoomStoreError::UnknownRoom(RoomKey::new("x")));
         assert_eq!(s, StatusCode::NOT_FOUND);
-        let (s, _) =
-            room_store_error_response(RoomStoreError::AlreadyExists(RoomKey::new("x")));
+        let (s, _) = room_store_error_response(RoomStoreError::AlreadyExists(RoomKey::new("x")));
         assert_eq!(s, StatusCode::CONFLICT);
         let (s, _) = room_store_error_response(RoomStoreError::UnknownParticipant {
             room: RoomKey::new("x"),
@@ -13034,7 +13136,11 @@ mod tests {
             ("caller", "hey thanks for jumping on", 0u64),
             ("caller", "so for the Warner Q3 push", 2_000),
             ("caller", "I'll send the master to Atlantic tonight", 4_000),
-            ("caller", "and we need to verify the toll-free number by Friday", 7_000),
+            (
+                "caller",
+                "and we need to verify the toll-free number by Friday",
+                7_000,
+            ),
             ("caller", "hey Ocean what did we just agree to", 10_000),
         ];
         for (speaker, text, ms) in script {
@@ -13072,8 +13178,7 @@ mod tests {
             .transcript
             .iter()
             .filter(|m| {
-                m.kind == RoomMessageKind::Message
-                    && m.author_kind == RoomParticipantKind::Human
+                m.kind == RoomMessageKind::Message && m.author_kind == RoomParticipantKind::Human
             })
             .collect();
         assert_eq!(
@@ -13098,7 +13203,9 @@ mod tests {
             !summaries.is_empty(),
             "CallSummaryUpdated must be persisted as a System message"
         );
-        assert!(summaries.iter().all(|m| m.author_kind == RoomParticipantKind::System));
+        assert!(summaries
+            .iter()
+            .all(|m| m.author_kind == RoomParticipantKind::System));
 
         // Interim segments are never persisted — assert no row duplicates a body
         // (the assembler emits an interim+final pair per utterance; only finals
@@ -13190,15 +13297,15 @@ mod tests {
         assert!(!persist_error_is_transient(
             &ocean_store::RoomStoreError::UnknownRoom(RoomKey::new("call:x"))
         ));
-        assert!(!persist_error_is_transient(&ocean_store::RoomStoreError::BadKey(
-            "".into()
-        )));
+        assert!(!persist_error_is_transient(
+            &ocean_store::RoomStoreError::BadKey("".into())
+        ));
         assert!(!persist_error_is_transient(
             &ocean_store::RoomStoreError::AlreadyExists(RoomKey::new("call:x"))
         ));
-        assert!(!persist_error_is_transient(&ocean_store::RoomStoreError::Encode(
-            "boom".into()
-        )));
+        assert!(!persist_error_is_transient(
+            &ocean_store::RoomStoreError::Encode("boom".into())
+        ));
     }
 
     /// A no-op sleep so the retry engine runs instantly under a plain
@@ -13289,7 +13396,9 @@ mod tests {
             move || {
                 run_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // Non-transient on the very first retry.
-                Err(ocean_store::RoomStoreError::UnknownRoom(RoomKey::new("call:x")))
+                Err(ocean_store::RoomStoreError::UnknownRoom(RoomKey::new(
+                    "call:x",
+                )))
             },
             no_sleep,
             &failures,
@@ -13333,7 +13442,9 @@ mod tests {
 
         // (1) The live rail still got the event — emit was not blocked/aborted by
         // the failed write.
-        let got = rx.try_recv().expect("event must reach the live bus despite persist failure");
+        let got = rx
+            .try_recv()
+            .expect("event must reach the live bus despite persist failure");
         assert!(matches!(
             got.event,
             ocean_core::OceanEvent::CallSummaryUpdated { .. }
@@ -13449,10 +13560,18 @@ mod tests {
         // The handler's `let Some(agent) = ... else { continue }` short-circuits
         // BEFORE the audit-line / event writes — so no convene footprint.
         let human_decision = evaluate_trigger_policy(
-            Some(&RoomTriggerPolicy { on_mention: true, ..Default::default() }),
-            &RoomTriggerEvent::Mention { participant_id: "john".into() },
+            Some(&RoomTriggerPolicy {
+                on_mention: true,
+                ..Default::default()
+            }),
+            &RoomTriggerEvent::Mention {
+                participant_id: "john".into(),
+            },
         );
-        assert!(human_decision.should_convene, "policy still matches on @john");
+        assert!(
+            human_decision.should_convene,
+            "policy still matches on @john"
+        );
         assert!(
             human_decision
                 .target_participant
@@ -13465,8 +13584,13 @@ mod tests {
         // An agent mention: resolves to the Agent participant, so the footprint
         // (audit line + event + turn) is written.
         let agent_decision = evaluate_trigger_policy(
-            Some(&RoomTriggerPolicy { on_mention: true, ..Default::default() }),
-            &RoomTriggerEvent::Mention { participant_id: "ocean".into() },
+            Some(&RoomTriggerPolicy {
+                on_mention: true,
+                ..Default::default()
+            }),
+            &RoomTriggerEvent::Mention {
+                participant_id: "ocean".into(),
+            },
         );
         assert!(agent_decision.should_convene);
         let resolved = agent_decision
@@ -13479,7 +13603,6 @@ mod tests {
         );
         assert_eq!(resolved.unwrap().id, "ocean");
     }
-
 
     // --- OCEAN-52/55: session↔workspace binding + traversal guard -----------
 
@@ -13528,9 +13651,9 @@ mod tests {
         // A forged session_id whose bound workspace differs from the cwd the
         // turn points at is a cross-workspace hijack — reject it.
         let err = resolve_bound_cwd(
-            "/etc",                                  // attacker cwd
-            "/etc",                                  // its workspace
-            Some(("/work/repo/sub", "/work/repo")),  // session bound elsewhere
+            "/etc",                                 // attacker cwd
+            "/etc",                                 // its workspace
+            Some(("/work/repo/sub", "/work/repo")), // session bound elsewhere
         )
         .expect_err("cross-workspace resume must be rejected");
         assert_eq!(
@@ -13607,8 +13730,7 @@ mod tests {
         let policy = gating_policy(false);
         let args = json!({"path": "src/lib.rs"});
         let check = policy.check("write", &args);
-        let timed =
-            tokio::time::timeout(std::time::Duration::from_millis(150), check).await;
+        let timed = tokio::time::timeout(std::time::Duration::from_millis(150), check).await;
         assert!(
             timed.is_err(),
             "default gating must suspend on a permission decision, not auto-allow"
@@ -13771,7 +13893,10 @@ mod tests {
         assert!(!body.ok, "over-cap turn must report ok:false");
         assert_eq!(body.status, AgentTurnStatus::Failed);
         assert!(
-            body.error.as_deref().unwrap_or_default().contains("capacity"),
+            body.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("capacity"),
             "429 body should explain the daemon is at capacity, got {:?}",
             body.error
         );
@@ -13956,8 +14081,7 @@ mod tests {
     async fn decision_without_token_is_rejected_403_and_tool_not_run() {
         let state = permission_test_state();
         let token = ocean_core::mint_decision_token();
-        let (permission_id, mut rx) =
-            register_bound_waiter(&state, Some(token.clone())).await;
+        let (permission_id, mut rx) = register_bound_waiter(&state, Some(token.clone())).await;
 
         // Attacker forges an Allow with only the sniffed permission_id.
         let body = PermissionDecisionRequest {
@@ -13965,12 +14089,8 @@ mod tests {
             decision: PermissionDecisionBody::Allow,
             decision_token: None,
         };
-        let (status, resp) = permission_decision(
-            State(state.clone()),
-            Path(permission_id),
-            Json(body),
-        )
-        .await;
+        let (status, resp) =
+            permission_decision(State(state.clone()), Path(permission_id), Json(body)).await;
 
         assert_eq!(
             status,
@@ -14007,7 +14127,11 @@ mod tests {
         let (status, _resp) =
             permission_decision(State(state.clone()), Path(permission_id), Json(body)).await;
 
-        assert_eq!(status, StatusCode::FORBIDDEN, "a wrong token must be forbidden");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a wrong token must be forbidden"
+        );
         assert_eq!(state.permissions.read().await.len(), 1);
         assert!(rx.try_recv().is_err());
     }
@@ -14076,7 +14200,9 @@ mod tests {
         );
 
         // ...but the broadcast envelope must NOT leak it.
-        let envelope = rx.try_recv().expect("a PermissionRequest must be broadcast");
+        let envelope = rx
+            .try_recv()
+            .expect("a PermissionRequest must be broadcast");
         assert!(
             matches!(envelope.event, OceanEvent::PermissionRequest { .. }),
             "first broadcast event is the PermissionRequest"
@@ -14123,7 +14249,10 @@ mod tests {
         assert!(!ocean_core::decision_token_matches(None, Some(&t)));
         assert!(!ocean_core::decision_token_matches(None, None));
         // Differing lengths must not match and must not panic.
-        assert!(!ocean_core::decision_token_matches(Some("abc"), Some("abcd")));
+        assert!(!ocean_core::decision_token_matches(
+            Some("abc"),
+            Some("abcd")
+        ));
     }
 
     /// `OCEAN_YOLO` parsing: default/empty/garbage = gated (false); the
@@ -14219,12 +14348,18 @@ mod tests {
 
         // OCEAN_YOLO=0 overrides persisted true ⇒ env wins, gated.
         env::set_var("OCEAN_YOLO", "0");
-        assert!(!effective_yolo(), "OCEAN_YOLO=0 must override persisted true");
+        assert!(
+            !effective_yolo(),
+            "OCEAN_YOLO=0 must override persisted true"
+        );
 
         // OCEAN_YOLO=1 overrides persisted false ⇒ env wins, bypass.
         ocean_agent::persist_yolo_pref(&tmp, false);
         env::set_var("OCEAN_YOLO", "1");
-        assert!(effective_yolo(), "OCEAN_YOLO=1 must override persisted false");
+        assert!(
+            effective_yolo(),
+            "OCEAN_YOLO=1 must override persisted false"
+        );
 
         // Unrecognized env ⇒ falls through to persisted (false here).
         env::set_var("OCEAN_YOLO", "maybe");
@@ -14316,8 +14451,7 @@ mod tests {
         assert_eq!(resp.status, AgentTurnStatus::Failed);
         let err = resp.error.clone().unwrap_or_default();
         assert!(
-            err.to_lowercase().contains("yolo")
-                && err.to_lowercase().contains("decision_token"),
+            err.to_lowercase().contains("yolo") && err.to_lowercase().contains("decision_token"),
             "the error must name BOTH escape hatches (enable yolo / send a \
              decision_token) so the caller can act; got: {err:?}"
         );
@@ -14395,7 +14529,10 @@ mod tests {
         // Operator opted in via env ⇒ on regardless of wire flag.
         ocean_agent::persist_yolo_pref(&tmp, false);
         env::set_var("OCEAN_YOLO", "1");
-        assert!(resolve_request_yolo(false), "OCEAN_YOLO=1 ⇒ on (wire false)");
+        assert!(
+            resolve_request_yolo(false),
+            "OCEAN_YOLO=1 ⇒ on (wire false)"
+        );
         assert!(resolve_request_yolo(true), "OCEAN_YOLO=1 ⇒ on (wire true)");
 
         // env explicitly OFF must override even a wire true.
@@ -14432,9 +14569,9 @@ mod tests {
     // No network, no key — the whole point of the fake-tool mode.
     #[tokio::test]
     async fn fake_tool_provider_blocks_on_gate_then_runs_tool_after_allow() {
+        use ocean_protocol::{Message, Model};
         use ocean_runtime::types::AgentConfig;
         use ocean_runtime::{run_agent_with_history, tools::write::WriteTool, FakeToolProvider};
-        use ocean_protocol::{Message, Model};
 
         // A unique temp target so this test never collides with the live-test
         // file or a parallel run.
@@ -14464,9 +14601,7 @@ mod tests {
                 use ocean_protocol::{
                     AssistantMessage, AssistantMessageEvent, Content, StopReason, Usage,
                 };
-                let round = self
-                    .calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let round = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let msg = |content: Vec<Content>, stop: StopReason| AssistantMessage {
                     content,
                     api: "fake".into(),
@@ -14506,11 +14641,14 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
 
-        let cfg = AgentConfig::new(Model::openai_compat("fake", "fake-tool", "fake://local", 1000, 1000), "sys")
-            .with_tools(vec![Arc::new(WriteTool)])
-            .with_permission(policy.clone())
-            .with_provider(provider)
-            .with_max_turns(4);
+        let cfg = AgentConfig::new(
+            Model::openai_compat("fake", "fake-tool", "fake://local", 1000, 1000),
+            "sys",
+        )
+        .with_tools(vec![Arc::new(WriteTool)])
+        .with_permission(policy.clone())
+        .with_provider(provider)
+        .with_max_turns(4);
 
         // Drive the real loop.
         let run = tokio::spawn(async move {
@@ -14616,10 +14754,10 @@ mod tests {
         let extra = parse_allowed_origins("https://ocean.example.com");
         for o in [
             "https://evil.com",
-            "http://localhost.evil.com",   // not a real loopback host
-            "http://127.0.0.1.evil.com",   // not a real loopback host
-            "https://notlocalhost",        // unrelated
-            "http://ocean.example.com",    // http when only https was allowed
+            "http://localhost.evil.com", // not a real loopback host
+            "http://127.0.0.1.evil.com", // not a real loopback host
+            "https://notlocalhost",      // unrelated
+            "http://ocean.example.com",  // http when only https was allowed
         ] {
             assert!(
                 !is_trusted_origin(&origin(o), &extra),
@@ -14867,8 +15005,16 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        let fired = body.0.get("triggers_fired").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(fired.len(), 1, "mention of an agent must fire exactly one trigger");
+        let fired = body
+            .0
+            .get("triggers_fired")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            fired.len(),
+            1,
+            "mention of an agent must fire exactly one trigger"
+        );
 
         // The convened turn runs async; its reply lands as an Agent-authored
         // message authored by `helper` carrying the fake provider's output.
@@ -14893,7 +15039,10 @@ mod tests {
             .await
             .values()
             .any(|c| c.status.session_id == Some(expected_sid));
-        assert!(registered, "a turn must be registered for the room+agent session");
+        assert!(
+            registered,
+            "a turn must be registered for the room+agent session"
+        );
 
         std::env::remove_var("OCEAN_YOLO");
     }
@@ -15142,7 +15291,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        let fired = body.0.get("triggers_fired").and_then(|v| v.as_array()).unwrap();
+        let fired = body
+            .0
+            .get("triggers_fired")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert!(
             fired.is_empty(),
             "an agent-authored message must never fire a trigger (anti-loop guard)"
@@ -15181,10 +15334,7 @@ mod tests {
         let app = longhouse_routes().with_state(state);
 
         // Helper: POST a convene body to `path`, returning (status, json).
-        async fn post_convene(
-            app: Router,
-            path: &str,
-        ) -> (StatusCode, serde_json::Value) {
+        async fn post_convene(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
             let req = axum::http::Request::builder()
                 .method(axum::http::Method::POST)
                 .uri(path)
@@ -15202,8 +15352,7 @@ mod tests {
         }
 
         // The alias must route to the handler, not 404.
-        let (alias_status, alias_body) =
-            post_convene(app.clone(), "/v1/council/convene").await;
+        let (alias_status, alias_body) = post_convene(app.clone(), "/v1/council/convene").await;
         assert_eq!(
             alias_status,
             StatusCode::OK,
@@ -15217,8 +15366,7 @@ mod tests {
         );
 
         // The canonical longhouse path returns the identical shape — same handler.
-        let (canon_status, canon_body) =
-            post_convene(app.clone(), "/v1/longhouse/convene").await;
+        let (canon_status, canon_body) = post_convene(app.clone(), "/v1/longhouse/convene").await;
         assert_eq!(canon_status, StatusCode::OK);
         assert_eq!(canon_body["ok"], json!(true));
         assert_eq!(
@@ -15341,10 +15489,15 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "legit cross-turn claim must 200; body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "legit cross-turn claim must 200; body: {body}"
+        );
         assert_eq!(body["ok"], json!(true), "body: {body}");
         assert_eq!(
-            body["escrow_released"], json!(1),
+            body["escrow_released"],
+            json!(1),
             "the topic's one validator stake is released on a successful claim: {body}"
         );
     }
@@ -15374,7 +15527,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "a tokenless claim must 403; body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a tokenless claim must 403; body: {body}"
+        );
         assert_eq!(body["ok"], json!(false));
     }
 
@@ -15408,7 +15565,10 @@ mod tests {
                 )
             })
         };
-        assert!(revoke_result.is_ok(), "the daemon's Revoker (with its key) revokes");
+        assert!(
+            revoke_result.is_ok(),
+            "the daemon's Revoker (with its key) revokes"
+        );
 
         let app = longhouse_routes().with_state(state);
         let (status, body) = post_json(
@@ -15454,7 +15614,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT, "wrong decision is a 409; body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "wrong decision is a 409; body: {body}"
+        );
         assert_eq!(body["engine_decision"], json!(bound.to_string()));
     }
 
@@ -15492,7 +15656,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "board post to a tracked topic must 200; body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "board post to a tracked topic must 200; body: {body}"
+        );
         assert_eq!(body["ok"], json!(true));
 
         // The mark landed on the durable board.
@@ -15513,7 +15681,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(missing_status, StatusCode::NOT_FOUND, "board post to an unknown topic 404s");
+        assert_eq!(
+            missing_status,
+            StatusCode::NOT_FOUND,
+            "board post to an unknown topic 404s"
+        );
     }
 
     // Persistence-no-leak at the daemon's own DB path: after a grant, reopen the
@@ -15567,7 +15739,11 @@ mod tests {
             json!({ "title_id": title_id.to_string(), "reason": "unsafe tool call" }),
         )
         .await;
-        assert_eq!(rev_status, StatusCode::OK, "operator revoke must 200; body: {rev_body}");
+        assert_eq!(
+            rev_status,
+            StatusCode::OK,
+            "operator revoke must 200; body: {rev_body}"
+        );
         assert_eq!(rev_body["agent_id"], json!(agent.to_string()));
 
         // The correct token now buys nothing — the title is revoked.
@@ -15595,7 +15771,11 @@ mod tests {
             json!({ "title_id": title_id.to_string() }),
         )
         .await;
-        assert_eq!(again_status, StatusCode::CONFLICT, "double-revoke is a 409 NotLive");
+        assert_eq!(
+            again_status,
+            StatusCode::CONFLICT,
+            "double-revoke is a 409 NotLive"
+        );
     }
 
     /// The convene FOOTPRINT (notice + audit line + turn) is gated on the mention
@@ -15676,7 +15856,8 @@ mod tests {
         // Author a room with one human participant and two transcript lines.
         let key = RoomKey::new("hydrate-me");
         with_rooms(&state, |reg| {
-            reg.create(key.clone(), "Hydrate Me", None, Utc::now()).unwrap();
+            reg.create(key.clone(), "Hydrate Me", None, Utc::now())
+                .unwrap();
             reg.add_participant(
                 &key,
                 RoomParticipant {
@@ -15787,10 +15968,7 @@ mod tests {
             tail["events"].as_array().unwrap().is_empty(),
             "after_seq at the head returns no entries"
         );
-        assert!(
-            tail["last_seq"].is_null(),
-            "empty tail reports no last_seq"
-        );
+        assert!(tail["last_seq"].is_null(), "empty tail reports no last_seq");
         // An empty tail is the end of the log: no more pages, no cursor.
         assert_eq!(tail["has_more"], json!(false));
         assert!(tail["next_seq"].is_null());
@@ -15817,7 +15995,11 @@ mod tests {
         )
         .await;
         let tail2_events = tail2["events"].as_array().unwrap();
-        assert_eq!(tail2_events.len(), 1, "exactly one new entry since last_seq");
+        assert_eq!(
+            tail2_events.len(),
+            1,
+            "exactly one new entry since last_seq"
+        );
         assert_eq!(tail2_events[0]["body"], json!("third"));
 
         // --- unknown room: 404, not a panic, on both endpoints. ---
@@ -15860,7 +16042,8 @@ mod tests {
         let key = RoomKey::new("pageable");
         let total: usize = 25;
         with_rooms(&state, |reg| {
-            reg.create(key.clone(), "Pageable", None, Utc::now()).unwrap();
+            reg.create(key.clone(), "Pageable", None, Utc::now())
+                .unwrap();
             for i in 0..total {
                 reg.append_message(
                     &key,
@@ -15891,7 +16074,9 @@ mod tests {
             "first page is capped at the requested limit"
         );
         assert_eq!(first["has_more"], json!(true));
-        let cursor = first["next_seq"].as_u64().expect("has_more implies a cursor");
+        let cursor = first["next_seq"]
+            .as_u64()
+            .expect("has_more implies a cursor");
         assert_eq!(cursor, 9, "cursor is the last returned seq");
 
         // Walk the rest with the cursor; collect every seq we see.
@@ -16018,7 +16203,10 @@ mod tests {
             }
         }
         let expected: Vec<String> = (0..total).rev().map(|i| format!("room-{i:03}")).collect();
-        assert_eq!(seen, expected, "paging covers every room once, in list order");
+        assert_eq!(
+            seen, expected,
+            "paging covers every room once, in list order"
+        );
 
         // No limit ⇒ default cap; 12 < 100 so it's the whole list, no more pages.
         let (status, Json(all)) = rooms_list_persistent(
@@ -16096,8 +16284,14 @@ mod tests {
                 break;
             }
         }
-        let expected: Vec<String> = (0..total as i64).rev().map(|i| format!("proj-{i}")).collect();
-        assert_eq!(names, expected, "paging covers every project once, newest-first");
+        let expected: Vec<String> = (0..total as i64)
+            .rev()
+            .map(|i| format!("proj-{i}"))
+            .collect();
+        assert_eq!(
+            names, expected,
+            "paging covers every project once, newest-first"
+        );
 
         // No limit ⇒ default cap; 7 < 100 so all in one page, no more.
         let Json(all) = projects_list(
@@ -16141,7 +16335,10 @@ mod tests {
         assert_eq!(first["ok"], json!(true));
         assert_eq!(first["sessions"].as_array().unwrap().len(), 2);
         assert_eq!(first["has_more"], json!(true));
-        let cursor = first["next_cursor"].as_str().expect("has_more ⇒ cursor").to_string();
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("has_more ⇒ cursor")
+            .to_string();
 
         // Walk to the end; collect ids, assert each appears once.
         let mut seen: Vec<String> = first["sessions"]
@@ -16176,14 +16373,14 @@ mod tests {
         }
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), total, "paging covers every session exactly once");
+        assert_eq!(
+            seen.len(),
+            total,
+            "paging covers every session exactly once"
+        );
 
         // No limit ⇒ default cap; 5 < 100 so all in one page, no more.
-        let Json(all) = sessions(
-            State(state.clone()),
-            Query(SessionListQuery::default()),
-        )
-        .await;
+        let Json(all) = sessions(State(state.clone()), Query(SessionListQuery::default())).await;
         assert_eq!(all["sessions"].as_array().unwrap().len(), total);
         assert_eq!(all["has_more"], json!(false));
         assert!(all["next_cursor"].is_null());
@@ -16601,7 +16798,10 @@ mod tests {
         std::env::remove_var(PUBLISH_TOKEN_ENV);
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-ocean-publish-token", HeaderValue::from_static("anything"));
+        headers.insert(
+            "x-ocean-publish-token",
+            HeaderValue::from_static("anything"),
+        );
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer anything"),
@@ -16729,8 +16929,10 @@ mod tests {
         let prep: ocean_longhouse::TurnPrep =
             serde_json::from_value(body["prep"].clone()).expect("prep is a valid TurnPrep");
         assert!(
-            prep.skills.iter().any(|s| s.name == "Zorptastic Widget"
-                && s.source == ocean_longhouse::SkillSource::Repo),
+            prep.skills
+                .iter()
+                .any(|s| s.name == "Zorptastic Widget"
+                    && s.source == ocean_longhouse::SkillSource::Repo),
             "the planted repo skill must surface in the ranked brief, got {:?}",
             prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
@@ -16961,7 +17163,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(fbody["ok"], json!(true));
         assert_eq!(fbody["advisory"], json!(true));
-        assert_eq!(fbody["skill"]["id"], json!(id), "fetch echoes the queried id");
+        assert_eq!(
+            fbody["skill"]["id"],
+            json!(id),
+            "fetch echoes the queried id"
+        );
         assert_eq!(fbody["skill"]["name"], json!("Blizzcorp Protocol"));
         let returned_body = fbody["skill"]["body"].as_str().expect("body present");
         assert!(
@@ -17120,7 +17326,10 @@ mod tests {
         );
 
         let spec = &body["spec"];
-        assert_eq!(spec["role"], json!("review and audit the blorpsec deployment"));
+        assert_eq!(
+            spec["role"],
+            json!("review and audit the blorpsec deployment")
+        );
         // The planted skill must surface in skill_ids as a fetchable source_path.
         let skill_ids = spec["skill_ids"].as_array().expect("skill_ids array");
         assert!(
@@ -17137,10 +17346,15 @@ mod tests {
             spec["memory_namespace"],
             json!("subagent/review-and-audit-the-blorpsec-deployment")
         );
-        assert!(spec["max_turns"].as_u64().unwrap() > 0, "a finite turn ceiling");
+        assert!(
+            spec["max_turns"].as_u64().unwrap() > 0,
+            "a finite turn ceiling"
+        );
         assert!(spec["budget"].as_u64().unwrap() > 0, "a token budget");
         // A pure review role keeps the read-leaning baseline (no write).
-        let tools = spec["allowed_tools"].as_array().expect("allowed_tools array");
+        let tools = spec["allowed_tools"]
+            .as_array()
+            .expect("allowed_tools array");
         assert!(
             tools.iter().any(|t| t == "read_file"),
             "baseline read tool present"
@@ -17230,8 +17444,7 @@ mod tests {
             .uri("/v1/subagents/spec")
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(
-                json!({ "role": "build a thing", "cwd": tmp.path().to_string_lossy() })
-                    .to_string(),
+                json!({ "role": "build a thing", "cwd": tmp.path().to_string_lossy() }).to_string(),
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -17265,8 +17478,7 @@ mod tests {
     /// Dedicated lock serializing the `OCEAN_LONGHOUSE_PREPARE` env mutation in the
     /// tests below (process env is global; parallel test threads would race it),
     /// mirroring `YOLO_ENV_LOCK` (tokio mutex: async-holdable, non-poisoning).
-    static LONGHOUSE_PREPARE_ENV_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
+    static LONGHOUSE_PREPARE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Blocking flavor for non-async `#[test]`s (no runtime to stall).
     fn longhouse_prepare_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
@@ -17315,7 +17527,10 @@ mod tests {
         // capability — this is the contract that the brief can't read as
         // permission to bypass a gate.
         let lower = block.to_ascii_lowercase();
-        assert!(lower.contains("advisory"), "header must mark the block advisory");
+        assert!(
+            lower.contains("advisory"),
+            "header must mark the block advisory"
+        );
         assert!(
             lower.contains("permission gates"),
             "header must remind the model it still routes through the gates"
@@ -17342,12 +17557,21 @@ mod tests {
         let out = apply_longhouse_prep(prompt, Some(&prep));
 
         // The brief reaches the prompt context...
-        assert!(out.contains("Remotion Video"), "brief must reach the prompt");
+        assert!(
+            out.contains("Remotion Video"),
+            "brief must reach the prompt"
+        );
         // ...and the original task text is preserved, untouched, after it.
-        assert!(out.ends_with(prompt), "task text preserved verbatim at the end");
+        assert!(
+            out.ends_with(prompt),
+            "task text preserved verbatim at the end"
+        );
         let brief_at = out.find("Remotion Video").unwrap();
         let prompt_at = out.find(prompt).unwrap();
-        assert!(brief_at < prompt_at, "advisory brief precedes the task prompt");
+        assert!(
+            brief_at < prompt_at,
+            "advisory brief precedes the task prompt"
+        );
     }
 
     /// End-to-end at the real seam the turn path uses: layering the consult on top
@@ -17371,17 +17595,26 @@ mod tests {
         // Consult enabled → brief is prepended; guidance + task both survive below.
         let prep = prep_with(&[("Widget Builder", "Use when building a widget")]);
         let composed = apply_longhouse_prep(&guided, Some(&prep));
-        assert!(composed.contains("Widget Builder"), "consult brief reaches prompt");
+        assert!(
+            composed.contains("Widget Builder"),
+            "consult brief reaches prompt"
+        );
         assert!(
             composed.contains("Operator guidance for this turn:"),
             "operator guidance is preserved under the consult"
         );
-        assert!(composed.contains("build the widget"), "task text is preserved");
+        assert!(
+            composed.contains("build the widget"),
+            "task text is preserved"
+        );
         // Ordering: advisory consult, then operator guidance, then the task.
         let consult_at = composed.find("Widget Builder").unwrap();
         let guidance_at = composed.find("Operator guidance for this turn:").unwrap();
         let task_at = composed.find("build the widget").unwrap();
-        assert!(consult_at < guidance_at, "consult precedes operator guidance");
+        assert!(
+            consult_at < guidance_at,
+            "consult precedes operator guidance"
+        );
         assert!(guidance_at < task_at, "guidance precedes the task");
     }
 
@@ -17783,7 +18016,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK, "a legit open call room must mint a token");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a legit open call room must mint a token"
+        );
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["room"], json!(room));
         let video = jwt_video_grants(body["token"].as_str().expect("token string"));
@@ -17858,13 +18095,8 @@ mod tests {
         let state = permission_test_state();
         // Never created in the store; a `project:` surface room minted lazily.
         let room = "project:surface-main";
-        let (status, Json(body)) = room_livekit_token(
-            State(state),
-            Path(room.to_string()),
-            HeaderMap::new(),
-            None,
-        )
-        .await;
+        let (status, Json(body)) =
+            room_livekit_token(State(state), Path(room.to_string()), HeaderMap::new(), None).await;
 
         assert_eq!(
             status,
@@ -17874,7 +18106,11 @@ mod tests {
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["room"], json!(room));
         let video = jwt_video_grants(body["token"].as_str().expect("token string"));
-        assert_eq!(video["room"], json!(room), "token must be scoped to the room");
+        assert_eq!(
+            video["room"],
+            json!(room),
+            "token must be scoped to the room"
+        );
         assert_eq!(
             video["canPublish"],
             json!(false),
@@ -17917,7 +18153,8 @@ mod tests {
         );
         // `missing` names the FIRST unset var so the operator knows where to start.
         assert_eq!(
-            body["missing"], json!("LIVEKIT_URL not set"),
+            body["missing"],
+            json!("LIVEKIT_URL not set"),
             "missing should name the first unset var, got {body}"
         );
     }
@@ -17936,7 +18173,9 @@ mod tests {
         let (status, Json(body)) = call_place(
             State(state),
             // A valid number, so we pass the format guard and reach the creds gate.
-            Json(PlaceCallRequest { to: "+17035551234".into() }),
+            Json(PlaceCallRequest {
+                to: "+17035551234".into(),
+            }),
         )
         .await;
 
@@ -17950,13 +18189,17 @@ mod tests {
         assert_eq!(
             body["needed_env"],
             json!([
-                "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-                "OCEAN_CALL_OUTBOUND_TRUNK", "OCEAN_CALL_CALLER_NUMBER"
+                "LIVEKIT_URL",
+                "LIVEKIT_API_KEY",
+                "LIVEKIT_API_SECRET",
+                "OCEAN_CALL_OUTBOUND_TRUNK",
+                "OCEAN_CALL_CALLER_NUMBER"
             ]),
             "the 503 must enumerate the full telephony env set, got {body}"
         );
         assert_eq!(
-            body["missing"], json!("LIVEKIT_URL not set"),
+            body["missing"],
+            json!("LIVEKIT_URL not set"),
             "missing should name the first unset var"
         );
     }
@@ -17976,7 +18219,9 @@ mod tests {
         let state = permission_test_state();
         let (status, Json(body)) = call_place(
             State(state),
-            Json(PlaceCallRequest { to: "not-a-number".into() }),
+            Json(PlaceCallRequest {
+                to: "not-a-number".into(),
+            }),
         )
         .await;
 
@@ -18004,11 +18249,8 @@ mod tests {
         clear_livekit_env();
 
         let state = permission_test_state();
-        let (status, Json(body)) = call_place(
-            State(state),
-            Json(PlaceCallRequest { to: "   ".into() }),
-        )
-        .await;
+        let (status, Json(body)) =
+            call_place(State(state), Json(PlaceCallRequest { to: "   ".into() })).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "an empty number must 400");
         assert_eq!(body["ok"], json!(false));
@@ -18072,10 +18314,19 @@ mod tests {
         assert!(body.contains("# TYPE ocean_turns_total counter"));
 
         // Zero everywhere on a fresh surface.
-        assert_eq!(labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"), Some(0));
-        assert_eq!(labelled_value(&body, "ocean_turns_total{outcome=\"error\"}"), Some(0));
+        assert_eq!(
+            labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"),
+            Some(0)
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_turns_total{outcome=\"error\"}"),
+            Some(0)
+        );
         assert_eq!(metric_value(&body, "ocean_turns_in_flight"), Some(0));
-        assert_eq!(metric_value(&body, "ocean_turn_duration_seconds_count"), Some(0));
+        assert_eq!(
+            metric_value(&body, "ocean_turn_duration_seconds_count"),
+            Some(0)
+        );
 
         // One explicit bucket per configured bound, plus the implicit +Inf.
         let bucket_lines = body
@@ -18107,9 +18358,18 @@ mod tests {
 
         let body = m.render_prometheus(0);
 
-        assert_eq!(labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"), Some(2));
-        assert_eq!(labelled_value(&body, "ocean_turns_total{outcome=\"error\"}"), Some(1));
-        assert_eq!(metric_value(&body, "ocean_turn_duration_seconds_count"), Some(3));
+        assert_eq!(
+            labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"),
+            Some(2)
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_turns_total{outcome=\"error\"}"),
+            Some(1)
+        );
+        assert_eq!(
+            metric_value(&body, "ocean_turn_duration_seconds_count"),
+            Some(3)
+        );
 
         // +Inf bucket == total turns.
         assert_eq!(
@@ -18218,8 +18478,8 @@ mod tests {
         // Seed metrics through the exact entry points the turn path uses.
         state.metrics.record_turn(120, true); // one OK turn, 120ms
         state.metrics.record_turn(7, false); // one error turn, 7ms
-        // Bump persist_failures on AppState (NOT in TurnMetrics) to prove the
-        // handler reads it from the single source of truth.
+                                             // Bump persist_failures on AppState (NOT in TurnMetrics) to prove the
+                                             // handler reads it from the single source of truth.
         state
             .persist_failures
             .store(4, std::sync::atomic::Ordering::Relaxed);
@@ -18252,9 +18512,18 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
 
-        assert_eq!(labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"), Some(1));
-        assert_eq!(labelled_value(&body, "ocean_turns_total{outcome=\"error\"}"), Some(1));
-        assert_eq!(metric_value(&body, "ocean_turn_duration_seconds_count"), Some(2));
+        assert_eq!(
+            labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"),
+            Some(1)
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_turns_total{outcome=\"error\"}"),
+            Some(1)
+        );
+        assert_eq!(
+            metric_value(&body, "ocean_turn_duration_seconds_count"),
+            Some(2)
+        );
         assert_eq!(
             metric_value(&body, "ocean_turns_in_flight"),
             Some(1),

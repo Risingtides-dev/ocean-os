@@ -44,10 +44,10 @@ use axum::extract::{Path, State};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ocean_core::{EventEnvelope, OceanEvent};
 use ocean_agent_sdk::{
     AgentSessionId, AgentTurnEvent, AgentTurnId, AgentTurnResponse, AgentTurnStatus,
 };
+use ocean_core::{EventEnvelope, OceanEvent};
 use serde_json::Value;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tokio_stream::wrappers::BroadcastStream;
@@ -309,9 +309,17 @@ async fn old_order_misses_permission_and_would_hang() {
     // Fire the (blocking) turn first. We DO NOT await it — it blocks on the gate.
     let submit = {
         let client = client.clone();
-        tokio::spawn(
-            async move { client.submit_turn("mutate a file".into(), "/proj".into(), None, None, Some(ocean_core::mint_decision_token())).await },
-        )
+        tokio::spawn(async move {
+            client
+                .submit_turn(
+                    "mutate a file".into(),
+                    "/proj".into(),
+                    None,
+                    None,
+                    Some(ocean_core::mint_decision_token()),
+                )
+                .await
+        })
     };
 
     // Let the turn handler run far enough to emit the PermissionRequest.
@@ -356,9 +364,17 @@ async fn new_order_receives_permission_and_turn_completes() {
     // 2) Submit the (blocking) gated turn off-task.
     let submit = {
         let client = client.clone();
-        tokio::spawn(
-            async move { client.submit_turn("mutate a file".into(), "/proj".into(), None, None, Some(ocean_core::mint_decision_token())).await },
-        )
+        tokio::spawn(async move {
+            client
+                .submit_turn(
+                    "mutate a file".into(),
+                    "/proj".into(),
+                    None,
+                    None,
+                    Some(ocean_core::mint_decision_token()),
+                )
+                .await
+        })
     };
 
     // 3) The bridge would learn its request id from the agent stream's
@@ -367,7 +383,9 @@ async fn new_order_receives_permission_and_turn_completes() {
     let mut learned_request_id: Option<String> = None;
     for _ in 0..50 {
         if let Ok(Some(AgentTurnEvent::TurnStarted { turn_id, .. })) =
-            tokio::time::timeout(Duration::from_millis(500), agent.next_event()).await.unwrap()
+            tokio::time::timeout(Duration::from_millis(500), agent.next_event())
+                .await
+                .unwrap()
         {
             learned_request_id = Some(turn_id.0.to_string());
             break;
@@ -431,7 +449,17 @@ async fn synchronous_submit_failure_does_not_hang() {
     // Submit off-task, exactly as run_turn does.
     let mut submit_handle = Some(tokio::spawn({
         let client = client.clone();
-        async move { client.submit_turn("bad cwd".into(), "/etc".into(), None, None, Some(ocean_core::mint_decision_token())).await }
+        async move {
+            client
+                .submit_turn(
+                    "bad cwd".into(),
+                    "/etc".into(),
+                    None,
+                    None,
+                    Some(ocean_core::mint_decision_token()),
+                )
+                .await
+        }
     }));
 
     let turn_id: Option<String> = None; // no turn ever starts

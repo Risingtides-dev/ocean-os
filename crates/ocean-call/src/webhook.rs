@@ -155,7 +155,10 @@ mod tests {
         assert_eq!(decide("room_started", "writers"), WebhookAction::Ignore);
         // A room that merely contains "call" but doesn't have the prefix is also
         // ignored — only the inbound `call_` / outbound `call:` prefixes count.
-        assert_eq!(decide("room_finished", "recall-room"), WebhookAction::Ignore);
+        assert_eq!(
+            decide("room_finished", "recall-room"),
+            WebhookAction::Ignore
+        );
     }
 
     #[test]

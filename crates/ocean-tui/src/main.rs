@@ -2287,12 +2287,7 @@ struct AgentRecord {
     lifecycle: Option<String>,
     #[serde(default)]
     status_message: Option<String>,
-    #[serde(
-        default,
-        rename = "sessionId",
-        alias = "session_id",
-        alias = "session"
-    )]
+    #[serde(default, rename = "sessionId", alias = "session_id", alias = "session")]
     session_id: Option<String>,
     #[serde(default)]
     activity: Option<AgentActivity>,
@@ -3827,7 +3822,11 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             if status != ocean_agent_sdk::AgentTurnStatus::Completed {
                 for turn in app.pm_turns.iter_mut() {
                     for block in turn.blocks.iter_mut() {
-                        if let PmBlock::ToolCall { status: tool_status, .. } = block {
+                        if let PmBlock::ToolCall {
+                            status: tool_status,
+                            ..
+                        } = block
+                        {
                             if *tool_status == ToolStatus::Running {
                                 *tool_status = ToolStatus::Err;
                             }
@@ -4099,7 +4098,10 @@ fn daemon_apply_stream_event(app: &mut DaemonApp, envelope: EventEnvelope) {
             app.push_transcript_if_new(format!("☎ call started · {room_id}"));
         }
         OceanEvent::CallTranscriptSegment {
-            speaker, text, is_final, ..
+            speaker,
+            text,
+            is_final,
+            ..
         } => {
             if *is_final {
                 app.push_transcript_if_new(format!("{speaker}: {text}"));
@@ -4272,8 +4274,8 @@ fn spawn_daemon_event_stream(url: String, tx: mpsc::Sender<Action>) {
                     .header("Accept", "text/event-stream"),
                 last_event_id.as_deref(),
             )
-                .send()
-                .and_then(|res| res.error_for_status())
+            .send()
+            .and_then(|res| res.error_for_status())
             {
                 Ok(response) => response,
                 Err(err) => {
@@ -4520,8 +4522,8 @@ fn spawn_daemon_agent_event_stream(
                     .header("Accept", "text/event-stream"),
                 last_event_id.as_deref(),
             )
-                .send()
-                .and_then(|res| res.error_for_status())
+            .send()
+            .and_then(|res| res.error_for_status())
             {
                 Ok(response) => response,
                 Err(err) => {
@@ -4609,9 +4611,7 @@ fn spawn_daemon_agent_event_stream(
                                                 None => true,
                                             };
                                             if fresh
-                                                && tx
-                                                    .send(Action::AgentStreamEvent(event))
-                                                    .is_err()
+                                                && tx.send(Action::AgentStreamEvent(event)).is_err()
                                             {
                                                 return;
                                             }
@@ -4716,7 +4716,11 @@ fn summarize_longhouse_event(event: &LonghouseEvent) -> String {
     match event {
         LonghouseEvent::TopicConvened {
             topic_id, title, ..
-        } => format!("convened [{}] {}", short_id(*topic_id), compact_text(title, 40)),
+        } => format!(
+            "convened [{}] {}",
+            short_id(*topic_id),
+            compact_text(title, 40)
+        ),
         LonghouseEvent::Convened {
             topic_id, members, ..
         } => format!("seated {} members [{}]", members.len(), short_id(*topic_id)),
@@ -4748,9 +4752,9 @@ fn summarize_longhouse_event(event: &LonghouseEvent) -> String {
         LonghouseEvent::TopicClosed { topic_id } => {
             format!("closed [{}]", short_id(*topic_id))
         }
-        LonghouseEvent::RoleGranted {
-            topic_id, role, ..
-        } => format!("role {:?} granted [{}]", role, short_id(*topic_id)),
+        LonghouseEvent::RoleGranted { topic_id, role, .. } => {
+            format!("role {:?} granted [{}]", role, short_id(*topic_id))
+        }
         LonghouseEvent::RoleRevoked { topic_id, .. } => {
             format!("role revoked [{}]", short_id(*topic_id))
         }
@@ -4941,7 +4945,10 @@ fn summarize_event(envelope: &EventEnvelope) -> String {
         }
         OceanEvent::CallStarted { room_id, .. } => format!("{request}call_started: {room_id}"),
         OceanEvent::CallTranscriptSegment { speaker, text, .. } => {
-            format!("{request}call_segment: {speaker}: {}", compact_text(text, 56))
+            format!(
+                "{request}call_segment: {speaker}: {}",
+                compact_text(text, 56)
+            )
         }
         OceanEvent::CallSummaryUpdated { summary, .. } => {
             format!("{request}call_summary: {}", compact_text(summary, 56))
@@ -5460,21 +5467,22 @@ fn draw_pm_support_column(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Daem
         ])
         .split(area);
 
-    let pane = |frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'static>>| {
-        let inner_rows = area.height.saturating_sub(2) as usize;
-        let shown: Vec<Line<'static>> = lines.into_iter().take(inner_rows.max(1)).collect();
-        frame.render_widget(
-            Paragraph::new(shown)
-                .block(
-                    Block::default()
-                        .title(title.to_string())
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                )
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-    };
+    let pane =
+        |frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'static>>| {
+            let inner_rows = area.height.saturating_sub(2) as usize;
+            let shown: Vec<Line<'static>> = lines.into_iter().take(inner_rows.max(1)).collect();
+            frame.render_widget(
+                Paragraph::new(shown)
+                    .block(
+                        Block::default()
+                            .title(title.to_string())
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::DarkGray)),
+                    )
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+        };
 
     pane(
         frame,
@@ -6012,9 +6020,7 @@ fn draw_approvals_panel(
     app: &DaemonApp,
 ) {
     let pending = app.pending_permission_count();
-    let title = format!(
-        "⚠ APPROVALS — {pending} WAITING · Ctrl-Y approve · Ctrl-N deny"
-    );
+    let title = format!("⚠ APPROVALS — {pending} WAITING · Ctrl-Y approve · Ctrl-N deny");
     let panel = Paragraph::new(app.pending_permission_lines())
         .block(
             Block::default()
@@ -6066,7 +6072,10 @@ fn draw_daemon_header(
         // (OCEAN-29): bright, reversed badge with the live count.
         title_line.push(Span::raw("  "));
         title_line.push(Span::styled(
-            format!(" ⚠ {pending} APPROVAL{} WAITING ", if pending == 1 { "" } else { "S" }),
+            format!(
+                " ⚠ {pending} APPROVAL{} WAITING ",
+                if pending == 1 { "" } else { "S" }
+            ),
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
@@ -6518,9 +6527,7 @@ fn draw_mesh_agents(
             "members {} · active {} · away {} · stale {}",
             counts.total, counts.active, counts.away, counts.stale
         )),
-        Line::from(
-            "state    agent              session   pid     age   last              preview",
-        ),
+        Line::from("state    agent              session   pid     age   last              preview"),
     ];
     for agent in state
         .agents
@@ -6680,10 +6687,7 @@ fn render_agent_line(agent: &AgentView, width: usize) -> String {
         .as_deref()
         .or(agent.cwd.as_deref())
         .unwrap_or("");
-    let model = agent
-        .model
-        .as_deref()
-        .or(agent.provider.as_deref());
+    let model = agent.model.as_deref().or(agent.provider.as_deref());
     let session = agent
         .session_id
         .as_deref()
@@ -6930,9 +6934,7 @@ fn humanize_tool_args(name: &str, args: &serde_json::Value) -> String {
         .map(|obj| {
             obj.iter()
                 .filter_map(|(key, value)| match value {
-                    serde_json::Value::String(s) if !s.is_empty() => {
-                        Some(format!("{key}: {s}"))
-                    }
+                    serde_json::Value::String(s) if !s.is_empty() => Some(format!("{key}: {s}")),
                     serde_json::Value::Number(n) => Some(format!("{key}: {n}")),
                     serde_json::Value::Bool(b) => Some(format!("{key}: {b}")),
                     _ => None,
@@ -7359,7 +7361,11 @@ mod tests {
         // Scoped WITH a valid anchor → Last-Event-ID gap replay is more
         // precise; no replay param.
         assert_eq!(
-            agent_events_url(base, Some(sid), Some("550e8400-e29b-41d4-a716-446655440000")),
+            agent_events_url(
+                base,
+                Some(sid),
+                Some("550e8400-e29b-41d4-a716-446655440000")
+            ),
             format!("{base}?session_id={sid}"),
         );
 
@@ -7403,7 +7409,10 @@ mod tests {
         use serde_json::json;
 
         assert_eq!(
-            humanize_tool_args("bash", &json!({"command": "pwd && git status", "timeout_ms": 30000})),
+            humanize_tool_args(
+                "bash",
+                &json!({"command": "pwd && git status", "timeout_ms": 30000})
+            ),
             "pwd && git status"
         );
         assert_eq!(
@@ -7433,7 +7442,10 @@ mod tests {
             "a.rs: foo() → bar()"
         );
         // Payload KEY absent → degrade to the path alone, not a dangling arrow.
-        assert_eq!(humanize_tool_args("write", &json!({"path": "a.txt"})), "a.txt");
+        assert_eq!(
+            humanize_tool_args("write", &json!({"path": "a.txt"})),
+            "a.txt"
+        );
         // But an explicit empty string is a real payload — it truncates the
         // file — and the approval card must say so, not hide it (Codex P2).
         assert_eq!(
@@ -7441,7 +7453,10 @@ mod tests {
             "a.txt ⇐ (empty file)"
         );
         assert_eq!(
-            humanize_tool_args("todo", &json!({"action": "add", "index": 0, "text": "Run tests"})),
+            humanize_tool_args(
+                "todo",
+                &json!({"action": "add", "index": 0, "text": "Run tests"})
+            ),
             "add Run tests"
         );
         assert_eq!(
@@ -7458,7 +7473,10 @@ mod tests {
         use serde_json::json;
 
         assert_eq!(
-            humanize_tool_args("mcp_linear_create", &json!({"title": "Ship it", "priority": 2})),
+            humanize_tool_args(
+                "mcp_linear_create",
+                &json!({"title": "Ship it", "priority": 2})
+            ),
             "priority: 2 · title: Ship it"
         );
         // A known tool with its salient key absent still gets the pair fallback.
@@ -8083,8 +8101,10 @@ mod tests {
         mirror_tool.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
         daemon_apply_stream_event(&mut app, mirror_tool);
 
-        let mut mirror_finished =
-            EventEnvelope::new(OceanEvent::TurnFinished { ok: true, wall_ms: 12 });
+        let mut mirror_finished = EventEnvelope::new(OceanEvent::TurnFinished {
+            ok: true,
+            wall_ms: 12,
+        });
         mirror_finished.request_id = Some(request_id);
         mirror_finished.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
         daemon_apply_stream_event(&mut app, mirror_finished);
@@ -8795,7 +8815,15 @@ mod tests {
             .pm_turns
             .iter()
             .flat_map(|t| t.blocks.iter())
-            .filter(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Running, .. }))
+            .filter(|b| {
+                matches!(
+                    b,
+                    PmBlock::ToolCall {
+                        status: ToolStatus::Running,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(running_count, 1, "expected one Running block before cancel");
 
@@ -8817,11 +8845,15 @@ mod tests {
         );
 
         // The Running block must now be Err — the yellow badge is gone.
-        let still_running = app
-            .pm_turns
-            .iter()
-            .flat_map(|t| t.blocks.iter())
-            .any(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Running, .. }));
+        let still_running = app.pm_turns.iter().flat_map(|t| t.blocks.iter()).any(|b| {
+            matches!(
+                b,
+                PmBlock::ToolCall {
+                    status: ToolStatus::Running,
+                    ..
+                }
+            )
+        });
         assert!(
             !still_running,
             "Running ToolCall blocks must be closed to Err after a non-Completed TurnFinished"
@@ -8831,7 +8863,15 @@ mod tests {
             .pm_turns
             .iter()
             .flat_map(|t| t.blocks.iter())
-            .filter(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Err, .. }))
+            .filter(|b| {
+                matches!(
+                    b,
+                    PmBlock::ToolCall {
+                        status: ToolStatus::Err,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(err_count, 1, "the cancelled block must be in Err state");
     }
@@ -8875,11 +8915,15 @@ mod tests {
             },
         );
 
-        let still_running = app
-            .pm_turns
-            .iter()
-            .flat_map(|t| t.blocks.iter())
-            .any(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Running, .. }));
+        let still_running = app.pm_turns.iter().flat_map(|t| t.blocks.iter()).any(|b| {
+            matches!(
+                b,
+                PmBlock::ToolCall {
+                    status: ToolStatus::Running,
+                    ..
+                }
+            )
+        });
         assert!(
             still_running,
             "Completed turn must not sweep Running blocks (that would hide pipeline bugs)"

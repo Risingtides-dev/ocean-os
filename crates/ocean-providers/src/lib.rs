@@ -191,13 +191,22 @@ pub struct ProviderReadiness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProviderConfigError {
-    UnknownModel { model: String },
+    UnknownModel {
+        model: String,
+    },
     /// No model was selected anywhere — no `OCEAN_MODEL`, no persisted choice.
     /// The daemon never picks a model for you; you set it.
     NoModelSelected,
-    MissingBaseUrl { provider: String },
-    MissingCredential { provider: String },
-    InvalidAuthFile { path: String, message: String },
+    MissingBaseUrl {
+        provider: String,
+    },
+    MissingCredential {
+        provider: String,
+    },
+    InvalidAuthFile {
+        path: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for ProviderConfigError {
@@ -326,7 +335,10 @@ fn fallback_order(env: &ProviderEnv) -> Vec<String> {
             return parsed;
         }
     }
-    DEFAULT_FALLBACK_ORDER.iter().map(|s| s.to_string()).collect()
+    DEFAULT_FALLBACK_ORDER
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Resolve the ordered list of **ready alternate** provider configs for failover.
@@ -353,7 +365,9 @@ pub fn fallback_candidates(
         // Resolve this alias as if it were the selected model: same env, so the
         // OCEAN_MODEL override is the only thing that changes.
         let mut alias_env = env.clone();
-        alias_env.vars.insert("OCEAN_MODEL".to_string(), alias.clone());
+        alias_env
+            .vars
+            .insert("OCEAN_MODEL".to_string(), alias.clone());
         // A fallback alias must route purely on the alias itself, not inherit an
         // OCEAN_PROVIDER pin meant for the primary (which would force every
         // candidate onto the same provider and defeat failover).
@@ -391,7 +405,9 @@ pub fn resolve_fallback_config(
     env: &ProviderEnv,
     exclude_provider: &ProviderId,
 ) -> Option<ProviderConfig> {
-    fallback_candidates(env, exclude_provider).into_iter().next()
+    fallback_candidates(env, exclude_provider)
+        .into_iter()
+        .next()
 }
 
 /// Read the ChatGPT account id from the `openai-codex` auth.json block.
@@ -925,7 +941,10 @@ mod tests {
         assert_eq!(config.selection.provider, ProviderId::Google);
         assert_eq!(config.selection.model, "gemini-2.0-flash");
         assert_eq!(config.selection.base_url, GOOGLE_BASE_URL);
-        let credential = config.credential.as_ref().expect("google key should resolve");
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("google key should resolve");
         assert_eq!(credential.secret.expose(), "g-secret");
         assert_eq!(
             credential.source,
@@ -1169,7 +1188,10 @@ mod tests {
         // though the default order leads with anthropic.
         let e = env(&[
             ("OCEAN_MODEL", "gemini-2.0-flash"),
-            ("OCEAN_PROVIDER_FALLBACK", "deepseek-v4-pro, claude-opus-4-7"),
+            (
+                "OCEAN_PROVIDER_FALLBACK",
+                "deepseek-v4-pro, claude-opus-4-7",
+            ),
             ("ANTHROPIC_API_KEY", "sk-ant"),
             ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
         ]);
