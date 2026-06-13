@@ -14,7 +14,6 @@ members = [
   "crates/ocean-cli",
   "crates/ocean-tui",
   "crates/ocean-browser",
-  "crates/ocean-heartbeat",
   "crates/ocean-call",
   "crates/ocean-store",
   "crates/ocean-plugin",
