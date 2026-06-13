@@ -3116,15 +3116,20 @@ fn parse_federation(s: Option<&str>) -> Federation {
     }
 }
 
-/// Convene a **real** longhouse council: spawn cheap-model LLM workers, run the
+/// Convene a **real** longhouse council: run cheap-model LLM workers through the
 /// propose → endorse/inhibit rounds, let the daemon-side `QuorumEngine` decide
 /// convergence, and stream the resulting `LonghouseEvent`s onto the existing
 /// agent event bus — exactly like `longhouse_demo`, but driven by real agents
 /// and a real quorum engine instead of a scripted timer. The deck renders it
 /// with zero changes.
 ///
-/// Returns immediately with the topic id; the council runs in a background task
-/// and its events arrive on `/v1/agent/events`.
+/// Blocks until the council finishes, then returns `200 { ok, question,
+/// federation, streaming_on, title_id?, token? }`. `title_id` and `token` are
+/// present only when the council converged; they are the firekeeper's durable
+/// cross-turn claim credential. The token is delivered **only** in this direct
+/// HTTP response — it is never emitted on the SSE/bus (OCEAN-229 discipline:
+/// the bus carries public event data only, never secrets; an SSE sniff would
+/// otherwise let any bus subscriber forge a firekeeper claim).
 async fn longhouse_convene(
     State(state): State<AppState>,
     Json(req): Json<LonghouseConveneRequest>,
@@ -3132,8 +3137,8 @@ async fn longhouse_convene(
     let bus = state.agent_events.clone();
     let registry = state.longhouse.clone();
     // The persisted title registry (OCEAN-272): the convened council mints its
-    // firekeeper title into THIS durable store on convergence, so the title — and
-    // the right to `claim_outcome` against it — survives the turn.
+    // firekeeper title into THIS durable store on convergence, so the title —
+    // and the right to `claim_outcome` against it — survives the turn.
     let titles = state.titles.clone();
     let federation = parse_federation(req.federation.as_deref());
 
@@ -3145,92 +3150,107 @@ async fn longhouse_convene(
     }
 
     let topic_hint = convene_req.question.clone();
-    tokio::spawn(async move {
-        let clock = ocean_longhouse::SystemClock;
-        // Emit each longhouse event onto the agent bus, exactly as the demo does
-        // (`bus.emit(ev.into_turn_event())`), so existing SSE clients render it —
-        // AND tee it into the read-side registry so the topic survives a refresh
-        // (OCEAN-58). The registry is the durable mirror; the bus is the live feed.
-        let outcome = ocean_longhouse::convene(convene_req, &clock, |ev| {
-            // Fold into the observable topic store first, then publish to the bus.
-            // A std Mutex is fine: the guard is dropped before any await (the
-            // closure is fully synchronous), so it never blocks the scheduler.
-            if let Ok(mut reg) = registry.lock() {
-                reg.ingest(&ev);
-            }
-            bus.emit(ev.into_turn_event());
-        })
-        .await;
+    let clock = ocean_longhouse::SystemClock;
+    // Emit each longhouse event onto the agent bus, exactly as the demo does
+    // (`bus.emit(ev.into_turn_event())`), so existing SSE clients render it —
+    // AND tee it into the read-side registry so the topic survives a refresh
+    // (OCEAN-58). The registry is the durable mirror; the bus is the live feed.
+    //
+    // OCEAN-229/339: the bus closure carries only `LonghouseEvent` variants
+    // (TopicConvened, RoleGranted, Converged, …) — none of which carry the
+    // secret token. The token lives only in the `FirekeeperTitle` returned by
+    // `grant()` below and is delivered solely in this HTTP response body.
+    let outcome = ocean_longhouse::convene(convene_req, &clock, |ev| {
+        // Fold into the observable topic store first, then publish to the bus.
+        // A std Mutex is fine: the guard is dropped before any await (the
+        // closure is fully synchronous), so it never blocks the scheduler.
+        if let Ok(mut reg) = registry.lock() {
+            reg.ingest(&ev);
+        }
+        bus.emit(ev.into_turn_event());
+    })
+    .await;
 
-        // OCEAN-272: persist the firekeeper title for a converged council into the
-        // durable registry, bound to the engine's decision. The in-frame title
-        // inside `convene()` already gated the binding `Converged` it emitted
-        // (OCEAN-229); this is the *additional* durable authority that lets a
-        // firekeeper ratify in a LATER turn via `POST /v1/longhouse/claim`.
-        //
-        // Security: `grant()` mints the secret server-side from the CSPRNG and the
-        // registry persists only a salt+SHA-256 verifier — the raw token is NEVER
-        // stored and NEVER emitted on any event (we log only the public title_id /
-        // agent_id / decision). The secret `FirekeeperTitle` returned here is used
-        // and dropped in this frame, mirroring how `convene()` itself mints, uses,
-        // and drops its in-frame title: the durable *authority* persists; the
-        // secret does not leak.
-        if let Some(decision) = outcome.decision {
-            // The winning proposal's author holds the firekeeper title (the same
-            // binding `convene()` uses). Fall back is irrelevant here — a converged
-            // outcome always has a recorded firekeeper on the snapshot.
-            let firekeeper = registry
+    // OCEAN-272/339: persist the firekeeper title for a converged council into
+    // the durable registry, bound to the engine's decision. The in-frame title
+    // inside `convene()` already gated the binding `Converged` it emitted
+    // (OCEAN-229); this is the *additional* durable authority that lets a
+    // firekeeper ratify in a LATER turn via `POST /v1/longhouse/claim`.
+    //
+    // Security: `grant()` mints the secret server-side from the CSPRNG and the
+    // registry persists only a salt+SHA-256 verifier — the raw token is NEVER
+    // stored and NEVER emitted on any event (we log only the public title_id /
+    // agent_id / decision). The raw `FirekeeperTitle` returned here is used to
+    // extract the token for this response, then dropped. The durable *authority*
+    // persists in the registry; the secret travels only in this HTTP response,
+    // directly to the convening caller. It never touches the SSE bus.
+    let grant_result: Option<(Uuid, String)> = if let Some(decision) = outcome.decision {
+        // The winning proposal's author holds the firekeeper title (the same
+        // binding `convene()` uses). A converged outcome always has a recorded
+        // firekeeper on the snapshot.
+        let firekeeper = registry
+            .lock()
+            .ok()
+            .and_then(|reg| reg.topic(&outcome.topic_id).and_then(|t| t.firekeeper));
+        if let Some(firekeeper) = firekeeper {
+            let now = ocean_protocol::now_ms();
+            let mut reg = titles
                 .lock()
-                .ok()
-                .and_then(|reg| reg.topic(&outcome.topic_id).and_then(|t| t.firekeeper));
-            if let Some(firekeeper) = firekeeper {
-                let now = ocean_protocol::now_ms();
-                let granted = {
-                    let mut reg = titles
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    match reg.grant(outcome.topic_id, firekeeper, AgentRole::Firekeeper, now) {
-                        Ok((persisted, _secret)) => {
-                            // Bind the durable title to the engine's decision so a
-                            // later, engine-free `claim_bound_outcome` can ratify
-                            // exactly this proposal. `_secret` is dropped here.
-                            if let Err(e) = reg.bind_decision(persisted.title_id, decision) {
-                                tracing::warn!(error = %e, "failed to bind persisted firekeeper title to decision");
-                            }
-                            Some(persisted.title_id)
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to persist firekeeper title for converged council");
-                            None
-                        }
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match reg.grant(outcome.topic_id, firekeeper, AgentRole::Firekeeper, now) {
+                Ok((persisted, secret)) => {
+                    // Bind the durable title to the engine's decision so a
+                    // later, engine-free `claim_bound_outcome` can ratify
+                    // exactly this proposal.
+                    if let Err(e) = reg.bind_decision(persisted.title_id, decision) {
+                        tracing::warn!(error = %e, "failed to bind persisted firekeeper title to decision");
                     }
-                };
-                if let Some(title_id) = granted {
                     tracing::info!(
                         topic = %outcome.topic_id,
-                        title = %title_id,
+                        title = %persisted.title_id,
                         firekeeper = %firekeeper,
                         decision = %decision,
                         "persisted firekeeper title bound to converged decision (claimable across turns)"
                     );
+                    // Capture title_id + token before `secret` is dropped.
+                    // The token is never logged; only the title_id is public.
+                    Some((persisted.title_id, secret.token().to_string()))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to persist firekeeper title for converged council");
+                    None
                 }
             }
+        } else {
+            None
         }
+    } else {
+        None
+    };
 
-        tracing::info!(
-            topic = %outcome.topic_id,
-            converged = outcome.decision.is_some(),
-            proposals = outcome.proposals.len(),
-            "longhouse council finished"
-        );
-    });
+    tracing::info!(
+        topic = %outcome.topic_id,
+        converged = outcome.decision.is_some(),
+        proposals = outcome.proposals.len(),
+        "longhouse council finished"
+    );
 
-    Json(json!({
+    // Build the response. `title_id` and `token` are included only on
+    // convergence — a caller MUST check `converged` before using them.
+    // The token is the cross-turn claim credential; it must be stored by
+    // the caller and presented verbatim to `POST /v1/longhouse/claim`.
+    let mut resp = json!({
         "ok": true,
         "question": topic_hint,
         "federation": format!("{federation:?}").to_lowercase(),
         "streaming_on": "/v1/agent/events",
-    }))
+        "converged": grant_result.is_some(),
+    });
+    if let Some((title_id, token)) = grant_result {
+        resp["title_id"] = json!(title_id.to_string());
+        resp["token"] = json!(token);
+    }
+    Json(resp)
 }
 
 /// Request body for `POST /v1/longhouse/prepare`.
@@ -15620,6 +15640,115 @@ mod tests {
             "wrong decision is a 409; body: {body}"
         );
         assert_eq!(body["engine_decision"], json!(bound.to_string()));
+    }
+
+    // OCEAN-339: end-to-end convene→claim path is reachable.
+    //
+    // Proves that the token delivered by `longhouse_convene` on convergence can
+    // be presented verbatim to `POST /v1/longhouse/claim` and ratifies the title.
+    // In production the token arrives in the convene HTTP response body; here we
+    // simulate convergence directly (real LLM workers are unavailable in CI)
+    // using the same `grant` + `bind_decision` call the handler now makes, then
+    // drive the claim route end-to-end through `longhouse_routes()`.
+    //
+    // This is the load-bearing cross-turn guarantee: the handler must hand the
+    // token to its caller, and the caller must be able to use it in a later turn
+    // against the persisted title registry (OCEAN-272). The previous code
+    // discarded `_secret` inside a fire-and-forget spawn, making this path
+    // unreachable (always 403 ForgedFirekeeper).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn convene_response_carries_title_id_and_token_for_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let topic = esc_uid(5);
+        let agent = esc_uid(50);
+        let decision = esc_uid(6);
+
+        // Simulate what `longhouse_convene` now does on a converged outcome:
+        // grant → capture (title_id, token) → bind_decision. The handler
+        // delivers these in the HTTP 200 body; here we capture them directly.
+        let (title_id, token) = with_titles(&state, |reg| {
+            let (p, secret) = reg.grant(topic, agent, AgentRole::Firekeeper, 0).unwrap();
+            reg.bind_decision(p.title_id, decision).unwrap();
+            // This is the token that the new handler returns in resp["token"].
+            (p.title_id, secret.token().to_string())
+        });
+
+        // Later turn — claim the title through the real route. The token from
+        // the convene response is the only valid credential; a forger has none.
+        let app = longhouse_routes().with_state(state);
+        let (status, body) = post_json(
+            app,
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": title_id.to_string(),
+                "agent_id": agent.to_string(),
+                "token": token,
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the token from the convene response must ratify the title; body: {body}"
+        );
+        assert_eq!(body["ok"], json!(true), "body: {body}");
+    }
+
+    // OCEAN-339: the `POST /v1/longhouse/convene` route now includes a
+    // `converged` boolean in its response body. When models do not resolve (CI /
+    // no credentials) the council aborts → `converged: false`. When the council
+    // does converge (real LLMs), `converged: true` and `title_id` + `token` are
+    // also present. This test covers the non-converging path (the only path
+    // testable without real credentials) to pin the response shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn convene_route_response_includes_converged_flag() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let app = longhouse_routes().with_state(state);
+
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/longhouse/convene")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({ "question": "ship it?" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+
+        assert_eq!(status, StatusCode::OK, "convene must 200; body: {body}");
+        assert_eq!(body["ok"], json!(true), "body: {body}");
+        assert_eq!(
+            body["question"],
+            json!("ship it?"),
+            "question echoed in response: {body}"
+        );
+        // The new `converged` field must always be present (OCEAN-339).
+        assert!(
+            body.get("converged").is_some(),
+            "response must include `converged` field (OCEAN-339); body: {body}"
+        );
+        // Without real credentials the council aborts → not converged, so
+        // title_id and token must NOT be present.
+        assert!(
+            body.get("title_id").is_none(),
+            "title_id must be absent when not converged; body: {body}"
+        );
+        assert!(
+            body.get("token").is_none(),
+            "token must be absent when not converged; body: {body}"
+        );
+
+        std::env::remove_var("OCEAN_YOLO");
     }
 
     // `POST /v1/longhouse/board` posts a note mark onto a tracked topic's durable
