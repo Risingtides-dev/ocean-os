@@ -1986,6 +1986,9 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/longhouse/revoke",
         "POST /v1/longhouse/recall",
         "POST /v1/longhouse/breach",
+        // Workflow-brief endpoint (OCEAN-340): surfaces the OCEAN-338 loader's
+        // workflows[] over HTTP. Advisory + read-only + fail-open.
+        "POST /v1/workflows/prepare",
         "POST /v1/calls/demo",
         "POST /v1/calls/place",
         "POST /v1/calls/webhook",
@@ -2884,6 +2887,9 @@ fn longhouse_routes() -> Router<AppState> {
         // strikes via `warn` and escalates to a hard `revoke` at the threshold.
         .route("/v1/longhouse/recall", post(longhouse_recall))
         .route("/v1/longhouse/breach", post(longhouse_breach))
+        // Workflow-brief endpoint (OCEAN-340): advisory + read-only + fail-open
+        // shell that surfaces the OCEAN-338 loader's workflows[] over HTTP.
+        .route("/v1/workflows/prepare", post(workflows_prepare))
 }
 
 /// Emit a scripted-but-real Longhouse deliberation onto the agent event bus so
@@ -3355,6 +3361,74 @@ async fn longhouse_prepare(Json(req): Json<LonghousePrepareRequest>) -> Json<ser
         // "no library on disk" from "library present, nothing matched").
         "skills_indexed": skills_indexed,
         "prep": prep,
+    }))
+}
+
+// --- Workflow-brief endpoint: POST /v1/workflows/prepare (OCEAN-340) ----------
+//
+// Surfaces the OCEAN-338 WorkflowBrief loader's `workflows` field from
+// `TurnPrep` over HTTP as a thin, advisory, read-only, fail-open shell.
+// Mirrors `longhouse_prepare` exactly: same `spawn_blocking` pattern, same
+// fail-open JoinError collapse, same `advisory: true` wire contract.  Returns
+// `{ ok: true, advisory: true, workflows: [...WorkflowBrief] }`.  Until a
+// `docs/orchestrator/workflows/` dir exists in the cwd the array is empty —
+// that is the expected, correct behaviour.
+
+/// `POST /v1/workflows/prepare` — the **read-only workflow-brief step** from
+/// the Longhouse discovery wave (OCEAN-340).  Runs the same prepare path as
+/// `longhouse_prepare` but surfaces only the `workflows` field populated by the
+/// OCEAN-338 WorkflowBrief loader.
+///
+/// **Advisory only** — Longhouse recommends, it never acts.  This endpoint
+/// performs no local side effects, executes nothing, and touches no permission
+/// gate.  The `advisory: true` field makes that contract explicit on the wire.
+///
+/// **Fail-open**: a missing `docs/orchestrator/workflows/` dir, a garbled
+/// loader, or a JoinError all collapse to `workflows: []` — never a 5xx —
+/// so consulting this endpoint can never block a would-be turn.
+///
+/// The disk scan runs on a blocking thread (`spawn_blocking`) so the workflow
+/// dir walk never stalls the async scheduler, matching `longhouse_prepare`.
+async fn workflows_prepare(Json(req): Json<LonghousePrepareRequest>) -> Json<serde_json::Value> {
+    let brief = ocean_longhouse::TurnBrief {
+        session_id: req.session_id.unwrap_or_default(),
+        prompt: req.prompt,
+        cwd: req.cwd.clone(),
+        client_type: req.client_type,
+    };
+    let top_n = req.top_n;
+
+    // Scan the workflow dir on a blocking thread — same rationale as
+    // `longhouse_prepare`: filesystem I/O must not run on the async scheduler.
+    // A missing dir returns an empty index (fail-open), and a JoinError (the
+    // only way this can fail) collapses to workflows:[] — never a 500.
+    let workflows = tokio::task::spawn_blocking(move || {
+        let roots = match brief.cwd.as_deref() {
+            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
+            _ => ocean_longhouse::SkillRoots::default(),
+        };
+        let index = ocean_longhouse::cached_index_for(&roots);
+        let prep = match top_n {
+            Some(n) => index.prepare_top_n(&brief, n),
+            None => index.prepare(&brief),
+        };
+        prep.workflows
+    })
+    .await;
+
+    let workflows = workflows.unwrap_or_else(|err| {
+        // spawn_blocking only errors if the closure panicked; the loader
+        // doesn't panic, but stay fail-open here regardless.
+        tracing::warn!(error = %err, "workflows prepare task failed; returning empty list");
+        Vec::new()
+    });
+
+    Json(json!({
+        "ok": true,
+        // Advisory contract: Longhouse only recommends. This endpoint executes
+        // nothing and bypasses no permission gate.
+        "advisory": true,
+        "workflows": workflows,
     }))
 }
 
@@ -17603,6 +17677,66 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t == "write_file"));
+    }
+
+    // ---- OCEAN-340: POST /v1/workflows/prepare wiring test ----------------------
+    //
+    // Mirrors `subagent_spec_is_wired_into_longhouse_routes` exactly: drives
+    // the request through the REAL `longhouse_routes()` table, asserts 200,
+    // `ok: true`, `advisory: true`, and `workflows` is an array.  The test cwd
+    // has no `docs/orchestrator/workflows/` dir, so the array is expected to be
+    // empty — that is the correct fail-open behaviour from OCEAN-338's loader.
+
+    /// The endpoint is reachable through the REAL `longhouse_routes()` table —
+    /// not a direct handler call.  Asserts 200, `ok: true`, `advisory: true`,
+    /// and `workflows` is an array (empty when no workflow dir exists in cwd).
+    ///
+    /// Fail-open invariant: missing workflow dir → `workflows: []`, not an
+    /// error.  Advisory invariant: `advisory: true` on the wire.
+    #[tokio::test]
+    async fn workflows_prepare_is_wired_into_longhouse_routes() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let app = longhouse_routes().with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/workflows/prepare")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "prompt": "run the build workflow",
+                    "cwd": tmp.path().to_string_lossy()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "POST /v1/workflows/prepare must be wired into longhouse_routes()"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], json!(true), "ok must be true");
+        assert_eq!(body["advisory"], json!(true), "advisory must be true");
+        assert!(
+            body["workflows"].is_array(),
+            "workflows must be an array (got {:?})",
+            body["workflows"]
+        );
+        // The test cwd has no docs/orchestrator/workflows/ dir — loader is
+        // fail-open, so workflows[] is empty rather than an error.
+        assert!(
+            body["workflows"].as_array().unwrap().is_empty(),
+            "no workflow dir in test cwd, expected empty workflows, got {:?}",
+            body["workflows"]
+        );
     }
 
     // ---- OCEAN-245: opt-in Longhouse pre-turn consult turn-hook ----------------
