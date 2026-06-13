@@ -39,10 +39,19 @@
 //!   remains the named follow-up; this is the bounded deterministic prefilter
 //!   (step 1 of the documented selection path) that it would sit on top of.
 //!
-//! SOPs and workflows have **no real on-disk source yet**, so their briefs are
-//! intentionally always empty here (the types exist so the daemon contract is
-//! stable and a later phase can fill them in without a signature change). We do
-//! not fabricate SOP/workflow sources.
+//! SOPs have no real on-disk source yet; their briefs are intentionally always
+//! empty (the type exists so the daemon contract is stable; we do not fabricate
+//! SOP sources).
+//!
+//! Workflows **are** now populated: [`WorkflowIndex`] scans
+//! `{cwd}/docs/orchestrator/workflows/` (or any explicit dir set in
+//! [`WorkflowRoots`]), parses each `.md` file's YAML frontmatter (`name:` +
+//! `description:`), and surfaces ranked [`WorkflowBrief`] entries. The same
+//! fail-open and TTL-cache discipline applies: a missing dir returns empty,
+//! malformed files are skipped, and the scan runs at most once per TTL window
+//! per root via [`cached_workflows_for`] (a sibling cache keyed by
+//! [`WorkflowRoots`], separate from the skill cache to prevent cross-stale
+//! invalidation).
 //!
 //! The daemon hook + prompt injection live in `main.rs` (default-on, fail-open,
 //! time-bounded); this module is the read-only library half it calls.
@@ -129,7 +138,7 @@ pub struct SkillBrief {
 }
 
 /// A compact SOP reminder. **No real on-disk source exists yet** — present so
-/// the daemon contract is stable; always empty in phase 1.
+/// the daemon contract is stable; always empty until a SOP loader is added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SopBrief {
     pub name: String,
@@ -137,8 +146,9 @@ pub struct SopBrief {
     pub source_path: PathBuf,
 }
 
-/// A compact workflow/routine suggestion. **No real on-disk source exists yet**
-/// — present so the daemon contract is stable; always empty in phase 1.
+/// A compact workflow/routine suggestion sourced from a `.md` file with YAML
+/// frontmatter (`name:` + `description:`). Populated by [`WorkflowIndex`]
+/// scanning `docs/orchestrator/workflows/` (or any configured dir).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowBrief {
     pub name: String,
@@ -266,24 +276,29 @@ impl SkillIndex {
     }
 
     /// The pre-turn preparation step. Returns the top [`DEFAULT_TOP_N`] skills
-    /// most relevant to the brief's prompt by cheap keyword overlap.
+    /// most relevant to the brief's prompt by cheap keyword overlap, plus ranked
+    /// [`WorkflowBrief`]s sourced from `{cwd}/docs/orchestrator/workflows/`
+    /// when the brief carries a `cwd`. SOPs remain empty (no on-disk source yet).
     ///
-    /// Deterministic + fail-open: an empty/irrelevant prompt or an empty index
-    /// yields an empty [`TurnPrep`]. SOPs/workflows are always empty in phase 1.
+    /// Deterministic + fail-open: an empty/irrelevant prompt, an empty skill
+    /// index, or a missing workflow dir all yield empty results without error.
     pub fn prepare(&self, brief: &TurnBrief) -> TurnPrep {
+        let workflows = workflows_for_brief(brief, DEFAULT_TOP_N);
         TurnPrep {
             skills: self.rank_skills(&brief.prompt, DEFAULT_TOP_N),
             sops: Vec::new(),
-            workflows: Vec::new(),
+            workflows,
         }
     }
 
-    /// Same as [`prepare`](Self::prepare) but with an explicit result cap.
+    /// Same as [`prepare`](Self::prepare) but with an explicit result cap
+    /// applied to both skills and workflows.
     pub fn prepare_top_n(&self, brief: &TurnBrief, top_n: usize) -> TurnPrep {
+        let workflows = workflows_for_brief(brief, top_n);
         TurnPrep {
             skills: self.rank_skills(&brief.prompt, top_n),
             sops: Vec::new(),
-            workflows: Vec::new(),
+            workflows,
         }
     }
 
@@ -440,6 +455,253 @@ pub fn clear_index_cache() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
 }
+
+// ── Workflow index ────────────────────────────────────────────────────────────
+
+/// Configurable root for the workflow index. The documented default is
+/// `{cwd}/docs/orchestrator/workflows/`; the dir may be absent on disk — the
+/// loader skips it silently (fail-open).
+///
+/// `Hash`/`Eq` so it can key the process-wide [`cached_workflows_for`] cache.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkflowRoots {
+    /// The directory to scan for `*.md` workflow docs with YAML frontmatter.
+    pub dir: Option<PathBuf>,
+}
+
+impl WorkflowRoots {
+    /// Roots derived from a known cwd: `{cwd}/docs/orchestrator/workflows/`.
+    pub fn for_cwd(cwd: impl AsRef<Path>) -> Self {
+        Self {
+            dir: Some(cwd.as_ref().join("docs/orchestrator/workflows")),
+        }
+    }
+}
+
+/// The loaded, cached workflow index. Built once via [`WorkflowIndex::load_from`],
+/// then queried per-turn — the scan does NOT re-run on every prepare call.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowIndex {
+    workflows: Vec<WorkflowBrief>,
+}
+
+impl WorkflowIndex {
+    /// Load the index from explicit roots. Never errors: missing dirs and
+    /// malformed files are skipped (the latter logged at `warn`/`debug`).
+    pub fn load_from(roots: &WorkflowRoots) -> Self {
+        let mut workflows = Vec::new();
+        if let Some(dir) = &roots.dir {
+            scan_workflow_dir(dir, &mut workflows);
+        }
+        tracing::debug!(count = workflows.len(), "longhouse workflow index loaded");
+        Self { workflows }
+    }
+
+    /// The number of workflow briefs currently indexed.
+    pub fn len(&self) -> usize {
+        self.workflows.len()
+    }
+
+    /// True when no workflows are indexed.
+    pub fn is_empty(&self) -> bool {
+        self.workflows.is_empty()
+    }
+
+    /// Read-only view of the loaded briefs.
+    pub fn workflows(&self) -> &[WorkflowBrief] {
+        &self.workflows
+    }
+
+    /// Rank workflows against a prompt and return the top `top_n`. Uses the
+    /// same term-set scoring as skills: name hits weighted higher than
+    /// description hits, minimum-score floor, deterministic tie-break.
+    pub fn rank(&self, prompt: &str, top_n: usize) -> Vec<WorkflowBrief> {
+        if top_n == 0 || self.workflows.is_empty() {
+            return Vec::new();
+        }
+        let prompt_terms = tokenize(prompt);
+        if prompt_terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(u32, &WorkflowBrief)> = self
+            .workflows
+            .iter()
+            .filter_map(|wf| {
+                let score = workflow_relevance_score(&prompt_terms, wf);
+                (score >= MIN_RELEVANCE_SCORE).then_some((score, wf))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.name.cmp(&b.1.name))
+                .then_with(|| a.1.source_path.cmp(&b.1.source_path))
+        });
+
+        // De-dupe by (name, source_path) — same discipline as skills.
+        let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
+        scored
+            .into_iter()
+            .filter(|(_, wf)| seen.insert((wf.name.as_str(), wf.source_path.as_path())))
+            .take(top_n)
+            .map(|(_, wf)| wf.clone())
+            .collect()
+    }
+}
+
+/// Walk one dir for `*.md` workflow docs, parsing each file's YAML frontmatter.
+///
+/// Missing dir → no-op (fail-open). Unreadable/garbled file → skipped + logged.
+fn scan_workflow_dir(dir: &Path, out: &mut Vec<WorkflowBrief>) {
+    if !dir.is_dir() {
+        tracing::debug!(
+            dir = %dir.display(),
+            "longhouse workflow dir absent, skipping"
+        );
+        return;
+    }
+
+    for entry in WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| match e {
+            Ok(e) => Some(e),
+            Err(err) => {
+                tracing::debug!(error = %err, "skipping unreadable workflow dir entry");
+                None
+            }
+        })
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let is_md = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !is_md {
+            continue;
+        }
+
+        match parse_workflow_md(path) {
+            Some(brief) => out.push(brief),
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "skipping workflow doc: no usable name in frontmatter"
+                );
+            }
+        }
+    }
+}
+
+/// Parse a workflow `.md` file's YAML frontmatter for `name:` + `description:`.
+///
+/// Reuses the existing [`extract_frontmatter`] + [`yaml_scalar`] helpers —
+/// the same path as `parse_skill_md`, but without the `SKILL.md` filename gate
+/// and with no heading fallback (a workflow doc without a frontmatter `name` is
+/// simply skipped).
+fn parse_workflow_md(path: &Path) -> Option<WorkflowBrief> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let fm = extract_frontmatter(&text)?;
+    let name = yaml_scalar(&fm, "name").filter(|s| !s.is_empty())?;
+    let description = yaml_scalar(&fm, "description").unwrap_or_default();
+    Some(WorkflowBrief {
+        name,
+        description,
+        source_path: path.to_path_buf(),
+    })
+}
+
+struct WorkflowCacheEntry {
+    index: std::sync::Arc<WorkflowIndex>,
+    loaded_at: Instant,
+}
+
+fn workflow_cache() -> &'static Mutex<HashMap<WorkflowRoots, WorkflowCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<WorkflowRoots, WorkflowCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return a cached [`WorkflowIndex`] for `roots`, loading from disk only when
+/// the cache is cold or older than [`cache_ttl`]. Separate from the skill
+/// cache (`index_cache`) so editing a workflow doc doesn't stale-invalidate
+/// the skill index and vice versa. Same fail-open, poison-tolerant discipline.
+pub fn cached_workflows_for(roots: &WorkflowRoots) -> std::sync::Arc<WorkflowIndex> {
+    let ttl = cache_ttl();
+
+    if ttl.is_zero() {
+        return std::sync::Arc::new(WorkflowIndex::load_from(roots));
+    }
+
+    let mut cache = workflow_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(entry) = cache.get(roots) {
+        if entry.loaded_at.elapsed() < ttl {
+            return std::sync::Arc::clone(&entry.index);
+        }
+    }
+
+    let index = std::sync::Arc::new(WorkflowIndex::load_from(roots));
+    cache.insert(
+        roots.clone(),
+        WorkflowCacheEntry {
+            index: std::sync::Arc::clone(&index),
+            loaded_at: Instant::now(),
+        },
+    );
+    index
+}
+
+/// Drop all cached workflow indexes. Test-only seam (mirrors [`clear_index_cache`]).
+#[doc(hidden)]
+pub fn clear_workflow_cache() {
+    workflow_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Derive and rank workflow briefs from the cwd encoded in a [`TurnBrief`].
+/// Returns empty when the brief has no cwd or the workflow dir is absent.
+/// This is the single call-site that [`SkillIndex::prepare`] and
+/// [`SkillIndex::prepare_top_n`] use to populate `TurnPrep::workflows`.
+fn workflows_for_brief(brief: &TurnBrief, top_n: usize) -> Vec<WorkflowBrief> {
+    let cwd = match brief.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let roots = WorkflowRoots::for_cwd(cwd);
+    let index = cached_workflows_for(&roots);
+    index.rank(&brief.prompt, top_n)
+}
+
+/// Relevance score for a workflow against the prompt — identical algorithm to
+/// skill scoring: term-set, name-weighted, coverage bonus.
+fn workflow_relevance_score(prompt_terms: &[String], wf: &WorkflowBrief) -> u32 {
+    let name = wf.name.to_ascii_lowercase();
+    let desc = wf.description.to_ascii_lowercase();
+
+    let mut weighted = 0u32;
+    let mut distinct_hits = 0u32;
+    for term in prompt_terms {
+        if name.contains(term.as_str()) {
+            weighted += NAME_HIT;
+            distinct_hits += 1;
+        } else if desc.contains(term.as_str()) {
+            weighted += DESC_HIT;
+            distinct_hits += 1;
+        }
+    }
+    weighted + distinct_hits
+}
+
+// ── Skill scoring ─────────────────────────────────────────────────────────────
 
 /// Minimum relevance score for a skill to be surfaced. A single description-only
 /// term hit scores `DESC_HIT` (1) + the 1-distinct-term coverage bonus (1) = 2;
@@ -961,8 +1223,10 @@ mod tests {
         ));
         assert!(!prep.skills.is_empty());
         assert_eq!(prep.skills[0].name, "Remotion Video");
-        // SOPs/workflows always empty in phase 1.
-        assert!(prep.sops.is_empty() && prep.workflows.is_empty());
+        // SOPs always empty (no on-disk source). Workflows come from cwd;
+        // this brief has no cwd so they're empty here too.
+        assert!(prep.sops.is_empty());
+        assert!(prep.workflows.is_empty());
     }
 
     #[test]
@@ -1217,5 +1481,147 @@ mod tests {
             "top matches: {:?}",
             prep.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+    }
+
+    // ---- OCEAN-338: WorkflowIndex loader ----
+
+    /// Plant a workflow .md with YAML frontmatter under a tempdir's
+    /// `docs/orchestrator/workflows/` and confirm WorkflowIndex parses it.
+    #[test]
+    fn workflow_index_loads_md_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "docs/orchestrator/workflows/my-flow.md",
+            "---\nname: my-test-workflow\ndescription: does something useful in tests\n---\n\n# Body\n",
+        );
+        let roots = WorkflowRoots::for_cwd(tmp.path());
+        let index = WorkflowIndex::load_from(&roots);
+        assert_eq!(index.len(), 1, "one workflow should parse");
+        assert_eq!(index.workflows()[0].name, "my-test-workflow");
+        assert!(index.workflows()[0]
+            .description
+            .contains("does something useful"));
+    }
+
+    /// A missing workflow dir must yield an empty index, never an error.
+    #[test]
+    fn workflow_missing_dir_is_fail_open() {
+        let roots = WorkflowRoots {
+            dir: Some(PathBuf::from("/nonexistent/docs/orchestrator/workflows")),
+        };
+        let index = WorkflowIndex::load_from(&roots);
+        assert!(
+            index.is_empty(),
+            "missing dir must yield empty, not an error"
+        );
+    }
+
+    /// A workflow .md with no frontmatter (or a `name:` that's empty) is skipped.
+    #[test]
+    fn workflow_without_name_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        // No frontmatter at all.
+        write(
+            tmp.path(),
+            "docs/orchestrator/workflows/no-front.md",
+            "# Just a heading\nno frontmatter here\n",
+        );
+        // Has frontmatter but no `name:`.
+        write(
+            tmp.path(),
+            "docs/orchestrator/workflows/no-name.md",
+            "---\ndescription: has description but no name\n---\n",
+        );
+        let roots = WorkflowRoots::for_cwd(tmp.path());
+        let index = WorkflowIndex::load_from(&roots);
+        assert!(
+            index.is_empty(),
+            "workflow docs without a name must be skipped"
+        );
+    }
+
+    /// `prepare()` with a cwd that contains a matching workflow doc populates
+    /// `TurnPrep::workflows` with a brief for that workflow.
+    #[test]
+    fn prepare_populates_workflows_from_cwd() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "docs/orchestrator/workflows/factory-tick.md",
+            "---\nname: ocean-os-factory-tick\ndescription: Ocean-native factory loop for keeping ocean-os moving\n---\n",
+        );
+
+        let skill_index = SkillIndex::default(); // no skills needed for this test
+        let brief = TurnBrief {
+            prompt: "run the factory tick workflow".to_string(),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        // Disable caching so the tempdir scan is always fresh.
+        let guard = ttl_env_guard();
+        clear_workflow_cache();
+        std::env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
+
+        let prep = skill_index.prepare(&brief);
+
+        assert!(
+            prep.workflows
+                .iter()
+                .any(|wf| wf.name == "ocean-os-factory-tick"),
+            "planted workflow must surface in prep.workflows, got {:?}",
+            prep.workflows.iter().map(|w| &w.name).collect::<Vec<_>>()
+        );
+        assert!(prep.sops.is_empty(), "SOPs must remain empty");
+
+        clear_workflow_cache();
+        drop(guard);
+    }
+
+    /// `prepare()` with no cwd returns empty workflows (fail-open, not an error).
+    #[test]
+    fn prepare_no_cwd_returns_empty_workflows() {
+        let index = sample_index();
+        let prep = index.prepare(&TurnBrief::from_prompt("run the factory workflow"));
+        assert!(
+            prep.workflows.is_empty(),
+            "no cwd → no workflow scan → empty workflows"
+        );
+    }
+
+    /// The workflow cache serves stale data on a cache hit and re-scans on TTL=0.
+    #[test]
+    fn workflow_cache_hit_avoids_disk_rescan() {
+        let guard = ttl_env_guard();
+        clear_workflow_cache();
+        std::env::remove_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS");
+
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "docs/orchestrator/workflows/wf.md",
+            "---\nname: cache-test-flow\ndescription: workflow for cache test\n---\n",
+        );
+        let roots = WorkflowRoots::for_cwd(tmp.path());
+
+        let first = cached_workflows_for(&roots);
+        assert_eq!(first.len(), 1, "warm load sees the planted workflow");
+
+        // Remove the source. A cache HIT must still serve it.
+        fs::remove_dir_all(tmp.path().join("docs")).unwrap();
+        let second = cached_workflows_for(&roots);
+        assert_eq!(second.len(), 1, "cache hit must serve without re-scanning");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "cache hit returns the same Arc"
+        );
+
+        // TTL=0 → re-scan sees the deletion.
+        std::env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
+        let third = cached_workflows_for(&roots);
+        assert_eq!(third.len(), 0, "TTL=0 re-scan sees the gone dir");
+
+        clear_workflow_cache();
+        drop(guard);
     }
 }
