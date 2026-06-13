@@ -8544,7 +8544,23 @@ async fn agent_turn(
                 AgentEvent::PermissionDenied {
                     tool_name, reason, ..
                 } => {
+                    // OCEAN-317: emit a paired Started→Finished so clients can
+                    // correlate the denial with the tool call that triggered it.
+                    // A lone Finished (no Started) leaves TUI blocks in a
+                    // permanent "running" state. Both events share one call_id
+                    // minted here; ToolExecutionStart was never emitted by the
+                    // runtime for a denied call, so no existing entry exists in
+                    // `tool_call_ids` to reuse.
                     let call_id = ToolCallId(Uuid::new_v4());
+                    bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
+                        session_id: bridge_session_id,
+                        turn_id: bridge_turn_id,
+                        call: ToolCall {
+                            id: call_id.clone(),
+                            name: tool_name.clone(),
+                            args_json: serde_json::Value::Null,
+                        },
+                    });
                     bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
                         session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
