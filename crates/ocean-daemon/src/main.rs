@@ -8831,7 +8831,7 @@ async fn agent_turn(
     (
         http_status,
         Json(AgentTurnResponse {
-            ok: true,
+            ok: res.ok,
             turn_id,
             session_id,
             status: if res.ok {
