@@ -547,14 +547,17 @@ impl VelocityMeter {
     }
 
     /// Raw counts for one anchor file over the trailing window ending at
-    /// `at_commit`: `(commits, churn_lines)` where `churn_lines` is summed
-    /// added+deleted across those commits. `--follow` keeps a rename's earlier
-    /// history attached. Returns `(0, 0)` for an unattestable path (out of
-    /// tree, symlinked, unreadable commit, or absent AT the anchor commit) —
-    /// silence, never error.
-    fn counts_for_file(&self, file: &str, at_commit: &str) -> (u32, u64) {
+    /// `at_commit`: `Some((resolved_path, commits, churn_lines))` where
+    /// `churn_lines` is summed added+deleted across those commits, and
+    /// `resolved_path` is the path actually measured (the exact anchor or its
+    /// unique basename resolution) so the caller can DEDUP by it — two anchors
+    /// naming the same file differently must not double-count. `--follow` keeps
+    /// a rename's earlier history attached. `None` for an unattestable anchor
+    /// (out of tree, symlinked, ambiguous basename, unreadable commit, or
+    /// absent AT the anchor commit) — silence, never error.
+    fn counts_for_file(&self, file: &str, at_commit: &str) -> Option<(String, u32, u64)> {
         if !is_repo_relative(file) {
-            return (0, 0);
+            return None;
         }
         // The trailing window's end time: a real commit's timestamp, or HEAD's
         // for a working-tree measurement (WORKTREE is not a revision, so it
@@ -563,10 +566,8 @@ impl VelocityMeter {
         // Resolve the path whose churn we measure: the exact anchor when it is
         // a present regular file, else the UNIQUE bare-basename match (B1's
         // corpus fallback). Ambiguous / absent / non-regular → no signal.
-        let Some(path) = self.effective_path(file, at_commit, time_rev) else {
-            return (0, 0);
-        };
-        let Some(end) = self.commit_time(time_rev) else { return (0, 0) };
+        let path = self.effective_path(file, at_commit, time_rev)?;
+        let end = self.commit_time(time_rev)?;
         let lo = end - self.window_days * 86_400;
         // `--` separates options from paths but does NOT disable pathspec
         // magic: an untrusted anchor like `:(glob)**/*.rs` would otherwise
@@ -577,7 +578,7 @@ impl VelocityMeter {
         let literal = format!(":(literal){path}");
         // Walk from `time_rev` (HEAD for a working-tree measurement — WORKTREE
         // is not a revision; committed history is what `git log` can read).
-        let Some(out) = self.git(&[
+        let out = self.git(&[
             "log",
             "--follow",
             // `%at` (author time), matching `commit_time`'s window bounds — a
@@ -587,9 +588,7 @@ impl VelocityMeter {
             time_rev,
             "--",
             &literal,
-        ]) else {
-            return (0, 0);
-        };
+        ])?;
         let mut commits: u32 = 0;
         let mut churn: u64 = 0;
         let mut in_window = false;
@@ -608,7 +607,7 @@ impl VelocityMeter {
                 }
             }
         }
-        (commits, churn)
+        Some((path, commits, churn))
     }
 
     /// Measure `(v_code, v_sem)` for a claim's anchor set at its anchor commit.
@@ -628,24 +627,27 @@ impl VelocityMeter {
     ///   the same cadence. With zero commits both are exactly `0.0`, so a
     ///   frozen anchor reduces [`VelocityDecayTrust`] to the baseline.
     pub fn measure(&self, claim: &Claim) -> Velocity {
-        // Distinct, attestable anchor files only.
-        let mut files: Vec<&str> = claim
-            .provenance
-            .anchors
-            .iter()
-            .filter_map(|a| a.file.as_deref())
-            .collect();
-        files.sort_unstable();
-        files.dedup();
-
         let commit = claim.provenance.commit_sha.as_str();
         if commit.is_empty() {
             return Velocity { v_code: 0.0, v_sem: 0.0 };
         }
+        // Dedup by RESOLVED path, not by the raw anchor string: two anchors
+        // that name the same file differently (bare `input.rs` + full
+        // `crates/.../input.rs`) resolve to one tracked path and must be
+        // counted once, or velocity would be inflated for multi-anchor claims
+        // that point at a single nested file. Each unique resolved path
+        // contributes its counts exactly once.
+        let mut seen: std::collections::HashMap<String, (u32, u64)> =
+            std::collections::HashMap::new();
+        for anchor in &claim.provenance.anchors {
+            let Some(file) = anchor.file.as_deref() else { continue };
+            if let Some((path, c, churn)) = self.counts_for_file(file, commit) {
+                seen.entry(path).or_insert((c, churn));
+            }
+        }
         let mut total_commits: u32 = 0;
         let mut total_churn: u64 = 0;
-        for file in files {
-            let (c, churn) = self.counts_for_file(file, commit);
+        for (c, churn) in seen.values() {
             total_commits += c;
             total_churn += churn;
         }

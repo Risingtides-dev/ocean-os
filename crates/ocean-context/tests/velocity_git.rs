@@ -481,3 +481,61 @@ fn bare_basename_anchor_measures_the_unique_nested_file() {
     assert_eq!(ambiguous.v_sem, 0.0, "an ambiguous basename has no attributable churn");
     assert_eq!(ambiguous.v_code, 0.0);
 }
+
+/// Make a claim with several anchor files on one commit.
+fn multi_file_claim(id: &str, files: &[&str], commit: &str) -> Claim {
+    let anchors = files
+        .iter()
+        .map(|f| Anchor { file: Some((*f).into()), symbol: None, lines: vec![], sig_hash: None })
+        .collect();
+    Claim {
+        id: id.into(),
+        text: format!("claim {id}"),
+        provenance: Provenance { anchors, tickets: vec![], commit_sha: commit.into() },
+        status: ClaimStatus::Verified,
+        knowledge_tier: KnowledgeTier::Individual,
+        ps_anchor: None,
+        confidence: 1.0,
+        borrowed_from: None,
+        history: vec![ClaimEvent { at: 0, event: "written".into(), by_session: "t".into() }],
+    }
+}
+
+/// Codex P2 (PR #210): two anchors naming the SAME file differently — bare
+/// `input.rs` plus its full `crates/.../input.rs` — must count once. Raw-string
+/// dedup runs before basename resolution, so both would resolve to the same
+/// tracked path and double-count, inflating velocity. Dedup-by-resolved-path
+/// fixes it.
+#[test]
+fn two_anchors_for_one_resolved_file_count_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+    let nested = "crates/core/src/input.rs";
+    std::fs::write(root.join(nested), "fn input() {}\n").unwrap();
+    git_at(root, "2026-06-01T12:00:00 +0000", &["add", "."]);
+    git_at(root, "2026-06-01T12:00:00 +0000", &["commit", "-qm", "born"]);
+    for day in 16..=21 {
+        let when = format!("2026-06-{day:02}T12:00:00 +0000");
+        let body: String = (0..day * 8).map(|i| format!("    let v{i} = {i};\n")).collect();
+        std::fs::write(root.join(nested), format!("fn input() {{\n{body}}}\n")).unwrap();
+        git_at(root, &when, &["add", nested]);
+        git_at(root, &when, &["commit", "-qm", &format!("churn {day}")]);
+    }
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let meter = VelocityMeter::new(root.to_path_buf());
+
+    // Single anchor (full path) = the ground-truth velocity for this file.
+    let single = meter.measure(&multi_file_claim("one", &[nested], &head));
+    assert!(single.v_code > 0.0);
+
+    // Two anchors pointing at the SAME resolved file (bare + full): identical
+    // to the single-anchor measurement — NOT doubled.
+    let two = meter.measure(&multi_file_claim("two", &["input.rs", nested], &head));
+    assert_eq!(two.v_code, single.v_code, "same file via two anchors must not double-count");
+    assert_eq!(two.v_sem, single.v_sem);
+    // Order-independent.
+    let two_rev = meter.measure(&multi_file_claim("two_rev", &[nested, "input.rs"], &head));
+    assert_eq!(two_rev.v_code, single.v_code);
+}
