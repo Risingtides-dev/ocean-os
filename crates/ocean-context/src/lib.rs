@@ -15,7 +15,8 @@ pub use claim::*;
 pub use extract::{extract_claims, ExtractCtx};
 pub use seams::{
     Baseline, Borrowed, Borrower, ConfidenceRecencyTrust, FileExistsResolver, NoBorrow,
-    Resolution, Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel, WORKTREE,
+    Resolution, Resolver, Retriever, SubstringRetriever, TrustContext, TrustModel,
+    VelocityDecayTrust, VelocityMeter, VELOCITY_WINDOW_DAYS, WORKTREE,
 };
 pub use treesitter::TreeSitterResolver;
 
@@ -34,7 +35,7 @@ pub fn read_freshest(dir: &Path, repo: &str, branch: &str, now: i64) -> Result<O
         return Ok(None);
     };
     let trust = ConfidenceRecencyTrust::default();
-    let ctx = TrustContext { now, handoff_written_at: h.written_at };
+    let ctx = TrustContext::new(now, h.written_at);
     h.claims.sort_by(|a, b| trust.trust(b, &ctx).total_cmp(&trust.trust(a, &ctx)));
     Ok(Some(h))
 }

@@ -2,8 +2,8 @@
 //! trivial stubs; Layer B (tree-sitter, velocity decay, BM25+embeddings,
 //! feature-borrowing) implements them behind the exact same signatures.
 
-use crate::claim::{Anchor, Claim};
-use std::path::PathBuf;
+use crate::claim::{Anchor, Claim, Velocity};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Pseudo-commit meaning "resolve against the working tree, not git history".
@@ -64,6 +64,29 @@ pub struct TrustContext {
     /// whose history carries no `written` event (schema friction #6: such
     /// claims must never silently decay from epoch 0).
     pub handoff_written_at: i64,
+    /// Semantic/code velocity of the anchored region, measured OUTSIDE the lib
+    /// (by [`VelocityMeter`] against real git history) and passed in — the lib
+    /// stays `now()`-free and git-free at the trust seam. `None` means "no
+    /// velocity measured": [`VelocityDecayTrust`] then falls back to the fixed
+    /// half-life, identical to [`ConfidenceRecencyTrust`]. The no-velocity
+    /// baseline is the zero case, never a separate code path.
+    pub velocity: Option<Velocity>,
+}
+
+impl TrustContext {
+    /// The no-velocity context (B2 absent): only `now` + the handoff's
+    /// `written_at` fallback. [`VelocityDecayTrust`] on this is byte-for-byte
+    /// [`ConfidenceRecencyTrust`].
+    pub fn new(now: i64, handoff_written_at: i64) -> Self {
+        Self { now, handoff_written_at, velocity: None }
+    }
+
+    /// Attach a measured velocity (B2). Builder-style so existing call sites
+    /// that only know `now`/`written_at` are untouched.
+    pub fn with_velocity(mut self, velocity: Velocity) -> Self {
+        self.velocity = Some(velocity);
+        self
+    }
 }
 
 /// Score a claim's live trust. v1 stub: confidence × recency.
@@ -202,6 +225,84 @@ impl TrustModel for ConfidenceRecencyTrust {
     }
 }
 
+/// B2 — the velocity-modulated forgetting term of the master equation
+/// (OCEAN-313): `e^(−λ(v)·Δt)` with `λ(v) = ln2/H`, `H = H₀·e^(−κ·v_sem)`.
+///
+/// **What it does.** The half-life is no longer fixed. It *contracts with
+/// churn*: high `v_sem` (molten code) → small `H` → fast decay (everything
+/// provisional, reverify cheap); `v_sem ≈ 0` (frozen code) → `H ≈ H₀` → slow
+/// decay, so a broken anchor on a crystallized region is a *real alarm* rather
+/// than expected drift. The system tapers itself — it reads whether the
+/// codebase's representational geometry has stiffened and lengthens trust
+/// accordingly. `v_sem` is the disentanglement-rate proxy from
+/// [`VelocityMeter`] (see its docs for why churn-rate is a faithful stand-in
+/// for the spec's representation-kernel `d/dt` at this layer).
+///
+/// **Reduces to the baseline.** With no measured velocity
+/// (`ctx.velocity == None`) OR `v_sem == 0`, `H = H₀` and this is *exactly*
+/// [`ConfidenceRecencyTrust`] — same `confidence × e^(−ln2·Δt/H₀)`, bit-for-bit
+/// (`reduces_to_confidence_recency_when_no_velocity` asserts it). B2 adds a
+/// term, it does not replace the v1 curve; the v1 model stays as the
+/// no-velocity baseline.
+///
+/// **Constants, derived against real ocean-os history (not guessed).** Measured
+/// at HEAD, 7-day window, with [`VelocityMeter`]'s own `v_sem` formula:
+/// - `h0_secs = 30 days` — matches the v1 fixed half-life, so the `v_sem = 0`
+///   reduction is to the *same* number, not a near-miss.
+/// - `kappa = ln2 / v_inflect`, `v_inflect = 5.27` (the measured `v_sem` of a
+///   mature-but-not-dead provider, `crates/ocean-protocol/src/providers/
+///   anthropic.rs`) ⟹ `κ ≈ 0.1315`. This puts the half-life inflection
+///   (`H = H₀/2`, one extra halving of trust from velocity alone) exactly at
+///   the maturity boundary: a region as live as a built-out provider gets half
+///   the frozen half-life. Measured taper at HEAD — frozen anchor (`input.rs`,
+///   built-then-abandoned, `v_sem≈0`) keeps the full 30 days; frozen doc
+///   (`README.md`, 0.42) → 28.4 days; mature provider (5.27) → 15 days (the
+///   inflection); warm protocol (`core/lib.rs`, 10.4) → 7.7 days; hot session
+///   layer (`agent/lib.rs`, 21.9) → 1.7 days; molten hub (`daemon/main.rs`,
+///   61.5) → ~13 minutes. Whether that maturity inflection is reasonable is a
+///   human judgment call — see the PR's taper-curve table.
+pub struct VelocityDecayTrust {
+    /// Frozen-anchor half-life in seconds (`H₀`). Default 30 days — the v1
+    /// fixed half-life, so `v_sem = 0` reduces to [`ConfidenceRecencyTrust`].
+    pub h0_secs: f64,
+    /// Stiffening coefficient `κ`. Default `≈0.1315` (`ln2 / 5.27`): the
+    /// half-life halves at `v_sem ≈ 5.27`, the measured churn rate of a mature
+    /// ocean-os provider file.
+    pub kappa: f64,
+}
+
+impl Default for VelocityDecayTrust {
+    fn default() -> Self {
+        // κ = ln2 / v_inflect, v_inflect = 5.27 (measured anthropic.rs v_sem).
+        Self { h0_secs: 30.0 * 24.0 * 3600.0, kappa: std::f64::consts::LN_2 / 5.27 }
+    }
+}
+
+impl VelocityDecayTrust {
+    /// The velocity-modulated half-life `H = H₀·e^(−κ·v_sem)` in seconds.
+    /// `v_sem` is clamped to be non-negative — a churn *rate* is never
+    /// negative, and a stray negative would *lengthen* the half-life past
+    /// frozen, which is meaningless.
+    pub fn half_life_secs(&self, v_sem: f32) -> f64 {
+        let v = f64::from(v_sem).max(0.0);
+        self.h0_secs * (-self.kappa * v).exp()
+    }
+}
+
+impl TrustModel for VelocityDecayTrust {
+    fn trust(&self, claim: &Claim, ctx: &TrustContext) -> f32 {
+        // Same freshness rule as v1 (schema friction #6): no `written` event
+        // ⇒ date from the handoff's `written_at`, never epoch 0.
+        let written = claim.written_at().unwrap_or(ctx.handoff_written_at);
+        let dt = (ctx.now - written).max(0) as f64;
+        // No measured velocity ⇒ v_sem = 0 ⇒ H = H₀: the baseline curve.
+        let v_sem = ctx.velocity.map_or(0.0, |v| v.v_sem);
+        let h = self.half_life_secs(v_sem);
+        let decay = (-(std::f64::consts::LN_2) * dt / h).exp();
+        claim.confidence * decay as f32
+    }
+}
+
 /// Case-insensitive word-overlap scoring; zero-score claims are dropped.
 pub struct SubstringRetriever;
 
@@ -235,13 +336,207 @@ impl Borrower for NoBorrow {
     }
 }
 
+// ---------------------------------------------------------------------------
+// B2 — velocity measurement from real git history (OCEAN-313)
+// ---------------------------------------------------------------------------
+
+/// Default trailing window for the churn-rate proxy, in days. Chosen against
+/// ocean-os's ~36-day history: a window this short reads the *instantaneous*
+/// local churn rate (a file built-then-abandoned reads ~0; a constantly-edited
+/// hub reads high), whereas a 30-day window on a 36-day repo just accumulates
+/// cumulative age and can't separate molten from frozen. Configurable.
+pub const VELOCITY_WINDOW_DAYS: i64 = 7;
+
+/// Measures a claim's anchor velocity from REAL git history — the input to
+/// [`VelocityDecayTrust`]'s `v_sem`. Lives OUTSIDE the trust seam (it touches
+/// git; the lib's `trust()` does not), so the trust math stays pure and
+/// `now()`-free: you measure here, pass the [`Velocity`] in via
+/// [`TrustContext::with_velocity`].
+///
+/// ## The proxy (and why it is faithful — the TRUE kernel `d/dt` is DEFERRED)
+///
+/// The spec defines `v_sem` as the *rate of disentanglement* — the time
+/// derivative of the representation-kernel geometry (Wang–Fusi). Computing that
+/// literally needs embeddings + the parallelism-score machinery (B4), which do
+/// not exist yet and must not be pulled forward (staging discipline). So B2
+/// ships a **churn-rate proxy**: the rate at which a claim's anchor file(s)
+/// are being rewritten in git, measured over a trailing window ending at the
+/// claim's anchor commit.
+///
+/// Why churn-rate is a faithful stand-in *at this layer*: the representation
+/// kernel only disentangles when the *code changes* — a file no commit touches
+/// cannot be moving through representational space, and a file under constant
+/// rewrite is precisely one whose structure has not yet crystallized. Commit
+/// frequency on the anchored region is therefore a monotone, observable lower
+/// bound on the true `d/dt`: it cannot see *semantic* churn inside a
+/// byte-identical file (a dependency's meaning shifting underneath it), so it
+/// under-reports, never over-reports, disentanglement — the safe direction
+/// (it errs toward *longer* trust, never spuriously shorter). It is exact at
+/// the two poles the taper cares about (frozen ⇒ 0, molten ⇒ large), and
+/// `VelocityDecayTrust` consumes only `v_sem`'s magnitude, not its provenance —
+/// so B4 can later swap the kernel `d/dt` in behind this same `Velocity`
+/// without touching the trust model.
+///
+/// ## Trust boundary (mirrors B1's `TreeSitterResolver` exactly)
+///
+/// - git reads only via `git -C <repo_root>` — **never a checkout**;
+/// - `--follow` so a renamed anchor's history isn't truncated at the rename;
+/// - anchors that are not [`is_repo_relative`] (absolute, `..`) contribute
+///   nothing — `Velocity` stays `0` for them, never an error and never a git
+///   probe on an out-of-tree path;
+/// - a symlinked anchor path is skipped (consistent with B1's symlink trust
+///   boundary): its history is the link's, not the region the claim is about.
+pub struct VelocityMeter {
+    pub repo_root: PathBuf,
+    /// Trailing window in days (default [`VELOCITY_WINDOW_DAYS`]).
+    pub window_days: i64,
+}
+
+impl VelocityMeter {
+    pub fn new(repo_root: PathBuf) -> Self {
+        Self { repo_root, window_days: VELOCITY_WINDOW_DAYS }
+    }
+
+    fn git(&self, args: &[&str]) -> Option<String> {
+        let out = Command::new("git").arg("-C").arg(&self.repo_root).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Author time (unix seconds) of `rev`, or `None` if it can't be read
+    /// (unknown/pruned commit in a shallow clone — uncheckable, never an
+    /// error).
+    fn commit_time(&self, rev: &str) -> Option<i64> {
+        self.git(&["log", "-1", "--format=%ct", rev])
+            .and_then(|s| s.trim().parse::<i64>().ok())
+    }
+
+    /// Whether the in-repo `file` path crosses a symlink at the working tree
+    /// (the same one-segment `symlink_metadata` walk B1 uses). At-history reads
+    /// can't follow a symlink — git tracks the link blob — but a working-tree
+    /// symlink whose *string* is repo-relative still points out of the trust
+    /// boundary, so its commit history is not the anchored region's. Callers
+    /// pass only `is_repo_relative` paths, so the accumulated path can't escape
+    /// `repo_root` during the walk.
+    fn crosses_symlink(&self, file: &str) -> bool {
+        let mut acc = self.repo_root.clone();
+        for comp in Path::new(file).components() {
+            if let std::path::Component::Normal(seg) = comp {
+                acc.push(seg);
+                match std::fs::symlink_metadata(&acc) {
+                    Ok(md) if md.file_type().is_symlink() => return true,
+                    Ok(_) => {}
+                    Err(_) => return false, // vanished mid-walk: nothing to follow
+                }
+            }
+        }
+        false
+    }
+
+    /// Raw counts for one anchor file over the trailing window ending at
+    /// `at_commit`: `(commits, churn_lines)` where `churn_lines` is summed
+    /// added+deleted across those commits. `--follow` keeps a rename's earlier
+    /// history attached. Returns `(0, 0)` for an unattestable path (out of
+    /// tree, symlinked, unreadable commit) — silence, never error.
+    fn counts_for_file(&self, file: &str, at_commit: &str) -> (u32, u64) {
+        if !is_repo_relative(file) {
+            return (0, 0);
+        }
+        if self.crosses_symlink(file) {
+            return (0, 0);
+        }
+        let Some(end) = self.commit_time(at_commit) else { return (0, 0) };
+        let lo = end - self.window_days * 86_400;
+        // `--follow` needs a single pathspec; `--no-renames` off so the rename
+        // chain is walked. `%ct` per commit, then numstat rows for that commit.
+        let Some(out) = self.git(&[
+            "log",
+            "--follow",
+            "--format=COMMIT %ct",
+            "--numstat",
+            at_commit,
+            "--",
+            file,
+        ]) else {
+            return (0, 0);
+        };
+        let mut commits: u32 = 0;
+        let mut churn: u64 = 0;
+        let mut in_window = false;
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix("COMMIT ") {
+                let t: i64 = rest.trim().parse().unwrap_or(i64::MIN);
+                in_window = t >= lo && t <= end;
+                if in_window {
+                    commits += 1;
+                }
+            } else if in_window && !line.is_empty() {
+                // numstat: "<added>\t<deleted>\t<path>"; binary files show "-".
+                let mut it = line.split('\t');
+                if let (Some(a), Some(d)) = (it.next(), it.next()) {
+                    churn += a.parse::<u64>().unwrap_or(0) + d.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+        (commits, churn)
+    }
+
+    /// Measure `(v_code, v_sem)` for a claim's anchor set at its anchor commit.
+    ///
+    /// Both axes are **rates per day** over the trailing window, aggregated
+    /// across the claim's anchor files (a claim touching several hot files is
+    /// more molten than one touching a single hot file). To stay robust to a
+    /// claim that anchors the same file twice, files are de-duplicated first.
+    ///
+    /// - `v_code` = commits/day (structural-edit frequency on the region);
+    /// - `v_sem` = a churn-magnitude-weighted rate, `commits/day · (1 + ln(1 +
+    ///   lines_per_commit))`. Pure commit-frequency (`v_code`) treats a
+    ///   one-line tweak and a full rewrite alike; weighting by *how much* each
+    ///   commit moved (sub-linear, so a giant mechanical reformat can't
+    ///   dominate) tracks disentanglement more closely — a region rewritten in
+    ///   large strokes is less crystallized than one receiving tiny touches at
+    ///   the same cadence. With zero commits both are exactly `0.0`, so a
+    ///   frozen anchor reduces [`VelocityDecayTrust`] to the baseline.
+    pub fn measure(&self, claim: &Claim) -> Velocity {
+        // Distinct, attestable anchor files only.
+        let mut files: Vec<&str> = claim
+            .provenance
+            .anchors
+            .iter()
+            .filter_map(|a| a.file.as_deref())
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+
+        let commit = claim.provenance.commit_sha.as_str();
+        if commit.is_empty() {
+            return Velocity { v_code: 0.0, v_sem: 0.0 };
+        }
+        let mut total_commits: u32 = 0;
+        let mut total_churn: u64 = 0;
+        for file in files {
+            let (c, churn) = self.counts_for_file(file, commit);
+            total_commits += c;
+            total_churn += churn;
+        }
+        let window = self.window_days.max(1) as f32;
+        let v_code = total_commits as f32 / window;
+        let v_sem = if total_commits == 0 {
+            0.0
+        } else {
+            let lines_per_commit = total_churn as f32 / total_commits as f32;
+            v_code * (1.0 + (1.0 + lines_per_commit).ln())
+        };
+        Velocity { v_code, v_sem }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::claim::tests::sample_handoff;
 
     fn ctx_at(now: i64) -> TrustContext {
-        TrustContext { now, handoff_written_at: 1_780_980_000 }
+        TrustContext::new(now, 1_780_980_000)
     }
 
     #[test]
@@ -268,6 +563,88 @@ mod tests {
         let one_half_life = ctx_at(1_780_980_000 + 30 * 24 * 3600);
         let got = trust.trust(&claim, &one_half_life);
         assert!((got - 0.45).abs() < 1e-3, "decays from handoff written_at, got {got}");
+    }
+
+    // ---- B2: velocity-modulated decay (OCEAN-313) ----
+
+    /// THE reduction contract (spec deliverable #1): `VelocityDecayTrust` with
+    /// no measured velocity must be byte-for-byte `ConfidenceRecencyTrust`.
+    /// Same H₀ on both sides, swept across the whole decay curve.
+    #[test]
+    fn reduces_to_confidence_recency_when_no_velocity() {
+        let h = sample_handoff();
+        let claim = &h.claims[0];
+        let baseline = ConfidenceRecencyTrust::default();
+        let b2 = VelocityDecayTrust::default(); // h0 == baseline half-life
+        let t0 = 1_780_980_000;
+        for days in [0, 1, 7, 15, 30, 60, 120, 365] {
+            let ctx = ctx_at(t0 + days * 24 * 3600); // velocity: None
+            let a = baseline.trust(claim, &ctx);
+            let b = b2.trust(claim, &ctx);
+            assert_eq!(a.to_bits(), b.to_bits(), "diverged at day {days}: {a} vs {b}");
+        }
+    }
+
+    /// v_sem == 0 (an explicitly-measured frozen anchor) is the same zero case
+    /// as `velocity: None`: still exactly the baseline.
+    #[test]
+    fn v_sem_zero_is_the_baseline() {
+        let h = sample_handoff();
+        let claim = &h.claims[0];
+        let baseline = ConfidenceRecencyTrust::default();
+        let b2 = VelocityDecayTrust::default();
+        let ctx = ctx_at(1_780_980_000 + 30 * 24 * 3600)
+            .with_velocity(Velocity { v_code: 0.0, v_sem: 0.0 });
+        assert_eq!(baseline.trust(claim, &ctx).to_bits(), b2.trust(claim, &ctx).to_bits());
+    }
+
+    /// The taper: higher churn ⇒ shorter half-life ⇒ less surviving trust at a
+    /// fixed Δt. Monotone strictly decreasing in v_sem.
+    #[test]
+    fn higher_velocity_decays_faster() {
+        let h = sample_handoff();
+        let claim = &h.claims[0];
+        let b2 = VelocityDecayTrust::default();
+        let dt_ctx = |v_sem: f32| {
+            ctx_at(1_780_980_000 + 7 * 24 * 3600)
+                .with_velocity(Velocity { v_code: 0.0, v_sem })
+        };
+        let frozen = b2.trust(claim, &dt_ctx(0.0));
+        let mature = b2.trust(claim, &dt_ctx(5.27));
+        let warm = b2.trust(claim, &dt_ctx(10.4));
+        let molten = b2.trust(claim, &dt_ctx(61.5));
+        assert!(frozen > mature, "{frozen} !> {mature}");
+        assert!(mature > warm, "{mature} !> {warm}");
+        assert!(warm > molten, "{warm} !> {molten}");
+        // Frozen at 7 days < one 30-day half-life ⇒ still most of the trust.
+        assert!(frozen > 0.5 * claim.confidence);
+        // Molten anchor is near-worthless after a week.
+        assert!(molten < 0.02);
+    }
+
+    /// The half-life formula itself: H(0) = H₀, and the inflection H₀/2 lands
+    /// at the derived v_sem (≈5.27, the mature-provider rate).
+    #[test]
+    fn half_life_inflection_lands_at_mature_velocity() {
+        let b2 = VelocityDecayTrust::default();
+        let h0 = b2.h0_secs;
+        assert!((b2.half_life_secs(0.0) - h0).abs() < 1e-6);
+        // κ = ln2/5.27 ⇒ H(5.27) = H₀·e^(−ln2) = H₀/2 (within f64 round-trip).
+        assert!((b2.half_life_secs(5.27) - h0 / 2.0).abs() < h0 * 1e-6);
+        // A negative rate is impossible; it must not lengthen H past frozen.
+        assert!(b2.half_life_secs(-3.0) <= h0);
+    }
+
+    /// A negative `now - written` (clock skew / claim from the future) must not
+    /// blow trust above confidence — same `.max(0)` guard as the baseline.
+    #[test]
+    fn future_dated_claim_does_not_exceed_confidence() {
+        let h = sample_handoff();
+        let claim = &h.claims[0];
+        let b2 = VelocityDecayTrust::default();
+        let past = ctx_at(1_780_980_000 - 10 * 24 * 3600)
+            .with_velocity(Velocity { v_code: 1.0, v_sem: 5.0 });
+        assert!((b2.trust(claim, &past) - claim.confidence).abs() < 1e-6);
     }
 
     #[test]
