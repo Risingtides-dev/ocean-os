@@ -432,6 +432,26 @@ impl VelocityMeter {
         false
     }
 
+    /// Whether `file` is a REGULAR tracked blob (mode 100644 / 100755) at
+    /// `rev`. `ls-tree` lists nothing for an absent path and reports the mode
+    /// for a present one, so this is existence + mode in one probe: a symlink
+    /// blob (120000) or a tree (040000) is rejected — only a real file carries
+    /// a churn signal. The path is forced to a literal pathspec so anchor magic
+    /// can't widen the match.
+    fn is_regular_blob_at(&self, file: &str, rev: &str) -> bool {
+        let literal = format!(":(literal){file}");
+        let Some(out) = self.git(&["ls-tree", "-z", rev, "--", &literal]) else {
+            return false;
+        };
+        // `ls-tree` rows are `<mode> SP <type> SP <object> TAB <path>`; with
+        // `-z` they are NUL-separated. The mode is the leading whitespace-
+        // delimited token of each row.
+        out.split('\0')
+            .filter(|row| !row.is_empty())
+            .filter_map(|row| row.split_whitespace().next())
+            .any(|mode| mode == "100644" || mode == "100755")
+    }
+
     /// Raw counts for one anchor file over the trailing window ending at
     /// `at_commit`: `(commits, churn_lines)` where `churn_lines` is summed
     /// added+deleted across those commits. `--follow` keeps a rename's earlier
@@ -442,6 +462,10 @@ impl VelocityMeter {
         if !is_repo_relative(file) {
             return (0, 0);
         }
+        // The trailing window's end time: a real commit's timestamp, or HEAD's
+        // for a working-tree measurement (WORKTREE is not a revision, so it
+        // can't date the window directly).
+        let time_rev = if at_commit == WORKTREE { "HEAD" } else { at_commit };
         if at_commit == WORKTREE {
             // Working-tree measurement reads the live filesystem, so the same
             // symlink guard B1 applies in WORKTREE mode holds: a symlinked path
@@ -450,28 +474,31 @@ impl VelocityMeter {
                 return (0, 0);
             }
         } else {
-            // At-commit measurement: the anchor must EXIST at its own commit to
-            // carry a velocity signal. `git log -- <path>` still returns a
-            // deleted file's deletion + prior edits, so a file removed
-            // at/before `at_commit` would otherwise read as "recently churned"
-            // and decay trust — when the anchor is unattestable there (B1
-            // resolves it Dead). Same existence probe the resolver uses.
+            // At-commit measurement: the anchor must be a REGULAR tracked blob
+            // at its own commit to carry a velocity signal.
             //
-            // Crucially, the symlink guard above is NOT applied here: it
-            // consults the CURRENT checkout, but history reads go through
-            // `<rev>:<path>` (git's object syntax — a literal tree path, no
-            // filesystem traversal, no pathspec magic), exactly like
-            // `TreeSitterResolver::load`'s at-commit path. Gating historical
-            // churn on what HEAD happens to symlink now would make decay depend
-            // on the current checkout — a file that was a real blob at its
-            // anchor commit but is a symlink at HEAD must still measure its
-            // real historical velocity. A degenerate path just fails the
-            // existence probe → 0, the safe direction.
-            if self.git(&["cat-file", "-e", &format!("{at_commit}:{file}")]).is_none() {
+            // - Existence: `git log -- <path>` still returns a deleted file's
+            //   deletion + prior edits, so a file removed at/before `at_commit`
+            //   would otherwise read as "recently churned" when the anchor is
+            //   unattestable there (B1 resolves it Dead).
+            // - Mode: git stores a symlink as a 120000 blob, so an existence-
+            //   only probe (`cat-file -e`) would ACCEPT a historical symlink
+            //   and `--numstat` would count edits to the link-target string as
+            //   churn — the symlink trust boundary, breached in the past tense.
+            //
+            // `ls-tree` checks both at once: it lists nothing for an absent
+            // path and reports the mode for a present one. We accept only
+            // regular-file modes (100644 / 100755); symlink (120000) and tree
+            // (040000) yield no signal. The worktree symlink guard is
+            // deliberately NOT consulted here — history reads go through
+            // `<rev>:<path>` (object syntax, no filesystem traversal), so a
+            // file that was a real blob at its anchor commit but is a symlink
+            // at HEAD still measures its real historical velocity.
+            if !self.is_regular_blob_at(file, at_commit) {
                 return (0, 0);
             }
         }
-        let Some(end) = self.commit_time(at_commit) else { return (0, 0) };
+        let Some(end) = self.commit_time(time_rev) else { return (0, 0) };
         let lo = end - self.window_days * 86_400;
         // `--` separates options from paths but does NOT disable pathspec
         // magic: an untrusted anchor like `:(glob)**/*.rs` would otherwise
@@ -481,12 +508,14 @@ impl VelocityMeter {
         // zero, the safe direction. `:(literal)` is a single pathspec, which
         // `--follow` requires.
         let literal = format!(":(literal){file}");
+        // Walk from `time_rev` (HEAD for a working-tree measurement — WORKTREE
+        // is not a revision; committed history is what `git log` can read).
         let Some(out) = self.git(&[
             "log",
             "--follow",
             "--format=COMMIT %ct",
             "--numstat",
-            at_commit,
+            time_rev,
             "--",
             &literal,
         ]) else {

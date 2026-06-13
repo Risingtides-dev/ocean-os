@@ -7,7 +7,7 @@
 //! boundary (out-of-tree paths, symlinks) mirrors B1's `TreeSitterResolver`.
 
 use ocean_context::claim::{Anchor, Claim, ClaimEvent, ClaimStatus, KnowledgeTier, Provenance};
-use ocean_context::seams::{TrustContext, TrustModel, VelocityDecayTrust, VelocityMeter};
+use ocean_context::seams::{TrustContext, TrustModel, VelocityDecayTrust, VelocityMeter, WORKTREE};
 use std::path::Path;
 
 /// Run git with deterministic identity AND a fixed author/committer date so the
@@ -285,4 +285,58 @@ fn historical_velocity_ignores_current_worktree_symlink() {
         "historical velocity must not depend on the current checkout's symlink"
     );
     assert!(still_hot > 0.0);
+}
+
+/// Codex P2 (PR #210): an anchor that is a SYMLINK BLOB at its commit must
+/// carry no velocity signal. Git stores a symlink as a mode-120000 blob, so an
+/// existence-only probe accepts it and `--numstat` would count edits to the
+/// link-target string as churn — the symlink trust boundary, in the past
+/// tense. The mode check (regular blob only) rejects it.
+#[cfg(unix)]
+#[test]
+fn historical_symlink_blob_measures_zero_velocity() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("real_a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(root.join("real_b.rs"), "fn b() {}\n").unwrap();
+    git_at(root, "2026-06-15T12:00:00 +0000", &["add", "."]);
+    git_at(root, "2026-06-15T12:00:00 +0000", &["commit", "-qm", "born"]);
+    // Create a committed symlink and re-point it several times so its blob
+    // (the target string) churns — `--numstat` would see edits if accepted.
+    for (day, target) in [(16, "real_a.rs"), (18, "real_b.rs"), (20, "real_a.rs")] {
+        let _ = std::fs::remove_file(root.join("link.rs"));
+        symlink(root.join(target), root.join("link.rs")).unwrap();
+        let when = format!("2026-06-{day:02}T12:00:00 +0000");
+        git_at(root, &when, &["add", "-A"]);
+        git_at(root, &when, &["commit", "-qm", &format!("day{day}: repoint link")]);
+    }
+    let head = git(root, &["rev-parse", "HEAD"]);
+    // Confirm link.rs is a 120000 blob at HEAD.
+    let mode = git(root, &["ls-tree", &head, "--", "link.rs"]);
+    assert!(mode.starts_with("120000"), "fixture: link.rs must be a symlink blob, got {mode:?}");
+
+    let meter = VelocityMeter::new(root.to_path_buf());
+    let v = meter.measure(&anchored_claim("link", "link.rs", &head));
+    assert_eq!(v.v_sem, 0.0, "a historical symlink blob must measure zero (trust boundary)");
+    assert_eq!(v.v_code, 0.0);
+}
+
+/// Codex P2 (PR #210): a WORKTREE-anchored measurement must actually work —
+/// `WORKTREE` is not a revision, so the trailing window dates from HEAD's time.
+/// Before the fix `commit_time("WORKTREE")` failed → every live anchor silently
+/// got the no-velocity baseline.
+#[test]
+fn worktree_anchor_dates_the_window_from_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let _head = build_repo(root); // hot.rs molten through day 21 (HEAD)
+    let meter = VelocityMeter::new(root.to_path_buf());
+
+    // Anchor hot.rs at the WORKTREE sentinel: the window is dated from HEAD, so
+    // the recent churn is in range and velocity is non-zero (not the silent
+    // (0,0) baseline the broken commit_time("WORKTREE") produced).
+    let v = meter.measure(&anchored_claim("hot", "hot.rs", WORKTREE));
+    assert!(v.v_sem > 0.0, "a worktree anchor must measure real velocity via HEAD-dated window");
 }
