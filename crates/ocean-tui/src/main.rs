@@ -3820,6 +3820,21 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
                     perf
                 )),
             }
+            // Sweep: any ToolCall block still in Running state means the
+            // runtime cancelled mid-tool without emitting ToolCallFinished
+            // (cancel arrives as Failed, not a distinct Cancelled variant).
+            // Close them so the yellow "running" badge never gets stuck.
+            if status != ocean_agent_sdk::AgentTurnStatus::Completed {
+                for turn in app.pm_turns.iter_mut() {
+                    for block in turn.blocks.iter_mut() {
+                        if let PmBlock::ToolCall { status: tool_status, .. } = block {
+                            if *tool_status == ToolStatus::Running {
+                                *tool_status = ToolStatus::Err;
+                            }
+                        }
+                    }
+                }
+            }
         }
         AgentTurnEvent::Extension {
             extension, payload, ..
@@ -8748,6 +8763,127 @@ mod tests {
         fs::remove_dir_all(&temp).ok();
 
         assert!(agents.iter().any(|agent| agent.agent == "PIXEL"));
+    }
+
+    /// OCEAN-319: when a turn is cancelled the runtime emits TurnFinished with
+    /// status Failed but no ToolCallFinished, leaving ToolCall blocks in
+    /// ToolStatus::Running forever.  The TurnFinished handler must sweep
+    /// pm_turns and close any still-Running blocks as Err.
+    #[test]
+    fn pm_cancelled_turn_closes_running_blocks() {
+        let turn_id = AgentTurnId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let call_id = ocean_agent_sdk::ToolCallId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+
+        // Push a ToolCallStarted to plant a Running block in pm_turns.
+        daemon_apply_agent_stream_event(
+            &mut app,
+            AgentTurnEvent::ToolCallStarted {
+                session_id,
+                turn_id,
+                call: ocean_agent_sdk::ToolCall {
+                    id: call_id,
+                    name: "bash".to_string(),
+                    args_json: serde_json::json!({"command": "sleep 60"}),
+                },
+            },
+        );
+
+        // Confirm the block was created in Running state.
+        let running_count = app
+            .pm_turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Running, .. }))
+            .count();
+        assert_eq!(running_count, 1, "expected one Running block before cancel");
+
+        // Simulate cancel: the daemon emits TurnFinished{status: Failed} with no
+        // paired ToolCallFinished — exactly what the runtime does on Cancelled.
+        daemon_apply_agent_stream_event(
+            &mut app,
+            AgentTurnEvent::TurnFinished {
+                session_id,
+                turn_id,
+                status: ocean_agent_sdk::AgentTurnStatus::Failed,
+                error: Some("cancelled by user".to_string()),
+                wall_ms: Some(120),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                tokens_per_second: None,
+            },
+        );
+
+        // The Running block must now be Err — the yellow badge is gone.
+        let still_running = app
+            .pm_turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .any(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Running, .. }));
+        assert!(
+            !still_running,
+            "Running ToolCall blocks must be closed to Err after a non-Completed TurnFinished"
+        );
+
+        let err_count = app
+            .pm_turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Err, .. }))
+            .count();
+        assert_eq!(err_count, 1, "the cancelled block must be in Err state");
+    }
+
+    /// OCEAN-319 guard: a Completed turn must NOT sweep Running blocks —
+    /// any Running block at that point is a bug in the tool pipeline, not a
+    /// cancel, and we don't want to paper over it here.
+    #[test]
+    fn pm_completed_turn_does_not_close_running_blocks() {
+        let turn_id = AgentTurnId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let call_id = ocean_agent_sdk::ToolCallId::new_v4();
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+
+        daemon_apply_agent_stream_event(
+            &mut app,
+            AgentTurnEvent::ToolCallStarted {
+                session_id,
+                turn_id,
+                call: ocean_agent_sdk::ToolCall {
+                    id: call_id,
+                    name: "bash".to_string(),
+                    args_json: serde_json::json!({"command": "echo hi"}),
+                },
+            },
+        );
+
+        // Completed turn — sweep must not fire.
+        daemon_apply_agent_stream_event(
+            &mut app,
+            AgentTurnEvent::TurnFinished {
+                session_id,
+                turn_id,
+                status: ocean_agent_sdk::AgentTurnStatus::Completed,
+                error: None,
+                wall_ms: Some(50),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                tokens_per_second: None,
+            },
+        );
+
+        let still_running = app
+            .pm_turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .any(|b| matches!(b, PmBlock::ToolCall { status: ToolStatus::Running, .. }));
+        assert!(
+            still_running,
+            "Completed turn must not sweep Running blocks (that would hide pipeline bugs)"
+        );
     }
 }
 
