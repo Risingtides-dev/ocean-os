@@ -473,6 +473,18 @@ impl VelocityMeter {
             if self.crosses_symlink(file) {
                 return (0, 0);
             }
+            // The anchor must EXIST as a regular file in the working tree to
+            // carry a signal. Without this, a file deleted locally but still
+            // present in HEAD would skip to `git log HEAD -- <file>` and get
+            // HEAD's churn — a positive velocity for an anchor that is absent
+            // (B1 resolves a missing WORKTREE file Dead), and inconsistent with
+            // the historical branch's existence gate below. `symlink_metadata`
+            // does not follow the leaf; the component walk above already
+            // excluded symlinked parents.
+            match std::fs::symlink_metadata(self.repo_root.join(file)) {
+                Ok(md) if md.file_type().is_file() => {}
+                _ => return (0, 0),
+            }
         } else {
             // At-commit measurement: the anchor must be a REGULAR tracked blob
             // at its own commit to carry a velocity signal.

@@ -340,3 +340,33 @@ fn worktree_anchor_dates_the_window_from_head() {
     let v = meter.measure(&anchored_claim("hot", "hot.rs", WORKTREE));
     assert!(v.v_sem > 0.0, "a worktree anchor must measure real velocity via HEAD-dated window");
 }
+
+/// Codex P2 (PR #210): a WORKTREE anchor whose file has been deleted locally
+/// (but still exists in HEAD) must measure zero. Without a live existence gate
+/// it would skip to `git log HEAD -- <file>` and get HEAD's churn — a positive
+/// velocity for an anchor B1 resolves Dead, inconsistent with the historical
+/// branch. The working-tree existence check returns (0, 0).
+#[test]
+fn worktree_anchor_deleted_locally_measures_zero_even_if_in_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let _head = build_repo(root); // hot.rs molten through HEAD, present on disk
+    let meter = VelocityMeter::new(root.to_path_buf());
+
+    // Sanity: while present on disk, the WORKTREE anchor measures hot.
+    assert!(
+        meter.measure(&anchored_claim("hot", "hot.rs", WORKTREE)).v_sem > 0.0,
+        "present worktree file is molten"
+    );
+
+    // Delete hot.rs from the working tree WITHOUT committing — it still exists
+    // in HEAD, so `git log HEAD -- hot.rs` would still report its churn.
+    std::fs::remove_file(root.join("hot.rs")).unwrap();
+    assert!(root.join("frozen.rs").exists(), "control file still on disk");
+
+    // The WORKTREE anchor is now absent on disk → no signal, despite HEAD
+    // history. (Matches B1 resolving a missing WORKTREE file Dead.)
+    let v = meter.measure(&anchored_claim("hot", "hot.rs", WORKTREE));
+    assert_eq!(v.v_sem, 0.0, "a locally-deleted worktree anchor measures zero");
+    assert_eq!(v.v_code, 0.0);
+}
