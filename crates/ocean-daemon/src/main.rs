@@ -2230,6 +2230,13 @@ async fn prompt(
     req.yolo = resolve_request_yolo(req.yolo);
     emit_user_message(&state.events, &req, request_id);
 
+    // OCEAN-318: Longhouse pre-turn consult — same default-ON advisory prep as
+    // `agent_turn`. Fail-open: a None/slow/error consult leaves the prompt
+    // unchanged. PromptRequest carries no guidance/room fields, so we only
+    // apply the skill brief, not the room/operator guidance layer.
+    let consult = longhouse_prep_for_turn(req.prompt.clone(), req.cwd.clone()).await;
+    req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());
+
     let control = build_prompt_control(
         &state,
         request_id,
@@ -2300,6 +2307,11 @@ async fn create_request(
         // `permit` is moved in and dropped when this future ends (or is aborted),
         // releasing the turn slot on every exit path (OCEAN-304).
         let _turn_permit = permit;
+        // OCEAN-318: Longhouse pre-turn consult inside the spawned task so the
+        // async await does not block the `create_request` response path. Same
+        // default-ON, fail-open behaviour as `prompt` and `agent_turn`.
+        let consult = longhouse_prep_for_turn(req.prompt.clone(), req.cwd.clone()).await;
+        req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());
         let res = task_state.runtime.prompt(req, control).await;
         record_prompt_result(&task_state, request_id, &res, None).await;
     });
