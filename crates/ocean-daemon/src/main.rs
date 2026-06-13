@@ -1918,79 +1918,86 @@ async fn wait_for_signal() {
     }
 }
 
+/// The canonical route discovery list served by `GET /`.
+///
+/// Extracted from `root()` so tests can assert no-duplicates without
+/// starting the server (OCEAN-333). Keep this in sync with both the
+/// `Router::route()` calls in `main()` and the operator guide
+/// (`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`) whenever a route is added or
+/// removed.
+fn banner_routes() -> &'static [&'static str] {
+    &[
+        "GET /",
+        "GET /health",
+        "GET /ready",
+        "GET /metrics",
+        "POST /v1/agent/turns",
+        "POST /v1/agent/voice",
+        "GET /v1/agent/events",
+        "POST /v1/agent/canvas/fulfill",
+        "GET /v1/agent/canvas/fulfill",
+        "POST /v1/agent/sessions",
+        "GET /v1/agent/sessions",
+        "GET /v1/agent/sessions/{id}",
+        "GET /v1/events",
+        "POST /v1/prompt",
+        "GET /v1/requests",
+        "POST /v1/requests",
+        "POST /v1/requests/{id}/cancel",
+        "GET /v1/permissions",
+        "POST /v1/permissions/{id}/decision",
+        "GET /v1/rooms",
+        "GET /v1/rooms/{room_id}",
+        "GET /v1/rooms/{room_id}/snapshot",
+        "GET /v1/rooms/{room_id}/events",
+        "POST /v1/rooms/{room_id}/livekit-token",
+        "GET /v1/rooms/persistent",
+        "POST /v1/rooms/persistent",
+        "GET /v1/rooms/persistent/{key}",
+        "POST /v1/rooms/persistent/{key}/participants",
+        "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
+        "POST /v1/rooms/persistent/{key}/messages",
+        "GET /v1/rooms/persistent/{key}/transcript",
+        "GET /v1/rooms/persistent/{key}/snapshot",
+        "GET /v1/rooms/persistent/{key}/events",
+        "GET /v1/sessions",
+        "GET /v1/sessions/{id}",
+        "GET /v1/projects",
+        "POST /v1/projects",
+        "GET /v1/projects/{id}",
+        "PATCH /v1/projects/{id}",
+        "DELETE /v1/projects/{id}",
+        "GET /v1/model",
+        "POST /v1/model",
+        "GET /v1/models",
+        "GET /v1/settings/yolo",
+        "POST /v1/settings/yolo",
+        "POST /v1/component/event",
+        "POST /v1/longhouse/demo",
+        "POST /v1/longhouse/convene",
+        "POST /v1/council/convene",
+        "POST /v1/longhouse/prepare",
+        "POST /v1/skills/query",
+        "POST /v1/skills/fetch",
+        "POST /v1/subagents/spec",
+        "GET /v1/longhouse/topics",
+        "GET /v1/longhouse/topics/{topic_id}",
+        "POST /v1/longhouse/claim",
+        "POST /v1/longhouse/board",
+        "POST /v1/longhouse/revoke",
+        "POST /v1/longhouse/recall",
+        "POST /v1/longhouse/breach",
+        "POST /v1/calls/demo",
+        "POST /v1/calls/place",
+        "POST /v1/calls/webhook",
+    ]
+}
+
 async fn root() -> Json<serde_json::Value> {
-    // OCEAN-25: this list mirrors the `Router::route()` calls in `main()` exactly,
-    // grouped by concern. Keep it in sync with both the router above and the
-    // authoritative route table in docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md whenever a
-    // route is added or removed.
     Json(json!({
         "ok": true,
         "service": "ocean-daemon",
-        "routes": [
-            "GET /",
-            "GET /health",
-            "GET /ready",
-            "GET /metrics",
-            "POST /v1/agent/turns",
-            "POST /v1/agent/voice",
-            "GET /v1/agent/events",
-            "POST /v1/agent/canvas/fulfill",
-            "GET /v1/agent/canvas/fulfill",
-            "POST /v1/agent/sessions",
-            "GET /v1/agent/sessions",
-            "GET /v1/agent/sessions/{id}",
-            "GET /v1/events",
-            "POST /v1/prompt",
-            "GET /v1/requests",
-            "POST /v1/requests",
-            "POST /v1/requests/{id}/cancel",
-            "GET /v1/permissions",
-            "POST /v1/permissions/{id}/decision",
-            "GET /v1/rooms",
-            "GET /v1/rooms/{room_id}",
-            "GET /v1/rooms/{room_id}/snapshot",
-            "GET /v1/rooms/{room_id}/events",
-            "POST /v1/rooms/{room_id}/livekit-token",
-            "GET /v1/rooms/persistent",
-            "POST /v1/rooms/persistent",
-            "GET /v1/rooms/persistent/{key}",
-            "POST /v1/rooms/persistent/{key}/participants",
-            "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
-            "POST /v1/rooms/persistent/{key}/messages",
-            "GET /v1/rooms/persistent/{key}/transcript",
-            "GET /v1/rooms/persistent/{key}/snapshot",
-            "GET /v1/rooms/persistent/{key}/events",
-            "GET /v1/sessions",
-            "GET /v1/sessions/{id}",
-            "GET /v1/projects",
-            "POST /v1/projects",
-            "GET /v1/projects/{id}",
-            "PATCH /v1/projects/{id}",
-            "DELETE /v1/projects/{id}",
-            "GET /v1/model",
-            "POST /v1/model",
-            "GET /v1/models",
-            "GET /v1/settings/yolo",
-            "POST /v1/settings/yolo",
-            "POST /v1/component/event",
-            "POST /v1/longhouse/demo",
-            "POST /v1/longhouse/convene",
-            "POST /v1/council/convene",
-            "POST /v1/longhouse/prepare",
-            "POST /v1/skills/query",
-            "POST /v1/skills/fetch",
-            "POST /v1/subagents/spec",
-            "GET /v1/longhouse/topics",
-            "GET /v1/longhouse/topics/{topic_id}",
-            "POST /v1/longhouse/claim",
-            "POST /v1/longhouse/board",
-            "POST /v1/longhouse/revoke",
-            "POST /v1/longhouse/recall",
-            "POST /v1/longhouse/breach",
-            "POST /v1/calls/demo",
-            "POST /v1/calls/place",
-            "POST /v1/calls/webhook"
-        ]
+        "routes": banner_routes(),
     }))
 }
 
@@ -18258,5 +18265,60 @@ mod tests {
             Some(4),
             "persist_failures must be read off AppState\n{body}"
         );
+    }
+
+    // OCEAN-333 — banner route-list integrity guards
+    // -----------------------------------------------
+
+    /// The banner served on `GET /` must not list the same route twice.
+    ///
+    /// This is a regression guard for OCEAN-332 where `"POST /v1/agent/sessions"`
+    /// appeared at both index 9 and index 14.  `banner_routes()` is extracted
+    /// from `root()` so this test runs without an HTTP server.
+    ///
+    /// NOTE: this test WILL FAIL until OCEAN-332 (#222) is merged — that PR
+    /// removes the duplicate `"POST /v1/agent/sessions"` entry.  Merge 332
+    /// before 333 so the test goes green on first land.
+    #[test]
+    fn banner_routes_has_no_duplicates() {
+        use std::collections::HashSet;
+
+        let routes = banner_routes();
+        let mut seen = HashSet::new();
+        let mut dupes: Vec<&str> = Vec::new();
+
+        for &route in routes {
+            if !seen.insert(route) {
+                dupes.push(route);
+            }
+        }
+
+        assert!(
+            dupes.is_empty(),
+            "banner_routes() contains duplicate entries (merge OCEAN-332 first): {dupes:?}"
+        );
+    }
+
+    /// Every entry in the banner must be `"METHOD /path"` — no blank strings,
+    /// no accidental trailing whitespace that would silently mis-render.
+    #[test]
+    fn banner_routes_entries_are_well_formed() {
+        for &route in banner_routes() {
+            let parts: Vec<&str> = route.splitn(2, ' ').collect();
+            assert_eq!(
+                parts.len(),
+                2,
+                "banner entry {route:?} does not match \"METHOD /path\" format"
+            );
+            let (method, path) = (parts[0], parts[1]);
+            assert!(
+                matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE"),
+                "banner entry {route:?} has unexpected HTTP method {method:?}"
+            );
+            assert!(
+                path.starts_with('/'),
+                "banner entry {route:?} path does not start with '/'"
+            );
+        }
     }
 }
