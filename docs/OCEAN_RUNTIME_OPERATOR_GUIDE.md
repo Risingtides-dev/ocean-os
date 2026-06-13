@@ -1,6 +1,6 @@
 # Ocean runtime operator guide
 
-This guide is for operators running the current `ocean-rs` Rust-native Pi-style coding-agent harness/runtime and its clients. It reflects the repo state as validated from source on 2026-06-06.
+This guide is for operators running the current `ocean-rs` Rust-native Pi-style coding-agent harness/runtime and its clients. It reflects the repo state as validated from source on 2026-06-13.
 
 ## Operating model
 
@@ -226,6 +226,11 @@ The current health endpoint reports daemon availability and backend name; it doe
 
 Sessions are currently JSON-backed. Avoid concurrent prompts into the same session until per-session locking/storage hardening lands.
 
+Two additional SQLite databases live alongside sessions and the config dir:
+
+- `rooms.db` — persistent room store (`SqliteRoomStore`). Survives daemon restarts; override the full path with `OCEAN_DB_PATH`.
+- `titles.db` — Longhouse title/escrow registry (firekeeper titles, recall tallies). Survives daemon restarts; override the full path with `OCEAN_TITLES_DB_PATH`.
+
 ## Common commands
 
 ### CLI help
@@ -293,7 +298,8 @@ the `health` and `ready` route handlers in `crates/ocean-daemon/src/main.rs`.
 - **Always returns HTTP 200** as long as the process is accepting connections.
   The body's `ok` field is hardcoded `true`; it does **not** reflect provider
   state.
-- Body: `{"ok":true,"service":"ocean-daemon","version":"<v>","backend":"<name>"}`.
+- Body: `{"ok":true,"service":"ocean-daemon","version":"<v>","backend":"<name>","persist_failures_total":<n>}`.
+  `persist_failures_total` mirrors `ocean_persist_failures_total` in `GET /metrics` — it is the count of dropped call-transcript writes since daemon start. `0` is healthy; a non-zero value means the SQLite room store is silently losing writes.
 - Says nothing about whether a provider/credential is configured. A daemon with
   no API key still answers `/health` with 200.
 
@@ -362,6 +368,16 @@ before exiting, in two stages, instead of dropping it mid-stream:
 The wait in stage 2 is bounded by `OCEAN_SHUTDOWN_GRACE_SECS` (default **20s**;
 set `0` to skip waiting). If the budget elapses with turns still running, the
 daemon logs a warning and exits anyway, so a stuck turn can't hang shutdown.
+
+#### `OCEAN_MAX_CONCURRENT_TURNS` — concurrent-turn ceiling (OCEAN-304)
+
+The daemon limits how many agent turns can run simultaneously via a bounded semaphore. When the pool is full any new turn submission (`POST /v1/agent/turns`, `POST /v1/requests`) is rejected immediately with **HTTP 429** — it never queues. Default: **24**. Set `OCEAN_MAX_CONCURRENT_TURNS` to a positive integer to override; a `0` or non-numeric value falls back to the default rather than shutting off intake.
+
+```bash
+OCEAN_MAX_CONCURRENT_TURNS=8 cargo run -p ocean-daemon
+```
+
+This ceiling is high enough that normal multi-room / multi-client use never trips it; it exists to bound burst or runaway-loop fan-out before it exhausts provider quota or host memory.
 
 Both clients depend on this daemon, so prefer signal-based stops: `launchctl
 kickstart -k` (sends `SIGTERM`) or Ctrl-C in the foreground. Avoid `kill -9` /
@@ -468,10 +484,11 @@ Full daemon route table, read from `crates/ocean-daemon/src/main.rs` (the
 `Router::route()` calls). Grouped by concern:
 
 ```text
-# Liveness
-GET    /                                  root banner
+# Liveness / observability
+GET    /                                  root banner (JSON route list)
 GET    /health                            liveness check
 GET    /ready                             readiness (model/credentials wired)
+GET    /metrics                           Prometheus text (v0.0.4); Content-Type: text/plain; version=0.0.4
 
 # Agent product API (session-scoped — first-party surfaces)
 POST   /v1/agent/turns                    submit a turn { prompt, cwd, session_id, ... }
@@ -494,19 +511,23 @@ POST   /v1/requests/{id}/cancel           cancel an in-flight request
 GET    /v1/permissions                    list pending permission requests
 POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
 
-# Rooms — Track-0 projection (RoomSnapshot)
+# Rooms — Track-0 projection (RoomSnapshot); {room_id} ∈ {pm,writers,orch_mesh,review}
 GET    /v1/rooms                          list room projections
-GET    /v1/rooms/{room_id}                room projection detail (pm|writers|orch_mesh|review)
+GET    /v1/rooms/{room_id}                room projection detail
+GET    /v1/rooms/{room_id}/snapshot       richer projection: turns, active_turn, messages feed (?after_seq=N)
+GET    /v1/rooms/{room_id}/events         live-tail of projection messages (?after_seq=N); returns last_seq
 POST   /v1/rooms/{room_id}/livekit-token  mint a LiveKit join token for the room (web in-room voice/video)
 
-# Rooms — persistent lifecycle (OCEAN-65; in-memory store)
+# Rooms — persistent lifecycle (SQLite-backed; survives restarts)
 GET    /v1/rooms/persistent               list persistent rooms
 POST   /v1/rooms/persistent               create a room { key, name, trigger_policy? }
 GET    /v1/rooms/persistent/{key}         room + transcript
 POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
-DELETE /v1/rooms/persistent/{key}/participants/{id}       leave
+DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave
 POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
-GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N)
+GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N&limit=M)
+GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+has_more (?after_seq=N&limit=M)
+GET    /v1/rooms/persistent/{key}/events                  live-tail: events since after_seq (?after_seq=N&limit=M); returns last_seq+next_seq+has_more
 
 # Sessions (legacy view)
 GET    /v1/sessions                       list sessions
@@ -524,10 +545,14 @@ GET    /v1/model                          current provider/model
 POST   /v1/model                          set provider/model
 GET    /v1/models                         available models for a client picker
 
+# Settings
+GET    /v1/settings/yolo                  read persisted + effective YOLO posture
+POST   /v1/settings/yolo                  set persisted YOLO default { enabled: bool }
+
 # Surface components
 POST   /v1/component/event                surface component interaction event
 
-# Longhouse (council / quorum)
+# Longhouse (council / quorum / governance)
 POST   /v1/longhouse/demo                 scripted demo harness (fake events)
 POST   /v1/longhouse/convene              convene a real council; events on /v1/agent/events
 POST   /v1/council/convene                alias of /v1/longhouse/convene (same handler)
@@ -536,7 +561,12 @@ POST   /v1/skills/query                   skill-librarian prefilter: rank skills
 POST   /v1/skills/fetch                   skill-librarian fetch: one skill's full body by id (advisory, read-only)
 POST   /v1/subagents/spec                 assemble a subagent spec from skills + defaults (advisory, returns a spec; no spawn)
 GET    /v1/longhouse/topics               list longhouse topics
-GET    /v1/longhouse/topics/{id}          longhouse topic detail
+GET    /v1/longhouse/topics/{topic_id}    longhouse topic detail
+POST   /v1/longhouse/claim                ratify a converged outcome against the title registry { title_id, agent_id, token, decision }
+POST   /v1/longhouse/board                append a note/evidence mark to a topic's durable board { topic_id, author, kind?, summary }
+POST   /v1/longhouse/revoke               operator hard-pull of a live title { title_id, reason? }
+POST   /v1/longhouse/recall               cast a no-confidence vote in a seated firekeeper { topic_id, firekeeper_id, voter_id, threshold? }
+POST   /v1/longhouse/breach               report a policy breach, accruing a graduated strike { title_id, detail? }
 
 # Calls (Twilio/LiveKit call-intelligence pipeline — ocean-call)
 POST   /v1/calls/demo                     scripted call-pipeline demo (fake transcript/events)
@@ -584,6 +614,75 @@ curl -sS -X POST http://127.0.0.1:4780/v1/permissions/<permission-id>/decision \
 
 Use `{"permission_id":"<permission-id>","decision":"allow"}` only when the operator explicitly approves the requested action. Mutating tools without approval should remain denied unless `--yolo` was intentionally used.
 
+### Health/readiness metrics — GET /metrics
+
+`GET /metrics` exposes the daemon's observability surface in Prometheus text exposition format (v0.0.4). Read-only — the scrape never touches the hot agent-turn path or takes a lock. Four metric families:
+
+| Metric | Type | Description |
+|---|---|---|
+| `ocean_turns_total{outcome="ok"\|"error"}` | counter | Finished turns by outcome |
+| `ocean_turns_in_flight` | gauge | Turns currently executing |
+| `ocean_turn_duration_seconds` | histogram | Turn wall-clock latency (cumulative buckets + `_sum`/`_count`) |
+| `ocean_persist_failures_total` | counter | Dropped call-transcript writes (mirrors `GET /health` `persist_failures_total`); `0` is healthy |
+
+Content-Type is `text/plain; version=0.0.4; charset=utf-8`. Sample scrape:
+
+```bash
+curl -s http://127.0.0.1:4780/metrics
+# ocean_turns_total{outcome="ok"} 22
+# ocean_turns_total{outcome="error"} 3
+# ocean_turns_in_flight 0
+# ocean_turn_duration_seconds_bucket{le="5"} 13
+# ...
+# ocean_persist_failures_total 0
+```
+
+Point Prometheus or any compatible scraper at `:4780/metrics`. A non-zero `ocean_persist_failures_total` means the SQLite room store is silently losing transcript writes — investigate immediately.
+
+### Longhouse governance routes
+
+The five Longhouse governance routes implement the firekeeper title lifecycle. All accept JSON, return `{ ok, … }`, and go through the daemon's own unforgeable `Revoker` key (held on `AppState`, never emitted on the wire).
+
+**POST /v1/longhouse/claim** — ratify a converged outcome (OCEAN-272).
+
+```json
+{ "title_id": "<uuid>", "agent_id": "<uuid>", "token": "<secret>", "decision": "<uuid>" }
+```
+
+Status: `200` on a ratified claim; `403` for a forged/revoked title (`ForgedFirekeeper`); `409` for premature (`NotConverged`) or wrong-proposal (`WrongDecision`) claim; `400` on a malformed UUID. On success the title is released and the topic's validator escrow is freed.
+
+**POST /v1/longhouse/board** — append a note/evidence mark to a tracked topic's durable board (OCEAN-272). `kind` is `note` (default) or `evidence`; quorum-affecting kinds (proposal/endorse/inhibit) are not accepted here.
+
+```json
+{ "topic_id": "<uuid>", "author": "<uuid>", "kind": "note", "summary": "…" }
+```
+
+Status: `200` on success; `404` if the topic is not tracked; `400` on malformed UUID or empty `summary`.
+
+**POST /v1/longhouse/revoke** — operator hard-pull of a live title (OCEAN-246/272). The daemon presents its own server-minted `RevokerKey` — the caller names the title, but the daemon executes the revocation.
+
+```json
+{ "title_id": "<uuid>", "reason": "unsafe tool call" }
+```
+
+Status: `200` on success; `404` unknown title; `409` already revoked/released (`NotLive`); `400` malformed UUID.
+
+**POST /v1/longhouse/recall** — cast a no-confidence vote in a seated firekeeper (OCEAN-302, quorum-of-recall). The daemon tallies distinct credentialed votes; when the tally carries (≥ threshold distinct voters) it pulls the title. A single voter casting multiple times counts as one vote.
+
+```json
+{ "topic_id": "<uuid>", "firekeeper_id": "<uuid>", "voter_id": "<uuid>", "threshold": 3 }
+```
+
+Status: `200` with `{ carried: false, votes, threshold }` while pending; `200` with `{ carried: true, revocation }` when carried and title pulled; `404` if no live firekeeper title for `(topic_id, firekeeper_id)`; `400` on malformed UUID. `threshold` is fixed on the first vote and ignored by subsequent votes.
+
+**POST /v1/longhouse/breach** — report a detected policy breach against a seated title (OCEAN-302, policy-breach trigger). Each report accrues a graduated strike; the daemon escalates to a hard revoke at 3 strikes.
+
+```json
+{ "title_id": "<uuid>", "detail": "acted outside bound decision" }
+```
+
+Status: `200` with `{ revoked: false, strikes, threshold }` while below threshold; `200` with `{ revoked: true, revocation }` when the gradient tips and the title is pulled; `404` unknown title; `409` already revoked/released; `400` malformed UUID.
+
 ## Logs and events
 
 ### Process logs
@@ -605,11 +704,15 @@ Use the actual unit name from the local install; this repo does not currently de
 
 ### SSE event stream
 
-Follow daemon events:
+Follow daemon events (modern session-scoped stream):
 
 ```bash
-curl -N http://127.0.0.1:4780/v1/events
+curl -N http://127.0.0.1:4780/v1/agent/events
+# Scope to one session:
+curl -N "http://127.0.0.1:4780/v1/agent/events?session_id=<id>"
 ```
+
+The legacy global stream at `GET /v1/events` is still served for debug use but is not the recommended surface for production clients.
 
 Events are Server-Sent Events carrying an `EventEnvelope` with IDs and optional request/session/permission correlation. Event types include:
 
@@ -658,7 +761,7 @@ Check:
 
 ```bash
 curl -sS http://127.0.0.1:4780/v1/requests
-curl -N http://127.0.0.1:4780/v1/events
+curl -N http://127.0.0.1:4780/v1/agent/events
 ```
 
 Look for a request in `waiting_for_permission` and a matching `permission_request` event. Decide only with explicit operator approval.
