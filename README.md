@@ -1,4 +1,5 @@
 # Ocean OS
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/4bf6221b-7b77-4303-9268-3ba2be698cd9" />
 
 > Rust-native coding-agent runtime, daemon, and TUI cockpit.
 
