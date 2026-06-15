@@ -1458,6 +1458,38 @@ async fn main() -> anyhow::Result<()> {
     // never *required* — a daemon with no telephony/provider creds still boots.
     startup::validate_startup_config()?;
 
+    // The daemon is workspace-agnostic: turns carry their own cwd/project and
+    // sessions bind to it. But unbound/legacy fallback paths still reach for the
+    // process cwd, so launching from inside a repo silently welds those turns to
+    // that repo (the "every session reverts to ocean-os" trap). Refuse to boot
+    // from a git working tree. `OCEAN_ALLOW_REPO_CWD=1` opts out.
+    // ponytail: git-toplevel probe, not a libgit dep.
+    if !matches!(
+        env::var("OCEAN_ALLOW_REPO_CWD").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    ) {
+        if let Ok(cwd) = env::current_dir() {
+            let in_repo = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    &cwd.to_string_lossy(),
+                    "rev-parse",
+                    "--is-inside-work-tree",
+                ])
+                .output()
+                .map(|o| o.status.success() && o.stdout.starts_with(b"true"))
+                .unwrap_or(false);
+            if in_repo {
+                anyhow::bail!(
+                    "refusing to start: daemon cwd {} is inside a git repo. Launch it from a \
+                     neutral dir (e.g. `cd ~ && ocean-daemon`) so unbound turns don't bind to \
+                     this repo. Set OCEAN_ALLOW_REPO_CWD=1 to override.",
+                    cwd.display()
+                );
+            }
+        }
+    }
+
     let bind = env::var("OCEAN_BIND").unwrap_or_else(|_| "127.0.0.1:4780".to_string());
 
     // The Longhouse read-side topic registry. Built BEFORE the runtime so the
