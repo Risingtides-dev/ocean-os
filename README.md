@@ -14,13 +14,13 @@ Ocean OS is a local-first agent runtime written in Rust. A long-running daemon o
 | `ocean-mcp` | Ocean as an MCP **client**: connects to external Model Context Protocol servers and exposes their tools to the agent through the runtime |
 | `ocean-acp` | ACP (Agent Client Protocol) bridge — exposes the daemon to Zed and other ACP editors over stdio |
 | `ocean-providers` | Ocean-owned provider registry: model routing, credential resolution, readiness checks |
-| `ocean-longhouse` | Quorum engine + convening flow behind the longhouse deck (real multi-agent council, not the scripted demo) |
+| `ocean-longhouse` | Quorum engine + convening flow behind the longhouse deck (multi-agent council) |
 | `ocean-heartbeat` | Scheduleable Ocean routines: prompt-injection scheduler hooks for daemon routines (`ocean-heartbeat` binary) |
 | `ocean-agent` | Ocean session/history layer wrapping `ocean-runtime` |
 | `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
 | `ocean-daemon` | Long-running HTTP service on `:4780`. Owns runtime authority |
 | `ocean-cli` (`ocean-rs` binary) | CLI client: health, prompt, sessions |
-| `ocean-tui` (`ocean` binary) | Terminal steering cockpit with TIDES-MESH parity views |
+| `ocean-tui` (`ocean` binary) | Terminal Agent surface |
 | `ocean-browser` | Typed async handle to a Chrome instance driven over the DevTools Protocol |
 | `ocean-call` | Ocean Call Intelligence: daemon-side PSTN call agent (Twilio SIP → LiveKit room) that Ocean joins as a server-side participant |
 
@@ -28,16 +28,10 @@ Ocean OS is a local-first agent runtime written in Rust. A long-running daemon o
 
 ## Product framing
 
-`ocean-rs` is the canonical Rust-native coding-agent harness/runtime for Ocean.
-It is **not** a Pi fork. We are using Pi concepts as reference material, then building a lower-level Rust runtime and operator floor in Rust.
-
 - `ocean-rs` is the canonical Rust-native coding-agent harness/runtime.
 - `ocean-daemon` owns runtime authority: provider calls, agent loops, tools, sessions, permissions, and events.
-- `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that harness, not a passive daemon dashboard.
-- F1 PM is the minimal Rust-backed agent-turn chat lane.
-- F2-F4 are the rest of the active runtime-backed Track-0 rooms; F5-F7 remain provisional.
-- The existing Pi/tmux floor is only a temporary visual reference until F1-F4 can render, submit, stream, and cancel through Ocean runtime.
-- Ocean GUI and service layers remain thin clients until the daemon protocol is stable.
+- `ocean-tui` is the Agent terminal coding surface
+- Ocean GUI and service layers remain thin clients until the daemon protocol is stable. see risingtides-dev/ocean-surface repo
 
 Run the daemon:
 
