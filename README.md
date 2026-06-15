@@ -2,7 +2,7 @@
 
 > Rust-native coding-agent runtime, daemon, and TUI cockpit.
 
-Ocean OS is a local-first agent runtime written in Rust. A long-running daemon owns the agent loop, tool execution, provider calls, sessions, and permissions. Clients (CLI, TUI, future GUI / web / voice) are thin shells that steer the daemon over a stable protocol.
+Ocean OS is an agentic operating system written in Rust. A long-running daemon owns the agent loop, tool execution, provider calls, sessions, and permissions. Clients (CLI, TUI, future GUI / web / voice) are thin shells that steer the daemon over a stable protocol.
 
 ## What's in this repo
 
