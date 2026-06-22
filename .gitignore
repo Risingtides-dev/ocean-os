@@ -39,3 +39,15 @@ __pycache__/
 # Local Claude Code session state (per-developer)
 .claude/
 .ocean-orchestrator/
+
+# stitchpad runtime
+.stitchpad/.state/
+.stitchpad/stitchpad-git/
+.stitchpad/stitchpad.md
+
+# ocean daemon runtime (keep .ocean/AGENTS.md tracked)
+.ocean/daemon.log
+.ocean/daemon.pid
+
+# Playwright MCP test artifacts
+.playwright-mcp/

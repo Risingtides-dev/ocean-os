@@ -1,5 +1,7 @@
 # Ocean OS — read this first
 
+**Devlog source of truth:** read `AGENTS.md` first. The AGENTS.md hierarchy is the cross-harness work contract for Claude, Codex, Pi, ocean-native agents, and any other runtime. This file is Claude/bootstrap context only and does not override AGENTS.md.
+
 **Longhouse note:** Ocean Longhouse is the hive — the local-first agentic operations hub where agents go before they act. It centralizes SOPs, routines/workflows, tools/MCP discovery, skills, memory/knowledge, subagent specs, and quorum/council workflows. `ocean-daemon` remains the local runtime/body and execution authority; Longhouse coordinates/recommends and must not bypass daemon permission gates. Canonical doc: `docs/LONGHOUSE.md`.
 
 **This repo is one half of a two-repo system. The other half is `ocean-surface`.**
