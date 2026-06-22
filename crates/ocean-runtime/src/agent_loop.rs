@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use ocean_protocol::{
-    stream_simple, AssistantMessageEvent, Content, Context, Message, StopReason, ToolResultMessage,
+    stream_simple, AssistantMessage, AssistantMessageEvent, Content, Context, Message, StopReason,
+    ToolResultMessage, Usage,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -117,15 +118,36 @@ pub async fn run_agent_with_history(
             },
         );
 
+        // Reserve the final provider round after a tool result for synthesis, not
+        // another tool call. Without this, a model that keeps choosing tools can
+        // consume `max_turns` with `assistant(tool_use) -> tool_result` loops and
+        // return no user-visible reply. On the last round we hide tools and make
+        // the instruction explicit so the provider must answer from the results
+        // it already has.
+        let final_answer_round =
+            turn == config.max_turns && matches!(messages.last(), Some(Message::ToolResult(_)));
+        let system_prompt = if final_answer_round {
+            format!(
+                "{}\n\n[Ocean runtime: tool-call budget is exhausted. Do not call tools. \
+                 Reply to the user now with a concise text summary of what you found or did.]",
+                config.system_prompt
+            )
+        } else {
+            config.system_prompt.clone()
+        };
         let ctx = Context {
-            system_prompt: Some(config.system_prompt.clone()),
+            system_prompt: Some(system_prompt.clone()),
             messages: trim_to_context_window(
                 &messages,
-                &config.system_prompt,
+                &system_prompt,
                 config.model.context_window,
                 config.model.max_tokens,
             ),
-            tools: tool_defs.clone(),
+            tools: if final_answer_round {
+                Vec::new()
+            } else {
+                tool_defs.clone()
+            },
         };
 
         let mut options = config.stream_options.clone();
@@ -137,6 +159,7 @@ pub async fn run_agent_with_history(
 
         let mut final_message: Option<ocean_protocol::AssistantMessage> = None;
         let mut stop = StopReason::Stop;
+        let mut streamed_text = String::new();
 
         // Bound the entire turn — provider request + full stream consumption —
         // by a single wall-clock deadline. A hung or slow provider that never
@@ -192,6 +215,7 @@ pub async fn run_agent_with_history(
                         return Err(AgentError::Other(err_msg));
                     }
                     AssistantMessageEvent::TextDelta { delta, .. } => {
+                        streamed_text.push_str(&delta);
                         emit(
                             &events,
                             AgentEvent::TextDelta {
@@ -235,6 +259,16 @@ pub async fn run_agent_with_history(
                 "provider stream produced no terminal event".into(),
             ));
         };
+        let terminal_text = assistant_text(&msg);
+        if streamed_text.is_empty() && !terminal_text.is_empty() {
+            emit(
+                &events,
+                AgentEvent::TextDelta {
+                    session_id: sid.clone(),
+                    delta: terminal_text,
+                },
+            );
+        }
 
         let assistant_message = Message::Assistant(msg.clone());
         messages.push(assistant_message.clone());
@@ -290,7 +324,7 @@ pub async fn run_agent_with_history(
             break 'outer;
         }
 
-        let mut any_terminate = !tool_calls.is_empty();
+        let mut any_terminate = false;
         for (id, name, args) in tool_calls {
             // Permission gate (only for tools that require it, and only once
             // per name per run if the user said "allow session").
@@ -326,7 +360,6 @@ pub async fn run_agent_with_history(
                             timestamp: ocean_protocol::now_ms(),
                         };
                         messages.push(Message::ToolResult(tr));
-                        any_terminate = false;
                         continue;
                     }
                 }
@@ -400,8 +433,8 @@ pub async fn run_agent_with_history(
                     Value::Null,
                 ),
             };
-            if !terminate {
-                any_terminate = false;
+            if terminate {
+                any_terminate = true;
             }
             emit(
                 &events,
@@ -507,8 +540,26 @@ pub async fn run_agent_with_history(
         }
     }
 
-    if turn >= config.max_turns {
+    if turn >= config.max_turns && matches!(messages.last(), Some(Message::ToolResult(_))) {
         stopped_at_turn_limit = true;
+        let reply = tool_limit_fallback_reply(&messages);
+        emit(
+            &events,
+            AgentEvent::TextDelta {
+                session_id: sid.clone(),
+                delta: reply.clone(),
+            },
+        );
+        messages.push(Message::Assistant(AssistantMessage {
+            content: vec![Content::text(reply)],
+            api: config.model.api.clone(),
+            provider: config.model.provider.clone(),
+            model: config.model.id.clone(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: ocean_protocol::now_ms(),
+        }));
     }
 
     emit(
@@ -523,6 +574,47 @@ pub async fn run_agent_with_history(
         stopped_at_turn_limit,
         usage: total_usage,
     })
+}
+
+fn tool_limit_fallback_reply(messages: &[Message]) -> String {
+    let last_tool = messages.iter().rev().find_map(|message| match message {
+        Message::ToolResult(result) => Some(result),
+        _ => None,
+    });
+    let Some(result) = last_tool else {
+        return "I stopped after reaching the tool-call limit before producing a final reply."
+            .to_string();
+    };
+    let mut text = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    const PREVIEW_LIMIT: usize = 2000;
+    if text.len() > PREVIEW_LIMIT {
+        text.truncate(PREVIEW_LIMIT);
+        text.push_str("…");
+    }
+    if text.trim().is_empty() {
+        text = "(tool returned no text output)".to_string();
+    }
+    format!(
+        "I stopped after reaching the tool-call limit before the model produced a final reply. \
+         Latest tool result from `{}`{}:\n{}",
+        result.tool_name,
+        if result.is_error { " (error)" } else { "" },
+        text
+    )
+}
+
+fn assistant_text(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|content| content.as_text())
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Build the synthetic error `ToolResult` that answers a tool_use the model
@@ -801,7 +893,12 @@ async fn cancelled(config: &AgentConfig) {
 mod tests {
     use super::*;
     use crate::types::AgentConfig;
-    use ocean_protocol::{Model, ToolResultMessage};
+    use async_trait::async_trait;
+    use futures::stream;
+    use ocean_protocol::{
+        AssistantMessageEventStream, Model, Provider, StreamOptions, ToolResultMessage,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
     fn user(s: &str) -> Message {
@@ -816,6 +913,84 @@ mod tests {
             is_error: false,
             timestamp: 0,
         })
+    }
+
+    #[derive(Default)]
+    struct TerminalDoneProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for TerminalDoneProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> ocean_protocol::Result<AssistantMessageEventStream> {
+            let round = self.calls.fetch_add(1, Ordering::SeqCst);
+            let message = |content, stop| AssistantMessage {
+                content,
+                api: "test".into(),
+                provider: "test".into(),
+                model: "test".into(),
+                usage: Usage::default(),
+                stop_reason: stop,
+                error_message: None,
+                timestamp: ocean_protocol::now_ms(),
+            };
+            let events = if round == 0 {
+                vec![AssistantMessageEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message: message(
+                        vec![Content::ToolCall {
+                            id: "call-terminal-done".into(),
+                            name: "missing_tool".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        StopReason::ToolUse,
+                    ),
+                }]
+            } else {
+                vec![AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: message(
+                        vec![Content::text("final answer after tool result")],
+                        StopReason::Stop,
+                    ),
+                }]
+            };
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_done_text_after_tool_result_is_emitted_as_text_delta() {
+        let cfg = AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test")
+            .with_session_id("sess-terminal-done")
+            .with_provider(Arc::new(TerminalDoneProvider::default()))
+            .with_max_turns(4);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let run = run_agent(&cfg, user("use a tool then answer"), Some(tx))
+            .await
+            .expect("run should finish");
+
+        assert!(matches!(run.messages.last(), Some(Message::Assistant(a))
+            if a.content.iter().any(|c| c.as_text() == Some("final answer after tool result"))));
+
+        let mut deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::TextDelta { delta, .. } = ev {
+                deltas.push(delta);
+            }
+        }
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| delta == "final answer after tool result"),
+            "terminal assistant text must be surfaced as TextDelta for SSE clients; got {deltas:?}"
+        );
     }
 
     #[test]

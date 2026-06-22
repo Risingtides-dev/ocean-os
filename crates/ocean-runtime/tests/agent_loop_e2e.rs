@@ -404,6 +404,77 @@ async fn transport_error_mid_stream_surfaces_as_err() {
 // Round 2: provider emits final text (stop=Stop). Loop completes cleanly.
 // ===========================================================================
 #[tokio::test]
+async fn final_round_after_tool_result_disables_tools_and_forces_reply() {
+    struct FinalizeOnNoToolsProvider {
+        calls: AtomicUsize,
+        saw_empty_tools: std::sync::Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Provider for FinalizeOnNoToolsProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+        ) -> ocean_protocol::Result<AssistantMessageEventStream> {
+            let round = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = if context.tools.is_empty() {
+                *self.saw_empty_tools.lock().unwrap() = true;
+                vec![
+                    text_delta("final"),
+                    done(vec![Content::text("final answer")], StopReason::Stop),
+                ]
+            } else {
+                vec![done(
+                    vec![tool_call(
+                        &format!("call-{round}"),
+                        "echo",
+                        serde_json::json!({ "round": round }),
+                    )],
+                    StopReason::ToolUse,
+                )]
+            };
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(FinalizeOnNoToolsProvider {
+        calls: AtomicUsize::new(0),
+        saw_empty_tools: std::sync::Mutex::new(false),
+    });
+    let cfg = AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test system")
+        .with_session_id("e2e")
+        .with_provider(provider.clone())
+        .with_max_turns(2)
+        .with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
+
+    let run = ocean_runtime::run_agent(&cfg, user("use tools, then answer"), None)
+        .await
+        .expect("final round should produce text instead of another tool call");
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "only the first round runs a tool"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert!(*provider.saw_empty_tools.lock().unwrap());
+    assert!(!run.stopped_at_turn_limit);
+    let last_text = run
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::Assistant(a) => a.content.iter().find_map(|c| c.as_text()),
+            _ => None,
+        })
+        .expect("final assistant text");
+    assert_eq!(last_text, "final answer");
+}
+
+#[tokio::test]
 async fn multi_round_tool_loop_runs_tool_then_completes() {
     let ran = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(MockProvider::new(vec![
