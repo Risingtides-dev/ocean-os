@@ -145,3 +145,29 @@ Verification:
 - restarted daemon by exact old listener PID `77477`; rebuilt daemon is PID `14023` in tmux session `ocean-daemon`
 - `curl http://127.0.0.1:4780/health`
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [10:05pm] [06-22-26]
+agent: [pi], [gpt-5.1], [Thoth]
+worktree: [main]
+type:  [refactor]: smart-commit the uncommitted daemon tree (39 files) into 5 logical commits + push
+area:  [backend]: daemon/runtime git hygiene
+
+Triaged 39 uncommitted files in the working tree that carried a week of daemon
+stabilization work (cwd-binding leak fix, agent-loop synthesis after tool
+results, terminal-text SSE fix, the new ocean-hooks crate, and the devlog
+AGENTS.md hierarchy) existing only in the working tree and the running release
+binary — a silent-regression landmine. Split into 5 conventional commits:
+1. docs(devlog): AGENTS.md hierarchy + events ledger
+2. fix(runtime): force synthesis after tool results + emit terminal text as TextDelta
+3. fix(runtime): bind tools to SessionContext cwd + resolve relative patterns
+4. feat(hooks): plugin-agnostic lifecycle hooks crate + daemon config wiring
+5. docs(specs): SubprocessProvider spec
+Rebased onto origin/main (resolved CLAUDE.md→OCEAN.md rename cleanly via git
+rename detection; my devlog line landed in OCEAN.md). cargo check --workspace
+green before and after rebase. Pushed: f58cd9d..2e83e8b.
+
+Verification:
+- cargo check --workspace (pre-commit, post-rebase)
+- git log --oneline origin/main..HEAD (5 commits)
+- git rev-list --left-right --count origin/main...HEAD (0/0 synced)
