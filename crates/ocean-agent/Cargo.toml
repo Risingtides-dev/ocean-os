@@ -15,6 +15,7 @@ ocean-providers.workspace = true
 ocean-runtime.workspace = true
 ocean-mcp.workspace = true
 ocean-plugin.workspace = true
+ocean-hooks.workspace = true
 # Longhouse council ops exposed to agents as tools via LonghouseProvider
 # (OCEAN-118). ocean-longhouse depends UP on ocean-runtime, not on ocean-agent,
 # so there is no cycle.

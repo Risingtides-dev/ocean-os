@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use anyhow::Context;
+use ocean_hooks::HooksConfig;
 use ocean_mcp::McpServerConfig;
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,8 @@ use serde::{Deserialize, Serialize};
 pub struct DaemonConfig {
     #[serde(default)]
     pub mcp: McpSection,
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 /// The `[mcp]` table, holding the `[[mcp.server]]` array.
@@ -57,6 +60,7 @@ impl DaemonConfig {
         tracing::info!(
             path = %path.display(),
             mcp_servers = cfg.mcp.server.len(),
+            stop_hooks = cfg.hooks.count_for(ocean_hooks::HookEvent::Stop),
             "loaded daemon config"
         );
         Ok(cfg)
@@ -91,6 +95,7 @@ impl DaemonConfig {
                 );
             }
         }
+        self.hooks.validate()?;
         Ok(())
     }
 }
@@ -118,6 +123,10 @@ mod tests {
             command = "npx"
             args = ["-y", "@modelcontextprotocol/server-brave-search"]
             env = ["BRAVE_API_KEY"]
+
+            [[hooks.Stop]]
+            command = "/tmp/stop-hook.sh"
+            timeout_secs = 9
             "#,
         )
         .unwrap();
@@ -125,6 +134,9 @@ mod tests {
         assert_eq!(cfg.mcp.server.len(), 1);
         assert_eq!(cfg.mcp.server[0].name, "brave");
         assert_eq!(cfg.mcp.server[0].env, vec!["BRAVE_API_KEY".to_string()]);
+        assert_eq!(cfg.hooks.stop.len(), 1);
+        assert_eq!(cfg.hooks.stop[0].command, "/tmp/stop-hook.sh");
+        assert_eq!(cfg.hooks.stop[0].timeout_secs, 9);
         let _ = std::fs::remove_dir_all(dir);
     }
 

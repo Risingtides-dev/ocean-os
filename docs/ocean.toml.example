@@ -41,3 +41,13 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
 env = ["GITHUB_TOKEN"]
 enabled = false
+
+# Runtime hooks run local commands at lifecycle points. They are plugin-agnostic:
+# Ocean writes JSON to stdin and any adapter can consume it:
+#   {"hook_event_name":"Stop","cwd":"...","session_id":"...","stop_hook_active":false,"metadata":{}}
+# Empty stdout means continue. To block/notify, print:
+#   {"decision":"block","reason":"..."}
+# Hooks fail open: timeouts/errors are logged and the turn still completes.
+[[hooks.Stop]]
+command = "/path/to/any/plugin-or-local-adapter"
+timeout_secs = 15

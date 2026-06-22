@@ -17,6 +17,7 @@ members = [
   "crates/ocean-call",
   "crates/ocean-store",
   "crates/ocean-plugin",
+  "crates/ocean-hooks",
   "crates/ocean-context",
   "xtask",
 ]
@@ -43,6 +44,7 @@ default-members = [
   "crates/ocean-call",
   "crates/ocean-store",
   "crates/ocean-plugin",
+  "crates/ocean-hooks",
   "crates/ocean-context",
 ]
 resolver = "2"
@@ -92,6 +94,7 @@ ocean-store = { path = "crates/ocean-store" }
 # coupling — matches the daemon's std::sync::Mutex room registry style.
 rusqlite = { version = "0.32", features = ["bundled"] }
 ocean-plugin = { path = "crates/ocean-plugin" }
+ocean-hooks = { path = "crates/ocean-hooks" }
 regex = "1"
 ocean-context = { path = "crates/ocean-context" }
 # B1 tree-sitter resolver (OCEAN-307). Pinned: grammar ABI and node-kind names

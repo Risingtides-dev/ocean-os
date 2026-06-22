@@ -2913,6 +2913,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ocean-core",
+ "ocean-hooks",
  "ocean-longhouse",
  "ocean-mcp",
  "ocean-plugin",
@@ -3065,6 +3066,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "ocean-hooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]
