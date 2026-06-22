@@ -1,10 +1,25 @@
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::fs;
 
+use crate::tools::path::resolve_against_cwd;
 use crate::types::{AgentTool, AgentToolResult};
 
-pub struct WriteTool;
+pub struct WriteTool {
+    cwd: Option<PathBuf>,
+}
+
+impl WriteTool {
+    pub fn new() -> Self {
+        Self { cwd: None }
+    }
+
+    pub fn for_cwd(cwd: PathBuf) -> Self {
+        Self { cwd: Some(cwd) }
+    }
+}
 
 #[async_trait]
 impl AgentTool for WriteTool {
@@ -36,7 +51,9 @@ impl AgentTool for WriteTool {
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or("missing 'content'")?;
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let display_path = path.to_string();
+        let path = resolve_against_cwd(self.cwd.as_deref(), path);
+        if let Some(parent) = Path::new(&path).parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).await.map_err(|e| {
                     format!(
@@ -46,13 +63,13 @@ impl AgentTool for WriteTool {
                 })?;
             }
         }
-        fs::write(path, content)
+        fs::write(&path, content)
             .await
-            .map_err(|e| format!("write {path}: {e}"))?;
+            .map_err(|e| format!("write {display_path}: {e}"))?;
         Ok(AgentToolResult::text(format!(
             "wrote {} bytes to {}",
             content.len(),
-            path
+            display_path
         )))
     }
 }
@@ -80,7 +97,7 @@ mod tests {
         // Target lives "under" the file → create_dir_all(blocker) must fail.
         let target = blocker.join("child.txt");
 
-        let tool = WriteTool;
+        let tool = WriteTool::new();
         let args = json!({
             "path": target.to_str().unwrap(),
             "content": "hello",

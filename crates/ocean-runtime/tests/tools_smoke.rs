@@ -28,7 +28,7 @@ async fn write_then_read_roundtrips() {
     let path = dir.join("hello.txt");
     let path_s = path.to_string_lossy().to_string();
 
-    let res = write::WriteTool
+    let res = write::WriteTool::new()
         .execute("1", json!({"path": path_s, "content": "hello\nworld\n"}))
         .await
         .unwrap();
@@ -37,7 +37,7 @@ async fn write_then_read_roundtrips() {
         ocean_protocol::Content::Text { .. }
     ));
 
-    let res = read::ReadTool
+    let res = read::ReadTool::new()
         .execute("2", json!({"path": path_s}))
         .await
         .unwrap();
@@ -53,7 +53,7 @@ async fn edit_replaces_single_occurrence() {
     let path_s = path.to_string_lossy().to_string();
     std::fs::write(&path, "foo bar baz").unwrap();
 
-    let res = edit::EditTool
+    let res = edit::EditTool::new()
         .execute(
             "1",
             json!({"path": path_s, "old_string": "bar", "new_string": "BAR"}),
@@ -71,7 +71,7 @@ async fn ls_lists_dir() {
     std::fs::write(dir.join("a.txt"), "x").unwrap();
     std::fs::create_dir(dir.join("sub")).unwrap();
 
-    let res = ls::LsTool
+    let res = ls::LsTool::new()
         .execute("1", json!({"path": dir.to_string_lossy()}))
         .await
         .unwrap();
@@ -86,7 +86,7 @@ async fn grep_finds_pattern() {
     std::fs::write(dir.join("a.txt"), "needle\nhaystack\n").unwrap();
     std::fs::write(dir.join("b.txt"), "nothing here\n").unwrap();
 
-    let res = grep::GrepTool
+    let res = grep::GrepTool::new()
         .execute(
             "1",
             json!({"pattern": "needle", "path": dir.to_string_lossy()}),
@@ -106,7 +106,7 @@ async fn glob_finds_files() {
     std::fs::write(dir.join("c.txt"), "").unwrap();
 
     let pattern = format!("{}/*.rs", dir.to_string_lossy());
-    let res = glob_tool::GlobTool
+    let res = glob_tool::GlobTool::new()
         .execute("1", json!({"pattern": pattern}))
         .await
         .unwrap();
@@ -118,7 +118,7 @@ async fn glob_finds_files() {
 
 #[tokio::test]
 async fn bash_runs_simple_command() {
-    let res = bash::BashTool
+    let res = bash::BashTool::new()
         .execute("1", json!({"command": "echo hi-from-bash"}))
         .await
         .unwrap();

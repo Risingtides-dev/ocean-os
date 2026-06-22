@@ -2,10 +2,24 @@ use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::fs;
+use std::path::PathBuf;
 
+use crate::tools::path::resolve_against_cwd;
 use crate::types::{AgentTool, AgentToolResult};
 
-pub struct GrepTool;
+pub struct GrepTool {
+    cwd: Option<PathBuf>,
+}
+
+impl GrepTool {
+    pub fn new() -> Self {
+        Self { cwd: None }
+    }
+
+    pub fn for_cwd(cwd: PathBuf) -> Self {
+        Self { cwd: Some(cwd) }
+    }
+}
 
 #[async_trait]
 impl AgentTool for GrepTool {
@@ -37,6 +51,7 @@ impl AgentTool for GrepTool {
             .and_then(|v| v.as_str())
             .unwrap_or(".")
             .to_string();
+        let path = resolve_against_cwd(self.cwd.as_deref(), &path);
         let max = args
             .get("max_matches")
             .and_then(|v| v.as_u64())

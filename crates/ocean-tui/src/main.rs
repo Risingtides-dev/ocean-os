@@ -2380,24 +2380,27 @@ fn resolve_project_root(cli_project: Option<&str>) -> PathBuf {
 
 fn run_daemon(url: String, project: Option<String>, session: Option<String>) -> anyhow::Result<()> {
     let client = DaemonClient::new()?;
+    let launch_root = resolve_project_root(project.as_deref());
     // OCEAN-311: resolve --session/OCEAN_SESSION against the daemon's session
     // list BEFORE any terminal setup, so an unknown/ambiguous id fails loudly
     // on stderr instead of opening the TUI on a fresh session.
     let resumed = match session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(wanted) => Some(resolve_resume_session(&client, &url, wanted)?),
-        None => None,
+        None => {
+            // Auto-resume: if exactly one session is scoped to this workspace,
+            // resume it so `cd project && ocean` continues where you left off.
+            let cwd_str = launch_root.to_string_lossy();
+            match client.sessions(&url, Some(cwd_str.as_ref()), false) {
+                Ok(resp) if resp.sessions.len() == 1 => {
+                    Some(resp.sessions.into_iter().next().unwrap())
+                }
+                _ => None,
+            }
+        }
     };
-    // Explicit --project (or OCEAN_PROJECT) wins; otherwise adopt the resumed
-    // session's recorded workspace root so turns pass the daemon's cwd-binding
-    // guard (OCEAN-52) instead of being rejected as cross-workspace.
-    let root = match resumed
-        .as_ref()
-        .filter(|_| project.is_none())
-        .and_then(|s| s.workspace_root.as_deref())
-    {
-        Some(workspace_root) => PathBuf::from(workspace_root),
-        None => resolve_project_root(project.as_deref()),
-    };
+    // Keep the launch cwd as the surface root; the daemon turn resolver decides
+    // whether a resumed session stays put or rebinds to the caller's cwd.
+    let root = launch_root;
     let (action_tx, action_rx) = mpsc::channel();
     let mut state = AppState::new(
         UiMode::Daemon(Box::new(DaemonApp::new(url, root))),
@@ -7868,8 +7871,8 @@ mod tests {
         };
         let s = summary_from_detail(detail);
         assert_eq!(s.id, id);
-        // workspace_root drives --session root adoption; losing it would
-        // break the daemon's cwd binding guard on the first turn.
+        // workspace_root is the resume lookup key; losing it would make the
+        // launcher unable to find the session again by workspace.
         assert_eq!(s.workspace_root.as_deref(), Some("/repo"));
         assert_eq!(s.updated_ms, Some(42));
         assert_eq!(s.turns, 7);

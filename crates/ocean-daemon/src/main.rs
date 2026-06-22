@@ -2261,6 +2261,26 @@ async fn prompt(
         }
     };
 
+    req.cwd = match state.runtime.resolve_cwd_for_turn(req.project_id, &req.cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ocean_core::PromptResponse {
+                    ok: false,
+                    request_id: req.request_id,
+                    session_id: req.session_id,
+                    code: None,
+                    wall_ms: 0,
+                    stdout: String::new(),
+                    stderr: error.to_string(),
+                    cwd: req.cwd.clone(),
+                    usage: ocean_core::TokenUsage::default(),
+                }),
+            );
+        }
+    };
+
     let (request_id, cancel) =
         register_running_request(&state, &mut req, "prompt running", RequestState::Running).await;
     // OCEAN-160 (P0): do NOT trust the wire `yolo` flag to escalate. The posture
@@ -2316,6 +2336,19 @@ async fn create_request(
                 session_id: req.session_id,
                 state: RequestState::Errored,
                 message: "daemon at concurrent-turn capacity; busy, try again shortly".into(),
+            });
+        }
+    };
+
+    req.cwd = match state.runtime.resolve_cwd_for_turn(req.project_id, &req.cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return Json(RequestCreateResponse {
+                ok: false,
+                request_id: Uuid::new_v4(),
+                session_id: req.session_id,
+                state: RequestState::Errored,
+                message: error.to_string(),
             });
         }
     };
@@ -8212,10 +8245,9 @@ async fn agent_voice(
 /// resume. See [`resolve_bound_cwd`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CwdBindingError {
-    /// The resumed session is bound to one workspace, but the turn supplied a
-    /// cwd that resolves to a *different* workspace. A forged `session_id`
-    /// pointed at an arbitrary cwd is a session-hijack attempt (OCEAN-52a):
-    /// reject rather than relocate the session into the attacker's directory.
+    /// The caller's declared workspace does not match the session's bound
+    /// workspace on a read-scoped request. The read path keeps the existing
+    /// workspace boundary intact even when the turn path is allowed to rebind.
     WorkspaceMismatch {
         requested_workspace: String,
         session_workspace: String,
@@ -8234,8 +8266,7 @@ impl CwdBindingError {
                 session_workspace,
             } => format!(
                 "session/workspace mismatch: this session is bound to workspace \
-                 {session_workspace}, but the turn's cwd resolves to {requested_workspace}. \
-                 A resumed turn cannot relocate its session to a different workspace."
+                 {session_workspace}, but the request resolves to {requested_workspace}."
             ),
             CwdBindingError::PathTraversal { cwd } => format!(
                 "rejected cwd {cwd}: a working directory must be an absolute, \
@@ -8255,28 +8286,22 @@ fn cwd_has_traversal(cwd: &str) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
-/// Resolve the working directory a turn will actually execute in, enforcing the
-/// session↔workspace binding (OCEAN-52) and pinning resumed turns to their
-/// session's bound workspace (OCEAN-55).
+/// Resolve the working directory a turn will actually execute in. The caller's
+/// cwd always wins; the only guard here is path traversal.
 ///
 /// - `requested_cwd`: the cwd already resolved by `resolve_cwd_for_turn`
 ///   (non-empty: the client's cwd, or a project's workspace_root).
-/// - `requested_workspace_root`: the workspace root `requested_cwd` maps to
-///   (git toplevel, or the cwd itself), computed by the caller.
-/// - `session_binding`: `Some((session_cwd, session_workspace_root))` when the
-///   turn resumes an existing session that carries a bound workspace; `None` for
-///   a brand-new session (implicit or explicit) or a legacy session with no
-///   recorded workspace.
+/// - `requested_workspace_root`: kept for call-site compatibility; the resolver
+///   no longer compares against it.
+/// - `session_binding`: kept for call-site compatibility; the resolver no longer
+///   compares against it.
 ///
-/// Returns the cwd to run in. For a NEW session this is `requested_cwd` (the
-/// first turn legitimately sets the cwd). For a RESUMED session this is the
-/// session's *bound* cwd — the turn is pinned to where the session was started,
-/// never an arbitrary `requested_cwd`, after validating the two share a
-/// workspace root.
+/// Returns the cwd to run in. A resumed turn always uses the caller's cwd; the
+/// session binding is refreshed separately when the turn is saved.
 fn resolve_bound_cwd(
     requested_cwd: &str,
-    requested_workspace_root: &str,
-    session_binding: Option<(&str, &str)>,
+    _requested_workspace_root: &str,
+    _session_binding: Option<(&str, &str)>,
 ) -> Result<String, CwdBindingError> {
     // Path-traversal guard applies to every turn: the resolved cwd must not
     // contain `..` components that could escape into a parent / arbitrary dir.
@@ -8286,30 +8311,7 @@ fn resolve_bound_cwd(
         });
     }
 
-    match session_binding {
-        // RESUMED session: validate the binding, then pin to the session's
-        // bound cwd. The requested cwd's workspace must match the session's
-        // bound workspace, otherwise this is a cross-workspace hijack.
-        Some((session_cwd, session_workspace)) => {
-            if requested_workspace_root != session_workspace {
-                return Err(CwdBindingError::WorkspaceMismatch {
-                    requested_workspace: requested_workspace_root.to_string(),
-                    session_workspace: session_workspace.to_string(),
-                });
-            }
-            // The session's own bound cwd must also be traversal-free (it was
-            // captured at creation, but validate defensively).
-            if cwd_has_traversal(session_cwd) {
-                return Err(CwdBindingError::PathTraversal {
-                    cwd: session_cwd.to_string(),
-                });
-            }
-            Ok(session_cwd.to_string())
-        }
-        // NEW session (or legacy with no bound workspace): the first turn sets
-        // the cwd. Run in the requested cwd as before.
-        None => Ok(requested_cwd.to_string()),
-    }
+    Ok(requested_cwd.to_string())
 }
 
 /// Look up the workspace binding (`cwd`, `workspace_root`) of an existing
@@ -8476,35 +8478,17 @@ async fn agent_turn(
         session_id = %session_id
     );
 
-    // Session↔workspace binding (OCEAN-52) + resume cwd pinning (OCEAN-55).
+    // Session↔workspace binding (OCEAN-52) + resume cwd selection (OCEAN-55).
     //
     // A NEW session (`is_new_session`) legitimately sets its own cwd: the
     // path-traversal guard still applies, but there is no prior workspace to
-    // bind against. A RESUMED session (client supplied a `session_id` that
-    // exists on disk) is PINNED to the workspace it was started in — the turn
-    // executes in the session's bound cwd, never an arbitrary `req.cwd` — after
-    // validating that the requested cwd resolves to the *same* workspace root.
-    // A mismatch is a cross-workspace hijack (forged session_id pointed at an
-    // arbitrary cwd) and is rejected. An unknown `session_id` yields no binding
-    // here; the strict resume check inside the agent loop surfaces it as the
-    // canonical "session not found" error, preserving existing behaviour.
-    let requested_workspace_root = state
-        .runtime
-        .workspace_root_for(std::path::Path::new(&cwd))
-        .to_string_lossy()
-        .into_owned();
-    let session_binding = if is_new_session {
-        None
-    } else {
-        session_workspace_binding(&state.runtime, session_id)
-    };
-    let cwd = match resolve_bound_cwd(
-        &cwd,
-        &requested_workspace_root,
-        session_binding
-            .as_ref()
-            .map(|(c, r)| (c.as_str(), r.as_str())),
-    ) {
+    // bind against. A RESUMED session still runs in the caller's cwd; the
+    // session record is refreshed on save so the stored cwd and workspace root
+    // follow the launch directory instead of freezing on the first bind. An
+    // unknown `session_id` yields no binding here; the strict resume check
+    // inside the agent loop surfaces it as the canonical "session not found"
+    // error, preserving existing behaviour.
+    let cwd = match resolve_bound_cwd(&cwd, "", None) {
         Ok(resolved) => resolved,
         Err(binding_error) => {
             tracing::warn!(
@@ -10074,12 +10058,12 @@ async fn agent_session(
     let core_id = core_sid(session_id);
     match state.runtime.session_detail(core_id) {
         Ok(session) => {
-            // Real workspace path: prefer the bound workspace root, fall back to
-            // the recorded cwd; empty only for legacy pre-binding sessions.
+            // Real cwd path: prefer the recorded cwd, fall back to the bound
+            // workspace root; empty only for legacy pre-binding sessions.
             let cwd = session
-                .workspace_root
+                .cwd
                 .clone()
-                .or_else(|| session.cwd.clone())
+                .or_else(|| session.workspace_root.clone())
                 .unwrap_or_default();
 
             // Workspace-scoping guard (OCEAN-74). The turn path binds a session
@@ -12361,13 +12345,13 @@ mod tests {
     #[test]
     fn session_detail_yields_real_cwd_and_timestamps() {
         let detail = detail_fixture(SessionRunState::Completed);
-        // cwd preference is workspace_root, not empty.
+        // cwd preference is the recorded cwd, not the workspace root stub.
         let cwd = detail
-            .workspace_root
+            .cwd
             .clone()
-            .or_else(|| detail.cwd.clone())
+            .or_else(|| detail.workspace_root.clone())
             .unwrap_or_default();
-        assert_eq!(cwd, "/work/repo");
+        assert_eq!(cwd, "/work/repo/sub");
         assert!(!cwd.is_empty(), "cwd must not be the empty stub");
         assert_eq!(ms_to_datetime(detail.created_ms).timestamp_millis(), 1_000);
         assert_eq!(ms_to_datetime(detail.updated_ms).timestamp_millis(), 5_000);
@@ -13761,34 +13745,16 @@ mod tests {
     }
 
     #[test]
-    fn resumed_turn_session_cwd_equal_to_req_cwd_is_pinned() {
-        // The common case: the client re-sends the same cwd it started in.
+    fn resumed_turn_rebinds_when_workspace_changes() {
+        // A resumed turn from a different workspace should follow the caller's
+        // cwd so the session can rebind to the new project.
         let out = resolve_bound_cwd(
-            "/work/repo",
-            "/work/repo",
-            Some(("/work/repo", "/work/repo")),
+            "/other/project",
+            "/other/project",
+            Some(("/work/repo/sub", "/work/repo")),
         )
-        .expect("identical workspace should be accepted");
-        assert_eq!(out, "/work/repo");
-    }
-
-    #[test]
-    fn session_cwd_mismatch_is_rejected() {
-        // A forged session_id whose bound workspace differs from the cwd the
-        // turn points at is a cross-workspace hijack — reject it.
-        let err = resolve_bound_cwd(
-            "/etc",                                 // attacker cwd
-            "/etc",                                 // its workspace
-            Some(("/work/repo/sub", "/work/repo")), // session bound elsewhere
-        )
-        .expect_err("cross-workspace resume must be rejected");
-        assert_eq!(
-            err,
-            CwdBindingError::WorkspaceMismatch {
-                requested_workspace: "/etc".into(),
-                session_workspace: "/work/repo".into(),
-            }
-        );
+        .expect("cross-workspace resume should rebind");
+        assert_eq!(out, "/other/project");
     }
 
     #[test]

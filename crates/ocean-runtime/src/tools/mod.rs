@@ -9,6 +9,7 @@ pub mod edit;
 pub mod glob_tool;
 pub mod grep;
 pub mod ls;
+pub mod path;
 pub mod read;
 pub mod slack_canvas;
 pub mod surface;
@@ -26,13 +27,13 @@ use crate::types::AgentTool;
 /// shared with the daemon's `/v1/component/event` route.
 pub fn default_tools() -> Vec<Arc<dyn AgentTool>> {
     vec![
-        Arc::new(read::ReadTool),
-        Arc::new(write::WriteTool),
-        Arc::new(edit::EditTool),
-        Arc::new(bash::BashTool),
-        Arc::new(ls::LsTool),
-        Arc::new(grep::GrepTool),
-        Arc::new(glob_tool::GlobTool),
+        Arc::new(read::ReadTool::new()),
+        Arc::new(write::WriteTool::new()),
+        Arc::new(edit::EditTool::new()),
+        Arc::new(bash::BashTool::new()),
+        Arc::new(ls::LsTool::new()),
+        Arc::new(grep::GrepTool::new()),
+        Arc::new(glob_tool::GlobTool::new()),
         Arc::new(web_fetch::WebFetchTool),
         Arc::new(todo::TodoTool::new()),
         Arc::new(component::ComponentRenderTool),

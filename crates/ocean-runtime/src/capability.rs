@@ -133,6 +133,28 @@ impl CapabilityProvider for BuiltinProvider {
                             Some(session_id.clone()),
                         ));
                     }
+                    "bash" => {
+                        *tool = Arc::new(crate::tools::bash::BashTool::for_cwd(ctx.cwd.clone()));
+                    }
+                    "read" => {
+                        *tool = Arc::new(crate::tools::read::ReadTool::for_cwd(ctx.cwd.clone()));
+                    }
+                    "write" => {
+                        *tool = Arc::new(crate::tools::write::WriteTool::for_cwd(ctx.cwd.clone()));
+                    }
+                    "edit" => {
+                        *tool = Arc::new(crate::tools::edit::EditTool::for_cwd(ctx.cwd.clone()));
+                    }
+                    "ls" => {
+                        *tool = Arc::new(crate::tools::ls::LsTool::for_cwd(ctx.cwd.clone()));
+                    }
+                    "grep" => {
+                        *tool = Arc::new(crate::tools::grep::GrepTool::for_cwd(ctx.cwd.clone()));
+                    }
+                    "glob" => {
+                        *tool =
+                            Arc::new(crate::tools::glob_tool::GlobTool::for_cwd(ctx.cwd.clone()));
+                    }
                     _ => {}
                 }
             }

@@ -453,9 +453,11 @@ impl AgentRuntime {
         req.request_id = Some(request_id);
 
         let start = Instant::now();
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // Report the turn/session cwd the daemon resolved from the client request,
+        // not the long-lived daemon process cwd. Returning `current_dir()` here
+        // made legacy `/v1/prompt` clients look bound to wherever the daemon was
+        // launched even when tool/session execution used a different cwd.
+        let cwd = req.cwd.clone();
 
         // Resolve the EFFECTIVE turn state before any readiness/dispatch check
         // (OCEAN-36 + Codex). When the turn pins a per-session `model_id`, the
@@ -1273,6 +1275,7 @@ impl AgentRuntime {
             cache_write: run.usage.cache_write,
             total_tokens: run.usage.total_tokens,
         };
+
         Ok((session.id, stdout, stderr, usage))
     }
 }
@@ -1960,22 +1963,28 @@ mod session {
             }
         }
 
-        /// Tag this session with workspace metadata derived from the
-        /// caller's cwd. Idempotent — pre-existing values win so that
-        /// resuming a session in a different cwd doesn't rewrite its
-        /// original workspace.
+        /// Tag this session with workspace metadata derived from the caller's cwd.
+        /// First bind is unconditional. On resume, rebinds when the incoming cwd
+        /// resolves to a different workspace root — so `cd /project-b && ocean
+        /// --resume <id>` picks up project-b's context instead of staying stale.
         pub fn bind_workspace(&mut self, cwd: &Path) {
-            if self.cwd.is_none() {
-                self.cwd = Some(cwd.to_string_lossy().into_owned());
+            let new_root = workspace_root(cwd);
+            let same_root = self
+                .workspace_root
+                .as_deref()
+                .map(|r| PathBuf::from(r) == new_root)
+                .unwrap_or(false);
+            self.cwd = Some(cwd.to_string_lossy().into_owned());
+            if same_root {
+                // Same project — keep the workspace root and git metadata, but
+                // refresh the recorded cwd to the latest launch directory.
+                return;
             }
-            if self.workspace_root.is_none() {
-                self.workspace_root = Some(workspace_root(cwd).to_string_lossy().into_owned());
-            }
-            if self.git_branch.is_none() && self.git_commit.is_none() {
-                let (branch, commit) = probe_git(cwd);
-                self.git_branch = branch;
-                self.git_commit = commit;
-            }
+            // Different project (or first bind) — write all fields unconditionally.
+            self.workspace_root = Some(new_root.to_string_lossy().into_owned());
+            let (branch, commit) = probe_git(cwd);
+            self.git_branch = branch;
+            self.git_commit = commit;
         }
 
         pub fn replace_messages(&mut self, messages: Vec<Message>) {
@@ -4298,6 +4307,74 @@ done
 
         let _ = std::fs::remove_dir_all(config_dir);
     }
+
+    #[test]
+    fn bind_workspace_rebinds_on_different_project() {
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let mut s = session::Session::new(&model);
+
+        // First bind — unconditional.
+        let tmp = std::env::temp_dir();
+        s.bind_workspace(&tmp);
+        let first_root = s.workspace_root.clone().unwrap();
+
+        // Second bind to a different directory — must overwrite.
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+        s.bind_workspace(&home);
+        let second_root = s.workspace_root.clone().unwrap();
+
+        // If home and tmp resolve to different workspace roots, we must have rebound.
+        // (They always will on a normal system; this guards the invariant.)
+        if first_root != second_root {
+            assert_eq!(
+                s.cwd.as_deref(),
+                Some(home.to_string_lossy().as_ref()),
+                "cwd must update to the new project directory"
+            );
+        }
+
+        // Bind to the same directory again — must NOT change cwd.
+        let cwd_before = s.cwd.clone();
+        let root_before = s.workspace_root.clone();
+        s.bind_workspace(&home);
+        assert_eq!(s.cwd, cwd_before, "same-project bind must be a no-op");
+        assert_eq!(
+            s.workspace_root, root_before,
+            "same-project bind must be a no-op"
+        );
+    }
+
+    #[test]
+    fn bind_workspace_refreshes_cwd_within_same_workspace() {
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let mut s = session::Session::new(&model);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+
+        let sub_a = repo.path().join("a");
+        let sub_b = repo.path().join("b");
+        std::fs::create_dir_all(&sub_a).expect("create subdir a");
+        std::fs::create_dir_all(&sub_b).expect("create subdir b");
+
+        s.bind_workspace(&sub_a);
+        let workspace_root = s.workspace_root.clone();
+
+        s.bind_workspace(&sub_b);
+        assert_eq!(
+            s.workspace_root, workspace_root,
+            "same-workspace bind must keep the workspace root"
+        );
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(sub_b.to_string_lossy().as_ref()),
+            "same-workspace bind must refresh cwd to the latest launch directory"
+        );
+    }
 }
 
 mod system_prompt {
@@ -4388,7 +4465,7 @@ Some Ocean clients render live, interactive UI components, not just text. When t
 
 The `component_render` tool description carries the exact props schema for each kind. Use it; don't guess the shape. After rendering, still give a short text reply — the component complements your words, it doesn't replace them.
 
-You operate from the user's project directory (passed per turn). Look for AGENTS.md, CLAUDE.md, or .pi/instructions.md in the project tree — those are project-specific instructions that override or extend the above.
+You operate from the user's project directory (passed per turn). Look for AGENTS.md, .ocean/AGENTS.md, CLAUDE.md, or .pi/instructions.md in the project tree — those are project-specific instructions that override or extend the above.
 "#;
 
     /// Build the system prompt, optionally scoped to `cwd` and `client_type`.
@@ -4750,7 +4827,12 @@ is the user's real, signed-in browser session.\n\n\
     }
 
     fn load_project_prompt(start: &Path) -> String {
-        const FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".pi/instructions.md"];
+        const FILES: &[&str] = &[
+            "AGENTS.md",
+            ".ocean/AGENTS.md",
+            "CLAUDE.md",
+            ".pi/instructions.md",
+        ];
         let mut found = Vec::new();
         for ancestor in start.ancestors() {
             for name in FILES {
@@ -5013,6 +5095,30 @@ is the user's real, signed-in browser session.\n\n\
             assert!(prompt.contains("Ocean native surface"));
             assert!(prompt.contains("surface_patch"));
             assert!(!prompt.contains("Responses render as HTML"));
+        }
+
+        #[test]
+        fn project_prompt_loads_ocean_agents_md_from_ancestor() {
+            let assistants = empty_assistants_root();
+            let project = TempDir::new().expect("create project tempdir");
+            let ocean_dir = project.path().join(".ocean");
+            std::fs::create_dir_all(&ocean_dir).expect("create .ocean dir");
+            std::fs::write(
+                ocean_dir.join("AGENTS.md"),
+                "OCEAN PROJECT CONTRACT FROM DOT OCEAN",
+            )
+            .expect("write .ocean/AGENTS.md");
+            let nested = project.path().join("crates/example/src");
+            std::fs::create_dir_all(&nested).expect("create nested cwd");
+
+            let prompt = build_system_prompt_from(
+                Some(nested.to_str().expect("nested path utf8")),
+                Some("tui"),
+                Some(assistants.path()),
+            );
+
+            assert!(prompt.contains(".ocean/AGENTS.md"));
+            assert!(prompt.contains("OCEAN PROJECT CONTRACT FROM DOT OCEAN"));
         }
 
         #[test]

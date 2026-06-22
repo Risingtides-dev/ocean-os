@@ -1,10 +1,25 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::fs;
 
+use crate::tools::path::resolve_against_cwd;
 use crate::types::{AgentTool, AgentToolResult};
 
-pub struct ReadTool;
+pub struct ReadTool {
+    cwd: Option<PathBuf>,
+}
+
+impl ReadTool {
+    pub fn new() -> Self {
+        Self { cwd: None }
+    }
+
+    pub fn for_cwd(cwd: PathBuf) -> Self {
+        Self { cwd: Some(cwd) }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ReadTool {
@@ -39,9 +54,12 @@ impl AgentTool for ReadTool {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        let text = fs::read_to_string(path)
+        let display_path = path.to_string();
+        let path = resolve_against_cwd(self.cwd.as_deref(), path);
+
+        let text = fs::read_to_string(&path)
             .await
-            .map_err(|e| format!("read {path}: {e}"))?;
+            .map_err(|e| format!("read {display_path}: {e}"))?;
         let lines: Vec<&str> = text.lines().collect();
         let start = offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
         let end = limit

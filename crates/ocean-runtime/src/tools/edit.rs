@@ -1,10 +1,25 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::fs;
 
+use crate::tools::path::resolve_against_cwd;
 use crate::types::{AgentTool, AgentToolResult};
 
-pub struct EditTool;
+pub struct EditTool {
+    cwd: Option<PathBuf>,
+}
+
+impl EditTool {
+    pub fn new() -> Self {
+        Self { cwd: None }
+    }
+
+    pub fn for_cwd(cwd: PathBuf) -> Self {
+        Self { cwd: Some(cwd) }
+    }
+}
 
 #[async_trait]
 impl AgentTool for EditTool {
@@ -47,16 +62,19 @@ impl AgentTool for EditTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let text = fs::read_to_string(path)
+        let display_path = path.to_string();
+        let path = resolve_against_cwd(self.cwd.as_deref(), path);
+
+        let text = fs::read_to_string(&path)
             .await
-            .map_err(|e| format!("read {path}: {e}"))?;
+            .map_err(|e| format!("read {display_path}: {e}"))?;
         let count = text.matches(old_s).count();
         if count == 0 {
-            return Err(format!("old_string not found in {path}"));
+            return Err(format!("old_string not found in {display_path}"));
         }
         if count > 1 && !replace_all {
             return Err(format!(
-                "old_string occurs {count} times in {path}; pass replace_all=true or expand the match"
+                "old_string occurs {count} times in {display_path}; pass replace_all=true or expand the match"
             ));
         }
         let updated = if replace_all {
@@ -64,12 +82,12 @@ impl AgentTool for EditTool {
         } else {
             text.replacen(old_s, new_s, 1)
         };
-        fs::write(path, updated)
+        fs::write(&path, updated)
             .await
-            .map_err(|e| format!("write {path}: {e}"))?;
+            .map_err(|e| format!("write {display_path}: {e}"))?;
         let n = if replace_all { count } else { 1 };
         Ok(AgentToolResult::text(format!(
-            "edited {path}: {n} replacement(s)"
+            "edited {display_path}: {n} replacement(s)"
         )))
     }
 }

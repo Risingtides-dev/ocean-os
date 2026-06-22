@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -5,7 +7,19 @@ use tokio::time::{timeout, Duration};
 
 use crate::types::{AgentTool, AgentToolResult};
 
-pub struct BashTool;
+pub struct BashTool {
+    cwd: Option<PathBuf>,
+}
+
+impl BashTool {
+    pub fn new() -> Self {
+        Self { cwd: None }
+    }
+
+    pub fn for_cwd(cwd: PathBuf) -> Self {
+        Self { cwd: Some(cwd) }
+    }
+}
 
 #[async_trait]
 impl AgentTool for BashTool {
@@ -38,7 +52,12 @@ impl AgentTool for BashTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(120_000);
 
-        let fut = Command::new("bash").arg("-lc").arg(cmd).output();
+        let mut command = Command::new("bash");
+        command.arg("-lc").arg(cmd);
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        let fut = command.output();
         let output = match timeout(Duration::from_millis(timeout_ms), fut).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return Err(format!("spawn: {e}")),
