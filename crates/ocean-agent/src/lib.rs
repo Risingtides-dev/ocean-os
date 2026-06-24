@@ -23,6 +23,7 @@ pub use ocean_providers::{known_models, KnownModel};
 use ocean_runtime::{
     run_agent_with_history, AgentConfig, AgentError, AgentEvent, BuiltinProvider,
     CapabilityProvider, CapabilityRegistry, PermissionDecision, PermissionPolicy, SessionContext,
+    SharedTool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1096,6 +1097,7 @@ impl AgentRuntime {
             // `model_id` was already consumed above (turn_state resolution); it
             // is discarded here so the destructure stays exhaustive.
             model_id: _,
+            tool_allowlist,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
         // built-ins plus any connected MCP/skill providers, deduped first-wins.
@@ -1105,6 +1107,11 @@ impl AgentRuntime {
             session_id: Some(session_id.to_string()),
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
+        // Folder-as-agent tool narrowing: a named agent's declared `tools` list
+        // restricts this turn to those tools. Fail-safe — if the allowlist
+        // matches no available tool (typo / renamed tool), keep the full set and
+        // warn rather than running the agent with zero tools.
+        let tools = narrow_tools(tools, tool_allowlist.as_deref());
 
         let mut cfg = AgentConfig::new(
             snapshot.model.clone(),
@@ -1395,6 +1402,41 @@ pub struct PromptControl {
     /// Zed/ACP sessions) each pin their own model without racing each other
     /// through the global `set_model` swap. `None` uses the global model.
     pub model_id: Option<String>,
+    /// Per-turn tool allowlist (folder-as-agent). When `Some` and non-empty, the
+    /// turn's toolset is narrowed to tools whose `name()` is in the list — a
+    /// named agent's declared `agent.toml` `tools`/`capabilities`. `None` (every
+    /// non-folder turn) leaves the full registry toolset in force. Fail-safe: if
+    /// the allowlist matches NO available tool (e.g. a typo), narrowing is
+    /// skipped and a warning logged rather than running the agent toolless.
+    pub tool_allowlist: Option<Vec<String>>,
+}
+
+/// Narrow a turn's toolset to `allowlist` (folder-as-agent tool restriction).
+/// Keeps the tools whose `name()` is in the list. Fail-safe: an allowlist that
+/// matches NOTHING (every entry a typo / renamed tool) returns the FULL set plus
+/// a warning, so a named agent is never left toolless by a bad config. `None` or
+/// an empty list means no narrowing.
+fn narrow_tools(tools: Vec<SharedTool>, allowlist: Option<&[String]>) -> Vec<SharedTool> {
+    let Some(allow) = allowlist else {
+        return tools;
+    };
+    if allow.is_empty() {
+        return tools;
+    }
+    let narrowed: Vec<SharedTool> = tools
+        .iter()
+        .filter(|t| allow.iter().any(|a| a == t.name()))
+        .cloned()
+        .collect();
+    if narrowed.is_empty() {
+        tracing::warn!(
+            ?allow,
+            "agent tool allowlist matched no available tool; keeping the full toolset"
+        );
+        tools
+    } else {
+        narrowed
+    }
 }
 
 impl PromptControl {
@@ -1405,7 +1447,14 @@ impl PromptControl {
             event_sink: None,
             thinking_level: None,
             model_id: None,
+            tool_allowlist: None,
         }
+    }
+
+    /// Narrow this turn's toolset to the named tools (folder-as-agent allowlist).
+    pub fn with_tool_allowlist(mut self, tools: Vec<String>) -> Self {
+        self.tool_allowlist = (!tools.is_empty()).then_some(tools);
+        self
     }
 
     pub fn yolo(allow_mutating: bool) -> Self {
@@ -2547,6 +2596,56 @@ mod session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NamedTool(&'static str);
+    #[async_trait]
+    impl ocean_runtime::AgentTool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _args: Value,
+        ) -> std::result::Result<ocean_runtime::AgentToolResult, String> {
+            Ok(ocean_runtime::AgentToolResult::text(""))
+        }
+    }
+    fn tool(name: &'static str) -> SharedTool {
+        Arc::new(NamedTool(name))
+    }
+
+    #[test]
+    fn narrow_tools_filters_and_is_fail_safe() {
+        let all = || vec![tool("read"), tool("write"), tool("bash")];
+        let names = |v: Vec<SharedTool>| -> Vec<String> {
+            v.iter().map(|t| t.name().to_string()).collect()
+        };
+
+        // None / empty allowlist => no narrowing.
+        assert_eq!(narrow_tools(all(), None).len(), 3);
+        assert_eq!(narrow_tools(all(), Some(&[])).len(), 3);
+
+        // A real allowlist narrows to the named tools.
+        assert_eq!(
+            names(narrow_tools(all(), Some(&["read".into(), "bash".into()]))),
+            vec!["read", "bash"]
+        );
+
+        // FAIL-SAFE: an allowlist that matches NOTHING keeps the full set rather
+        // than running the agent toolless.
+        assert_eq!(
+            narrow_tools(all(), Some(&["nonexistent".into()])).len(),
+            3,
+            "no match must fail safe to the full toolset"
+        );
+    }
 
     fn temp_config_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
