@@ -304,8 +304,34 @@ async fn dispatch_key(page: &Page, key: &str) -> Result<()> {
     };
     use chromiumoxide::keys::get_key_definition;
 
-    let def =
-        get_key_definition(key).ok_or_else(|| BrowserError::Cdp(format!("unknown key: {key}")))?;
+    let def = match get_key_definition(key) {
+        Some(def) => def,
+        None => {
+            // No US-layout key definition — an accented char (café), a smart
+            // quote / em-dash, emoji, or a non-Latin script. Don't fail the whole
+            // type_text: insert the raw character via the CDP `text` field. A
+            // keyDown carrying `text` inserts that character regardless of
+            // keyboard layout (what an IME or paste does), where a layout lookup
+            // can't. Without this, one accented char in a name aborts the typing.
+            let down = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .text(key)
+                .build()
+                .map_err(BrowserError::Cdp)?;
+            let up = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .text(key)
+                .build()
+                .map_err(BrowserError::Cdp)?;
+            page.execute(down)
+                .await
+                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+            page.execute(up)
+                .await
+                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+            return Ok(());
+        }
+    };
 
     let mut cmd = DispatchKeyEventParams::builder();
     let down_type = if let Some(txt) = def.text {
