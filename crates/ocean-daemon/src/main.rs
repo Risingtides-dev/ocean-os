@@ -4713,8 +4713,12 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                 let cfg = DeepgramConfig::default();
                 let clock_arc: Arc<dyn Fn() -> u64 + Send + Sync> =
                     Arc::new(|| ocean_protocol::now_ms() as u64);
-                let (provider, events_rx) = match DeepgramStt::connect(&cfg, &dg_key, clock_arc)
-                    .await
+                // Call-start epoch so streaming segment timestamps are
+                // call-relative, not wall-clock (OCEAN call-agent fix).
+                let stream_started_ms = (clock_arc)();
+                let (provider, events_rx) =
+                    match DeepgramStt::connect(&cfg, &dg_key, clock_arc, stream_started_ms)
+                        .await
                 {
                     Ok(pair) => pair,
                     Err(e) => {

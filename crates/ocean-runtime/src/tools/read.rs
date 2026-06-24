@@ -61,9 +61,15 @@ impl AgentTool for ReadTool {
             .await
             .map_err(|e| format!("read {display_path}: {e}"))?;
         let lines: Vec<&str> = text.lines().collect();
-        let start = offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
+        // Clamp start to the line count: a model-supplied `offset` past EOF must
+        // yield an empty read, not a `start > end` slice panic that tears down
+        // the turn. `saturating_add` guards a huge `limit` from overflowing usize.
+        let start = offset
+            .map(|o| o.saturating_sub(1))
+            .unwrap_or(0)
+            .min(lines.len());
         let end = limit
-            .map(|l| std::cmp::min(start + l, lines.len()))
+            .map(|l| std::cmp::min(start.saturating_add(l), lines.len()))
             .unwrap_or(lines.len());
 
         let mut buf = String::new();
@@ -71,5 +77,51 @@ impl AgentTool for ReadTool {
             buf.push_str(&format!("{:>5}\t{}\n", start + i + 1, line));
         }
         Ok(AgentToolResult::text(buf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pull the first text block out of a tool result.
+    fn body(r: &AgentToolResult) -> &str {
+        r.content.first().and_then(|c| c.as_text()).unwrap_or("")
+    }
+
+    /// Regression: a model-supplied `offset` past EOF must return an empty read,
+    /// not a `start > end` slice panic that tears the turn down.
+    #[tokio::test]
+    async fn offset_past_eof_is_empty_not_panic() {
+        let dir = std::env::temp_dir().join(format!("ocean-read-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir).await;
+        let file = dir.join("three.txt");
+        fs::write(&file, "a\nb\nc\n").await.unwrap();
+        let tool = ReadTool::new();
+
+        // offset way past the 3 lines, no limit
+        let r = tool
+            .execute("1", json!({ "path": file.to_string_lossy(), "offset": 100 }))
+            .await
+            .expect("must not error");
+        assert_eq!(body(&r).trim(), "", "past-EOF offset → empty");
+
+        // offset past EOF WITH a limit (end clamps below start without the fix)
+        let r = tool
+            .execute(
+                "2",
+                json!({ "path": file.to_string_lossy(), "offset": 100, "limit": 5 }),
+            )
+            .await
+            .expect("must not error");
+        assert_eq!(body(&r).trim(), "", "past-EOF offset+limit → empty");
+
+        // sanity: a normal in-range read still works
+        let r = tool
+            .execute("3", json!({ "path": file.to_string_lossy(), "offset": 2 }))
+            .await
+            .unwrap();
+        assert!(body(&r).contains("b") && body(&r).contains("c"));
+        let _ = fs::remove_dir_all(&dir).await;
     }
 }
