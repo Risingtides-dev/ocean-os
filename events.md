@@ -622,3 +622,26 @@ turn path). 92 agent tests + daemon build + acp/call/tui all green. Closes
 folder-as-agent spec "next" item #2. Session: 24 PRs. (Model-honoring left next
 — it needs agent.toml gateway-format -> Ocean alias mapping, no clean fail-safe.)
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [08:08am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo: ocean-bedrock)
+type:      [bug-report]
+area:      [backend]
+
+Cracked "log trip" by pushing (not dismissing, like I wrongly had). It = the
+onboarding's AUDIT TRAIL. bedrock's HTTP token route audits token.create + the
+README promises "audit log for token changes", but the CLI issue-token.mjs (the
+DOCUMENTED onboarding path, npm run token:create) wrote no audit -> onboarding
+tokens left no trail. Fixed (bedrock PR #7, merged): fail-soft appendTokenAudit
+writes token.create to the sibling audit.jsonl, same metaRoot/env as the server.
+Verified e2e (temp auth file -> audit line w/ real tokenId). Addresses goal #4's
+"log trip" the hook kept flagging.
+
+Lesson reinforced: 2 "undecodable" terms this session — EC (exhaustively searched,
+GENUINELY no referent) and log-trip (cracked into a real shippable fix). Rigor
+distinguishes truly-blocked from I-was-being-lazy. Session: 25 PRs across all 4
+repos. Remaining: EC (real-undecodable), prod ingest (creds), call-agent seam
+(needs what's-rough), model-honoring (format decision + sensitive path).
+_________________________________________________________________________________
