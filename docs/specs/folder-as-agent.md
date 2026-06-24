@@ -104,14 +104,14 @@ daemon.
   behavior-neutral when absent).
 - A tested reference agent at `docs/examples/agents/researcher/` (resolved by the
   `shipped_example_agent_resolves` test) to copy-and-adapt.
+- Tool narrowing: a named agent's `tools` allowlist restricts the turn's toolset
+  (fail-safe to the full set if it matches nothing). `narrow_tools` + the
+  `tool_allowlist` channel on `PromptControl`.
 
 **Next (separate PRs):**
 
 1. Capability binding: map `capabilities` entries to `CapabilityProvider`s in the
    per-session registry (builtin/mcp against today's registry; subprocess/wasm
    sideloaded as those `ocean-plugin` lanes land).
-2. Tool narrowing: enforce `agent.toml` `tools` / `effective_tools()` as a real
-   per-turn allowlist (today it's parsed + exposed but the turn doesn't restrict
-   to it).
-3. Honor an agent's declared `model` on the turn when the request doesn't
+2. Honor an agent's declared `model` on the turn when the request doesn't
    override it.
