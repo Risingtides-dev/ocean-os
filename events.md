@@ -389,3 +389,28 @@ Cleared as non-bugs after verification: several OpenAI/Gemini/store candidates.
 Session: 12 PRs merged across ocean-os(9)+surface(2)+agents(1), 7 real bugs
 fixed, all 4 repos advanced. Worktrees clean.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [04:48am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [bug-report]
+area:      [backend]
+
+MCP stdio cancellation P1 fixed carefully (PR #240, merged) — the 2nd P1 from
+the 2nd hunt. StdioTransport::recv used a LOCAL buffer with read_until (not
+cancellation-safe); the io-task select! drops the read mid-line on an outbound
+send -> torn JSON frame -> request hangs to 30s. Now persists the partial line
+in self.pending across recv calls; pure try_take_line() helper; cap enforced on
+accumulated buffer. HTTP transport untouched. Tests cover frame-reassembled-
+across-a-split; 22 unit + 9 e2e green. Flagged concurrency-sensitive in the PR
+for John's eyeball (behavior-preserving on the happy path).
+
+Both 2nd-hunt P1s now fixed (#239 longhouse leak, #240 mcp cancellation).
+Remaining catalogued = 4 P2s (Gemini content_index, TUI selection-drift, TUI
+cross-turn tool sweep, ACP multi-line data:) — low severity, nice-to-have.
+
+Session: 13 PRs merged across ocean-os(10)+surface(2)+agents(1), 8 real bugs
+fixed, all 4 repos advanced. Worktrees clean. Blockers unchanged (EC, feedback-
+box, call-agent seam — need John).
+_________________________________________________________________________________
