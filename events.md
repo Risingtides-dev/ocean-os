@@ -352,3 +352,40 @@ component turns) + ocean-agents(1: #18 CI). Multi-repo bug resolution (goal #1)
 now spans 3 code repos. Blocked items unchanged (EC, feedback-box, call-agent
 seam — need John). Worktrees clean.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [04:30am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [bug-report]
+area:      [backend]
+
+2nd fanout bug-hunt over the UN-hunted runtime crates (longhouse, context,
+store, protocol, mcp, tui, acp). All crates build/test-compile clean. Fixed the
+clearest P1 (PR #239, merged): ocean-longhouse topic registry was an unbounded
+memory leak — snapshots survive TopicClosed by design but had NO eviction while
+every sibling daemon map is TTL-reaped. Added MAX_TOPICS=256 cap evicting oldest
+CLOSED topics, never a live one. Test + 111 green.
+
+CATALOGUED for a focused next batch (real, NOT yet fixed):
+- [P1] ocean-mcp stdio recv: read_until is not cancellation-safe; the io-task
+  select! cancels a partial inbound read when an outbound send wins -> torn JSON
+  frame -> request hangs to 30s timeout. (transport.rs:122 + client.rs:333).
+  Fix = persistent line buffer across recv() calls — concurrency-critical,
+  wants careful review, NOT a rushed auto-merge.
+- [P2] ocean-protocol Gemini: tool-call + text collide on content_index when
+  functionCall precedes text; out_content reorders text-before-tools (google.rs
+  :528/:594).
+- [P2] ocean-tui session picker: selection preserved by INDEX not session id, so
+  a refresh that reorders the recency-sorted list silently moves the highlight +
+  detail pane (main.rs:803). Turn routing unaffected (active id retained).
+- [P2] ocean-tui: cross-turn tool sweep on non-Completed TurnFinished forces ALL
+  Running blocks to Err, not just the finishing turn_id's (main.rs:3827). Low
+  likelihood (turns serialized per session).
+- [P2 latent] ocean-acp: EventStream parses each data: line standalone, no
+  multi-line data: accumulation like the TUI does (daemon.rs:369/404).
+Cleared as non-bugs after verification: several OpenAI/Gemini/store candidates.
+
+Session: 12 PRs merged across ocean-os(9)+surface(2)+agents(1), 7 real bugs
+fixed, all 4 repos advanced. Worktrees clean.
+_________________________________________________________________________________
