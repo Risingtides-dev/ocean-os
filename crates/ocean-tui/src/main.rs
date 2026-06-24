@@ -801,6 +801,12 @@ impl DaemonApp {
     }
 
     fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        // Capture which session is highlighted so the selection follows the
+        // SESSION across a refresh, not a fixed row. The daemon returns sessions
+        // recency-ordered, so any session's activity reshuffles the list — an
+        // index-preserved highlight would silently jump to a different session
+        // (and `selected_session_detail` would fetch the wrong one).
+        let selected_id = self.selected_session().map(|s| s.id);
         let mut next: Vec<SessionSummary> = sessions.into_iter().take(SESSION_CAP).collect();
         // OCEAN-311: a resumed `--session` target can live beyond the first
         // `/v1/sessions` page (OCEAN-250), and the periodic refresh only
@@ -822,7 +828,15 @@ impl DaemonApp {
             }
         }
         self.sessions = next;
-        self.selected_session_index = self.selected_session_index.min(self.sessions.len());
+        // Re-locate the highlighted session by id so the cursor tracks it across
+        // a reorder; fall back to the clamped index when it's no longer present
+        // (e.g. it dropped off the fetched page).
+        self.selected_session_index = selected_id
+            .and_then(|id| self.sessions.iter().position(|s| s.id == id))
+            // `selected_session_index` is a 1-based slot (slot N => sessions[N-1],
+            // matching `select_session_row`'s `pos + 1`), so map position back up.
+            .map(|pos| pos + 1)
+            .unwrap_or_else(|| self.selected_session_index.min(self.sessions.len()));
         self.selected_session_detail = None;
     }
 
@@ -7731,6 +7745,31 @@ mod tests {
 
         assert!(handle_slash_command(&mut app, "/help"));
         assert!(app.show_help);
+    }
+
+    #[test]
+    fn selection_follows_the_session_across_a_reorder() {
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+        let a = resume_session_fixture("11111111-1111-4111-8111-111111111111", None);
+        let b = resume_session_fixture("11111111-2222-4222-8222-222222222222", None);
+        let (a_id, b_id) = (a.id, b.id);
+
+        // Operator highlights session b. Slots are 1-based (slot 2 => sessions[1]).
+        app.set_sessions(vec![a.clone(), b.clone()]);
+        app.selected_session_index = 2;
+        assert_eq!(app.selected_session_id(), Some(b_id));
+
+        // A refresh returns the list reordered (b's activity bumped it to top).
+        app.set_sessions(vec![b, a]);
+
+        // The highlight must still point at session b — by id, not the old slot.
+        assert_eq!(
+            app.selected_session_id(),
+            Some(b_id),
+            "selection follows the session, not the row slot"
+        );
+        assert_eq!(app.selected_session_index, 1, "b is now slot 1 (index 0 + 1)");
+        let _ = a_id;
     }
 
     fn resume_session_fixture(id: &str, workspace_root: Option<&str>) -> SessionSummary {
