@@ -4,7 +4,11 @@
 # <ocean-config>/agents) and the daemon will discover it: GET /v1/agents,
 # then run it on a turn with the `agent` field on POST /v1/agent/turns.
 
-model = "anthropic/claude-opus-4.8"
+# An Ocean model alias (see `GET /v1/models` / known_models). The daemon honors
+# this on a turn run via this agent — fail-soft: an unresolvable model falls back
+# to the global one. (eve-style gateway ids like `anthropic/claude-opus-4.8` are
+# a future mapping; today use Ocean's bare aliases.)
+model = "claude-opus-4-7"
 description = "A careful researcher: gathers sources, verifies claims, cites."
 
 # Tool allowlist by built-in tool name (empty = inherit all). These match the
