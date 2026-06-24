@@ -445,9 +445,15 @@ pub struct KnownModel {
 /// resolver recognizes; the keyless `fake`/`fake-ok`/`fake-tool`/`fake-surface`
 /// test providers and the `openai-compatible` catch-all are intentionally
 /// omitted so they never surface in the public `GET /v1/models` menu. The
-/// `id` used here is the canonical alias for each arm (the same string the arm
-/// emits as `selection.model`), so a client can round-trip it back through
-/// `OCEAN_MODEL` and reach the same provider.
+/// `id` used here is the exact string the matching arm emits as
+/// `selection.model` (i.e. what `GET /v1/models` reports as `current.model`
+/// after that model is selected) — so `resolve_model_selection(id).model == id`
+/// holds for every entry. ocean-acp builds the advertised mode ids from these
+/// `id`s but sets the *selected* mode from `current.model`; if the two diverged
+/// (e.g. a lowercase `minimax-m2` id vs the API-cased `MiniMax-M2` the resolver
+/// returns) the selected mode would not appear in the advertised list and the
+/// ACP/Zed picker would break. The `known_models_id_equals_resolved_model` test
+/// enforces this invariant.
 pub fn known_models() -> Vec<KnownModel> {
     let m = |id: &str, provider: &str, label: &str| KnownModel {
         id: id.to_string(),
@@ -467,8 +473,13 @@ pub fn known_models() -> Vec<KnownModel> {
         m("gpt-4o-mini", "openai", "GPT-4o Mini"),
         m("claude-opus-4-7", "anthropic", "Claude Opus 4.7"),
         m("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6"),
-        m("minimax-m2.7", "minimax", "MiniMax M2.7"),
-        m("minimax-m2", "minimax", "MiniMax M2"),
+        // MiniMax ids use the API casing the resolver returns as current.model
+        // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
+        // holds for every entry — ACP/Zed match the selected mode id against the
+        // advertised list, and a lowercase alias here would never match. The
+        // resolver lowercases the lookup key, so these still route correctly.
+        m("MiniMax-M2.7", "minimax", "MiniMax M2.7"),
+        m("MiniMax-M2", "minimax", "MiniMax M2"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
         m("gemini-2.0-flash", "google", "Gemini 2.0 Flash"),
@@ -1171,6 +1182,27 @@ mod tests {
     }
 
     #[test]
+    fn known_models_id_equals_resolved_model() {
+        // The ACP invariant (OCEAN-369 Codex follow-up): ocean-acp advertises
+        // mode ids from KnownModel.id but sets the *selected* mode from the
+        // resolver's current.model. If those diverge for any model, the selected
+        // mode id isn't in the advertised list and Zed/ACP pickers break. So
+        // every advertised id must satisfy resolve_model_selection(id).model == id.
+        // This is exactly what would have caught the lowercase `minimax-m2` id vs
+        // the API-cased `MiniMax-M2` the resolver returns.
+        for known in known_models() {
+            let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", &known.id)]))
+                .unwrap_or_else(|e| panic!("known model {:?} is not routable: {e}", known.id));
+            assert_eq!(
+                selection.model, known.id,
+                "known_models() id {:?} != resolve_model_selection's current.model {:?} \
+                 — ACP would advertise {:?} but select {:?}, breaking the picker",
+                known.id, selection.model, known.id, selection.model,
+            );
+        }
+    }
+
+    #[test]
     fn no_routable_production_model_is_missing_from_known_models() {
         // The inverse guard: enumerate every production (credential-backed)
         // canonical model id resolve_model_selection can route via its bare-alias
@@ -1192,8 +1224,10 @@ mod tests {
             "gpt-5.3-codex-spark",
             "claude-sonnet-4-6",
             "claude-opus-4-7",
-            "minimax-m2",
-            "minimax-m2.7",
+            // API-cased ids: `resolve_model_selection` returns these as
+            // current.model, and known_models() advertises the same string.
+            "MiniMax-M2",
+            "MiniMax-M2.7",
             "kimi-k2.6",
             "kimi-k2",
             "gemini-2.0-flash",
