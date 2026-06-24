@@ -933,3 +933,20 @@ being filtered into "other tabs" and lost. Added SDK tests (back-compat deserial
 + browser-context round-trip) and daemon tests (prompt-fold, fail-open, malicious-title
 sanitization, tabs-only fallback). Full local gate green on toolchain 1.96.0.
 _________________________________________________________________________________
+
+time:      [12:00pm] [24-06-26]
+agent:     [claude-code], [opus 4.8]
+worktree:  docs/ocean-374-longhouse-readme-drift
+type:      [refactor]
+area:      [docs]
+
+OCEAN-374 (P2) docs-drift fixes. (1) docs/LONGHOUSE.md: POST /v1/workflows/prepare
+is actually registered (route at main.rs:3009 + handler + test
+workflows_prepare_is_wired_into_longhouse_routes), so moved the bullet out of "Future
+Longhouse APIs" into the "Existing embedded daemon routes" list and dropped the
+"not yet registered in the daemon" clause. (2) README.md: removed the false
+"(default: deepseek-chat)" claim — resolve_model_selection returns
+ProviderConfigError::NoModelSelected when unset; there is no hardcoded default. Aligned
+wording with docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md. Docs-only; cargo fmt --all --check
+green.
+_________________________________________________________________________________
