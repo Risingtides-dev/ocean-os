@@ -13791,10 +13791,15 @@ mod tests {
     }
 
     #[test]
-    fn resumed_turn_pinned_to_session_bound_cwd_not_req_cwd() {
-        // The session was started in /work/repo/sub (workspace /work/repo). The
-        // resumed turn supplies the same workspace via a *different* sub-dir,
-        // but execution must pin to the session's bound cwd, not req.cwd.
+    fn resumed_turn_in_same_workspace_rebinds_to_requested_cwd() {
+        // Behavior changed in 18ba9a9 ("fix(runtime): bind tools to
+        // SessionContext cwd"): cwd binding moved into SessionContext, and a
+        // resumed turn now REBINDS to the requested cwd rather than being pinned
+        // to the session's original sub-dir ("resumed sessions rebind workspace
+        // metadata when the caller crosses projects"). `resolve_bound_cwd` is now
+        // just the traversal guard + pass-through. This test was left asserting
+        // the old pinning contract and only surfaced once the daemon test build
+        // was un-broken (#233) — updated here to the current contract.
         let out = resolve_bound_cwd(
             "/work/repo/another-sub",
             "/work/repo",
@@ -13802,9 +13807,19 @@ mod tests {
         )
         .expect("matching workspace should be accepted");
         assert_eq!(
-            out, "/work/repo/sub",
-            "a resumed turn executes in the session's bound cwd, not req.cwd"
+            out, "/work/repo/another-sub",
+            "a resumed turn rebinds to the requested cwd (traversal-guarded)"
         );
+    }
+
+    #[test]
+    fn bound_cwd_still_rejects_traversal_on_any_turn() {
+        // The one invariant resolve_bound_cwd still enforces: no `..` escape,
+        // resumed or not.
+        assert!(matches!(
+            resolve_bound_cwd("/work/repo/../etc", "/work/repo", Some(("/work/repo", "/work/repo"))),
+            Err(CwdBindingError::PathTraversal { .. })
+        ));
     }
 
     #[test]
