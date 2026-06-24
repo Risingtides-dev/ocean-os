@@ -71,7 +71,13 @@ impl BrowserHandle {
         // We skip the extension's own pages (chrome-extension://) and devtools.
         let existing = match chrome.browser.pages().await {
             Ok(pages) => {
-                let mut chosen = None;
+                // Prefer the tab the user is actually LOOKING AT, not an arbitrary
+                // one. `document.hasFocus()` is true only for the focused tab in
+                // the focused window. Fall back to the last real tab (the prior
+                // behavior) when no tab reports focus (e.g. Chrome isn't the
+                // foreground app) — so this is strictly better, never worse.
+                let mut focused = None;
+                let mut fallback = None;
                 for p in pages {
                     let url = p.url().await.ok().flatten().unwrap_or_default();
                     // Skip the extension's own pages, devtools, and chrome:// UI.
@@ -83,9 +89,19 @@ impl BrowserHandle {
                     {
                         continue;
                     }
-                    chosen = Some(p);
+                    let is_focused = p
+                        .evaluate("document.hasFocus()")
+                        .await
+                        .ok()
+                        .and_then(|r| r.value().and_then(|v| v.as_bool()))
+                        .unwrap_or(false);
+                    if is_focused {
+                        focused = Some(p);
+                    } else {
+                        fallback = Some(p);
+                    }
                 }
-                chosen
+                focused.or(fallback)
             }
             Err(_) => None,
         };
