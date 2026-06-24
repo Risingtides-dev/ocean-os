@@ -278,3 +278,26 @@ deepgram-stt feature build, daemon build — all green. Session: 7 PRs merged.
 Worktree clean (main only). Still awaiting John on EC / feedback-box / which
 call-agent seam beyond this.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [03:34am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Interactive onboarding surface shipped (PR #238, merged). `ocean-rs onboard`
+with no flags now prompts on a TTY for bedrock URL + token; flags/env skip the
+prompt; piped/no-TTY errors cleanly instead of hanging. Lazy-correct TUISF —
+no ratatui app needed since the CLI already does the verify. Onboarding now
+complete in 3 forms: skill (#231) + one-shot CLI (#236) + interactive (#238).
+Goal "simple initiation system / onboard with API token" substantially met.
+
+ocean-cli 11 tests green. Session: 8 PRs merged (#231 #232 #233 #234 #235
+#236 #237 #238). Worktree clean (main only).
+
+Goal repos coverage so far: ocean-os (heavy), ocean-bedrock (onboarding verify).
+NOT YET TOUCHED: ocean-surface, ocean-agents — candidate for next autonomous
+fanout (bug-hunt / assess) if John stays away. Still blocked: EC details,
+feedback-box info-layer migration (both need John's definition).
+_________________________________________________________________________________
