@@ -14737,7 +14737,7 @@ mod tests {
             Model::openai_compat("fake", "fake-tool", "fake://local", 1000, 1000),
             "sys",
         )
-        .with_tools(vec![Arc::new(WriteTool)])
+        .with_tools(vec![Arc::new(WriteTool::new())])
         .with_permission(policy.clone())
         .with_provider(provider)
         .with_max_turns(4);
