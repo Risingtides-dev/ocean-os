@@ -116,6 +116,12 @@ impl TopicSnapshot {
 ///
 /// Cheap to clone the snapshots out for a response; the registry itself is held
 /// behind the daemon's shared lock.
+/// Upper bound on retained topic snapshots. Closed councils survive a refresh
+/// (that's the point of the registry), but only the most recent `MAX_TOPICS` —
+/// past that, the oldest closed ones are evicted so a long-lived daemon stays
+/// bounded. Generous: a busy deck rarely holds more than a handful live at once.
+const MAX_TOPICS: usize = 256;
+
 #[derive(Debug, Default)]
 pub struct LonghouseRegistry {
     topics: HashMap<Uuid, TopicSnapshot>,
@@ -212,6 +218,32 @@ impl LonghouseRegistry {
             LonghouseEvent::RoleRevoked { .. }
             | LonghouseEvent::Warned { .. }
             | LonghouseEvent::RunHealth { .. } => {}
+        }
+        self.evict_over_cap();
+    }
+
+    /// Bound the registry so a long-running daemon doesn't grow without limit.
+    /// Closed snapshots intentionally survive their `TopicClosed` (a refresh
+    /// after the council ends must still show the final field) — but unbounded,
+    /// that's a leak: every other shared daemon map is TTL-reaped, this one was
+    /// not. Cap the map and drop the OLDEST CLOSED topics first (by deadline_ms,
+    /// the same recency order `topics()` presents). Live (`Convened`) topics are
+    /// never evicted, so an in-flight council is never dropped even past the cap.
+    fn evict_over_cap(&mut self) {
+        while self.topics.len() > MAX_TOPICS {
+            let victim = self
+                .topics
+                .values()
+                .filter(|t| !matches!(t.state, TopicState::Convened))
+                .min_by_key(|t| t.deadline_ms)
+                .map(|t| t.topic_id);
+            match victim {
+                Some(id) => {
+                    self.topics.remove(&id);
+                }
+                // Everything left is live; never evict a deliberating council.
+                None => break,
+            }
         }
     }
 
@@ -333,6 +365,41 @@ mod tests {
         // And it's listed.
         assert_eq!(reg.topics().len(), 1);
         assert_eq!(reg.topics()[0].topic_id, topic);
+    }
+
+    #[test]
+    fn registry_is_bounded_and_never_evicts_a_live_topic() {
+        let mut reg = LonghouseRegistry::new();
+
+        // One live (Convened, never closed) topic with the OLDEST deadline — it
+        // must survive eviction even though it's the oldest. (`uid` only spans a
+        // u8, so build ids past 255 directly.)
+        let live = Uuid::from_u128(9_999);
+        reg.ingest(&convened(live, 1));
+
+        // Flood with closed topics well past the cap.
+        for i in 0..(MAX_TOPICS as u128 + 50) {
+            let t = Uuid::from_u128(1_000 + i);
+            reg.ingest(&convened(t, 10_000 + i as i64));
+            reg.ingest(&LonghouseEvent::Converged {
+                topic_id: t,
+                decision: uid(1),
+                by: uid(2),
+            });
+        }
+
+        // Bounded.
+        assert!(
+            reg.len() <= MAX_TOPICS,
+            "registry must stay bounded, got {}",
+            reg.len()
+        );
+        // The live topic was never evicted despite being the oldest.
+        assert!(
+            reg.topic(&live).is_some(),
+            "a deliberating (Convened) topic must never be evicted"
+        );
+        assert_eq!(reg.topic(&live).unwrap().state, TopicState::Convened);
     }
 
     #[test]
