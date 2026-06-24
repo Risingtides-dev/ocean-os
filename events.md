@@ -255,3 +255,26 @@ dialed in" — which seam is rough (live phone path / STT-TTS failover / wake+
 barge-in)? Next autonomous-buildable item if still away: ocean-call hardening
 pass or full TUISF interactive onboarding surface.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [03:18am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [bug-report]
+area:      [backend]
+
+Cron tick: fanout bug-hunt (3 parallel read-only agents over runtime/daemon/
+call) -> 3 verified P1 fixes shipped (PR #237, merged). (1) read tool panicked
+on offset past EOF (start>end slice) — model-triggerable turn teardown; clamp
+start. (2) web_fetch panicked on UTF-8 char boundary when truncating a >8000B
+non-ASCII page; extracted truncate_to_budget() walking to nearest boundary.
+(3) ocean-call Deepgram streaming segment start_ms was wall-clock epoch not
+call-relative (connect hardcoded started_ms:0) — threaded call-start epoch in,
+matching the batch path. Directly hardens the call-agent John wants dialed in.
+Daemon hunt came back clean (well-hardened, only P2 theoretical notes).
+
+Verified: ocean-runtime 61 tests (2 new regression), ocean-call 159 tests,
+deepgram-stt feature build, daemon build — all green. Session: 7 PRs merged.
+Worktree clean (main only). Still awaiting John on EC / feedback-box / which
+call-agent seam beyond this.
+_________________________________________________________________________________
