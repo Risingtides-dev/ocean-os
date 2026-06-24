@@ -1018,3 +1018,30 @@ each). Full local gate green on toolchain 1.96.0: cargo build -p ocean-daemon,
 cargo test -p ocean-daemon (234 passed), cargo clippy -p ocean-daemon -- -D warnings,
 cargo fmt --all -- --check.
 _________________________________________________________________________________
+
+time:      [3:54P] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-373-agentevent-relay
+type:      feature-request
+area:      backend
+
+OCEAN-373 (P3): the runtime → SSE bridge in ocean-daemon relayed ten AgentEvent
+variants onto /v1/agent/events then dropped the rest on a bare `_ => {}`, silently
+swallowing the six structural variants the runtime defines (AgentStart, AgentEnd,
+TurnStart, TurnEnd, AssistantMessage, UserMessage). Investigated whether any SSE
+consumer needs them: it does not. The AgentTurnEvent wire enum has no corresponding
+variants, and the daemon already emits its own richer TurnStarted (with model) and
+TurnFinished (with status/tokens/wall time) bracketing the bridge, while assistant
+text streams delta-by-delta via AssistantTextDelta and the user message is the prompt
+the client just submitted. Relaying them would mean inventing speculative wire variants
+nothing consumes, so I took the SAFE minimal direction the ticket prefers: replaced the
+wildcard with an explicit, exhaustively-named match arm documenting WHY each of the six
+is intentionally not relayed. The filter is now deliberate and greppable, and — because
+there is no `_` wildcard — any NEW AgentEvent variant added upstream fails to compile
+in the bridge until someone consciously chooses relay-or-document. Added a unit test
+(ocean_373_agentevent_relay_classification_is_exhaustive_and_documented) that mirrors
+the bridge with its own wildcard-free classifier, pinning the current relayed/filtered
+split and double-guarding the compile-time exhaustiveness. Full local gate green on
+toolchain 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon,
+cargo clippy -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
+_________________________________________________________________________________
