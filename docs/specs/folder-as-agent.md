@@ -1,0 +1,103 @@
+# Folder-as-Agent — spec
+
+## Context
+
+Today Ocean derives an agent's identity from the **surface** it's invoked
+through: `client_type` (TUI/WEB/CLI/voice/…) maps to
+`assistants/<DIR>/system.md`, composed onto the compiled `BASE_SYSTEM_PROMPT`
+(`crates/ocean-agent/src/lib.rs`, `build_system_prompt_from` /
+`load_surface_profile_from`). There is no notion of a *named agent* with its own
+config, tools, skills, and child agents.
+
+The goal: make an agent a **folder on disk** — the way an eve.dev / Next.js app
+is a folder — Rust-native, read by the daemon, with identity derived from the
+path. A coworker authors an agent by dropping files in a directory; the daemon
+classifies and resolves it when invoked. No `agent.ts`, no TypeScript — Rust
+reads `agent.toml` + `instructions.md`.
+
+## Layout
+
+```text
+agents/
+  <name>/
+    agent.toml        runtime config: model, description, tools, capabilities, yolo
+    instructions.md   base system prompt (the only required slot)
+    skills/*.md       on-demand procedures, discovered by filename
+    tools/*           tool allowlist entries, discovered by filename stem
+    subagents/<id>/   nested agents, same shape, recursive
+```
+
+Identity comes from the path: `agents/researcher/` IS the agent `researcher`.
+No `name`/`id` field is ever written in a file (matches eve's naming rule). A
+folder with neither `instructions.md` nor `agent.toml` is not an agent.
+
+Implemented in `crates/ocean-agent/src/agentdir.rs`:
+
+- `discover(root) -> Vec<String>` — list agent names under a root
+- `resolve(root, name) -> Result<AgentDef, ResolveError>` — the daemon's
+  classification entry point; walks one folder into an `AgentDef`
+- `AgentDef::system_prompt()` — the agent's `instructions.md`, or `None` →
+  caller falls back to the compiled base prompt
+- `AgentDef::effective_tools()` — `agent.toml` `tools` merged with `tools/`
+  filename stems
+
+Hot-read: the daemon reads the tree live, so editing a prompt is picked up on
+the next turn — same contract as today's surface profiles. No build step.
+
+## The capability question: can a crate be sideloaded without a daemon rebuild?
+
+Yes — but **not** by `dlopen`-ing a Rust `rlib`. Rust has no stable ABI, so
+loading compiled Rust straight into the daemon process is the unsafe/fragile
+path and is rejected. Instead, every source of tools is a
+`CapabilityProvider` (`crates/ocean-runtime/src/capability.rs`) folded into the
+per-session `CapabilityRegistry`. The daemon binary stays frozen; it just
+discovers more providers at runtime. Three sideload tiers, cheapest first:
+
+| Tier | What | Rebuild daemon? | Machinery (exists today) |
+| ---- | ---- | --------------- | ------------------------ |
+| 0 — data agent | `agent.toml` + `instructions.md`, binds built-in tools by name | No | `agentdir` (this spec) + built-in tools |
+| 1 — subprocess capability | a crate-as-binary (or any language) speaking JSON-RPC over stdio; tools fold in via `SubprocessPlugin` | No — separate compilation unit | `ocean-plugin/src/subprocess.rs`, `transport.rs` |
+| 1b — subprocess *provider* | a whole agent CLI (`claude -p`, `codex exec`) as a model provider, deep mode | No | `docs/specs/subprocess-provider.md` |
+| 2 — WASM skill pack | compiled tools as `.wasm`, run in a `wasmtime` sandbox in-process | No | `ocean-plugin/src/lib.rs` (architected; `wasm` feature pending) |
+
+`agent.toml`'s `capabilities` field is the declared binding contract:
+
+```toml
+model = "anthropic/claude-opus-4.8"
+description = "deep researcher"
+tools = ["web_fetch"]                 # tier 0 — built-in, by name
+capabilities = [
+  "builtin:web_fetch",                # tier 0
+  "mcp:linear",                       # configured MCP server (ocean-mcp)
+  "subprocess:./tools/scrape",        # tier 1 — sideloaded crate-as-binary
+  "wasm:./skills/extract.wasm",       # tier 2 — sideloaded sandboxed module
+]
+```
+
+`capabilities` is parsed and surfaced now; the resolver does **not** spawn
+anything. The daemon binds `builtin:`/`mcp:` against today's registry and wires
+`subprocess:`/`wasm:` as those `ocean-plugin` lanes land. The field is the
+contract, not a loader.
+
+## Why this split (agents = data, capabilities = crates)
+
+If every agent were literally a compiled Rust crate, adding an agent would mean
+`cargo build` + daemon restart — killing the filesystem-first, edit-and-next-turn
+hot-read that makes the model good. So: **agents are data** (a folder anyone can
+author and download), **capabilities are crates** (the compiled tool surface the
+agent binds to). A specialist that genuinely needs compiled Rust ships as a
+tier-1 subprocess binary or tier-2 WASM pack — sideloaded, never recompiling the
+daemon.
+
+## What's built vs. next
+
+- **Built:** `agentdir` resolver + config + discovery + traversal guard, unit-
+  tested (`cargo test -p ocean-agent agentdir`).
+- **Next (separate PRs):**
+  1. Daemon classification: an `agents/` root (env `OCEAN_AGENTS_DIR`, default
+     under the config dir), an `agent` field on `AgentTurnRequest`, and
+     `resolve` wired into prompt composition so a named agent's `instructions.md`
+     overrides the surface profile.
+  2. `GET /v1/agents` (list) + `GET /v1/agents/{name}` (resolved def) for surfaces.
+  3. Capability binding: map `capabilities` entries to `CapabilityProvider`s in
+     the per-session registry (builtin/mcp first, subprocess/wasm as they land).

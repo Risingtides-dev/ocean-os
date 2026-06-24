@@ -32,6 +32,11 @@ use tracing::Instrument;
 
 mod config;
 pub use config::{DaemonConfig, McpSection};
+/// Filesystem-first agent definitions (folder = agent). Module-qualified to
+/// avoid colliding with `ocean_runtime::AgentConfig`; refer to the folder-agent
+/// config as `agentdir::AgentConfig`.
+pub mod agentdir;
+pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;
 mod rooms;
 pub use rooms::{RoomRecord, RoomRegistry, RoomStoreError};
