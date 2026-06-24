@@ -76,6 +76,27 @@ pub struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Bytes consumed from stdout that don't yet form a complete line. Persisted
+    /// across `recv` calls: `read_until` is NOT cancellation-safe, and the I/O
+    /// task drives `recv` inside a `select!` that drops the read future whenever
+    /// an outbound send wins. With a local buffer those already-consumed partial
+    /// bytes would be lost, tearing the next JSON frame and hanging the request
+    /// that owned the response. Keeping the partial line here lets the next
+    /// `recv` resume exactly where the cancelled one left off.
+    pending: Vec<u8>,
+}
+
+/// Pop the first complete line (up to and including the next `\n`) out of
+/// `pending`, trimming the trailing `\r?\n`. Returns `None` when no newline is
+/// buffered yet (caller reads more). Pure over the buffer so the resume-after-
+/// cancellation behavior is unit-testable without spawning a process.
+fn try_take_line(pending: &mut Vec<u8>) -> Option<Result<String>> {
+    let pos = pending.iter().position(|&b| b == b'\n')?;
+    let mut line: Vec<u8> = pending.drain(..=pos).collect();
+    while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Some(String::from_utf8(line).context("MCP server sent invalid UTF-8"))
 }
 
 impl StdioTransport {
@@ -106,6 +127,7 @@ impl StdioTransport {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            pending: Vec::new(),
         })
     }
 }
@@ -120,29 +142,44 @@ impl Transport for StdioTransport {
     }
 
     async fn recv(&mut self) -> Result<Option<String>> {
-        // Bounded read: read up to one newline, but never more than
-        // MAX_MESSAGE_BYTES, so a server that never sends a newline can't make
-        // us allocate without limit. `take` caps the bytes the reader will yield.
-        let mut buf = Vec::new();
-        let n = (&mut self.stdout)
-            .take(MAX_MESSAGE_BYTES + 1)
-            .read_until(b'\n', &mut buf)
-            .await?;
-        if n == 0 {
-            return Ok(None); // EOF: server exited.
+        loop {
+            // A complete line already buffered (possibly the tail of a previous
+            // read that also pulled in the start of this one)? Hand it back.
+            if let Some(line) = try_take_line(&mut self.pending) {
+                return Ok(Some(line?));
+            }
+            // Bound total buffered bytes BEFORE reading more: a server that never
+            // sends a newline can't make us allocate without limit. Checked on
+            // `pending` (not a single read's count) so the cap holds across the
+            // partial reads a cancelled recv may have accumulated.
+            if self.pending.len() as u64 > MAX_MESSAGE_BYTES {
+                bail!("MCP server message exceeded {MAX_MESSAGE_BYTES} bytes; dropping connection");
+            }
+            // Append more bytes onto the PERSISTENT buffer. `read_until` is not
+            // cancellation-safe, but because it appends into `self.pending`, a
+            // drop of this future (the io-task select! choosing an outbound send)
+            // leaves the consumed bytes in place for the next `recv` to resume.
+            let cap = (MAX_MESSAGE_BYTES + 1).saturating_sub(self.pending.len() as u64);
+            let n = (&mut self.stdout)
+                .take(cap)
+                .read_until(b'\n', &mut self.pending)
+                .await?;
+            if n == 0 {
+                // EOF. Surface a trailing newline-less line once, then None.
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                let mut line = std::mem::take(&mut self.pending);
+                while line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(
+                    String::from_utf8(line).context("MCP server sent invalid UTF-8")?,
+                ));
+            }
+            // Loop: either a newline arrived (top extracts the line) or we read
+            // more partial bytes / hit the cap (top bails).
         }
-        // If we hit the cap without seeing a newline, the message is oversized
-        // (or the server is wedged producing one). Fail rather than keep going —
-        // the provider folds this into its unavailable path.
-        if n as u64 > MAX_MESSAGE_BYTES {
-            bail!("MCP server message exceeded {MAX_MESSAGE_BYTES} bytes; dropping connection");
-        }
-        // Trim the trailing newline (and any CR) before handing back.
-        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-            buf.pop();
-        }
-        let line = String::from_utf8(buf).context("MCP server sent invalid UTF-8")?;
-        Ok(Some(line))
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -369,6 +406,38 @@ impl Transport for HttpTransport {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn try_take_line_extracts_and_keeps_remainder() {
+        let mut buf = b"line1\nline2\n".to_vec();
+        assert_eq!(try_take_line(&mut buf).unwrap().unwrap(), "line1");
+        assert_eq!(buf, b"line2\n", "remainder kept for the next line");
+        assert_eq!(try_take_line(&mut buf).unwrap().unwrap(), "line2");
+        assert!(buf.is_empty());
+        // No newline yet -> None, buffer untouched (caller reads more).
+        let mut partial = b"half".to_vec();
+        assert!(try_take_line(&mut partial).is_none());
+        assert_eq!(partial, b"half");
+        // CRLF trimmed.
+        let mut crlf = b"x\r\n".to_vec();
+        assert_eq!(try_take_line(&mut crlf).unwrap().unwrap(), "x");
+    }
+
+    #[test]
+    fn try_take_line_resumes_after_a_partial_read() {
+        // Models the cancellation-recovery contract: a recv() that was dropped
+        // mid-line leaves its consumed bytes in `pending`; the next read appends
+        // the rest, and the full frame comes back intact (not torn).
+        let mut pending = Vec::new();
+        pending.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"resu"); // partial
+        assert!(try_take_line(&mut pending).is_none(), "no newline yet");
+        pending.extend_from_slice(b"lt\":{}}\n"); // the rest arrives
+        assert_eq!(
+            try_take_line(&mut pending).unwrap().unwrap(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            "frame reassembled intact across the split"
+        );
+    }
 
     #[tokio::test]
     async fn http_connect_rejects_empty_endpoint() {
