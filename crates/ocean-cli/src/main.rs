@@ -122,17 +122,43 @@ enum Cmd {
         id: SessionId,
     },
     /// Onboard onto Ocean: verify a bedrock API token and print what to set.
-    /// One-command version of the ocean-coworker-onboarding skill — hits
-    /// `<bedrock-url>/api/v1/info` with the token and, on success, prints the
-    /// resolved principal plus the two env exports to add to your shell.
+    /// The interactive initiation surface — run it with no flags and it walks
+    /// you through entering the URL + token; or pass `--bedrock-url`/`--token`
+    /// (or set OCEAN_BEDROCK_URL / OCEAN_BEDROCK_TOKEN). Hits
+    /// `<bedrock-url>/api/v1/info`, and on success prints the resolved principal
+    /// plus the two env exports to add to your shell.
     Onboard {
-        /// ocean-bedrock base URL (e.g. http://localhost:8080).
+        /// ocean-bedrock base URL (e.g. http://localhost:8080). Prompted if absent.
         #[arg(long, env = "OCEAN_BEDROCK_URL")]
-        bedrock_url: String,
-        /// The bedrock API token (issued by an admin via `npm run token:create`).
+        bedrock_url: Option<String>,
+        /// The bedrock API token (admin issues via `npm run token:create`).
+        /// Prompted if absent.
         #[arg(long, env = "OCEAN_BEDROCK_TOKEN")]
-        token: String,
+        token: Option<String>,
     },
+}
+
+/// Resolve an onboarding value: use the supplied one (trimmed), else prompt for
+/// it interactively on a TTY. A piped/CI invocation with no value errors rather
+/// than hanging on stdin — onboarding is interactive-or-explicit, never silent.
+fn resolve_or_prompt(provided: Option<String>, label: &str) -> anyhow::Result<String> {
+    if let Some(v) = provided {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    anyhow::ensure!(
+        std::io::stdin().is_terminal(),
+        "{label} required — pass the flag or set the env var (no TTY to prompt)"
+    );
+    eprint!("[ocean onboard] enter {label}: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let v = line.trim().to_string();
+    anyhow::ensure!(!v.is_empty(), "{label} cannot be empty");
+    Ok(v)
 }
 
 /// Render the onboarding success summary from a bedrock `/api/v1/info` body:
@@ -505,6 +531,9 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
         Cmd::Onboard { bedrock_url, token } => {
+            let bedrock_url =
+                resolve_or_prompt(bedrock_url, "ocean-bedrock URL (e.g. http://localhost:8080)")?;
+            let token = resolve_or_prompt(token, "bedrock API token")?;
             let url = format!("{}/api/v1/info", bedrock_url.trim_end_matches('/'));
             let resp = client
                 .get(&url)
@@ -529,6 +558,15 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use ocean_core::TokenUsage;
+
+    #[test]
+    fn resolve_or_prompt_uses_provided_value_trimmed() {
+        // A supplied value is used verbatim (trimmed) without touching stdin.
+        assert_eq!(
+            resolve_or_prompt(Some("  http://localhost:8080  ".into()), "url").unwrap(),
+            "http://localhost:8080"
+        );
+    }
 
     #[test]
     fn onboard_summary_reports_principal_and_exports() {
