@@ -877,3 +877,30 @@ gui/ui/proxy; bedrock pure + server/auth/path (P0 #8) + verified mcp/courier;
 agents bridge/couriers. Session: 33 PRs, ~19 bugs incl. a P0 security vuln.
 Remaining genuinely external: EC (codename), CF embedding (credential).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [01:13pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [loop]
+area:      [backend]
+
+Orchestration loop tick. Started from a fully-drained factory: on main, clean
+tree, zero open PRs, no background tasks. Found 3 leftover local
+worktree-agent-* branches holding OCEAN-338 / OCEAN-52-55 / OCEAN-173 commits —
+verified all three were already in main (squash-merge leftovers: agent worked in
+worktree, PR'd a fresh branch, squashed, original lingered) and deleted them;
+worktree clean. Pulled the real backlog (Linear team ocean-os). Two "Todo/open"
+tickets were actually shipped: OCEAN-154 (GPUI Slice 7 keystone) had both halves
+merged 06-06 (ocean-os #99 prompt contract + ocean-surface #37 ledger injection)
+and its Gate-C test gpui_surface_guides_to_surface_patch_not_ascii lives in main
+— the 06-11 bounce-to-Todo was a reconciliation error that missed PR #37;
+OCEAN-179 fixed by merged ocean-agents PR #11. Closed both Done with
+evidence-backed comments (no phantom completion — concrete merged PRs + in-main
+tests). Dispatched two worktree-isolated agents on the genuinely-open clean
+lanes: OCEAN-312 (retry SubprocessPlugin::launch on ETXTBSY to kill the flaky
+plugin-discovery test) and OCEAN-40 (additive active-tab browser context in turn
+requests, back-compat preserved). Both open PRs; awaiting completion to gate.
+Deferred: OCEAN-337 (explicitly human-gated), web/deploy bugs 125/122 (need live
+repro), voice/obsidian 172/174 (fuzzy/non-repo).
+_________________________________________________________________________________
