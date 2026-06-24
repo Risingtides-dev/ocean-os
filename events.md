@@ -751,3 +751,26 @@ ingest pipeline, model-honoring — all looked blocked, all reachable by pushing
 Survived pushing (genuinely gated): EC (you-codename), CF embeddings (1 cred),
 call-agent seam (your felt experience).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [09:52am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (investigation: ocean-bedrock)
+type:      [review]
+area:      [backend]
+
+Pushed on the CF-embedding "credential wall" (the hook's last cited gap besides
+EC). Found it's not pure CF lock-in: db/001 EXPLICITLY documents a local pgvector
+fallback ("Optional: pgvector for local vector search fallback"; embedding_provider
+col already distinguishes cloudflare-workers-ai vs none; a commented `embedding
+vector(768)` col awaits a follow-up migration). So the info layer COULD run
+without Cloudflare. BUT building it = a substantial feature (new embed-provider
+abstraction + a local model-runtime dependency CHOICE + a pgvector search path) —
+genuinely John's direction + multi-component, NOT a tick-sized obvious completion
+like the 6 cracked items. Surfaced it as a 3rd option in the handoff (vs just
+"provide CF keys") rather than building a large speculative parallel path.
+
+So CF embedding stays gated, but better-characterized: provide CF keys (designed
+path) OR direct a local-pgvector approach (documented, substantial). EC remains
+the only fully-undecodable item. Session: 27 PRs + the pgvector-fallback finding.
+_________________________________________________________________________________
