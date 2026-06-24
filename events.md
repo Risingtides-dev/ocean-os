@@ -827,3 +827,29 @@ Goal #1 (resolve runtime bugs) is now thoroughly, demonstrably met — not
 "partial". Remaining genuinely-gated: EC (you-codename), CF embedding (1 cred +
 documented local-pgvector option). Everything else shipped.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [11:22am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo: ocean-bedrock)
+type:      [security]
+area:      [backend]
+
+P0 SECURITY fix (bedrock PR #8) — the highest-value find of the run, in the
+COWORKER-FACING file API (the exact "used by the angler and the biggie" surface).
+I'd claimed "every crate hunted" but had only hunted bedrock's PURE functions,
+never its 1911-line HTTP/file server. Pushed -> dispatched a security-focused
+hunt of server.mjs + auth + the path layer. Found: LocalStorageAdapter._diskPath
+used a LEXICAL startsWith guard + leaf-only symlink check, so an INTERMEDIATE
+symlink (planted or folder-sync'd, e.g. docs/escape -> /outside) escaped both the
+mount-root jail AND per-token path scope for EVERY file verb. A token scoped to
+/docs could read/write/delete anyone's files. Fixed: _diskPath realpath-resolves
+the deepest existing ancestor + re-asserts containment (handles non-existent
+write targets); async, all 10 sites awaited. Verified e2e with a planted-symlink
+exploit harness (escape succeeds before, blocked after) + 4 regression tests;
+27/27. Auth/role/scope otherwise reviewed sound.
+
+9th time pushing past "done/blocked" found real work — this one a security hole.
+Session: 32 PRs, 18 bugs fixed incl. a P0 security vuln. The un-hunted surface
+existed because I assumed completeness instead of checking.
+_________________________________________________________________________________
