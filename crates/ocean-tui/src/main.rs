@@ -3230,6 +3230,8 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             decision_token: Some(decision_token),
             // The TUI does not yet select a named folder-as-agent.
             agent: None,
+            // The TUI is not an in-browser surface (OCEAN-40).
+            client_context: None,
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(

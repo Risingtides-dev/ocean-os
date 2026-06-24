@@ -8297,6 +8297,9 @@ async fn agent_voice(
         // here only ever reaches `agent_turn` when yolo is effective — the guard
         // above already rejected the un-answerable no-token, no-yolo case.
         decision_token: req.decision_token,
+        // Voice turns are not in-browser; they carry no client/browser context
+        // (OCEAN-40). Additive field, `None` keeps the voice path unchanged.
+        client_context: None,
         // Voice turns run on the surface profile, not a named folder-as-agent.
         agent: None,
     };
@@ -8447,6 +8450,7 @@ async fn agent_turn(
         images,
         decision_token,
         agent,
+        client_context,
     } = req;
 
     // OCEAN-304: backpressure. Take a turn permit BEFORE any work (cwd
@@ -8689,6 +8693,20 @@ async fn agent_turn(
     // or blocks the turn.
     let consult = longhouse_prep_for_turn(prompt.clone(), cwd.clone()).await;
     let guided_prompt = apply_longhouse_prep(&guided_prompt, consult.as_ref());
+
+    // OCEAN-40 (Phase 2): for in-browser surfaces, fold the client-supplied
+    // active-tab context into the prompt so the agent sees what's loaded. Only
+    // wired for `surface-extension` (the surface that ships its own tab state);
+    // every other `client_type` and every client that omits `client_context`
+    // leaves `guided_prompt` untouched. Purely additive prompt layering.
+    let guided_prompt = if client_type.as_deref() == Some("surface-extension") {
+        apply_browser_context(
+            &guided_prompt,
+            client_context.as_ref().and_then(|c| c.browser.as_ref()),
+        )
+    } else {
+        guided_prompt
+    };
 
     let mut prompt_req = PromptRequest {
         prompt: guided_prompt,
@@ -9324,6 +9342,60 @@ fn apply_longhouse_prep(prompt: &str, prep: Option<&ocean_longhouse::TurnPrep>) 
         Some(block) => format!("{block}\n\n{prompt}"),
         None => prompt.to_string(),
     }
+}
+
+/// OCEAN-40 (Phase 2): fold the client-supplied browser context into the turn
+/// prompt as a compact, additive `## Browser context` block, the same purely
+/// prompt-layering seam room/operator/longhouse guidance uses — it touches no
+/// permissions, tools, or system-prompt composition. Returns the prompt
+/// unchanged (fail-open) when there is no browser context or it carries no
+/// active tab, so every existing client and every non-browser `client_type` is
+/// byte-for-byte unaffected.
+///
+/// The active-tab url/title (and any tab list) come from the *client*: the
+/// extension is the natural source of its own tab state, so this is real data
+/// the surface shipped, not a fabricated server-side snapshot.
+//
+// ponytail: this only renders what the SURFACE sent in `client_context.browser`.
+// The daemon does NOT yet pull a server-side CDP snapshot via
+// `ocean_browser::shell::BrowserHandle::list_tabs()` and merge it in — that
+// handle isn't plumbed into `AppState`/`agent_turn` here. Upgrade path: when the
+// browser shell is wired into the daemon, fetch `list_tabs()` for
+// surface-extension turns and prefer/merge it over the client-sent context.
+fn apply_browser_context(
+    prompt: &str,
+    browser: Option<&ocean_agent_sdk::BrowserContext>,
+) -> String {
+    let Some(browser) = browser else {
+        return prompt.to_string();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(url) = browser.active_tab_url.as_deref().filter(|u| !u.is_empty()) {
+        match browser.active_tab_title.as_deref().filter(|t| !t.is_empty()) {
+            Some(title) => lines.push(format!("- Active tab: {title} ({url})")),
+            None => lines.push(format!("- Active tab: {url}")),
+        }
+    }
+    let other_tabs: Vec<&ocean_agent_sdk::BrowserTab> =
+        browser.tabs.iter().filter(|t| !t.active).collect();
+    if !other_tabs.is_empty() {
+        lines.push(format!("- {} other open tab(s):", other_tabs.len()));
+        for tab in other_tabs.iter().take(20) {
+            let title = if tab.title.is_empty() {
+                "(untitled)"
+            } else {
+                tab.title.as_str()
+            };
+            lines.push(format!("  - {title} ({})", tab.url));
+        }
+    }
+    if lines.is_empty() {
+        return prompt.to_string();
+    }
+    format!(
+        "## Browser context\n\nThe operator's browser surface reported this live state:\n{}\n\n{prompt}",
+        lines.join("\n")
+    )
 }
 
 /// Hard deadline for the whole pre-turn consult. Default-on means EVERY turn
@@ -14057,6 +14129,7 @@ mod tests {
             images: None,
             decision_token: None,
             agent: None,
+            client_context: None,
         }
     }
 
@@ -17971,6 +18044,48 @@ mod tests {
         // Each skill surfaces as a `name — description` bullet.
         assert!(block.contains("- Remotion Video — Build programmatic videos in React"));
         assert!(block.contains("- Supabase Postgres — Optimize Postgres queries and schema"));
+    }
+
+    #[test]
+    fn apply_browser_context_none_leaves_prompt_byte_for_byte() {
+        // OCEAN-40 fail-open: no browser context → prompt returned unchanged.
+        let prompt = "summarize this page";
+        assert_eq!(apply_browser_context(prompt, None), prompt);
+        // An empty browser context (no active tab, no tabs) is the same no-op.
+        let empty = ocean_agent_sdk::BrowserContext::default();
+        assert_eq!(apply_browser_context(prompt, Some(&empty)), prompt);
+    }
+
+    #[test]
+    fn apply_browser_context_folds_active_tab_above_the_prompt() {
+        // OCEAN-40: a surface-extension turn's active-tab url/title is rendered
+        // as a `## Browser context` block above the original prompt, which is
+        // preserved verbatim at the end.
+        let browser = ocean_agent_sdk::BrowserContext {
+            active_tab_url: Some("https://example.com/post".into()),
+            active_tab_title: Some("A Post".into()),
+            tabs: vec![
+                ocean_agent_sdk::BrowserTab {
+                    url: "https://example.com/post".into(),
+                    title: "A Post".into(),
+                    active: true,
+                },
+                ocean_agent_sdk::BrowserTab {
+                    url: "https://other.example".into(),
+                    title: "Other".into(),
+                    active: false,
+                },
+            ],
+        };
+        let prompt = "what is this about?";
+        let out = apply_browser_context(prompt, Some(&browser));
+        assert!(out.contains("## Browser context"));
+        assert!(out.contains("Active tab: A Post (https://example.com/post)"));
+        // The non-active tab is surfaced as an "other open tab".
+        assert!(out.contains("Other (https://other.example)"));
+        // Original task text preserved verbatim, after the context block.
+        assert!(out.ends_with(prompt));
+        assert!(out.find("## Browser context").unwrap() < out.find(prompt).unwrap());
     }
 
     #[test]
