@@ -301,3 +301,31 @@ NOT YET TOUCHED: ocean-surface, ocean-agents — candidate for next autonomous
 fanout (bug-hunt / assess) if John stays away. Still blocked: EC details,
 feedback-box info-layer migration (both need John's definition).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [03:52am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo tick)
+type:      [bug-report]
+area:      [backend]
+
+Cross-repo tick: extended coverage to all four goal repos via fanout. Read-only
+bug-hunt/assess agents over ocean-surface (Rust) + ocean-agents (Python/md).
+
+ocean-surface: builds clean; found + fixed a real P1 (PR #82, merged) — the
+native GUI SSE listener (flush_sse_data) aborted the whole live stream on ONE
+malformed data: frame (no reconnect loop) -> desktop app silently froze mid-
+turn. Now logs+skips the bad frame, matching the WASM client. Regression test
+sse_reader_survives_a_malformed_frame (4 green). [2 more P1/P2s noted for later:
+ComponentRender turn fragmentation; session_id query not percent-encoded.]
+
+ocean-agents: assessed clean (19/19 + 25/25 tests, py_compile + compose drift
+green). Merged finished CI-only branch ci/ocean-328 -> main (PR #18): adds a
+test-runner job (unittest + py_compile sweep). Untracked WIP (event_streamer.py,
+content-agent tools) left alone = John's parked work. Folder-as-agent: layout
+already largely there (agent=folder w/ manifest+identity+profiles); gap is
+collapsing identity into one instructions.md + moving compose into the daemon.
+
+Session: 10 PRs merged across ocean-os(8) + ocean-surface(1) + ocean-agents(1),
+ocean-bedrock verified. All four repos advanced. Worktrees clean.
+_________________________________________________________________________________
