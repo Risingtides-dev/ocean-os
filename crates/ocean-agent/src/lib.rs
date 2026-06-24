@@ -474,6 +474,8 @@ impl AgentRuntime {
         // an ACP turn pinned to a real model is never silently routed through a
         // global `fake-ok`. A bad alias fails the turn cleanly, touching nothing.
         let turn_state = match control.model_id.as_deref() {
+            // Explicit per-request model: fail HARD on a bad alias — the operator
+            // pinned it, so surface the error rather than silently substituting.
             Some(model_spec) => match self.resolve_state_for_model(model_spec) {
                 Ok(state) => Some(state),
                 Err(e) => {
@@ -490,7 +492,24 @@ impl AgentRuntime {
                     };
                 }
             },
-            None => None,
+            // No explicit model: a folder-as-agent's declared `agent.toml` model
+            // drives the turn, but fail SOFT — an unresolvable / not-yet-mapped
+            // agent model (e.g. an eve-style gateway id Ocean doesn't map) falls
+            // back to the global model with a warning, never breaking the turn.
+            None => match control.agent_model.as_deref() {
+                Some(model_spec) => match self.resolve_state_for_model(model_spec) {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_model = %model_spec,
+                            error = %e,
+                            "agent's declared model did not resolve; using the global model"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            },
         };
         let global_snapshot = self.snapshot();
         let turn_snapshot: RuntimeState = turn_state.unwrap_or_else(|| global_snapshot.clone());
@@ -1094,9 +1113,10 @@ impl AgentRuntime {
             cancel,
             event_sink,
             thinking_level,
-            // `model_id` was already consumed above (turn_state resolution); it
-            // is discarded here so the destructure stays exhaustive.
+            // `model_id` and `agent_model` were already consumed above (turn_state
+            // resolution); discarded here so the destructure stays exhaustive.
             model_id: _,
+            agent_model: _,
             tool_allowlist,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
@@ -1409,6 +1429,11 @@ pub struct PromptControl {
     /// the allowlist matches NO available tool (e.g. a typo), narrowing is
     /// skipped and a warning logged rather than running the agent toolless.
     pub tool_allowlist: Option<Vec<String>>,
+    /// Per-turn model declared by a folder-as-agent (`agent.toml` `model`). Used
+    /// ONLY when `model_id` (an explicit per-request override) is unset. Unlike
+    /// `model_id` it fails SOFT — an unresolvable agent model falls back to the
+    /// global model rather than failing the turn. `None` = no agent model.
+    pub agent_model: Option<String>,
 }
 
 /// Narrow a turn's toolset to `allowlist` (folder-as-agent tool restriction).
@@ -1448,12 +1473,19 @@ impl PromptControl {
             thinking_level: None,
             model_id: None,
             tool_allowlist: None,
+            agent_model: None,
         }
     }
 
     /// Narrow this turn's toolset to the named tools (folder-as-agent allowlist).
     pub fn with_tool_allowlist(mut self, tools: Vec<String>) -> Self {
         self.tool_allowlist = (!tools.is_empty()).then_some(tools);
+        self
+    }
+
+    /// Set the folder-as-agent's declared model (fail-soft; see the field doc).
+    pub fn with_agent_model(mut self, model: Option<String>) -> Self {
+        self.agent_model = model.filter(|m| !m.trim().is_empty());
         self
     }
 
@@ -2619,6 +2651,24 @@ mod tests {
     }
     fn tool(name: &'static str) -> SharedTool {
         Arc::new(NamedTool(name))
+    }
+
+    #[test]
+    fn with_agent_model_filters_empty_and_defers_to_explicit() {
+        let p = |perm| PromptControl::new(perm);
+        let perm: Arc<dyn PermissionPolicy> = Arc::new(StaticPermissionPolicy { allow_mutating: false });
+        // A real model is kept; an empty/whitespace one is dropped to None.
+        assert_eq!(
+            p(perm.clone()).with_agent_model(Some("claude-opus-4-7".into())).agent_model.as_deref(),
+            Some("claude-opus-4-7")
+        );
+        assert!(p(perm.clone()).with_agent_model(Some("  ".into())).agent_model.is_none());
+        assert!(p(perm.clone()).with_agent_model(None).agent_model.is_none());
+        // agent_model is independent of model_id (the explicit override); the
+        // turn path prefers model_id and only falls to agent_model when it's None.
+        let ctl = p(perm).with_model_id(Some("explicit".into())).with_agent_model(Some("agentmodel".into()));
+        assert_eq!(ctl.model_id.as_deref(), Some("explicit"));
+        assert_eq!(ctl.agent_model.as_deref(), Some("agentmodel"));
     }
 
     #[test]

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// `agent.toml` only exists to override defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentConfig {
-    /// Gateway/provider model id, e.g. `anthropic/claude-opus-4.8`. `None` =
+    /// Gateway/provider model id, e.g. `claude-opus-4-7`. `None` =
     /// inherit the daemon default.
     #[serde(default)]
     pub model: Option<String>,
@@ -268,7 +268,7 @@ mod tests {
         fs::create_dir_all(r.join("subagents")).unwrap();
         fs::write(
             r.join("agent.toml"),
-            "model = \"anthropic/claude-opus-4.8\"\n\
+            "model = \"claude-opus-4-7\"\n\
              description = \"deep researcher\"\n\
              tools = [\"web_search\"]\n\
              yolo = true\n",
@@ -308,7 +308,7 @@ mod tests {
         let root = scaffold("full");
         let def = resolve(&root, "researcher").unwrap();
         assert_eq!(def.name, "researcher");
-        assert_eq!(def.config.model.as_deref(), Some("anthropic/claude-opus-4.8"));
+        assert_eq!(def.config.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(def.config.description.as_deref(), Some("deep researcher"));
         assert_eq!(def.config.yolo, Some(true));
         assert_eq!(def.system_prompt(), Some("You are a careful researcher."));
@@ -366,7 +366,13 @@ mod tests {
         assert!(discover(&root).contains(&"researcher".to_string()));
 
         let def = resolve(&root, "researcher").expect("example agent must resolve");
-        assert_eq!(def.config.model.as_deref(), Some("anthropic/claude-opus-4.8"));
+        // The example's model must be a REAL Ocean alias so model-honoring takes
+        // effect rather than silently fail-soft to global on a typo.
+        let model = def.config.model.as_deref().expect("example declares a model");
+        assert!(
+            crate::known_models().iter().any(|m| m.id == model),
+            "example model {model:?} must be a known Ocean alias",
+        );
         assert!(def.config.description.is_some());
         assert!(def.system_prompt().is_some(), "has instructions.md");
         assert!(def.effective_tools().contains(&"web_fetch".to_string()));

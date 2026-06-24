@@ -108,10 +108,15 @@ daemon.
   (fail-safe to the full set if it matches nothing). `narrow_tools` + the
   `tool_allowlist` channel on `PromptControl`.
 
+- Model-honoring: a named agent's `agent.toml` `model` drives the turn when the
+  request didn't pin a `model_id`. Fail-soft — an unresolvable model falls back
+  to the global one + a warn (vs explicit `model_id` which fails hard). Uses
+  Ocean's bare model aliases (`claude-opus-4-7`, see `GET /v1/models`).
+
 **Next (separate PRs):**
 
 1. Capability binding: map `capabilities` entries to `CapabilityProvider`s in the
    per-session registry (builtin/mcp against today's registry; subprocess/wasm
    sideloaded as those `ocean-plugin` lanes land).
-2. Honor an agent's declared `model` on the turn when the request doesn't
-   override it.
+2. Map eve-style gateway model ids (`anthropic/claude-opus-4.8`) to Ocean aliases
+   so `agent.toml` `model` can accept either format.
