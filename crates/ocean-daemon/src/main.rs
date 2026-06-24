@@ -126,6 +126,24 @@ struct AppState {
     /// registries unbounded while only emitting logs) becomes observable. `0` on a
     /// healthy daemon; a climbing value means GC is failing and memory is leaking.
     gc_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Daemon-wide count of `BroadcastStreamRecvError::Lagged` occurrences across
+    /// every SSE connection (OCEAN-372). Each lag event already logs at `warn`
+    /// per-connection (OCEAN-87), but there was no aggregate: a fleet-wide
+    /// "slow consumers are dropping events" signal was invisible to scrapers.
+    /// Bumped once per `Lagged(_)` arm in both SSE handlers (`/v1/events`,
+    /// `/v1/agent/events`) using the same lock-free relaxed-atomic pattern as
+    /// [`AppState::persist_failures`], and surfaced by `GET /metrics` as
+    /// `ocean_sse_lag_events_total`. `0` on a healthy daemon; a climbing value
+    /// means consumers can't keep up and events are being silently dropped.
+    sse_lag_events: Arc<std::sync::atomic::AtomicU64>,
+    /// Daemon-wide sum of the `skipped` event counts reported by every
+    /// `BroadcastStreamRecvError::Lagged(skipped)` across all SSE connections
+    /// (OCEAN-372). Where [`AppState::sse_lag_events`] counts lag *occurrences*,
+    /// this is the total *number of events dropped* by those lags. Bumped by
+    /// `skipped` in each handler's `Lagged(skipped)` arm (same lock-free pattern
+    /// as [`AppState::persist_failures`]) and surfaced by `GET /metrics` as
+    /// `ocean_sse_events_dropped_total`.
+    sse_events_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Fulfilled `slack_canvas` awareness results the `ocean-agents` Slack bridge
     /// has POSTed back (OCEAN-262). Keyed by `(session_id, canvas key)` so a
     /// fulfilled `read`/`list`/`create` is queryable per session via
@@ -249,10 +267,17 @@ impl TurnMetrics {
     }
 
     /// Render the full Prometheus text-format exposition (v0.0.4) for this set of
-    /// counters plus the externally-owned `persist_failures` and `gc_failures`
-    /// gauges. Read-only over relaxed atomics, so scraping never perturbs the hot
-    /// path. Each metric gets its `# HELP`/`# TYPE` header per the exposition format.
-    fn render_prometheus(&self, persist_failures: u64, gc_failures: u64) -> String {
+    /// counters plus the externally-owned `persist_failures`, `gc_failures`, and
+    /// SSE-lag gauges. Read-only over relaxed atomics, so scraping never perturbs
+    /// the hot path. Each metric gets its `# HELP`/`# TYPE` header per the
+    /// exposition format.
+    fn render_prometheus(
+        &self,
+        persist_failures: u64,
+        gc_failures: u64,
+        sse_lag_events: u64,
+        sse_events_dropped: u64,
+    ) -> String {
         use std::fmt::Write as _;
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -316,6 +341,23 @@ impl TurnMetrics {
         out.push_str("# HELP ocean_gc_failures_total Background registry-GC sweeps that failed.\n");
         out.push_str("# TYPE ocean_gc_failures_total counter\n");
         let _ = writeln!(out, "ocean_gc_failures_total {gc_failures}");
+
+        // SSE consumer-lag counters (OCEAN-372), read from the single source of
+        // truth on `AppState`. `sse_lag_events_total` counts `Lagged` occurrences
+        // across every SSE connection; `sse_events_dropped_total` sums the events
+        // those lags silently dropped. A climbing value means slow consumers are
+        // overflowing the broadcast ring and losing events.
+        out.push_str(
+            "# HELP ocean_sse_lag_events_total SSE subscriber lag occurrences (slow consumers).\n",
+        );
+        out.push_str("# TYPE ocean_sse_lag_events_total counter\n");
+        let _ = writeln!(out, "ocean_sse_lag_events_total {sse_lag_events}");
+
+        out.push_str(
+            "# HELP ocean_sse_events_dropped_total Events dropped by lagging SSE subscribers.\n",
+        );
+        out.push_str("# TYPE ocean_sse_events_dropped_total counter\n");
+        let _ = writeln!(out, "ocean_sse_events_dropped_total {sse_events_dropped}");
 
         out
     }
@@ -1596,6 +1638,10 @@ async fn main() -> anyhow::Result<()> {
         // OCEAN-371: daemon-wide failed-GC-sweep total surfaced at `/health` +
         // `/metrics`; incremented by the background GC task on a sweep failure.
         gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // OCEAN-372: daemon-wide SSE consumer-lag totals surfaced at `/metrics`;
+        // incremented by both SSE handlers on a `Lagged` event.
+        sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         room_canvas: Arc::new(Mutex::new(HashMap::new())),
         // OCEAN-300: a single daemon-wide shutdown token, cloned into the SSE
@@ -2118,15 +2164,27 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 ///   * `ocean_persist_failures_total` — dropped transcript writes (mirrors
 ///     `GET /health`),
 ///   * `ocean_gc_failures_total` — failed background registry-GC sweeps (OCEAN-371,
-///     mirrors `GET /health`'s `gc_failures_total`).
+///     mirrors `GET /health`'s `gc_failures_total`),
+///   * `ocean_sse_lag_events_total` — SSE subscriber lag occurrences (OCEAN-372),
+///   * `ocean_sse_events_dropped_total` — events dropped by lagging SSE
+///     subscribers (OCEAN-372).
 async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     let persist_failures = state
         .persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
     let gc_failures = state.gc_failures.load(std::sync::atomic::Ordering::Relaxed);
-    let body = state
-        .metrics
-        .render_prometheus(persist_failures, gc_failures);
+    let sse_lag_events = state
+        .sse_lag_events
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let sse_events_dropped = state
+        .sse_events_dropped
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let body = state.metrics.render_prometheus(
+        persist_failures,
+        gc_failures,
+        sse_lag_events,
+        sse_events_dropped,
+    );
     (
         StatusCode::OK,
         // The Prometheus text exposition content type. `text/plain; version=0.0.4`
@@ -2254,6 +2312,10 @@ async fn events(
         })
         .collect();
 
+    // OCEAN-372: clone the daemon-wide SSE-lag counters into the live closure so
+    // every `Lagged` event bumps the aggregate totals surfaced at `/metrics`.
+    let sse_lag_events = state.sse_lag_events.clone();
+    let sse_events_dropped = state.sse_events_dropped.clone();
     let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
         Ok(envelope) => {
             // Seam dedupe: drop anything already replayed.
@@ -2266,7 +2328,9 @@ async fn events(
             // A slow SSE consumer overflowed the 1024-slot ring and silently
             // lost `skipped` events. Surface it server-side at warn so dropped
             // events are visible in the daemon log, not just to the client
-            // (OCEAN-87).
+            // (OCEAN-87), and bump the daemon-wide aggregate totals (OCEAN-372).
+            sse_lag_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            sse_events_dropped.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(skipped, "events SSE subscriber lagged; dropped events");
             let data = json!({
                 "type": "error",
@@ -10164,6 +10228,10 @@ async fn agent_events(
         .map(|frame| Ok(frame.into_sse_event()))
         .collect();
 
+    // OCEAN-372: clone the daemon-wide SSE-lag counters into the live closure so
+    // every `Lagged` event bumps the aggregate totals surfaced at `/metrics`.
+    let sse_lag_events = state.sse_lag_events.clone();
+    let sse_events_dropped = state.sse_events_dropped.clone();
     let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
         Ok(envelope) => {
             // Skip anything already delivered during replay (seam dedupe).
@@ -10187,7 +10255,10 @@ async fn agent_events(
             // A slow `/v1/agent/events` consumer overflowed the ring and lost
             // `skipped` agent-turn events (thinking deltas, tool chunks).
             // Log at warn so the drop is visible in the daemon log, not just
-            // pushed to the client (OCEAN-87).
+            // pushed to the client (OCEAN-87), and bump the daemon-wide
+            // aggregate totals (OCEAN-372).
+            sse_lag_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            sse_events_dropped.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 skipped,
                 "agent_events SSE subscriber lagged; dropped events"
@@ -14401,6 +14472,8 @@ mod tests {
             recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -15519,6 +15592,8 @@ mod tests {
             recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -16031,6 +16106,8 @@ mod tests {
             recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -19367,7 +19444,7 @@ mod tests {
     #[test]
     fn metrics_render_empty_is_valid_prometheus() {
         let m = TurnMetrics::default();
-        let body = m.render_prometheus(0, 0);
+        let body = m.render_prometheus(0, 0, 0, 0);
 
         // Every metric has both header lines.
         for stem in [
@@ -19375,6 +19452,8 @@ mod tests {
             "ocean_turns_in_flight",
             "ocean_turn_duration_seconds",
             "ocean_persist_failures_total",
+            "ocean_sse_lag_events_total",
+            "ocean_sse_events_dropped_total",
         ] {
             assert!(
                 body.contains(&format!("# HELP {stem} ")),
@@ -19432,7 +19511,7 @@ mod tests {
         m.record_turn(300, true);
         m.record_turn(5, false);
 
-        let body = m.render_prometheus(0, 0);
+        let body = m.render_prometheus(0, 0, 0, 0);
 
         assert_eq!(
             labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"),
@@ -19637,7 +19716,7 @@ mod tests {
 
         // The renderer surfaces the daemon-wide count as a labelled-free counter
         // with its HELP/TYPE headers, exactly as `/metrics` will scrape it.
-        let body = TurnMetrics::default().render_prometheus(0, gc_failures.load(Relaxed));
+        let body = TurnMetrics::default().render_prometheus(0, gc_failures.load(Relaxed), 0, 0);
         assert!(
             body.contains("# HELP ocean_gc_failures_total ")
                 && body.contains("# TYPE ocean_gc_failures_total counter"),
@@ -19705,6 +19784,116 @@ mod tests {
         assert_eq!(
             health.gc_failures_total, 3,
             "gc_failures must be read off AppState and surfaced on /health"
+        );
+    }
+
+    // OCEAN-372 — sse_lag_events_total + sse_events_dropped_total (/metrics)
+    // ----------------------------------------------------------------------
+
+    /// Both SSE handlers bump the daemon-wide lag counters in their
+    /// `BroadcastStreamRecvError::Lagged(skipped)` arm: `sse_lag_events` once per
+    /// lag occurrence, `sse_events_dropped` by `skipped`. Racing a real slow
+    /// consumer past the 1024-slot ring would be flaky, so this asserts the core
+    /// "a lag bumps both counters" property on the exact `fetch_add` pair the arm
+    /// runs, then proves `render_prometheus` surfaces both verbatim.
+    #[test]
+    fn sse_lag_counters_increment_and_render() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+        let sse_lag_events = AtomicU64::new(0);
+        let sse_events_dropped = AtomicU64::new(0);
+
+        // Two simulated lag events (stand-in for `Lagged(skipped)` from an
+        // overflowed broadcast ring): the arm bumps occurrences by one and the
+        // dropped-events total by `skipped` each time.
+        for skipped in [7u64, 11u64] {
+            sse_lag_events.fetch_add(1, Relaxed);
+            sse_events_dropped.fetch_add(skipped, Relaxed);
+        }
+        assert_eq!(
+            sse_lag_events.load(Relaxed),
+            2,
+            "each lag occurrence must increment sse_lag_events_total by exactly one"
+        );
+        assert_eq!(
+            sse_events_dropped.load(Relaxed),
+            18,
+            "sse_events_dropped_total must sum the `skipped` counts (7 + 11)"
+        );
+
+        // The renderer surfaces both as label-free counters with HELP/TYPE
+        // headers, exactly as `/metrics` will scrape them.
+        let body = TurnMetrics::default().render_prometheus(
+            0,
+            0,
+            sse_lag_events.load(Relaxed),
+            sse_events_dropped.load(Relaxed),
+        );
+        assert!(
+            body.contains("# HELP ocean_sse_lag_events_total ")
+                && body.contains("# TYPE ocean_sse_lag_events_total counter"),
+            "sse_lag_events must render with HELP/TYPE headers\n{body}"
+        );
+        assert!(
+            body.contains("# HELP ocean_sse_events_dropped_total ")
+                && body.contains("# TYPE ocean_sse_events_dropped_total counter"),
+            "sse_events_dropped must render with HELP/TYPE headers\n{body}"
+        );
+        assert_eq!(
+            metric_value(&body, "ocean_sse_lag_events_total"),
+            Some(2),
+            "render_prometheus must surface the lag-occurrence count verbatim\n{body}"
+        );
+        assert_eq!(
+            metric_value(&body, "ocean_sse_events_dropped_total"),
+            Some(18),
+            "render_prometheus must surface the dropped-events sum verbatim\n{body}"
+        );
+    }
+
+    /// `/metrics` through the REAL handler + a real `AppState` surfaces both SSE
+    /// lag counters read off the single source of truth on `AppState`. Seeds them
+    /// the same way the SSE handlers' `Lagged` arm would, then scrapes `/metrics`
+    /// via `oneshot` and asserts both values appear.
+    #[tokio::test]
+    async fn sse_lag_counters_surfaced_in_metrics() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+        // Bump the counters on AppState (the SSE handlers' `Lagged` arm does the
+        // same `fetch_add`) to prove the handler reads the single source of truth.
+        state
+            .sse_lag_events
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        state
+            .sse_events_dropped
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+
+        let metrics_app = Router::new()
+            .route("/metrics", get(metrics))
+            .with_state(state);
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = metrics_app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            metric_value(&body, "ocean_sse_lag_events_total"),
+            Some(4),
+            "sse_lag_events must be read off AppState and surfaced on /metrics\n{body}"
+        );
+        assert_eq!(
+            metric_value(&body, "ocean_sse_events_dropped_total"),
+            Some(42),
+            "sse_events_dropped must be read off AppState and surfaced on /metrics\n{body}"
         );
     }
 

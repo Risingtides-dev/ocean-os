@@ -1044,4 +1044,28 @@ the bridge with its own wildcard-free classifier, pinning the current relayed/fi
 split and double-guarding the compile-time exhaustiveness. Full local gate green on
 toolchain 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon,
 cargo clippy -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
+time:      [04:12pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-372-sse-lag-metrics
+type:      feature-request
+area:      backend
+
+OCEAN-372 (P3): added daemon-wide SSE consumer-lag observability. Both SSE handlers
+(/v1/events and /v1/agent/events) already logged BroadcastStreamRecvError::Lagged(skipped)
+at warn per-connection (OCEAN-87) but there was no fleet-wide aggregate, so a chronic
+slow-consumer situation dropping events was invisible to scrapers. Modeled on the
+just-merged gc_failures pattern (OCEAN-371): added two relaxed AtomicU64s on AppState —
+sse_lag_events (Lagged occurrences) and sse_events_dropped (sum of skipped) — cloned the
+Arcs into each handler's live filter_map closure and bump both in the Lagged(skipped) arm
+(fetch_add 1 / fetch_add skipped) right alongside the existing warn. Surfaced both at
+GET /metrics as ocean_sse_lag_events_total and ocean_sse_events_dropped_total via
+render_prometheus (signature grew two u64 params), next to ocean_persist_failures_total /
+ocean_gc_failures_total; /health left untouched (optional per ticket). Added two tests
+mirroring the gc_failures style: sse_lag_counters_increment_and_render (deterministic unit
+test of the fetch_add pair + render, no flaky real-lag injection) and
+sse_lag_counters_surfaced_in_metrics (drives the real /metrics handler via oneshot, asserts
+AppState-sourced values appear). Extended the empty-prometheus test to require both new
+HELP/TYPE headers. Full local gate green on 1.96.0: cargo build -p ocean-daemon,
+cargo test -p ocean-daemon (236 passed), cargo clippy -p ocean-daemon -- -D warnings,
+cargo fmt --all -- --check.
 _________________________________________________________________________________
