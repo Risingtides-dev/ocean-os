@@ -171,3 +171,37 @@ Verification:
 - cargo check --workspace (pre-commit, post-rebase)
 - git log --oneline origin/main..HEAD (5 commits)
 - git rev-list --left-right --count origin/main...HEAD (0/0 synced)
+
+_________________________________________________________________________________
+time:      [02:08am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (hygiene + foundation across short-lived branches)
+type:      [feature-request]
+area:      [backend]
+
+Loop/goal tick driving the coworker-onboarding + folder-as-agent direction.
+(1) Git hygiene: 228 local branches -> ~8. Fanout subagents verified every
+"unmerged" feature/fix branch (ocean-271/277/339/340 + 12 more) was already on
+main under different commits (phantom branches), plus 47 patch-applied + 3
+misrouted campaign-hub branches deleted; all dead worktrees removed, tree = main.
+(2) Fixed a real CI-blocking runtime bug (PR #233, merged): the daemon TEST
+build failed E0423 because a test built WriteTool as a unit struct after it
+gained fields+new() — broke CI on EVERY open PR; one-line WriteTool::new() fix,
+verified `cargo test -p ocean-daemon --no-run`.
+(3) PR #231: ocean-coworker-onboarding skill — download-and-run onboarding to
+ocean-bedrock (scoped Bearer token, /api/v1/info verify, read+write smoke),
+every command verified against a live bedrock instance.
+(4) PR #232: folder-as-agent resolver (crates/ocean-agent/src/agentdir.rs) —
+eve.dev-style, Rust-native. Agent = folder, identity from path; agent.toml +
+instructions.md + skills/ + tools/ + subagents/. agent.toml `capabilities` is
+the binding contract to CapabilityProviders; spec docs/specs/folder-as-agent.md
+documents the 3-tier sideload model (data / subprocess-binary / wasm) that lets
+a compiled capability load without a daemon rebuild. 4 unit tests green.
+#231 + #232 rebased onto the #233-fixed main, CI re-running.
+
+Verification:
+- cargo test -p ocean-agent agentdir (4 passed)
+- cargo test -p ocean-daemon --no-run (clean after fix)
+- cargo build -p ocean-agent / -p ocean-daemon (clean)
+- PR #233 merged to main (98c11e4)
+_________________________________________________________________________________
