@@ -121,6 +121,43 @@ enum Cmd {
     Session {
         id: SessionId,
     },
+    /// Onboard onto Ocean: verify a bedrock API token and print what to set.
+    /// One-command version of the ocean-coworker-onboarding skill — hits
+    /// `<bedrock-url>/api/v1/info` with the token and, on success, prints the
+    /// resolved principal plus the two env exports to add to your shell.
+    Onboard {
+        /// ocean-bedrock base URL (e.g. http://localhost:8080).
+        #[arg(long, env = "OCEAN_BEDROCK_URL")]
+        bedrock_url: String,
+        /// The bedrock API token (issued by an admin via `npm run token:create`).
+        #[arg(long, env = "OCEAN_BEDROCK_TOKEN")]
+        token: String,
+    },
+}
+
+/// Render the onboarding success summary from a bedrock `/api/v1/info` body:
+/// the resolved principal + the two env exports a coworker should persist.
+/// Pure (no I/O) so it's unit-testable.
+fn format_onboard_summary(base_url: &str, token: &str, info: &serde_json::Value) -> String {
+    let p = &info["principal"];
+    let name = p["name"].as_str().unwrap_or("?");
+    let role = p["role"].as_str().unwrap_or("?");
+    let scopes = p["scopes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let instance = info["instance"].as_str().unwrap_or("ocean-bedrock");
+    format!(
+        "ok connected to {instance} (api {})\n  principal: {name} (role={role}, scopes=[{scopes}])\n\nAdd these to your shell profile to persist:\n  export OCEAN_BEDROCK_URL=\"{}\"\n  export OCEAN_BEDROCK_TOKEN=\"{}\"",
+        info["apiVersion"].as_str().unwrap_or("v1"),
+        base_url.trim_end_matches('/'),
+        token,
+    )
 }
 
 /// Build the trailing footer line printed after a prompt's output.
@@ -467,6 +504,23 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
+        Cmd::Onboard { bedrock_url, token } => {
+            let url = format!("{}/api/v1/info", bedrock_url.trim_end_matches('/'));
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .with_context(|| format!("GET {url} (is ocean-bedrock running / URL right?)"))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.context("read bedrock /info response")?;
+            anyhow::ensure!(
+                status.is_success() && body["ok"] != serde_json::Value::Bool(false),
+                "bedrock rejected the token ({status}): {}",
+                body["error"].as_str().unwrap_or("unknown error")
+            );
+            println!("{}", format_onboard_summary(&bedrock_url, &token, &body));
+        }
     }
     Ok(())
 }
@@ -475,6 +529,29 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use ocean_core::TokenUsage;
+
+    #[test]
+    fn onboard_summary_reports_principal_and_exports() {
+        let info = serde_json::json!({
+            "instance": "ocean-bedrock",
+            "apiVersion": "v1",
+            "principal": { "name": "alice", "role": "agent", "scopes": ["/docs", "/context"] }
+        });
+        let out = format_onboard_summary("http://localhost:8080/", "tok_abc", &info);
+        assert!(out.contains("ocean-bedrock"), "names the instance: {out}");
+        assert!(out.contains("alice"), "names the principal: {out}");
+        assert!(out.contains("role=agent"), "shows the role: {out}");
+        assert!(out.contains("/docs, /context"), "lists scopes: {out}");
+        // base url is trimmed of the trailing slash in the export line
+        assert!(
+            out.contains("export OCEAN_BEDROCK_URL=\"http://localhost:8080\""),
+            "emits the url export: {out}"
+        );
+        assert!(
+            out.contains("export OCEAN_BEDROCK_TOKEN=\"tok_abc\""),
+            "emits the token export: {out}"
+        );
+    }
 
     fn response(ok: bool) -> PromptResponse {
         PromptResponse {
