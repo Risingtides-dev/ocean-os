@@ -205,3 +205,28 @@ Verification:
 - cargo build -p ocean-agent / -p ocean-daemon (clean)
 - PR #233 merged to main (98c11e4)
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [02:34am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Folder-as-agent now END-TO-END live (PRs #234, #235 merged). Define an agent
+as a folder -> GET /v1/agents discovers/resolves it -> AgentTurnRequest.agent
+runs it on a turn. #234: read-only classification surface (GET /v1/agents +
+/v1/agents/{name}, OCEAN_AGENTS_DIR root). #235: optional `agent` field on
+AgentTurnRequest; when set the turn handler prepends the resolved agent's
+instructions.md as a steering layer on the prompt (same additive layering as
+apply_turn_guidance) — never touches permissions/tools/AgentRuntime system
+prompt. agent:None = every existing client (TUI/ACP/voice/SDK) byte-for-byte
+unchanged. Fail-open on missing/invalid.
+
+Verification: ocean-agent-sdk 45 tests, daemon agents_endpoints test, daemon
+test build clean, 4 affected crates build clean. Session total: 5 PRs merged
+(#231 onboarding skill, #232 agentdir foundation, #233 CI-unblock runtime fix,
+#234 endpoints, #235 turn wiring) + branches 228->6.
+
+NEXT (John's ask): get the call-agent (ocean-call) 100% dialed in. Recon queued.
+_________________________________________________________________________________
