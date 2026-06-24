@@ -230,3 +230,28 @@ test build clean, 4 affected crates build clean. Session total: 5 PRs merged
 
 NEXT (John's ask): get the call-agent (ocean-call) 100% dialed in. Recon queued.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [02:52am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Onboarding SYSTEM shipped (PR #236, merged): `ocean-rs onboard --bedrock-url X
+--token Y` verifies a bedrock token against /api/v1/info, prints the resolved
+principal + the two env exports, exit 0/1 scriptable. Pairs with the onboarding
+skill (#231). Verified end-to-end against live bedrock (success + 403 paths).
+Goal "onboard people with an API token" substantially met (CLI system + skill).
+
+Session total: 6 PRs merged (#231 skill, #232 agentdir, #233 CI-unblock bug,
+#234 /v1/agents endpoints, #235 turn-path agent wiring, #236 onboard CLI),
+branches 228->6, ocean-call confirmed healthy (159 tests green).
+
+BLOCKED on John's clarification (ambiguous goal terms, can't build correctly
+without): (a) "EC details" — what is EC? (b) "feedback box / information layer
+merge+migrate" — which data, which store, source->dest? (c) call-agent "100%
+dialed in" — which seam is rough (live phone path / STT-TTS failover / wake+
+barge-in)? Next autonomous-buildable item if still away: ocean-call hardening
+pass or full TUISF interactive onboarding surface.
+_________________________________________________________________________________
