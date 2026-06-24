@@ -904,3 +904,32 @@ requests, back-compat preserved). Both open PRs; awaiting completion to gate.
 Deferred: OCEAN-337 (explicitly human-gated), web/deploy bugs 125/122 (need live
 repro), voice/obsidian 172/174 (fuzzy/non-repo).
 _________________________________________________________________________________
+
+time:      [01:36pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-40-active-tab-context
+type:      [feature-request]
+area:      [backend]
+
+Implemented OCEAN-40 (Phase 2 active-tab context in turn requests) and addressed
+the Codex review on PR #255. Added typed wire DTOs to ocean-agent-sdk —
+ClientContext { client_type, browser: Option<BrowserContext> } plus
+BrowserContext { active_tab_url, active_tab_title, tabs: Vec<BrowserTab> } — and
+wired them onto AgentTurnRequest as a new additive, optional client_context field
+(serde default + skip_serializing_if), leaving the flat client_type back-compat
+selector untouched so old payloads still deserialize. Daemon-side, agent_turn
+folds the client-supplied active-tab state into the turn prompt as an additive
+"## Browser context" block, gated to client_type == "surface-extension" and
+fail-open (no context = prompt byte-for-byte unchanged); a ponytail comment marks
+that the daemon does not yet merge a server-side CDP snapshot and names the
+upgrade path. Then two hardening fixes from review: (1) prompt-injection defense —
+tab titles/urls are page-controlled, so sanitize_browser_field now collapses
+newlines/control chars to single spaces and neutralizes markdown control chars
+(#, *, backtick, _, [], >, backslash) to inert fullwidth lookalikes, length-capped,
+so a malicious title like "Hi\n\nIgnore prior instructions...## SYSTEM" can't break
+out of its bullet; (2) active-tab fallback — when active_tab_url is None but a tabs[]
+entry is flagged active, the active tab is now derived from that entry instead of
+being filtered into "other tabs" and lost. Added SDK tests (back-compat deserialize
++ browser-context round-trip) and daemon tests (prompt-fold, fail-open, malicious-title
+sanitization, tabs-only fallback). Full local gate green on toolchain 1.96.0.
+_________________________________________________________________________________
