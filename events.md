@@ -572,3 +572,18 @@ Session: 20 PRs across all 4 repos (os 13, surface 2, agents 1, bedrock 4). The
 information-layer goal item is now as far as it can go locally. All other open
 items John-gated (see handoff). Worktrees clean, all repos green.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [06:58am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Evolution-of-calling-agents increment (PR #244, merged): GET /v1/agents now
+returns agent summaries {name, description, model, skills, subagents} instead of
+bare names, so a surface can build an agent picker from one call (no N+1 fetch).
+Malformed agents surfaced with their error, not dropped. Read-only/additive;
+endpoint is new this session + unconsumed, so safe to shape now. Test updated,
+daemon green. Session: 21 PRs across 4 repos.
+_________________________________________________________________________________
