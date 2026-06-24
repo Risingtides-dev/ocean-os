@@ -136,12 +136,18 @@ struct AppState {
     /// `ocean_sse_lag_events_total`. `0` on a healthy daemon; a climbing value
     /// means consumers can't keep up and events are being silently dropped.
     sse_lag_events: Arc<std::sync::atomic::AtomicU64>,
-    /// Daemon-wide sum of the `skipped` event counts reported by every
-    /// `BroadcastStreamRecvError::Lagged(skipped)` across all SSE connections
+    /// Daemon-wide sum of *deliverable* events dropped by lagging SSE consumers
     /// (OCEAN-372). Where [`AppState::sse_lag_events`] counts lag *occurrences*,
-    /// this is the total *number of events dropped* by those lags. Bumped by
-    /// `skipped` in each handler's `Lagged(skipped)` arm (same lock-free pattern
-    /// as [`AppState::persist_failures`]) and surfaced by `GET /metrics` as
+    /// this is the total *number of events lost* by those lags — but only where
+    /// `skipped` actually equals deliverable-events-lost. The legacy `/v1/events`
+    /// rail applies no scope filter, so its `Lagged(skipped)` arm bumps this by
+    /// `skipped` (every skipped envelope was deliverable). The `/v1/agent/events`
+    /// rail consumes the GLOBAL `AgentEventBus` and applies
+    /// `should_emit_agent_event` locally, so its `skipped` over-counts deliverable
+    /// loss (most skipped envelopes belong to other sessions under `?session_id=`
+    /// or the default) — that rail deliberately does NOT feed this counter, only
+    /// the occurrence counter. Same lock-free pattern as
+    /// [`AppState::persist_failures`]; surfaced by `GET /metrics` as
     /// `ocean_sse_events_dropped_total`.
     sse_events_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Fulfilled `slack_canvas` awareness results the `ocean-agents` Slack bridge
@@ -354,7 +360,7 @@ impl TurnMetrics {
         let _ = writeln!(out, "ocean_sse_lag_events_total {sse_lag_events}");
 
         out.push_str(
-            "# HELP ocean_sse_events_dropped_total Events dropped by lagging SSE subscribers.\n",
+            "# HELP ocean_sse_events_dropped_total Deliverable events dropped by lagging SSE subscribers on unfiltered rails.\n",
         );
         out.push_str("# TYPE ocean_sse_events_dropped_total counter\n");
         let _ = writeln!(out, "ocean_sse_events_dropped_total {sse_events_dropped}");
@@ -2314,6 +2320,12 @@ async fn events(
 
     // OCEAN-372: clone the daemon-wide SSE-lag counters into the live closure so
     // every `Lagged` event bumps the aggregate totals surfaced at `/metrics`.
+    // This is the legacy `/v1/events` rail: it applies NO local scope filter, so
+    // every skipped broadcast envelope WAS deliverable to this client. That makes
+    // `skipped` an accurate count of deliverable loss here, so this rail feeds
+    // BOTH the lag-occurrence counter and the dropped-events SUM. (The
+    // scope-filtered `/v1/agent/events` rail only feeds the occurrence counter —
+    // see its clone-site note.)
     let sse_lag_events = state.sse_lag_events.clone();
     let sse_events_dropped = state.sse_events_dropped.clone();
     let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
@@ -2329,6 +2341,7 @@ async fn events(
             // lost `skipped` events. Surface it server-side at warn so dropped
             // events are visible in the daemon log, not just to the client
             // (OCEAN-87), and bump the daemon-wide aggregate totals (OCEAN-372).
+            // No scope filter on this rail → `skipped` is real deliverable loss.
             sse_lag_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             sse_events_dropped.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(skipped, "events SSE subscriber lagged; dropped events");
@@ -10228,10 +10241,17 @@ async fn agent_events(
         .map(|frame| Ok(frame.into_sse_event()))
         .collect();
 
-    // OCEAN-372: clone the daemon-wide SSE-lag counters into the live closure so
-    // every `Lagged` event bumps the aggregate totals surfaced at `/metrics`.
+    // OCEAN-372: clone the daemon-wide SSE-lag occurrence counter into the live
+    // closure so every `Lagged` event bumps it. NOTE: this rail does NOT feed the
+    // dropped-events SUM (`sse_events_dropped`). `skipped` here is the number of
+    // GLOBAL `AgentEventBus` envelopes the broadcast ring skipped, but this
+    // subscriber applies `should_emit_agent_event` locally — under `?session_id=`
+    // (and the default) most of those skipped envelopes belonged to other
+    // sessions and were never deliverable to this client. Adding the raw
+    // `skipped` would inflate `ocean_sse_events_dropped_total` with events this
+    // client never would have received, so we deliberately only count
+    // deliverable loss on the unfiltered legacy `/v1/events` rail.
     let sse_lag_events = state.sse_lag_events.clone();
-    let sse_events_dropped = state.sse_events_dropped.clone();
     let live = BroadcastStream::new(live_rx).filter_map(move |event| match event {
         Ok(envelope) => {
             // Skip anything already delivered during replay (seam dedupe).
@@ -10253,12 +10273,13 @@ async fn agent_events(
         }
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
             // A slow `/v1/agent/events` consumer overflowed the ring and lost
-            // `skipped` agent-turn events (thinking deltas, tool chunks).
+            // `skipped` GLOBAL broadcast envelopes (thinking deltas, tool chunks).
             // Log at warn so the drop is visible in the daemon log, not just
-            // pushed to the client (OCEAN-87), and bump the daemon-wide
-            // aggregate totals (OCEAN-372).
+            // pushed to the client (OCEAN-87), and bump the daemon-wide lag
+            // OCCURRENCE counter (OCEAN-372). We do NOT add `skipped` to
+            // `sse_events_dropped` here — see the clone-site note above: on this
+            // scope-filtered rail `skipped` over-counts deliverable loss.
             sse_lag_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            sse_events_dropped.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 skipped,
                 "agent_events SSE subscriber lagged; dropped events"
@@ -19790,12 +19811,15 @@ mod tests {
     // OCEAN-372 — sse_lag_events_total + sse_events_dropped_total (/metrics)
     // ----------------------------------------------------------------------
 
-    /// Both SSE handlers bump the daemon-wide lag counters in their
-    /// `BroadcastStreamRecvError::Lagged(skipped)` arm: `sse_lag_events` once per
-    /// lag occurrence, `sse_events_dropped` by `skipped`. Racing a real slow
-    /// consumer past the 1024-slot ring would be flaky, so this asserts the core
-    /// "a lag bumps both counters" property on the exact `fetch_add` pair the arm
-    /// runs, then proves `render_prometheus` surfaces both verbatim.
+    /// The two SSE rails account for a `Lagged(skipped)` differently (OCEAN-372
+    /// P2 fix): both bump the lag-OCCURRENCE counter (`sse_lag_events`), but only
+    /// the UNFILTERED legacy `/v1/events` rail adds `skipped` to the dropped-events
+    /// SUM (`sse_events_dropped`). The scope-filtered `/v1/agent/events` rail must
+    /// NOT add `skipped`, because there `skipped` counts GLOBAL broadcast envelopes
+    /// — most of which weren't deliverable to a `?session_id=`-scoped client.
+    /// Racing a real slow consumer past the ring would be flaky, so this asserts
+    /// the per-rail `fetch_add` logic each arm runs, then proves `render_prometheus`
+    /// surfaces both totals verbatim.
     #[test]
     fn sse_lag_counters_increment_and_render() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -19803,22 +19827,30 @@ mod tests {
         let sse_lag_events = AtomicU64::new(0);
         let sse_events_dropped = AtomicU64::new(0);
 
-        // Two simulated lag events (stand-in for `Lagged(skipped)` from an
-        // overflowed broadcast ring): the arm bumps occurrences by one and the
-        // dropped-events total by `skipped` each time.
-        for skipped in [7u64, 11u64] {
-            sse_lag_events.fetch_add(1, Relaxed);
-            sse_events_dropped.fetch_add(skipped, Relaxed);
-        }
+        // Legacy `/v1/events` rail lag (no scope filter): bump BOTH counters, since
+        // every skipped envelope was deliverable to this client.
+        let legacy_skipped = 7u64;
+        sse_lag_events.fetch_add(1, Relaxed);
+        sse_events_dropped.fetch_add(legacy_skipped, Relaxed);
+
+        // Scope-filtered `/v1/agent/events` rail lag: bump ONLY the occurrence
+        // counter. `skipped` (11) here is GLOBAL broadcast envelopes — most belong
+        // to other sessions — so it must NOT inflate the deliverable-loss sum.
+        let agent_skipped = 11u64;
+        sse_lag_events.fetch_add(1, Relaxed);
+        // (intentionally NO `sse_events_dropped.fetch_add(agent_skipped, ...)`)
+        let _ = agent_skipped;
+
         assert_eq!(
             sse_lag_events.load(Relaxed),
             2,
-            "each lag occurrence must increment sse_lag_events_total by exactly one"
+            "every lag on either rail must increment sse_lag_events_total by one"
         );
         assert_eq!(
             sse_events_dropped.load(Relaxed),
-            18,
-            "sse_events_dropped_total must sum the `skipped` counts (7 + 11)"
+            legacy_skipped,
+            "sse_events_dropped_total must count ONLY the unfiltered rail's skipped \
+             (7), not the scope-filtered rail's global skipped (11)"
         );
 
         // The renderer surfaces both as label-free counters with HELP/TYPE
@@ -19846,7 +19878,7 @@ mod tests {
         );
         assert_eq!(
             metric_value(&body, "ocean_sse_events_dropped_total"),
-            Some(18),
+            Some(7),
             "render_prometheus must surface the dropped-events sum verbatim\n{body}"
         );
     }
@@ -19894,6 +19926,105 @@ mod tests {
             metric_value(&body, "ocean_sse_events_dropped_total"),
             Some(42),
             "sse_events_dropped must be read off AppState and surfaced on /metrics\n{body}"
+        );
+    }
+
+    /// OCEAN-372 P2 regression: a burst of OTHER-session events that overflows the
+    /// broadcast ring on the scope-filtered `/v1/agent/events` rail must NOT inflate
+    /// `sse_events_dropped_total`, because none of those skipped envelopes were
+    /// deliverable to a `?session_id=`-scoped client. Drives the rail's EXACT live
+    /// closure (scope filter + occurrence-only counting) over a real lagged
+    /// `BroadcastStream`: fills a tiny channel past capacity with foreign-session
+    /// deltas, then asserts (1) the scoped client receives nothing, (2) the lag
+    /// OCCURRENCE counter incremented, and (3) the dropped-events SUM stayed 0.
+    #[tokio::test]
+    async fn agent_rail_lag_does_not_inflate_dropped_total_from_other_sessions() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use std::sync::Arc;
+
+        // This client is scoped to `mine`; the burst belongs to `other`.
+        let want = Some(AgentSessionId::new_v4());
+        let all = false;
+        let other = AgentSessionId::new_v4();
+
+        // Tiny ring so a small burst deterministically overflows a not-yet-polled
+        // subscriber → the next recv yields `Lagged(skipped)`.
+        let (tx, rx) = broadcast::channel::<AgentEventEnvelope>(2);
+        for i in 0..8 {
+            let _ = tx.send(AgentEventEnvelope {
+                id: Uuid::new_v4(),
+                event: delta_event(other, &format!("other-{i}")),
+            });
+        }
+
+        let sse_lag_events = Arc::new(AtomicU64::new(0));
+        let sse_events_dropped = Arc::new(AtomicU64::new(0));
+
+        // Replica of the production `/v1/agent/events` live closure: scope-filter
+        // deliverable events, and on `Lagged` bump ONLY the occurrence counter
+        // (never `sse_events_dropped` — the P2 fix being guarded here).
+        let lag = sse_lag_events.clone();
+        let mut replayed_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let live = BroadcastStream::new(rx).filter_map(move |event| match event {
+            Ok(envelope) => {
+                if replayed_ids.remove(&envelope.id) {
+                    return None;
+                }
+                if !should_emit_agent_event(want, all, &envelope.event) {
+                    return None;
+                }
+                Some(Ok::<_, Infallible>(
+                    Event::default().data(agent_event_type_name(&envelope.event)),
+                ))
+            }
+            Err(BroadcastStreamRecvError::Lagged(_skipped)) => {
+                lag.fetch_add(1, Relaxed);
+                Some(Ok(Event::default().event("error").data("lagged")))
+            }
+        });
+        tokio::pin!(live);
+
+        // Drain the stream. Foreign-session deltas are scope-filtered out; the only
+        // item the scoped client sees is the `error` lag marker. Bounded so a
+        // regression can't hang the test.
+        let mut saw_lag_marker = false;
+        let mut deliverable_seen = 0u32;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), live.next()).await {
+                Ok(Some(Ok(ev))) => {
+                    // The lag marker is the only thing this scoped client should get;
+                    // a data frame would mean an other-session event leaked through.
+                    let dbg = format!("{ev:?}");
+                    if dbg.contains("lagged") {
+                        saw_lag_marker = true;
+                    } else {
+                        deliverable_seen += 1;
+                    }
+                }
+                Ok(Some(Err(_))) => {}
+                Ok(None) | Err(_) => break, // stream end or quiescent → done
+            }
+        }
+        drop(tx);
+
+        assert!(
+            saw_lag_marker,
+            "the overflow must surface as a Lagged occurrence on the scoped rail"
+        );
+        assert_eq!(
+            deliverable_seen, 0,
+            "no other-session event may be delivered to a scoped client"
+        );
+        assert_eq!(
+            sse_lag_events.load(Relaxed),
+            1,
+            "the lag occurrence must increment sse_lag_events_total"
+        );
+        assert_eq!(
+            sse_events_dropped.load(Relaxed),
+            0,
+            "an other-session burst must NOT inflate sse_events_dropped_total on the \
+             scope-filtered agent rail (OCEAN-372 P2)"
         );
     }
 

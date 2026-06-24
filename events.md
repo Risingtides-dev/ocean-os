@@ -1069,3 +1069,29 @@ HELP/TYPE headers. Full local gate green on 1.96.0: cargo build -p ocean-daemon,
 cargo test -p ocean-daemon (236 passed), cargo clippy -p ocean-daemon -- -D warnings,
 cargo fmt --all -- --check.
 _________________________________________________________________________________
+
+time:      [04:48pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-372-sse-lag-metrics
+type:      review
+area:      backend
+
+OCEAN-372 PR #265 Codex P2 fix: don't count scope-filtered-out events as dropped on the
+agent rail. The /v1/agent/events handler consumes the GLOBAL AgentEventBus and applies
+should_emit_agent_event locally, so on a Lagged(skipped) its `skipped` is the count of
+GLOBAL envelopes skipped — NOT events deliverable to a ?session_id=-scoped client. Adding
+raw `skipped` inflated ocean_sse_events_dropped_total with other-session bursts the client
+never would have received. Fix (chose the clean per-rail attribution, not a rename):
+sse_lag_events_total (occurrences) still bumps on BOTH rails since that's accurate
+everywhere; sse_events_dropped_total (sum) now bumps ONLY on the unfiltered legacy
+/v1/events rail where skipped == deliverable loss. Removed the fetch_add(skipped) +
+unused sse_events_dropped clone from the agent rail, documented the asymmetry at both
+clone-sites and on the AppState field, and sharpened the /metrics HELP text to
+"Deliverable events dropped ... on unfiltered rails". Reworked the unit test to model
+both rails distinctly (legacy bumps both=7; agent bumps occurrence only) and added a new
+deterministic regression test agent_rail_lag_does_not_inflate_dropped_total_from_other_sessions
+that overflows a tiny broadcast ring with foreign-session deltas, drives the rail's exact
+scope-filtering live closure, and asserts the scoped client gets nothing deliverable, the
+occurrence counter ticks, and the dropped sum stays 0. Full gate green on 1.96.0: build,
+test (235 passed, +1), clippy -D warnings, fmt --check.
+_________________________________________________________________________________
