@@ -414,3 +414,32 @@ Session: 13 PRs merged across ocean-os(10)+surface(2)+agents(1), 8 real bugs
 fixed, all 4 repos advanced. Worktrees clean. Blockers unchanged (EC, feedback-
 box, call-agent seam — need John).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [05:06am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [bug-report]
+area:      [frontend]
+
+P2 mop-up: shipped the two clean catalogued P2s. #241 ocean-tui session-picker
+selection drifted on refresh (preserved by slot index not session id; daemon
+recency-reorders the list -> highlight + detail jumped to wrong session). Now
+follows the session by id (1-based slot, matching select_session_row). Test
+caught my initial off-by-one against the slot convention before merge. #242
+ocean-tui cancelled-turn tool sweep was unscoped (closed ALL turns' Running
+tools, not just the finishing turn_id's) -> a sibling turn's live tool wrongly
+errored. Scoped to turn_id; 2-turn test proves the sibling survives.
+
+REMAINING 2 P2s left catalogued (deliberately NOT fixed — verify-first / YAGNI):
+- ocean-protocol Gemini content_index collision: fixing changes emitted event
+  ordering; needs verifying the ocean-runtime consumer first (risk of breaking
+  correct behavior). 
+- ocean-acp single-line data: parse: pure defensive (daemon contract IS single
+  -line today); adding multi-line accumulation is YAGNI until the contract moves.
+
+Bug sweep COMPLETE: both fanout hunts fully actioned. Session: 15 PRs merged
+across ocean-os(12)+surface(2)+agents(1), 10 real bugs fixed, all 4 repos
+advanced, worktrees clean. Goal #1 (runtime bugs) thoroughly exercised. Blockers
+unchanged: EC, feedback-box, call-agent seam — need John.
+_________________________________________________________________________________
