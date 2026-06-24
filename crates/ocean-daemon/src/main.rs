@@ -8272,6 +8272,8 @@ async fn agent_voice(
         // here only ever reaches `agent_turn` when yolo is effective — the guard
         // above already rejected the un-answerable no-token, no-yolo case.
         decision_token: req.decision_token,
+        // Voice turns run on the surface profile, not a named folder-as-agent.
+        agent: None,
     };
     agent_turn(State(state), Json(turn)).await
 }
@@ -8419,6 +8421,7 @@ async fn agent_turn(
         model_id,
         images,
         decision_token,
+        agent,
     } = req;
 
     // OCEAN-304: backpressure. Take a turn permit BEFORE any work (cwd
@@ -8613,6 +8616,27 @@ async fn agent_turn(
     let yolo = effective_yolo();
 
     let guided_prompt = apply_turn_guidance(room_id, guidance.as_deref(), &prompt);
+
+    // Folder-as-agent: when the turn names an `agent`, prepend that agent's
+    // `instructions.md` as a steering layer — the same purely-additive prompt
+    // layering room/operator guidance uses, so it never touches permissions,
+    // tools, or AgentRuntime's own system-prompt composition. A missing/invalid
+    // agent or empty instructions leaves `guided_prompt` untouched (fail-open),
+    // so every existing client (`agent: None`) is unaffected. Discover names via
+    // GET /v1/agents; see docs/specs/folder-as-agent.md.
+    let guided_prompt = match agent.as_deref() {
+        Some(name) => match ocean_agent::agentdir::resolve(&agents_root(), name) {
+            Ok(def) => match def.system_prompt() {
+                Some(instr) => format!("{instr}\n\n{guided_prompt}"),
+                None => guided_prompt,
+            },
+            Err(e) => {
+                tracing::warn!(agent = name, error = %e, "named agent did not resolve; using surface profile");
+                guided_prompt
+            }
+        },
+        None => guided_prompt,
+    };
 
     // Longhouse pre-turn consult (OCEAN-283, default-ON). Unless the operator
     // opted out (`OCEAN_LONGHOUSE_PREPARE=0|false|no|off`), rank this turn's
@@ -13964,6 +13988,7 @@ mod tests {
             model_id: None,
             images: None,
             decision_token: None,
+            agent: None,
         }
     }
 

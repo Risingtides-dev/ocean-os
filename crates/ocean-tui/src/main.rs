@@ -3214,6 +3214,8 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             // The TUI does not attach images to turns.
             images: None,
             decision_token: Some(decision_token),
+            // The TUI does not yet select a named folder-as-agent.
+            agent: None,
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(

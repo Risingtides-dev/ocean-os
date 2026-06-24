@@ -234,6 +234,14 @@ pub struct AgentTurnRequest {
     /// Known values: "tui", "surface-web", "surface-gpui", "surface-native", "cli", "leo-voice"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+    /// Named folder-as-agent to run this turn (OCEAN folder-as-agent). When set,
+    /// the daemon resolves `<agents_root>/<agent>/` and composes that agent's
+    /// `instructions.md` as the turn's system prompt, overriding the surface
+    /// profile. `None` (the default, and every existing client) keeps today's
+    /// surface-profile behavior unchanged. Discover names via `GET /v1/agents`.
+    /// See `docs/specs/folder-as-agent.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Per-turn reasoning effort override. When set, the daemon applies this
     /// `ThinkingLevel` to *this turn only* — it does not mutate the runtime's
     /// global `thinking_level`. `None` leaves the global default in force.
@@ -1210,6 +1218,7 @@ mod tests {
             model_id: None,
             images: None,
             decision_token: None,
+            agent: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
@@ -1239,6 +1248,7 @@ mod tests {
             model_id: None,
             images: None,
             decision_token: None,
+            agent: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("thinking_level"));

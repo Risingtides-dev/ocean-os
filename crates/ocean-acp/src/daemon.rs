@@ -207,6 +207,8 @@ impl DaemonClient {
             // ACP bridge does not attach images to turns (yet).
             images: None,
             decision_token,
+            // ACP bridge does not select a named folder-as-agent.
+            agent: None,
         };
 
         let url = format!("{}/v1/agent/turns", self.base_url);
