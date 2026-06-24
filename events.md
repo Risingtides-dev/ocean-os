@@ -958,4 +958,21 @@ type:      testing
 area:      testing
 
 OCEAN-370 (P2): closed two daemon-level Longhouse test gaps in crates/ocean-daemon/src/main.rs (test module only, no runtime changes). GAP 1: extended the `prep_with()` test helper to accept a workflows param (was skills-only, sops/workflows hardcoded empty) and added `render_longhouse_prep_renders_workflows_alongside_skills`, which pins that workflows render in the same `- {name} — {description}` bullet shape as skills (main.rs:9316-9324) — mirrors the prepare.rs unit-level expectation. GAP 2: added async `workflows_prepare_returns_matching_workflows_from_cwd`, which plants docs/orchestrator/workflows/test.md (YAML frontmatter name+description) in a tempdir, POSTs /v1/workflows/prepare through the real longhouse_routes() table with that cwd + a matching prompt (TTL=0 + cache clear for a cold scan), and asserts the planted workflow surfaces on the wire — the on-disk counterpart to the empty-tmpdir wiring test. Updated the three other `prep_with` callers for the new signature. Full local gate green on toolchain 1.96.0: cargo test -p ocean-daemon (229 passed), cargo clippy -p ocean-daemon -- -D warnings clean, cargo fmt --all -- --check clean.
+time:      [3:06P] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  fix/ocean-368-sse-keepalive
+type:      [bug-report]
+area:      [backend]
+
+Implemented OCEAN-368 (P2): standardized the SSE keep-alive interval on the legacy
+/v1/events rail to match /v1/agent/events. The legacy rail was using KeepAlive::default()
+(axum's 15s), while the agent rail used a 3s interval (OCEAN-305), so clients on /v1/events
+saw asymmetric ~15s vs ~3s reconnect latency / TUI responsiveness. Factored the value into a
+single documented const SSE_KEEPALIVE_INTERVAL (3s) and wired both handlers to it via
+KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL), with comments on both rails noting they now
+share one contract. Since axum's KeepAlive does not expose its interval, added a unit test
+(sse_keepalive_interval_is_documented_3s_contract) asserting the shared const equals 3s — the
+single-const wiring is what makes both rails provably equal. Full local gate green on toolchain
+1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon (228 passed), cargo clippy
+-p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
 _________________________________________________________________________________
