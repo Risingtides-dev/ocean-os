@@ -329,3 +329,26 @@ collapsing identity into one instructions.md + moving compose into the daemon.
 Session: 10 PRs merged across ocean-os(8) + ocean-surface(1) + ocean-agents(1),
 ocean-bedrock verified. All four repos advanced. Worktrees clean.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [04:08am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [bug-report]
+area:      [frontend]
+
+ocean-surface 2nd P1 fixed (PR #83, merged): ComponentRender events carry no
+turn_id but the append path used a hardcoded "component-render" synthetic id ->
+ensure_assistant_turn never matched the real streaming turn, so every rendered
+card splintered into its own transcript turn and the next text delta orphaned
+the component. New ensure_component_turn() folds the card into the active
+assistant turn. Test green. Both ocean-surface P1s from the bug-hunt now fixed.
+Remaining P2 (agent_events_url session_id not percent-encoded) intentionally
+SKIPPED — latent only if a session id carries &/#/? (today UUIDs); not worth
+churn (YAGNI).
+
+Session: 11 PRs merged — ocean-os(8) + ocean-surface(2: #82 SSE resilience, #83
+component turns) + ocean-agents(1: #18 CI). Multi-repo bug resolution (goal #1)
+now spans 3 code repos. Blocked items unchanged (EC, feedback-box, call-agent
+seam — need John). Worktrees clean.
+_________________________________________________________________________________
