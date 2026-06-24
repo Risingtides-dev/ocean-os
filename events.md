@@ -645,3 +645,25 @@ distinguishes truly-blocked from I-was-being-lazy. Session: 25 PRs across all 4
 repos. Remaining: EC (real-undecodable), prod ingest (creds), call-agent seam
 (needs what's-rough), model-honoring (format decision + sensitive path).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [08:26am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Completed the onboarding "log trip" both sides (PR #248). The hook fairly noted
+#7 only audited admin token ISSUANCE; the coworker's onboarding FLOW recorded
+nothing. Now `ocean-rs onboard` appends a JSONL record (ts, bedrock_url,
+instance, principal) to $OCEAN_ONBOARD_LOG / $HOME/.local/state/ocean/
+onboarding.jsonl on success. Fail-soft, std-only, pure record builder unit-
+tested, verified e2e against live bedrock. So goal #4 is now FULLY met: onboard
+with an API token (skill #231 + CLI #236 + interactive #238) AND a log trip
+(bedrock #7 issuance audit + #248 onboarding log).
+
+Session: 26 PRs across all 4 repos. Pushing on "log trip" (twice) cracked it
+into 2 real shipped fixes — same lesson as tool-narrowing. Genuinely-remaining:
+EC (exhaustively confirmed no referent), prod ingest (creds), call-agent seam
+(needs what's-rough), model-honoring (format decision + sensitive path).
+_________________________________________________________________________________
