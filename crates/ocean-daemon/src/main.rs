@@ -9369,7 +9369,6 @@ fn apply_browser_context(
     let Some(browser) = browser else {
         return prompt.to_string();
     };
-    let mut lines: Vec<String> = Vec::new();
 
     // Resolve the active tab. Prefer the explicit `active_tab_url`/`title`
     // fields; when the client omitted them but shipped a full `tabs` snapshot
@@ -9387,6 +9386,17 @@ fn apply_browser_context(
                 .map(|t| t.url.as_str())
                 .filter(|u| !u.is_empty())
         });
+
+    // Fail-open + don't-leak contract: the whole block is gated on a RESOLVED
+    // active tab. If neither an explicit `active_tab_url` nor a `tabs` entry
+    // flagged `active` yields one (e.g. a tabs list where every entry defaulted
+    // `active: false`), return the prompt byte-for-byte unchanged — we never
+    // render the "other open tabs" list on its own, since without a "this tab"
+    // anchor it would only leak unrelated tab titles/URLs to no purpose.
+    let Some(active_url) = active_url else {
+        return prompt.to_string();
+    };
+
     let active_title = browser
         .active_tab_title
         .as_deref()
@@ -9400,15 +9410,14 @@ fn apply_browser_context(
                 .filter(|t| !t.is_empty())
         });
 
-    if let Some(url) = active_url {
-        let url = sanitize_browser_field(url);
-        match active_title {
-            Some(title) => lines.push(format!(
-                "- Active tab: {} ({url})",
-                sanitize_browser_field(title)
-            )),
-            None => lines.push(format!("- Active tab: {url}")),
-        }
+    let mut lines: Vec<String> = Vec::new();
+    let url = sanitize_browser_field(active_url);
+    match active_title {
+        Some(title) => lines.push(format!(
+            "- Active tab: {} ({url})",
+            sanitize_browser_field(title)
+        )),
+        None => lines.push(format!("- Active tab: {url}")),
     }
 
     let other_tabs: Vec<&ocean_agent_sdk::BrowserTab> =
@@ -9427,9 +9436,9 @@ fn apply_browser_context(
             ));
         }
     }
-    if lines.is_empty() {
-        return prompt.to_string();
-    }
+    // `lines` is non-empty here: a resolved active tab always pushes its line
+    // above (the function returned early otherwise), so the block always has a
+    // "this tab" anchor.
     format!(
         "## Browser context\n\nThe operator's browser surface reported this live state:\n{}\n\n{prompt}",
         lines.join("\n")
@@ -18138,6 +18147,34 @@ mod tests {
         // An empty browser context (no active tab, no tabs) is the same no-op.
         let empty = ocean_agent_sdk::BrowserContext::default();
         assert_eq!(apply_browser_context(prompt, Some(&empty)), prompt);
+
+        // OCEAN-40 (P2): a non-empty `tabs` list with NO entry flagged active
+        // and no explicit `active_tab_url` does NOT resolve a "this tab" anchor.
+        // The whole block is gated on a resolved active tab, so the prompt is
+        // returned byte-for-byte unchanged — the other-tabs list is never
+        // rendered on its own (no leaking unrelated tab titles/URLs).
+        let no_active = ocean_agent_sdk::BrowserContext {
+            active_tab_url: None,
+            active_tab_title: None,
+            tabs: vec![
+                ocean_agent_sdk::BrowserTab {
+                    url: "https://a.example".into(),
+                    title: "A".into(),
+                    active: false,
+                },
+                ocean_agent_sdk::BrowserTab {
+                    url: "https://b.example".into(),
+                    title: "B".into(),
+                    active: false,
+                },
+            ],
+        };
+        let out = apply_browser_context(prompt, Some(&no_active));
+        assert_eq!(out, prompt, "no resolved active tab => prompt unchanged");
+        assert!(
+            !out.contains("Browser context") && !out.contains("a.example"),
+            "the other-tabs list must not render without a resolved active tab"
+        );
     }
 
     #[test]
