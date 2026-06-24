@@ -9077,7 +9077,44 @@ async fn agent_turn(
                         result,
                     });
                 }
-                _ => {}
+                // OCEAN-373: the remaining runtime `AgentEvent` variants are
+                // *intentionally not relayed* onto `/v1/agent/events`. They are
+                // named explicitly (no `_ => {}` wildcard) so this filter is a
+                // deliberate, greppable decision rather than a silent drop, and
+                // so any NEW `AgentEvent` variant added upstream fails to compile
+                // here until someone consciously decides to relay-or-document it.
+                //
+                // Each of these is a structural turn-lifecycle marker that the
+                // daemon already covers from its own vantage point, or whose
+                // payload is already delivered through the streaming deltas
+                // above. There is no `AgentTurnEvent` wire variant for any of
+                // them, and no SSE consumer needs one today, so adding wire
+                // variants here would be speculative protocol surface. If a
+                // consumer ever genuinely needs one, add the matching
+                // `AgentTurnEvent` variant and move that arm up.
+                //
+                //   - AgentStart / AgentEnd: the run's outer boundary. The daemon
+                //     does not surface a run boundary on the wire; turn-level
+                //     `TurnStarted` / `TurnFinished` (emitted by the daemon itself,
+                //     bracketing this bridge) are the unit clients track.
+                //   - TurnStart / TurnEnd: the runtime's bare turn markers (carry
+                //     only a `session_id`). The daemon emits its own richer
+                //     `AgentTurnEvent::TurnStarted` (with `model`) and
+                //     `TurnFinished` (with status / tokens / wall time) around the
+                //     loop, so relaying these bare runtime markers would duplicate
+                //     the boundary with strictly less information.
+                //   - AssistantMessage: the finalized assistant message. Its text
+                //     already streamed to clients delta-by-delta via
+                //     `AssistantTextDelta` (see the `TextDelta` arm and the NOTE at
+                //     turn close), so re-emitting the whole message would double it.
+                //   - UserMessage: the prompt the client just submitted on this
+                //     turn — echoing it back over SSE tells the client nothing new.
+                AgentEvent::AgentStart { .. }
+                | AgentEvent::AgentEnd { .. }
+                | AgentEvent::TurnStart { .. }
+                | AgentEvent::TurnEnd { .. }
+                | AgentEvent::AssistantMessage { .. }
+                | AgentEvent::UserMessage { .. } => {}
             }
         }
     });
@@ -10772,6 +10809,107 @@ mod tests {
     /// exercise the request/permission paths (OCEAN-273 widened the signature).
     fn empty_canvas_store() -> CanvasFulfillmentStore {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// OCEAN-373: the runtime → SSE bridge classifies every `AgentEvent` variant
+    /// as either RELAYED (forwarded onto `/v1/agent/events` as an
+    /// `AgentTurnEvent`) or FILTERED (intentionally dropped — see the documented
+    /// match arm in the bridge). This classifier MIRRORS that bridge match arm
+    /// for arm, with NO `_` wildcard, so the contract has a single greppable
+    /// home in the tests as well as the bridge.
+    ///
+    /// The real guard is the compiler: adding a new `AgentEvent` variant upstream
+    /// breaks BOTH this match and the bridge's match (neither has a wildcard),
+    /// forcing whoever adds it to consciously choose relay-or-document rather
+    /// than letting it fall silently into a catch-all. The assertions below then
+    /// pin the *current* classification so a behavior change (moving a variant
+    /// between buckets) is caught too.
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum RelayClass {
+        Relayed,
+        Filtered,
+    }
+
+    #[cfg(test)]
+    fn classify_agent_event(ev: &AgentEvent) -> RelayClass {
+        match ev {
+            // Relayed onto the SSE wire (see the bridge match arms).
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::ToolExecutionStart { .. }
+            | AgentEvent::ToolExecutionEnd { .. }
+            | AgentEvent::PermissionDenied { .. }
+            | AgentEvent::Render { .. }
+            | AgentEvent::Unmount { .. }
+            | AgentEvent::BrowserActivity { .. }
+            | AgentEvent::SurfacePatch { .. }
+            | AgentEvent::SlackCanvas { .. } => RelayClass::Relayed,
+            // Intentionally NOT relayed (OCEAN-373) — structural turn/run markers
+            // the daemon covers itself, or message payloads already streamed.
+            AgentEvent::AgentStart { .. }
+            | AgentEvent::AgentEnd { .. }
+            | AgentEvent::TurnStart { .. }
+            | AgentEvent::TurnEnd { .. }
+            | AgentEvent::AssistantMessage { .. }
+            | AgentEvent::UserMessage { .. } => RelayClass::Filtered,
+        }
+    }
+
+    #[test]
+    fn ocean_373_agentevent_relay_classification_is_exhaustive_and_documented() {
+        use ocean_protocol::Message;
+
+        // Every currently-filtered variant must classify as Filtered. These are
+        // the six structural / message variants the bridge documents-and-drops.
+        let filtered = [
+            AgentEvent::AgentStart { session_id: None },
+            AgentEvent::AgentEnd {
+                session_id: None,
+                messages: vec![],
+            },
+            AgentEvent::TurnStart { session_id: None },
+            AgentEvent::TurnEnd { session_id: None },
+            AgentEvent::AssistantMessage {
+                session_id: None,
+                message: Message::user_text("x"),
+            },
+            AgentEvent::UserMessage {
+                session_id: None,
+                message: Message::user_text("x"),
+            },
+        ];
+        for ev in &filtered {
+            assert_eq!(
+                classify_agent_event(ev),
+                RelayClass::Filtered,
+                "{ev:?} must be intentionally filtered (OCEAN-373)"
+            );
+        }
+
+        // Spot-check that representative relayed variants classify as Relayed, so
+        // a regression that lumped everything into one bucket is caught.
+        let relayed = [
+            AgentEvent::TextDelta {
+                session_id: None,
+                delta: "hi".into(),
+            },
+            AgentEvent::BrowserActivity {
+                session_id: None,
+                active: true,
+            },
+            AgentEvent::Unmount {
+                session_id: None,
+                id: "c1".into(),
+            },
+        ];
+        for ev in &relayed {
+            assert_eq!(
+                classify_agent_event(ev),
+                RelayClass::Relayed,
+                "{ev:?} must be relayed onto SSE"
+            );
+        }
     }
 
     /// OCEAN-368: both the legacy `/v1/events` rail and the `/v1/agent/events`
