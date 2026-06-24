@@ -1071,6 +1071,14 @@ impl EventBus {
 /// replay (same as the pre-OCEAN-129 behavior), so memory stays bounded.
 const AGENT_EVENT_REPLAY_BUFFER: usize = 2048;
 
+/// Shared SSE keep-alive interval for both the legacy `/v1/events` rail and the
+/// `/v1/agent/events` rail. Set to 3s (down from axum's 15s default) per
+/// OCEAN-305 so the TUI's scope-change watcher — which only wakes on incoming
+/// lines, including keepalive comments — re-scopes within ~3s instead of ~15s.
+/// OCEAN-368 standardized both rails on this single documented contract; keep
+/// them in sync via this constant.
+const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Parallel broadcast bus that carries `AgentTurnEvent`s with full fidelity
 /// (turn_id, call_id, thinking deltas, tool chunks). The legacy `OceanEvent`
 /// bus still ships, but `/v1/agent/events` subscribes here so the TUI can
@@ -2224,9 +2232,16 @@ async fn events(
     // Replay first (in emission order), then the live broadcast. Terminate the
     // whole stream when the daemon shuts down so this connection can't pin
     // graceful shutdown open (OCEAN-300).
+    // Replay first (in emission order), then the live broadcast. Terminate the
+    // whole stream when the daemon shuts down so this connection can't pin
+    // graceful shutdown open (OCEAN-300).
+    //
+    // OCEAN-368: both this legacy rail and `/v1/agent/events` now share the
+    // documented 3s keep-alive contract via `SSE_KEEPALIVE_INTERVAL`, so clients
+    // on either rail see symmetric reconnect latency / TUI responsiveness.
     let stream = tokio_stream::iter(replay_events).chain(live);
     let stream = sse_until_shutdown(stream, state.shutdown.clone());
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
 }
 
 async fn prompt(
@@ -10105,11 +10120,11 @@ async fn agent_events(
     // OCEAN-305: a 3s keepalive (down from axum's 15s default) so the TUI's
     // scope-change watcher — which only wakes on incoming lines, including
     // keepalive comments — notices a session switch and re-scopes its
-    // subscription within ~3s instead of ~15s. Only this route; the legacy
-    // `/v1/events` rail keeps the default.
+    // subscription within ~3s instead of ~15s. OCEAN-368: the legacy
+    // `/v1/events` rail now shares this same `SSE_KEEPALIVE_INTERVAL` contract.
     let stream = tokio_stream::iter(replay_events).chain(live);
     let stream = sse_until_shutdown(stream, state.shutdown.clone());
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(3)))
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
 }
 
 /// Parse a truthy SSE query flag (`?all=`, `?replay=`): `1`/`true`/`yes`/`on`.
@@ -10709,6 +10724,24 @@ mod tests {
     /// exercise the request/permission paths (OCEAN-273 widened the signature).
     fn empty_canvas_store() -> CanvasFulfillmentStore {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// OCEAN-368: both the legacy `/v1/events` rail and the `/v1/agent/events`
+    /// rail must construct their SSE keep-alive from the same documented 3s
+    /// contract. `axum::response::sse::KeepAlive` doesn't expose its interval,
+    /// so both handlers feed `SSE_KEEPALIVE_INTERVAL` into
+    /// `KeepAlive::new().interval(..)`; this asserts that shared constant is the
+    /// agreed-upon 3s value. Keeping the rails wired to one const is what makes
+    /// them provably equal — drift would require editing this constant, which
+    /// flips both rails together.
+    #[test]
+    fn sse_keepalive_interval_is_documented_3s_contract() {
+        assert_eq!(
+            SSE_KEEPALIVE_INTERVAL,
+            std::time::Duration::from_secs(3),
+            "both SSE rails (/v1/events and /v1/agent/events) must share the \
+             documented 3s keep-alive contract (OCEAN-305 / OCEAN-368)"
+        );
     }
 
     /// Empty per-room ledger for `gc_registries` calls that don't exercise the
