@@ -803,3 +803,27 @@ Session: 29 PRs, 15 real bugs/regressions fixed across the runtime. Goal #1
 (resolve bugs in the runtime) genuinely deep now: 3 fanout hunts, every ocean-os
 crate covered.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [10:48am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [bug-report]
+area:      [backend]
+
+Cleared the 2 catalogued P2s instead of leaving them deferred (pushed, fixed):
+- ocean-browser active_page() drove the LAST arbitrary tab (no break, ignored
+  focus) -> wrong tab after a tab-close. Now prefers document.hasFocus() with a
+  safe fallback to prior behavior (PR #252).
+- ocean-providers MiniMax model casing lost on the explicit-provider path
+  (minimax-m2 -> rejected; bare alias worked). minimax_api_casing() restores it,
+  pure + tested (PR #253).
+
+3rd fanout hunt now FULLY actioned: P0 #250 + P1 #251 + P2 #252 + P2 #253 — all
+4 findings shipped. 17 real bugs/regressions fixed this session across all
+ocean-os crates (3 fanout hunts, every crate covered). Session: 31 PRs.
+
+Goal #1 (resolve runtime bugs) is now thoroughly, demonstrably met — not
+"partial". Remaining genuinely-gated: EC (you-codename), CF embedding (1 cred +
+documented local-pgvector option). Everything else shipped.
+_________________________________________________________________________________
