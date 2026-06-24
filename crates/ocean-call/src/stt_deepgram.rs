@@ -301,6 +301,12 @@ pub mod live {
             cfg: &DeepgramConfig,
             api_key: &str,
             clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+            // Call-start epoch (the caller's `clock()` at session start). Without
+            // it, `now_rel()` subtracts 0 and the first frame stamps `base_ms`
+            // with the full wall-clock epoch, so every streaming segment's
+            // `start_ms` is ~epoch-scale instead of call-relative (the batch path
+            // in session_task.rs captures `started_ms` the same way).
+            started_ms: u64,
         ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamEvent>)> {
             let url = build_ws_url(cfg);
             let mut request = url.into_client_request()?;
@@ -372,7 +378,7 @@ pub mod live {
                     write: Arc::new(Mutex::new(write)),
                     base_ms,
                     clock,
-                    started_ms: 0,
+                    started_ms,
                 },
                 events_rx,
             ))
