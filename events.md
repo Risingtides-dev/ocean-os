@@ -530,3 +530,23 @@ worktrees clean. Folder-as-agent end-to-end live; onboarding 3 forms; info-layer
 merge core tested; goal terms decoded. John-gated remainder: EC clarification,
 prod info-layer init (his infra), call-agent seam, .pdf/.docx ingest decision.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [06:24am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo: ocean-bedrock)
+type:      [feature-request]
+area:      [backend]
+
+Completed local test coverage of the ENTIRE information-layer pure pipeline
+(ocean-bedrock PR #5, merged). semantic.mjs embed->vectorize prep now covered:
+prepareText, compactMetadata (the non-obvious primitive-filter/2000-char-cap
+logic), toNdjson, chunkVectorId. The full merge/migrate core is now tested
+across all 3 stages: chunk (metadata.mjs) -> graph extraction (graph.mjs) ->
+embed/vectorize (semantic.mjs). 18 bedrock tests, npm test green, zero prod.
+
+Session: 19 PRs across all 4 repos (os 13, surface 2, agents 1, bedrock 3).
+Information-layer item materially advanced locally — only prod ingest (John's
+Postgres/CF) + the ingest-client dedup refactor (would restructure a working
+script) remain. All other blockers unchanged + John-gated.
+_________________________________________________________________________________
