@@ -663,6 +663,16 @@ fn normalize_model_id(model: &str) -> String {
         .collect()
 }
 
+/// Restore MiniMax's case-sensitive API model id from a lowercased alias:
+/// `minimax-m2` -> `MiniMax-M2`, `minimax-m2.7` -> `MiniMax-M2.7`. Anything that
+/// doesn't match the `minimax-m…` shape passes through unchanged.
+fn minimax_api_casing(model: &str) -> String {
+    match model.to_ascii_lowercase().strip_prefix("minimax-m") {
+        Some(rest) => format!("MiniMax-M{}", rest.to_ascii_uppercase()),
+        None => model.to_string(),
+    }
+}
+
 fn model_for_explicit_provider(
     provider: &str,
     model: &str,
@@ -697,9 +707,14 @@ fn model_for_explicit_provider(
             200_000,
             16_384,
         )),
+        // MiniMax's API is case-sensitive on model ids (`MiniMax-M2`), but `model`
+        // arrives lowercased (normalize_model_id). Restore the API casing for
+        // known forms so the explicit-provider path matches the bare-alias path —
+        // without this, `OCEAN_PROVIDER=minimax OCEAN_MODEL=minimax-m2` sends
+        // `minimax-m2` and MiniMax rejects it, while the bare alias works.
         "minimax" => Ok(model_selection(
             ProviderId::MiniMax,
-            model,
+            &minimax_api_casing(model),
             MINIMAX_BASE_URL,
             200_000,
             8_192,
@@ -861,6 +876,17 @@ fn base_url_host(base_url: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn minimax_api_casing_restores_case_sensitive_id() {
+        // The explicit-provider path must send the API-cased id (the bare-alias
+        // path already does), or MiniMax rejects the request.
+        assert_eq!(minimax_api_casing("minimax-m2"), "MiniMax-M2");
+        assert_eq!(minimax_api_casing("MiniMax-M2"), "MiniMax-M2");
+        assert_eq!(minimax_api_casing("minimax-m2.7"), "MiniMax-M2.7");
+        // Non-minimax shapes pass through unchanged.
+        assert_eq!(minimax_api_casing("something-else"), "something-else");
+    }
 
     fn env(vars: &[(&str, &str)]) -> ProviderEnv {
         ProviderEnv {
