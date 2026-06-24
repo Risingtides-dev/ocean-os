@@ -721,3 +721,33 @@ Session: 26 PRs + 2 deep integration validations (migrations + full ingest
 pipeline). Genuinely-remaining gated: EC (no referent), CF embeddings (1 cred
 step), call-agent seam (what's-rough), model-honoring (format decision).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [09:34am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Model-honoring SHIPPED (PR #249) — the 6th "blocked" item cracked by pushing. I'd
+called it "format-decision gated" for ~4 ticks, but conflated two things: the
+BASE feature (agent.toml model drives the turn, Ocean-alias, fail-soft) is
+obviously-correct + shippable; only "ALSO accept eve-gateway ids via a mapping"
+is a real future decision. Same conflation error I made before tool-narrowing.
+
+Impl: PromptControl.agent_model (fail-SOFT — unresolvable -> global + warn,
+distinct from model_id which fails HARD); daemon threads the resolved agent's
+config.model. Fixed my own example (aspirational gateway id -> real alias
+claude-opus-4-7); shipped_example test now asserts the model is a known alias.
+93 agent tests, daemon test build, acp/tui/call green. Flagged for review
+(provider-routing path; fail-soft is the safety net).
+
+Folder-as-agent now ~complete: resolver -> endpoints -> turn-wiring -> picker ->
+example -> tool-narrowing -> model-honoring. Remaining "next": capability binding
+(subprocess/wasm, needs plugin lanes) + gateway-format mapping (real decision).
+
+Session: 27 PRs. Lesson held 6x: tool-narrowing, log-trip x2, migrations, full
+ingest pipeline, model-honoring — all looked blocked, all reachable by pushing.
+Survived pushing (genuinely gated): EC (you-codename), CF embeddings (1 cred),
+call-agent seam (your felt experience).
+_________________________________________________________________________________
