@@ -587,3 +587,18 @@ Malformed agents surfaced with their error, not dropped. Read-only/additive;
 endpoint is new this session + unconsumed, so safe to shape now. Test updated,
 daemon green. Session: 21 PRs across 4 repos.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [07:14am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Shipped the first example folder-as-agent (PR #245): docs/examples/agents/
+researcher/ — complete reference (agent.toml, instructions.md, skills/summarize,
+subagents/fact-checker/) + README with copy-and-use steps. Test-validated
+(shipped_example_agent_resolves resolves it for real so it can't rot). Serves
+the download-and-adapt goal + completes the folder-as-agent demo surface
+(resolver -> endpoints -> turn-wiring -> picker -> example). Session: 22 PRs.
+_________________________________________________________________________________
