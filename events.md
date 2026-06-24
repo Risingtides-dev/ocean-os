@@ -950,3 +950,12 @@ ProviderConfigError::NoModelSelected when unset; there is no hardcoded default. 
 wording with docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md. Docs-only; cargo fmt --all --check
 green.
 _________________________________________________________________________________
+
+time:      [03:07pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  test/ocean-370-longhouse-daemon-tests
+type:      testing
+area:      testing
+
+OCEAN-370 (P2): closed two daemon-level Longhouse test gaps in crates/ocean-daemon/src/main.rs (test module only, no runtime changes). GAP 1: extended the `prep_with()` test helper to accept a workflows param (was skills-only, sops/workflows hardcoded empty) and added `render_longhouse_prep_renders_workflows_alongside_skills`, which pins that workflows render in the same `- {name} — {description}` bullet shape as skills (main.rs:9316-9324) — mirrors the prepare.rs unit-level expectation. GAP 2: added async `workflows_prepare_returns_matching_workflows_from_cwd`, which plants docs/orchestrator/workflows/test.md (YAML frontmatter name+description) in a tempdir, POSTs /v1/workflows/prepare through the real longhouse_routes() table with that cwd + a matching prompt (TTL=0 + cache clear for a cold scan), and asserts the planted workflow surfaces on the wire — the on-disk counterpart to the empty-tmpdir wiring test. Updated the three other `prep_with` callers for the new signature. Full local gate green on toolchain 1.96.0: cargo test -p ocean-daemon (229 passed), cargo clippy -p ocean-daemon -- -D warnings clean, cargo fmt --all -- --check clean.
+_________________________________________________________________________________

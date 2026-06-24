@@ -18031,6 +18031,75 @@ mod tests {
         );
     }
 
+    /// OCEAN-370 GAP 2: the on-disk half of the wiring test. Plant a real
+    /// workflow doc under `docs/orchestrator/workflows/` in a tempdir, POST
+    /// `/v1/workflows/prepare` through the REAL route table with that cwd + a
+    /// matching prompt, and assert the planted workflow is returned on the wire.
+    /// Mirrors prepare.rs:1546-1579 (`prepare_populates_workflows_from_cwd`) at
+    /// the daemon/HTTP boundary.
+    #[tokio::test]
+    async fn workflows_prepare_returns_matching_workflows_from_cwd() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        // TTL=0 + a cleared cache so the scan cold-loads our tempdir, never a
+        // stale entry left by another test in the same process.
+        let prior_ttl = env::var("OCEAN_LONGHOUSE_SKILL_TTL_SECS").ok();
+        env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
+        ocean_longhouse::clear_index_cache();
+        ocean_longhouse::clear_workflow_cache();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wf_dir = tmp.path().join("docs/orchestrator/workflows");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("test.md"),
+            "---\nname: ocean-os-factory-tick\ndescription: Ocean-native factory loop for keeping ocean-os moving\n---\n",
+        )
+        .unwrap();
+
+        let state = fake_convene_state(&tmp);
+        let app = longhouse_routes().with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/workflows/prepare")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "prompt": "run the factory tick workflow",
+                    "cwd": tmp.path().to_string_lossy()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], json!(true), "ok must be true");
+        assert_eq!(body["advisory"], json!(true), "advisory must be true");
+
+        let workflows = body["workflows"]
+            .as_array()
+            .expect("workflows must be an array");
+        assert!(
+            workflows
+                .iter()
+                .any(|wf| wf["name"] == json!("ocean-os-factory-tick")),
+            "the planted workflow must surface in the response, got {:?}",
+            workflows
+        );
+
+        ocean_longhouse::clear_index_cache();
+        ocean_longhouse::clear_workflow_cache();
+        match prior_ttl {
+            Some(v) => env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", v),
+            None => env::remove_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS"),
+        }
+    }
+
     // Serialize OCEAN_AGENTS_DIR mutation across the agent-endpoint tests so
     // parallel env writes don't race.
     static AGENTS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -18090,9 +18159,10 @@ mod tests {
         LONGHOUSE_PREPARE_ENV_LOCK.lock().await
     }
 
-    /// Build a non-empty `TurnPrep` with the given (name, description) skills, for
-    /// the pure renderer/injection tests (no disk, no env).
-    fn prep_with(skills: &[(&str, &str)]) -> ocean_longhouse::TurnPrep {
+    /// Build a non-empty `TurnPrep` with the given (name, description) skills and
+    /// workflows, for the pure renderer/injection tests (no disk, no env). SOPs are
+    /// left empty — no daemon test exercises them yet.
+    fn prep_with(skills: &[(&str, &str)], workflows: &[(&str, &str)]) -> ocean_longhouse::TurnPrep {
         ocean_longhouse::TurnPrep {
             skills: skills
                 .iter()
@@ -18104,7 +18174,14 @@ mod tests {
                 })
                 .collect(),
             sops: Vec::new(),
-            workflows: Vec::new(),
+            workflows: workflows
+                .iter()
+                .map(|(name, desc)| ocean_longhouse::WorkflowBrief {
+                    name: name.to_string(),
+                    description: desc.to_string(),
+                    source_path: std::path::PathBuf::from(format!("/workflows/{name}")),
+                })
+                .collect(),
         }
     }
 
@@ -18116,10 +18193,13 @@ mod tests {
 
     #[test]
     fn render_longhouse_prep_lists_skills_under_an_advisory_header() {
-        let prep = prep_with(&[
-            ("Remotion Video", "Build programmatic videos in React"),
-            ("Supabase Postgres", "Optimize Postgres queries and schema"),
-        ]);
+        let prep = prep_with(
+            &[
+                ("Remotion Video", "Build programmatic videos in React"),
+                ("Supabase Postgres", "Optimize Postgres queries and schema"),
+            ],
+            &[],
+        );
         let block = render_longhouse_prep(&prep).expect("non-empty prep renders a block");
 
         // Framed explicitly as ADVISORY, not an instruction or a granted
@@ -18137,6 +18217,42 @@ mod tests {
         // Each skill surfaces as a `name — description` bullet.
         assert!(block.contains("- Remotion Video — Build programmatic videos in React"));
         assert!(block.contains("- Supabase Postgres — Optimize Postgres queries and schema"));
+    }
+
+    /// OCEAN-370 GAP 1: `render_longhouse_prep` renders workflows in the same
+    /// `- {name} — {description}` shape as skills (main.rs:9316-9324). Pins that a
+    /// daemon-level prep carrying workflows surfaces each one alongside the skills,
+    /// mirroring the unit-level expectation in prepare.rs.
+    #[test]
+    fn render_longhouse_prep_renders_workflows_alongside_skills() {
+        let prep = prep_with(
+            &[("Remotion Video", "Build programmatic videos in React")],
+            &[
+                (
+                    "ocean-os-factory-tick",
+                    "Ocean-native factory loop for keeping ocean-os moving",
+                ),
+                ("nightly-merge-gate", "Drain the merge queue overnight"),
+            ],
+        );
+        let block = render_longhouse_prep(&prep).expect("non-empty prep renders a block");
+
+        // The skill still renders as a bullet…
+        assert!(
+            block.contains("- Remotion Video — Build programmatic videos in React"),
+            "skill bullet must still render, got:\n{block}"
+        );
+        // …and each workflow surfaces in the same `- {name} — {description}` shape.
+        assert!(
+            block.contains(
+                "- ocean-os-factory-tick — Ocean-native factory loop for keeping ocean-os moving"
+            ),
+            "workflow bullet must render as `- name — description`, got:\n{block}"
+        );
+        assert!(
+            block.contains("- nightly-merge-gate — Drain the merge queue overnight"),
+            "second workflow bullet must render, got:\n{block}"
+        );
     }
 
     #[test]
@@ -18287,7 +18403,10 @@ mod tests {
 
     #[test]
     fn apply_longhouse_prep_prepends_brief_above_the_prompt() {
-        let prep = prep_with(&[("Remotion Video", "Build programmatic videos in React")]);
+        let prep = prep_with(
+            &[("Remotion Video", "Build programmatic videos in React")],
+            &[],
+        );
         let prompt = "render a promo clip";
         let out = apply_longhouse_prep(prompt, Some(&prep));
 
@@ -18328,7 +18447,7 @@ mod tests {
         );
 
         // Consult enabled → brief is prepended; guidance + task both survive below.
-        let prep = prep_with(&[("Widget Builder", "Use when building a widget")]);
+        let prep = prep_with(&[("Widget Builder", "Use when building a widget")], &[]);
         let composed = apply_longhouse_prep(&guided, Some(&prep));
         assert!(
             composed.contains("Widget Builder"),
