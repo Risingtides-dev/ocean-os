@@ -550,3 +550,25 @@ Information-layer item materially advanced locally — only prod ingest (John's
 Postgres/CF) + the ingest-client dedup refactor (would restructure a working
 script) remain. All other blockers unchanged + John-gated.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [06:42am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo: ocean-bedrock)
+type:      [handoff]
+area:      [backend]
+
+Wrote a consolidated overnight handoff for John:
+ocean-orchestrator/HANDOFF_OVERNIGHT_2026-06-24.md (19-PR summary at write time,
+the 4 unblock questions, catalogued-not-fixed items, verify commands).
+
+Then completed the information-layer pure-pipeline test coverage: triageFindings
+(ocean-bedrock PR #6) — the daily-triage decision core. The bedrock info-layer
+pure pipeline is now FULLY tested: chunk -> graph -> embed -> triage, 23 tests,
+from a repo that had zero. No more safe pure-function work there; remainder is
+the dedup-refactor (invasive) or prod (John's infra).
+
+Session: 20 PRs across all 4 repos (os 13, surface 2, agents 1, bedrock 4). The
+information-layer goal item is now as far as it can go locally. All other open
+items John-gated (see handoff). Worktrees clean, all repos green.
+_________________________________________________________________________________
