@@ -1044,4 +1044,54 @@ the bridge with its own wildcard-free classifier, pinning the current relayed/fi
 split and double-guarding the compile-time exhaustiveness. Full local gate green on
 toolchain 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon,
 cargo clippy -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
+time:      [04:12pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-372-sse-lag-metrics
+type:      feature-request
+area:      backend
+
+OCEAN-372 (P3): added daemon-wide SSE consumer-lag observability. Both SSE handlers
+(/v1/events and /v1/agent/events) already logged BroadcastStreamRecvError::Lagged(skipped)
+at warn per-connection (OCEAN-87) but there was no fleet-wide aggregate, so a chronic
+slow-consumer situation dropping events was invisible to scrapers. Modeled on the
+just-merged gc_failures pattern (OCEAN-371): added two relaxed AtomicU64s on AppState —
+sse_lag_events (Lagged occurrences) and sse_events_dropped (sum of skipped) — cloned the
+Arcs into each handler's live filter_map closure and bump both in the Lagged(skipped) arm
+(fetch_add 1 / fetch_add skipped) right alongside the existing warn. Surfaced both at
+GET /metrics as ocean_sse_lag_events_total and ocean_sse_events_dropped_total via
+render_prometheus (signature grew two u64 params), next to ocean_persist_failures_total /
+ocean_gc_failures_total; /health left untouched (optional per ticket). Added two tests
+mirroring the gc_failures style: sse_lag_counters_increment_and_render (deterministic unit
+test of the fetch_add pair + render, no flaky real-lag injection) and
+sse_lag_counters_surfaced_in_metrics (drives the real /metrics handler via oneshot, asserts
+AppState-sourced values appear). Extended the empty-prometheus test to require both new
+HELP/TYPE headers. Full local gate green on 1.96.0: cargo build -p ocean-daemon,
+cargo test -p ocean-daemon (236 passed), cargo clippy -p ocean-daemon -- -D warnings,
+cargo fmt --all -- --check.
+_________________________________________________________________________________
+
+time:      [04:48pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-372-sse-lag-metrics
+type:      review
+area:      backend
+
+OCEAN-372 PR #265 Codex P2 fix: don't count scope-filtered-out events as dropped on the
+agent rail. The /v1/agent/events handler consumes the GLOBAL AgentEventBus and applies
+should_emit_agent_event locally, so on a Lagged(skipped) its `skipped` is the count of
+GLOBAL envelopes skipped — NOT events deliverable to a ?session_id=-scoped client. Adding
+raw `skipped` inflated ocean_sse_events_dropped_total with other-session bursts the client
+never would have received. Fix (chose the clean per-rail attribution, not a rename):
+sse_lag_events_total (occurrences) still bumps on BOTH rails since that's accurate
+everywhere; sse_events_dropped_total (sum) now bumps ONLY on the unfiltered legacy
+/v1/events rail where skipped == deliverable loss. Removed the fetch_add(skipped) +
+unused sse_events_dropped clone from the agent rail, documented the asymmetry at both
+clone-sites and on the AppState field, and sharpened the /metrics HELP text to
+"Deliverable events dropped ... on unfiltered rails". Reworked the unit test to model
+both rails distinctly (legacy bumps both=7; agent bumps occurrence only) and added a new
+deterministic regression test agent_rail_lag_does_not_inflate_dropped_total_from_other_sessions
+that overflows a tiny broadcast ring with foreign-session deltas, drives the rail's exact
+scope-filtering live closure, and asserts the scoped client gets nothing deliverable, the
+occurrence counter ticks, and the dropped sum stays 0. Full gate green on 1.96.0: build,
+test (235 passed, +1), clippy -D warnings, fmt --check.
 _________________________________________________________________________________
