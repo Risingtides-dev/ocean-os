@@ -443,3 +443,34 @@ across ocean-os(12)+surface(2)+agents(1), 10 real bugs fixed, all 4 repos
 advanced, worktrees clean. Goal #1 (runtime bugs) thoroughly exercised. Blockers
 unchanged: EC, feedback-box, call-agent seam — need John.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [05:30am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo: ocean-bedrock)
+type:      [feature-request]
+area:      [backend]
+
+Broke the "blocked" deadlock by DECODING the ambiguous goal terms instead of
+waiting. Read-only assessment of ocean-bedrock resolved two:
+- "feedback box" = the cloud box itself (the Bedrock/coworker instance), NOT a
+  feature. grep across the whole repo: zero "feedback" hits. So "initialize the
+  information layer on the feedback box" = harden + run Ocean Context's
+  ingest/merge pipeline on a Bedrock instance.
+- "information layer" = Ocean Context (docs/OCEAN-CONTEXT.md): file -> chunks ->
+  CF embeddings -> Vectorize -> graph. The actual migrate/embed needs John's
+  prod Postgres + Cloudflare (NOT touched).
+
+Shipped the fully-local half (ocean-bedrock PR #3, merged): the repo's FIRST
+test suite (node:test, zero deps). Covers the pure merge/ingest core — chunkText
+(overlap, boundary backtrack, CRLF), contentTypeFromPath, looksTextual. Exported
+them (behavior-neutral). Documented a real data-loss gap as a pinned test:
+bootstrap advertises .pdf/.docx/.pptx/.xlsx, client uploads them, but
+looksTextual() returns false -> stored in objects but NEVER indexed (silent drop
+from the knowledge layer). John's call: stop advertising or add a doc extractor.
+
+Now shipped code to ALL FOUR goal repos. Session: 16 PRs (os 12, surface 2,
+agents 1, bedrock 1). Still genuinely blocked: "EC details" (no referent ANYWHERE
+in any repo — likely voice-transcription noise), prod-side info-layer init (needs
+John's infra), call-agent seam specifics.
+_________________________________________________________________________________
