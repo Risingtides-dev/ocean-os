@@ -8645,19 +8645,27 @@ async fn agent_turn(
     // agent or empty instructions leaves `guided_prompt` untouched (fail-open),
     // so every existing client (`agent: None`) is unaffected. Discover names via
     // GET /v1/agents; see docs/specs/folder-as-agent.md.
-    let guided_prompt = match agent.as_deref() {
-        Some(name) => match ocean_agent::agentdir::resolve(&agents_root(), name) {
-            Ok(def) => match def.system_prompt() {
-                Some(instr) => format!("{instr}\n\n{guided_prompt}"),
-                None => guided_prompt,
+    // Also capture the named agent's declared tool allowlist (agent.toml
+    // `tools` + `tools/` filenames) so the turn can narrow to it below.
+    let (guided_prompt, agent_tool_allowlist): (String, Option<Vec<String>>) =
+        match agent.as_deref() {
+            Some(name) => match ocean_agent::agentdir::resolve(&agents_root(), name) {
+                Ok(def) => {
+                    let allow = def.effective_tools();
+                    let allow = (!allow.is_empty()).then_some(allow);
+                    let prompt = match def.system_prompt() {
+                        Some(instr) => format!("{instr}\n\n{guided_prompt}"),
+                        None => guided_prompt,
+                    };
+                    (prompt, allow)
+                }
+                Err(e) => {
+                    tracing::warn!(agent = name, error = %e, "named agent did not resolve; using surface profile");
+                    (guided_prompt, None)
+                }
             },
-            Err(e) => {
-                tracing::warn!(agent = name, error = %e, "named agent did not resolve; using surface profile");
-                guided_prompt
-            }
-        },
-        None => guided_prompt,
-    };
+            None => (guided_prompt, None),
+        };
 
     // Longhouse pre-turn consult (OCEAN-283, default-ON). Unless the operator
     // opted out (`OCEAN_LONGHOUSE_PREPARE=0|false|no|off`), rank this turn's
@@ -9002,6 +9010,13 @@ async fn agent_turn(
     // `model_id` into this turn's config only, leaving the runtime's
     // global model selection untouched.
     .with_model_id(model_id.clone());
+    // Folder-as-agent: a named agent's declared tool allowlist narrows this
+    // turn's toolset (fail-safe to the full set if it matches nothing). No-op
+    // for every non-agent turn (`agent: None`).
+    let control = match agent_tool_allowlist {
+        Some(tools) => control.with_tool_allowlist(tools),
+        None => control,
+    };
     // Run the turn inside the turn-root span (OCEAN-274): the runtime's
     // `runtime.prompt` span (and every child — agent_loop, provider_stream,
     // tool_exec, persist) nests under `turn`, so the full lifecycle of this turn
