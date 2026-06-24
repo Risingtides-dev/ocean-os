@@ -61,6 +61,28 @@ fn try_take_line(pending: &mut Vec<u8>) -> Option<Result<String>> {
     Some(String::from_utf8(line).context("plugin sent invalid UTF-8"))
 }
 
+/// Spawn the child, retrying a small bounded number of times on `ETXTBSY`
+/// (os error 26 — "text file busy"). Under parallel `cargo test`, a sibling
+/// process can briefly inherit the write fd of a just-written plugin script, so
+/// `exec` races and fails with `ETXTBSY`. The fd is closed promptly, so a short
+/// backoff clears it. Any other spawn error (or exhausting retries) is returned
+/// as-is, so a genuinely broken plugin still fails fast and gets skipped.
+fn spawn_with_etxtbsy_retry(cmd: &mut tokio::process::Command) -> std::io::Result<Child> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut attempt = 1;
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.raw_os_error() == Some(26) && attempt < MAX_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(BACKOFF);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl StdioTransport {
     /// Spawn `command` with `args` and `env` (each `(name, value)` set on the
     /// child only). The parent environment is inherited so the plugin can see
@@ -74,8 +96,7 @@ impl StdioTransport {
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
+        let mut child = spawn_with_etxtbsy_retry(&mut cmd)
             .with_context(|| format!("spawn plugin `{command}`"))?;
 
         let stdin = child
