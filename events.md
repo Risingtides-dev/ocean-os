@@ -602,3 +602,23 @@ subagents/fact-checker/) + README with copy-and-use steps. Test-validated
 the download-and-adapt goal + completes the folder-as-agent demo surface
 (resolver -> endpoints -> turn-wiring -> picker -> example). Session: 22 PRs.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [07:46am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [feature-request]
+area:      [backend]
+
+Reconsidered + shipped tool-narrowing (PR #247) — I'd been overcautious calling
+it "John-gated." The eve-aligned conservative semantic (declared tools = the
+agent's allowlist, fail-safe to full set if nothing matches) resolves the design
+question, and it's purely additive (only agents declaring tools are affected;
+all current turns are agent:None). A named agent's agent.toml `tools` now
+actually narrows the turn's toolset: PromptControl.tool_allowlist channel +
+narrow_tools() filter in AgentRuntime::prompt, fed from the daemon's agent
+resolve. Fail-safe tested (no-match keeps full set). Flagged for review (live
+turn path). 92 agent tests + daemon build + acp/call/tui all green. Closes
+folder-as-agent spec "next" item #2. Session: 24 PRs. (Model-honoring left next
+— it needs agent.toml gateway-format -> Ocean alias mapping, no clean fail-safe.)
+_________________________________________________________________________________
