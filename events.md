@@ -975,4 +975,22 @@ share one contract. Since axum's KeepAlive does not expose its interval, added a
 single-const wiring is what makes both rails provably equal. Full local gate green on toolchain
 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon (228 passed), cargo clippy
 -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
+time:      [02:18pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  fix/ocean-369-known-models
+type:      bug-report
+area:      backend
+
+OCEAN-369 (P2): known_models() under-reported the routable model set served on
+GET /v1/models. Reconciled the picker catalogue against resolve_model_selection()'s
+actual match arms as source of truth and found five production models that route but
+were never listed: gpt-4o + gpt-4o-mini (openai), gpt-5.3-codex-spark (openai-codex),
+minimax-m2.7 (minimax), and kimi-k2 (kimi). Added all five to known_models() with the
+canonical alias as the id so a client can round-trip a picked id back through
+OCEAN_MODEL and reach the same provider. Kept the keyless fake/fake-ok/fake-tool/
+fake-surface test providers and the openai-compatible catch-all OUT of the public menu
+by design. Added two unit tests: known_models_are_all_routable (every listed id resolves
+and reaches its declared provider) and no_routable_production_model_is_missing_from_known_models
+(inverse tripwire enumerating all production arms + rejecting any fake leak). Full local
+gate green on toolchain 1.96.0: build, 25 tests, clippy -D warnings, fmt --check.
 _________________________________________________________________________________
