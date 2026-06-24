@@ -354,4 +354,28 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// The shipped reference agent (docs/examples/agents/researcher) must stay a
+    /// valid folder-as-agent: this resolves it for real so the example can't rot
+    /// out of sync with the resolver. CARGO_MANIFEST_DIR is the crate dir; the
+    /// examples live two levels up at the repo root.
+    #[test]
+    fn shipped_example_agent_resolves() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/agents");
+        assert!(discover(&root).contains(&"researcher".to_string()));
+
+        let def = resolve(&root, "researcher").expect("example agent must resolve");
+        assert_eq!(def.config.model.as_deref(), Some("anthropic/claude-opus-4.8"));
+        assert!(def.config.description.is_some());
+        assert!(def.system_prompt().is_some(), "has instructions.md");
+        assert!(def.effective_tools().contains(&"web_fetch".to_string()));
+        assert!(def.skills.iter().any(|s| s.name == "summarize"));
+        assert_eq!(def.subagents, vec!["fact-checker"]);
+
+        // The declared subagent resolves too, with the required description.
+        let child = resolve(&def.root.join("subagents"), "fact-checker")
+            .expect("example subagent must resolve");
+        assert!(child.config.description.is_some(), "subagent declares a description");
+    }
 }
