@@ -774,3 +774,32 @@ So CF embedding stays gated, but better-characterized: provide CF keys (designed
 path) OR direct a local-pgvector approach (documented, substantial). EC remains
 the only fully-undecodable item. Session: 27 PRs + the pgvector-fallback finding.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [10:20am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [bug-report]
+area:      [backend]
+
+3rd fanout bug-hunt over the UN-hunted crates (providers, core, plugin, hooks,
+browser, heartbeat, agent-sdk) — I'd nearly accepted "no autonomous work left";
+pushing instead found a P0 + P1 (lesson, 7th time). Fixed + shipped:
+- [P0] ocean-plugin StdioTransport::recv — the IDENTICAL cancellation bug
+  ocean-mcp fixed in #240, unfixed here (no pending buffer). Torn frame -> hung
+  plugin request -> 30s timeout. Ported the #240 fix (PR #250, pending buffer +
+  try_take_line, tested).
+- [P1] ocean-browser type_text errored ("unknown key") on ANY non-US char
+  (café, smart quotes, em-dash, emoji, non-Latin) -> hard tool failure on common
+  input. Now falls back to CDP text-field insertion (PR #251).
+
+CATALOGUED P2s (lower value): ocean-browser active_page() picks the LAST
+arbitrary tab (no break, ignores focus) -> drives wrong tab after a tab close
+(needs CDP focus / shell active_target_id wiring); ocean-providers MiniMax model
+casing lost on the explicit-provider OCEAN_PROVIDER path (narrow opt-in).
+core/hooks/heartbeat/agent-sdk all clean.
+
+Session: 29 PRs, 15 real bugs/regressions fixed across the runtime. Goal #1
+(resolve bugs in the runtime) genuinely deep now: 3 fanout hunts, every ocean-os
+crate covered.
+_________________________________________________________________________________
