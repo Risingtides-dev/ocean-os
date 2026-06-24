@@ -2872,10 +2872,27 @@ fn agents_root() -> std::path::PathBuf {
 /// Read-only classification surface for folder-as-agent (docs/specs/folder-as-agent.md).
 async fn agents_list() -> Json<serde_json::Value> {
     let root = agents_root();
+    // Resolve each discovered agent into a compact summary so a surface can
+    // render an agent picker without an N+1 fetch per agent. A folder that fails
+    // to resolve (e.g. malformed agent.toml) is surfaced WITH its error rather
+    // than silently dropped, so the operator sees the broken one.
+    let agents: Vec<serde_json::Value> = ocean_agent::agentdir::discover(&root)
+        .into_iter()
+        .map(|name| match ocean_agent::agentdir::resolve(&root, &name) {
+            Ok(def) => json!({
+                "name": def.name,
+                "description": def.config.description,
+                "model": def.config.model,
+                "skills": def.skills.len(),
+                "subagents": def.subagents,
+            }),
+            Err(e) => json!({ "name": name, "error": e.to_string() }),
+        })
+        .collect();
     Json(json!({
         "ok": true,
         "root": root.to_string_lossy(),
-        "agents": ocean_agent::agentdir::discover(&root),
+        "agents": agents,
     }))
 }
 
@@ -17831,10 +17848,11 @@ mod tests {
         std::fs::write(a.join("instructions.md"), "be careful\n").unwrap();
         std::env::set_var("OCEAN_AGENTS_DIR", tmp.path());
 
-        // GET /v1/agents lists it
+        // GET /v1/agents lists it as a summary (name + description for a picker)
         let list = agents_list().await;
         assert_eq!(list.0["ok"], json!(true));
-        assert_eq!(list.0["agents"], json!(["researcher"]));
+        assert_eq!(list.0["agents"][0]["name"], json!("researcher"));
+        assert_eq!(list.0["agents"][0]["description"], json!("r"));
 
         // GET /v1/agents/researcher resolves the def
         let def = agent_def(Path("researcher".to_string())).await;
