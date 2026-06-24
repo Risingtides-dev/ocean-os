@@ -9,6 +9,12 @@ pub struct GlobTool {
     cwd: Option<PathBuf>,
 }
 
+impl Default for GlobTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GlobTool {
     pub fn new() -> Self {
         Self { cwd: None }

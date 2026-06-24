@@ -11,6 +11,12 @@ pub struct ReadTool {
     cwd: Option<PathBuf>,
 }
 
+impl Default for ReadTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReadTool {
     pub fn new() -> Self {
         Self { cwd: None }
@@ -101,7 +107,10 @@ mod tests {
 
         // offset way past the 3 lines, no limit
         let r = tool
-            .execute("1", json!({ "path": file.to_string_lossy(), "offset": 100 }))
+            .execute(
+                "1",
+                json!({ "path": file.to_string_lossy(), "offset": 100 }),
+            )
             .await
             .expect("must not error");
         assert_eq!(body(&r).trim(), "", "past-EOF offset → empty");

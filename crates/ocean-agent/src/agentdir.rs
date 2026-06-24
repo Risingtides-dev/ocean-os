@@ -257,8 +257,8 @@ mod tests {
     /// `tag` makes the path unique per test so parallel tests don't wipe each
     /// other's tree (pid alone collides — all tests share one process).
     fn scaffold(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("ocean-agentdir-test-{}-{tag}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("ocean-agentdir-test-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
 
         // agents/researcher — full shape
@@ -361,14 +361,18 @@ mod tests {
     /// examples live two levels up at the repo root.
     #[test]
     fn shipped_example_agent_resolves() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/examples/agents");
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/agents");
         assert!(discover(&root).contains(&"researcher".to_string()));
 
         let def = resolve(&root, "researcher").expect("example agent must resolve");
         // The example's model must be a REAL Ocean alias so model-honoring takes
         // effect rather than silently fail-soft to global on a typo.
-        let model = def.config.model.as_deref().expect("example declares a model");
+        let model = def
+            .config
+            .model
+            .as_deref()
+            .expect("example declares a model");
         assert!(
             crate::known_models().iter().any(|m| m.id == model),
             "example model {model:?} must be a known Ocean alias",
@@ -382,6 +386,9 @@ mod tests {
         // The declared subagent resolves too, with the required description.
         let child = resolve(&def.root.join("subagents"), "fact-checker")
             .expect("example subagent must resolve");
-        assert!(child.config.description.is_some(), "subagent declares a description");
+        assert!(
+            child.config.description.is_some(),
+            "subagent declares a description"
+        );
     }
 }

@@ -7775,7 +7775,10 @@ mod tests {
             Some(b_id),
             "selection follows the session, not the row slot"
         );
-        assert_eq!(app.selected_session_index, 1, "b is now slot 1 (index 0 + 1)");
+        assert_eq!(
+            app.selected_session_index, 1,
+            "b is now slot 1 (index 0 + 1)"
+        );
         let _ = a_id;
     }
 
@@ -8969,12 +8972,18 @@ mod tests {
             app.pm_turns
                 .iter()
                 .find(|t| t.turn_id == Some(tid))
-                .and_then(|t| t.blocks.iter().find_map(|b| match b {
-                    PmBlock::ToolCall { status, .. } => Some(*status),
-                    _ => None,
-                }))
+                .and_then(|t| {
+                    t.blocks.iter().find_map(|b| match b {
+                        PmBlock::ToolCall { status, .. } => Some(*status),
+                        _ => None,
+                    })
+                })
         };
-        assert_eq!(status_of(&app, turn_b), Some(ToolStatus::Err), "B's tool closed");
+        assert_eq!(
+            status_of(&app, turn_b),
+            Some(ToolStatus::Err),
+            "B's tool closed"
+        );
         assert_eq!(
             status_of(&app, turn_a),
             Some(ToolStatus::Running),

@@ -4733,9 +4733,13 @@ fn spawn_call_session(state: &AppState, room: &str, participants: Vec<String>) {
                 // Call-start epoch so streaming segment timestamps are
                 // call-relative, not wall-clock (OCEAN call-agent fix).
                 let stream_started_ms = (clock_arc)();
-                let (provider, events_rx) =
-                    match DeepgramStt::connect(&cfg, &dg_key, clock_arc, stream_started_ms)
-                        .await
+                let (provider, events_rx) = match DeepgramStt::connect(
+                    &cfg,
+                    &dg_key,
+                    clock_arc,
+                    stream_started_ms,
+                )
+                .await
                 {
                     Ok(pair) => pair,
                     Err(e) => {
@@ -13858,7 +13862,11 @@ mod tests {
         // The one invariant resolve_bound_cwd still enforces: no `..` escape,
         // resumed or not.
         assert!(matches!(
-            resolve_bound_cwd("/work/repo/../etc", "/work/repo", Some(("/work/repo", "/work/repo"))),
+            resolve_bound_cwd(
+                "/work/repo/../etc",
+                "/work/repo",
+                Some(("/work/repo", "/work/repo"))
+            ),
             Err(CwdBindingError::PathTraversal { .. })
         ));
     }

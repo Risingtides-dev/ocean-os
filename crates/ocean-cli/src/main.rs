@@ -164,7 +164,11 @@ fn resolve_or_prompt(provided: Option<String>, label: &str) -> anyhow::Result<St
 /// Build the onboarding log record (the client-side "log trip"): when, which
 /// box, and the resolved principal. Pure so it's unit-testable; `ts_ms` is the
 /// caller's clock.
-fn onboarding_record(bedrock_url: &str, info: &serde_json::Value, ts_ms: u128) -> serde_json::Value {
+fn onboarding_record(
+    bedrock_url: &str,
+    info: &serde_json::Value,
+    ts_ms: u128,
+) -> serde_json::Value {
     serde_json::json!({
         "ts_ms": ts_ms,
         "event": "onboard",
@@ -182,10 +186,7 @@ fn onboarding_log_path() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(p));
     }
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
-    Some(
-        std::path::Path::new(&home)
-            .join(".local/state/ocean/onboarding.jsonl"),
-    )
+    Some(std::path::Path::new(&home).join(".local/state/ocean/onboarding.jsonl"))
 }
 
 /// Append the onboarding record as one JSONL line. Fail-soft — a logging error
@@ -210,7 +211,10 @@ fn record_onboarding(bedrock_url: &str, info: &serde_json::Value) {
         writeln!(f, "{line}")
     };
     if let Err(e) = write() {
-        eprintln!("[ocean-rs] onboarding logged-trip write failed ({}): {e}", path.display());
+        eprintln!(
+            "[ocean-rs] onboarding logged-trip write failed ({}): {e}",
+            path.display()
+        );
     }
 }
 
@@ -584,8 +588,10 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
         Cmd::Onboard { bedrock_url, token } => {
-            let bedrock_url =
-                resolve_or_prompt(bedrock_url, "ocean-bedrock URL (e.g. http://localhost:8080)")?;
+            let bedrock_url = resolve_or_prompt(
+                bedrock_url,
+                "ocean-bedrock URL (e.g. http://localhost:8080)",
+            )?;
             let token = resolve_or_prompt(token, "bedrock API token")?;
             let url = format!("{}/api/v1/info", bedrock_url.trim_end_matches('/'));
             let resp = client
@@ -595,7 +601,8 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("GET {url} (is ocean-bedrock running / URL right?)"))?;
             let status = resp.status();
-            let body: serde_json::Value = resp.json().await.context("read bedrock /info response")?;
+            let body: serde_json::Value =
+                resp.json().await.context("read bedrock /info response")?;
             anyhow::ensure!(
                 status.is_success() && body["ok"] != serde_json::Value::Bool(false),
                 "bedrock rejected the token ({status}): {}",

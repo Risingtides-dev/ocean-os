@@ -2058,7 +2058,7 @@ mod session {
             let same_root = self
                 .workspace_root
                 .as_deref()
-                .map(|r| PathBuf::from(r) == new_root)
+                .map(|r| *r == new_root)
                 .unwrap_or(false);
             self.cwd = Some(cwd.to_string_lossy().into_owned());
             if same_root {
@@ -2656,17 +2656,27 @@ mod tests {
     #[test]
     fn with_agent_model_filters_empty_and_defers_to_explicit() {
         let p = |perm| PromptControl::new(perm);
-        let perm: Arc<dyn PermissionPolicy> = Arc::new(StaticPermissionPolicy { allow_mutating: false });
+        let perm: Arc<dyn PermissionPolicy> = Arc::new(StaticPermissionPolicy {
+            allow_mutating: false,
+        });
         // A real model is kept; an empty/whitespace one is dropped to None.
         assert_eq!(
-            p(perm.clone()).with_agent_model(Some("claude-opus-4-7".into())).agent_model.as_deref(),
+            p(perm.clone())
+                .with_agent_model(Some("claude-opus-4-7".into()))
+                .agent_model
+                .as_deref(),
             Some("claude-opus-4-7")
         );
-        assert!(p(perm.clone()).with_agent_model(Some("  ".into())).agent_model.is_none());
+        assert!(p(perm.clone())
+            .with_agent_model(Some("  ".into()))
+            .agent_model
+            .is_none());
         assert!(p(perm.clone()).with_agent_model(None).agent_model.is_none());
         // agent_model is independent of model_id (the explicit override); the
         // turn path prefers model_id and only falls to agent_model when it's None.
-        let ctl = p(perm).with_model_id(Some("explicit".into())).with_agent_model(Some("agentmodel".into()));
+        let ctl = p(perm)
+            .with_model_id(Some("explicit".into()))
+            .with_agent_model(Some("agentmodel".into()));
         assert_eq!(ctl.model_id.as_deref(), Some("explicit"));
         assert_eq!(ctl.agent_model.as_deref(), Some("agentmodel"));
     }

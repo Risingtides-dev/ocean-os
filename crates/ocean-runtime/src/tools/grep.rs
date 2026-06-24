@@ -11,6 +11,12 @@ pub struct GrepTool {
     cwd: Option<PathBuf>,
 }
 
+impl Default for GrepTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GrepTool {
     pub fn new() -> Self {
         Self { cwd: None }

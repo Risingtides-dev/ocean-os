@@ -714,7 +714,7 @@ fn model_for_explicit_provider(
         // `minimax-m2` and MiniMax rejects it, while the bare alias works.
         "minimax" => Ok(model_selection(
             ProviderId::MiniMax,
-            &minimax_api_casing(model),
+            minimax_api_casing(model),
             MINIMAX_BASE_URL,
             200_000,
             8_192,
