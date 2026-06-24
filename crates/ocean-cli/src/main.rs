@@ -161,6 +161,59 @@ fn resolve_or_prompt(provided: Option<String>, label: &str) -> anyhow::Result<St
     Ok(v)
 }
 
+/// Build the onboarding log record (the client-side "log trip"): when, which
+/// box, and the resolved principal. Pure so it's unit-testable; `ts_ms` is the
+/// caller's clock.
+fn onboarding_record(bedrock_url: &str, info: &serde_json::Value, ts_ms: u128) -> serde_json::Value {
+    serde_json::json!({
+        "ts_ms": ts_ms,
+        "event": "onboard",
+        "bedrock_url": bedrock_url.trim_end_matches('/'),
+        "instance": info["instance"].as_str(),
+        "principal": info["principal"].clone(),
+    })
+}
+
+/// Where the local onboarding log lives: `$OCEAN_ONBOARD_LOG`, else
+/// `$HOME/.local/state/ocean/onboarding.jsonl` (XDG state convention). `None`
+/// when no home is resolvable and no override is set.
+fn onboarding_log_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("OCEAN_ONBOARD_LOG") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(
+        std::path::Path::new(&home)
+            .join(".local/state/ocean/onboarding.jsonl"),
+    )
+}
+
+/// Append the onboarding record as one JSONL line. Fail-soft — a logging error
+/// is warned to stderr and never propagated, so it can't fail a good onboard.
+fn record_onboarding(bedrock_url: &str, info: &serde_json::Value) {
+    let Some(path) = onboarding_log_path() else {
+        return;
+    };
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = onboarding_record(bedrock_url, info, ts_ms).to_string();
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(f, "{line}")
+    };
+    if let Err(e) = write() {
+        eprintln!("[ocean-rs] onboarding logged-trip write failed ({}): {e}", path.display());
+    }
+}
+
 /// Render the onboarding success summary from a bedrock `/api/v1/info` body:
 /// the resolved principal + the two env exports a coworker should persist.
 /// Pure (no I/O) so it's unit-testable.
@@ -549,6 +602,11 @@ async fn main() -> anyhow::Result<()> {
                 body["error"].as_str().unwrap_or("unknown error")
             );
             println!("{}", format_onboard_summary(&bedrock_url, &token, &body));
+            // Leave a local "log trip": record the successful onboarding (which
+            // box, which principal, when) so a coworker has a trail of what they
+            // connected to — the client-side complement to bedrock's token-issue
+            // audit. Fail-soft: a logging failure never fails the onboard.
+            record_onboarding(&bedrock_url, &body);
         }
     }
     Ok(())
@@ -558,6 +616,22 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use ocean_core::TokenUsage;
+
+    #[test]
+    fn onboarding_record_captures_box_and_principal() {
+        let info = serde_json::json!({
+            "instance": "ocean-bedrock",
+            "principal": { "name": "alice", "role": "agent", "scopes": ["/docs"] }
+        });
+        let rec = onboarding_record("http://localhost:8080/", &info, 1_700_000_000_000);
+        assert_eq!(rec["event"], "onboard");
+        assert_eq!(rec["ts_ms"], 1_700_000_000_000u64);
+        // URL is trimmed of the trailing slash.
+        assert_eq!(rec["bedrock_url"], "http://localhost:8080");
+        assert_eq!(rec["instance"], "ocean-bedrock");
+        assert_eq!(rec["principal"]["name"], "alice");
+        assert_eq!(rec["principal"]["role"], "agent");
+    }
 
     #[test]
     fn resolve_or_prompt_uses_provided_value_trimmed() {
