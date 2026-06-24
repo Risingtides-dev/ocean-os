@@ -667,3 +667,28 @@ into 2 real shipped fixes — same lesson as tool-narrowing. Genuinely-remaining
 EC (exhaustively confirmed no referent), prod ingest (creds), call-agent seam
 (needs what's-rough), model-honoring (format decision + sensitive path).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [08:48am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (validation: ocean-bedrock)
+type:      [review]
+area:      [backend]
+
+PUSHED on "info-layer is prod-gated" and found it was only HALF true. Local
+Postgres 14 is installed, so I ran the REAL bedrock migrations against an
+ephemeral throwaway cluster (initdb -> pg_ctl on :55432, short /tmp socket,
+torn down + wiped after — zero trace, untouched John's prod which is a separate
+DATABASE_URL). Result: all 5 migrations (001-005) APPLY CLEANLY end-to-end; the
+full information-layer schema builds — 21 longhouse.* tables (objects,
+embedding_chunks, graph_nodes/edges, source_records/instances/streams/sync_runs,
+ledger_events, context_snapshots, ingest_jobs, auth_tokens, ...) with proper
+NOT-NULL/FK integrity; re-running migrations is IDEMPOTENT (no error). So the
+migrate/schema half of "initialize the information layer by merging and migrating
+data" is now PROVEN against a real DB, not just unit-tested. Only the live-data
+ingest (Cloudflare embeddings + persisting to John's PROD db) genuinely needs his
+creds. Corrects my earlier "entirely prod-gated" framing.
+
+Session: 26 PRs + this validation. Lesson holds (4th time): pushing on a
+"blocked" item narrowed it — migrate half wasn't actually gated.
+_________________________________________________________________________________
