@@ -91,13 +91,27 @@ daemon.
 
 ## What's built vs. next
 
-- **Built:** `agentdir` resolver + config + discovery + traversal guard, unit-
-  tested (`cargo test -p ocean-agent agentdir`).
-- **Next (separate PRs):**
-  1. Daemon classification: an `agents/` root (env `OCEAN_AGENTS_DIR`, default
-     under the config dir), an `agent` field on `AgentTurnRequest`, and
-     `resolve` wired into prompt composition so a named agent's `instructions.md`
-     overrides the surface profile.
-  2. `GET /v1/agents` (list) + `GET /v1/agents/{name}` (resolved def) for surfaces.
-  3. Capability binding: map `capabilities` entries to `CapabilityProvider`s in
-     the per-session registry (builtin/mcp first, subprocess/wasm as they land).
+**Built (shipped 2026-06-24):**
+
+- `agentdir` resolver + config + discovery + traversal guard, unit-tested
+  (`cargo test -p ocean-agent agentdir`).
+- Daemon classification: the `agents/` root (env `OCEAN_AGENTS_DIR`, else
+  `<config>/agents`), `GET /v1/agents` (returns summaries —
+  `{name, description, model, skills, subagents}` — for a picker) and
+  `GET /v1/agents/{name}` (full resolved def).
+- The `agent` field on `AgentTurnRequest`: when set, the named agent's
+  `instructions.md` is prepended as a steering layer on the turn (fail-open,
+  behavior-neutral when absent).
+- A tested reference agent at `docs/examples/agents/researcher/` (resolved by the
+  `shipped_example_agent_resolves` test) to copy-and-adapt.
+
+**Next (separate PRs):**
+
+1. Capability binding: map `capabilities` entries to `CapabilityProvider`s in the
+   per-session registry (builtin/mcp against today's registry; subprocess/wasm
+   sideloaded as those `ocean-plugin` lanes land).
+2. Tool narrowing: enforce `agent.toml` `tools` / `effective_tools()` as a real
+   per-turn allowlist (today it's parsed + exposed but the turn doesn't restrict
+   to it).
+3. Honor an agent's declared `model` on the turn when the request doesn't
+   override it.
