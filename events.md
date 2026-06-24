@@ -474,3 +474,30 @@ agents 1, bedrock 1). Still genuinely blocked: "EC details" (no referent ANYWHER
 in any repo — likely voice-transcription noise), prod-side info-layer init (needs
 John's infra), call-agent seam specifics.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [05:48am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo: ocean-bedrock)
+type:      [feature-request]
+area:      [backend]
+
+Extended bedrock information-layer test coverage (PR #4, merged): exported +
+tested the pure graph extractors (slugify, stableRef, extractHeadings,
+extractTags, extractLinks, pathPrefixes) — the 'merge into graph' half of the
+pipeline. 13 tests green (chunker + graph). The merge/ingest CORE of the
+information layer is now covered, fully local, zero prod touched.
+
+DELIBERATELY SKIPPED: extracting the ingest-client dedup decision into a tested
+pure fn. It lives in scripts/ocean-ingest-local.mjs which calls main()
+unconditionally at the bottom — testing it requires guarding main() or moving
+code out of a working script John didn't ask to refactor. Not worth churning
+unasked; noted for a future reviewed change.
+
+Session FINAL: 17 PRs merged across all 4 repos (os 12, surface 2, agents 1,
+bedrock 2). 10 runtime bugs fixed. Onboarding shipped 3 forms. Folder-as-agent
+end-to-end live. Information-layer merge core tested. Goal terms decoded
+(feedback-box=cloud box; information-layer=Ocean Context; EC=no referent found).
+Genuinely-remaining = John-gated: EC clarification, prod-side info-layer init
+(his Postgres/CF), call-agent seam specifics, .pdf/.docx ingest decision.
+_________________________________________________________________________________
