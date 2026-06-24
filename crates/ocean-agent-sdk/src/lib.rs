@@ -1397,7 +1397,10 @@ mod tests {
             browser.active_tab_url.as_deref(),
             Some("https://example.com/article")
         );
-        assert_eq!(browser.active_tab_title.as_deref(), Some("An Example Article"));
+        assert_eq!(
+            browser.active_tab_title.as_deref(),
+            Some("An Example Article")
+        );
         assert_eq!(browser.tabs.len(), 2);
         assert!(browser.tabs[0].active);
         assert!(!browser.tabs[1].active);
