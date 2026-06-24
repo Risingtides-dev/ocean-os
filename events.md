@@ -853,3 +853,27 @@ exploit harness (escape succeeds before, blocked after) + 4 regression tests;
 Session: 32 PRs, 18 bugs fixed incl. a P0 security vuln. The un-hunted surface
 existed because I assumed completeness instead of checking.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [11:54am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (cross-repo: ocean-agents)
+type:      [bug-report]
+area:      [backend]
+
+Applied the distrust-completeness lesson to ocean-agents — I'd marked it
+"assessed clean" but never ADVERSARIALLY bug-hunted its 2311-line Python Slack
+bridge + couriers (the coworker-facing intake). Hunted it: CONFIRMED hardened
+(no P0/P1 — Socket Mode auth, list-argv subprocess no shell, no token leakage,
+sound dedup/dispatch/session-keying). Fixed the one real user-facing P2 (ocean-
+agents PR #19): reply.py deliver() KeyError'd on a PARTIAL canvas dict
+({markdown} no title is truthy -> skips the `or` default -> canvas['title']
+KeyError -> caught -> coworker gets NO reply). Now reads fields with .get()
+defaults. Verified py_compile + behavioral check + bridge unittest.
+
+So EVERY meaningful surface across all 4 repos is now ACTUALLY hunted (not
+assumed): ocean-os all crates (3 hunts) + verified-delegating surfaces; surface
+gui/ui/proxy; bedrock pure + server/auth/path (P0 #8) + verified mcp/courier;
+agents bridge/couriers. Session: 33 PRs, ~19 bugs incl. a P0 security vuln.
+Remaining genuinely external: EC (codename), CF embedding (credential).
+_________________________________________________________________________________
