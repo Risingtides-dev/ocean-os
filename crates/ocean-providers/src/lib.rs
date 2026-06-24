@@ -438,6 +438,22 @@ pub struct KnownModel {
 /// render a model picker. Kept in sync with the alias arms in
 /// `resolve_model_selection`. (Availability still depends on the relevant
 /// provider credential being present; this is the menu, not a guarantee.)
+///
+/// Every entry here MUST be routable by [`resolve_model_selection`] — the
+/// `known_models_are_all_routable` test enforces that. The list deliberately
+/// covers exactly the *production* (credential-backed) canonical model ids the
+/// resolver recognizes; the keyless `fake`/`fake-ok`/`fake-tool`/`fake-surface`
+/// test providers and the `openai-compatible` catch-all are intentionally
+/// omitted so they never surface in the public `GET /v1/models` menu. The
+/// `id` used here is the exact string the matching arm emits as
+/// `selection.model` (i.e. what `GET /v1/models` reports as `current.model`
+/// after that model is selected) — so `resolve_model_selection(id).model == id`
+/// holds for every entry. ocean-acp builds the advertised mode ids from these
+/// `id`s but sets the *selected* mode from `current.model`; if the two diverged
+/// (e.g. a lowercase `minimax-m2` id vs the API-cased `MiniMax-M2` the resolver
+/// returns) the selected mode would not appear in the advertised list and the
+/// ACP/Zed picker would break. The `known_models_id_equals_resolved_model` test
+/// enforces this invariant.
 pub fn known_models() -> Vec<KnownModel> {
     let m = |id: &str, provider: &str, label: &str| KnownModel {
         id: id.to_string(),
@@ -452,10 +468,20 @@ pub fn known_models() -> Vec<KnownModel> {
         m("gpt-5.5", "openai-codex", "GPT-5.5 (Codex)"),
         m("gpt-5.4", "openai-codex", "GPT-5.4 (Codex)"),
         m("gpt-5.4-mini", "openai-codex", "GPT-5.4 Mini (Codex)"),
+        m("gpt-5.3-codex-spark", "openai-codex", "GPT-5.3 Codex Spark"),
+        m("gpt-4o", "openai", "GPT-4o"),
+        m("gpt-4o-mini", "openai", "GPT-4o Mini"),
         m("claude-opus-4-7", "anthropic", "Claude Opus 4.7"),
         m("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6"),
-        m("minimax-m2", "minimax", "MiniMax M2"),
+        // MiniMax ids use the API casing the resolver returns as current.model
+        // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
+        // holds for every entry — ACP/Zed match the selected mode id against the
+        // advertised list, and a lowercase alias here would never match. The
+        // resolver lowercases the lookup key, so these still route correctly.
+        m("MiniMax-M2.7", "minimax", "MiniMax M2.7"),
+        m("MiniMax-M2", "minimax", "MiniMax M2"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
+        m("kimi-k2", "kimi", "Kimi K2"),
         m("gemini-2.0-flash", "google", "Gemini 2.0 Flash"),
     ]
 }
@@ -1130,6 +1156,104 @@ mod tests {
         let readiness = config.readiness();
         assert!(readiness.ok);
         assert!(!readiness.credential_present);
+    }
+
+    // ---- known_models() <-> resolve_model_selection() (OCEAN-369) ---------
+
+    #[test]
+    fn known_models_are_all_routable() {
+        // Every model the public picker advertises must actually route through
+        // resolve_model_selection (passed as OCEAN_MODEL, the way a client
+        // round-trips a picked id), and reach the provider the menu declares.
+        // Otherwise GET /v1/models lists a model that fails the moment it's
+        // selected.
+        for known in known_models() {
+            let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", &known.id)]))
+                .unwrap_or_else(|e| panic!("known model {:?} is not routable: {e}", known.id));
+            assert_eq!(
+                selection.provider.as_str(),
+                known.provider,
+                "known model {:?} routed to provider {} but the menu declares {}",
+                known.id,
+                selection.provider.as_str(),
+                known.provider,
+            );
+        }
+    }
+
+    #[test]
+    fn known_models_id_equals_resolved_model() {
+        // The ACP invariant (OCEAN-369 Codex follow-up): ocean-acp advertises
+        // mode ids from KnownModel.id but sets the *selected* mode from the
+        // resolver's current.model. If those diverge for any model, the selected
+        // mode id isn't in the advertised list and Zed/ACP pickers break. So
+        // every advertised id must satisfy resolve_model_selection(id).model == id.
+        // This is exactly what would have caught the lowercase `minimax-m2` id vs
+        // the API-cased `MiniMax-M2` the resolver returns.
+        for known in known_models() {
+            let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", &known.id)]))
+                .unwrap_or_else(|e| panic!("known model {:?} is not routable: {e}", known.id));
+            assert_eq!(
+                selection.model, known.id,
+                "known_models() id {:?} != resolve_model_selection's current.model {:?} \
+                 — ACP would advertise {:?} but select {:?}, breaking the picker",
+                known.id, selection.model, known.id, selection.model,
+            );
+        }
+    }
+
+    #[test]
+    fn no_routable_production_model_is_missing_from_known_models() {
+        // The inverse guard: enumerate every production (credential-backed)
+        // canonical model id resolve_model_selection can route via its bare-alias
+        // arms, and assert the public picker lists each one. Keyless `fake*`
+        // variants and the `openai-compatible` catch-all are intentionally
+        // excluded from the menu and so are not listed here. If a new production
+        // arm is added to resolve_model_selection, add it here AND to
+        // known_models() — this test is the tripwire that forces that.
+        let routable_production_ids = [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex-spark",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            // API-cased ids: `resolve_model_selection` returns these as
+            // current.model, and known_models() advertises the same string.
+            "MiniMax-M2",
+            "MiniMax-M2.7",
+            "kimi-k2.6",
+            "kimi-k2",
+            "gemini-2.0-flash",
+        ];
+        let listed: std::collections::BTreeSet<String> =
+            known_models().into_iter().map(|m| m.id).collect();
+        for id in routable_production_ids {
+            // Sanity: each really is routable (canonical id round-trips).
+            resolve_model_selection(&env(&[("OCEAN_MODEL", id)]))
+                .unwrap_or_else(|e| panic!("expected {id:?} to be routable: {e}"));
+            assert!(
+                listed.contains(id),
+                "routable production model {id:?} is missing from known_models()"
+            );
+        }
+        // Every listed id must be one of the enumerated production ids — catches
+        // a fake/test variant accidentally leaking into the public menu.
+        let production: std::collections::BTreeSet<&str> =
+            routable_production_ids.into_iter().collect();
+        for id in &listed {
+            assert!(
+                production.contains(id.as_str()),
+                "known_models() lists {id:?}, which is not an enumerated production model \
+                 (a fake/test variant must never appear in the public picker)"
+            );
+        }
     }
 
     // ---- Fallback / failover (OCEAN-275) ----------------------------------
