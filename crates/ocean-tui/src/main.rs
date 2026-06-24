@@ -3840,6 +3840,13 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             // Close them so the yellow "running" badge never gets stuck.
             if status != ocean_agent_sdk::AgentTurnStatus::Completed {
                 for turn in app.pm_turns.iter_mut() {
+                    // Scope to the finishing turn: only ITS unclosed tools were
+                    // cancelled. A blanket sweep would wrongly error a sibling
+                    // turn's legitimately-running tool (rare — turns serialize
+                    // per session — but the unscoped sweep had no reason to).
+                    if turn.turn_id != Some(turn_id) {
+                        continue;
+                    }
                     for block in turn.blocks.iter_mut() {
                         if let PmBlock::ToolCall {
                             status: tool_status,
@@ -8918,6 +8925,61 @@ mod tests {
             })
             .count();
         assert_eq!(err_count, 1, "the cancelled block must be in Err state");
+    }
+
+    #[test]
+    fn pm_cancelled_turn_sweep_spares_a_sibling_turns_running_tool() {
+        let session_id = AgentSessionId::new_v4();
+        let (turn_a, turn_b) = (AgentTurnId::new_v4(), AgentTurnId::new_v4());
+        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+
+        // A Running tool on turn A, then a Running tool on turn B.
+        for (tid, cmd) in [(turn_a, "sleep 1"), (turn_b, "sleep 2")] {
+            daemon_apply_agent_stream_event(
+                &mut app,
+                AgentTurnEvent::ToolCallStarted {
+                    session_id,
+                    turn_id: tid,
+                    call: ocean_agent_sdk::ToolCall {
+                        id: ocean_agent_sdk::ToolCallId::new_v4(),
+                        name: "bash".to_string(),
+                        args_json: serde_json::json!({ "command": cmd }),
+                    },
+                },
+            );
+        }
+
+        // Turn B fails (cancelled). Only B's tool should close; A's stays Running.
+        daemon_apply_agent_stream_event(
+            &mut app,
+            AgentTurnEvent::TurnFinished {
+                session_id,
+                turn_id: turn_b,
+                status: ocean_agent_sdk::AgentTurnStatus::Failed,
+                error: Some("cancelled".to_string()),
+                wall_ms: Some(10),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                tokens_per_second: None,
+            },
+        );
+
+        let status_of = |app: &DaemonApp, tid: AgentTurnId| -> Option<ToolStatus> {
+            app.pm_turns
+                .iter()
+                .find(|t| t.turn_id == Some(tid))
+                .and_then(|t| t.blocks.iter().find_map(|b| match b {
+                    PmBlock::ToolCall { status, .. } => Some(*status),
+                    _ => None,
+                }))
+        };
+        assert_eq!(status_of(&app, turn_b), Some(ToolStatus::Err), "B's tool closed");
+        assert_eq!(
+            status_of(&app, turn_a),
+            Some(ToolStatus::Running),
+            "A's tool must NOT be swept by B's cancel"
+        );
     }
 
     /// OCEAN-319 guard: a Completed turn must NOT sweep Running blocks —
