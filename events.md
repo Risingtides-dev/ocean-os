@@ -501,3 +501,32 @@ end-to-end live. Information-layer merge core tested. Goal terms decoded
 Genuinely-remaining = John-gated: EC clarification, prod-side info-layer init
 (his Postgres/CF), call-agent seam specifics, .pdf/.docx ingest decision.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [06:08am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main
+type:      [review]
+area:      [testing]
+
+Post-session verification capstone: ran full test suites across all 4 repos
+after the session's 18 merges (many --admin-merged with local verification
+substituting for slow CI). It CAUGHT a real regression: ocean-daemon test
+resumed_turn_pinned_to_session_bound_cwd_not_req_cwd was RED — a stale test
+asserting the pre-18ba9a9 cwd-pinning contract that was intentionally changed to
+rebind-to-requested. It stayed invisible because the daemon test binary didn't
+compile (WriteTool E0423) until #233 this session unmasked it. Fixed + added a
+traversal-guard test (PR #243, merged). 
+
+Final verification, all green:
+- ocean-os: cargo test --workspace, 0 failures (53 test binaries)
+- ocean-surface: ocean-gui + ocean-surface-ui green (105 in surface-ui)
+- ocean-bedrock: npm test 13/13
+- ocean-agents: python unittest OK
+
+SESSION FINAL: 18 PRs merged across all 4 repos (os 13, surface 2, agents 1,
+bedrock 2), 11 real bugs/regressions fixed, all 4 repos build+test green,
+worktrees clean. Folder-as-agent end-to-end live; onboarding 3 forms; info-layer
+merge core tested; goal terms decoded. John-gated remainder: EC clarification,
+prod info-layer init (his infra), call-agent seam, .pdf/.docx ingest decision.
+_________________________________________________________________________________
