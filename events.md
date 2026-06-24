@@ -692,3 +692,32 @@ creds. Corrects my earlier "entirely prod-gated" framing.
 Session: 26 PRs + this validation. Lesson holds (4th time): pushing on a
 "blocked" item narrowed it — migrate half wasn't actually gated.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [09:06am] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  main (validation: ocean-bedrock)
+type:      [review]
+area:      [backend]
+
+PROVED the FULL information-layer pipeline end-to-end against a real Postgres
+(ephemeral, torn down + wiped — prod untouched). Ran the real bedrock server +
+ingest worker on a local PG: PUT a markdown file -> drained the worker -> queried
+the DB. Result:
+  objects=1 (MERGED via UPSERT), chunks=1 (CHUNKED), graph_nodes=7, graph_edges=6
+  (GRAPH extracted+persisted: file:sample.md, directory:docs, heading:Ocean Title
+  /Section One/Section Two, topic:ocean, external_link:https://x.io) — matching
+  the graph.mjs unit tests, now proven in integration. The CF embed step SKIPPED
+  gracefully ("semantic environment not configured"), no crash.
+
+So "initialize the information layer by merging and migrating data" is PROVEN
+end-to-end (merge->chunk->graph->persist to a real DB). ONLY the Cloudflare
+embedding/vectorize step genuinely needs John's keys, and it degrades cleanly.
+This materially narrows item #3: it's substantially done + demonstrated, not
+"broadly prod-gated" as I'd framed it. Lesson holds (5th time): pushing on
+"blocked" turned ~all of the info layer from gated -> proven.
+
+Session: 26 PRs + 2 deep integration validations (migrations + full ingest
+pipeline). Genuinely-remaining gated: EC (no referent), CF embeddings (1 cred
+step), call-agent seam (what's-rough), model-honoring (format decision).
+_________________________________________________________________________________
