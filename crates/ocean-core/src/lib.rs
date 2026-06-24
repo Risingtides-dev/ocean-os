@@ -33,6 +33,16 @@ pub struct HealthResponse {
     /// that predate the field still parse.
     #[serde(default)]
     pub persist_failures_total: u64,
+    /// Count of background registry-GC sweeps the daemon has seen FAIL (OCEAN-371).
+    /// Each sweep runs on its own task so a panic (e.g. a poisoned lock) is caught
+    /// rather than killing the GC loop; a dead/failing GC loop leaks the request and
+    /// permission registries unbounded while only emitting logs. Surfacing the
+    /// running total here (and as `ocean_gc_failures_total` on `GET /metrics`) makes
+    /// a self-perpetuating GC failure observable. `0` on a healthy daemon; a
+    /// climbing value means GC is failing and memory is leaking. Defaulted on
+    /// deserialize so older clients/payloads that predate the field still parse.
+    #[serde(default)]
+    pub gc_failures_total: u64,
 }
 
 /// Lifecycle state for a request.
