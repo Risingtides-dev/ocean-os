@@ -1705,6 +1705,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
+        // Folder-as-agent classification (read-only): list + resolve agents from
+        // the agents root. See docs/specs/folder-as-agent.md.
+        .route("/v1/agents", get(agents_list))
+        .route("/v1/agents/{name}", get(agent_def))
         .route("/v1/projects", get(projects_list).post(project_create))
         .route(
             "/v1/projects/{id}",
@@ -2853,6 +2857,37 @@ async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
         "current": { "provider": provider, "model": model },
         "models": ocean_agent::known_models(),
     }))
+}
+
+/// Where folder-as-agent definitions live: `$OCEAN_AGENTS_DIR`, else `agents/`
+/// under the Ocean config dir (sibling of `assistants/`). Mirrors the
+/// assistants-root resolution so operators get one predictable layout.
+fn agents_root() -> std::path::PathBuf {
+    std::env::var("OCEAN_AGENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| ocean_agent::config_dir_from_env().join("agents"))
+}
+
+/// `GET /v1/agents` — list the agents discoverable under the agents root.
+/// Read-only classification surface for folder-as-agent (docs/specs/folder-as-agent.md).
+async fn agents_list() -> Json<serde_json::Value> {
+    let root = agents_root();
+    Json(json!({
+        "ok": true,
+        "root": root.to_string_lossy(),
+        "agents": ocean_agent::agentdir::discover(&root),
+    }))
+}
+
+/// `GET /v1/agents/{name}` — resolve one agent folder into its full definition
+/// (config, instructions, skills, tools, subagents). `ok:false` on a bad name
+/// or missing agent, so a surface can probe without a 500.
+async fn agent_def(Path(name): Path<String>) -> Json<serde_json::Value> {
+    let root = agents_root();
+    match ocean_agent::agentdir::resolve(&root, &name) {
+        Ok(def) => Json(json!({ "ok": true, "agent": def })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 // ---- YOLO setting (OCEAN-YOLO) ---------------------------------------------
@@ -17735,6 +17770,39 @@ mod tests {
             "no workflow dir in test cwd, expected empty workflows, got {:?}",
             body["workflows"]
         );
+    }
+
+    // Serialize OCEAN_AGENTS_DIR mutation across the agent-endpoint tests so
+    // parallel env writes don't race.
+    static AGENTS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn agents_endpoints_list_and_resolve_from_root() {
+        let _guard = AGENTS_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        // one well-formed agent folder
+        let a = tmp.path().join("researcher");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("agent.toml"), "description = \"r\"\n").unwrap();
+        std::fs::write(a.join("instructions.md"), "be careful\n").unwrap();
+        std::env::set_var("OCEAN_AGENTS_DIR", tmp.path());
+
+        // GET /v1/agents lists it
+        let list = agents_list().await;
+        assert_eq!(list.0["ok"], json!(true));
+        assert_eq!(list.0["agents"], json!(["researcher"]));
+
+        // GET /v1/agents/researcher resolves the def
+        let def = agent_def(Path("researcher".to_string())).await;
+        assert_eq!(def.0["ok"], json!(true));
+        assert_eq!(def.0["agent"]["name"], json!("researcher"));
+        assert_eq!(def.0["agent"]["instructions"], json!("be careful\n"));
+
+        // bad name -> ok:false, not a panic/500
+        let bad = agent_def(Path("../escape".to_string())).await;
+        assert_eq!(bad.0["ok"], json!(false));
+
+        std::env::remove_var("OCEAN_AGENTS_DIR");
     }
 
     // ---- OCEAN-245: opt-in Longhouse pre-turn consult turn-hook ----------------
