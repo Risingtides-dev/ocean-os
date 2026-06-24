@@ -115,6 +115,17 @@ struct AppState {
     /// problem that's silently losing transcripts becomes observable instead of
     /// only living in the logs.
     persist_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Daemon-wide count of background registry-GC sweeps that FAILED (OCEAN-371).
+    /// The GC task runs each sweep on its own `tokio::spawn` so a panic inside
+    /// `gc_registries` (e.g. a poisoned lock surfacing) is caught as a `JoinError`
+    /// instead of killing the loop; previously that error was only logged. Bumped
+    /// here on every failed sweep (same lock-free relaxed-atomic pattern as
+    /// [`AppState::persist_failures`]) and surfaced by `GET /health` as
+    /// `gc_failures_total` and `GET /metrics` as `ocean_gc_failures_total`, so a
+    /// self-perpetuating poisoned-mutex GC loop (which would otherwise leak the
+    /// registries unbounded while only emitting logs) becomes observable. `0` on a
+    /// healthy daemon; a climbing value means GC is failing and memory is leaking.
+    gc_failures: Arc<std::sync::atomic::AtomicU64>,
     /// Fulfilled `slack_canvas` awareness results the `ocean-agents` Slack bridge
     /// has POSTed back (OCEAN-262). Keyed by `(session_id, canvas key)` so a
     /// fulfilled `read`/`list`/`create` is queryable per session via
@@ -238,10 +249,10 @@ impl TurnMetrics {
     }
 
     /// Render the full Prometheus text-format exposition (v0.0.4) for this set of
-    /// counters plus the externally-owned `persist_failures` gauge. Read-only over
-    /// relaxed atomics, so scraping never perturbs the hot path. Each metric gets
-    /// its `# HELP`/`# TYPE` header per the exposition format.
-    fn render_prometheus(&self, persist_failures: u64) -> String {
+    /// counters plus the externally-owned `persist_failures` and `gc_failures`
+    /// gauges. Read-only over relaxed atomics, so scraping never perturbs the hot
+    /// path. Each metric gets its `# HELP`/`# TYPE` header per the exposition format.
+    fn render_prometheus(&self, persist_failures: u64, gc_failures: u64) -> String {
         use std::fmt::Write as _;
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -297,6 +308,14 @@ impl TurnMetrics {
         );
         out.push_str("# TYPE ocean_persist_failures_total counter\n");
         let _ = writeln!(out, "ocean_persist_failures_total {persist_failures}");
+
+        // Failed-registry-GC-sweep count (OCEAN-371), read from the single source of
+        // truth on `AppState`. Mirrors what `GET /health` reports as
+        // `gc_failures_total`. A climbing value means the background GC loop is
+        // failing and the request/permission registries are leaking unbounded.
+        out.push_str("# HELP ocean_gc_failures_total Background registry-GC sweeps that failed.\n");
+        out.push_str("# TYPE ocean_gc_failures_total counter\n");
+        let _ = writeln!(out, "ocean_gc_failures_total {gc_failures}");
 
         out
     }
@@ -618,6 +637,21 @@ impl PermissionWaiter {
 /// fulfillment lookup registry (OCEAN-273), and the per-room component/participant
 /// ledger (OCEAN-277) on the same tick. `now` is injected so the sweep is
 /// deterministic in tests.
+/// Record a failed background registry-GC sweep (OCEAN-371): bump the daemon-wide
+/// `gc_failures` total and escalate to `error!`. Factored out of the GC loop so the
+/// increment is unit-testable without injecting a real panic into `gc_registries`.
+/// The error is whatever made the sweep fail — a `JoinError` from a panicked sweep
+/// task, or any future Err result from a fallible sweep. Relaxed ordering matches
+/// the lock-free pattern used for [`AppState::persist_failures`].
+fn record_gc_failure(gc_failures: &std::sync::atomic::AtomicU64, error: &dyn std::fmt::Display) {
+    let total = gc_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::error!(
+        error = %error,
+        gc_failures_total = total,
+        "registry GC sweep failed; skipping this cycle, loop continues"
+    );
+}
+
 async fn gc_registries(
     requests: &RequestRegistry,
     permissions: &PermissionRegistry,
@@ -1559,6 +1593,9 @@ async fn main() -> anyhow::Result<()> {
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
         recalls: Arc::new(Mutex::new(HashMap::new())),
         persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // OCEAN-371: daemon-wide failed-GC-sweep total surfaced at `/health` +
+        // `/metrics`; incremented by the background GC task on a sweep failure.
+        gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         room_canvas: Arc::new(Mutex::new(HashMap::new())),
         // OCEAN-300: a single daemon-wide shutdown token, cloned into the SSE
@@ -1581,6 +1618,7 @@ async fn main() -> anyhow::Result<()> {
         let permissions = state.permissions.clone();
         let canvas_fulfillments = state.canvas_fulfillments.clone();
         let room_canvas = state.room_canvas.clone();
+        let gc_failures = state.gc_failures.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(REGISTRY_GC_INTERVAL);
             // Skip the immediate first tick; first sweep happens one interval in.
@@ -1601,10 +1639,10 @@ async fn main() -> anyhow::Result<()> {
                     gc_registries(&reqs, &perms, &canvas, &rooms, Utc::now()).await
                 });
                 if let Err(join_err) = sweep.await {
-                    tracing::error!(
-                        error = %join_err,
-                        "registry GC sweep panicked; skipping this cycle, loop continues"
-                    );
+                    // OCEAN-371: bump the daemon-wide `gc_failures_total` counter
+                    // (surfaced at `GET /health` + `GET /metrics`) so a sustained
+                    // poisoned-mutex GC loop is observable, not just logged.
+                    record_gc_failure(&gc_failures, &join_err);
                 }
             }
         });
@@ -2059,6 +2097,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         persist_failures_total: state
             .persist_failures
             .load(std::sync::atomic::Ordering::Relaxed),
+        // Surface failed-GC-sweep count (OCEAN-371): the GC loop catches a panicked
+        // sweep as a `JoinError` and keeps going, so without this a self-perpetuating
+        // poisoned-mutex GC loop leaking the registries would only live in the logs.
+        // `0` healthy; a climbing value means GC is failing and memory is leaking.
+        gc_failures_total: state.gc_failures.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -2073,12 +2116,17 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 ///     (cumulative buckets + `_sum`/`_count`), fed by the `wall_ms` computed at
 ///     turn-finish,
 ///   * `ocean_persist_failures_total` — dropped transcript writes (mirrors
-///     `GET /health`).
+///     `GET /health`),
+///   * `ocean_gc_failures_total` — failed background registry-GC sweeps (OCEAN-371,
+///     mirrors `GET /health`'s `gc_failures_total`).
 async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     let persist_failures = state
         .persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
-    let body = state.metrics.render_prometheus(persist_failures);
+    let gc_failures = state.gc_failures.load(std::sync::atomic::Ordering::Relaxed);
+    let body = state
+        .metrics
+        .render_prometheus(persist_failures, gc_failures);
     (
         StatusCode::OK,
         // The Prometheus text exposition content type. `text/plain; version=0.0.4`
@@ -14214,6 +14262,7 @@ mod tests {
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -15331,6 +15380,7 @@ mod tests {
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -15842,6 +15892,7 @@ mod tests {
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             recalls: Arc::new(Mutex::new(HashMap::new())),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -19178,7 +19229,7 @@ mod tests {
     #[test]
     fn metrics_render_empty_is_valid_prometheus() {
         let m = TurnMetrics::default();
-        let body = m.render_prometheus(0);
+        let body = m.render_prometheus(0, 0);
 
         // Every metric has both header lines.
         for stem in [
@@ -19243,7 +19294,7 @@ mod tests {
         m.record_turn(300, true);
         m.record_turn(5, false);
 
-        let body = m.render_prometheus(0);
+        let body = m.render_prometheus(0, 0);
 
         assert_eq!(
             labelled_value(&body, "ocean_turns_total{outcome=\"ok\"}"),
@@ -19420,6 +19471,102 @@ mod tests {
             metric_value(&body, "ocean_persist_failures_total"),
             Some(4),
             "persist_failures must be read off AppState\n{body}"
+        );
+    }
+
+    // OCEAN-371 — gc_failures_total counter (/health + /metrics)
+    // ---------------------------------------------------------
+
+    /// `record_gc_failure` — the exact call the GC loop makes on a failed sweep —
+    /// bumps the daemon-wide counter once per call. Injecting a real panic into
+    /// `gc_registries` and racing the GC interval would be flaky; factoring the
+    /// increment out makes the core "a failed sweep increments the counter"
+    /// property a deterministic unit test, and `render_prometheus` then surfaces it.
+    #[test]
+    fn record_gc_failure_increments_and_renders() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+        let gc_failures = AtomicU64::new(0);
+        // Two simulated failed sweeps (stand-in for a `JoinError` from a panicked
+        // sweep task) — the loop calls `record_gc_failure` once per failed cycle.
+        record_gc_failure(&gc_failures, &"simulated GC sweep panic #1");
+        record_gc_failure(&gc_failures, &"simulated GC sweep panic #2");
+        assert_eq!(
+            gc_failures.load(Relaxed),
+            2,
+            "each failed GC sweep must increment gc_failures_total by exactly one"
+        );
+
+        // The renderer surfaces the daemon-wide count as a labelled-free counter
+        // with its HELP/TYPE headers, exactly as `/metrics` will scrape it.
+        let body = TurnMetrics::default().render_prometheus(0, gc_failures.load(Relaxed));
+        assert!(
+            body.contains("# HELP ocean_gc_failures_total ")
+                && body.contains("# TYPE ocean_gc_failures_total counter"),
+            "gc_failures must render with HELP/TYPE headers\n{body}"
+        );
+        assert_eq!(
+            metric_value(&body, "ocean_gc_failures_total"),
+            Some(2),
+            "render_prometheus must surface the gc_failures count verbatim\n{body}"
+        );
+    }
+
+    /// `/health` and `/metrics` through the REAL handlers + a real `AppState` both
+    /// surface `gc_failures` read off the single source of truth on `AppState`.
+    /// Seeds the counter the same way the GC loop's `record_gc_failure` would, then
+    /// scrapes both endpoints via `oneshot` and asserts the value appears in each.
+    #[tokio::test]
+    async fn gc_failures_surfaced_in_health_and_metrics() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+        // Bump gc_failures on AppState (the GC loop's `record_gc_failure` does the
+        // same `fetch_add`) to prove both handlers read the single source of truth.
+        state
+            .gc_failures
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        // ── /metrics ──
+        let metrics_app = Router::new()
+            .route("/metrics", get(metrics))
+            .with_state(state.clone());
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = metrics_app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            metric_value(&body, "ocean_gc_failures_total"),
+            Some(3),
+            "gc_failures must be read off AppState and surfaced on /metrics\n{body}"
+        );
+
+        // ── /health ──
+        let health_app = Router::new()
+            .route("/health", get(health))
+            .with_state(state);
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = health_app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let health: ocean_core::HealthResponse =
+            serde_json::from_slice(&bytes).expect("health body parses");
+        assert_eq!(
+            health.gc_failures_total, 3,
+            "gc_failures must be read off AppState and surfaced on /health"
         );
     }
 

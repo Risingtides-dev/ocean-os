@@ -994,3 +994,27 @@ and reaches its declared provider) and no_routable_production_model_is_missing_f
 (inverse tripwire enumerating all production arms + rejecting any fake leak). Full local
 gate green on toolchain 1.96.0: build, 25 tests, clippy -D warnings, fmt --check.
 _________________________________________________________________________________
+
+time:      [02:34pm] [06-24-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-371-gc-failures-metric
+type:      feature-request
+area:      backend
+
+OCEAN-371 (P2): the background registry-GC task spawned gc_registries() on its own
+task so a panicked sweep (e.g. a poisoned lock) is caught as a JoinError and the loop
+keeps going — but that failure was only logged, so a self-perpetuating poisoned-mutex
+GC loop leaking the request/permission registries unbounded was invisible to operators.
+Added a daemon-wide atomic gc_failures counter on AppState (modeled on persist_failures),
+factored the increment + error! escalation into a unit-testable record_gc_failure()
+helper the GC loop calls on every JoinError, and surfaced the total in BOTH endpoints:
+gc_failures_total on GET /health (added the field to ocean_core::HealthResponse,
+#[serde(default)] so older clients still parse) and ocean_gc_failures_total on
+GET /metrics next to the existing persist_failures exposure. Added two tests:
+record_gc_failure_increments_and_renders (deterministic unit test of the increment +
+render, no flaky real-panic injection) and gc_failures_surfaced_in_health_and_metrics
+(drives both real handlers via oneshot, asserts the AppState-sourced value appears in
+each). Full local gate green on toolchain 1.96.0: cargo build -p ocean-daemon,
+cargo test -p ocean-daemon (234 passed), cargo clippy -p ocean-daemon -- -D warnings,
+cargo fmt --all -- --check.
+_________________________________________________________________________________
