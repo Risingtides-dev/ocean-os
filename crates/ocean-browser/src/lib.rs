@@ -71,13 +71,7 @@ impl BrowserHandle {
         // We skip the extension's own pages (chrome-extension://) and devtools.
         let existing = match chrome.browser.pages().await {
             Ok(pages) => {
-                // Prefer the tab the user is actually LOOKING AT, not an arbitrary
-                // one. `document.hasFocus()` is true only for the focused tab in
-                // the focused window. Fall back to the last real tab (the prior
-                // behavior) when no tab reports focus (e.g. Chrome isn't the
-                // foreground app) — so this is strictly better, never worse.
-                let mut focused = None;
-                let mut fallback = None;
+                let mut chosen = None;
                 for p in pages {
                     let url = p.url().await.ok().flatten().unwrap_or_default();
                     // Skip the extension's own pages, devtools, and chrome:// UI.
@@ -89,19 +83,9 @@ impl BrowserHandle {
                     {
                         continue;
                     }
-                    let is_focused = p
-                        .evaluate("document.hasFocus()")
-                        .await
-                        .ok()
-                        .and_then(|r| r.value().and_then(|v| v.as_bool()))
-                        .unwrap_or(false);
-                    if is_focused {
-                        focused = Some(p);
-                    } else {
-                        fallback = Some(p);
-                    }
+                    chosen = Some(p);
                 }
-                focused.or(fallback)
+                chosen
             }
             Err(_) => None,
         };
@@ -320,34 +304,8 @@ async fn dispatch_key(page: &Page, key: &str) -> Result<()> {
     };
     use chromiumoxide::keys::get_key_definition;
 
-    let def = match get_key_definition(key) {
-        Some(def) => def,
-        None => {
-            // No US-layout key definition — an accented char (café), a smart
-            // quote / em-dash, emoji, or a non-Latin script. Don't fail the whole
-            // type_text: insert the raw character via the CDP `text` field. A
-            // keyDown carrying `text` inserts that character regardless of
-            // keyboard layout (what an IME or paste does), where a layout lookup
-            // can't. Without this, one accented char in a name aborts the typing.
-            let down = DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyDown)
-                .text(key)
-                .build()
-                .map_err(BrowserError::Cdp)?;
-            let up = DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyUp)
-                .text(key)
-                .build()
-                .map_err(BrowserError::Cdp)?;
-            page.execute(down)
-                .await
-                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
-            page.execute(up)
-                .await
-                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
-            return Ok(());
-        }
-    };
+    let def =
+        get_key_definition(key).ok_or_else(|| BrowserError::Cdp(format!("unknown key: {key}")))?;
 
     let mut cmd = DispatchKeyEventParams::builder();
     let down_type = if let Some(txt) = def.text {

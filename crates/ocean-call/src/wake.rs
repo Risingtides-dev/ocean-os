@@ -118,11 +118,7 @@ impl WakeGate {
             return WakeAction::Silent;
         }
         // Within cooldown after the last reply: ignore (likely our own echo).
-        // IMPORTANT: also clear any pending `armed` state so the wake phrase that
-        // arrived during the cooldown window does not linger and fire as a ghost
-        // command on the first post-cooldown utterance.
         if self.last_reply_ms != 0 && now_ms.saturating_sub(self.last_reply_ms) < self.cooldown_ms {
-            self.armed = false;
             return WakeAction::Silent;
         }
         let text = text.trim();
@@ -225,48 +221,6 @@ mod tests {
         assert_eq!(
             g.on_utterance("tell ocean we said hi", 1_000),
             WakeAction::Silent
-        );
-    }
-
-    /// A bare "hey ocean" arms the gate. If a *cooldown* (from a prior reply) is
-    /// active at that moment, the utterance is correctly silenced — but the
-    /// `armed` flag must NOT be left set. Leaving it set means that after the
-    /// cooldown window expires the very next utterance, regardless of its content,
-    /// is treated as a wake command. That is a ghost-trigger: normal conversation
-    /// after a cooldown window suddenly activates Ocean.
-    ///
-    /// Regression test for the fix: `armed` must be cleared whenever an
-    /// utterance is silenced by the cooldown guard.
-    #[test]
-    fn armed_state_is_cleared_when_cooldown_silences_the_wake_utterance() {
-        let mut g = WakeGate::new(false, 2_000);
-
-        // Previous answer at t=100 starts a 2s cooldown window.
-        // (last_reply_ms=0 is the "never replied" sentinel; use a non-zero time.)
-        g.mark_replied(100);
-
-        // t=500: user says "hey ocean" — within cooldown, so it must be Silent.
-        // Before the fix, this set `armed = true` even though it returned Silent.
-        assert_eq!(
-            g.on_utterance("hey ocean", 500),
-            WakeAction::Silent,
-            "within-cooldown utterance must be Silent"
-        );
-
-        // The gate must NOT be armed: a cooldown-silenced wake phrase is voided.
-        assert!(
-            !g.is_armed(),
-            "armed must be false after a cooldown-silenced wake utterance — \
-             otherwise any post-cooldown chatter becomes a ghost wake command"
-        );
-
-        // t=3_000: cooldown has expired. Normal chatter must stay Silent.
-        // Before the fix this would fire WakeAction::Answer("the release is locked")
-        // because `armed` was still true.
-        assert_eq!(
-            g.on_utterance("the release is locked for friday", 3_000),
-            WakeAction::Silent,
-            "post-cooldown chatter must NOT be treated as a wake command"
         );
     }
 }

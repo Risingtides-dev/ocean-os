@@ -91,32 +91,13 @@ daemon.
 
 ## What's built vs. next
 
-**Built (shipped 2026-06-24):**
-
-- `agentdir` resolver + config + discovery + traversal guard, unit-tested
-  (`cargo test -p ocean-agent agentdir`).
-- Daemon classification: the `agents/` root (env `OCEAN_AGENTS_DIR`, else
-  `<config>/agents`), `GET /v1/agents` (returns summaries —
-  `{name, description, model, skills, subagents}` — for a picker) and
-  `GET /v1/agents/{name}` (full resolved def).
-- The `agent` field on `AgentTurnRequest`: when set, the named agent's
-  `instructions.md` is prepended as a steering layer on the turn (fail-open,
-  behavior-neutral when absent).
-- A tested reference agent at `docs/examples/agents/researcher/` (resolved by the
-  `shipped_example_agent_resolves` test) to copy-and-adapt.
-- Tool narrowing: a named agent's `tools` allowlist restricts the turn's toolset
-  (fail-safe to the full set if it matches nothing). `narrow_tools` + the
-  `tool_allowlist` channel on `PromptControl`.
-
-- Model-honoring: a named agent's `agent.toml` `model` drives the turn when the
-  request didn't pin a `model_id`. Fail-soft — an unresolvable model falls back
-  to the global one + a warn (vs explicit `model_id` which fails hard). Uses
-  Ocean's bare model aliases (`claude-opus-4-7`, see `GET /v1/models`).
-
-**Next (separate PRs):**
-
-1. Capability binding: map `capabilities` entries to `CapabilityProvider`s in the
-   per-session registry (builtin/mcp against today's registry; subprocess/wasm
-   sideloaded as those `ocean-plugin` lanes land).
-2. Map eve-style gateway model ids (`anthropic/claude-opus-4.8`) to Ocean aliases
-   so `agent.toml` `model` can accept either format.
+- **Built:** `agentdir` resolver + config + discovery + traversal guard, unit-
+  tested (`cargo test -p ocean-agent agentdir`).
+- **Next (separate PRs):**
+  1. Daemon classification: an `agents/` root (env `OCEAN_AGENTS_DIR`, default
+     under the config dir), an `agent` field on `AgentTurnRequest`, and
+     `resolve` wired into prompt composition so a named agent's `instructions.md`
+     overrides the surface profile.
+  2. `GET /v1/agents` (list) + `GET /v1/agents/{name}` (resolved def) for surfaces.
+  3. Capability binding: map `capabilities` entries to `CapabilityProvider`s in
+     the per-session registry (builtin/mcp first, subprocess/wasm as they land).

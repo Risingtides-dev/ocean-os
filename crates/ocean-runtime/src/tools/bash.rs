@@ -11,12 +11,6 @@ pub struct BashTool {
     cwd: Option<PathBuf>,
 }
 
-impl Default for BashTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl BashTool {
     pub fn new() -> Self {
         Self { cwd: None }

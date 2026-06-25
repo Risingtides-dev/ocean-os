@@ -209,61 +209,6 @@ pub struct AgentTurn {
 /// `ocean-core` is the dep-free leaf crate — `sdk → core` is a legal arrow.
 pub use ocean_core::PromptImage as TurnImage;
 
-/// A single tab as the **client** sees it (OCEAN-40, Phase 2). This is the wire
-/// DTO a surface ships with its turn, deliberately decoupled from
-/// `ocean_browser::shell::TabInfo` (the server-side CDP snapshot type): the SDK
-/// is a dep-free leaf and must not depend on `ocean-browser`, and the extension
-/// is the natural source of its *own* tab state. Only the always-cheap shell
-/// metadata — url + title + which tab is active — never DOM content.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserTab {
-    /// The tab's URL.
-    pub url: String,
-    /// The tab's document title.
-    pub title: String,
-    /// True for the tab the client considers active/foregrounded.
-    #[serde(default)]
-    pub active: bool,
-}
-
-/// Active-tab / loaded-page browser state attached to a turn (OCEAN-40, Phase 2).
-///
-/// Surfaces that live inside a browser (the Chrome extension, `client_type ==
-/// "surface-extension"`) populate this so the agent can resolve "this tab" /
-/// "what's loaded" without a round-trip. At minimum it carries the active tab's
-/// url + title; the optional `tabs` list mirrors `ocean_browser::BrowserContext`
-/// for surfaces that already have a full shell snapshot. Every field is additive
-/// and optional so older payloads (and other `client_type`s) are unaffected.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserContext {
-    /// URL of the active tab, if one is foregrounded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_tab_url: Option<String>,
-    /// Title of the active tab's loaded document, if known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_tab_title: Option<String>,
-    /// The full open-tab list when the surface has a shell snapshot to send.
-    /// Empty/omitted for surfaces that only know their own active tab.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tabs: Vec<BrowserTab>,
-}
-
-/// Per-turn client/browser context (OCEAN-40, Phase 2). Lets a surface ship its
-/// live state alongside the prompt so the agent sees which client it is and, for
-/// browser surfaces, which tab is active / what's loaded. Additive and optional:
-/// every existing client omits it (`client_context: None`) and is unaffected.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientContext {
-    /// The client surface kind. Mirrors `AgentTurnRequest::client_type` (kept as
-    /// a flat field for back-compat); carried here too so the context object is
-    /// self-describing.
-    #[serde(default)]
-    pub client_type: String,
-    /// Browser state for in-browser surfaces (e.g. `surface-extension`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub browser: Option<BrowserContext>,
-}
-
 /// Request payload for `POST /v1/agent/turns`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTurnRequest {
@@ -326,15 +271,6 @@ pub struct AgentTurnRequest {
     /// tool. `None` (legacy clients) leaves the turn's gate unbound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_token: Option<String>,
-    /// Phase-2 client/browser context (OCEAN-40). When the surface is an
-    /// in-browser one (`client_type == "surface-extension"`), it ships the
-    /// active-tab url/title (and optionally the full tab list) here so the agent
-    /// can see what's loaded without a round-trip. Additive + optional: every
-    /// existing client omits it (the flat `client_type` field above is untouched
-    /// and remains the back-compat surface selector), so old payloads still
-    /// deserialize and other `client_type`s are unaffected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_context: Option<ClientContext>,
 }
 
 /// Response payload for `POST /v1/agent/turns`.
@@ -1283,7 +1219,6 @@ mod tests {
             images: None,
             decision_token: None,
             agent: None,
-            client_context: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
@@ -1314,116 +1249,13 @@ mod tests {
             images: None,
             decision_token: None,
             agent: None,
-            client_context: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("thinking_level"));
-        // client_context is skip_serializing_if = "Option::is_none" too.
-        assert!(!json.contains("client_context"));
         // model_id is also skip_serializing_if = "Option::is_none".
         assert!(!json.contains("model_id"));
         // images is skip_serializing_if = "Option::is_none" too.
         assert!(!json.contains("images"));
-    }
-
-    #[test]
-    fn agent_turn_request_old_payload_without_client_context_still_deserializes() {
-        // OCEAN-40 back-compat: a payload minted by a pre-Phase-2 client carries
-        // NO `client_context` field. It must still deserialize, with the field
-        // defaulting to `None` — existing clients are unaffected.
-        let old_payload = r#"{
-            "prompt": "list the src directory",
-            "cwd": "/home/user/project",
-            "client_type": "surface-extension"
-        }"#;
-        let req: AgentTurnRequest = serde_json::from_str(old_payload).unwrap();
-        assert_eq!(req.prompt, "list the src directory");
-        assert_eq!(req.client_type.as_deref(), Some("surface-extension"));
-        assert!(
-            req.client_context.is_none(),
-            "missing client_context must default to None for back-compat"
-        );
-    }
-
-    #[test]
-    fn agent_turn_request_with_browser_context_round_trips() {
-        // OCEAN-40: a Phase-2 extension turn carrying active-tab browser context
-        // must survive a serialize → deserialize round-trip with every field
-        // intact, and the flat `client_type` selector must remain alongside it.
-        let req = AgentTurnRequest {
-            session_id: None,
-            prompt: "summarize this tab".into(),
-            cwd: "/home/user/project".into(),
-            guidance: None,
-            room_id: None,
-            project_id: None,
-            client_type: Some("surface-extension".into()),
-            thinking_level: None,
-            model_id: None,
-            images: None,
-            decision_token: None,
-            agent: None,
-            client_context: Some(ClientContext {
-                client_type: "surface-extension".into(),
-                browser: Some(BrowserContext {
-                    active_tab_url: Some("https://example.com/article".into()),
-                    active_tab_title: Some("An Example Article".into()),
-                    tabs: vec![
-                        BrowserTab {
-                            url: "https://example.com/article".into(),
-                            title: "An Example Article".into(),
-                            active: true,
-                        },
-                        BrowserTab {
-                            url: "https://news.example.org".into(),
-                            title: "Example News".into(),
-                            active: false,
-                        },
-                    ],
-                }),
-            }),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"client_context\""));
-        assert!(json.contains("\"active_tab_url\":\"https://example.com/article\""));
-        // The flat back-compat selector is still present alongside the new object.
-        assert!(json.contains("\"client_type\":\"surface-extension\""));
-
-        let back: AgentTurnRequest = serde_json::from_str(&json).unwrap();
-        let ctx = back.client_context.expect("client_context round-trips");
-        assert_eq!(ctx.client_type, "surface-extension");
-        let browser = ctx.browser.expect("browser context round-trips");
-        assert_eq!(
-            browser.active_tab_url.as_deref(),
-            Some("https://example.com/article")
-        );
-        assert_eq!(
-            browser.active_tab_title.as_deref(),
-            Some("An Example Article")
-        );
-        assert_eq!(browser.tabs.len(), 2);
-        assert!(browser.tabs[0].active);
-        assert!(!browser.tabs[1].active);
-        // The flat client_type selector survives unchanged.
-        assert_eq!(back.client_type.as_deref(), Some("surface-extension"));
-    }
-
-    #[test]
-    fn browser_context_empty_tabs_are_omitted_on_the_wire() {
-        // An active-tab-only context (no full tab list) must not emit an empty
-        // `tabs` array — keeps the wire minimal and additive.
-        let ctx = ClientContext {
-            client_type: "surface-extension".into(),
-            browser: Some(BrowserContext {
-                active_tab_url: Some("https://example.com".into()),
-                active_tab_title: None,
-                tabs: Vec::new(),
-            }),
-        };
-        let json = serde_json::to_string(&ctx).unwrap();
-        assert!(!json.contains("\"tabs\""));
-        assert!(!json.contains("active_tab_title"));
-        assert!(json.contains("\"active_tab_url\""));
     }
 
     #[test]

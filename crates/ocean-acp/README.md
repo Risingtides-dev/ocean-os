@@ -61,6 +61,11 @@ cargo build -p ocean-acp --release
 
 ## Use it in Zed
 
+**Also:** a first-party VS Code / Cursor extension lives in the sibling
+`ocean-surface/vscode-extension/` repo. It spawns this binary with
+`OCEAN_ACP_CLIENT_TYPE=acp-vscode` and injects rich editor context (active
+file, selection, tabs, diagnostics, git branch) on every turn.
+
 **1. The Ocean daemon must be running** (the bridge talks to it, it does not
 start it):
 
