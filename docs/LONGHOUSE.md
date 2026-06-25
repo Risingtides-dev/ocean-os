@@ -94,6 +94,7 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
 - `POST /v1/skills/query` — skill-librarian prefilter (OCEAN-281).
 - `POST /v1/skills/fetch` — fetch one skill's full body by id (OCEAN-281).
 - `POST /v1/subagents/spec` — assemble a subagent spec from skills + defaults (OCEAN-282).
+- `POST /v1/workflows/prepare` — read-only workflow-brief preparation step (OCEAN-340).
 
 Local/remote service shape now starts with:
 
@@ -102,10 +103,6 @@ Local/remote service shape now starts with:
   Already served by the embedded daemon as an alias of `/v1/longhouse/convene`
   (see the embedded route list above); a standalone Longhouse service should
   expose the same path so clients can target either deployment unchanged.
-
-Future Longhouse APIs should add:
-
-- `POST /v1/workflows/prepare` — workflow preparation step (tracked as OCEAN-340; not yet registered in the daemon).
 
 Keep the daemon-side embedded routes working while adding the standalone service; clients and daemons can bridge versions during migration.
 

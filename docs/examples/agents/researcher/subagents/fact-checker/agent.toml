@@ -1,0 +1,6 @@
+# A local subagent. Its name comes from this directory (`fact-checker`). A
+# subagent's agent.toml SHOULD declare a description — the parent reads it to
+# decide when to delegate. Subagents are discovered recursively under
+# subagents/. See docs/specs/folder-as-agent.md.
+
+description = "Adversarially verifies a claim: tries to refute it, reports what holds."

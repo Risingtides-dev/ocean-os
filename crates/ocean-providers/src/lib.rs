@@ -4,12 +4,7 @@
 //! provider/auth decision for Ocean callers; temporary adapters can translate the
 //! resolved config into legacy runtime structs at the edge.
 
-use std::{
-    collections::BTreeMap,
-    fmt,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -154,9 +149,6 @@ pub struct ModelSelection {
 pub struct ProviderConfig {
     pub selection: ModelSelection,
     pub credential: Option<ResolvedCredential>,
-    /// Non-secret credential state that makes readiness fail even when a
-    /// credential source exists, for example an expired OAuth access token.
-    pub credential_error: Option<ProviderConfigError>,
     /// ChatGPT account id, present only for the Codex OAuth provider. Sent as
     /// the `chatgpt-account-id` request header. Non-secret.
     pub account_id: Option<String>,
@@ -166,8 +158,7 @@ impl ProviderConfig {
     pub fn readiness(&self) -> ProviderReadiness {
         let credential_present = self.credential.is_some();
         let credential_source = self.credential.as_ref().map(|cred| cred.source.clone());
-        let ok = self.credential_error.is_none()
-            && (credential_present || !self.selection.provider.requires_credential());
+        let ok = credential_present || !self.selection.provider.requires_credential();
         ProviderReadiness {
             ok,
             provider: self.selection.provider.clone(),
@@ -175,12 +166,8 @@ impl ProviderConfig {
             base_url_host: base_url_host(&self.selection.base_url),
             credential_present,
             credential_source,
-            error: (!ok).then(|| {
-                self.credential_error.clone().unwrap_or_else(|| {
-                    ProviderConfigError::MissingCredential {
-                        provider: self.selection.provider.as_str().to_string(),
-                    }
-                })
+            error: (!ok).then_some(ProviderConfigError::MissingCredential {
+                provider: self.selection.provider.as_str().to_string(),
             }),
         }
     }
@@ -216,10 +203,6 @@ pub enum ProviderConfigError {
     MissingCredential {
         provider: String,
     },
-    ExpiredCredential {
-        provider: String,
-        expired_at_ms: i64,
-    },
     InvalidAuthFile {
         path: String,
         message: String,
@@ -241,13 +224,6 @@ impl fmt::Display for ProviderConfigError {
             Self::MissingCredential { provider } => {
                 write!(f, "missing credential for provider {provider}")
             }
-            Self::ExpiredCredential {
-                provider,
-                expired_at_ms,
-            } => write!(
-                f,
-                "expired credential for provider {provider} (expired_at_ms={expired_at_ms}); sign in again"
-            ),
             Self::InvalidAuthFile { path, message } => {
                 write!(f, "invalid Ocean auth file {path}: {message}")
             }
@@ -287,7 +263,7 @@ pub fn resolve_provider_config_from_env() -> Result<ProviderConfig, ProviderConf
 /// Resolve full provider config from a provided environment snapshot.
 pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, ProviderConfigError> {
     let selection = resolve_model_selection(env)?;
-    let (credential, credential_error) = resolve_credential(env, &selection.provider)?;
+    let credential = resolve_credential(env, &selection.provider)?;
     let account_id = if matches!(selection.provider, ProviderId::OpenAiCodex) {
         resolve_codex_account_id(env)
     } else {
@@ -296,7 +272,6 @@ pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, Prov
     Ok(ProviderConfig {
         selection,
         credential,
-        credential_error,
         account_id,
     })
 }
@@ -463,6 +438,22 @@ pub struct KnownModel {
 /// render a model picker. Kept in sync with the alias arms in
 /// `resolve_model_selection`. (Availability still depends on the relevant
 /// provider credential being present; this is the menu, not a guarantee.)
+///
+/// Every entry here MUST be routable by [`resolve_model_selection`] — the
+/// `known_models_are_all_routable` test enforces that. The list deliberately
+/// covers exactly the *production* (credential-backed) canonical model ids the
+/// resolver recognizes; the keyless `fake`/`fake-ok`/`fake-tool`/`fake-surface`
+/// test providers and the `openai-compatible` catch-all are intentionally
+/// omitted so they never surface in the public `GET /v1/models` menu. The
+/// `id` used here is the exact string the matching arm emits as
+/// `selection.model` (i.e. what `GET /v1/models` reports as `current.model`
+/// after that model is selected) — so `resolve_model_selection(id).model == id`
+/// holds for every entry. ocean-acp builds the advertised mode ids from these
+/// `id`s but sets the *selected* mode from `current.model`; if the two diverged
+/// (e.g. a lowercase `minimax-m2` id vs the API-cased `MiniMax-M2` the resolver
+/// returns) the selected mode would not appear in the advertised list and the
+/// ACP/Zed picker would break. The `known_models_id_equals_resolved_model` test
+/// enforces this invariant.
 pub fn known_models() -> Vec<KnownModel> {
     let m = |id: &str, provider: &str, label: &str| KnownModel {
         id: id.to_string(),
@@ -477,10 +468,20 @@ pub fn known_models() -> Vec<KnownModel> {
         m("gpt-5.5", "openai-codex", "GPT-5.5 (Codex)"),
         m("gpt-5.4", "openai-codex", "GPT-5.4 (Codex)"),
         m("gpt-5.4-mini", "openai-codex", "GPT-5.4 Mini (Codex)"),
+        m("gpt-5.3-codex-spark", "openai-codex", "GPT-5.3 Codex Spark"),
+        m("gpt-4o", "openai", "GPT-4o"),
+        m("gpt-4o-mini", "openai", "GPT-4o Mini"),
         m("claude-opus-4-7", "anthropic", "Claude Opus 4.7"),
         m("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6"),
-        m("minimax-m2", "minimax", "MiniMax M2"),
+        // MiniMax ids use the API casing the resolver returns as current.model
+        // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
+        // holds for every entry — ACP/Zed match the selected mode id against the
+        // advertised list, and a lowercase alias here would never match. The
+        // resolver lowercases the lookup key, so these still route correctly.
+        m("MiniMax-M2.7", "minimax", "MiniMax M2.7"),
+        m("MiniMax-M2", "minimax", "MiniMax M2"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
+        m("kimi-k2", "kimi", "Kimi K2"),
         m("gemini-2.0-flash", "google", "Gemini 2.0 Flash"),
     ]
 }
@@ -688,6 +689,16 @@ fn normalize_model_id(model: &str) -> String {
         .collect()
 }
 
+/// Restore MiniMax's case-sensitive API model id from a lowercased alias:
+/// `minimax-m2` -> `MiniMax-M2`, `minimax-m2.7` -> `MiniMax-M2.7`. Anything that
+/// doesn't match the `minimax-m…` shape passes through unchanged.
+fn minimax_api_casing(model: &str) -> String {
+    match model.to_ascii_lowercase().strip_prefix("minimax-m") {
+        Some(rest) => format!("MiniMax-M{}", rest.to_ascii_uppercase()),
+        None => model.to_string(),
+    }
+}
+
 fn model_for_explicit_provider(
     provider: &str,
     model: &str,
@@ -722,9 +733,14 @@ fn model_for_explicit_provider(
             200_000,
             16_384,
         )),
+        // MiniMax's API is case-sensitive on model ids (`MiniMax-M2`), but `model`
+        // arrives lowercased (normalize_model_id). Restore the API casing for
+        // known forms so the explicit-provider path matches the bare-alias path —
+        // without this, `OCEAN_PROVIDER=minimax OCEAN_MODEL=minimax-m2` sends
+        // `minimax-m2` and MiniMax rejects it, while the bare alias works.
         "minimax" => Ok(model_selection(
             ProviderId::MiniMax,
-            model,
+            minimax_api_casing(model),
             MINIMAX_BASE_URL,
             200_000,
             8_192,
@@ -789,30 +805,27 @@ fn model_selection(
 fn resolve_credential(
     env: &ProviderEnv,
     provider: &ProviderId,
-) -> Result<(Option<ResolvedCredential>, Option<ProviderConfigError>), ProviderConfigError> {
+) -> Result<Option<ResolvedCredential>, ProviderConfigError> {
     if !provider.requires_credential() {
-        return Ok((None, None));
+        return Ok(None);
     }
 
     for name in provider.credential_env_names() {
         if let Some(secret) = env.get(name).and_then(SecretString::new) {
-            return Ok((
-                Some(ResolvedCredential {
-                    secret,
-                    source: CredentialSource::Env {
-                        name: (*name).into(),
-                    },
-                }),
-                None,
-            ));
+            return Ok(Some(ResolvedCredential {
+                secret,
+                source: CredentialSource::Env {
+                    name: (*name).into(),
+                },
+            }));
         }
     }
 
     let Some(path) = &env.auth_file else {
-        return Ok((None, None));
+        return Ok(None);
     };
     if !path.exists() {
-        return Ok((None, None));
+        return Ok(None);
     }
 
     let text =
@@ -832,19 +845,12 @@ fn resolve_credential(
 
     // The Codex provider authenticates with the OAuth access token from the
     // "openai-codex" block; everyone else uses a plain api_key.
-    let (secret, credential_error) = if matches!(provider, ProviderId::OpenAiCodex) {
-        let (token, error) = oauth_access_token(&json, "openai-codex");
-        (token.and_then(SecretString::new), error)
+    let secret = if matches!(provider, ProviderId::OpenAiCodex) {
+        oauth_access_token(&json, "openai-codex").and_then(SecretString::new)
     } else {
-        (
-            auth_file_key(&json, provider.as_str()).and_then(SecretString::new),
-            None,
-        )
+        auth_file_key(&json, provider.as_str()).and_then(SecretString::new)
     };
-    Ok((
-        secret.map(|secret| ResolvedCredential { secret, source }),
-        credential_error,
-    ))
+    Ok(secret.map(|secret| ResolvedCredential { secret, source }))
 }
 
 fn auth_file_key<'a>(json: &'a serde_json::Value, provider: &str) -> Option<&'a str> {
@@ -859,43 +865,16 @@ fn auth_file_key<'a>(json: &'a serde_json::Value, provider: &str) -> Option<&'a 
 /// Pull an OAuth access token from an auth.json block of `type: "oauth"`.
 /// Used so the OpenAI provider can authenticate with the Codex OAuth login
 /// (bearer token) when no plain api_key is configured.
-fn oauth_access_token<'a>(
-    json: &'a serde_json::Value,
-    block: &str,
-) -> (Option<&'a str>, Option<ProviderConfigError>) {
-    let Some(entry) = json.pointer(&format!("/{block}")) else {
-        return (None, None);
-    };
+fn oauth_access_token<'a>(json: &'a serde_json::Value, block: &str) -> Option<&'a str> {
+    let entry = json.pointer(&format!("/{block}"))?;
     if entry.pointer("/type").and_then(serde_json::Value::as_str) != Some("oauth") {
-        return (None, None);
+        return None;
     }
-    if let Some(expired_at_ms) = entry
-        .pointer("/expires")
-        .and_then(serde_json::Value::as_i64)
-    {
-        if expired_at_ms <= now_ms() {
-            return (
-                None,
-                Some(ProviderConfigError::ExpiredCredential {
-                    provider: block.to_string(),
-                    expired_at_ms,
-                }),
-            );
-        }
-    }
-    let token = entry
+    entry
         .pointer("/access")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    (token, None)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
+        .filter(|value| !value.is_empty())
 }
 
 fn default_ocean_auth_file() -> Option<PathBuf> {
@@ -923,6 +902,17 @@ fn base_url_host(base_url: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn minimax_api_casing_restores_case_sensitive_id() {
+        // The explicit-provider path must send the API-cased id (the bare-alias
+        // path already does), or MiniMax rejects the request.
+        assert_eq!(minimax_api_casing("minimax-m2"), "MiniMax-M2");
+        assert_eq!(minimax_api_casing("MiniMax-M2"), "MiniMax-M2");
+        assert_eq!(minimax_api_casing("minimax-m2.7"), "MiniMax-M2.7");
+        // Non-minimax shapes pass through unchanged.
+        assert_eq!(minimax_api_casing("something-else"), "something-else");
+    }
 
     fn env(vars: &[(&str, &str)]) -> ProviderEnv {
         ProviderEnv {
@@ -1146,38 +1136,6 @@ mod tests {
     }
 
     #[test]
-    fn expired_codex_oauth_token_is_not_ready() {
-        let dir =
-            std::env::temp_dir().join(format!("ocean-expired-oauth-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        fs::write(
-            &path,
-            r#"{"openai-codex":{"type":"oauth","access":"stale-token","refresh":"rt_x","expires":1,"accountId":"acct-123"}}"#,
-        )
-        .unwrap();
-
-        let config = resolve_provider_config(&ProviderEnv {
-            vars: BTreeMap::from([("OCEAN_MODEL".into(), "gpt-5.5".into())]),
-            auth_file: Some(path.clone()),
-        })
-        .unwrap();
-        assert!(config.credential.is_none());
-        assert_eq!(config.account_id.as_deref(), Some("acct-123"));
-        let readiness = config.readiness();
-        assert!(!readiness.ok);
-        assert!(matches!(
-            readiness.error,
-            Some(ProviderConfigError::ExpiredCredential {
-                provider,
-                expired_at_ms: 1
-            }) if provider == "openai-codex"
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn readiness_reports_missing_credential_without_secret() {
         let config = resolve_provider_config(&env(&[("OCEAN_MODEL", "deepseek-chat")])).unwrap();
         let readiness = config.readiness();
@@ -1198,6 +1156,104 @@ mod tests {
         let readiness = config.readiness();
         assert!(readiness.ok);
         assert!(!readiness.credential_present);
+    }
+
+    // ---- known_models() <-> resolve_model_selection() (OCEAN-369) ---------
+
+    #[test]
+    fn known_models_are_all_routable() {
+        // Every model the public picker advertises must actually route through
+        // resolve_model_selection (passed as OCEAN_MODEL, the way a client
+        // round-trips a picked id), and reach the provider the menu declares.
+        // Otherwise GET /v1/models lists a model that fails the moment it's
+        // selected.
+        for known in known_models() {
+            let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", &known.id)]))
+                .unwrap_or_else(|e| panic!("known model {:?} is not routable: {e}", known.id));
+            assert_eq!(
+                selection.provider.as_str(),
+                known.provider,
+                "known model {:?} routed to provider {} but the menu declares {}",
+                known.id,
+                selection.provider.as_str(),
+                known.provider,
+            );
+        }
+    }
+
+    #[test]
+    fn known_models_id_equals_resolved_model() {
+        // The ACP invariant (OCEAN-369 Codex follow-up): ocean-acp advertises
+        // mode ids from KnownModel.id but sets the *selected* mode from the
+        // resolver's current.model. If those diverge for any model, the selected
+        // mode id isn't in the advertised list and Zed/ACP pickers break. So
+        // every advertised id must satisfy resolve_model_selection(id).model == id.
+        // This is exactly what would have caught the lowercase `minimax-m2` id vs
+        // the API-cased `MiniMax-M2` the resolver returns.
+        for known in known_models() {
+            let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", &known.id)]))
+                .unwrap_or_else(|e| panic!("known model {:?} is not routable: {e}", known.id));
+            assert_eq!(
+                selection.model, known.id,
+                "known_models() id {:?} != resolve_model_selection's current.model {:?} \
+                 — ACP would advertise {:?} but select {:?}, breaking the picker",
+                known.id, selection.model, known.id, selection.model,
+            );
+        }
+    }
+
+    #[test]
+    fn no_routable_production_model_is_missing_from_known_models() {
+        // The inverse guard: enumerate every production (credential-backed)
+        // canonical model id resolve_model_selection can route via its bare-alias
+        // arms, and assert the public picker lists each one. Keyless `fake*`
+        // variants and the `openai-compatible` catch-all are intentionally
+        // excluded from the menu and so are not listed here. If a new production
+        // arm is added to resolve_model_selection, add it here AND to
+        // known_models() — this test is the tripwire that forces that.
+        let routable_production_ids = [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex-spark",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            // API-cased ids: `resolve_model_selection` returns these as
+            // current.model, and known_models() advertises the same string.
+            "MiniMax-M2",
+            "MiniMax-M2.7",
+            "kimi-k2.6",
+            "kimi-k2",
+            "gemini-2.0-flash",
+        ];
+        let listed: std::collections::BTreeSet<String> =
+            known_models().into_iter().map(|m| m.id).collect();
+        for id in routable_production_ids {
+            // Sanity: each really is routable (canonical id round-trips).
+            resolve_model_selection(&env(&[("OCEAN_MODEL", id)]))
+                .unwrap_or_else(|e| panic!("expected {id:?} to be routable: {e}"));
+            assert!(
+                listed.contains(id),
+                "routable production model {id:?} is missing from known_models()"
+            );
+        }
+        // Every listed id must be one of the enumerated production ids — catches
+        // a fake/test variant accidentally leaking into the public menu.
+        let production: std::collections::BTreeSet<&str> =
+            routable_production_ids.into_iter().collect();
+        for id in &listed {
+            assert!(
+                production.contains(id.as_str()),
+                "known_models() lists {id:?}, which is not an enumerated production model \
+                 (a fake/test variant must never appear in the public picker)"
+            );
+        }
     }
 
     // ---- Fallback / failover (OCEAN-275) ----------------------------------

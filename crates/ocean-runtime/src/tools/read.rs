@@ -11,6 +11,12 @@ pub struct ReadTool {
     cwd: Option<PathBuf>,
 }
 
+impl Default for ReadTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReadTool {
     pub fn new() -> Self {
         Self { cwd: None }

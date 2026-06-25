@@ -6,11 +6,10 @@ The **daemon** (`crates/ocean-daemon`, built to `target/release/ocean-daemon`) i
 the runtime/body: it owns the agent loop, tools, provider calls, **sessions**,
 permissions, and events, and it listens on **`127.0.0.1:4780`**.
 
-Previously it was **hand-launched** from the repo root. Newer daemon builds
-refuse repo cwd, so the supervised launcher now execs the prebuilt binary from a
-neutral cwd (`$HOME` by default), logging to `/private/tmp/ocean-daemon.log`.
-A reboot lost the old hand-launch entirely, and a crash left it down until
-someone noticed. There was no
+Previously it was **hand-launched** from the repo root —
+`cd <repo> && OCEAN_YOLO=1 ./target/release/ocean-daemon`, logging to
+`/private/tmp/ocean-daemon.log` — with **no supervision**. A reboot lost it
+entirely, and a crash left it down until someone noticed. There was no
 version-controlled supervision spec. **OCEAN-161** put the surface **proxy**
 (`:8790`) under launchd but explicitly left the **daemon** out of scope; this
 ticket (**OCEAN-253**) does the same for the daemon itself. Both clients (the TUI
@@ -25,10 +24,9 @@ on crash (`KeepAlive`) and starts it at login/reboot (`RunAtLoad`).
 | Launcher it execs | `deploy/ocean-daemon.sh` |
 | Installed plist path | `~/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist` |
 | Binary run | `target/release/ocean-daemon` (prebuilt, from **main**) |
-| Working directory | neutral cwd (`$HOME` by default; never the ocean-os repo) |
+| Working directory | ocean-os repo root |
 | Bind address | `127.0.0.1:4780` (binary default; env `OCEAN_BIND` to override) |
 | Env | `OCEAN_YOLO=1` (matches the prior hand-launch) |
-| Assistants dir | sibling `../ocean-agents/assistants` when present |
 | Logs (stdout+stderr) | `/private/tmp/ocean-daemon.log` |
 
 > ### Build from MAIN — always

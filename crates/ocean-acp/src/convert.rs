@@ -258,15 +258,14 @@ fn fenced_json(kind: &str, props: &serde_json::Value) -> String {
 }
 
 /// Map a finished turn's Ocean status to the ACP stop reason for the prompt
-/// response. ACP has no generic infrastructure-failure stop reason, and Ocean
-/// provider/runtime failures are not safety refusals; the bridge streams the
-/// daemon error text separately and closes the prompt normally.
+/// response. `EndTurn` is the success case; failures and cancellations map to
+/// their ACP equivalents.
 pub fn stop_reason_for(status: &AgentTurnStatus) -> agent_client_protocol::schema::StopReason {
     use agent_client_protocol::schema::StopReason;
     match status {
         AgentTurnStatus::Completed => StopReason::EndTurn,
         AgentTurnStatus::Cancelled => StopReason::Cancelled,
-        AgentTurnStatus::Failed => StopReason::EndTurn,
+        AgentTurnStatus::Failed => StopReason::Refusal,
         // Queued/Running shouldn't appear on a TurnFinished, but if they do,
         // treat as a normal end so the editor isn't left hanging.
         AgentTurnStatus::Queued | AgentTurnStatus::Running => StopReason::EndTurn,

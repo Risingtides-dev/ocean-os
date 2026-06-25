@@ -79,6 +79,28 @@ fn resolve_cwd(project: Option<&str>) -> String {
         .into_owned()
 }
 
+/// Sub-commands of `ocean agents`.
+#[derive(Debug, Subcommand)]
+enum AgentsCmd {
+    /// Lint one or all agent folders under the agents root. Exits non-zero
+    /// when any error-severity diagnostic is found.
+    ///
+    /// Checks performed:
+    ///   error  — instructions.md missing or empty (no system prompt)
+    ///   error  — model alias not in known Ocean models catalogue
+    ///   warn   — tool name not a known builtin
+    ///   warn   — subagent folder listed but fails to resolve
+    ///   warn   — skill file exists but is blank
+    ///
+    /// The agents root is $OCEAN_AGENTS_DIR, else `./agents`.
+    Lint {
+        /// Lint a single agent folder at this path instead of scanning the
+        /// entire agents root. The folder name becomes the agent name.
+        #[arg(value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ocean-rs", about = "Ocean OS agent runtime client")]
 struct Cli {
@@ -136,6 +158,11 @@ enum Cmd {
         #[arg(long, env = "OCEAN_BEDROCK_TOKEN")]
         token: Option<String>,
     },
+    /// Agent folder (folder-as-agent) management.
+    Agents {
+        #[command(subcommand)]
+        subcmd: AgentsCmd,
+    },
 }
 
 /// Resolve an onboarding value: use the supplied one (trimmed), else prompt for
@@ -159,6 +186,63 @@ fn resolve_or_prompt(provided: Option<String>, label: &str) -> anyhow::Result<St
     let v = line.trim().to_string();
     anyhow::ensure!(!v.is_empty(), "{label} cannot be empty");
     Ok(v)
+}
+
+/// Build the onboarding log record (the client-side "log trip"): when, which
+/// box, and the resolved principal. Pure so it's unit-testable; `ts_ms` is the
+/// caller's clock.
+fn onboarding_record(
+    bedrock_url: &str,
+    info: &serde_json::Value,
+    ts_ms: u128,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ts_ms": ts_ms,
+        "event": "onboard",
+        "bedrock_url": bedrock_url.trim_end_matches('/'),
+        "instance": info["instance"].as_str(),
+        "principal": info["principal"].clone(),
+    })
+}
+
+/// Where the local onboarding log lives: `$OCEAN_ONBOARD_LOG`, else
+/// `$HOME/.local/state/ocean/onboarding.jsonl` (XDG state convention). `None`
+/// when no home is resolvable and no override is set.
+fn onboarding_log_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("OCEAN_ONBOARD_LOG") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(std::path::Path::new(&home).join(".local/state/ocean/onboarding.jsonl"))
+}
+
+/// Append the onboarding record as one JSONL line. Fail-soft — a logging error
+/// is warned to stderr and never propagated, so it can't fail a good onboard.
+fn record_onboarding(bedrock_url: &str, info: &serde_json::Value) {
+    let Some(path) = onboarding_log_path() else {
+        return;
+    };
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = onboarding_record(bedrock_url, info, ts_ms).to_string();
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(f, "{line}")
+    };
+    if let Err(e) = write() {
+        eprintln!(
+            "[ocean-rs] onboarding logged-trip write failed ({}): {e}",
+            path.display()
+        );
+    }
 }
 
 /// Render the onboarding success summary from a bedrock `/api/v1/info` body:
@@ -552,7 +636,95 @@ async fn main() -> anyhow::Result<()> {
                 body["error"].as_str().unwrap_or("unknown error")
             );
             println!("{}", format_onboard_summary(&bedrock_url, &token, &body));
+            // Leave a local "log trip": record the successful onboarding (which
+            // box, which principal, when) so a coworker has a trail of what they
+            // connected to — the client-side complement to bedrock's token-issue
+            // audit. Fail-soft: a logging failure never fails the onboard.
+            record_onboarding(&bedrock_url, &body);
         }
+        Cmd::Agents { subcmd } => {
+            agents_lint_cmd(subcmd)?;
+        }
+    }
+    Ok(())
+}
+
+/// Where folder-as-agent definitions live: `$OCEAN_AGENTS_DIR`, else `./agents`.
+fn agents_root() -> std::path::PathBuf {
+    std::env::var("OCEAN_AGENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("agents"))
+}
+
+/// Handler for `ocean agents lint [path]` — synchronous, no daemon required.
+fn agents_lint_cmd(subcmd: AgentsCmd) -> anyhow::Result<()> {
+    use ocean_agent::agentdir::{discover, resolve, validate, Severity};
+
+    let AgentsCmd::Lint { path } = subcmd;
+
+    // Collect (root, agent_name) pairs to lint.
+    let targets: Vec<(std::path::PathBuf, String)> = match path {
+        Some(p) => {
+            // Single-path mode: parent dir is the "agents root", folder name is
+            // the agent name — matches how resolve() interprets the on-disk tree.
+            let p = p
+                .canonicalize()
+                .with_context(|| format!("path does not exist: {}", p.display()))?;
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .with_context(|| {
+                    format!("cannot determine agent name from path: {}", p.display())
+                })?;
+            let parent = p
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+            vec![(parent, name)]
+        }
+        None => {
+            let root = agents_root();
+            let names = discover(&root);
+            names.into_iter().map(|name| (root.clone(), name)).collect()
+        }
+    };
+
+    if targets.is_empty() {
+        eprintln!("[ocean agents lint] no agent folders found");
+        return Ok(());
+    }
+
+    let mut any_error = false;
+    for (root, name) in &targets {
+        let def = match resolve(root, name) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("error: {name}: {e}");
+                any_error = true;
+                continue;
+            }
+        };
+        let diags = validate(&def);
+        if diags.is_empty() {
+            println!("{name}: ok");
+        } else {
+            for d in &diags {
+                let loc = d
+                    .path
+                    .as_ref()
+                    .map(|p| format!(" ({})", p.display()))
+                    .unwrap_or_default();
+                println!("{name}: {}{loc}: {}", d.severity, d.message);
+            }
+            if diags.iter().any(|d| d.severity == Severity::Error) {
+                any_error = true;
+            }
+        }
+    }
+
+    if any_error {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -561,6 +733,22 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use ocean_core::TokenUsage;
+
+    #[test]
+    fn onboarding_record_captures_box_and_principal() {
+        let info = serde_json::json!({
+            "instance": "ocean-bedrock",
+            "principal": { "name": "alice", "role": "agent", "scopes": ["/docs"] }
+        });
+        let rec = onboarding_record("http://localhost:8080/", &info, 1_700_000_000_000);
+        assert_eq!(rec["event"], "onboard");
+        assert_eq!(rec["ts_ms"], 1_700_000_000_000u64);
+        // URL is trimmed of the trailing slash.
+        assert_eq!(rec["bedrock_url"], "http://localhost:8080");
+        assert_eq!(rec["instance"], "ocean-bedrock");
+        assert_eq!(rec["principal"]["name"], "alice");
+        assert_eq!(rec["principal"]["role"], "agent");
+    }
 
     #[test]
     fn resolve_or_prompt_uses_provided_value_trimmed() {
