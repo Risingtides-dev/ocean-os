@@ -11,6 +11,12 @@ pub struct LsTool {
     cwd: Option<PathBuf>,
 }
 
+impl Default for LsTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LsTool {
     pub fn new() -> Self {
         Self { cwd: None }

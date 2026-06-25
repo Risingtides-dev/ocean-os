@@ -26,11 +26,7 @@ use tokio_util::io::StreamReader;
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4780";
 
 /// Client surface tag reported to the daemon so it can tailor responses.
-/// Override with `OCEAN_ACP_CLIENT_TYPE` (for example, `acp-vscode` from the
-/// first-party VS Code / Cursor extension).
-fn client_type() -> String {
-    std::env::var("OCEAN_ACP_CLIENT_TYPE").unwrap_or_else(|_| "acp-zed".to_string())
-}
+const CLIENT_TYPE: &str = "acp-zed";
 
 /// A boxed byte stream that yields `io::Result<Bytes>`, suitable for `StreamReader`.
 type IoByteStream = Pin<Box<dyn Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
@@ -121,7 +117,7 @@ impl DaemonClient {
         let body = AgentSessionCreateRequest {
             workspace_root: cwd.to_string(),
             project_id: None,
-            client_type: Some(client_type()),
+            client_type: Some(CLIENT_TYPE.to_string()),
         };
         let resp = self
             .http
@@ -202,7 +198,7 @@ impl DaemonClient {
             guidance: None,
             room_id: None,
             project_id: None,
-            client_type: Some(client_type()),
+            client_type: Some(CLIENT_TYPE.to_string()),
             // ACP bridge has no per-turn reasoning control; defer to the
             // runtime's global thinking_level.
             thinking_level: None,
@@ -213,6 +209,8 @@ impl DaemonClient {
             decision_token,
             // ACP bridge does not select a named folder-as-agent.
             agent: None,
+            // ACP bridge is not an in-browser surface (OCEAN-40).
+            client_context: None,
         };
 
         let url = format!("{}/v1/agent/turns", self.base_url);

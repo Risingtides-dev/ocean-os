@@ -507,11 +507,11 @@ async fn main() -> AcpResult<()> {
                                         SessionId::new(session_id.clone()),
                                         SessionUpdate::AgentMessageChunk(
                                             agent_client_protocol::schema::ContentChunk::new(
-                                                text_block(format_turn_error(&format!("{err:#}"))),
+                                                text_block(format!("⚠️ ocean-acp: {err:#}")),
                                             ),
                                         ),
                                     ));
-                                    StopReason::EndTurn
+                                    StopReason::Refusal
                                 }
                             };
                             // The turn is done; drop the cancel target.
@@ -827,26 +827,12 @@ async fn run_turn(
         if let ocean_agent_sdk::AgentTurnEvent::TurnFinished {
             turn_id: ev_turn,
             status,
-            error,
             ..
         } = &event
         {
             let ev_turn = ev_turn.0.to_string();
             if turn_id.as_deref() == Some(ev_turn.as_str()) {
                 tracing::info!(%acp_session_id, turn_id = %ev_turn, ?status, "turn finished");
-                if matches!(status, ocean_agent_sdk::AgentTurnStatus::Failed) {
-                    if let Some(error) = error.as_deref().filter(|s| !s.trim().is_empty()) {
-                        conn.send_notification(SessionNotification::new(
-                            acp_session.clone(),
-                            SessionUpdate::AgentMessageChunk(
-                                agent_client_protocol::schema::ContentChunk::new(text_block(
-                                    format_turn_error(error),
-                                )),
-                            ),
-                        ))
-                        .map_err(|e| anyhow::anyhow!("send failure session/update: {e}"))?;
-                    }
-                }
                 return Ok(stop_reason_for(status));
             }
             // A different turn finished on this session — ignore.
@@ -858,20 +844,6 @@ async fn run_turn(
                 .map_err(|e| anyhow::anyhow!("send session/update: {e}"))?;
         }
     }
-}
-
-fn format_turn_error(error: &str) -> String {
-    let mut text = error.trim().to_string();
-    const MAX_LEN: usize = 4000;
-    if text.len() > MAX_LEN {
-        let mut end = MAX_LEN;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-        text.push_str("\n\n[truncated]");
-    }
-    format!("Ocean turn failed:\n\n{text}")
 }
 
 /// Permission option ids the editor echoes back in its `Selected` outcome. The

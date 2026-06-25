@@ -1,0 +1,6 @@
+# events.md is an append-only chronological ledger written by many parallel
+# agents on separate branches. Concurrent appends at EOF always conflict on
+# merge/rebase. The built-in `union` driver resolves these by keeping BOTH
+# sides' lines (no markers), which is exactly the desired semantics for an
+# append-only log — entries are never deleted, only added.
+events.md merge=union
