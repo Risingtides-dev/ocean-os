@@ -11,12 +11,6 @@ pub struct EditTool {
     cwd: Option<PathBuf>,
 }
 
-impl Default for EditTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl EditTool {
     pub fn new() -> Self {
         Self { cwd: None }

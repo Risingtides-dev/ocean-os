@@ -11,12 +11,6 @@ pub struct WriteTool {
     cwd: Option<PathBuf>,
 }
 
-impl Default for WriteTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WriteTool {
     pub fn new() -> Self {
         Self { cwd: None }

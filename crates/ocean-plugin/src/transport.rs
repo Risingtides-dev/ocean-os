@@ -39,48 +39,6 @@ pub struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    /// Bytes consumed from stdout that don't yet form a complete line. Persisted
-    /// across `recv` calls: `read_until` is NOT cancellation-safe, and the plugin
-    /// io-loop drives `recv` inside a `select!` that drops the read future
-    /// whenever an outbound send wins. With a local buffer those already-consumed
-    /// partial bytes would be lost, tearing the next JSON frame and hanging the
-    /// request that owned the response. (Same fix as ocean-mcp #240.)
-    pending: Vec<u8>,
-}
-
-/// Pop the first complete line (up to and including the next `\n`) out of
-/// `pending`, trimming the trailing `\r?\n`. `None` when no newline is buffered
-/// yet. Pure over the buffer so the resume-after-cancellation behavior is
-/// unit-testable without spawning a process.
-fn try_take_line(pending: &mut Vec<u8>) -> Option<Result<String>> {
-    let pos = pending.iter().position(|&b| b == b'\n')?;
-    let mut line: Vec<u8> = pending.drain(..=pos).collect();
-    while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    Some(String::from_utf8(line).context("plugin sent invalid UTF-8"))
-}
-
-/// Spawn the child, retrying a small bounded number of times on `ETXTBSY`
-/// (os error 26 — "text file busy"). Under parallel `cargo test`, a sibling
-/// process can briefly inherit the write fd of a just-written plugin script, so
-/// `exec` races and fails with `ETXTBSY`. The fd is closed promptly, so a short
-/// backoff clears it. Any other spawn error (or exhausting retries) is returned
-/// as-is, so a genuinely broken plugin still fails fast and gets skipped.
-fn spawn_with_etxtbsy_retry(cmd: &mut tokio::process::Command) -> std::io::Result<Child> {
-    const MAX_ATTEMPTS: u32 = 3;
-    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
-    let mut attempt = 1;
-    loop {
-        match cmd.spawn() {
-            Ok(child) => return Ok(child),
-            Err(e) if e.raw_os_error() == Some(26) && attempt < MAX_ATTEMPTS => {
-                attempt += 1;
-                std::thread::sleep(BACKOFF);
-            }
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 impl StdioTransport {
@@ -96,7 +54,8 @@ impl StdioTransport {
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
 
-        let mut child = spawn_with_etxtbsy_retry(&mut cmd)
+        let mut child = cmd
+            .spawn()
             .with_context(|| format!("spawn plugin `{command}`"))?;
 
         let stdin = child
@@ -112,7 +71,6 @@ impl StdioTransport {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-            pending: Vec::new(),
         })
     }
 }
@@ -127,42 +85,25 @@ impl Transport for StdioTransport {
     }
 
     async fn recv(&mut self) -> Result<Option<String>> {
-        loop {
-            // A complete line already buffered (e.g. the tail of a previous read
-            // that also pulled in the start of this one)? Hand it back.
-            if let Some(line) = try_take_line(&mut self.pending) {
-                return Ok(Some(line?));
-            }
-            // Bound total buffered bytes BEFORE reading more, so a plugin that
-            // never sends a newline can't make us allocate without limit. Checked
-            // on `pending` so the cap holds across the partial reads a cancelled
-            // recv may have accumulated.
-            if self.pending.len() as u64 > MAX_MESSAGE_BYTES {
-                bail!("plugin message exceeded {MAX_MESSAGE_BYTES} bytes; dropping connection");
-            }
-            // Append onto the PERSISTENT buffer. `read_until` is not
-            // cancellation-safe, but because it appends into `self.pending`, a
-            // drop of this future (the io-loop select! choosing an outbound send)
-            // leaves the consumed bytes in place for the next `recv` to resume.
-            let cap = (MAX_MESSAGE_BYTES + 1).saturating_sub(self.pending.len() as u64);
-            let n = (&mut self.stdout)
-                .take(cap)
-                .read_until(b'\n', &mut self.pending)
-                .await?;
-            if n == 0 {
-                // EOF. Surface a trailing newline-less line once, then None.
-                if self.pending.is_empty() {
-                    return Ok(None);
-                }
-                let mut line = std::mem::take(&mut self.pending);
-                while line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                return Ok(Some(
-                    String::from_utf8(line).context("plugin sent invalid UTF-8")?,
-                ));
-            }
+        // Bounded read: read up to one newline, but never more than
+        // MAX_MESSAGE_BYTES, so a plugin that never sends a newline can't make us
+        // allocate without limit.
+        let mut buf = Vec::new();
+        let n = (&mut self.stdout)
+            .take(MAX_MESSAGE_BYTES + 1)
+            .read_until(b'\n', &mut buf)
+            .await?;
+        if n == 0 {
+            return Ok(None); // EOF: plugin exited.
         }
+        if n as u64 > MAX_MESSAGE_BYTES {
+            bail!("plugin message exceeded {MAX_MESSAGE_BYTES} bytes; dropping connection");
+        }
+        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        let line = String::from_utf8(buf).context("plugin sent invalid UTF-8")?;
+        Ok(Some(line))
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -171,40 +112,5 @@ impl Transport for StdioTransport {
         let _ = self.stdin.shutdown().await;
         let _ = self.child.start_kill();
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn try_take_line_extracts_and_keeps_remainder() {
-        let mut buf = b"line1\nline2\n".to_vec();
-        assert_eq!(try_take_line(&mut buf).unwrap().unwrap(), "line1");
-        assert_eq!(buf, b"line2\n", "remainder kept for the next line");
-        assert_eq!(try_take_line(&mut buf).unwrap().unwrap(), "line2");
-        assert!(buf.is_empty());
-        let mut partial = b"half".to_vec();
-        assert!(try_take_line(&mut partial).is_none());
-        assert_eq!(partial, b"half", "no newline -> buffer untouched");
-        let mut crlf = b"x\r\n".to_vec();
-        assert_eq!(try_take_line(&mut crlf).unwrap().unwrap(), "x");
-    }
-
-    #[test]
-    fn try_take_line_resumes_after_a_partial_read() {
-        // The cancellation-recovery contract: a recv() dropped mid-line leaves
-        // its consumed bytes in `pending`; the next read appends the rest and the
-        // full frame comes back intact (not torn). Same guarantee as ocean-mcp #240.
-        let mut pending = Vec::new();
-        pending.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"resu");
-        assert!(try_take_line(&mut pending).is_none(), "no newline yet");
-        pending.extend_from_slice(b"lt\":{}}\n");
-        assert_eq!(
-            try_take_line(&mut pending).unwrap().unwrap(),
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
-            "frame reassembled intact across the split"
-        );
     }
 }

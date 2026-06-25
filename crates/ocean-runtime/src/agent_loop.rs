@@ -594,7 +594,7 @@ fn tool_limit_fallback_reply(messages: &[Message]) -> String {
     const PREVIEW_LIMIT: usize = 2000;
     if text.len() > PREVIEW_LIMIT {
         text.truncate(PREVIEW_LIMIT);
-        text.push('…');
+        text.push_str("…");
     }
     if text.trim().is_empty() {
         text = "(tool returned no text output)".to_string();

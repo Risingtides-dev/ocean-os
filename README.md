@@ -58,7 +58,7 @@ curl http://127.0.0.1:4780/health
 
 ## Provider configuration
 
-Model selection via `OCEAN_MODEL` — there is no hardcoded default model; with nothing set the daemon errors (`NoModelSelected`) rather than picking one for you (see [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md#model-selection)). Supported model strings include:
+Model selection via `OCEAN_MODEL` (default: `deepseek-chat`). Supported model strings include:
 
 - `deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash`, `deepseek-v4-pro`
 - `gpt-4o`, `gpt-4o-mini`

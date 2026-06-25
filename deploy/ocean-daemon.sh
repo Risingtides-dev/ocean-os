@@ -8,9 +8,9 @@
 # ops/install-ocean-daemon.sh) from MAIN, per the operator's build-from-main
 # rule. To pick up new code: rebuild from main, then kickstart -k (see ops/README).
 #
-# Mirrors what the daemon was hand-launched as before this ticket:
-#     cd <repo> && OCEAN_YOLO=1 ./target/release/ocean-daemon
-# i.e. cwd = repo root, env = OCEAN_YOLO=1, default bind 127.0.0.1:4780.
+# The daemon refuses to start from inside a git repo so unbound turns cannot
+# accidentally bind to the daemon source checkout. Keep the binary path pinned
+# to this repo, but run it from a neutral cwd.
 set -euo pipefail
 
 # Repo root = parent of this deploy/ dir, resolved absolutely (symlink-safe).
@@ -29,13 +29,17 @@ if [[ ! -x "$BIN" ]]; then
   exit 127
 fi
 
-# Production env. Mirrors the prior hand-launch exactly; override via the plist's
-# EnvironmentVariables block or by exporting before launch.
+# Production env. Override via the plist's EnvironmentVariables block or by
+# exporting before launch.
 #   OCEAN_YOLO=1            -> operator default: tools run without per-call gating.
 #   OCEAN_BIND (optional)   -> defaults to 127.0.0.1:4780 inside the binary.
-#   OCEAN_ASSISTANTS_DIR    -> optional; defaults to ~/.config/ocean-rs/assistants.
+#   OCEAN_ASSISTANTS_DIR    -> defaults to sibling ocean-agents/assistants when present.
 export OCEAN_YOLO="${OCEAN_YOLO:-1}"
+if [[ -z "${OCEAN_ASSISTANTS_DIR:-}" && -d "$REPO/../ocean-agents/assistants" ]]; then
+  export OCEAN_ASSISTANTS_DIR="$(cd "$REPO/../ocean-agents/assistants" && pwd)"
+fi
 
-echo "==> ocean-daemon: cwd=$REPO yolo=$OCEAN_YOLO bind=${OCEAN_BIND:-127.0.0.1:4780}"
-cd "$REPO"
+RUN_CWD="${OCEAN_DAEMON_RUN_CWD:-$HOME}"
+echo "==> ocean-daemon: cwd=$RUN_CWD bin=$BIN yolo=$OCEAN_YOLO bind=${OCEAN_BIND:-127.0.0.1:4780} assistants=${OCEAN_ASSISTANTS_DIR:-default}"
+cd "$RUN_CWD"
 exec "$BIN"

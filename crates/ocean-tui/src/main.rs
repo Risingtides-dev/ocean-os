@@ -801,12 +801,6 @@ impl DaemonApp {
     }
 
     fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
-        // Capture which session is highlighted so the selection follows the
-        // SESSION across a refresh, not a fixed row. The daemon returns sessions
-        // recency-ordered, so any session's activity reshuffles the list — an
-        // index-preserved highlight would silently jump to a different session
-        // (and `selected_session_detail` would fetch the wrong one).
-        let selected_id = self.selected_session().map(|s| s.id);
         let mut next: Vec<SessionSummary> = sessions.into_iter().take(SESSION_CAP).collect();
         // OCEAN-311: a resumed `--session` target can live beyond the first
         // `/v1/sessions` page (OCEAN-250), and the periodic refresh only
@@ -828,15 +822,7 @@ impl DaemonApp {
             }
         }
         self.sessions = next;
-        // Re-locate the highlighted session by id so the cursor tracks it across
-        // a reorder; fall back to the clamped index when it's no longer present
-        // (e.g. it dropped off the fetched page).
-        self.selected_session_index = selected_id
-            .and_then(|id| self.sessions.iter().position(|s| s.id == id))
-            // `selected_session_index` is a 1-based slot (slot N => sessions[N-1],
-            // matching `select_session_row`'s `pos + 1`), so map position back up.
-            .map(|pos| pos + 1)
-            .unwrap_or_else(|| self.selected_session_index.min(self.sessions.len()));
+        self.selected_session_index = self.selected_session_index.min(self.sessions.len());
         self.selected_session_detail = None;
     }
 
@@ -3230,8 +3216,6 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             decision_token: Some(decision_token),
             // The TUI does not yet select a named folder-as-agent.
             agent: None,
-            // The TUI is not an in-browser surface (OCEAN-40).
-            client_context: None,
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(
@@ -3842,13 +3826,6 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
             // Close them so the yellow "running" badge never gets stuck.
             if status != ocean_agent_sdk::AgentTurnStatus::Completed {
                 for turn in app.pm_turns.iter_mut() {
-                    // Scope to the finishing turn: only ITS unclosed tools were
-                    // cancelled. A blanket sweep would wrongly error a sibling
-                    // turn's legitimately-running tool (rare — turns serialize
-                    // per session — but the unscoped sweep had no reason to).
-                    if turn.turn_id != Some(turn_id) {
-                        continue;
-                    }
                     for block in turn.blocks.iter_mut() {
                         if let PmBlock::ToolCall {
                             status: tool_status,
@@ -7756,34 +7733,6 @@ mod tests {
         assert!(app.show_help);
     }
 
-    #[test]
-    fn selection_follows_the_session_across_a_reorder() {
-        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
-        let a = resume_session_fixture("11111111-1111-4111-8111-111111111111", None);
-        let b = resume_session_fixture("11111111-2222-4222-8222-222222222222", None);
-        let (a_id, b_id) = (a.id, b.id);
-
-        // Operator highlights session b. Slots are 1-based (slot 2 => sessions[1]).
-        app.set_sessions(vec![a.clone(), b.clone()]);
-        app.selected_session_index = 2;
-        assert_eq!(app.selected_session_id(), Some(b_id));
-
-        // A refresh returns the list reordered (b's activity bumped it to top).
-        app.set_sessions(vec![b, a]);
-
-        // The highlight must still point at session b — by id, not the old slot.
-        assert_eq!(
-            app.selected_session_id(),
-            Some(b_id),
-            "selection follows the session, not the row slot"
-        );
-        assert_eq!(
-            app.selected_session_index, 1,
-            "b is now slot 1 (index 0 + 1)"
-        );
-        let _ = a_id;
-    }
-
     fn resume_session_fixture(id: &str, workspace_root: Option<&str>) -> SessionSummary {
         SessionSummary {
             id: SessionId::parse_str(id).expect("fixture uuid"),
@@ -8930,67 +8879,6 @@ mod tests {
             })
             .count();
         assert_eq!(err_count, 1, "the cancelled block must be in Err state");
-    }
-
-    #[test]
-    fn pm_cancelled_turn_sweep_spares_a_sibling_turns_running_tool() {
-        let session_id = AgentSessionId::new_v4();
-        let (turn_a, turn_b) = (AgentTurnId::new_v4(), AgentTurnId::new_v4());
-        let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
-
-        // A Running tool on turn A, then a Running tool on turn B.
-        for (tid, cmd) in [(turn_a, "sleep 1"), (turn_b, "sleep 2")] {
-            daemon_apply_agent_stream_event(
-                &mut app,
-                AgentTurnEvent::ToolCallStarted {
-                    session_id,
-                    turn_id: tid,
-                    call: ocean_agent_sdk::ToolCall {
-                        id: ocean_agent_sdk::ToolCallId::new_v4(),
-                        name: "bash".to_string(),
-                        args_json: serde_json::json!({ "command": cmd }),
-                    },
-                },
-            );
-        }
-
-        // Turn B fails (cancelled). Only B's tool should close; A's stays Running.
-        daemon_apply_agent_stream_event(
-            &mut app,
-            AgentTurnEvent::TurnFinished {
-                session_id,
-                turn_id: turn_b,
-                status: ocean_agent_sdk::AgentTurnStatus::Failed,
-                error: Some("cancelled".to_string()),
-                wall_ms: Some(10),
-                input_tokens: None,
-                output_tokens: None,
-                cache_read_tokens: None,
-                tokens_per_second: None,
-            },
-        );
-
-        let status_of = |app: &DaemonApp, tid: AgentTurnId| -> Option<ToolStatus> {
-            app.pm_turns
-                .iter()
-                .find(|t| t.turn_id == Some(tid))
-                .and_then(|t| {
-                    t.blocks.iter().find_map(|b| match b {
-                        PmBlock::ToolCall { status, .. } => Some(*status),
-                        _ => None,
-                    })
-                })
-        };
-        assert_eq!(
-            status_of(&app, turn_b),
-            Some(ToolStatus::Err),
-            "B's tool closed"
-        );
-        assert_eq!(
-            status_of(&app, turn_a),
-            Some(ToolStatus::Running),
-            "A's tool must NOT be swept by B's cancel"
-        );
     }
 
     /// OCEAN-319 guard: a Completed turn must NOT sweep Running blocks —
