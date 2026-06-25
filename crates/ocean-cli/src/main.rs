@@ -79,6 +79,28 @@ fn resolve_cwd(project: Option<&str>) -> String {
         .into_owned()
 }
 
+/// Sub-commands of `ocean agents`.
+#[derive(Debug, Subcommand)]
+enum AgentsCmd {
+    /// Lint one or all agent folders under the agents root. Exits non-zero
+    /// when any error-severity diagnostic is found.
+    ///
+    /// Checks performed:
+    ///   error  — instructions.md missing or empty (no system prompt)
+    ///   error  — model alias not in known Ocean models catalogue
+    ///   warn   — tool name not a known builtin
+    ///   warn   — subagent folder listed but fails to resolve
+    ///   warn   — skill file exists but is blank
+    ///
+    /// The agents root is $OCEAN_AGENTS_DIR, else `./agents`.
+    Lint {
+        /// Lint a single agent folder at this path instead of scanning the
+        /// entire agents root. The folder name becomes the agent name.
+        #[arg(value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ocean-rs", about = "Ocean OS agent runtime client")]
 struct Cli {
@@ -135,6 +157,11 @@ enum Cmd {
         /// Prompted if absent.
         #[arg(long, env = "OCEAN_BEDROCK_TOKEN")]
         token: Option<String>,
+    },
+    /// Agent folder (folder-as-agent) management.
+    Agents {
+        #[command(subcommand)]
+        subcmd: AgentsCmd,
     },
 }
 
@@ -615,6 +642,89 @@ async fn main() -> anyhow::Result<()> {
             // audit. Fail-soft: a logging failure never fails the onboard.
             record_onboarding(&bedrock_url, &body);
         }
+        Cmd::Agents { subcmd } => {
+            agents_lint_cmd(subcmd)?;
+        }
+    }
+    Ok(())
+}
+
+/// Where folder-as-agent definitions live: `$OCEAN_AGENTS_DIR`, else `./agents`.
+fn agents_root() -> std::path::PathBuf {
+    std::env::var("OCEAN_AGENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("agents"))
+}
+
+/// Handler for `ocean agents lint [path]` — synchronous, no daemon required.
+fn agents_lint_cmd(subcmd: AgentsCmd) -> anyhow::Result<()> {
+    use ocean_agent::agentdir::{discover, resolve, validate, Severity};
+
+    let AgentsCmd::Lint { path } = subcmd;
+
+    // Collect (root, agent_name) pairs to lint.
+    let targets: Vec<(std::path::PathBuf, String)> = match path {
+        Some(p) => {
+            // Single-path mode: parent dir is the "agents root", folder name is
+            // the agent name — matches how resolve() interprets the on-disk tree.
+            let p = p
+                .canonicalize()
+                .with_context(|| format!("path does not exist: {}", p.display()))?;
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .with_context(|| {
+                    format!("cannot determine agent name from path: {}", p.display())
+                })?;
+            let parent = p
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+            vec![(parent, name)]
+        }
+        None => {
+            let root = agents_root();
+            let names = discover(&root);
+            names.into_iter().map(|name| (root.clone(), name)).collect()
+        }
+    };
+
+    if targets.is_empty() {
+        eprintln!("[ocean agents lint] no agent folders found");
+        return Ok(());
+    }
+
+    let mut any_error = false;
+    for (root, name) in &targets {
+        let def = match resolve(root, name) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("error: {name}: {e}");
+                any_error = true;
+                continue;
+            }
+        };
+        let diags = validate(&def);
+        if diags.is_empty() {
+            println!("{name}: ok");
+        } else {
+            for d in &diags {
+                let loc = d
+                    .path
+                    .as_ref()
+                    .map(|p| format!(" ({})", p.display()))
+                    .unwrap_or_default();
+                println!("{name}: {}{loc}: {}", d.severity, d.message);
+            }
+            if diags.iter().any(|d| d.severity == Severity::Error) {
+                any_error = true;
+            }
+        }
+    }
+
+    if any_error {
+        std::process::exit(1);
     }
     Ok(())
 }
