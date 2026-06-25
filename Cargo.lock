@@ -3127,6 +3127,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-memory"
+version = "0.1.0"
+dependencies = [
+ "ocean-context",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "ocean-plugin"
 version = "0.1.0"
 dependencies = [
