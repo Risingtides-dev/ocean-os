@@ -29,10 +29,13 @@
     <string>/Users/risingtidesdev/dev/ocean-os/deploy/ocean-daemon.sh</string>
   </array>
 
-  <!-- The daemon runs with the ocean-os repo root as cwd (matches the prior
-       hand-launch; the binary resolves some paths relative to cwd). -->
+  <!-- Neutral cwd ($HOME), NOT the repo. The daemon is workspace-agnostic
+       (turns carry their own cwd); its startup guard refuses to boot from
+       inside a git repo so unbound fallback turns don't bind to ocean-os
+       (see main.rs, OCEAN_ALLOW_REPO_CWD). deploy/ocean-daemon.sh also cd's
+       here. BIN is resolved absolutely, so repo-cwd isn't needed. -->
   <key>WorkingDirectory</key>
-  <string>/Users/risingtidesdev/dev/ocean-os</string>
+  <string>/Users/risingtidesdev</string>
 
   <!-- Respawn on crash/exit. launchd's KeepAlive can't natively curl /health;
        respawn-on-exit is the right primitive — a daemon that exits (crash, OOM,

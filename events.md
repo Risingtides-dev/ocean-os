@@ -1095,3 +1095,48 @@ scope-filtering live closure, and asserts the scoped client gets nothing deliver
 occurrence counter ticks, and the dropped sum stays 0. Full gate green on 1.96.0: build,
 test (235 passed, +1), clippy -D warnings, fmt --check.
 _________________________________________________________________________________
+
+time:      [02:44am] [25-06-26]
+agent:     [pi]
+worktree:  [main]
+type:      [bug report]
+area:      [backend]
+
+Supervised daemon crash-loop on fresh main: the cwd-neutrality startup guard (refuses to
+boot inside a git repo so unbound fallback turns don't bind to ocean-os; OCEAN_ALLOW_REPO_CWD
+opts out) was added to ocean-daemon::main, but the OCEAN-253 launchd surface was never updated
+to match — deploy/ocean-daemon.sh force-`cd "$REPO"` and the plist WorkingDirectory pointed at
+the repo root, so the freshly-built binary bailed on every respawn (state=spawn scheduled,
+nothing on :4780). Operator asked to get the daemon running on latest main and reap stale
+instances. Fix chosen to HONOR the guard rather than defeat it: run the daemon from a neutral
+cwd ($HOME) — the sanctioned neutral dir the guard's own error message recommends — since the
+daemon is workspace-agnostic (turns carry their own cwd; process cwd is only the unbound/legacy
+fallback anchor, per OCEAN_WORKSPACE_BINDING.md). Changed deploy/ocean-daemon.sh to cd a
+NEUTRAL_CWD ($HOME, overridable via OCEAN_DAEMON_CWD) and still exec the absolute BIN; changed
+the plist WorkingDirectory to /Users/risingtidesdev; corrected the now-stale comments claiming
+the binary resolves paths relative to repo cwd. Did NOT set OCEAN_ALLOW_REPO_CWD=1 — that would
+recreate the "every session reverts to ocean-os" trap the guard prevents. Reinstalled via
+ops/install-ocean-daemon.sh (release build from 12ea25c = origin/main HEAD; plist re-copied;
+job bootstrapped). Verified: /health -> {"ok":true}, launchd state=running keepalive|runatload
+(now survives reboot — it was not even loaded before), single daemon PID on :4780, cwd=$HOME.
+Also reaped an orphaned ocean-tui (PID 96096, ~1d9h old, Jun 14 build); left the active TUI.
+Two tracked files modified, uncommitted pending Knox (merge gate) — see git status.
+_________________________________________________________________________________
+
+time:      [04:53pm] [06-25-26]
+agent:     [pi] [gpt-5]
+worktree:  [main]
+type:      feature-request
+area:      backend/writing
+
+Ocean Rooms focus: implemented C Tier-1 read-before-answer context for room auto-convene without using Claude agents/subagents. `spawn_room_agent_turn` now builds the woken agent prompt from the current room roster, resolved workspace/git state (`git_root`, branch, latest head, bounded `git status --short`), and the recent transcript tail instead of transcript-only context. Added a prompt-builder regression test. Also documented that B is handled by folder-as-agent profiles, updated `docs/OCEAN_ROOMS_COLLABORATION_MODEL.md`, and added `docs/specs/ocean-room-execution-isolation.md` as the A plan for worktree-backed room execution/promotion. Verification green: `cargo fmt --all -- --check`, `cargo test -p ocean-daemon` (237 passed), and `cargo check --workspace`.
+_________________________________________________________________________________
+
+time:      [05:08pm] [06-25-26]
+agent:     [pi] [gpt-5]
+worktree:  [main]
+type:      workflow
+area:      backend
+
+Synced local `main` after user-submitted GitHub work. Created safety branch `backup/pre-sync-main-20260625-170651`, saved patch `/tmp/ocean-os-pre-sync-20260625-170651.patch`, stashed dirty local work, fast-forwarded main from 12ea25c to origin/main 789aeee, and reapplied the stash with no conflicts. Pulled in the typed SQLite `ocean-memory` crate from `d5467db` plus later checkpoint/revert commits; updated the root crate map to include `ocean-memory`. Validation after sync stayed green: `cargo check --workspace`, `cargo fmt --all -- --check`, and `cargo test -p ocean-daemon` (237 passed). Kept `stash@{0}` as a recovery copy until the dirty local work is committed or intentionally dropped.
+_________________________________________________________________________________
