@@ -11,13 +11,13 @@ anyhow.workspace = true
 clap.workspace = true
 regex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile = "3"
 
 [[bin]]

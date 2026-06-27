@@ -6,6 +6,7 @@
 
 pub mod claim;
 pub mod extract;
+pub mod okf;
 pub mod replay;
 pub mod seams;
 pub mod store;
