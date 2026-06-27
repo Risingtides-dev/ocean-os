@@ -237,6 +237,88 @@ pub fn normalize(type_name: &str, mut fields: Fields) -> (Fields, Vec<Diagnostic
     (fields, diags)
 }
 
+/// The on-disk shape a source artifact carries its machine fields in. Each maps
+/// to a thin parser that produces [`Fields`]; from there [`normalize`] and
+/// [`validate`] are format-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `+++`-delimited TOML frontmatter (codified handoffs — see `store.rs`).
+    Toml,
+    /// `---`-delimited YAML frontmatter (vault notes, memory files).
+    Yaml,
+    /// A single `events.md` entry: `key: value` header lines up to the first
+    /// blank line, then prose. Caller splits the ledger into entries first.
+    Devlog,
+}
+
+/// Pull the frontmatter block delimited by `delim` (`+++` or `---`) off the top
+/// of `text`. Returns `None` when the file doesn't open with the delimiter —
+/// an artifact with no machine fields, which validation reports as missing, not
+/// a parse error.
+fn frontmatter<'a>(text: &'a str, delim: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(delim)?.strip_prefix('\n')?;
+    let end = rest.find(&format!("\n{delim}"))?;
+    Some(&rest[..end])
+}
+
+/// Parse one devlog entry's header (`key:   value` lines until the first blank
+/// line) into [`Fields`]. Splits on the first `:` so values may themselves
+/// contain colons (`[12:34pm]`); a line whose key has whitespace ends the header
+/// (it's prose, not a field).
+fn parse_devlog(text: &str) -> Fields {
+    let mut out = Fields::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            break; // blank line ends the header block
+        }
+        let Some((key, val)) = line.split_once(':') else { break };
+        let key = key.trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            break; // not a `key: value` header line → start of prose
+        }
+        let val = val.trim();
+        if !val.is_empty() {
+            out.insert(key.to_string(), serde_json::Value::String(val.to_string()));
+        }
+    }
+    out
+}
+
+/// Parse source `text` of the given [`Source`] into a field-map. A missing
+/// frontmatter block yields empty fields (validation surfaces what's absent); a
+/// *present but malformed* block is an `Err` — a real parse failure the caller
+/// can skip, mirroring `store.rs`'s treatment of a bad claims block.
+pub fn parse(source: Source, text: &str) -> anyhow::Result<Fields> {
+    let from_object = |v: serde_json::Value| -> Fields {
+        match v {
+            serde_json::Value::Object(m) => m.into_iter().collect(),
+            _ => Fields::new(), // a scalar/array frontmatter has no named fields
+        }
+    };
+    Ok(match source {
+        // ponytail: deserialize straight to serde_json::Value. Ceiling: a TOML
+        // datetime would deserialize oddly, but handoff frontmatter carries none
+        // (written_at is an i64). Switch to toml::Value → json if that changes.
+        Source::Toml => match frontmatter(text, "+++") {
+            Some(fm) => from_object(toml::from_str(fm)?),
+            None => Fields::new(),
+        },
+        Source::Yaml => match frontmatter(text, "---") {
+            Some(fm) => from_object(serde_yaml_ng::from_str(fm)?),
+            None => Fields::new(),
+        },
+        Source::Devlog => parse_devlog(text),
+    })
+}
+
+/// End-to-end: parse `text` as `source`, then [`normalize`] it as concept
+/// `type_name` (apply `maps_from` migrations, then validate). The single entry
+/// point a producer calls to turn a messy on-disk artifact into a conforming
+/// concept plus its work-items.
+pub fn load(source: Source, type_name: &str, text: &str) -> anyhow::Result<(Fields, Vec<Diagnostic>)> {
+    Ok(normalize(type_name, parse(source, text)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +410,58 @@ mod tests {
         let (norm, _) = normalize("memory", raw);
         assert_eq!(norm.get("type").and_then(|v| v.as_str()), Some("memory"));
         assert_eq!(norm.get("kind").and_then(|v| v.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn load_toml_handoff_frontmatter_conforms() {
+        // The real `+++`-delimited handoff frontmatter (store.rs format), loaded
+        // as a handoff: every required field present, claims block ignored.
+        let text = "+++\nsession_id = \"s-1\"\nrepo = \"ocean-os\"\nbranch = \"main\"\n\
+                    commit_anchor = \"abc1234\"\nwritten_at = 1780000000\n+++\n\nnarrative here";
+        let (f, diags) = load(Source::Toml, "handoff", text).unwrap();
+        assert_eq!(f.get("repo").and_then(|v| v.as_str()), Some("ocean-os"));
+        assert!(diags.is_empty(), "handoff conforms: {diags:?}");
+    }
+
+    #[test]
+    fn load_yaml_memory_frontmatter_heals() {
+        // A real metadata-nested memory file as YAML frontmatter: loading lifts
+        // metadata.type → kind, healing the needs-migration warning.
+        let text = "---\nname: campaign-hub-real-data\nmetadata:\n  node_type: memory\n  \
+                    type: project\n---\n\nthe fact body";
+        let (f, diags) = load(Source::Yaml, "memory", text).unwrap();
+        assert_eq!(f.get("kind").and_then(|v| v.as_str()), Some("project"));
+        assert_eq!(f.get("title").and_then(|v| v.as_str()), Some("campaign-hub-real-data"));
+        assert!(diags.iter().all(|d| d.severity != Severity::Error), "healed: {diags:?}");
+    }
+
+    #[test]
+    fn load_devlog_entry_parses_header_and_maps_type() {
+        // One events.md entry: header lines (with colon-bearing values) up to the
+        // blank line; prose ignored; inner `type:` understood as category.
+        let text = "time:      [12:34pm] [06-15-26]\nagent:     [claude] [opus 4.8]\n\
+                    worktree:  feat/voice-agent\ntype:      feature-request\narea:      backend\n\n\
+                    What I did and why. Plain prose: with a colon even.\n___________";
+        let (f, diags) = load(Source::Devlog, "event", text).unwrap();
+        assert_eq!(f.get("time").and_then(|v| v.as_str()), Some("[12:34pm] [06-15-26]"));
+        assert_eq!(f.get("category").and_then(|v| v.as_str()), Some("feature-request"));
+        assert!(!f.contains_key("What I did and why. Plain prose"), "prose is not a field");
+        assert!(diags.is_empty(), "event conforms: {diags:?}");
+    }
+
+    #[test]
+    fn absent_frontmatter_is_empty_not_error() {
+        // A bare markdown file (no delimiters) parses to empty fields — validation
+        // then reports what's missing, rather than the parse bouncing.
+        let (f, _) = load(Source::Yaml, "note", "# just a heading\n\nbody").unwrap();
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn malformed_frontmatter_is_a_parse_error() {
+        // Delimiters present but the YAML inside is broken → Err, so the caller
+        // can skip the file (mirrors store.rs's unparseable-claims handling).
+        let bad = "---\nname: [unterminated\n  : : :\n---\nbody";
+        assert!(parse(Source::Yaml, bad).is_err());
     }
 }
