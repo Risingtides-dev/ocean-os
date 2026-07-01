@@ -1218,3 +1218,12 @@ existing thinking-level metadata changes in this worktree. Checks green:
 smoke test verified initialize returns `sessionCapabilities: { list: {} }` and
 `session/list` returns real sessions for `/Users/risingtidesdev/dev/ocean-agents`.
 _________________________________________________________________________________
+
+time:      [06:01pm] [07-01-26]
+agent:     [claude] [fable 5]
+worktree:  main
+type:      [workflow]
+area:      [infra]
+
+Phase-0 stabilization complete across the quad (per ocean-discovery/06-orchestration-plan.md). ocean-os: landed the in-flight tree as PR #267 (neutral-cwd supervised-daemon fix — was live-but-unmerged and would have regressed on next deploy — plus docs reorg + ACP session/list + thinking-level), hardened by a max-effort 10-angle review (10 findings fixed incl. session/list→prompt fork-instead-of-resume, case-sensitive thinking-level drop, launcher crash-loop guards, 8 dangling doc refs; review record on the PR). Unblocked the rolling-toolchain fmt gate workspace-wide (PR #268, rustfmt 1.96.1). Stashes: 5→0 — rooms workspace-packet WIP became rescue/ocean-rooms-workspace-packet (recovering the lost ocean-room-execution-isolation spec), the rest archived as patches on backup/stash-archive-20260701. Branches: 13 remote deleted with file-diff proof, 62 boarded (57 near-certain deletable, see ocean-discovery/08-branch-triage-ocean-os.md). Sibling repos: surface pushed+PR#96 (vscode extension pass)+8 branches pruned; agents landed docs+found the missing content-agent design spec on design/content-agent-slack-assistant; bedrock landed docs+HANDOFF refresh+6 branches pruned; longhouse-deck first-pushed to a private origin; swift-widget markdown wip rebased+PR#1. All repos now on main/master, clean trees.
+_________________________________________________________________________________
