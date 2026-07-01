@@ -16,6 +16,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 - Walk from repo root to your target path and read every AGENTS.md along the route.
 - Use the nearest AGENTS.md as the local contract; parent docs set repo-wide rules.
 - No child doc may weaken this root contract.
+- Cross-repo routing map: `docs/OCEAN_PROJECT_MAP.md`.
 - After any meaningful change, do a devlog pass: update the nearest owning AGENTS.md, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`.
 
 ## Crate Map
@@ -28,6 +29,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 | `ocean-providers` | Provider registry: model routing, credentials, readiness |
 | `ocean-agent` | Session/history layer — session load/save lives here |
 | `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
+| `ocean-memory` | Typed SQLite memory store and ingest helpers |
 | `ocean-daemon` | Long-running HTTP service on `:4780` |
 | `ocean-cli` | CLI client |
 | `ocean-tui` | Terminal steering cockpit (`ocean` binary) |
@@ -38,6 +40,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 - TUI change: `cargo build -p ocean-tui --release`
 - Daemon restarts: standing authorization to restart from `main`; use specific-PID kill, not blind pkill
 - Daemon health: `GET /health` (not `/v1/health`)
+- Supervised daemon (`dev.risingtides.ocean-daemon` LaunchAgent): install/reinstall via `ops/install-ocean-daemon.sh` (builds from `main`, copies plist, bootstraps launchd, `keepalive|runatload` so it survives reboot). Ship new code: rebuild from `main`, then `launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon`. The daemon must run from a NEUTRAL cwd (`$HOME`), NOT the repo — its startup guard refuses to boot inside a git repo so unbound fallback turns don't bind to ocean-os; do NOT paper over this with `OCEAN_ALLOW_REPO_CWD=1`.
 - Sessions live in the daemon only — session bugs break both TUI and ocean-surface simultaneously
 
 ## Verification

@@ -57,5 +57,5 @@ Standing authorization (set 2026-06-13): the factory loop may restart/redeploy t
 ## More context
 
 - Architecture: `docs/ARCHITECTURE.md`
-- Repo routing / Linear rules: `docs/CLAUDE.md`, `docs/AGENTS.md`
+- Repo routing / Linear rules: `docs/linear-teams-routing.md`, `docs/AGENTS.md`
 - Operator guide: `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`

@@ -17,7 +17,9 @@ your origin surface (TUI / PWA).
    ```
 3. Build + run the daemon:
    ```bash
-   cargo build --workspace --release && ./target/release/ocean-daemon
+   cargo build --workspace --release && OCEAN_ALLOW_REPO_CWD=1 ./target/release/ocean-daemon
+   # (OCEAN_ALLOW_REPO_CWD=1: the startup guard refuses a repo cwd; supervised
+   #  launches run from $HOME instead — see deploy/ocean-daemon.sh.)
    ```
 
 The extension is optional — without it, Ocean still fully drives Chrome; you

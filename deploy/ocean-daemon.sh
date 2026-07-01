@@ -8,9 +8,13 @@
 # ops/install-ocean-daemon.sh) from MAIN, per the operator's build-from-main
 # rule. To pick up new code: rebuild from main, then kickstart -k (see ops/README).
 #
-# Mirrors what the daemon was hand-launched as before this ticket:
-#     cd <repo> && OCEAN_YOLO=1 ./target/release/ocean-daemon
-# i.e. cwd = repo root, env = OCEAN_YOLO=1, default bind 127.0.0.1:4780.
+# cwd is NEUTRAL ($HOME), not the repo. The daemon is workspace-agnostic
+# (turns carry their own cwd); its startup guard refuses to boot from inside a
+# git repo so unbound fallback turns don't bind to ocean-os (see main.rs,
+# OCEAN_ALLOW_REPO_CWD). Pre-guard this mirrored the hand-launch
+# (cd <repo> && OCEAN_YOLO=1 ./target/release/ocean-daemon); the guard made that
+# cwd invalid, so we run from $HOME instead. BIN is resolved absolutely, so
+# repo-cwd isn't needed to find the binary. Override via OCEAN_DAEMON_CWD.
 set -euo pipefail
 
 # Repo root = parent of this deploy/ dir, resolved absolutely (symlink-safe).
@@ -19,7 +23,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Toolchain + common bins on PATH (launchd starts with a minimal PATH). The
 # daemon shells out to tools (git, ripgrep, etc.) for its own tool calls, so a
 # sane PATH matters even though this script doesn't compile anything.
-export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# ${HOME:-} so an unset HOME degrades to a system PATH instead of tripping
+# `set -u` before the clearer NEUTRAL_CWD diagnostics below can run.
+export PATH="${HOME:-}/.rustup/toolchains/stable-aarch64-apple-darwin/bin:${HOME:-}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 BIN="$REPO/target/release/ocean-daemon"
 if [[ ! -x "$BIN" ]]; then
@@ -36,6 +42,23 @@ fi
 #   OCEAN_ASSISTANTS_DIR    -> optional; defaults to ~/.config/ocean-rs/assistants.
 export OCEAN_YOLO="${OCEAN_YOLO:-1}"
 
-echo "==> ocean-daemon: cwd=$REPO yolo=$OCEAN_YOLO bind=${OCEAN_BIND:-127.0.0.1:4780}"
-cd "$REPO"
+# Run from a NEUTRAL cwd so the startup guard's repo-cwd check passes and the
+# unbound-turn fallback anchor is harmless (home, not ocean-os).
+#
+# Guarded explicitly rather than leaning on `${..:-$HOME}` under `set -u`: if
+# HOME is unset/empty (LaunchDaemon context, odd session bootstraps) or
+# OCEAN_DAEMON_CWD points at a missing dir, fail with a clear FATAL line
+# instead of a cryptic bash error inside a 10s KeepAlive crash loop.
+NEUTRAL_CWD="${OCEAN_DAEMON_CWD:-${HOME:-}}"
+if [[ -z "$NEUTRAL_CWD" ]]; then
+  echo "FATAL: no neutral cwd — HOME is unset/empty and OCEAN_DAEMON_CWD is not set." >&2
+  echo "       Set OCEAN_DAEMON_CWD to a directory outside any git repo." >&2
+  exit 78 # EX_CONFIG
+fi
+if [[ ! -d "$NEUTRAL_CWD" ]]; then
+  echo "FATAL: neutral cwd '$NEUTRAL_CWD' does not exist (check OCEAN_DAEMON_CWD)." >&2
+  exit 78 # EX_CONFIG
+fi
+echo "==> ocean-daemon: cwd=$NEUTRAL_CWD (neutral) bin=$BIN yolo=$OCEAN_YOLO bind=${OCEAN_BIND:-127.0.0.1:4780}"
+cd "$NEUTRAL_CWD"
 exec "$BIN"

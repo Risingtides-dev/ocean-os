@@ -32,15 +32,19 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, CurrentModeUpdate, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionMode,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    StopReason, ToolCallUpdate, ToolCallUpdateFields,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result as AcpResult, Stdio};
 use anyhow::Context;
 use clap::Parser;
+use ocean_agent_sdk::ThinkingLevel;
+use serde_json::Value;
 
 use convert::{event_to_update, stop_reason_for, text_block};
 use daemon::{DaemonClient, DEFAULT_BASE_URL};
@@ -251,9 +255,12 @@ async fn main() -> AcpResult<()> {
                 async move |req: InitializeRequest, responder, _conn| {
                     // Advertise the protocol version the client asked for (the
                     // SDK negotiates; echoing the request version is correct for
-                    // a v1 agent). Capabilities: we can load sessions by id.
+                    // a v1 agent). Capabilities: load by id and list the
+                    // daemon-owned session roster.
                     let mut caps = AgentCapabilities::default();
                     caps.load_session = true;
+                    caps.session_capabilities =
+                        SessionCapabilities::new().list(SessionListCapabilities::new());
                     responder.respond(
                         InitializeResponse::new(req.protocol_version).agent_capabilities(caps),
                     )
@@ -418,6 +425,52 @@ async fn main() -> AcpResult<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // --- session/list (daemon-owned roster) ---------------------------
+        .on_receive_request(
+            {
+                let client = client.clone();
+                async move |req: ListSessionsRequest, responder, _conn| {
+                    match client
+                        .list_sessions(req.cwd.as_deref(), req.cursor.as_deref())
+                        .await
+                    {
+                        Ok(daemon_resp) => {
+                            let sessions = daemon_resp
+                                .sessions
+                                .into_iter()
+                                .map(|session| {
+                                    let mut info = SessionInfo::new(
+                                        SessionId::new(session.id.to_string()),
+                                        session.cwd,
+                                    );
+                                    // Empty daemon title (never-prompted session)
+                                    // maps to None so editors render their own
+                                    // "Untitled" placeholder instead of a blank row.
+                                    info.title =
+                                        Some(session.title).filter(|t| !t.trim().is_empty());
+                                    info.updated_at = Some(session.updated_at.to_rfc3339());
+                                    info
+                                })
+                                .collect();
+                            let mut response = ListSessionsResponse::new(sessions);
+                            response.next_cursor = daemon_resp.next_cursor;
+                            responder.respond(response)
+                        }
+                        Err(err) => {
+                            // Surface the failure to the editor rather than
+                            // responding with an empty-but-successful list: an
+                            // unreachable daemon must not be indistinguishable
+                            // from "this workspace has no saved sessions".
+                            tracing::warn!(error = %err, "session/list: daemon list failed");
+                            responder.respond_with_internal_error(format!(
+                                "daemon session list failed: {err}"
+                            ))
+                        }
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         // --- session/set_mode (per-session model selection) ----------------
         .on_receive_request(
             {
@@ -461,22 +514,45 @@ async fn main() -> AcpResult<()> {
                 async move |req: PromptRequest, responder, conn: ConnectionTo<Client>| {
                     let session_id = req.session_id.0.to_string();
                     let prompt = flatten_prompt(&req);
+                    let thinking_level = thinking_level_from_meta(&req);
 
                     let cwd = match sessions.cwd(&session_id) {
                         Some(cwd) => cwd,
                         None => {
                             // Normally session/new (or session/load on resume)
-                            // populates the cwd. If we still miss — a stray prompt
-                            // for a session we never saw — fall back to the process
-                            // cwd so we never wedge.
-                            tracing::warn!(
-                                %session_id,
-                                "session/prompt for a session with no recorded cwd; \
-                                 falling back to the process cwd"
-                            );
-                            std::env::current_dir()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| ".".to_string())
+                            // populates the cwd. A miss is NOT necessarily a
+                            // stray prompt: a client may go session/list →
+                            // session/prompt without an intervening load, or
+                            // the bridge may have restarted while the editor
+                            // held live session ids. In both cases the ACP id
+                            // IS the daemon id (OCEAN-213), so resolve against
+                            // the daemon first — otherwise we'd submit
+                            // daemon_id=None under the process cwd and fork a
+                            // fresh transcript instead of resuming (the same
+                            // bug class as Codex P1 #137, via a different door).
+                            match client.session_cwd(&session_id).await {
+                                Ok(Some(daemon_cwd)) => {
+                                    sessions.insert_with_daemon_id(
+                                        session_id.clone(),
+                                        daemon_cwd.clone(),
+                                        Some(session_id.clone()),
+                                    );
+                                    daemon_cwd
+                                }
+                                Ok(None) | Err(_) => {
+                                    // Genuinely unknown (or daemon unreachable):
+                                    // fall back to the process cwd so we never
+                                    // wedge; the daemon will mint a session.
+                                    tracing::warn!(
+                                        %session_id,
+                                        "session/prompt for a session with no recorded cwd \
+                                         and no daemon match; falling back to the process cwd"
+                                    );
+                                    std::env::current_dir()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| ".".to_string())
+                                }
+                            }
                         }
                     };
 
@@ -493,7 +569,13 @@ async fn main() -> AcpResult<()> {
                         let conn = conn.clone();
                         async move {
                             let stop = match run_turn(
-                                &client, &sessions, &conn, &session_id, prompt, cwd,
+                                &client,
+                                &sessions,
+                                &conn,
+                                &session_id,
+                                prompt,
+                                cwd,
+                                thinking_level,
                             )
                             .await
                             {
@@ -632,6 +714,7 @@ async fn run_turn(
     acp_session_id: &str,
     prompt: String,
     cwd: String,
+    thinking_level: Option<ThinkingLevel>,
 ) -> anyhow::Result<StopReason> {
     // Resolve the daemon's session id to submit with.
     //
@@ -699,7 +782,14 @@ async fn run_turn(
         let decision_token = decision_token.clone();
         Some(tokio::spawn(async move {
             client
-                .submit_turn(prompt, cwd, known_daemon_id, model_id, Some(decision_token))
+                .submit_turn(
+                    prompt,
+                    cwd,
+                    known_daemon_id,
+                    model_id,
+                    thinking_level,
+                    Some(decision_token),
+                )
                 .await
         }))
     };
@@ -1055,6 +1145,34 @@ fn flatten_prompt(req: &PromptRequest) -> String {
     out
 }
 
+fn thinking_level_from_meta(req: &PromptRequest) -> Option<ThinkingLevel> {
+    // Only the namespaced `_meta.ocean.thinking_level` form is supported: ACP's
+    // `_meta` is a namespace-per-implementation extension bag, and the one real
+    // producer (the ocean-surface VS Code/Cursor extension) sends exactly this
+    // shape. A flat `_meta.thinking_level` fallback existed briefly but had no
+    // producer and would squat on other implementations' namespace.
+    let raw = req
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("ocean"))
+        .and_then(|ocean| ocean.get("thinking_level"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|level| !level.is_empty())?;
+
+    // `ThinkingLevel` is #[serde(rename_all = "lowercase")]; accept "High" /
+    // "HIGH" from clients that stringify variant names rather than silently
+    // dropping the user's explicit override to the daemon default.
+    let normalized = raw.to_ascii_lowercase();
+    match serde_json::from_value::<ThinkingLevel>(Value::String(normalized)) {
+        Ok(level) => Some(level),
+        Err(err) => {
+            tracing::warn!(%raw, error = %err, "ignoring invalid ACP thinking_level");
+            None
+        }
+    }
+}
+
 /// Extract the `turn_id` carried by a turn-scoped daemon event, as a String.
 ///
 /// The daemon's per-turn `request_id` IS the `turn_id`, so this is also how the
@@ -1193,16 +1311,72 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_load_session_capability() {
-        // We honour session/load (it repopulates cwd), so the advertised
-        // capability must stay `true`. If a future change drops the handler,
-        // this guards against silently advertising an unhonored capability.
+    fn initialize_advertises_session_lifecycle_capabilities() {
+        // We honour session/load and session/list, so advertised capabilities
+        // must stay in sync with the handlers above.
         let mut caps = agent_client_protocol::schema::AgentCapabilities::default();
         caps.load_session = true;
+        caps.session_capabilities = SessionCapabilities::new().list(SessionListCapabilities::new());
         assert!(
             caps.load_session,
             "ocean-acp implements session/load and must advertise it"
         );
+        assert!(
+            caps.session_capabilities.list.is_some(),
+            "ocean-acp implements session/list and must advertise it"
+        );
+    }
+
+    #[test]
+    fn thinking_level_meta_extracts_ocean_namespace() {
+        let mut ocean = serde_json::Map::new();
+        ocean.insert("thinking_level".into(), Value::String("high".into()));
+        let mut meta = serde_json::Map::new();
+        meta.insert("ocean".into(), Value::Object(ocean));
+        let req = PromptRequest::new("session", vec!["hello".to_string().into()]).meta(meta);
+
+        assert_eq!(thinking_level_from_meta(&req), Some(ThinkingLevel::High));
+    }
+
+    #[test]
+    fn thinking_level_meta_ignores_invalid_values() {
+        let mut ocean = serde_json::Map::new();
+        ocean.insert("thinking_level".into(), Value::String("turbo".into()));
+        let mut meta = serde_json::Map::new();
+        meta.insert("ocean".into(), Value::Object(ocean));
+        let req = PromptRequest::new("session", vec!["hello".to_string().into()]).meta(meta);
+
+        assert_eq!(thinking_level_from_meta(&req), None);
+    }
+
+    #[test]
+    fn thinking_level_meta_is_case_insensitive() {
+        // Clients that stringify Rust-style variant names ("High", "XHIGH")
+        // must not silently lose the user's explicit per-turn override.
+        for raw in ["High", "HIGH", "xHigh", "XHIGH"] {
+            let mut ocean = serde_json::Map::new();
+            ocean.insert("thinking_level".into(), Value::String(raw.into()));
+            let mut meta = serde_json::Map::new();
+            meta.insert("ocean".into(), Value::Object(ocean));
+            let req = PromptRequest::new("session", vec!["hello".to_string().into()]).meta(meta);
+
+            assert!(
+                thinking_level_from_meta(&req).is_some(),
+                "expected {raw:?} to parse case-insensitively"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_level_meta_flat_key_is_not_read() {
+        // Only the namespaced `_meta.ocean.thinking_level` is Ocean's; a flat
+        // `_meta.thinking_level` may belong to another implementation's
+        // extension and must not be consumed.
+        let mut meta = serde_json::Map::new();
+        meta.insert("thinking_level".into(), Value::String("high".into()));
+        let req = PromptRequest::new("session", vec!["hello".to_string().into()]).meta(meta);
+
+        assert_eq!(thinking_level_from_meta(&req), None);
     }
 
     #[test]

@@ -70,9 +70,11 @@ Provider env-var lookup order is documented in [`crates/ocean-providers/src/lib.
 
 ## Architecture
 
+Cross-repo routing and ownership map: [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md).
+
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the daemon ↔ client model, and [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md) for runtime ops.
 
-TUI design: [`docs/OCEAN_TUI_MOCKUPS.md`](docs/OCEAN_TUI_MOCKUPS.md), [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](docs/OCEAN_TUI_TIDES_MESH_PARITY.md), [`docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md).
+TUI design: [`docs/OCEAN_TUI_MOCKUPS.md`](docs/OCEAN_TUI_MOCKUPS.md), [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](docs/OCEAN_TUI_TIDES_MESH_PARITY.md).
 
 Internals: [`docs/OCEAN_NATIVE_INTERNALS_MAP.md`](docs/OCEAN_NATIVE_INTERNALS_MAP.md).
 
@@ -88,4 +90,4 @@ See [`NOTICE.md`](NOTICE.md).
 
 ## Contributing
 
-See [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md). For repo routing and Linear team rules, see [`docs/CLAUDE.md`](docs/CLAUDE.md) and [`docs/AGENTS.md`](docs/AGENTS.md).
+See [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md). For repo routing and Linear team rules, see [`docs/linear-teams-routing.md`](docs/linear-teams-routing.md) and [`docs/AGENTS.md`](docs/AGENTS.md).

@@ -682,7 +682,7 @@ pub enum RoomParticipantKind {
 /// A **persistent room entity** (OCEAN-39).
 ///
 /// This is the durable data-model foundation for Ocean Rooms described in
-/// `docs/OCEAN_ROOMS_COLLABORATION_MODEL.md`: a room that owns a participant
+/// `docs/.agentarchive/OCEAN_ROOMS_COLLABORATION_MODEL.md` (archived): a room that owns a participant
 /// roster, identity, timestamps, and an optional trigger policy. It is
 /// deliberately distinct from [`RoomSnapshot`], which is a *projection* of
 /// runtime state for a Track-0 panel view — `Room` is the thing that is stored,

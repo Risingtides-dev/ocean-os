@@ -116,7 +116,7 @@ ocean-tui
   under daemon authority.
 
   Main layout/parity references:
-  - docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md
+  - docs/.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md (archived)
   - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
 ```
 
