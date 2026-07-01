@@ -2,7 +2,7 @@
 
 Status: **shipped** — registry (Phase 2) + MCP client over stdio (Phase 3).
 This is the Goose-comparison audit's #1 unlock
-(`docs/GOOSE_COMPARISON_AND_EXTENSIONS_GUIDANCE.md`): tools load *dynamically*
+(`docs/.agentarchive/GOOSE_COMPARISON_AND_EXTENSIONS_GUIDANCE.md`, archived): tools load *dynamically*
 through one seam instead of being hardcoded into the agent. The audit explicitly
 warns against wiring the `tools.env` keys (Linear/Slack/Brave/…) as one-off
 native Rust tools — they plug in here, as MCP servers, behind one trait.

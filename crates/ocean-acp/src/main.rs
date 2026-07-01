@@ -453,8 +453,14 @@ async fn main() -> AcpResult<()> {
                             responder.respond(response)
                         }
                         Err(err) => {
+                            // Surface the failure to the editor rather than
+                            // responding with an empty-but-successful list: an
+                            // unreachable daemon must not be indistinguishable
+                            // from "this workspace has no saved sessions".
                             tracing::warn!(error = %err, "session/list: daemon list failed");
-                            responder.respond(ListSessionsResponse::new(Vec::new()))
+                            responder.respond_with_internal_error(format!(
+                                "daemon session list failed: {err}"
+                            ))
                         }
                     }
                 }
@@ -1114,19 +1120,25 @@ fn flatten_prompt(req: &PromptRequest) -> String {
 }
 
 fn thinking_level_from_meta(req: &PromptRequest) -> Option<ThinkingLevel> {
+    // Only the namespaced `_meta.ocean.thinking_level` form is supported: ACP's
+    // `_meta` is a namespace-per-implementation extension bag, and the one real
+    // producer (the ocean-surface VS Code/Cursor extension) sends exactly this
+    // shape. A flat `_meta.thinking_level` fallback existed briefly but had no
+    // producer and would squat on other implementations' namespace.
     let raw = req
         .meta
         .as_ref()
-        .and_then(|meta| {
-            meta.get("ocean")
-                .and_then(|ocean| ocean.get("thinking_level"))
-                .or_else(|| meta.get("thinking_level"))
-        })
+        .and_then(|meta| meta.get("ocean"))
+        .and_then(|ocean| ocean.get("thinking_level"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|level| !level.is_empty())?;
 
-    match serde_json::from_value::<ThinkingLevel>(Value::String(raw.to_string())) {
+    // `ThinkingLevel` is #[serde(rename_all = "lowercase")]; accept "High" /
+    // "HIGH" from clients that stringify variant names rather than silently
+    // dropping the user's explicit override to the daemon default.
+    let normalized = raw.to_ascii_lowercase();
+    match serde_json::from_value::<ThinkingLevel>(Value::String(normalized)) {
         Ok(level) => Some(level),
         Err(err) => {
             tracing::warn!(%raw, error = %err, "ignoring invalid ACP thinking_level");
@@ -1306,6 +1318,36 @@ mod tests {
         ocean.insert("thinking_level".into(), Value::String("turbo".into()));
         let mut meta = serde_json::Map::new();
         meta.insert("ocean".into(), Value::Object(ocean));
+        let req = PromptRequest::new("session", vec!["hello".to_string().into()]).meta(meta);
+
+        assert_eq!(thinking_level_from_meta(&req), None);
+    }
+
+    #[test]
+    fn thinking_level_meta_is_case_insensitive() {
+        // Clients that stringify Rust-style variant names ("High", "XHIGH")
+        // must not silently lose the user's explicit per-turn override.
+        for raw in ["High", "HIGH", "xHigh", "XHIGH"] {
+            let mut ocean = serde_json::Map::new();
+            ocean.insert("thinking_level".into(), Value::String(raw.into()));
+            let mut meta = serde_json::Map::new();
+            meta.insert("ocean".into(), Value::Object(ocean));
+            let req = PromptRequest::new("session", vec!["hello".to_string().into()]).meta(meta);
+
+            assert!(
+                thinking_level_from_meta(&req).is_some(),
+                "expected {raw:?} to parse case-insensitively"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_level_meta_flat_key_is_not_read() {
+        // Only the namespaced `_meta.ocean.thinking_level` is Ocean's; a flat
+        // `_meta.thinking_level` may belong to another implementation's
+        // extension and must not be consumed.
+        let mut meta = serde_json::Map::new();
+        meta.insert("thinking_level".into(), Value::String("high".into()));
         let req = PromptRequest::new("session", vec!["hello".to_string().into()]).meta(meta);
 
         assert_eq!(thinking_level_from_meta(&req), None);

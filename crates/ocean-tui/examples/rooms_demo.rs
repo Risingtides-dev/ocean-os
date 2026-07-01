@@ -334,7 +334,7 @@ fn draw_room_writers(frame: &mut ratatui::Frame<'_>, area: Rect) {
             "- TUI Room Shell PRD (review)",
             "",
             "# Sources",
-            "- docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md",
+            "- docs/.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md",
             "- docs/research/ratatui-impl-brief.md",
             "",
             "# Actions",

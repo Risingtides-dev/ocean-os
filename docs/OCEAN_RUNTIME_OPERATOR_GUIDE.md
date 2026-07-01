@@ -18,10 +18,12 @@ Current crates in the operator path:
 
 ## Startup
 
-From the repo root:
+From the repo root (`OCEAN_ALLOW_REPO_CWD=1` is required for a dev launch
+from inside the git tree — the daemon's startup guard otherwise refuses a
+repo cwd so unbound fallback turns can't bind to ocean-os):
 
 ```bash
-cargo run -p ocean-daemon
+OCEAN_ALLOW_REPO_CWD=1 cargo run -p ocean-daemon
 ```
 
 The daemon logs a listening line similar to:
@@ -475,7 +477,7 @@ Mesh view also honors:
 
 Main MeshFloor references:
 
-- [`docs/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](OCEAN_TUI_TMUX_LAYOUT_MAP.md)
+- [`docs/.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md) (archived)
 - [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md)
 
 ## HTTP API quick reference

@@ -185,8 +185,15 @@ impl DaemonClient {
             .context("build sessions URL")?;
         {
             let mut query = url.query_pairs_mut();
-            if let Some(cwd) = cwd {
-                query.append_pair("cwd", &cwd.to_string_lossy());
+            // Filter an empty/whitespace cwd the same way the cursor is
+            // filtered below: a type-legal `Some(PathBuf::from(""))` from an
+            // ACP client must mean "no filter", not `?cwd=` (which the daemon
+            // would treat as a real — and never-matching — workspace filter).
+            if let Some(cwd) = cwd
+                .map(|c| c.to_string_lossy().into_owned())
+                .filter(|value| !value.trim().is_empty())
+            {
+                query.append_pair("cwd", &cwd);
             }
             if let Some(cursor) = cursor.filter(|value| !value.trim().is_empty()) {
                 query.append_pair("cursor", cursor);
@@ -208,7 +215,6 @@ impl DaemonClient {
             anyhow::bail!(
                 "{}",
                 resp.error
-                    .clone()
                     .unwrap_or_else(|| "daemon sessions list failed".to_string())
             );
         }

@@ -90,4 +90,4 @@ See [`NOTICE.md`](NOTICE.md).
 
 ## Contributing
 
-See [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md). For repo routing and Linear team rules, see [`docs/CLAUDE.md`](docs/CLAUDE.md) and [`docs/AGENTS.md`](docs/AGENTS.md).
+See [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md). For repo routing and Linear team rules, see [`docs/linear-teams-routing.md`](docs/linear-teams-routing.md) and [`docs/AGENTS.md`](docs/AGENTS.md).
