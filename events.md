@@ -1258,3 +1258,12 @@ including the OKF profile registry + loader in src/okf.rs, commits
 plugins, skill packs, theme protocol, Phase 4 OS integration, Longhouse
 validator economics. Docs-only, committed direct to main and pushed.
 _________________________________________________________________________________
+
+time:      [07:45pm] [07-01-26]
+agent:     [claude] [fable 5]
+worktree:  main
+type:      [workflow]
+area:      [infra]
+
+Phase-1 (security & truth) complete via workflow wf_a7d90235-6e9 (5 parallel lanes + review + land; ledger at ocean-discovery/09-phase1-run.md). Leak closure: rotation verdict AUTH-OFF (leaked pair guards nothing — proxy down, no creds configured), scrub procedure staged privately, handoff.md sanitized; scrub yes/no with John (repo is public, literal fetchable from 4 commits). Bedrock PDF/DOCX extraction reviewed+merged (PR #9, 1d4f502, 37/37 tests) closing the silent data-loss gap; backfill script pending a live-DB dry-run. Doc truth: ocean-os ROADMAP/ARCHITECTURE revalidated with anchors; ocean-agents missing design spec recovered+merged; surface F-03/F-04 transitional framing landed. Next: Phase-2 waves per ocean-discovery/06-orchestration-plan.md.
+_________________________________________________________________________________
