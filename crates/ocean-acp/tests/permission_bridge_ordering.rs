@@ -316,6 +316,7 @@ async fn old_order_misses_permission_and_would_hang() {
                     "/proj".into(),
                     None,
                     None,
+                    None,
                     Some(ocean_core::mint_decision_token()),
                 )
                 .await
@@ -369,6 +370,7 @@ async fn new_order_receives_permission_and_turn_completes() {
                 .submit_turn(
                     "mutate a file".into(),
                     "/proj".into(),
+                    None,
                     None,
                     None,
                     Some(ocean_core::mint_decision_token()),
@@ -454,6 +456,7 @@ async fn synchronous_submit_failure_does_not_hang() {
                 .submit_turn(
                     "bad cwd".into(),
                     "/etc".into(),
+                    None,
                     None,
                     None,
                     Some(ocean_core::mint_decision_token()),

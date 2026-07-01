@@ -13,11 +13,12 @@
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
 use ocean_agent_sdk::{
-    AgentSessionCreateRequest, AgentSessionCreateResponse, AgentTurnEvent, AgentTurnRequest,
-    AgentTurnResponse,
+    AgentSessionCreateRequest, AgentSessionCreateResponse, AgentSessionsResponse, AgentTurnEvent,
+    AgentTurnRequest, AgentTurnResponse, ThinkingLevel,
 };
 use ocean_core::{EventEnvelope, PermissionDecision, PermissionDecisionRequest};
 use serde::Deserialize;
+use std::path::Path;
 use std::pin::Pin;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio_util::io::StreamReader;
@@ -173,6 +174,47 @@ impl DaemonClient {
             .filter(|cwd| !cwd.trim().is_empty()))
     }
 
+    /// List daemon sessions, optionally scoped to the ACP request cwd.
+    /// Mirrors `GET /v1/agent/sessions`, preserving daemon pagination.
+    pub async fn list_sessions(
+        &self,
+        cwd: Option<&Path>,
+        cursor: Option<&str>,
+    ) -> Result<AgentSessionsResponse> {
+        let mut url = reqwest::Url::parse(&format!("{}/v1/agent/sessions", self.base_url))
+            .context("build sessions URL")?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cwd) = cwd {
+                query.append_pair("cwd", &cwd.to_string_lossy());
+            }
+            if let Some(cursor) = cursor.filter(|value| !value.trim().is_empty()) {
+                query.append_pair("cursor", cursor);
+            }
+        }
+
+        let resp = self
+            .http
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .context("daemon rejected sessions list")?
+            .json::<AgentSessionsResponse>()
+            .await
+            .context("decode sessions response")?;
+        if !resp.ok {
+            anyhow::bail!(
+                "{}",
+                resp.error
+                    .clone()
+                    .unwrap_or_else(|| "daemon sessions list failed".to_string())
+            );
+        }
+        Ok(resp)
+    }
+
     /// Submit a turn. The daemon creates a session lazily when `session_id`
     /// is `None`; in that case the real id arrives via the SSE
     /// `session_created` / `turn_started` events and in the response body.
@@ -182,6 +224,7 @@ impl DaemonClient {
         cwd: String,
         session_id: Option<String>,
         model_id: Option<String>,
+        thinking_level: Option<ThinkingLevel>,
         // OCEAN-185 (P0): per-turn permission secret minted by the bridge. The
         // daemon binds the gate to it and never broadcasts it; the bridge replays
         // it on each decision POST so the decision is bound to this submitter.
@@ -199,9 +242,9 @@ impl DaemonClient {
             room_id: None,
             project_id: None,
             client_type: Some(CLIENT_TYPE.to_string()),
-            // ACP bridge has no per-turn reasoning control; defer to the
-            // runtime's global thinking_level.
-            thinking_level: None,
+            // Per-turn reasoning override from ACP metadata; None preserves the
+            // daemon's global thinking_level.
+            thinking_level,
             // Per-session model override (OCEAN-36): drives this turn only.
             model_id,
             // ACP bridge does not attach images to turns (yet).
