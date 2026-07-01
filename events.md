@@ -1227,3 +1227,34 @@ area:      [infra]
 
 Phase-0 stabilization complete across the quad (per ocean-discovery/06-orchestration-plan.md). ocean-os: landed the in-flight tree as PR #267 (neutral-cwd supervised-daemon fix — was live-but-unmerged and would have regressed on next deploy — plus docs reorg + ACP session/list + thinking-level), hardened by a max-effort 10-angle review (10 findings fixed incl. session/list→prompt fork-instead-of-resume, case-sensitive thinking-level drop, launcher crash-loop guards, 8 dangling doc refs; review record on the PR). Unblocked the rolling-toolchain fmt gate workspace-wide (PR #268, rustfmt 1.96.1). Stashes: 5→0 — rooms workspace-packet WIP became rescue/ocean-rooms-workspace-packet (recovering the lost ocean-room-execution-isolation spec), the rest archived as patches on backup/stash-archive-20260701. Branches: 13 remote deleted with file-diff proof, 62 boarded (57 near-certain deletable, see ocean-discovery/08-branch-triage-ocean-os.md). Sibling repos: surface pushed+PR#96 (vscode extension pass)+8 branches pruned; agents landed docs+found the missing content-agent design spec on design/content-agent-slack-assistant; bedrock landed docs+HANDOFF refresh+6 branches pruned; longhouse-deck first-pushed to a private origin; swift-widget markdown wip rebased+PR#1. All repos now on main/master, clean trees.
 _________________________________________________________________________________
+
+time:      [07:35pm] [07-01-26]
+agent:     [claude] [fable 5]
+worktree:  main
+type:      [docs]
+area:      [docs]
+
+Phase-1 lane os-docs-truth: revalidated ROADMAP.md and docs/ARCHITECTURE.md
+against live source on main (e66502e). ROADMAP's "Built, pending daemon
+integration" section listed six shipped items as pending — verified each in
+code and moved them to a resolved list with file:line anchors: SqliteRoomStore
+constructed at daemon startup (main.rs:1612) and held on AppState.rooms;
+PluginProvider registered via discover_plugin_providers in
+build_capability_registry (ocean-agent lib.rs:1546/1612/1693); room
+auto-convene spawning real agent turns (spawn_room_agent_turn main.rs:6517/6642);
+ACP permission forwarding functional with subscribe-before-submit ordering
+(ocean-acp main.rs:710-785, OCEAN-146); Content::Image encoded on all four
+provider wire paths (anthropic/openai/google/codex); and the Longhouse escrow
+trio (titles/revoker/recalls) on AppState (main.rs:1628/1640-1642,
+OCEAN-272/302) with live revoke/recall routes. Checked off Phase 5 subprocess
+plugins. ARCHITECTURE.md: fixed all drifted line anchors in the "Shipped since"
+section, recorded the OCEAN-177 ImageMeta fix closing the transcript-flattener
+gap, rewrote the stale Longhouse "remaining follow-ups" (AppState wiring is
+done; only staking economics open), and added the five crates missing from the
+inventory (ocean-store, ocean-plugin, ocean-hooks, ocean-memory, ocean-context
+including the OKF profile registry + loader in src/okf.rs, commits
+7351cd8/a2ed070). Header dates now state exactly what was re-verified
+2026-07-01 vs unverified since 06-06. Genuinely-open items left open: WASM
+plugins, skill packs, theme protocol, Phase 4 OS integration, Longhouse
+validator economics. Docs-only, committed direct to main and pushed.
+_________________________________________________________________________________
