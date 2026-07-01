@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ocean Project Map - Animated Cartography</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      --paper: #ead9b5;
+      --paper-deep: #c9a86c;
+      --ink: #20343a;
+      --ink-soft: rgba(32, 52, 58, 0.72);
+      --sea: #3c8f96;
+      --sea-deep: #1f5f6e;
+      --foam: #edf1dc;
+      --route: #9a342f;
+      --route-gold: #be8843;
+      --shadow: rgba(32, 52, 58, 0.22);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      min-height: 100%;
+      margin: 0;
+    }
+
+    body {
+      color: var(--ink);
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      background:
+        radial-gradient(circle at 18% 16%, rgba(237, 241, 220, 0.34), transparent 30%),
+        radial-gradient(circle at 88% 78%, rgba(190, 136, 67, 0.16), transparent 34%),
+        linear-gradient(135deg, #235c69 0%, #347f87 45%, #b89158 100%);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.24;
+      mix-blend-mode: multiply;
+      background-image:
+        linear-gradient(rgba(32, 52, 58, 0.08) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(32, 52, 58, 0.07) 1px, transparent 1px),
+        radial-gradient(circle at center, rgba(32, 52, 58, 0.12) 1px, transparent 1.5px);
+      background-size: 64px 64px, 64px 64px, 9px 9px;
+    }
+
+    .page {
+      width: min(1360px, calc(100vw - 32px));
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 28px 0;
+      display: grid;
+      place-items: center;
+    }
+
+    .chart {
+      position: relative;
+      width: 100%;
+      min-height: calc(100vh - 56px);
+      border: 2px solid rgba(32, 52, 58, 0.82);
+      background:
+        radial-gradient(circle at 30% 20%, rgba(237, 241, 220, 0.92), rgba(234, 217, 181, 0.74) 42%, transparent 66%),
+        radial-gradient(circle at 78% 74%, rgba(60, 143, 150, 0.18), transparent 36%),
+        linear-gradient(135deg, rgba(234, 217, 181, 0.96), rgba(206, 175, 116, 0.92));
+      box-shadow:
+        0 28px 70px var(--shadow),
+        inset 0 0 0 10px rgba(237, 241, 220, 0.26),
+        inset 0 0 0 13px rgba(32, 52, 58, 0.34);
+      overflow: hidden;
+      isolation: isolate;
+    }
+
+    .chart::before,
+    .chart::after {
+      content: "";
+      position: absolute;
+      inset: 18px;
+      pointer-events: none;
+      border: 1px solid rgba(32, 52, 58, 0.34);
+      transform: rotate(-0.18deg);
+      z-index: 3;
+    }
+
+    .chart::after {
+      inset: 30px;
+      border-style: dashed;
+      opacity: 0.48;
+      transform: rotate(0.22deg);
+    }
+
+    .paper-grain {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      pointer-events: none;
+      opacity: 0.28;
+      background:
+        repeating-linear-gradient(7deg, rgba(32, 52, 58, 0.035) 0 2px, transparent 2px 7px),
+        repeating-linear-gradient(93deg, rgba(255, 255, 255, 0.12) 0 1px, transparent 1px 8px);
+      filter: contrast(128%);
+    }
+
+    .title-block {
+      position: absolute;
+      z-index: 7;
+      left: clamp(28px, 4vw, 70px);
+      top: clamp(26px, 4vw, 58px);
+      max-width: 520px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2.5rem, 6.8vw, 7.4rem);
+      line-height: 0.84;
+      letter-spacing: 0;
+      font-weight: 700;
+      text-transform: uppercase;
+      text-wrap: balance;
+      color: var(--ink);
+      text-shadow: 1px 1px 0 rgba(237, 241, 220, 0.45);
+    }
+
+    .deck {
+      width: min(470px, 76vw);
+      margin-top: 15px;
+      font-size: clamp(0.95rem, 1.2vw, 1.1rem);
+      line-height: 1.48;
+      color: var(--ink-soft);
+    }
+
+    .chart-meta {
+      margin-top: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font: 700 0.72rem/1.1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--ink);
+    }
+
+    .chart-meta span {
+      border-top: 1px solid rgba(32, 52, 58, 0.48);
+      border-bottom: 1px solid rgba(32, 52, 58, 0.22);
+      padding: 6px 0;
+    }
+
+    .map-wrap {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+    }
+
+    .map-svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-height: calc(100vh - 56px);
+    }
+
+    .latline,
+    .longline {
+      stroke: rgba(32, 52, 58, 0.18);
+      stroke-width: 1;
+      stroke-dasharray: 7 9;
+      fill: none;
+    }
+
+    .coast {
+      fill: rgba(237, 241, 220, 0.78);
+      stroke: var(--ink);
+      stroke-width: 2.2;
+      filter: url("#rough-ink");
+    }
+
+    .coast-shadow {
+      fill: rgba(31, 95, 110, 0.25);
+      transform: translate(7px, 8px);
+    }
+
+    .ridge {
+      fill: none;
+      stroke: rgba(32, 52, 58, 0.28);
+      stroke-width: 1.2;
+      stroke-linecap: round;
+      stroke-dasharray: 9 7;
+    }
+
+    .island {
+      animation: island-bob 7s ease-in-out infinite;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+
+    .island:nth-of-type(2) {
+      animation-delay: -1.2s;
+    }
+
+    .island:nth-of-type(3) {
+      animation-delay: -2.7s;
+    }
+
+    .island:nth-of-type(4) {
+      animation-delay: -4.1s;
+    }
+
+    .route {
+      fill: none;
+      stroke: var(--route);
+      stroke-width: 2.6;
+      stroke-linecap: round;
+      stroke-dasharray: 9 12;
+      filter: url("#rough-ink");
+      animation: route-current 4.8s linear infinite;
+    }
+
+    .route.secondary {
+      stroke: var(--route-gold);
+      stroke-width: 2;
+      stroke-dasharray: 4 10;
+      animation-duration: 6.4s;
+    }
+
+    .route.loop {
+      stroke: var(--sea-deep);
+      stroke-width: 2.1;
+      stroke-dasharray: 3 11;
+      opacity: 0.84;
+      animation-duration: 9s;
+    }
+
+    .route-glow {
+      fill: none;
+      stroke: rgba(237, 241, 220, 0.5);
+      stroke-width: 8;
+      stroke-linecap: round;
+      opacity: 0.48;
+    }
+
+    .port-dot {
+      fill: var(--route);
+      stroke: var(--foam);
+      stroke-width: 2;
+      animation: lantern 2.8s ease-in-out infinite;
+    }
+
+    .node-label {
+      font-size: 26px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      fill: var(--ink);
+      paint-order: stroke;
+      stroke: rgba(237, 241, 220, 0.74);
+      stroke-width: 4px;
+      stroke-linejoin: round;
+    }
+
+    .node-note {
+      font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      fill: rgba(32, 52, 58, 0.7);
+    }
+
+    .route-label {
+      font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      fill: rgba(32, 52, 58, 0.64);
+      paint-order: stroke;
+      stroke: rgba(237, 241, 220, 0.7);
+      stroke-width: 3px;
+    }
+
+    .wave {
+      fill: none;
+      stroke: rgba(237, 241, 220, 0.5);
+      stroke-width: 1.4;
+      stroke-linecap: round;
+      animation: tide-mark 8s ease-in-out infinite;
+    }
+
+    .wave.dark {
+      stroke: rgba(32, 52, 58, 0.2);
+      animation-delay: -3s;
+    }
+
+    .compass {
+      transform-origin: 1020px 165px;
+      animation: compass-breathe 9s ease-in-out infinite;
+      filter: url("#rough-ink");
+    }
+
+    .compass line,
+    .compass path,
+    .compass circle {
+      fill: none;
+      stroke: rgba(32, 52, 58, 0.72);
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .compass text {
+      fill: rgba(32, 52, 58, 0.72);
+      font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.08em;
+    }
+
+    .legend {
+      position: absolute;
+      z-index: 8;
+      left: clamp(28px, 4vw, 72px);
+      right: auto;
+      bottom: clamp(28px, 4vw, 58px);
+      width: min(690px, calc(100vw - 64px));
+      padding: 14px 18px 13px;
+      background:
+        linear-gradient(180deg, rgba(237, 241, 220, 0.82), rgba(234, 217, 181, 0.68));
+      border-top: 2px solid rgba(32, 52, 58, 0.75);
+      border-bottom: 2px solid rgba(32, 52, 58, 0.52);
+      box-shadow: 0 18px 36px rgba(32, 52, 58, 0.18);
+      transform: rotate(-0.4deg);
+    }
+
+    .legend h2 {
+      margin: 0 0 10px;
+      font-size: 0.78rem;
+      line-height: 1.1;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .legend p {
+      margin: 0;
+      max-width: 620px;
+      font-size: 0.86rem;
+      line-height: 1.32;
+      color: var(--ink-soft);
+    }
+
+    .legend dl {
+      margin: 10px 0 0;
+      display: grid;
+      grid-template-columns: max-content minmax(130px, 1fr) max-content minmax(130px, 1fr);
+      gap: 7px 12px;
+      font-size: 0.8rem;
+      line-height: 1.24;
+    }
+
+    .legend dt {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-weight: 800;
+      color: var(--route);
+      white-space: nowrap;
+    }
+
+    .legend dd {
+      margin: 0;
+      color: var(--ink-soft);
+    }
+
+    .soundings {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+      overflow: hidden;
+    }
+
+    .sounding {
+      position: absolute;
+      color: rgba(32, 52, 58, 0.28);
+      font: 700 0.72rem/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      animation: sounding-drift 13s ease-in-out infinite;
+    }
+
+    .s1 { left: 15%; top: 50%; animation-delay: -2s; }
+    .s2 { left: 28%; top: 28%; animation-delay: -7s; }
+    .s3 { left: 48%; top: 66%; animation-delay: -4s; }
+    .s4 { left: 70%; top: 24%; animation-delay: -9s; }
+    .s5 { left: 82%; top: 54%; animation-delay: -5s; }
+    .s6 { left: 60%; top: 82%; animation-delay: -11s; }
+
+    .current {
+      position: absolute;
+      z-index: 5;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--foam);
+      box-shadow: 0 0 0 1px rgba(32, 52, 58, 0.24);
+      opacity: 0.8;
+    }
+
+    .c1 {
+      offset-path: path("M 267 398 C 430 238, 606 245, 736 358");
+      animation: sail 9s linear infinite;
+    }
+
+    .c2 {
+      offset-path: path("M 760 361 C 825 236, 955 238, 1010 310");
+      animation: sail 8s linear infinite -2.4s;
+    }
+
+    .c3 {
+      offset-path: path("M 780 414 C 850 542, 982 550, 1022 456");
+      animation: sail 10s linear infinite -5s;
+    }
+
+    .c4 {
+      offset-path: path("M 306 416 C 470 592, 824 614, 1010 476");
+      animation: sail 13s linear infinite -7s;
+    }
+
+    @keyframes route-current {
+      to { stroke-dashoffset: -84; }
+    }
+
+    @keyframes island-bob {
+      0%, 100% { transform: translate3d(0, 0, 0) rotate(-0.2deg); }
+      50% { transform: translate3d(0, -5px, 0) rotate(0.35deg); }
+    }
+
+    @keyframes tide-mark {
+      0%, 100% { opacity: 0.38; transform: translateX(0); }
+      50% { opacity: 0.72; transform: translateX(10px); }
+    }
+
+    @keyframes lantern {
+      0%, 100% { opacity: 0.64; transform: scale(0.92); }
+      50% { opacity: 1; transform: scale(1.12); }
+    }
+
+    @keyframes compass-breathe {
+      0%, 100% { transform: rotate(-0.7deg) scale(1); }
+      50% { transform: rotate(0.8deg) scale(1.018); }
+    }
+
+    @keyframes sounding-drift {
+      0%, 100% { transform: translate3d(0, 0, 0) rotate(-1deg); opacity: 0.22; }
+      50% { transform: translate3d(7px, -10px, 0) rotate(1deg); opacity: 0.38; }
+    }
+
+    @keyframes sail {
+      from { offset-distance: 0%; transform: scale(0.8); }
+      50% { transform: scale(1.15); }
+      to { offset-distance: 100%; transform: scale(0.8); }
+    }
+
+    @media (max-width: 820px) {
+      .page {
+        width: min(100vw - 18px, 760px);
+        padding: 9px 0;
+      }
+
+      .chart {
+        min-height: 860px;
+      }
+
+      .map-svg {
+        min-height: 860px;
+        width: 100%;
+        transform: none;
+      }
+
+      .title-block {
+        top: 28px;
+        left: 24px;
+      }
+
+      .deck {
+        width: min(360px, 78vw);
+      }
+
+      .legend {
+        left: 24px;
+        right: auto;
+        bottom: 28px;
+        width: min(420px, calc(100vw - 64px));
+      }
+
+      .legend dl {
+        grid-template-columns: max-content 1fr;
+      }
+
+      .current {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="chart" aria-label="Animated hand-drawn ocean cartography map of the four connected Ocean repositories">
+      <div class="paper-grain" aria-hidden="true"></div>
+      <div class="soundings" aria-hidden="true">
+        <span class="sounding s1">4780</span>
+        <span class="sounding s2">SSE</span>
+        <span class="sounding s3">cwd</span>
+        <span class="sounding s4">MCP</span>
+        <span class="sounding s5">8080</span>
+        <span class="sounding s6">ctx</span>
+      </div>
+
+      <header class="title-block">
+        <h1>Ocean Quad</h1>
+        <p class="deck">A sea chart for the four connected repositories: surface, runtime, agent packages, and Bedrock context.</p>
+        <div class="chart-meta" aria-label="Map metadata">
+          <span>project -> workspace -> session -> turns -> events</span>
+          <span>surface -> session</span>
+        </div>
+      </header>
+
+      <div class="map-wrap" aria-hidden="true">
+        <svg class="map-svg" viewBox="0 0 1200 760" role="img">
+          <defs>
+            <filter id="rough-ink">
+              <feTurbulence type="fractalNoise" baseFrequency="0.018" numOctaves="3" seed="8" result="noise"></feTurbulence>
+              <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.7" xChannelSelector="R" yChannelSelector="G"></feDisplacementMap>
+            </filter>
+            <marker id="arrow" markerWidth="12" markerHeight="12" refX="8" refY="6" orient="auto" markerUnits="strokeWidth">
+              <path d="M 1 1 L 10 6 L 1 11" fill="none" stroke="#9a342f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+            </marker>
+          </defs>
+
+          <g class="grid">
+            <path class="latline" d="M 58 154 C 252 139, 430 147, 612 154 S 992 173, 1142 154"></path>
+            <path class="latline" d="M 42 286 C 232 268, 448 281, 650 292 S 1002 300, 1158 286"></path>
+            <path class="latline" d="M 34 430 C 216 405, 452 417, 650 430 S 1000 458, 1162 430"></path>
+            <path class="latline" d="M 60 592 C 236 578, 464 580, 644 594 S 990 615, 1140 592"></path>
+            <path class="longline" d="M 164 80 C 150 230, 160 402, 164 694"></path>
+            <path class="longline" d="M 386 68 C 376 238, 394 430, 386 704"></path>
+            <path class="longline" d="M 602 62 C 588 240, 606 426, 602 708"></path>
+            <path class="longline" d="M 822 70 C 806 232, 820 434, 822 700"></path>
+            <path class="longline" d="M 1042 78 C 1028 236, 1044 430, 1042 690"></path>
+          </g>
+
+          <g class="waves">
+            <path class="wave" d="M 102 226 c 22 -14, 42 -14, 64 0 c 22 14, 42 14, 64 0"></path>
+            <path class="wave dark" d="M 116 252 c 16 -10, 34 -10, 50 0 c 17 10, 34 10, 50 0"></path>
+            <path class="wave" d="M 530 162 c 22 -14, 42 -14, 64 0 c 22 14, 42 14, 64 0"></path>
+            <path class="wave dark" d="M 498 198 c 16 -10, 34 -10, 50 0 c 17 10, 34 10, 50 0"></path>
+            <path class="wave" d="M 418 536 c 22 -14, 42 -14, 64 0 c 22 14, 42 14, 64 0"></path>
+            <path class="wave dark" d="M 872 612 c 16 -10, 34 -10, 50 0 c 17 10, 34 10, 50 0"></path>
+            <path class="wave" d="M 972 194 c 22 -14, 42 -14, 64 0 c 22 14, 42 14, 64 0"></path>
+            <path class="wave dark" d="M 976 228 c 16 -10, 34 -10, 50 0 c 17 10, 34 10, 50 0"></path>
+          </g>
+
+          <g class="routes">
+            <path class="route-glow" d="M 267 398 C 430 238, 606 245, 736 358"></path>
+            <path class="route" d="M 267 398 C 430 238, 606 245, 736 358" marker-end="url(#arrow)"></path>
+            <text class="route-label" x="455" y="292">sessions turns sse</text>
+
+            <path class="route-glow" d="M 760 361 C 825 236, 955 238, 1010 310"></path>
+            <path class="route secondary" d="M 760 361 C 825 236, 955 238, 1010 310"></path>
+            <text class="route-label" x="846" y="259">profiles manifests</text>
+
+            <path class="route-glow" d="M 780 414 C 850 542, 982 550, 1022 456"></path>
+            <path class="route secondary" d="M 780 414 C 850 542, 982 550, 1022 456"></path>
+            <text class="route-label" x="870" y="548">context ledger api</text>
+
+            <path class="route-glow" d="M 306 416 C 470 592, 824 614, 1010 476"></path>
+            <path class="route" d="M 306 416 C 470 592, 824 614, 1010 476"></path>
+            <text class="route-label" x="542" y="624">shared files search handoffs</text>
+
+            <path class="route-glow" d="M 296 346 C 452 168, 826 136, 1012 292"></path>
+            <path class="route secondary" d="M 296 346 C 452 168, 826 136, 1012 292"></path>
+            <text class="route-label" x="516" y="178">surface context selects behavior</text>
+
+            <path class="route-glow" d="M 1012 340 C 1036 382, 1044 408, 1034 444"></path>
+            <path class="route secondary" d="M 1012 340 C 1036 382, 1044 408, 1034 444"></path>
+
+            <path class="route loop" d="M 260 412 C 462 642, 858 646, 1040 470 C 1136 376, 1084 230, 1014 292 C 908 118, 514 108, 260 356 C 186 420, 200 498, 260 412"></path>
+            <text class="route-label" x="612" y="690">normal flow: surface -> daemon -> package -> bedrock -> surface</text>
+          </g>
+
+          <g class="island">
+            <path class="coast-shadow" d="M 142 353 C 168 314, 220 303, 266 318 C 307 331, 342 359, 340 403 C 338 444, 300 475, 252 484 C 206 492, 152 470, 130 431 C 114 401, 119 378, 142 353 Z"></path>
+            <path class="coast" d="M 142 353 C 168 314, 220 303, 266 318 C 307 331, 342 359, 340 403 C 338 444, 300 475, 252 484 C 206 492, 152 470, 130 431 C 114 401, 119 378, 142 353 Z"></path>
+            <path class="ridge" d="M 166 403 C 202 372, 240 360, 304 381"></path>
+            <path class="ridge" d="M 184 436 C 224 423, 260 424, 302 444"></path>
+            <circle class="port-dot" cx="267" cy="398" r="6"></circle>
+            <text class="node-label" x="151" y="391">ocean</text>
+            <text class="node-label" x="151" y="421">surface</text>
+            <text class="node-note" x="154" y="452">gpui web extension voice canvas</text>
+          </g>
+
+          <g class="island">
+            <path class="coast-shadow" d="M 672 330 C 702 286, 770 282, 812 308 C 850 331, 866 380, 844 424 C 820 472, 752 486, 700 462 C 650 439, 636 382, 672 330 Z"></path>
+            <path class="coast" d="M 672 330 C 702 286, 770 282, 812 308 C 850 331, 866 380, 844 424 C 820 472, 752 486, 700 462 C 650 439, 636 382, 672 330 Z"></path>
+            <path class="ridge" d="M 688 379 C 726 342, 784 334, 832 362"></path>
+            <path class="ridge" d="M 704 420 C 746 405, 788 408, 824 432"></path>
+            <circle class="port-dot" cx="760" cy="384" r="7"></circle>
+            <text class="node-label" x="700" y="380">ocean</text>
+            <text class="node-label" x="733" y="410">os</text>
+            <text class="node-note" x="679" y="441">daemon runtime tools permissions</text>
+          </g>
+
+          <g class="island">
+            <path class="coast-shadow" d="M 942 275 C 968 236, 1032 225, 1086 251 C 1130 272, 1135 320, 1100 358 C 1064 398, 990 395, 948 360 C 914 332, 918 302, 942 275 Z"></path>
+            <path class="coast" d="M 942 275 C 968 236, 1032 225, 1086 251 C 1130 272, 1135 320, 1100 358 C 1064 398, 990 395, 948 360 C 914 332, 918 302, 942 275 Z"></path>
+            <path class="ridge" d="M 960 314 C 998 288, 1046 283, 1092 310"></path>
+            <path class="ridge" d="M 972 344 C 1010 334, 1046 336, 1084 350"></path>
+            <circle class="port-dot" cx="1010" cy="310" r="6"></circle>
+            <text class="node-label" x="967" y="313">ocean</text>
+            <text class="node-label" x="957" y="343">agents</text>
+            <text class="node-note" x="962" y="367">profiles couriers sops tools</text>
+          </g>
+
+          <g class="island">
+            <path class="coast-shadow" d="M 922 427 C 955 382, 1035 381, 1084 416 C 1126 447, 1118 504, 1066 530 C 1014 556, 934 536, 902 492 C 884 467, 894 444, 922 427 Z"></path>
+            <path class="coast" d="M 922 427 C 955 382, 1035 381, 1084 416 C 1126 447, 1118 504, 1066 530 C 1014 556, 934 536, 902 492 C 884 467, 894 444, 922 427 Z"></path>
+            <path class="ridge" d="M 934 469 C 978 438, 1038 436, 1088 462"></path>
+            <path class="ridge" d="M 950 500 C 990 490, 1030 492, 1068 508"></path>
+            <circle class="port-dot" cx="1022" cy="456" r="6"></circle>
+            <text class="node-label" x="952" y="461">ocean</text>
+            <text class="node-label" x="945" y="492">bedrock</text>
+            <text class="node-note" x="943" y="516">docs context ledger graph api</text>
+          </g>
+
+          <g class="compass">
+            <circle cx="1020" cy="165" r="55" stroke-width="1.8"></circle>
+            <circle cx="1020" cy="165" r="20" stroke-width="1.1"></circle>
+            <path d="M 1020 91 L 1032 165 L 1020 239 L 1008 165 Z" stroke-width="1.5"></path>
+            <path d="M 946 165 L 1020 153 L 1094 165 L 1020 177 Z" stroke-width="1.5"></path>
+            <line x1="970" y1="115" x2="1070" y2="215" stroke-width="1"></line>
+            <line x1="1070" y1="115" x2="970" y2="215" stroke-width="1"></line>
+            <text x="1015" y="83">N</text>
+            <text x="1015" y="260">S</text>
+            <text x="929" y="169">W</text>
+            <text x="1105" y="169">E</text>
+          </g>
+        </svg>
+      </div>
+
+      <span class="current c1" aria-hidden="true"></span>
+      <span class="current c2" aria-hidden="true"></span>
+      <span class="current c3" aria-hidden="true"></span>
+      <span class="current c4" aria-hidden="true"></span>
+
+      <aside class="legend">
+        <h2>Connection soundings</h2>
+        <p>The four repositories form one working sea: clients steer, the daemon executes, packages shape behavior, and Bedrock holds shared context.</p>
+        <dl>
+          <dt>surface</dt>
+          <dd>renders and attaches to sessions</dd>
+          <dt>os</dt>
+          <dd>owns runtime authority and permissions</dd>
+          <dt>agents</dt>
+          <dd>declares profiles, couriers, SOPs, and tools</dd>
+          <dt>bedrock</dt>
+          <dd>stores shared docs, context, ledger, and handoffs</dd>
+        </dl>
+      </aside>
+    </section>
+  </main>
+</body>
+</html>

@@ -16,6 +16,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 - Walk from repo root to your target path and read every AGENTS.md along the route.
 - Use the nearest AGENTS.md as the local contract; parent docs set repo-wide rules.
 - No child doc may weaken this root contract.
+- Cross-repo routing map: `docs/OCEAN_PROJECT_MAP.md`.
 - After any meaningful change, do a devlog pass: update the nearest owning AGENTS.md, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`.
 
 ## Crate Map

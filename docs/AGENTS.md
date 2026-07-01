@@ -13,6 +13,7 @@ This child doc governs the `docs/` subtree: architecture notes, operator guides,
 ## Local Contracts
 
 - Keep durable docs current with the implementation they describe.
+- Cross-repo routing and ownership map lives in `OCEAN_PROJECT_MAP.md`; keep it mirrored with sibling Ocean repos when connection contracts change.
 - Longhouse is the hive: the local-first agentic operations hub where agents go before they act. See `LONGHOUSE.md`.
 - `ocean-daemon` owns local sessions, streaming, filesystem/tools, permission gates, and execution authority.
 - `ocean-longhouse` owns SOPs, routines/workflows, tools/MCP discovery, skills, memory/knowledge, subagent specs, and quorum/council coordination.
@@ -33,3 +34,12 @@ This child doc governs the `docs/` subtree: architecture notes, operator guides,
 ## Child devlog Index
 
 No child boundaries defined within `docs/` at this time.
+
+## .agentarchive
+Location:
+
+~/dev/ocean-os/docs/.agentarchive
+
+This is where stale context documents are stored for later use to analyze things and get forensic analysis of projects, but it's not something that ever gets loaded into active context. Agents do not read from this directory unless expressly requested by an operator. 
+
+Rules on when to transfer docs into .agentarchive --- sweeping contradictions, patterns of builds that are outdated, finished or could somehow redirect an agent away from understanding the current intent of the operator --- actively suggesting to move docs to this folder is best practice

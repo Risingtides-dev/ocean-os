@@ -1140,3 +1140,81 @@ area:      backend
 
 Synced local `main` after user-submitted GitHub work. Created safety branch `backup/pre-sync-main-20260625-170651`, saved patch `/tmp/ocean-os-pre-sync-20260625-170651.patch`, stashed dirty local work, fast-forwarded main from 12ea25c to origin/main 789aeee, and reapplied the stash with no conflicts. Pulled in the typed SQLite `ocean-memory` crate from `d5467db` plus later checkpoint/revert commits; updated the root crate map to include `ocean-memory`. Validation after sync stayed green: `cargo check --workspace`, `cargo fmt --all -- --check`, and `cargo test -p ocean-daemon` (237 passed). Kept `stash@{0}` as a recovery copy until the dirty local work is committed or intentionally dropped.
 _________________________________________________________________________________
+
+time:      [11:25pm] [06-26-26]
+agent:     [codex] [gpt-5]
+worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
+type:      feature-request
+area:      backend
+
+Supported the Ocean Cursor/VS Code extension thinking-level selector by wiring ACP prompt
+metadata into daemon turns. `ocean-acp` now reads `_meta.ocean.thinking_level` (or a flat
+`_meta.thinking_level` fallback), deserializes the existing lowercase `ThinkingLevel` values,
+ignores invalid values with a warning, and passes the valid override through
+`DaemonClient::submit_turn` to `AgentTurnRequest::thinking_level`. Existing callers pass
+`None`, preserving daemon-default behavior. Added unit coverage for valid/invalid metadata
+and updated permission-bridge tests for the new parameter. Verification green:
+`cargo fmt --check -p ocean-acp`, `cargo test -p ocean-acp`, and `cargo build -p ocean-acp --release`.
+_________________________________________________________________________________
+
+time:      [12:07pm] [06-26-26]
+agent:     [codex] [gpt-5]
+worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
+type:      [workflow]
+area:      [writing]
+
+Added `docs/OCEAN_PROJECT_MAP.md` as the cross-repo orientation map for the Ocean
+quad: `ocean-os`, `ocean-agents`, `ocean-surface`, and `ocean-bedrock`. Updated
+the root and docs devlog entrypoints plus README so future agents can route
+runtime, surface, agent-package, and Bedrock/data-plane references before making
+cross-repo claims. This was a docs-only change; verification was link/path review
+and mirrored-file comparison across sibling repos.
+_________________________________________________________________________________
+
+time:      [12:15pm] [06-26-26]
+agent:     [codex] [gpt-5]
+worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
+type:      [workflow]
+area:      [writing]
+
+Refined `docs/OCEAN_PROJECT_MAP.md` to state that the four Ocean repos are one
+connected system, not isolated routing lanes. Added a pairwise connection matrix
+covering `ocean-surface` <-> `ocean-os`, `ocean-os` <-> `ocean-agents`,
+`ocean-os` <-> `ocean-bedrock`, `ocean-surface` <-> `ocean-agents`,
+`ocean-surface` <-> `ocean-bedrock`, `ocean-agents` <-> `ocean-bedrock`, and the
+normal all-four workflow path.
+_________________________________________________________________________________
+
+time:      [12:49pm] [06-26-26]
+agent:     [codex] [gpt-5]
+worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
+type:      [workflow]
+area:      [design]
+
+Added `docs/OCEAN_PROJECT_MAP_ART.html`, a self-contained animated CSS/SVG
+cartography artifact for the four connected Ocean repos. The scene uses a
+hand-drawn ocean chart style with four repo islands, animated route currents,
+compass, parchment texture, and a connection-soundings cartouche. Linked the
+artifact from the mirrored `docs/OCEAN_PROJECT_MAP.md` using the sibling-safe
+path `../../ocean-os/docs/OCEAN_PROJECT_MAP_ART.html`. Verified in Playwright on
+desktop and mobile-sized viewports.
+_________________________________________________________________________________
+
+time:      [1:34pm] [06-26-26]
+agent:     [codex] [gpt-5]
+worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
+type:      [feature-request]
+area:      [backend]
+
+Exposed the daemon-owned session roster through `ocean-acp` ACP `session/list`
+for VS Code/Cursor extension session history. The bridge now advertises
+`sessionCapabilities.list`, maps `session/list` to the existing
+`GET /v1/agent/sessions` daemon endpoint with `cwd` and cursor pagination, and
+converts daemon `AgentSessionSummary` records into ACP `SessionInfo`. Added a
+guard test for the advertised session lifecycle capabilities. Preserved the
+existing thinking-level metadata changes in this worktree. Checks green:
+`cargo fmt --check --package ocean-acp`, `cargo check -p ocean-acp`,
+`cargo test -p ocean-acp`, and `cargo build -p ocean-acp --release`. Raw stdio
+smoke test verified initialize returns `sessionCapabilities: { list: {} }` and
+`session/list` returns real sessions for `/Users/risingtidesdev/dev/ocean-agents`.
+_________________________________________________________________________________
