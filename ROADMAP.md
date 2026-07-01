@@ -52,32 +52,50 @@
 - [ ] sandbox profiles
 
 ## Phase 5: extensibility
-- [ ] Subprocess plugins
+- [x] Subprocess plugins — `ocean-plugin` crate; tools reach live turns via
+      `PluginProvider` registration in `build_capability_registry`
+      (`crates/ocean-agent/src/lib.rs:1612`) (OCEAN-95)
 - [ ] WASM plugins via wasmtime
 - [ ] Skill/prompt packs
 - [ ] Theme/client protocol
 
-## Built, pending daemon integration
+## Built, pending daemon integration — RESOLVED
 
-These exist in the workspace (crate compiles, unit-tested) but the daemon does
-not yet construct/register them, so the **feature is not live**. See
-`docs/ARCHITECTURE.md` § "Built, pending daemon integration" for operator impact.
+Everything this section used to track as built-but-not-wired has since shipped
+into the live daemon path. Re-verified against source on main, 2026-07-01;
+anchors below. See `docs/ARCHITECTURE.md` § "Shipped since the original
+integration list" for operator impact.
 
-- [ ] Wire `ocean-store` (SqliteRoomStore) into the daemon — persistent rooms
-      are currently held in the in-memory `RoomRegistry` and LOST on restart
-      (OCEAN-86 built the store; daemon still uses the in-memory registry)
-- [ ] Register `PluginProvider` in `build_capability_registry` — installed
-      plugins contribute zero tools to a turn until then (OCEAN-95 built the
-      provider; the daemon never constructs it)
-- [ ] Queue a real agent turn on room auto-convene — `room_post_message`
-      evaluates the trigger policy and emits a `room_trigger` notice, but does
-      not yet spawn a turn for the mentioned agent (OCEAN-65; held behind the
-      in-flight `agent_turn` permission PRs)
-- [ ] Activate ACP permission forwarding — the per-turn permission bridge in
-      `ocean-acp` is built but inert because the daemon submits ACP turns with
-      `yolo: true` (it gates the moment ACP turns run non-yolo; OCEAN-51 / #54)
-- [ ] Cross-provider `Content::Image` — produced (browser `perceive`) and wired
-      for Anthropic, but the OpenAI/Gemini encoders drop image content
-- [ ] Longhouse governance layer (escrow trio: TitleRegistry + Revoker +
-      validator escrow + unforgeable `claim_outcome` gate) — quorum steps 1–5
-      are built; steps 6+ are stubbed (see `docs/LONGHOUSE.md`)
+- [x] `ocean-store` (SqliteRoomStore) wired — the daemon opens the durable
+      store at startup (`crates/ocean-daemon/src/main.rs:1612`) and holds it on
+      `AppState.rooms` (main.rs:88, constructed at main.rs:1639); rooms and
+      transcripts survive restart (OCEAN-86/107)
+- [x] `PluginProvider` registered — `build_capability_registry`
+      (`crates/ocean-agent/src/lib.rs:1546`) calls `discover_plugin_providers`
+      (lib.rs:1612) and registers each `ocean_plugin::PluginProvider`
+      (connected at lib.rs:1693) (OCEAN-95)
+- [x] Room auto-convene queues a real agent turn — `room_post_message` calls
+      `spawn_room_agent_turn` (`crates/ocean-daemon/src/main.rs:6517`, defined
+      at main.rs:6642) when a mention resolves to a roster `Agent`
+      (OCEAN-111/128/225)
+- [x] ACP permission forwarding active — ACP turns run gated by default
+      (`yolo_enabled()`, OCEAN-51) and `run_turn`
+      (`crates/ocean-acp/src/main.rs:710`) subscribes the control stream
+      before `submit_turn` (main.rs:742-785), so `spawn_permission_bridge`
+      (main.rs:973) delivers editor-side approval prompts (OCEAN-146)
+- [x] Cross-provider `Content::Image` — encoded on all four provider wire
+      paths under `crates/ocean-protocol/src/providers/`: anthropic.rs:159,194;
+      openai.rs:218,306; google.rs:140,244; codex.rs:66,154
+      (OCEAN-99/131/132/133)
+- [x] Longhouse escrow trio on AppState — persisted `SqliteTitleRegistry`
+      opened at startup (`crates/ocean-daemon/src/main.rs:1628`) and held on
+      `AppState` with the `Revoker` and quorum-of-recall registry
+      (main.rs:1640-1642); `/v1/longhouse/revoke` and `/v1/longhouse/recall`
+      routes live (OCEAN-229/246/272/302)
+
+Still genuinely open:
+
+- [ ] Longhouse validator/staking *economics* — the escrow ledger mechanics
+      exist (`crates/ocean-longhouse/src/escrow.rs`) but the economic policy
+      (stake sizing, forfeiture schedule) is not designed
+      (see `docs/LONGHOUSE.md` § "Built vs unbuilt")

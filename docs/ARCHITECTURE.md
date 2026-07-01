@@ -1,8 +1,10 @@
 # Ocean OS architecture
 
-> Last validated against source: 2026-06-06 (post Epoch 6 / M1: durable rooms,
-> plugin tools, cross-provider vision, and room auto-convene have all shipped —
-> see "Shipped since the original integration list" below).
+> Last validated against source: 2026-07-01 for the "Shipped since the original
+> integration list" reconciliation (all file:line anchors re-checked on main),
+> the Longhouse governance status, and the crate inventory below (five crates
+> added). The per-crate prose descriptions (ocean-call routes, ocean-heartbeat
+> subcommands, etc.) were last validated 2026-06-06 and are unverified since.
 
 Ocean OS is a Rust-native coding-agent runtime and daemon. The daemon owns runtime authority; `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that runtime.
 
@@ -55,6 +57,39 @@ ocean-longhouse
   LLM. The convene flow staffs a council with real LLM workers on cheap models,
   runs a two-round propose → endorse/inhibit protocol, and emits the existing
   LonghouseEvents so the deck renders a live council with zero deck changes.
+
+ocean-store
+  SQLite-backed durable storage (OCEAN-86). `SqliteRoomStore` behind the
+  `RoomStore` trait — the persistent counterpart to the old in-memory
+  RoomRegistry. Constructed by the daemon at startup; see "Shipped since the
+  original integration list" below.
+
+ocean-plugin
+  Subprocess-first plugin runtime for agent skill packs. A plugin declares
+  tools behind the `Plugin` trait; `PluginProvider` adapts them onto the
+  runtime's CapabilityProvider seam as `plugin__<plugin>__<tool>`. Registered
+  into live turns by ocean-agent; see "Shipped since" below.
+
+ocean-hooks
+  Plugin-agnostic runtime hooks: run configured subprocesses at lifecycle
+  events, stable JSON payload on stdin, JSON stdout interpreted as a decision.
+  Deliberately independent of any one plugin or MCP server.
+
+ocean-memory
+  Typed memory primitive for Ocean agents: a queryable, provenance-bearing
+  SQLite store at Agent / Operator / Shared scopes. A memory row is an
+  attested claim (this store owns Agent and Operator rows; Shared lives in
+  ocean-bedrock).
+
+ocean-context
+  The handoff as a context primitive: sets of claims, each with provenance,
+  that a receiving session distrusts by default and reverifies against ground
+  truth (spec: docs/specs/ocean-context-handoff-engine.md). Also home of the
+  OKF profile — `src/okf.rs` is the typed concept-type registry for Ocean's
+  knowledge artifacts (handoff/claim/memory/agent/event/note) plus per-source
+  loader adapters (TOML/YAML/devlog frontmatter). Validation is
+  diagnostic-only: a missing field is a work-item for a normalizer, never a
+  rejection.
 
 ocean-acp
   ACP (Agent Client Protocol) bridge. Exposes the Ocean daemon to Zed and other
@@ -123,20 +158,22 @@ ocean-tui
 ## Shipped since the original integration list
 
 This section used to read "Built, pending daemon integration" and listed a set of
-crates and types as existing-but-not-wired. **As of Epoch 6 / M1 nearly all of
-them are now constructed and live in the daemon path.** They are recorded here so
-the history is clear and so the one genuinely remaining gap (a display-only
-transcript flattener) is not lost in the noise.
+crates and types as existing-but-not-wired. **All of them are now constructed and
+live in the daemon path** (file:line anchors below re-verified against main on
+2026-07-01). They are recorded here so the history is clear. The one gap this
+section used to carry — a display-only transcript flattener that dropped image
+evidence — was closed by OCEAN-177 (see the Content::Image entry).
 
 ```text
 ocean-store — WIRED (durable rooms).
   SQLite-backed durable Room store (`SqliteRoomStore`) behind the `RoomStore`
-  trait. The daemon depends on it (`crates/ocean-daemon/Cargo.toml:25
+  trait. The daemon depends on it (`crates/ocean-daemon/Cargo.toml:45
   ocean-store.workspace = true`) and constructs it at startup
-  (`crates/ocean-daemon/src/main.rs:565 ocean_store::SqliteRoomStore::open(...)`),
-  holding it as `Arc<Mutex<ocean_store::SqliteRoomStore>>` (main.rs:85) instead of
+  (`crates/ocean-daemon/src/main.rs:1612 ocean_store::SqliteRoomStore::open(...)`),
+  holding it as `AppState.rooms: RoomStoreHandle` — an
+  `Arc<Mutex<ocean_store::SqliteRoomStore>>` (main.rs:88, 511) — instead of
   the old in-memory `RoomRegistry`. Every persistent-room handler routes through
-  it via `with_rooms(...)` and `RoomStore` (main.rs:45, 1900) (OCEAN-86 / 107).
+  it via `with_rooms(...)` (main.rs:6189) (OCEAN-86 / 107).
   OPERATOR IMPACT: rooms, rosters, and transcripts now PERSIST across daemon
   restarts — they live in the rooms SQLite db, not process memory.
 
@@ -144,34 +181,36 @@ ocean-plugin — WIRED (plugin tools reach the agent).
   Subprocess plugin runtime + a `PluginProvider` implementing the runtime's
   `CapabilityProvider` seam, exposing plugin tools as `plugin__<plugin>__<tool>`
   (OCEAN-95). `ocean-agent` depends on it (`crates/ocean-agent/Cargo.toml:17
-  ocean-plugin.workspace = true`). `build_capability_registry` now calls
+  ocean-plugin.workspace = true`). `build_capability_registry`
+  (`crates/ocean-agent/src/lib.rs:1546`) calls
   `discover_plugin_providers(config_dir)` and registers each returned
-  `ocean_plugin::PluginProvider` (`crates/ocean-agent/src/lib.rs:978`,
-  constructed at lib.rs:1060). PluginProvider tools report
+  `ocean_plugin::PluginProvider` (registration loop at lib.rs:1612,
+  connected at lib.rs:1693). PluginProvider tools report
   `requires_permission == true`, so they gate like any mutating tool.
   OPERATOR IMPACT: installed plugins now contribute their tools to a turn; the
   live agent path discovers, lists, and calls them.
 
-Content::Image (cross-provider vision) — WIRED on the model wire path; one
-  display-only flattener remains.
+Content::Image (cross-provider vision) — WIRED on the model wire path; the
+  display-side gap is closed too (OCEAN-177).
   The protocol type `Content::Image { data, mime_type }` is produced by the
   browser/computer-use tools and now encoded by ALL FOUR providers on the way to
   the model:
-    - Anthropic — `crates/ocean-protocol/src/providers/anthropic.rs:158,193`
-    - OpenAI    — `crates/ocean-protocol/src/providers/openai.rs:198,286,813,864`
+    - Anthropic — `crates/ocean-protocol/src/providers/anthropic.rs:159,194`
+    - OpenAI    — `crates/ocean-protocol/src/providers/openai.rs:218,306`
                   (OCEAN-99 user-message vision, OCEAN-131 tool-result images)
-    - Gemini    — `crates/ocean-protocol/src/providers/google.rs:131,235,617,654`
+    - Gemini    — `crates/ocean-protocol/src/providers/google.rs:140,244`
                   (OCEAN-99 / OCEAN-132)
-    - Codex     — `crates/ocean-protocol/src/providers/codex.rs:66,154,651,688`
+    - Codex     — `crates/ocean-protocol/src/providers/codex.rs:66,154`
                   (OCEAN-133)
   The old "OpenAI text-only / Gemini has no Image arm" claim is OBSOLETE — a
   screenshot taken mid-turn now reaches every provider's model.
-  REMAINING GAP (LOW sev, display-only): the daemon's transcript flattener
-  `text_from_content` (`crates/ocean-agent/src/lib.rs:1806-1816`) still drops
-  `Content::Image` — it keeps only `Text`/`Thinking`. This affects ONLY the
-  human-readable transcript returned by `GET /v1/sessions/{id}`, NOT the model
-  wire path. So a session-detail view shows an image-bearing turn as text-only,
-  even though the model itself received the image. Cosmetic, not a capability gap.
+  The formerly-listed display gap is FIXED: the transcript flattener
+  `text_from_content` (`crates/ocean-agent/src/lib.rs:2589`) still keeps only
+  `Text`/`Thinking` in the flattened text, but `images_from_content`
+  (lib.rs:2606, OCEAN-177) projects `Content::Image` blocks to lightweight
+  `ImageMeta` (mime type, never the base64 data) so a session-detail view
+  records that an image was attached; the raw bytes remain in
+  `SessionDetail::messages`.
 
 ocean-acp permission forwarding — WIRED and functional (race fixed, OCEAN-146).
   The per-turn ACP permission bridge (`spawn_permission_bridge`) watches the
@@ -179,8 +218,10 @@ ocean-acp permission forwarding — WIRED and functional (race fixed, OCEAN-146)
   `session/request_permission`, and POSTs the decision back. Gating is real: the
   daemon decides the mode per turn (`yolo_enabled()`, default GATED, OCEAN-51).
   The old subscribe-order race is FIXED. `run_turn`
-  (`crates/ocean-acp/src/main.rs`) now subscribes the control stream BEFORE
-  submitting the turn (main.rs:490-508, then `submit_turn` at ~525), so the
+  (`crates/ocean-acp/src/main.rs:710`) now subscribes the control stream BEFORE
+  submitting the turn (control stream connected at main.rs:742,
+  `spawn_permission_bridge` at main.rs:766, then `submit_turn` at main.rs:785;
+  the bridge itself is defined at main.rs:973), so the
   bridge is listening before the daemon can emit the gated `PermissionRequest`.
   Because the broadcast channel has no replay, this ordering is what makes
   delivery work. The turn's `request_id` is learned from the event stream, not
@@ -190,11 +231,11 @@ ocean-acp permission forwarding — WIRED and functional (race fixed, OCEAN-146)
 
 Room auto-convene — WIRED (a resolved mention now wakes the agent).
   `room_post_message` evaluates the stored trigger policy
-  (`evaluate_trigger_policy`, `crates/ocean-daemon/src/main.rs:2114`) on an
-  `@mention`. When the policy says convene AND the mentioned id resolves to a real
-  `Agent` in the roster, the handler emits the `room_trigger` notice (main.rs:2148),
+  (`evaluate_trigger_policy`, called at `crates/ocean-daemon/src/main.rs:6450`)
+  on an `@mention`. When the policy says convene AND the mentioned id resolves to a real
+  `Agent` in the roster, the handler emits the `room_trigger` notice (main.rs:6487),
   writes an `auto-convene:` audit line, and — crucially — calls
-  `spawn_room_agent_turn(...)` (main.rs:2181, defined at main.rs:2302), which
+  `spawn_room_agent_turn(...)` (main.rs:6517, defined at main.rs:6642), which
   spawns an actual agent turn for the mentioned participant (resumes the
   deterministic room+agent session, builds a transcript-tail prompt, runs it).
   Note OCEAN-128: the `room_trigger` event and audit line only fire once an Agent
@@ -218,9 +259,15 @@ One related item is still partial and tracked in its own doc:
   (graduated `Warned` strikes → hard `RoleRevoked`; a revoked title fails
   `claim_outcome` even with the right token; revocation requires the Revoker's
   own server-minted key so it can't be forged), and a validator escrow ledger
-  (stake → held → released-on-claim / forfeited-on-abort). Remaining follow-ups:
-  wiring the persisted registry onto the daemon's `AppState` (it is an additive
-  library today, as `ocean-store` was when it landed) and the staking *economics*.
+  (stake → held → released-on-claim / forfeited-on-abort). The persisted
+  registry is now **wired onto the daemon's `AppState`** (OCEAN-272/302,
+  re-verified 2026-07-01): the daemon opens the titles DB at startup
+  (`crates/ocean-daemon/src/main.rs:1628`) and holds `titles` / `revoker` /
+  `recalls` on `AppState` (main.rs:1640-1642, fields at main.rs:96-110), with
+  live `/v1/longhouse/revoke` and `/v1/longhouse/recall` routes (quorum-of-recall
+  tallies distinct credentialed marks before the daemon's single `Revoker`
+  executes). Remaining follow-up: the staking *economics* (stake sizing,
+  forfeiture schedule) — the ledger mechanics exist, the policy is not designed.
   See `docs/LONGHOUSE.md` § "Built vs unbuilt".
 
 ## API model
