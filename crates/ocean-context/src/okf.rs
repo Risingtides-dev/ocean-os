@@ -190,7 +190,11 @@ pub fn validate(type_name: &str, fields: &Fields) -> Vec<Diagnostic> {
             .maps_from
             .iter()
             .find(|(_, canonical)| *canonical == field)
-            .and_then(|(legacy, _)| get_path(fields, legacy).filter(|v| is_present(v)).map(|_| *legacy));
+            .and_then(|(legacy, _)| {
+                get_path(fields, legacy)
+                    .filter(|v| is_present(v))
+                    .map(|_| *legacy)
+            });
         out.push(match via {
             Some(legacy) => Diagnostic {
                 severity: Severity::Warn,
@@ -271,7 +275,9 @@ fn parse_devlog(text: &str) -> Fields {
         if line.trim().is_empty() {
             break; // blank line ends the header block
         }
-        let Some((key, val)) = line.split_once(':') else { break };
+        let Some((key, val)) = line.split_once(':') else {
+            break;
+        };
         let key = key.trim();
         if key.is_empty() || key.contains(char::is_whitespace) {
             break; // not a `key: value` header line → start of prose
@@ -315,7 +321,11 @@ pub fn parse(source: Source, text: &str) -> anyhow::Result<Fields> {
 /// `type_name` (apply `maps_from` migrations, then validate). The single entry
 /// point a producer calls to turn a messy on-disk artifact into a conforming
 /// concept plus its work-items.
-pub fn load(source: Source, type_name: &str, text: &str) -> anyhow::Result<(Fields, Vec<Diagnostic>)> {
+pub fn load(
+    source: Source,
+    type_name: &str,
+    text: &str,
+) -> anyhow::Result<(Fields, Vec<Diagnostic>)> {
     Ok(normalize(type_name, parse(source, text)?))
 }
 
@@ -325,7 +335,11 @@ mod tests {
     use serde_json::json;
 
     fn fields(v: serde_json::Value) -> Fields {
-        v.as_object().expect("test fields must be a JSON object").clone().into_iter().collect()
+        v.as_object()
+            .expect("test fields must be a JSON object")
+            .clone()
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -348,7 +362,10 @@ mod tests {
             "metadata": { "node_type": "memory", "type": "project" }
         }));
         let d = validate("memory", &f);
-        assert!(d.iter().all(|x| x.severity == Severity::Warn), "no hard errors: {d:?}");
+        assert!(
+            d.iter().all(|x| x.severity == Severity::Warn),
+            "no hard errors: {d:?}"
+        );
         assert!(d.iter().any(|x| x.code == "needs-migration"));
     }
 
@@ -356,7 +373,9 @@ mod tests {
     fn memory_missing_everything_is_a_hard_error() {
         let f = fields(json!({ "description": "a fact with no kind anywhere" }));
         let d = validate("memory", &f);
-        assert!(d.iter().any(|x| x.code == "missing-required" && x.severity == Severity::Error));
+        assert!(d
+            .iter()
+            .any(|x| x.code == "missing-required" && x.severity == Severity::Error));
     }
 
     #[test]
@@ -364,9 +383,14 @@ mod tests {
         // A devlog entry: its `type:` is the CATEGORY; the concept type is "event"
         // (assigned by the loader). With time+agent present it's clean, and the
         // inner `type` is understood as `category` via maps_from.
-        let f = fields(json!({ "time": "[3:36am] [06-26-26]", "agent": "claude", "type": "feature-request" }));
+        let f = fields(
+            json!({ "time": "[3:36am] [06-26-26]", "agent": "claude", "type": "feature-request" }),
+        );
         assert!(validate("event", &f).is_empty());
-        assert_eq!(concept_type("event").unwrap().maps_from, &[("type", "category")]);
+        assert_eq!(
+            concept_type("event").unwrap().maps_from,
+            &[("type", "category")]
+        );
     }
 
     #[test]
@@ -380,7 +404,10 @@ mod tests {
     #[test]
     fn dotted_path_resolves_nested_fields() {
         let f = fields(json!({ "metadata": { "type": "project" } }));
-        assert_eq!(get_path(&f, "metadata.type").and_then(|v| v.as_str()), Some("project"));
+        assert_eq!(
+            get_path(&f, "metadata.type").and_then(|v| v.as_str()),
+            Some("project")
+        );
         assert!(get_path(&f, "metadata.missing").is_none());
         assert!(get_path(&f, "absent.path").is_none());
     }
@@ -397,8 +424,14 @@ mod tests {
         let (norm, diags) = normalize("memory", raw);
         assert_eq!(norm.get("kind").and_then(|v| v.as_str()), Some("project"));
         assert_eq!(norm.get("type").and_then(|v| v.as_str()), Some("memory"));
-        assert_eq!(norm.get("title").and_then(|v| v.as_str()), Some("campaign-hub-real-data"));
-        assert!(diags.iter().all(|d| d.severity != Severity::Error), "healed: {diags:?}");
+        assert_eq!(
+            norm.get("title").and_then(|v| v.as_str()),
+            Some("campaign-hub-real-data")
+        );
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "healed: {diags:?}"
+        );
     }
 
     #[test]
@@ -431,8 +464,14 @@ mod tests {
                     type: project\n---\n\nthe fact body";
         let (f, diags) = load(Source::Yaml, "memory", text).unwrap();
         assert_eq!(f.get("kind").and_then(|v| v.as_str()), Some("project"));
-        assert_eq!(f.get("title").and_then(|v| v.as_str()), Some("campaign-hub-real-data"));
-        assert!(diags.iter().all(|d| d.severity != Severity::Error), "healed: {diags:?}");
+        assert_eq!(
+            f.get("title").and_then(|v| v.as_str()),
+            Some("campaign-hub-real-data")
+        );
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "healed: {diags:?}"
+        );
     }
 
     #[test]
@@ -443,9 +482,18 @@ mod tests {
                     worktree:  feat/voice-agent\ntype:      feature-request\narea:      backend\n\n\
                     What I did and why. Plain prose: with a colon even.\n___________";
         let (f, diags) = load(Source::Devlog, "event", text).unwrap();
-        assert_eq!(f.get("time").and_then(|v| v.as_str()), Some("[12:34pm] [06-15-26]"));
-        assert_eq!(f.get("category").and_then(|v| v.as_str()), Some("feature-request"));
-        assert!(!f.contains_key("What I did and why. Plain prose"), "prose is not a field");
+        assert_eq!(
+            f.get("time").and_then(|v| v.as_str()),
+            Some("[12:34pm] [06-15-26]")
+        );
+        assert_eq!(
+            f.get("category").and_then(|v| v.as_str()),
+            Some("feature-request")
+        );
+        assert!(
+            !f.contains_key("What I did and why. Plain prose"),
+            "prose is not a field"
+        );
         assert!(diags.is_empty(), "event conforms: {diags:?}");
     }
 
