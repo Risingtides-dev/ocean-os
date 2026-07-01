@@ -443,7 +443,11 @@ async fn main() -> AcpResult<()> {
                                         SessionId::new(session.id.to_string()),
                                         session.cwd,
                                     );
-                                    info.title = Some(session.title);
+                                    // Empty daemon title (never-prompted session)
+                                    // maps to None so editors render their own
+                                    // "Untitled" placeholder instead of a blank row.
+                                    info.title =
+                                        Some(session.title).filter(|t| !t.trim().is_empty());
                                     info.updated_at = Some(session.updated_at.to_rfc3339());
                                     info
                                 })
@@ -516,17 +520,39 @@ async fn main() -> AcpResult<()> {
                         Some(cwd) => cwd,
                         None => {
                             // Normally session/new (or session/load on resume)
-                            // populates the cwd. If we still miss — a stray prompt
-                            // for a session we never saw — fall back to the process
-                            // cwd so we never wedge.
-                            tracing::warn!(
-                                %session_id,
-                                "session/prompt for a session with no recorded cwd; \
-                                 falling back to the process cwd"
-                            );
-                            std::env::current_dir()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| ".".to_string())
+                            // populates the cwd. A miss is NOT necessarily a
+                            // stray prompt: a client may go session/list →
+                            // session/prompt without an intervening load, or
+                            // the bridge may have restarted while the editor
+                            // held live session ids. In both cases the ACP id
+                            // IS the daemon id (OCEAN-213), so resolve against
+                            // the daemon first — otherwise we'd submit
+                            // daemon_id=None under the process cwd and fork a
+                            // fresh transcript instead of resuming (the same
+                            // bug class as Codex P1 #137, via a different door).
+                            match client.session_cwd(&session_id).await {
+                                Ok(Some(daemon_cwd)) => {
+                                    sessions.insert_with_daemon_id(
+                                        session_id.clone(),
+                                        daemon_cwd.clone(),
+                                        Some(session_id.clone()),
+                                    );
+                                    daemon_cwd
+                                }
+                                Ok(None) | Err(_) => {
+                                    // Genuinely unknown (or daemon unreachable):
+                                    // fall back to the process cwd so we never
+                                    // wedge; the daemon will mint a session.
+                                    tracing::warn!(
+                                        %session_id,
+                                        "session/prompt for a session with no recorded cwd \
+                                         and no daemon match; falling back to the process cwd"
+                                    );
+                                    std::env::current_dir()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| ".".to_string())
+                                }
+                            }
                         }
                     };
 
