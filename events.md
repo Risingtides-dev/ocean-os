@@ -1267,3 +1267,11 @@ area:      [infra]
 
 Phase-1 (security & truth) complete via workflow wf_a7d90235-6e9 (5 parallel lanes + review + land; ledger at ocean-discovery/09-phase1-run.md). Leak closure: rotation verdict AUTH-OFF (leaked pair guards nothing — proxy down, no creds configured), scrub procedure staged privately, handoff.md sanitized; scrub yes/no with John (repo is public, literal fetchable from 4 commits). Bedrock PDF/DOCX extraction reviewed+merged (PR #9, 1d4f502, 37/37 tests) closing the silent data-loss gap; backfill script pending a live-DB dry-run. Doc truth: ocean-os ROADMAP/ARCHITECTURE revalidated with anchors; ocean-agents missing design spec recovered+merged; surface F-03/F-04 transitional framing landed. Next: Phase-2 waves per ocean-discovery/06-orchestration-plan.md.
 _________________________________________________________________________________
+time:      [11:13pm] [07-01-26]
+agent:     [claude] [fable 5]
+worktree:  claude/quirky-morse-c1f4c4
+type:      [merge]
+area:      [backend]
+
+Phase 2 Wave A complete (workflow wf_5bc67ba5-36b: 3 worktree lanes -> adversarial review -> sequential land). A2 folder-as-agent tier-1 subprocess capability binding merged as bfeba13 (PR #270): [[subprocess_capability]] in agent.toml now instantiates real PluginProvider tools merged into the per-turn registry, fail-soft, 3 new tests. A3 OKF first real consumer merged as fb28a58 (PR #269): ocean-memory ingest runs frontmatter through okf::load, diagnostics carried not rejected, maps_from migration proven by test. A1 (Longhouse workflow loader) verified already shipped via OCEAN-338/340 — lane opened no PR; noted efficiency nit in workflows_prepare (loads full skill index to discard .skills). Both reviews verdict approve; both merges on green CI. Lane worktrees/branches removed after per-file containment proof. Deferred: builtin:/mcp: scheme binding + wasm tier-2 (A2), Transcript::frontmatter producer/session-startup seeding (A3, Phase 3 on-ramp). Ledger: ocean-discovery/10-phase2-wave-a-run.md.
+_________________________________________________________________________________
