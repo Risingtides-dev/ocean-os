@@ -16,11 +16,14 @@
 
 use std::sync::LazyLock;
 
+use ocean_context::okf;
 use ocean_context::{Anchor, ClaimEvent, ClaimStatus, Provenance};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{Memory, MemoryId, MemoryKind, MemoryScope, MemoryStore, PrincipalId, Result};
+use crate::{
+    Memory, MemoryError, MemoryId, MemoryKind, MemoryScope, MemoryStore, PrincipalId, Result,
+};
 
 // ===========================================================================
 // Transcript shape
@@ -49,6 +52,56 @@ pub enum TurnRole {
 pub struct Transcript {
     pub session_id: String,
     pub turns: Vec<TranscriptTurn>,
+    /// A structured source artifact seeding the session — a handoff (TOML), a
+    /// memory/vault file (YAML), or an `events.md` entry (devlog). When present,
+    /// its frontmatter is normalized through the OKF profile registry (rather
+    /// than hand-parsed or dropped) and written as one OKF-typed memory row.
+    #[serde(default)]
+    pub frontmatter: Option<Frontmatter>,
+}
+
+/// A structured on-disk artifact attached to a session, carried through the OKF
+/// profile registry at ingest time. Rather than re-implementing frontmatter
+/// parsing here, ingest hands `text` to [`okf::load`] as the declared [`okf::Source`]
+/// and OKF concept `concept_type`; the normalized [`okf::Fields`] and its
+/// diagnostics land verbatim on the resulting memory row's body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Frontmatter {
+    /// The on-disk shape (`toml` / `yaml` / `devlog`).
+    pub source: FrontmatterSource,
+    /// The OKF concept type the artifact declares (`"handoff"`, `"memory"`,
+    /// `"event"`, …). Passed straight to [`okf::load`] as the routing
+    /// discriminator; an unknown type is tolerated as a diagnostic, never
+    /// rejected — matching OKF's validate-by-diagnostics contract.
+    pub concept_type: String,
+    /// The raw artifact text (frontmatter block plus any body/prose).
+    pub text: String,
+}
+
+/// Serde-friendly mirror of [`okf::Source`]. OKF's enum is `Copy` but not
+/// `Serialize`; this keeps `Transcript` (de)serializable while delegating the
+/// actual parsing to OKF via [`FrontmatterSource::as_okf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrontmatterSource {
+    /// `+++`-delimited TOML frontmatter (handoffs).
+    Toml,
+    /// `---`-delimited YAML frontmatter (vault notes, memory files).
+    Yaml,
+    /// A single `events.md` entry (`key: value` header lines then prose).
+    Devlog,
+}
+
+impl FrontmatterSource {
+    /// The OKF [`okf::Source`] this maps to — the single point that couples this
+    /// crate to OKF's source discriminator.
+    fn as_okf(self) -> okf::Source {
+        match self {
+            FrontmatterSource::Toml => okf::Source::Toml,
+            FrontmatterSource::Yaml => okf::Source::Yaml,
+            FrontmatterSource::Devlog => okf::Source::Devlog,
+        }
+    }
 }
 
 // ===========================================================================
@@ -75,6 +128,9 @@ pub struct IngestReport {
     pub deterministic: usize,
     /// Extra memories the residue (model) seam contributed.
     pub residue: usize,
+    /// OKF-normalized frontmatter rows written (0 or 1 — the transcript's
+    /// [`Transcript::frontmatter`], normalized through the profile registry).
+    pub normalized: usize,
     /// Total rows written to the store.
     pub written: usize,
 }
@@ -261,16 +317,109 @@ fn build_memory(cand: Candidate, turn: &TranscriptTurn, ctx: &IngestContext<'_>)
 }
 
 // ===========================================================================
+// OKF frontmatter normalization
+// ===========================================================================
+
+/// Run `fm` through the OKF profile registry ([`okf::load`]) and build one
+/// memory row carrying the normalized, typed fields plus its diagnostics.
+///
+/// This is the crate's single OKF call site: the frontmatter is *not* hand-parsed
+/// here — `okf::load` applies the profile's `maps_from` migrations and produces
+/// the conformance diagnostics, and both land verbatim on the row's body. Per
+/// OKF's validate-by-diagnostics contract, diagnostics are *carried*, never a
+/// reason to reject — a malformed block (an actual parse error) is the only
+/// `Err`, and the caller may skip it exactly as `store.rs` skips a bad claims
+/// block. The row's `kind` follows the concept type where it names a memory
+/// nature; everything else is a [`MemoryKind::Fact`] about the artifact.
+///
+/// A malformed frontmatter block is OKF's one `Err`; it is surfaced as
+/// [`MemoryError::BadInput`] so the caller can skip that artifact. Diagnostics
+/// are never an error here — they ride on the row's body.
+fn build_frontmatter_memory(fm: &Frontmatter, ctx: &IngestContext<'_>) -> Result<Memory> {
+    let (normalized, diagnostics) = okf::load(fm.source.as_okf(), &fm.concept_type, &fm.text)
+        .map_err(|e| MemoryError::BadInput(format!("malformed OKF frontmatter: {e}")))?;
+
+    // Diagnostics are structured (severity/code/message) so a later normalizer
+    // pass can query the carried work-items, not just read prose.
+    let diagnostics: Vec<serde_json::Value> = diagnostics
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "severity": match d.severity {
+                    okf::Severity::Warn => "warn",
+                    okf::Severity::Error => "error",
+                },
+                "code": d.code,
+                "message": d.message,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "okf": {
+            "concept_type": fm.concept_type,
+            // Normalized (post-`maps_from`) typed fields, carried verbatim.
+            "fields": normalized,
+            // Conformance work-items — carried, not gating.
+            "diagnostics": diagnostics,
+        }
+    });
+
+    Ok(Memory {
+        id: MemoryId::new(),
+        scope: ctx.scope,
+        owner: ctx.owner.clone(),
+        kind: frontmatter_memory_kind(&fm.concept_type),
+        body,
+        provenance: Provenance {
+            anchors: Vec::new(),
+            tickets: Vec::new(),
+            commit_sha: ctx.commit_sha.to_string(),
+        },
+        trust: ClaimStatus::Asserted,
+        seq: 0, // assigned by the store on insert
+        written_at: ctx.now,
+        updated_at: ctx.now,
+        history: vec![ClaimEvent {
+            at: ctx.now,
+            event: "written".into(),
+            by_session: ctx.by_session.to_string(),
+        }],
+    })
+}
+
+/// The memory kind for a normalized-frontmatter row. A `memory` concept is a
+/// [`MemoryKind::Fact`]; an `event`/devlog entry an [`MemoryKind::Event`]; every
+/// other artifact (handoff/claim/agent/note/unknown) is recorded as a
+/// [`MemoryKind::Fact`] *about* that artifact.
+fn frontmatter_memory_kind(concept_type: &str) -> MemoryKind {
+    match concept_type {
+        "event" => MemoryKind::Event,
+        _ => MemoryKind::Fact,
+    }
+}
+
+// ===========================================================================
 // The ingest entry point
 // ===========================================================================
 
-/// Ingest a transcript: deterministic pass → store writes → residue seam.
+/// Ingest a transcript: OKF frontmatter → deterministic pass → store writes →
+/// residue seam.
 ///
-/// Deterministic candidates are written immediately (one [`Memory`] each, proven
-/// = the structured signal). Turns that yield no candidate accumulate as
-/// [`Residue`] and are handed to `residue` — a no-op by default, the cheap-model
-/// seam. Returns counts; never aborts the run on a single bad write (a `put`
-/// failure short-circuits, since the store is the source of truth).
+/// If the transcript carries [`Transcript::frontmatter`], it is first normalized
+/// through the OKF profile registry ([`okf::load`]) and written as one row whose
+/// body holds the typed, migrated fields plus their conformance diagnostics —
+/// the frontmatter is neither dropped nor hand-parsed here. Deterministic
+/// candidates are then written immediately (one [`Memory`] each, proven = the
+/// structured signal). Turns that yield no candidate accumulate as [`Residue`]
+/// and are handed to `residue` — a no-op by default, the cheap-model seam.
+///
+/// Returns counts; never aborts the run on a single bad write (a `put` failure
+/// short-circuits, since the store is the source of truth). A *malformed*
+/// frontmatter block is the one OKF `Err` — surfaced as [`MemoryError::BadInput`]
+/// so the caller can skip that artifact, mirroring `store.rs`'s treatment of an
+/// unparseable claims block. Diagnostics are never such an error: they are
+/// carried on the row, per OKF's validate-by-diagnostics contract.
 pub fn ingest(
     transcript: &Transcript,
     ctx: &IngestContext<'_>,
@@ -279,6 +428,13 @@ pub fn ingest(
 ) -> Result<IngestReport> {
     let mut report = IngestReport::default();
     let mut residue_buf = Residue::default();
+
+    if let Some(fm) = &transcript.frontmatter {
+        let mem = build_frontmatter_memory(fm, ctx)?;
+        store.put(mem)?;
+        report.normalized += 1;
+        report.written += 1;
+    }
 
     for turn in &transcript.turns {
         let candidates = extract_candidates(&turn.text);
@@ -331,6 +487,7 @@ mod tests {
                 text: text.into(),
                 at: 1_780_000_000,
             }],
+            frontmatter: None,
         }
     }
 
@@ -363,6 +520,7 @@ mod tests {
                 text: "hey how's it going today".into(),
                 at: 1,
             }],
+            frontmatter: None,
         };
         let report = ingest(&t, &ctx(&owner), &mut store, &NoResidue).unwrap();
         assert_eq!(report.deterministic, 0);
@@ -435,6 +593,136 @@ mod tests {
             Some(MemoryKind::Event)
         );
         assert_eq!(parse_marker("not a marker"), None);
+    }
+
+    #[test]
+    fn devlog_frontmatter_is_okf_normalized_into_a_memory_row() {
+        // A real events.md entry ingested through ocean-memory: OKF's maps_from
+        // migration must fire (`type:` → canonical `category`) and the normalized
+        // fields + diagnostics must land on a written memory row — proving the
+        // frontmatter was carried through the profile registry, not hand-parsed
+        // or dropped.
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let owner = PrincipalId::new("coworker-a");
+        let t = Transcript {
+            session_id: "sess-1".into(),
+            turns: Vec::new(),
+            frontmatter: Some(Frontmatter {
+                source: FrontmatterSource::Devlog,
+                concept_type: "event".into(),
+                text: "time:      [12:34pm] [06-15-26]\nagent:     [claude] [opus 4.8]\n\
+                       type:      feature-request\narea:      backend\n\n\
+                       What I did and why."
+                    .into(),
+            }),
+        };
+
+        let report = ingest(&t, &ctx(&owner), &mut store, &NoResidue).unwrap();
+        assert_eq!(report.normalized, 1, "one OKF-normalized frontmatter row");
+        assert_eq!(report.written, 1);
+        assert_eq!(report.deterministic, 0);
+
+        // The written row carries the OKF-normalized fields.
+        let page = store.list_page(&owner, None, None).unwrap();
+        assert_eq!(page.memories.len(), 1);
+        let row = &page.memories[0];
+        assert_eq!(row.kind, MemoryKind::Event, "an event concept is an Event");
+
+        let okf = &row.body["okf"];
+        assert_eq!(okf["concept_type"], "event");
+        // maps_from migration fired: the devlog's `type:` was lifted to the
+        // canonical `category`, and does NOT collide with the OKF concept type.
+        assert_eq!(
+            okf["fields"]["category"], "feature-request",
+            "OKF normalize() lifted `type` → `category`: {:?}",
+            okf["fields"]
+        );
+        // A conforming event (time + agent present) carries no diagnostics.
+        assert_eq!(
+            okf["diagnostics"].as_array().map(Vec::len),
+            Some(0),
+            "conforming event has no diagnostics"
+        );
+    }
+
+    #[test]
+    fn frontmatter_diagnostics_are_carried_not_rejected() {
+        // A memory artifact whose `kind` is only reachable via metadata.type: OKF
+        // must heal it (needs-migration warning), and the normalized `kind` plus
+        // any carried diagnostics must be attached — never a reason to reject.
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let owner = PrincipalId::new("a");
+        let t = Transcript {
+            session_id: "s".into(),
+            turns: Vec::new(),
+            frontmatter: Some(Frontmatter {
+                source: FrontmatterSource::Yaml,
+                concept_type: "memory".into(),
+                text: "---\nname: campaign-hub-real-data\nmetadata:\n  node_type: memory\n  \
+                       type: project\n---\n\nthe fact body"
+                    .into(),
+            }),
+        };
+
+        let report = ingest(&t, &ctx(&owner), &mut store, &NoResidue).unwrap();
+        assert_eq!(report.normalized, 1);
+
+        let page = store.list_page(&owner, None, None).unwrap();
+        let okf = &page.memories[0].body["okf"];
+        // maps_from healed metadata.type → kind and name → title.
+        assert_eq!(okf["fields"]["kind"], "project");
+        assert_eq!(okf["fields"]["title"], "campaign-hub-real-data");
+        // No hard errors were carried (the shape healed to conformance).
+        let diags = okf["diagnostics"].as_array().unwrap();
+        assert!(
+            diags.iter().all(|d| d["severity"] != "error"),
+            "healed shape carries no error diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_frontmatter_is_skippable_bad_input() {
+        // Delimiters present but the YAML inside is broken → OKF returns Err,
+        // surfaced as BadInput so the caller can skip the artifact (mirrors the
+        // unparseable-claims handling in store.rs). Diagnostics never do this.
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let owner = PrincipalId::new("a");
+        let t = Transcript {
+            session_id: "s".into(),
+            turns: Vec::new(),
+            frontmatter: Some(Frontmatter {
+                source: FrontmatterSource::Yaml,
+                concept_type: "note".into(),
+                text: "---\nname: [unterminated\n  : : :\n---\nbody".into(),
+            }),
+        };
+        let err = ingest(&t, &ctx(&owner), &mut store, &NoResidue).unwrap_err();
+        assert!(
+            matches!(err, MemoryError::BadInput(_)),
+            "malformed frontmatter is skippable BadInput, got {err:?}"
+        );
+        // Nothing was written.
+        assert_eq!(store.count(&owner).unwrap(), 0);
+    }
+
+    #[test]
+    fn frontmatter_coexists_with_deterministic_pass() {
+        // Frontmatter row AND turn candidates both write: the OKF row is additive,
+        // not a replacement for the deterministic transcript pass.
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let owner = PrincipalId::new("a");
+        let mut t = transcript("touched router.py and OCEAN-9");
+        t.frontmatter = Some(Frontmatter {
+            source: FrontmatterSource::Toml,
+            concept_type: "handoff".into(),
+            text: "+++\nsession_id = \"s-1\"\nrepo = \"ocean-os\"\nbranch = \"main\"\n\
+                   commit_anchor = \"abc1234\"\n+++\n\nnarrative"
+                .into(),
+        });
+        let report = ingest(&t, &ctx(&owner), &mut store, &NoResidue).unwrap();
+        assert_eq!(report.normalized, 1, "one OKF row");
+        assert_eq!(report.deterministic, 2, "router.py + OCEAN-9");
+        assert_eq!(report.written, 3);
     }
 
     /// Helper used by the fake-model test: build a [`Provenance`] from a ctx.
