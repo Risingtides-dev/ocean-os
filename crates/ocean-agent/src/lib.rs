@@ -1118,6 +1118,7 @@ impl AgentRuntime {
             model_id: _,
             agent_model: _,
             tool_allowlist,
+            agent_capabilities,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
         // built-ins plus any connected MCP/skill providers, deduped first-wins.
@@ -1131,7 +1132,38 @@ impl AgentRuntime {
         // restricts this turn to those tools. Fail-safe — if the allowlist
         // matches no available tool (typo / renamed tool), keep the full set and
         // warn rather than running the agent with zero tools.
-        let tools = narrow_tools(tools, tool_allowlist.as_deref());
+        let mut tools = narrow_tools(tools, tool_allowlist.as_deref());
+        // A2 — folder-as-agent capability binding. When the turn's agent declares
+        // tier-1 subprocess capabilities, launch each as an `ocean-plugin`
+        // subprocess and APPEND its tools (namespaced `plugin__<name>__*`, always
+        // permission-gated) to this turn's toolset. Appended AFTER narrowing so an
+        // agent's own declared capability tools are never filtered out by its
+        // built-in `tools` allowlist — the allowlist restricts built-ins, not the
+        // capabilities the agent explicitly asked for. Fail-soft: a spec that
+        // can't spawn is skipped inside the builder, so a bad capability never
+        // breaks the turn. No caps → the toolset is unchanged (behavior-neutral
+        // for every other turn). First-wins dedup keeps built-ins unshadowable.
+        if let Some((agent_root, caps)) = agent_capabilities {
+            let extra = build_agent_capability_providers(&caps, &agent_root).await;
+            if !extra.is_empty() {
+                let mut seen: std::collections::HashSet<String> =
+                    tools.iter().map(|t| t.name().to_string()).collect();
+                for provider in &extra {
+                    for tool in provider.tools(&tool_ctx).await {
+                        let name = tool.name().to_string();
+                        if seen.insert(name.clone()) {
+                            tools.push(tool);
+                        } else {
+                            tracing::warn!(
+                                tool = %name,
+                                provider = %provider.id(),
+                                "agent capability tool name collides with an existing tool; keeping the existing one"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let mut cfg = AgentConfig::new(
             snapshot.model.clone(),
@@ -1434,6 +1466,14 @@ pub struct PromptControl {
     /// `model_id` it fails SOFT — an unresolvable agent model falls back to the
     /// global model rather than failing the turn. `None` = no agent model.
     pub agent_model: Option<String>,
+    /// A folder-as-agent's declared tier-1 subprocess capabilities plus the agent
+    /// folder they resolve relative to (A2 capability binding). When `Some`, the
+    /// turn launches each spec as an `ocean-plugin` subprocess and merges its
+    /// tools into this turn's registry alongside the built-ins. `None` (every
+    /// non-folder turn, and every data-only agent) leaves the process registry
+    /// unchanged. Fail-soft: a spec that can't spawn is warned and skipped, never
+    /// breaking the turn.
+    pub agent_capabilities: Option<(PathBuf, Vec<agentdir::SubprocessCapability>)>,
 }
 
 /// Narrow a turn's toolset to `allowlist` (folder-as-agent tool restriction).
@@ -1474,12 +1514,26 @@ impl PromptControl {
             model_id: None,
             tool_allowlist: None,
             agent_model: None,
+            agent_capabilities: None,
         }
     }
 
     /// Narrow this turn's toolset to the named tools (folder-as-agent allowlist).
     pub fn with_tool_allowlist(mut self, tools: Vec<String>) -> Self {
         self.tool_allowlist = (!tools.is_empty()).then_some(tools);
+        self
+    }
+
+    /// Bind a folder-as-agent's declared tier-1 subprocess capabilities for this
+    /// turn (A2). `caps` are launched (relative commands resolved against
+    /// `agent_root`) and their tools merged into the turn's registry. An empty
+    /// `caps` list leaves the turn registry unchanged.
+    pub fn with_agent_capabilities(
+        mut self,
+        agent_root: PathBuf,
+        caps: Vec<agentdir::SubprocessCapability>,
+    ) -> Self {
+        self.agent_capabilities = (!caps.is_empty()).then_some((agent_root, caps));
         self
     }
 
@@ -1697,6 +1751,95 @@ async fn discover_plugin_providers(config_dir: &Path) -> Vec<Arc<dyn CapabilityP
         providers.push(Arc::new(provider));
     }
 
+    providers
+}
+
+/// Bind a folder-as-agent's declared tier-1 **subprocess capabilities** into
+/// runtime providers for a turn (A2 capability binding).
+///
+/// For each `[[subprocess_capability]]` in the agent's `agent.toml`, launch its
+/// `command` as an `ocean-plugin` [`SubprocessPlugin`](ocean_plugin::SubprocessPlugin)
+/// (relative commands/cwd resolved against `agent_root`) and adapt it with
+/// [`PluginProvider::connect`](ocean_plugin::PluginProvider::connect), so the
+/// agent's declared tools become callable alongside the built-ins — namespaced
+/// `plugin__<name>__<tool>` and permission-gated exactly like every other plugin
+/// tool. Reuses `ocean-plugin`'s subprocess JSON-RPC wholesale; no reimplementation.
+///
+/// **Fail-soft, mirroring MCP/plugin discovery and the agent model-honoring path
+/// in `prompt()`:** a capability with an empty command, or one whose command
+/// can't spawn, is logged at warn and skipped — it can NEVER kill the turn. The
+/// plugin's own `list_tools` failure is already absorbed into an empty,
+/// `Unavailable`-health provider by `connect`. An agent with no subprocess
+/// capabilities yields an empty vec (behavior-neutral for every data-only agent).
+async fn build_agent_capability_providers(
+    caps: &[agentdir::SubprocessCapability],
+    agent_root: &Path,
+) -> Vec<Arc<dyn CapabilityProvider>> {
+    let mut providers: Vec<Arc<dyn CapabilityProvider>> = Vec::new();
+    for cap in caps {
+        let name = cap.effective_name();
+        if cap.command.trim().is_empty() {
+            tracing::warn!(
+                capability = %name,
+                "skipping agent subprocess capability: empty command"
+            );
+            continue;
+        }
+
+        // Resolve a relative command against the agent folder; an absolute path is
+        // used as-is. Mirrors `SubprocessPlugin::launch`'s base-dir resolution for
+        // a manifest `entry`, so a capability command is located exactly like a
+        // plugin pack's `entry` (relative to the folder that declares it).
+        let command = {
+            let p = Path::new(&cap.command);
+            if p.is_absolute() {
+                cap.command.clone()
+            } else {
+                agent_root.join(p).to_string_lossy().into_owned()
+            }
+        };
+        let mut env: Vec<(String, String)> = cap
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let Some(cwd) = cap.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
+            // ocean-plugin's StdioTransport spawns from the launcher's cwd; pass a
+            // resolved working directory via the child's PWD so a capability that
+            // honors it lands in the right place without changing the launcher.
+            let resolved = {
+                let c = Path::new(cwd);
+                if c.is_absolute() {
+                    c.to_path_buf()
+                } else {
+                    agent_root.join(c)
+                }
+            };
+            env.push(("PWD".to_string(), resolved.to_string_lossy().into_owned()));
+        }
+
+        let plugin = match ocean_plugin::SubprocessPlugin::launch_command(
+            &name, "0.0.0", &command, &cap.args, &env,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    capability = %name,
+                    command = %command,
+                    error = %e,
+                    "skipping agent subprocess capability: failed to launch"
+                );
+                continue;
+            }
+        };
+        // connect() never errors on a plugin-side failure: a plugin that can't
+        // list tools becomes an empty, Unavailable provider rather than aborting.
+        let provider = ocean_plugin::PluginProvider::connect(
+            Arc::new(plugin) as Arc<dyn ocean_plugin::Plugin>
+        )
+        .await;
+        providers.push(Arc::new(provider));
+    }
     providers
 }
 
@@ -3044,6 +3187,95 @@ done
         );
 
         let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // A2 — folder-as-agent capability binding. A fixture agent folder that
+    // declares a tier-1 `[[subprocess_capability]]` must have its tool folded
+    // into the resolved registry, namespaced `plugin__<name>__<tool>` and
+    // permission-gated, alongside the built-ins — the whole point of A2. Resolves
+    // the agent through `agentdir` for real so the parse + bind path is exercised
+    // end-to-end, then merges the agent providers on top of the built-ins exactly
+    // as `run_prompt` does.
+    #[tokio::test]
+    async fn agent_subprocess_capability_tool_appears_in_registry() {
+        let agents_root = temp_config_dir("agent-cap-bind");
+        let agent_dir = agents_root.join("scraper");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("instructions.md"), "You scrape.\n").unwrap();
+        let script = write_echo_plugin_script(&agent_dir);
+        // The capability command is RELATIVE to the agent folder — the binder must
+        // resolve it against `def.root` for the spawn to succeed.
+        let agent_toml = format!(
+            "description = \"scraper\"\n\n[[subprocess_capability]]\nname = \"scrape\"\ncommand = \"{}\"\n",
+            script.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(agent_dir.join("agent.toml"), agent_toml).unwrap();
+
+        let def = agentdir::resolve(&agents_root, "scraper").expect("agent resolves");
+        assert_eq!(def.config.subprocess_capabilities.len(), 1);
+
+        let providers =
+            build_agent_capability_providers(&def.config.subprocess_capabilities, &def.root).await;
+        assert_eq!(providers.len(), 1, "exactly one capability bound");
+
+        // Layer the agent's providers on top of the built-ins, as run_prompt does.
+        let mut all: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
+        all.extend(providers);
+        let registry = CapabilityRegistry::new(all);
+        let tools = registry.tools_for_session(&SessionContext::default()).await;
+
+        let echo = tools
+            .iter()
+            .find(|t| t.name() == "plugin__scrape__echo")
+            .expect("agent capability tool namespaced into registry");
+        assert!(
+            echo.requires_permission(),
+            "capability tools must be permission-gated"
+        );
+        assert!(
+            tools.iter().any(|t| t.name() == "bash"),
+            "built-ins still present alongside the capability"
+        );
+
+        let _ = std::fs::remove_dir_all(agents_root);
+    }
+
+    // A2 fail-soft — a capability whose command can't spawn is logged and skipped;
+    // the turn still resolves with the FULL built-in toolset intact. This is the
+    // guarantee that a broken agent.toml capability never kills a turn. Mirrors the
+    // model-honoring fail-soft posture (a bad agent model falls back, never fails).
+    #[tokio::test]
+    async fn broken_agent_capability_is_skipped_turn_still_resolves() {
+        let agents_root = temp_config_dir("agent-cap-broken");
+        let agent_dir = agents_root.join("broken");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("instructions.md"), "You do stuff.\n").unwrap();
+        // A command that does not exist anywhere → spawn fails at launch.
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "description = \"broken\"\n\n[[subprocess_capability]]\nname = \"nope\"\ncommand = \"./definitely-not-a-real-binary-xyz\"\n",
+        )
+        .unwrap();
+
+        let def = agentdir::resolve(&agents_root, "broken").expect("agent resolves");
+        let providers =
+            build_agent_capability_providers(&def.config.subprocess_capabilities, &def.root).await;
+        assert!(
+            providers.is_empty(),
+            "a capability that can't spawn is skipped, not bound"
+        );
+
+        // The turn's toolset is unaffected: built-ins remain the full set.
+        let mut all: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
+        all.extend(providers);
+        let registry = CapabilityRegistry::new(all);
+        let tools = registry.tools_for_session(&SessionContext::default()).await;
+        assert!(
+            tools.iter().any(|t| t.name() == "bash"),
+            "built-ins intact after a broken capability is skipped"
+        );
+
+        let _ = std::fs::remove_dir_all(agents_root);
     }
 
     // Missing plugins dir → no plugins, no error, unchanged behavior.

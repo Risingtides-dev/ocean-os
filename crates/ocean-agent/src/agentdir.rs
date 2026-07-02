@@ -60,9 +60,86 @@ pub struct AgentConfig {
     /// loader. `builtin:`/`mcp:` are bindable against today's registry.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Tier-1 **subprocess** capabilities the agent binds when it runs a turn.
+    /// Unlike the `capabilities` scheme-strings above (a forward-declared,
+    /// surface-only contract), each entry here is a concrete, launchable spec:
+    /// the turn constructs an `ocean-plugin` `SubprocessPlugin` -> `PluginProvider`
+    /// from it and merges the resulting tools into the turn's `CapabilityRegistry`
+    /// alongside the built-ins (tools namespaced `plugin__<name>__<tool>`).
+    ///
+    /// Declared in `agent.toml` as a TOML array of tables:
+    ///
+    /// ```toml
+    /// [[subprocess_capability]]
+    /// name = "scrape"                 # namespaces its tools; defaults to command stem
+    /// command = "./tools/scrape"      # relative entries resolve against the agent folder
+    /// args = ["--stdio"]
+    /// cwd = "."                       # optional; defaults to the agent folder
+    /// env = { API_BASE = "https://…" } # optional extra child env
+    /// ```
+    ///
+    /// Empty (the default) = a data-only agent that binds no subprocess tools, so
+    /// every existing agent folder is unaffected. Fail-soft at bind time: a spec
+    /// whose command can't spawn is logged and skipped, never breaking the turn.
+    #[serde(default, rename = "subprocess_capability")]
+    pub subprocess_capabilities: Vec<SubprocessCapability>,
     /// Coarse permission posture for this agent. `None` = inherit daemon policy.
     #[serde(default)]
     pub yolo: Option<bool>,
+}
+
+/// A concrete tier-1 subprocess capability declared in `agent.toml`. The turn
+/// launches `command` (with `args`/`cwd`/`env`) as an `ocean-plugin`
+/// `SubprocessPlugin` speaking JSON-RPC over stdio and folds its tools into the
+/// turn's `CapabilityRegistry`. This is the *launchable* shape; the string
+/// `capabilities` field stays the forward-declared contract for `builtin:`/`mcp:`/
+/// `wasm:` schemes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubprocessCapability {
+    /// Stable name used to namespace this capability's tools
+    /// (`plugin__<name>__<tool>`). Optional in the TOML: when omitted it defaults
+    /// to the `command`'s file stem (see [`SubprocessCapability::effective_name`]),
+    /// so a minimal spec is just a `command`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The executable to launch. A relative path (including a bare filename)
+    /// resolves against the agent folder — the same base-dir rule
+    /// `SubprocessPlugin::launch` applies to a plugin pack's `entry`; an absolute
+    /// path is used as-is.
+    pub command: String,
+    /// Arguments passed to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Working directory for the child, resolved against the agent folder when
+    /// relative. `None` = inherit the launcher's cwd.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Extra environment variables injected into the child, on top of the
+    /// launcher's environment.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl SubprocessCapability {
+    /// The name that namespaces this capability's tools: the explicit `name` if
+    /// set, else the `command`'s file stem, else the raw `command`. Never empty
+    /// for a non-empty `command`.
+    pub fn effective_name(&self) -> String {
+        if let Some(name) = self
+            .name
+            .as_ref()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+        {
+            return name.to_string();
+        }
+        Path::new(&self.command)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.command.clone())
+    }
 }
 
 /// A discovered skill: `skills/<name>.md`. Body is read lazily by the caller.
@@ -504,6 +581,53 @@ mod tests {
         assert_eq!(def.effective_tools(), vec!["web_search", "fetch"]);
         // nested subagent discovered
         assert_eq!(def.subagents, vec!["fact_checker"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `[[subprocess_capability]]` table in agent.toml parses into a concrete,
+    /// launchable spec. This is the tier-1 binding shape the turn constructs a
+    /// SubprocessPlugin from — distinct from the forward-declared `capabilities`
+    /// scheme-strings.
+    #[test]
+    fn resolve_parses_subprocess_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "ocean-agentdir-test-{}-subproc-cap",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("bot");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("instructions.md"), "Do stuff.\n").unwrap();
+        fs::write(
+            dir.join("agent.toml"),
+            "description = \"has a subprocess tool\"\n\
+             [[subprocess_capability]]\n\
+             name = \"scrape\"\n\
+             command = \"./tools/scrape\"\n\
+             args = [\"--stdio\"]\n\
+             cwd = \".\"\n\
+             env = { API_BASE = \"https://example.test\" }\n\
+             \n\
+             [[subprocess_capability]]\n\
+             command = \"/usr/local/bin/enrich\"\n",
+        )
+        .unwrap();
+
+        let def = resolve(&root, "bot").unwrap();
+        let caps = &def.config.subprocess_capabilities;
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0].effective_name(), "scrape");
+        assert_eq!(caps[0].command, "./tools/scrape");
+        assert_eq!(caps[0].args, vec!["--stdio"]);
+        assert_eq!(caps[0].cwd.as_deref(), Some("."));
+        assert_eq!(
+            caps[0].env.get("API_BASE").map(String::as_str),
+            Some("https://example.test")
+        );
+        // Second entry omits `name` → defaults to the command's file stem.
+        assert!(caps[1].name.is_none());
+        assert_eq!(caps[1].effective_name(), "enrich");
+
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -19,3 +19,18 @@ tools = ["web_fetch", "read", "grep"]
 # builtin:/mcp: bind against today's registry; subprocess:/wasm: are sideloaded
 # without a daemon rebuild as those ocean-plugin lanes land.
 capabilities = ["builtin:web_fetch", "builtin:read", "builtin:grep"]
+
+# Tier-1 subprocess capability (A2 — shipped): a concrete, launchable spec. Each
+# entry is launched per-turn as an ocean-plugin SubprocessPlugin (JSON-RPC over
+# stdio) and its tools fold into the turn's registry, namespaced
+# plugin__<name>__<tool> and permission-gated. `command` resolves relative to
+# this folder; a spec that can't spawn is skipped (fail-soft), never breaking the
+# turn. Commented out here because this example ships no binary — uncomment and
+# point `command` at your plugin executable to try it.
+#
+# [[subprocess_capability]]
+# name = "scrape"
+# command = "./tools/scrape"
+# args = ["--stdio"]
+# cwd = "."
+# env = { API_BASE = "https://example.test" }
