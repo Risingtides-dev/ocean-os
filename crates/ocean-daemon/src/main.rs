@@ -8794,31 +8794,40 @@ async fn agent_turn(
     // so every existing client (`agent: None`) is unaffected. Discover names via
     // GET /v1/agents; see docs/specs/folder-as-agent.md.
     // Also capture the named agent's declared tool allowlist (agent.toml
-    // `tools` + `tools/` filenames) and declared model so the turn can apply them
-    // below. `agent_model` feeds the turn fail-soft (unresolvable -> global).
+    // `tools` + `tools/` filenames), declared model, and tier-1 subprocess
+    // capabilities so the turn can apply them below. `agent_model` feeds the turn
+    // fail-soft (unresolvable -> global); `agent_capabilities` (A2) are launched
+    // per-turn and their tools merged into the registry (fail-soft: a spec that
+    // can't spawn is skipped, never breaking the turn).
     #[allow(clippy::type_complexity)]
-    let (guided_prompt, agent_tool_allowlist, agent_model): (
+    let (guided_prompt, agent_tool_allowlist, agent_model, agent_capabilities): (
         String,
         Option<Vec<String>>,
         Option<String>,
+        Option<(
+            std::path::PathBuf,
+            Vec<ocean_agent::agentdir::SubprocessCapability>,
+        )>,
     ) = match agent.as_deref() {
         Some(name) => match ocean_agent::agentdir::resolve(&agents_root(), name) {
             Ok(def) => {
                 let allow = def.effective_tools();
                 let allow = (!allow.is_empty()).then_some(allow);
                 let model = def.config.model.clone();
+                let caps = def.config.subprocess_capabilities.clone();
+                let caps = (!caps.is_empty()).then(|| (def.root.clone(), caps));
                 let prompt = match def.system_prompt() {
                     Some(instr) => format!("{instr}\n\n{guided_prompt}"),
                     None => guided_prompt,
                 };
-                (prompt, allow, model)
+                (prompt, allow, model, caps)
             }
             Err(e) => {
                 tracing::warn!(agent = name, error = %e, "named agent did not resolve; using surface profile");
-                (guided_prompt, None, None)
+                (guided_prompt, None, None, None)
             }
         },
-        None => (guided_prompt, None, None),
+        None => (guided_prompt, None, None, None),
     };
 
     // Longhouse pre-turn consult (OCEAN-283, default-ON). Unless the operator
@@ -9225,6 +9234,12 @@ async fn agent_turn(
         None => control,
     };
     let control = control.with_agent_model(agent_model);
+    // A2 — bind the named agent's tier-1 subprocess capabilities for this turn
+    // (no-op for every non-agent turn and every data-only agent).
+    let control = match agent_capabilities {
+        Some((root, caps)) => control.with_agent_capabilities(root, caps),
+        None => control,
+    };
     // Run the turn inside the turn-root span (OCEAN-274): the runtime's
     // `runtime.prompt` span (and every child — agent_loop, provider_stream,
     // tool_exec, persist) nests under `turn`, so the full lifecycle of this turn

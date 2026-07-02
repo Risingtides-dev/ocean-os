@@ -113,10 +113,32 @@ daemon.
   to the global one + a warn (vs explicit `model_id` which fails hard). Uses
   Ocean's bare model aliases (`claude-opus-4-7`, see `GET /v1/models`).
 
+- Capability binding — **tier 1 (subprocess), shipped (A2):** an agent folder's
+  declared `[[subprocess_capability]]` entries are launched per-turn as
+  `ocean-plugin` `SubprocessPlugin`s and merged into that turn's
+  `CapabilityRegistry`, so the agent's declared tools become callable alongside
+  the built-ins (namespaced `plugin__<name>__<tool>`, permission-gated). Each
+  entry is a concrete, launchable spec (distinct from the forward-declared
+  `capabilities` scheme-strings):
+
+  ```toml
+  [[subprocess_capability]]
+  name = "scrape"                  # namespaces its tools; defaults to command stem
+  command = "./tools/scrape"       # relative entries resolve against the agent folder
+  args = ["--stdio"]
+  cwd = "."                        # optional
+  env = { API_BASE = "https://…" } # optional extra child env
+  ```
+
+  Fail-soft: a spec whose command can't spawn is logged and skipped — it never
+  kills the turn (mirrors the model-honoring fail-soft path). Reuses
+  `ocean-plugin`'s subprocess JSON-RPC wholesale. Bound at the `ocean-agent` turn
+  layer via `PromptControl::with_agent_capabilities`; the daemon reads the caps
+  off the resolved `AgentDef` and threads them onto the turn.
+
 **Next (separate PRs):**
 
-1. Capability binding: map `capabilities` entries to `CapabilityProvider`s in the
-   per-session registry (builtin/mcp against today's registry; subprocess/wasm
-   sideloaded as those `ocean-plugin` lanes land).
+1. Capability binding, remaining tiers: `builtin:`/`mcp:` scheme-strings against
+   today's registry; tier-2 `wasm:` sideloaded as that `ocean-plugin` lane lands.
 2. Map eve-style gateway model ids (`anthropic/claude-opus-4.8`) to Ocean aliases
    so `agent.toml` `model` can accept either format.
