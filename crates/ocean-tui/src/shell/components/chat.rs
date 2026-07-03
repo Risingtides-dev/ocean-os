@@ -51,6 +51,21 @@ pub struct ChatComponent {
 }
 
 impl ChatComponent {
+    /// Replace the transcript with a resumed session's history (from disk).
+    pub fn load_history(&mut self, msgs: Vec<crate::shell::sessions::HistoryMsg>) {
+        self.turns = msgs
+            .into_iter()
+            .map(|m| {
+                if m.role == "user" {
+                    Turn::User(m.text)
+                } else {
+                    Turn::Assistant(m.text)
+                }
+            })
+            .collect();
+        self.busy = false;
+    }
+
     /// Append an assistant text delta, coalescing into the trailing Assistant
     /// block when the last turn is already assistant text.
     fn push_assistant(&mut self, delta: &str) {

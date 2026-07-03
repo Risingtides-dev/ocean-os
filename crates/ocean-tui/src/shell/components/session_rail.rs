@@ -19,6 +19,7 @@ use crate::shell::{
     component::Component,
     sessions::{ago, discover, Session, Sort},
 };
+use ocean_agent_sdk::AgentSessionId;
 
 pub struct SessionRailComponent {
     root: PathBuf,
@@ -45,11 +46,24 @@ impl SessionRailComponent {
         }
     }
 
-    fn open_selected(&self) -> Option<Action> {
+    /// Native resume: load the session's transcript into the chat and bind the
+    /// id. The primary way to open a session; falls back to the PTY only if the
+    /// id doesn't parse as a session uuid.
+    fn resume_selected(&self) -> Option<Action> {
+        let s = self.sessions.get(self.selected)?;
+        match uuid::Uuid::parse_str(&s.id) {
+            Ok(uuid) => Some(Action::ResumeSession {
+                id: AgentSessionId(uuid),
+                path: s.path.clone(),
+            }),
+            Err(_) => self.open_in_terminal(),
+        }
+    }
+
+    /// Secondary path: run the session's `ocean --resume` line in the PTY.
+    fn open_in_terminal(&self) -> Option<Action> {
         let s = self.sessions.get(self.selected)?;
         let (cmd, args) = s.resume_command();
-        // Match CTRL: cd into the session's cwd if it differs from the project
-        // root, then run the resume line.
         let mut line = format!("{} {}", cmd, args.join(" "));
         if s.cwd != self.root {
             line = format!("cd {} && {}", s.cwd.display(), line);
@@ -82,7 +96,8 @@ impl Component for SessionRailComponent {
                 self.refresh();
                 None
             }
-            KeyCode::Enter => self.open_selected(),
+            KeyCode::Enter => self.resume_selected(),
+            KeyCode::Char('t') => self.open_in_terminal(),
             _ => None,
         }
     }

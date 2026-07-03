@@ -29,4 +29,7 @@ pub enum Action {
     CycleFocus,
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
+    /// Resume a session natively in the chat: load its transcript from `path`
+    /// and bind future turns to `id`.
+    ResumeSession { id: AgentSessionId, path: PathBuf },
 }

@@ -214,6 +214,78 @@ pub fn sort_sessions(v: &mut [Session], sort: Sort) {
     }
 }
 
+/// A single transcript message loaded from a session's on-disk record.
+pub struct HistoryMsg {
+    pub role: String,
+    pub text: String,
+}
+
+/// Load a session's transcript from its JSON record. Concatenates the text of
+/// each user/assistant message; tool/system noise is skipped. Used to rehydrate
+/// the chat view when a session is resumed natively.
+pub fn load_transcript(path: &Path) -> Vec<HistoryMsg> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(messages) = v.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in messages {
+        let role = json_str(m, "role").unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let text = message_text(m);
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push(HistoryMsg {
+            role: role.to_string(),
+            text,
+        });
+    }
+    out
+}
+
+/// Extract the plain text of a message whose `content` is either a string or an
+/// array of `{type,text}` blocks.
+fn message_text(m: &serde_json::Value) -> String {
+    let Some(c) = m.get("content") else {
+        return String::new();
+    };
+    if let Some(s) = c.as_str() {
+        return clean_history_text(s);
+    }
+    if let Some(arr) = c.as_array() {
+        let mut buf = String::new();
+        for b in arr {
+            if let Some(t) = json_str(b, "text") {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(t);
+            }
+        }
+        return clean_history_text(&buf);
+    }
+    String::new()
+}
+
+/// Strip the `[TUI]`/`[ACP]` surface prefix operators prepend to prompts.
+fn clean_history_text(s: &str) -> String {
+    let t = s.trim();
+    if (t.starts_with("[TUI]") || t.starts_with("[ACP]")) && t.contains("\n\n") {
+        if let Some((_, rest)) = t.split_once("\n\n") {
+            return rest.trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
 /// Human "2h", "3d", "now" from a unix-seconds mtime.
 pub fn ago(mtime: u64) -> String {
     let now = SystemTime::now()
@@ -284,6 +356,25 @@ mod tests {
         println!("discovered {} ocean sessions under {}", found.len(), root.display());
         for s in found.iter().take(15) {
             println!("  [{}] {} · {}", s.worktree, ago(s.mtime), s.title);
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_transcript {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn dump_one_transcript() {
+        // Newest ocean-os session on disk.
+        let root = PathBuf::from("/Users/risingtidesdev/dev/ocean-os");
+        let sessions = discover(&root, Sort::Date);
+        let Some(s) = sessions.first() else { println!("no sessions"); return; };
+        let hist = load_transcript(&s.path);
+        println!("session '{}' → {} messages", s.title, hist.len());
+        for m in hist.iter().take(6) {
+            let preview: String = m.text.chars().take(70).collect();
+            println!("  {}: {}", m.role, preview);
         }
     }
 }

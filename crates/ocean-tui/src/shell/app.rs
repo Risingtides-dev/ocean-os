@@ -180,6 +180,15 @@ impl App {
                 self.editor.open(path.clone());
                 self.go(Focus::Main, None, Some(Main::Editor));
             }
+            Action::ResumeSession { id, path } => {
+                // Rehydrate the transcript from disk, bind future turns to this
+                // id, and subscribe its live event stream.
+                self.chat.load_history(crate::shell::sessions::load_transcript(path));
+                self.session_id = Some(*id);
+                self.client.spawn_event_stream(*id, self.actions_tx.clone());
+                self.status = format!("resumed session {:.8}", id.0.to_string());
+                self.go(Focus::Main, None, Some(Main::Chat));
+            }
             Action::CycleFocus => {
                 let next = match self.focus {
                     Focus::Left => Focus::Main,
