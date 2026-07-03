@@ -424,45 +424,34 @@ impl App {
     }
 
     fn draw_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let mut spans: Vec<Span> = vec![
+        // CTRL-style status: what's happening + where focus is, not a mode menu.
+        let focus_name = match self.focus {
+            Focus::Sessions => "sessions",
+            Focus::Tree => "files",
+            Focus::Term => "terminal",
+            Focus::Center => match self.center {
+                Center::Chat => "chat",
+                Center::Editor => "editor",
+                Center::Graph => "graph",
+            },
+        };
+        let spans: Vec<Span> = vec![
             Span::styled(
-                format!(" {} ", self.status),
+                format!(" {} ", focus_name),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .bg(theme::BG_HL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", self.status),
                 Style::default().fg(theme::COMMENT),
             ),
-            Span::raw("  "),
+            Span::styled(
+                "   ⇥ move · ⌃Q quit",
+                Style::default().fg(theme::COMMENT),
+            ),
         ];
-        for (key, name, active) in [
-            ("⌃⌥1", "sessions", self.focus == Focus::Sessions),
-            ("⌃⌥2", "files", self.focus == Focus::Tree),
-            (
-                "⌃⌥3",
-                "chat",
-                self.focus == Focus::Center && self.center == Center::Chat,
-            ),
-            (
-                "⌃⌥4",
-                "editor",
-                self.focus == Focus::Center && self.center == Center::Editor,
-            ),
-            (
-                "⌃⌥5",
-                "graph",
-                self.focus == Focus::Center && self.center == Center::Graph,
-            ),
-            ("⌃⌥6", "term", self.focus == Focus::Term),
-        ] {
-            let (kf, nf) = if active {
-                (theme::CYAN, theme::FG)
-            } else {
-                (theme::COMMENT, theme::COMMENT)
-            };
-            spans.push(Span::styled(format!("{key} "), Style::default().fg(kf)));
-            spans.push(Span::styled(format!("{name}  "), Style::default().fg(nf)));
-        }
-        spans.push(Span::styled(
-            "⇥ cycle · ⌃Q quit",
-            Style::default().fg(theme::COMMENT),
-        ));
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
             area,

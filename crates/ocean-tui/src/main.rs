@@ -108,11 +108,11 @@ struct Cli {
     #[arg(long, env = "OCEAN_SESSION")]
     session: Option<String>,
 
-    /// Launch the new session-first shell (Phase 1 rebuild) instead of the
-    /// legacy room UI. Opt-in until it reaches parity.
-    /// See docs/specs/2026-07-03-ocean-tui-shell-rebuild-design.md.
-    #[arg(long, env = "OCEAN_TUI_NEXT")]
-    next: bool,
+    /// Launch the LEGACY room UI instead of the workbench shell. The CTRL-frame
+    /// workbench is the default; this is the escape hatch until legacy is
+    /// deleted. See docs/specs/2026-07-03-ocean-tui-shell-rebuild-design.md.
+    #[arg(long, env = "OCEAN_TUI_LEGACY")]
+    legacy: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2371,11 +2371,11 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Mesh(mesh)) => run_mesh(mesh),
-        None if cli.next => {
+        None if cli.legacy => run_daemon(cli.url, cli.project, cli.session),
+        None => {
             let root = resolve_project_root(cli.project.as_deref());
             shell::run(&cli.url, root.to_string_lossy().into_owned())
         }
-        None => run_daemon(cli.url, cli.project, cli.session),
     }
 }
 
