@@ -1283,3 +1283,10 @@ area:      [frontend]
 
 Ocean-TUI session-shell rebuild kicked off. Researched four angles (current ocean-tui monolith, oh-my-pi feature menu, John's CTRL app, best-in-class ratatui). Approved design + spec at docs/specs/2026-07-03-ocean-tui-shell-rebuild-design.md: fuse CTRL's already-ocean-aware session rail + PTY into ocean-tui, rebuilt on the ratatui component/tokio architecture, kill the 6 dead room-tabs, phase in oh-my-pi model roles + advisor-observer. Phase 1 (spine) landed on branch: new crates/ocean-tui/src/shell/ tree — Component trait, event/action tokio channels, async DaemonClient (health/session-mint/turn/SSE), ChatComponent re-housing PM streaming (text/thinking/tool blocks). Launches behind `--next` (OCEAN_TUI_NEXT), legacy room UI stays default until parity. Builds clean, clippy -D clean, 65 legacy + 2 new SSE-parser tests pass. Interactive end-to-end (live streaming turn) still needs John's terminal. Next: Phase 2 — harvest CTRL session rail + PTY, delete dead tabs.
 _________________________________________________________________________________
+time:      [evening] [07-03-26]
+agent:     [claude] [sonnet 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      [feature-request]
+area:      [frontend]
+
+Ocean-TUI Phase 2 landed on branch: harvested CTRL's session rail + PTY into the new shell. New modules shell/sessions.rs (Ocean-only discovery, stripped from CTRL — reads ~/.config/ocean-rs/sessions), shell/pty.rs (portable-pty+vt100+tui-term, lifted from CTRL term.rs), shell/components/session_rail.rs + pty_pane.rs. app.rs rewired to two-pane layout: left session rail, right main (native chat default, swaps to embedded PTY running `ocean --project X --session ID` when a rail session is opened). Tab cycles pane focus. Verified with a live discovery test: the exact rail code found 29 real ocean-os-bound sessions with real titles. Builds clean, clippy -D clean, 69 tests pass. NOTE: CTRL repo untouched — only read from. Editor + file-tree harvest queued next per John (keep, don't rebuild — CTRL already has working ones). Native resume-into-chat still deferred (needs daemon history replay).

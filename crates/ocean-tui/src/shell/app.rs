@@ -1,7 +1,10 @@
-//! App — the thin coordinator. Owns the component tree and the action channel,
-//! routes events to components, drains actions, and spawns network work off the
-//! render loop. No business logic lives here beyond wiring.
+//! App — the thin coordinator. Owns the component tree (session rail + main
+//! surface) and the action channel, routes events, drains actions, and spawns
+//! network work off the render loop. No business logic beyond wiring.
 
+use std::path::PathBuf;
+
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
 use ocean_agent_sdk::{AgentSessionId, AgentTurnRequest};
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
@@ -10,15 +13,26 @@ use super::{
     action::Action,
     client::DaemonClient,
     component::Component,
-    components::chat::ChatComponent,
+    components::{chat::ChatComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent},
     event::{Event, EventHandler},
     tui,
 };
 
+/// Which pane has the keyboard. `Main` routes to the PTY when a session is
+/// live, else to the native chat.
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    Rail,
+    Main,
+}
+
 pub struct App {
     client: DaemonClient,
     workspace_root: String,
+    rail: SessionRailComponent,
     chat: ChatComponent,
+    pty: PtyComponent,
+    focus: Focus,
     session_id: Option<AgentSessionId>,
     status: String,
     should_quit: bool,
@@ -29,10 +43,15 @@ pub struct App {
 impl App {
     pub fn new(client: DaemonClient, workspace_root: String) -> Self {
         let (actions_tx, actions_rx) = mpsc::unbounded_channel();
+        let mut rail = SessionRailComponent::new(PathBuf::from(&workspace_root));
+        rail.focused = true;
         Self {
             client,
             workspace_root,
+            rail,
             chat: ChatComponent::default(),
+            pty: PtyComponent::default(),
+            focus: Focus::Rail,
             session_id: None,
             status: "connecting…".into(),
             should_quit: false,
@@ -42,9 +61,9 @@ impl App {
     }
 
     pub async fn run(mut self, terminal: &mut tui::Tui) -> anyhow::Result<()> {
-        let mut events = EventHandler::new(8.0, 60.0);
+        let mut events = EventHandler::new(30.0, 60.0);
 
-        // Kick a health check so the status line reflects reality on boot.
+        // Health check so the status line reflects reality on boot.
         {
             let client = self.client.clone();
             let tx = self.actions_tx.clone();
@@ -68,14 +87,13 @@ impl App {
                 Event::Render => {
                     terminal.draw(|f| self.draw(f))?;
                 }
-                Event::Tick => {}
-                Event::Crossterm(evt) => {
-                    if let Some(action) = self.chat.handle_event(&evt) {
-                        self.dispatch(action);
+                Event::Tick => {
+                    if let Some(a) = self.pty.tick() {
+                        self.dispatch(a);
                     }
                 }
+                Event::Crossterm(evt) => self.on_crossterm(evt),
             }
-            // Drain everything the components / tasks queued this cycle.
             while let Ok(action) = self.actions_rx.try_recv() {
                 self.dispatch(action);
             }
@@ -83,32 +101,65 @@ impl App {
         Ok(())
     }
 
-    /// Apply one action: app-level effects first, then fan out to components.
+    /// Global keys first (quit, focus cycle), then route to the focused pane.
+    fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        if let CrosstermEvent::Key(k) = evt {
+            if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return;
+            }
+            if k.code == KeyCode::Tab {
+                self.dispatch(Action::CycleFocus);
+                return;
+            }
+        }
+        let action = match self.focus {
+            Focus::Rail => self.rail.handle_event(&evt),
+            Focus::Main if self.pty.is_active() => self.pty.handle_event(&evt),
+            Focus::Main => self.chat.handle_event(&evt),
+        };
+        if let Some(a) = action {
+            self.dispatch(a);
+        }
+    }
+
     fn dispatch(&mut self, action: Action) {
         match &action {
             Action::Quit => {
                 self.should_quit = true;
                 return;
             }
-            Action::Status(s) | Action::Error(s) => {
-                self.status = s.clone();
+            Action::Status(s) | Action::Error(s) => self.status = s.clone(),
+            Action::SessionBound(id) => self.session_id = Some(*id),
+            Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
+            Action::OpenSession { line, cwd } => {
+                self.pty.open(cwd, line);
+                self.set_focus(Focus::Main);
             }
-            Action::SessionBound(id) => {
-                self.session_id = Some(*id);
-            }
-            Action::SubmitPrompt(text) => {
-                self.submit_turn(text.clone());
+            Action::CycleFocus => {
+                let next = match self.focus {
+                    Focus::Rail => Focus::Main,
+                    Focus::Main => Focus::Rail,
+                };
+                self.set_focus(next);
             }
             _ => {}
         }
+        // Fan out to components that react to streamed events.
         if let Some(next) = self.chat.update(&action) {
             self.dispatch(next);
         }
     }
 
+    fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
+        self.rail.focused = focus == Focus::Rail;
+        self.pty.focused = focus == Focus::Main && self.pty.is_active();
+    }
+
     /// Spawn the network turn off the render loop. On the first turn, mint the
-    /// session and subscribe the event stream *before* submitting, so no early
-    /// deltas are missed (OCEAN-305 eager scoping, async port).
+    /// session and subscribe the event stream *before* submitting (OCEAN-305
+    /// eager scoping) so no early deltas are missed.
     fn submit_turn(&mut self, prompt: String) {
         let client = self.client.clone();
         let tx = self.actions_tx.clone();
@@ -130,7 +181,6 @@ impl App {
                     }
                 },
             };
-
             let req = AgentTurnRequest {
                 session_id: Some(session_id),
                 prompt,
@@ -153,15 +203,31 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame) {
-        let chunks = Layout::default()
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(34), Constraint::Min(20)])
+            .split(frame.area());
+
+        self.rail.draw(frame, cols[0]);
+
+        let main = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(1)])
-            .split(frame.area());
-        self.chat.draw(frame, chunks[0]);
+            .split(cols[1]);
+
+        if self.pty.is_active() {
+            self.pty.draw(frame, main[0]);
+        } else {
+            self.chat.draw(frame, main[0]);
+        }
+
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(format!(" {}", self.status))
-                .style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
-            chunks[1],
+            ratatui::widgets::Paragraph::new(format!(
+                " {}   [Tab] switch pane · [Ctrl-C] quit",
+                self.status
+            ))
+            .style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
+            main[1],
         );
     }
 }

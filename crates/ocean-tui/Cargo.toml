@@ -24,3 +24,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = "0.3"
+# Phase-2 shell: embedded PTY for resuming ocean sessions (harvested from CTRL).
+portable-pty = "0.8"
+vt100 = "0.15"
+tui-term = "0.2"

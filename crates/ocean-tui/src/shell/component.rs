@@ -33,6 +33,12 @@ pub trait Component {
         None
     }
 
+    /// Periodic tick — e.g. drain a PTY. Return `Action::Render` to force a
+    /// redraw when internal state changed off-band.
+    fn tick(&mut self) -> Option<Action> {
+        None
+    }
+
     /// Draw into the given area.
     fn draw(&mut self, frame: &mut Frame, area: Rect);
 }

@@ -2,6 +2,8 @@
 //! `App::update` and each component's `update` consume them. Nothing mutates
 //! state outside of an action.
 
+use std::path::PathBuf;
+
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 
 #[derive(Debug, Clone)]
@@ -21,4 +23,8 @@ pub enum Action {
     Error(String),
     /// Transient status message (connection state, etc.).
     Status(String),
+    /// Open a discovered session in the PTY: run `line` in a shell rooted at `cwd`.
+    OpenSession { line: String, cwd: PathBuf },
+    /// Move keyboard focus to the next pane.
+    CycleFocus,
 }

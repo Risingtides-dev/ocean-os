@@ -12,6 +12,8 @@ mod client;
 mod component;
 mod components;
 mod event;
+mod pty;
+mod sessions;
 mod tui;
 
 use app::App;
