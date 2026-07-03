@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Ocean daemon health watchdog. KeepAlive on the daemon job only covers
+       crash/exit; this job covers hung-but-alive. Runs the watchdog script
+       every 60s; the script curls /health and kickstarts the daemon on
+       repeated failure. Installed by ops/install-ocean-daemon.sh. -->
+  <key>Label</key>
+  <string>dev.risingtides.ocean-daemon-watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/risingtidesdev/dev/ocean-os/deploy/ocean-daemon-watchdog.sh</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/private/tmp/ocean-daemon-watchdog.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/private/tmp/ocean-daemon-watchdog.log</string>
+</dict>
+</plist>

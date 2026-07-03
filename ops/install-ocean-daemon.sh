@@ -40,18 +40,28 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-echo "==> [2/3] installing plist -> $PLIST_DST"
+echo "==> [2/3] installing plists -> $HOME/Library/LaunchAgents/"
 mkdir -p "$HOME/Library/LaunchAgents"
 cp "$PLIST_SRC" "$PLIST_DST"
 plutil -lint "$PLIST_DST"
 
-echo "==> [3/3] (re)bootstrapping launchd job $LABEL in $DOMAIN"
-# Tear down any previous instance so this is a clean (re)install.
+# Health watchdog (covers hung-but-alive; KeepAlive only covers exit).
+WD_LABEL="dev.risingtides.ocean-daemon-watchdog"
+WD_DST="$HOME/Library/LaunchAgents/$WD_LABEL.plist"
+cp "$REPO/deploy/$WD_LABEL.plist" "$WD_DST"
+plutil -lint "$WD_DST"
+
+echo "==> [3/3] (re)bootstrapping launchd jobs in $DOMAIN"
+# Tear down any previous instances so this is a clean (re)install.
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$PLIST_DST"
 launchctl enable "$DOMAIN/$LABEL"
 # Force an immediate (re)start so we don't wait for the next event.
 launchctl kickstart -k "$DOMAIN/$LABEL"
+
+launchctl bootout "$DOMAIN/$WD_LABEL" 2>/dev/null || true
+launchctl bootstrap "$DOMAIN" "$WD_DST"
+launchctl enable "$DOMAIN/$WD_LABEL"
 
 echo
 echo "==> done. status:"

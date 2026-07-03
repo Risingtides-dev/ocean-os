@@ -66,10 +66,10 @@
 
   <key>EnvironmentVariables</key>
   <dict>
-    <!-- Operator default (matches the live hand-launched process): tools run
-         without per-call permission prompts. Set OCEAN_YOLO=0 to gate. -->
+    <!-- Prod hardening: gate mutating tools by default (the binary's own
+         default). Set to 1 only for a deliberate, temporary bypass. -->
     <key>OCEAN_YOLO</key>
-    <string>1</string>
+    <string>0</string>
     <!-- launchd starts with a minimal PATH; give the launcher + daemon a sane
          one (the daemon shells out to git/ripgrep/etc for tool calls). -->
     <key>PATH</key>

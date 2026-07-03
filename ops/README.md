@@ -26,8 +26,32 @@ on crash (`KeepAlive`) and starts it at login/reboot (`RunAtLoad`).
 | Binary run | `target/release/ocean-daemon` (prebuilt, from **main**) |
 | Working directory | ocean-os repo root |
 | Bind address | `127.0.0.1:4780` (binary default; env `OCEAN_BIND` to override) |
-| Env | `OCEAN_YOLO=1` (matches the prior hand-launch) |
+| Env | `OCEAN_YOLO=0` (mutating tools permission-gated — prod default) |
 | Logs (stdout+stderr) | `/private/tmp/ocean-daemon.log` |
+
+> ### Permission gating: `OCEAN_YOLO=0` is the default
+> The plist now ships `OCEAN_YOLO=0`, so mutating tool calls are **permission-gated**
+> (the binary's own default). The prior hand-launch ran `OCEAN_YOLO=1`, which
+> bypasses all per-call gating — fine for a throwaway dev process, wrong for a
+> reboot-persistent supervised service. To bypass deliberately and temporarily,
+> export `OCEAN_YOLO=1` before a manual launch, or flip it in the plist for the
+> duration you need it — don't leave it on.
+
+> ### Health watchdog (hung-but-alive)
+> `KeepAlive` only respawns on **exit**. A daemon that's hung but still running
+> (deadlock, stuck event loop) never triggers it. A second LaunchAgent
+> (`dev.risingtides.ocean-daemon-watchdog`, plist `deploy/*-watchdog.plist`,
+> script `deploy/ocean-daemon-watchdog.sh`) runs every **60s**, curls `/health`
+> twice 5s apart, and `kickstart -k`s the daemon only if both fail. Installed
+> automatically by `ops/install-ocean-daemon.sh`; logs to
+> `/private/tmp/ocean-daemon-watchdog.log`.
+
+> ### One-command redeploy: `ops/deploy.sh`
+> Codifies the merge-to-main → rebuild → restart → verify loop so no step gets
+> skipped. **Hard-fails** unless on `main` with a clean tree (install-ocean-daemon.sh
+> only warns), then builds, kickstarts, and polls `/health` until the new process
+> answers. Use it for every redeploy; use `install-ocean-daemon.sh` only for the
+> first-time launchd bootstrap.
 
 > ### Build from MAIN — always
 > Per operator rule, **never build/deploy/run the daemon from a feature branch.**
