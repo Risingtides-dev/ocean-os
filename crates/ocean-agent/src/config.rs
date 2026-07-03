@@ -14,6 +14,7 @@
 //! it needs (`env = ["LINEAR_API_KEY"]`); the values are resolved from the
 //! daemon's process environment (loaded from `tools.env`) at spawn time.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Context;
@@ -29,6 +30,37 @@ pub struct DaemonConfig {
     pub mcp: McpSection,
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// Named model *roles* (oh-my-pi-style indirection): a `[roles]` table
+    /// mapping a symbolic role name to a concrete model alias. E.g.
+    ///
+    /// ```toml
+    /// [roles]
+    /// fast    = "deepseek/deepseek-chat"
+    /// deep    = "anthropic/claude-opus-4"
+    /// advisor = "anthropic/claude-sonnet-4"
+    /// ```
+    ///
+    /// A turn carrying `role = "fast"` (and no explicit `model_id`) is driven
+    /// with the mapped alias. The special `advisor` role, when present, also
+    /// activates the post-turn advisor observer. Absent/empty `[roles]` →
+    /// behavior is 100% unchanged and the advisor is off (zero cost).
+    #[serde(default)]
+    pub roles: HashMap<String, String>,
+}
+
+impl DaemonConfig {
+    /// Resolve a named role to its configured model alias. `None` when the role
+    /// isn't present in `[roles]` (caller falls back to default model behavior).
+    pub fn role_model(&self, role: &str) -> Option<&str> {
+        self.roles.get(role).map(String::as_str)
+    }
+
+    /// The configured `advisor` role's model alias, if any. `Some` iff an
+    /// `advisor` entry is present in `[roles]` — the single switch that turns the
+    /// post-turn advisor observer on.
+    pub fn advisor_model(&self) -> Option<&str> {
+        self.role_model("advisor")
+    }
 }
 
 /// The `[mcp]` table, holding the `[[mcp.server]]` array.
@@ -138,6 +170,36 @@ mod tests {
         assert_eq!(cfg.hooks.stop[0].command, "/tmp/stop-hook.sh");
         assert_eq!(cfg.hooks.stop[0].timeout_secs, 9);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn roles_table_resolves_known_and_unknown() {
+        let dir = std::env::temp_dir().join(format!("ocean-cfg-roles-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ocean.toml"),
+            r#"
+            [roles]
+            fast = "deepseek/deepseek-chat"
+            advisor = "anthropic/claude-sonnet-4"
+            "#,
+        )
+        .unwrap();
+        let cfg = DaemonConfig::load(&dir).unwrap();
+        // Known role → its alias.
+        assert_eq!(cfg.role_model("fast"), Some("deepseek/deepseek-chat"));
+        // Unknown role → None (caller falls back to default model).
+        assert_eq!(cfg.role_model("nope"), None);
+        // The advisor switch is derived from the same table.
+        assert_eq!(cfg.advisor_model(), Some("anthropic/claude-sonnet-4"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_roles_table_means_no_advisor() {
+        let cfg = DaemonConfig::default();
+        assert_eq!(cfg.role_model("fast"), None);
+        assert_eq!(cfg.advisor_model(), None);
     }
 
     #[test]

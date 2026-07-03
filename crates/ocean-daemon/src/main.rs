@@ -194,6 +194,14 @@ struct AppState {
     /// every exit path (it's an owned permit dropped — success, error, panic).
     /// Sized by [`max_concurrent_turns`] (`OCEAN_MAX_CONCURRENT_TURNS`).
     turn_limiter: TurnLimiter,
+    /// Named model *roles* loaded once at startup from `ocean.toml`'s `[roles]`
+    /// table (oh-my-pi-style indirection). Maps a symbolic role name (e.g.
+    /// `"fast"`, `"advisor"`) to a concrete model alias. A turn carrying a `role`
+    /// (and no explicit `model_id`) is driven with the mapped alias; the special
+    /// `advisor` entry, when present, also arms the post-turn advisor observer.
+    /// Empty (the default — no `[roles]` table) ⇒ role indirection and the
+    /// advisor are both no-ops, so behavior is 100% unchanged at zero cost.
+    roles: Arc<std::collections::HashMap<String, String>>,
 }
 
 // ── OCEAN-303: in-process turn metrics ──────────────────────────────────────
@@ -1629,8 +1637,32 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening titles DB at {}", titles_db_path.display()))?;
     tracing::info!(path = %titles_db_path.display(), "persisted longhouse title registry ready");
 
+    // Model roles (oh-my-pi-style indirection) loaded once from `ocean.toml`'s
+    // `[roles]` table. A malformed config here is non-fatal for roles — the
+    // daemon already validated + loaded the same file for MCP/hooks at runtime
+    // construction, so a parse error would have surfaced there; if it somehow
+    // doesn't parse now we log and fall back to an empty table (roles + advisor
+    // simply off), never blocking startup.
+    let roles = match ocean_agent::DaemonConfig::load(&ocean_agent::config_dir_from_env()) {
+        Ok(cfg) => {
+            if !cfg.roles.is_empty() {
+                tracing::info!(
+                    role_count = cfg.roles.len(),
+                    advisor = cfg.advisor_model().is_some(),
+                    "loaded model roles from ocean.toml [roles]"
+                );
+            }
+            cfg.roles
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load [roles] from ocean.toml; roles disabled");
+            std::collections::HashMap::new()
+        }
+    };
+
     let state = AppState {
         runtime,
+        roles: Arc::new(roles),
         events: EventBus::new(1024),
         agent_events: AgentEventBus::new(1024),
         requests: Arc::new(RwLock::new(HashMap::new())),
@@ -8430,6 +8462,8 @@ async fn agent_voice(
         // Voice turns defer to the runtime's global reasoning/model selection.
         thinking_level: None,
         model_id: None,
+        // Voice turns defer to the global model; no named role indirection.
+        role: None,
         // Voice turns carry no images.
         images: None,
         // OCEAN-224: thread the caller's per-turn secret through so a gated voice
@@ -8569,6 +8603,104 @@ fn session_detail_scope_check(
     }
 }
 
+// ── Advisor observer (post-turn) ────────────────────────────────────────────
+//
+// When an `advisor` role is configured, the daemon runs ONE fresh single
+// completion after each operator turn, on the advisor model, silently reviewing
+// the exchange. A non-empty, actionable note is emitted as an
+// `AgentTurnEvent::Extension { extension: "advisor", .. }` scoped to the
+// session. The heavy lifting (the provider call) is fire-and-forget in a spawned
+// task; the pieces below are the PURE, network-free helpers it composes — kept
+// standalone so they're unit-testable without a provider.
+
+/// The advisor's tight system instruction. It watches, it does not chat: a real
+/// concern in 1-2 sentences, or exactly nothing.
+fn advisor_system_prompt() -> &'static str {
+    "You are an advisor silently watching another coding agent. Review the \
+     exchange below. If you see a real correctness concern, risk, or blocker, \
+     state it in 1-2 sentences. If nothing is wrong, reply with exactly the \
+     empty string / NOTHING."
+}
+
+/// Build the advisor's user turn: the operator prompt + the assistant response,
+/// clearly delimited. Pure — no I/O.
+fn advisor_user_prompt(operator_prompt: &str, assistant_response: &str) -> String {
+    format!(
+        "OPERATOR PROMPT:\n{operator_prompt}\n\nASSISTANT RESPONSE:\n{assistant_response}\n\n\
+         Now give your advisor note (1-2 sentences), or NOTHING."
+    )
+}
+
+/// Normalize an advisor completion to an *actionable* note, or `None`. Suppresses
+/// the empty string and the sentinel "NOTHING" (case-insensitive, ignoring
+/// surrounding punctuation/whitespace) so a "nothing wrong" verdict emits no
+/// event. Returns the trimmed note when there is genuine content.
+fn advisor_note_if_actionable(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip surrounding quotes/punctuation for the sentinel check only.
+    let sentinel = trimmed
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase();
+    if sentinel.is_empty() || sentinel == "nothing" || sentinel == "none" {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Heuristic severity for an advisor note. Strong "this will hurt" language →
+/// `"blocker"`; mild/hedged language → `"info"`; everything else → `"concern"`
+/// (the default). Pure string classification.
+fn advisor_severity(note: &str) -> &'static str {
+    let lower = note.to_ascii_lowercase();
+    const BLOCKER: &[&str] = &[
+        "must not",
+        "will break",
+        "data loss",
+        "will fail",
+        "security vulnerability",
+        "critical",
+        "corrupt",
+        "irreversible",
+    ];
+    const MILD: &[&str] = &["minor", "nitpick", "consider", "might want", "optional", "cosmetic"];
+    if BLOCKER.iter().any(|w| lower.contains(w)) {
+        "blocker"
+    } else if MILD.iter().any(|w| lower.contains(w)) {
+        "info"
+    } else {
+        "concern"
+    }
+}
+
+/// Resolve the EFFECTIVE per-turn model from an explicit `model_id`, an optional
+/// symbolic `role`, and the loaded `[roles]` table. Pure so the precedence rules
+/// are unit-testable without a full turn:
+///
+/// - An explicit `model_id` ALWAYS wins (role is ignored entirely).
+/// - Otherwise a known `role` resolves to its configured alias.
+/// - An unknown role (or no role) yields `None` → the runtime's global model.
+///
+/// The `bool` is `true` when a role was given but did NOT resolve — the caller
+/// logs a warning for that case (a typo'd role silently using the global model
+/// would be surprising).
+fn resolve_effective_model_id(
+    model_id: Option<&str>,
+    role: Option<&str>,
+    roles: &std::collections::HashMap<String, String>,
+) -> (Option<String>, bool) {
+    match (model_id, role) {
+        (Some(m), _) => (Some(m.to_string()), false),
+        (None, Some(r)) => match roles.get(r) {
+            Some(alias) => (Some(alias.clone()), false),
+            None => (None, true),
+        },
+        (None, None) => (None, false),
+    }
+}
+
 async fn agent_turn(
     State(state): State<AppState>,
     Json(req): Json<AgentTurnRequest>,
@@ -8587,6 +8719,7 @@ async fn agent_turn(
         client_type,
         thinking_level,
         model_id,
+        role,
         images,
         decision_token,
         agent,
@@ -9205,6 +9338,25 @@ async fn agent_turn(
         }
     });
 
+    // Model-role indirection (oh-my-pi-style): a turn may carry a symbolic
+    // `role` (e.g. "fast", "deep") that the daemon resolves to a concrete model
+    // alias through the `[roles]` table loaded at startup. An explicit
+    // `model_id` ALWAYS wins over `role`; role resolution only fills in when no
+    // explicit model was pinned. An unknown / unconfigured role falls back to
+    // the runtime's global model (a logged warning, never a hard fail), so a
+    // typo can't break a turn. With no `[roles]` configured this is a no-op and
+    // `effective_model_id == model_id`.
+    let (effective_model_id, role_unresolved) =
+        resolve_effective_model_id(model_id.as_deref(), role.as_deref(), &state.roles);
+    if role_unresolved {
+        tracing::warn!(
+            role = role.as_deref().unwrap_or(""),
+            "unknown model role (not in ocean.toml [roles]); using global model"
+        );
+    } else if let (None, Some(r)) = (&model_id, &role) {
+        tracing::debug!(role = %r, "resolved model role → alias");
+    }
+
     // Same `yolo` flag drives the permission policy: `false` (default) builds a
     // gating `DaemonPermissionPolicy`; `true` builds the auto-allow policy.
     let control = build_prompt_control(
@@ -9223,7 +9375,7 @@ async fn agent_turn(
     // Per-turn model override (OCEAN-36): threads the optional request
     // `model_id` into this turn's config only, leaving the runtime's
     // global model selection untouched.
-    .with_model_id(model_id.clone());
+    .with_model_id(effective_model_id.clone());
     // Folder-as-agent: a named agent's declared tool allowlist narrows this
     // turn's toolset (fail-safe to the full set if it matches nothing), and its
     // declared model drives the turn (fail-soft to the global model if the model
@@ -9340,6 +9492,61 @@ async fn agent_turn(
             },
         );
     }
+    // Post-turn advisor observer (fire-and-forget). Runs at most once per
+    // operator prompt, and ONLY when an `advisor` role is configured — zero cost
+    // otherwise. It reviews the completed exchange on a FRESH advisor-model
+    // context (a single completion, not the agent loop) and, if it finds a real
+    // concern, emits it as an `AgentTurnEvent::Extension` scoped to this session.
+    // Fully detached: a slow/failed advisor never blocks or fails the operator's
+    // turn — the response below is already computed and returns immediately.
+    if res.ok {
+        if let Some(advisor_alias) = state.roles.get("advisor").cloned() {
+            let assistant_text = res.stdout.clone();
+            if !assistant_text.trim().is_empty() {
+                let operator_prompt = prompt.clone();
+                let runtime = state.runtime.clone();
+                let events = state.events.clone();
+                let agent_events = state.agent_events.clone();
+                tokio::spawn(async move {
+                    let user = advisor_user_prompt(&operator_prompt, &assistant_text);
+                    match runtime
+                        .complete_once(&advisor_alias, advisor_system_prompt(), &user)
+                        .await
+                    {
+                        Ok((note, model_id)) => {
+                            if let Some(clean) = advisor_note_if_actionable(&note) {
+                                let severity = advisor_severity(&clean);
+                                tracing::info!(
+                                    %session_id,
+                                    severity,
+                                    model = %model_id,
+                                    "advisor observer note"
+                                );
+                                emit_agent(
+                                    &events,
+                                    &agent_events,
+                                    session_id,
+                                    AgentTurnEvent::Extension {
+                                        extension: "advisor".into(),
+                                        payload: serde_json::json!({
+                                            "note": clean,
+                                            "severity": severity,
+                                            "model": model_id,
+                                        }),
+                                        scope: Some(session_id),
+                                    },
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "advisor observer failed; dropping");
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // A per-turn timeout (OCEAN-17) surfaces as code 408 from the runtime; map
     // it to HTTP 408 Request Timeout so callers can distinguish a hung-provider
     // abort from a normal failed turn. Every other outcome keeps the
@@ -10891,6 +11098,79 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Advisor observer pure helpers ───────────────────────────────────────
+
+    #[test]
+    fn advisor_suppresses_empty_and_nothing() {
+        assert_eq!(advisor_note_if_actionable(""), None);
+        assert_eq!(advisor_note_if_actionable("   \n  "), None);
+        assert_eq!(advisor_note_if_actionable("NOTHING"), None);
+        assert_eq!(advisor_note_if_actionable("nothing"), None);
+        assert_eq!(advisor_note_if_actionable("  NOTHING.  "), None);
+        assert_eq!(advisor_note_if_actionable("\"NOTHING\""), None);
+        assert_eq!(advisor_note_if_actionable("None"), None);
+    }
+
+    #[test]
+    fn advisor_keeps_real_notes_trimmed() {
+        assert_eq!(
+            advisor_note_if_actionable("  The retry loop never breaks on cancel.  "),
+            Some("The retry loop never breaks on cancel.".to_string())
+        );
+    }
+
+    #[test]
+    fn advisor_severity_heuristic() {
+        // Strong words → blocker.
+        assert_eq!(
+            advisor_severity("This will break the migration and cause data loss."),
+            "blocker"
+        );
+        assert_eq!(advisor_severity("You must not drop the table here."), "blocker");
+        // Mild/hedged → info.
+        assert_eq!(advisor_severity("Minor nitpick: rename the variable."), "info");
+        assert_eq!(advisor_severity("Consider adding a doc comment."), "info");
+        // Default → concern.
+        assert_eq!(
+            advisor_severity("The error path returns Ok, which hides the failure."),
+            "concern"
+        );
+    }
+
+    #[test]
+    fn role_resolution_known_unknown_and_model_id_precedence() {
+        let mut roles = std::collections::HashMap::new();
+        roles.insert("fast".to_string(), "deepseek/deepseek-chat".to_string());
+        roles.insert("advisor".to_string(), "anthropic/claude-sonnet-4".to_string());
+
+        // Known role → its alias, no warning.
+        assert_eq!(
+            resolve_effective_model_id(None, Some("fast"), &roles),
+            (Some("deepseek/deepseek-chat".to_string()), false)
+        );
+        // Unknown role → None + warn flag (falls back to global model).
+        assert_eq!(
+            resolve_effective_model_id(None, Some("nope"), &roles),
+            (None, true)
+        );
+        // Explicit model_id ALWAYS wins over role.
+        assert_eq!(
+            resolve_effective_model_id(Some("openai/gpt-4o"), Some("fast"), &roles),
+            (Some("openai/gpt-4o".to_string()), false)
+        );
+        // Neither → global model.
+        assert_eq!(resolve_effective_model_id(None, None, &roles), (None, false));
+    }
+
+    #[test]
+    fn advisor_user_prompt_contains_both_sides() {
+        let p = advisor_user_prompt("do X", "I did Y");
+        assert!(p.contains("do X"));
+        assert!(p.contains("I did Y"));
+        assert!(p.contains("OPERATOR PROMPT"));
+        assert!(p.contains("ASSISTANT RESPONSE"));
+    }
 
     /// Serializes every test that mutates the process-global env this module
     /// reads for the YOLO resolution (`OCEAN_YOLO`, `OCEAN_CONFIG_DIR`). Rust
@@ -14495,6 +14775,7 @@ mod tests {
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
         AppState {
             runtime,
+            roles: Arc::new(std::collections::HashMap::new()),
             events: EventBus::new(64),
             agent_events: AgentEventBus::new(64),
             requests: Arc::new(RwLock::new(HashMap::new())),
@@ -14548,6 +14829,7 @@ mod tests {
             client_type: Some("test".to_string()),
             thinking_level: None,
             model_id: None,
+            role: None,
             images: None,
             decision_token: None,
             agent: None,
@@ -15615,6 +15897,7 @@ mod tests {
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
         AppState {
             runtime,
+            roles: Arc::new(std::collections::HashMap::new()),
             events: EventBus::new(1024),
             agent_events: AgentEventBus::new(1024),
             requests: Arc::new(RwLock::new(HashMap::new())),
@@ -16131,6 +16414,7 @@ mod tests {
             .expect("on-disk titles");
         AppState {
             runtime,
+            roles: Arc::new(std::collections::HashMap::new()),
             events: EventBus::new(64),
             agent_events: AgentEventBus::new(64),
             requests: Arc::new(RwLock::new(HashMap::new())),

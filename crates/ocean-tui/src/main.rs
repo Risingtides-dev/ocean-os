@@ -3241,6 +3241,8 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             decision_token: Some(decision_token),
             // The TUI does not yet select a named folder-as-agent.
             agent: None,
+            // The legacy TUI does not use model roles (the new shell does).
+            role: None,
             // The TUI is not an in-browser surface (OCEAN-40).
             client_context: None,
         };

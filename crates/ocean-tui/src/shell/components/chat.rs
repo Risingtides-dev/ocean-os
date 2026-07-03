@@ -33,6 +33,13 @@ enum Turn {
         output: String,
         status: ToolStatus,
     },
+    /// An advisor aside — a note from the observer/advisor extension. Rendered as
+    /// a set-off amber card, clearly not the agent's own output.
+    Advisor {
+        note: String,
+        severity: String,
+        model: String,
+    },
 }
 
 #[derive(PartialEq)]
@@ -87,6 +94,31 @@ impl ChatComponent {
             .iter_mut()
             .rev()
             .find(|t| matches!(t, Turn::Tool { id: tid, .. } if tid == id))
+    }
+
+    /// Fold an `advisor` extension event into an [`Turn::Advisor`]. Tolerates
+    /// missing fields (sensible defaults), skips empty notes, and never panics
+    /// on a malformed payload.
+    fn push_advisor(&mut self, payload: &serde_json::Value) {
+        let note = payload.get("note").and_then(|v| v.as_str()).unwrap_or("");
+        if note.trim().is_empty() {
+            return;
+        }
+        let severity = payload
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info")
+            .to_string();
+        let model = payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        self.turns.push(Turn::Advisor {
+            note: note.to_string(),
+            severity,
+            model,
+        });
     }
 }
 
@@ -149,6 +181,9 @@ impl Component for ChatComponent {
                     }
                 }
                 AgentTurnEvent::TurnFinished { .. } => self.busy = false,
+                AgentTurnEvent::Extension {
+                    extension, payload, ..
+                } if extension == "advisor" => self.push_advisor(payload),
                 _ => {}
             }
         }
@@ -193,6 +228,39 @@ impl Component for ChatComponent {
                         Style::default().fg(color),
                     )));
                 }
+                Turn::Advisor {
+                    note,
+                    severity,
+                    model,
+                } => {
+                    // Color the card by severity: info = blue/gray, concern =
+                    // amber, blocker = red. Set it off with a rule + label so it
+                    // reads as an aside, not the agent's own text.
+                    let accent = match severity.as_str() {
+                        "blocker" => Color::Red,
+                        "concern" => Color::Rgb(255, 176, 0), // amber
+                        _ => Color::Rgb(120, 144, 168),       // muted blue/gray
+                    };
+                    let mut header: Vec<Span> = vec![Span::styled(
+                        format!("  ⚑ advisor ({severity})"),
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    )];
+                    if !model.is_empty() {
+                        header.push(Span::styled(
+                            format!("  · {model}"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                    }
+                    lines.push(Line::from(header));
+                    for l in note.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(accent)),
+                            Span::styled(l.to_string(), Style::default().fg(accent)),
+                        ]));
+                    }
+                }
             }
             lines.push(Line::from(""));
         }
@@ -224,5 +292,73 @@ impl Component for ChatComponent {
                 .block(Block::default().borders(Borders::ALL).title(hint)),
             chunks[1],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn extension(extension: &str, payload: serde_json::Value) -> Action {
+        Action::AgentEvent(Box::new(AgentTurnEvent::Extension {
+            extension: extension.to_string(),
+            payload,
+            scope: None,
+        }))
+    }
+
+    #[test]
+    fn advisor_extension_appends_advisor_turn() {
+        let mut chat = ChatComponent::default();
+        chat.update(&extension(
+            "advisor",
+            json!({ "note": "consider a smaller diff", "severity": "concern", "model": "opus" }),
+        ));
+        assert_eq!(chat.turns.len(), 1);
+        match &chat.turns[0] {
+            Turn::Advisor {
+                note,
+                severity,
+                model,
+            } => {
+                assert_eq!(note, "consider a smaller diff");
+                assert_eq!(severity, "concern");
+                assert_eq!(model, "opus");
+            }
+            _ => panic!("expected an advisor turn"),
+        }
+    }
+
+    #[test]
+    fn advisor_defaults_missing_fields() {
+        let mut chat = ChatComponent::default();
+        chat.update(&extension("advisor", json!({ "note": "heads up" })));
+        assert_eq!(chat.turns.len(), 1);
+        match &chat.turns[0] {
+            Turn::Advisor {
+                severity, model, ..
+            } => {
+                assert_eq!(severity, "info");
+                assert_eq!(model, "");
+            }
+            _ => panic!("expected an advisor turn"),
+        }
+    }
+
+    #[test]
+    fn empty_note_is_skipped() {
+        let mut chat = ChatComponent::default();
+        chat.update(&extension("advisor", json!({ "note": "   ", "severity": "info" })));
+        chat.update(&extension("advisor", json!({ "severity": "blocker" })));
+        assert!(chat.turns.is_empty());
+    }
+
+    #[test]
+    fn foreign_extension_is_ignored() {
+        let mut chat = ChatComponent::default();
+        chat.update(&extension("longhouse", json!({ "note": "not for us" })));
+        chat.update(&extension("advisor", json!({ "note": 42 })));
+        assert!(chat.turns.is_empty());
     }
 }

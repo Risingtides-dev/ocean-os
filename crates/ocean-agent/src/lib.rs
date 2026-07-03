@@ -453,6 +453,82 @@ impl AgentRuntime {
         state_from_provider_config(provider_config)
     }
 
+    /// One-shot, single-completion call against an arbitrary model alias on a
+    /// FRESH context — no session, no history, no tools, no agent loop. Resolves
+    /// `model_spec` through the same provider-config machinery as a real turn
+    /// ([`resolve_state_for_model`]), makes ONE `stream_simple` call with the
+    /// given system + user text, and returns the collected assistant text plus
+    /// the resolved model id (for attribution).
+    ///
+    /// This is the seam the daemon's advisor observer runs on: it deliberately
+    /// does not touch the runtime's global state, so an advisor pass is a pure
+    /// side call that can never perturb an operator turn. Errors (bad alias,
+    /// missing credential, provider failure) are returned to the caller, which
+    /// logs and drops them — the advisor is fully best-effort.
+    pub async fn complete_once(
+        &self,
+        model_spec: &str,
+        system_prompt: &str,
+        user_text: &str,
+    ) -> anyhow::Result<(String, String)> {
+        use futures::StreamExt as _;
+
+        let state = self.resolve_state_for_model(model_spec)?;
+        let model_id = state.model.id.clone();
+
+        let ctx = ocean_protocol::Context {
+            system_prompt: Some(system_prompt.to_string()),
+            messages: vec![Message::user_text(user_text)],
+            tools: Vec::new(),
+        };
+
+        let mut options = ocean_protocol::StreamOptions {
+            api_key: state.api_key.clone(),
+            base_url: Some(state.provider_config.selection.base_url.clone()),
+            ..Default::default()
+        };
+        if let Some(account_id) = &state.provider_config.account_id {
+            options
+                .headers
+                .insert("chatgpt-account-id".into(), account_id.clone());
+        }
+
+        let mut stream = ocean_protocol::stream_simple(&state.model, &ctx, &options).await?;
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            match ev? {
+                ocean_protocol::AssistantMessageEvent::TextDelta { delta, .. } => {
+                    text.push_str(&delta);
+                }
+                ocean_protocol::AssistantMessageEvent::Done { message, .. } => {
+                    // Fall back to the finalized message text if no deltas were
+                    // observed (some providers emit only a terminal message).
+                    if text.is_empty() {
+                        for c in &message.content {
+                            if let Content::Text { text: t } = c {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    break;
+                }
+                ocean_protocol::AssistantMessageEvent::Error { error, .. } => {
+                    let msg = error
+                        .content
+                        .iter()
+                        .find_map(|c| match c {
+                            Content::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "provider error".to_string());
+                    anyhow::bail!("advisor provider error: {msg}");
+                }
+                _ => {}
+            }
+        }
+        Ok((text, model_id))
+    }
+
     pub async fn prompt(&self, req: PromptRequest, control: PromptControl) -> PromptResponse {
         let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
         let mut req = req;

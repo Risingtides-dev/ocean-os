@@ -310,6 +310,16 @@ pub struct AgentTurnRequest {
     /// global runtime model as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Named model *role* (oh-my-pi-style indirection). A role is a symbolic
+    /// name (e.g. `"advisor"`, `"fast"`, `"deep"`) that the daemon resolves to a
+    /// concrete model alias through the `[roles]` table in `ocean.toml`. This is
+    /// purely a lookup in front of `model_id`: when `role` is set AND `model_id`
+    /// is `None`, the daemon resolves `role → alias` and drives the turn with
+    /// that alias. An explicit `model_id` always wins over `role`; an unknown or
+    /// unconfigured role falls back to the global runtime model (never a hard
+    /// fail). `None` (every existing client) is 100% backward compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Optional images attached to the turn (OCEAN-115). When present, the daemon
     /// emits one `Content::Image` block per entry alongside the prompt text on the
     /// FIRST user message of the turn, enabling vision end-to-end. Existing clients
@@ -1280,6 +1290,7 @@ mod tests {
             client_type: Some("surface-web".into()),
             thinking_level: Some(ThinkingLevel::High),
             model_id: None,
+            role: None,
             images: None,
             decision_token: None,
             agent: None,
@@ -1311,6 +1322,7 @@ mod tests {
             client_type: None,
             thinking_level: None,
             model_id: None,
+            role: None,
             images: None,
             decision_token: None,
             agent: None,
@@ -1360,6 +1372,7 @@ mod tests {
             client_type: Some("surface-extension".into()),
             thinking_level: None,
             model_id: None,
+            role: None,
             images: None,
             decision_token: None,
             agent: None,

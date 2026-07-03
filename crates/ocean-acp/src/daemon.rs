@@ -253,6 +253,8 @@ impl DaemonClient {
             thinking_level,
             // Per-session model override (OCEAN-36): drives this turn only.
             model_id,
+            // ACP bridge does not use named model-role indirection.
+            role: None,
             // ACP bridge does not attach images to turns (yet).
             images: None,
             decision_token,

@@ -21,6 +21,10 @@ ocean-hooks.workspace = true
 # so there is no cycle.
 ocean-longhouse.workspace = true
 ocean-protocol.workspace = true
+# Consuming the provider's `AssistantMessageEventStream` in the one-shot
+# `complete_once` advisor path needs `StreamExt::next` (same 0.3 line the
+# protocol crate already pulls in).
+futures = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

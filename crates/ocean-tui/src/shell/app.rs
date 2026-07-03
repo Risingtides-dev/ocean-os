@@ -257,6 +257,7 @@ impl App {
                 project_id: None,
                 client_type: Some("tui".into()),
                 agent: None,
+                role: None,
                 thinking_level: None,
                 model_id: None,
                 images: None,
