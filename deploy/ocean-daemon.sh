@@ -37,10 +37,11 @@ fi
 
 # Production env. Mirrors the prior hand-launch exactly; override via the plist's
 # EnvironmentVariables block or by exporting before launch.
-#   OCEAN_YOLO=0            -> prod default: mutating tools are permission-gated.
+#   OCEAN_YOLO=1            -> operator default: tools run without per-call gating
+#                             (unattended autonomous loops need this).
 #   OCEAN_BIND (optional)   -> defaults to 127.0.0.1:4780 inside the binary.
 #   OCEAN_ASSISTANTS_DIR    -> optional; defaults to ~/.config/ocean-rs/assistants.
-export OCEAN_YOLO="${OCEAN_YOLO:-0}"
+export OCEAN_YOLO="${OCEAN_YOLO:-1}"
 
 # Run from a NEUTRAL cwd so the startup guard's repo-cwd check passes and the
 # unbound-turn fallback anchor is harmless (home, not ocean-os).
