@@ -2,10 +2,10 @@
 //! sessions|files; main view: chat|pty|editor|graph), routes events, drains the
 //! action channel, and spawns network work off the render loop.
 //!
-//! Navigation is function-key based so nothing collides with editor typing or
-//! PTY input: F1 sessions · F2 files · F3 chat · F4 editor · F5 graph · F6 term.
-//! Ctrl-Q quits (Ctrl-C is left free to reach the PTY as SIGINT). Enter on a
-//! session opens the PTY; Enter on a file opens the editor.
+//! Navigation is Ctrl+Opt+digit so nothing collides with macOS (which owns the
+//! F-keys), editor typing, or PTY input: ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat ·
+//! ⌃⌥4 editor · ⌃⌥5 graph · ⌃⌥6 term. Ctrl-Q quits (Ctrl-C is left free to
+//! reach the PTY as SIGINT). Enter resumes a session; Enter opens a file.
 
 use std::path::PathBuf;
 
@@ -140,23 +140,20 @@ impl App {
                 self.should_quit = true;
                 return;
             }
-            // F-keys, with Alt-digit fallbacks — macOS grabs F1–F6 for
-            // brightness/media unless Fn is held, and some terminals eat them.
-            let alt = k.modifiers.contains(KeyModifiers::ALT);
-            match k.code {
-                KeyCode::F(1) => return self.go(Focus::Left, Some(Left::Sessions), None),
-                KeyCode::F(2) => return self.go(Focus::Left, Some(Left::Files), None),
-                KeyCode::F(3) => return self.go(Focus::Main, None, Some(Main::Chat)),
-                KeyCode::F(4) => return self.go(Focus::Main, None, Some(Main::Editor)),
-                KeyCode::F(5) => return self.go(Focus::Main, None, Some(Main::Graph)),
-                KeyCode::F(6) => return self.go(Focus::Main, None, Some(Main::Pty)),
-                KeyCode::Char('1') if alt => return self.go(Focus::Left, Some(Left::Sessions), None),
-                KeyCode::Char('2') if alt => return self.go(Focus::Left, Some(Left::Files), None),
-                KeyCode::Char('3') if alt => return self.go(Focus::Main, None, Some(Main::Chat)),
-                KeyCode::Char('4') if alt => return self.go(Focus::Main, None, Some(Main::Editor)),
-                KeyCode::Char('5') if alt => return self.go(Focus::Main, None, Some(Main::Graph)),
-                KeyCode::Char('6') if alt => return self.go(Focus::Main, None, Some(Main::Pty)),
-                _ => {}
+            // Pane switching: Ctrl+Opt+digit only. F-keys are gone — macOS owns
+            // them — and bare Opt+digit collided with app menus / typed glyphs.
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.modifiers.contains(KeyModifiers::ALT)
+            {
+                match k.code {
+                    KeyCode::Char('1') => return self.go(Focus::Left, Some(Left::Sessions), None),
+                    KeyCode::Char('2') => return self.go(Focus::Left, Some(Left::Files), None),
+                    KeyCode::Char('3') => return self.go(Focus::Main, None, Some(Main::Chat)),
+                    KeyCode::Char('4') => return self.go(Focus::Main, None, Some(Main::Editor)),
+                    KeyCode::Char('5') => return self.go(Focus::Main, None, Some(Main::Graph)),
+                    KeyCode::Char('6') => return self.go(Focus::Main, None, Some(Main::Pty)),
+                    _ => {}
+                }
             }
         }
         let action = match (self.focus, self.left, self.main) {
@@ -304,7 +301,7 @@ impl App {
 
         frame.render_widget(
             ratatui::widgets::Paragraph::new(format!(
-                " {}   ⌥1 sessions · ⌥2 files · ⌥3 chat · ⌥4 editor · ⌥5 graph · ⌥6 term (or F1–F6) · ^Q quit",
+                " {}   ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat · ⌃⌥4 editor · ⌃⌥5 graph · ⌃⌥6 term · ^Q quit",
                 self.status
             ))
             .style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),

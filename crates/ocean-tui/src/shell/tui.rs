@@ -4,8 +4,14 @@
 use std::io::{self, Stdout};
 
 use crossterm::{
+    event::{
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
@@ -16,11 +22,21 @@ pub fn init() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Kitty keyboard protocol where supported (iTerm2, Ghostty, kitty, WezTerm):
+    // without it, modifier combos like Ctrl+Opt+1 are ambiguous or dropped.
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     install_panic_hook();
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
 pub fn restore() -> io::Result<()> {
+    // Pop is a no-op where enhancement was never pushed.
+    let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
