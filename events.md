@@ -1275,3 +1275,11 @@ area:      [backend]
 
 Phase 2 Wave A complete (workflow wf_5bc67ba5-36b: 3 worktree lanes -> adversarial review -> sequential land). A2 folder-as-agent tier-1 subprocess capability binding merged as bfeba13 (PR #270): [[subprocess_capability]] in agent.toml now instantiates real PluginProvider tools merged into the per-turn registry, fail-soft, 3 new tests. A3 OKF first real consumer merged as fb28a58 (PR #269): ocean-memory ingest runs frontmatter through okf::load, diagnostics carried not rejected, maps_from migration proven by test. A1 (Longhouse workflow loader) verified already shipped via OCEAN-338/340 — lane opened no PR; noted efficiency nit in workflows_prepare (loads full skill index to discard .skills). Both reviews verdict approve; both merges on green CI. Lane worktrees/branches removed after per-file containment proof. Deferred: builtin:/mcp: scheme binding + wasm tier-2 (A2), Transcript::frontmatter producer/session-startup seeding (A3, Phase 3 on-ramp). Ledger: ocean-discovery/10-phase2-wave-a-run.md.
 _________________________________________________________________________________
+time:      [afternoon] [07-03-26]
+agent:     [claude] [sonnet 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      [feature-request]
+area:      [frontend]
+
+Ocean-TUI session-shell rebuild kicked off. Researched four angles (current ocean-tui monolith, oh-my-pi feature menu, John's CTRL app, best-in-class ratatui). Approved design + spec at docs/specs/2026-07-03-ocean-tui-shell-rebuild-design.md: fuse CTRL's already-ocean-aware session rail + PTY into ocean-tui, rebuilt on the ratatui component/tokio architecture, kill the 6 dead room-tabs, phase in oh-my-pi model roles + advisor-observer. Phase 1 (spine) landed on branch: new crates/ocean-tui/src/shell/ tree — Component trait, event/action tokio channels, async DaemonClient (health/session-mint/turn/SSE), ChatComponent re-housing PM streaming (text/thinking/tool blocks). Launches behind `--next` (OCEAN_TUI_NEXT), legacy room UI stays default until parity. Builds clean, clippy -D clean, 65 legacy + 2 new SSE-parser tests pass. Interactive end-to-end (live streaming turn) still needs John's terminal. Next: Phase 2 — harvest CTRL session rail + PTY, delete dead tabs.
+_________________________________________________________________________________

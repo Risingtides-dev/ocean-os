@@ -45,6 +45,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 mod rooms;
+mod shell;
 mod splash;
 
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4780";
@@ -106,6 +107,12 @@ struct Cli {
     /// recorded workspace so turns pass the daemon's cwd-binding guard.
     #[arg(long, env = "OCEAN_SESSION")]
     session: Option<String>,
+
+    /// Launch the new session-first shell (Phase 1 rebuild) instead of the
+    /// legacy room UI. Opt-in until it reaches parity.
+    /// See docs/specs/2026-07-03-ocean-tui-shell-rebuild-design.md.
+    #[arg(long, env = "OCEAN_TUI_NEXT")]
+    next: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2364,6 +2371,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Mesh(mesh)) => run_mesh(mesh),
+        None if cli.next => {
+            let root = resolve_project_root(cli.project.as_deref());
+            shell::run(&cli.url, root.to_string_lossy().into_owned())
+        }
         None => run_daemon(cli.url, cli.project, cli.session),
     }
 }
