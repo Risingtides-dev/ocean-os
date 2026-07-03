@@ -33,6 +33,9 @@ pub fn run(url: &str, workspace_root: String) -> anyhow::Result<()> {
     rt.block_on(async move {
         let client = DaemonClient::new(url)?;
         let mut terminal = tui::init()?;
+        // The OCEAN splash: hold, then slide-and-fade. Runs before the event
+        // pump spawns, so its direct crossterm polling can't race the app loop.
+        crate::splash::play(&mut terminal)?;
         let result = App::new(client, workspace_root).run(&mut terminal).await;
         tui::restore()?;
         result

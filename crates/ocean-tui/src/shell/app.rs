@@ -1,17 +1,32 @@
-//! App — the thin coordinator. Owns the workbench component tree (left rail:
-//! sessions|files; main view: chat|pty|editor|graph), routes events, drains the
-//! action channel, and spawns network work off the render loop.
+//! App — the workbench frame, mirroring CTRL's `ui()` layout exactly:
 //!
-//! Navigation is Ctrl+Opt+digit so nothing collides with macOS (which owns the
-//! F-keys), editor typing, or PTY input: ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat ·
-//! ⌃⌥4 editor · ⌃⌥5 graph · ⌃⌥6 term. Ctrl-Q quits (Ctrl-C is left free to
-//! reach the PTY as SIGINT). Enter resumes a session; Enter opens a file.
+//! ```text
+//! ┌ title row ──────────────────────────────────────────────┐
+//! │ SESSIONS │▏│ breadcrumb                       │▏│ FILES │
+//! │ (left)   │ │ CENTER: chat / editor / graph    │ │(right)│
+//! │          │ │ ──────────────────────────────── │ │       │
+//! │          │ │ TERMINAL (docked bottom, live)   │ │       │
+//! └ status row ──────────────────────────────────────────────┘
+//! ```
+//!
+//! No tabs: sessions, tree, and the terminal dock are ALWAYS visible (the dock
+//! appears when a shell is hydrated). The center holds the working surface —
+//! chat by default, the editor when a file is open, the graph as a toggle —
+//! the same way CTRL swaps its center between editor and graph.
+//!
+//! Keys: ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat · ⌃⌥4 editor · ⌃⌥5 graph toggle ·
+//! ⌃⌥6 terminal · Tab cycles focus · ⌃Q quits (⌃C passes to the PTY).
 
 use std::path::PathBuf;
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
 use ocean_agent_sdk::{AgentSessionId, AgentTurnRequest};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
+};
 use tokio::sync::mpsc;
 
 use super::{
@@ -23,27 +38,29 @@ use super::{
         graph::GraphComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent,
     },
     event::{Event, EventHandler},
+    theme::{self, g},
     tui,
 };
 
-#[derive(Clone, Copy, PartialEq)]
-enum Left {
-    Sessions,
-    Files,
-}
+const SESS_W: u16 = 30;
+const TREE_W: u16 = 30;
+const TERM_H: u16 = 14;
 
+/// What the center surface is showing (CTRL swaps editor↔graph the same way).
 #[derive(Clone, Copy, PartialEq)]
-enum Main {
+enum Center {
     Chat,
-    Pty,
     Editor,
     Graph,
 }
 
+/// Which visible pane has the keyboard.
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
-    Left,
-    Main,
+    Sessions,
+    Tree,
+    Center,
+    Term,
 }
 
 pub struct App {
@@ -55,8 +72,7 @@ pub struct App {
     pty: PtyComponent,
     editor: EditorComponent,
     graph: GraphComponent,
-    left: Left,
-    main: Main,
+    center: Center,
     focus: Focus,
     session_id: Option<AgentSessionId>,
     status: String,
@@ -78,9 +94,8 @@ impl App {
             pty: PtyComponent::default(),
             editor: EditorComponent::new(root.clone()),
             graph: GraphComponent::new(root),
-            left: Left::Sessions,
-            main: Main::Chat,
-            focus: Focus::Left,
+            center: Center::Chat,
+            focus: Focus::Sessions,
             session_id: None,
             status: "connecting…".into(),
             should_quit: false,
@@ -116,7 +131,6 @@ impl App {
                     terminal.draw(|f| self.draw(f))?;
                 }
                 Event::Tick => {
-                    // Panes with off-band state (PTY output, debounced highlight).
                     if let Some(a) = self.pty.tick() {
                         self.dispatch(a);
                     }
@@ -135,38 +149,84 @@ impl App {
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
         if let CrosstermEvent::Key(k) = evt {
-            // Global navigation / quit — function keys never collide with input.
             if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('q') {
                 self.should_quit = true;
                 return;
             }
-            // Pane switching: Ctrl+Opt+digit only. F-keys are gone — macOS owns
-            // them — and bare Opt+digit collided with app menus / typed glyphs.
+            // Tab cycles focus across the VISIBLE panes (never hides anything).
+            if k.code == KeyCode::Tab && self.focus != Focus::Term {
+                self.cycle_focus();
+                return;
+            }
             if k.modifiers.contains(KeyModifiers::CONTROL)
                 && k.modifiers.contains(KeyModifiers::ALT)
             {
                 match k.code {
-                    KeyCode::Char('1') => return self.go(Focus::Left, Some(Left::Sessions), None),
-                    KeyCode::Char('2') => return self.go(Focus::Left, Some(Left::Files), None),
-                    KeyCode::Char('3') => return self.go(Focus::Main, None, Some(Main::Chat)),
-                    KeyCode::Char('4') => return self.go(Focus::Main, None, Some(Main::Editor)),
-                    KeyCode::Char('5') => return self.go(Focus::Main, None, Some(Main::Graph)),
-                    KeyCode::Char('6') => return self.go(Focus::Main, None, Some(Main::Pty)),
+                    KeyCode::Char('1') => return self.focus_to(Focus::Sessions),
+                    KeyCode::Char('2') => return self.focus_to(Focus::Tree),
+                    KeyCode::Char('3') => {
+                        self.center = Center::Chat;
+                        return self.focus_to(Focus::Center);
+                    }
+                    KeyCode::Char('4') => {
+                        if self.editor.has_tabs() {
+                            self.center = Center::Editor;
+                        }
+                        return self.focus_to(Focus::Center);
+                    }
+                    KeyCode::Char('5') => {
+                        // Graph toggles over the center, exactly like CTRL's
+                        // show_graph; toggling off returns to chat/editor.
+                        self.center = if self.center == Center::Graph {
+                            if self.editor.has_tabs() {
+                                Center::Editor
+                            } else {
+                                Center::Chat
+                            }
+                        } else {
+                            Center::Graph
+                        };
+                        return self.focus_to(Focus::Center);
+                    }
+                    KeyCode::Char('6') => {
+                        if self.pty.is_active() {
+                            return self.focus_to(Focus::Term);
+                        }
+                        return;
+                    }
                     _ => {}
                 }
             }
         }
-        let action = match (self.focus, self.left, self.main) {
-            (Focus::Left, Left::Sessions, _) => self.rail.handle_event(&evt),
-            (Focus::Left, Left::Files, _) => self.tree.handle_event(&evt),
-            (Focus::Main, _, Main::Chat) => self.chat.handle_event(&evt),
-            (Focus::Main, _, Main::Pty) => self.pty.handle_event(&evt),
-            (Focus::Main, _, Main::Editor) => self.editor.handle_event(&evt),
-            (Focus::Main, _, Main::Graph) => self.graph.handle_event(&evt),
+        let action = match self.focus {
+            Focus::Sessions => self.rail.handle_event(&evt),
+            Focus::Tree => self.tree.handle_event(&evt),
+            Focus::Term => self.pty.handle_event(&evt),
+            Focus::Center => match self.center {
+                Center::Chat => self.chat.handle_event(&evt),
+                Center::Editor => self.editor.handle_event(&evt),
+                Center::Graph => self.graph.handle_event(&evt),
+            },
         };
         if let Some(a) = action {
             self.dispatch(a);
         }
+    }
+
+    fn cycle_focus(&mut self) {
+        let next = match self.focus {
+            Focus::Sessions => Focus::Center,
+            Focus::Center => {
+                if self.pty.is_active() {
+                    Focus::Term
+                } else {
+                    Focus::Tree
+                }
+            }
+            Focus::Term => Focus::Tree,
+            Focus::Tree => Focus::Sessions,
+        };
+        self.focus_to(next);
     }
 
     fn dispatch(&mut self, action: Action) {
@@ -179,59 +239,47 @@ impl App {
             Action::SessionBound(id) => self.session_id = Some(*id),
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
             Action::OpenSession { line, cwd } => {
+                // Hydrate into the terminal DOCK (appears at the bottom of the
+                // center column, CTRL-style) and focus it.
                 self.pty.open(cwd, line);
-                self.go(Focus::Main, None, Some(Main::Pty));
+                self.focus_to(Focus::Term);
             }
             Action::OpenFile(path) => {
                 self.editor.open(path.clone());
-                self.go(Focus::Main, None, Some(Main::Editor));
+                self.center = Center::Editor;
+                self.focus_to(Focus::Center);
             }
             Action::ResumeSession { id, path } => {
-                // Rehydrate the transcript from disk, bind future turns to this
-                // id, and subscribe its live event stream.
-                self.chat.load_history(crate::shell::sessions::load_transcript(path));
+                self.chat
+                    .load_history(crate::shell::sessions::load_transcript(path));
                 self.session_id = Some(*id);
+                self.rail.live_id = Some(id.0.to_string());
                 self.client.spawn_event_stream(*id, self.actions_tx.clone());
                 self.status = format!("resumed session {:.8}", id.0.to_string());
-                self.go(Focus::Main, None, Some(Main::Chat));
+                self.center = Center::Chat;
+                self.focus_to(Focus::Center);
             }
-            Action::CycleFocus => {
-                let next = match self.focus {
-                    Focus::Left => Focus::Main,
-                    Focus::Main => Focus::Left,
-                };
-                self.go(next, None, None);
-            }
+            Action::CycleFocus => self.cycle_focus(),
             _ => {}
         }
-        // Chat folds in streamed agent events regardless of focus.
         if let Some(next) = self.chat.update(&action) {
             self.dispatch(next);
         }
     }
 
-    /// Switch focus and optionally the active left/main surface, then sync each
-    /// component's `focused` flag for border styling + input gating.
-    fn go(&mut self, focus: Focus, left: Option<Left>, main: Option<Main>) {
+    fn focus_to(&mut self, focus: Focus) {
         self.focus = focus;
-        if let Some(l) = left {
-            self.left = l;
-        }
-        if let Some(m) = main {
-            self.main = m;
-        }
         self.apply_focus();
     }
 
     fn apply_focus(&mut self) {
-        let left_focused = self.focus == Focus::Left;
-        let main_focused = self.focus == Focus::Main;
-        self.rail.focused = left_focused && self.left == Left::Sessions;
-        self.tree.focused = left_focused && self.left == Left::Files;
-        self.chat.focused = main_focused && self.main == Main::Chat;
-        self.pty.focused = main_focused && self.main == Main::Pty;
-        self.editor.focused = main_focused && self.main == Main::Editor;
-        self.graph.focused = main_focused && self.main == Main::Graph;
+        self.rail.focused = self.focus == Focus::Sessions;
+        self.tree.focused = self.focus == Focus::Tree;
+        self.pty.focused = self.focus == Focus::Term;
+        let center = self.focus == Focus::Center;
+        self.chat.focused = center && self.center == Center::Chat;
+        self.editor.focused = center && self.center == Center::Editor;
+        self.graph.focused = center && self.center == Center::Graph;
     }
 
     fn submit_turn(&mut self, prompt: String) {
@@ -277,60 +325,131 @@ impl App {
         });
     }
 
+    // ── the CTRL frame ───────────────────────────────────────────────────────
+
     fn draw(&mut self, frame: &mut ratatui::Frame) {
-        use ratatui::{
-            style::{Modifier, Style},
-            text::{Line, Span},
-            widgets::{Block, Paragraph},
-        };
-        use super::theme;
+        let full = frame.area();
+        if full.width < 40 || full.height < 8 {
+            frame.render_widget(
+                Paragraph::new("ocean: window too small — enlarge the terminal")
+                    .style(Style::default().fg(theme::YELLOW).bg(theme::BG_DARK)),
+                full,
+            );
+            return;
+        }
 
-        // The void: everything floats on CTRL's dark rail color.
-        frame.render_widget(
-            Block::default().style(Style::default().bg(theme::BG_DARK)),
-            frame.area(),
-        );
-
-        let rows = Layout::default()
+        // root: title / body / status — CTRL's exact vertical frame.
+        let root = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
-            .split(frame.area());
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(full);
+        let (title_row, body, status_row) = (root[0], root[1], root[2]);
 
+        // body: [sessions][splitter][center][splitter][tree] — CTRL's columns.
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(34), Constraint::Min(20)])
-            .split(rows[0]);
+            .constraints([
+                Constraint::Length(SESS_W),
+                Constraint::Length(1),
+                Constraint::Min(40),
+                Constraint::Length(1),
+                Constraint::Length(TREE_W),
+            ])
+            .split(body);
+        let (r_sessions, r_split_a, center, r_split_b, r_tree) =
+            (cols[0], cols[1], cols[2], cols[3], cols[4]);
 
-        match self.left {
-            Left::Sessions => self.rail.draw(frame, cols[0]),
-            Left::Files => self.tree.draw(frame, cols[0]),
+        // center: main surface + terminal docked at the bottom when live.
+        let (r_center, r_split_term, r_term) = if self.pty.is_active() {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(5),
+                    Constraint::Length(1),
+                    Constraint::Length(TERM_H),
+                ])
+                .split(center);
+            (rows[0], rows[1], rows[2])
+        } else {
+            (center, Rect::default(), Rect::default())
+        };
+
+        // deep chrome first
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme::BG)),
+            full,
+        );
+
+        // panels — all visible, always.
+        self.rail.draw(frame, r_sessions);
+        match self.center {
+            Center::Chat => self.chat.draw(frame, r_center),
+            Center::Editor => self.editor.draw(frame, r_center),
+            Center::Graph => self.graph.draw(frame, r_center),
         }
-
-        match self.main {
-            Main::Chat => self.chat.draw(frame, cols[1]),
-            Main::Pty => self.pty.draw(frame, cols[1]),
-            Main::Editor => self.editor.draw(frame, cols[1]),
-            Main::Graph => self.graph.draw(frame, cols[1]),
+        self.tree.draw(frame, r_tree);
+        if self.pty.is_active() {
+            self.pty.draw(frame, r_term);
+            splitter(frame, r_split_term, false);
         }
+        splitter(frame, r_split_a, true);
+        splitter(frame, r_split_b, true);
 
-        // ── status bar: ◇ OCEAN glyph, dim status, key hints with lit digits ──
-        let mut spans: Vec<Span> = vec![
+        self.draw_title(frame, title_row);
+        self.draw_status(frame, status_row);
+    }
+
+    fn draw_title(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let spans = vec![
             Span::styled(
-                " ◇ OCEAN ",
+                format!(" {} OCEAN ", g("◇", "*")),
                 Style::default()
                     .fg(theme::CYAN)
+                    .bg(theme::BG_DARK)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&self.status, Style::default().fg(theme::COMMENT)),
-            Span::raw("   "),
+            Span::styled(
+                self.workspace_root.clone(),
+                Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
+            area,
+        );
+    }
+
+    fn draw_status(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let mut spans: Vec<Span> = vec![
+            Span::styled(
+                format!(" {} ", self.status),
+                Style::default().fg(theme::COMMENT),
+            ),
+            Span::raw("  "),
         ];
         for (key, name, active) in [
-            ("⌃⌥1", "sessions", self.focus == Focus::Left && self.left == Left::Sessions),
-            ("⌃⌥2", "files", self.focus == Focus::Left && self.left == Left::Files),
-            ("⌃⌥3", "chat", self.main == Main::Chat && self.focus == Focus::Main),
-            ("⌃⌥4", "editor", self.main == Main::Editor && self.focus == Focus::Main),
-            ("⌃⌥5", "graph", self.main == Main::Graph && self.focus == Focus::Main),
-            ("⌃⌥6", "term", self.main == Main::Pty && self.focus == Focus::Main),
+            ("⌃⌥1", "sessions", self.focus == Focus::Sessions),
+            ("⌃⌥2", "files", self.focus == Focus::Tree),
+            (
+                "⌃⌥3",
+                "chat",
+                self.focus == Focus::Center && self.center == Center::Chat,
+            ),
+            (
+                "⌃⌥4",
+                "editor",
+                self.focus == Focus::Center && self.center == Center::Editor,
+            ),
+            (
+                "⌃⌥5",
+                "graph",
+                self.focus == Focus::Center && self.center == Center::Graph,
+            ),
+            ("⌃⌥6", "term", self.focus == Focus::Term),
         ] {
             let (kf, nf) = if active {
                 (theme::CYAN, theme::FG)
@@ -340,10 +459,39 @@ impl App {
             spans.push(Span::styled(format!("{key} "), Style::default().fg(kf)));
             spans.push(Span::styled(format!("{name}  "), Style::default().fg(nf)));
         }
-        spans.push(Span::styled("⌃Q quit", Style::default().fg(theme::COMMENT)));
+        spans.push(Span::styled(
+            "⇥ cycle · ⌃Q quit",
+            Style::default().fg(theme::COMMENT),
+        ));
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
-            rows[1],
+            area,
+        );
+    }
+}
+
+/// A 1-cell splitter line between panels, CTRL-style.
+fn splitter(frame: &mut ratatui::Frame, area: Rect, vertical: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let ch = if vertical { "▏" } else { "─" };
+    if vertical {
+        for k in 0..area.height {
+            frame.render_widget(
+                Paragraph::new(Span::styled(ch, Style::default().fg(theme::EDGE)))
+                    .style(Style::default().bg(theme::BG)),
+                Rect::new(area.x, area.y + k, 1, 1),
+            );
+        }
+    } else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                ch.repeat(area.width as usize),
+                Style::default().fg(theme::EDGE),
+            ))
+            .style(Style::default().bg(theme::BG)),
+            area,
         );
     }
 }
