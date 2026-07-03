@@ -28,3 +28,6 @@ futures = "0.3"
 portable-pty = "0.8"
 vt100 = "0.15"
 tui-term = "0.2"
+# Phase-3 shell: editor / file tree / graph workbench surfaces (harvested from CTRL).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+ignore = "0.4"

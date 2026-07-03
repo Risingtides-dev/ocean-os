@@ -11,9 +11,14 @@ mod app;
 mod client;
 mod component;
 mod components;
+mod editor;
 mod event;
+mod git;
+mod graph;
+mod highlight;
 mod pty;
 mod sessions;
+mod tree;
 mod tui;
 
 use app::App;

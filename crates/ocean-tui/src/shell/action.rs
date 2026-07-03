@@ -27,4 +27,6 @@ pub enum Action {
     OpenSession { line: String, cwd: PathBuf },
     /// Move keyboard focus to the next pane.
     CycleFocus,
+    /// Open a file in the editor (from the file tree or the graph).
+    OpenFile(PathBuf),
 }

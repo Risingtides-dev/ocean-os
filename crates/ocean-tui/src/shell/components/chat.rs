@@ -78,7 +78,6 @@ impl ChatComponent {
 impl Component for ChatComponent {
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
