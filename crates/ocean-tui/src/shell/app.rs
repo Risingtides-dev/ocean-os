@@ -123,8 +123,9 @@ impl App {
             pty: PtyComponent::default(),
             editor: EditorComponent::new(root.clone()),
             graph: GraphComponent::new(root),
+            // Land in the chat, typing-ready — the rail is one click away.
             center: Center::Chat,
-            focus: Focus::Sessions,
+            focus: Focus::Center,
             session_id: None,
             status: "connecting…".into(),
             should_quit: false,

@@ -248,4 +248,67 @@ mod tests {
     fn none_when_no_data_line() {
         assert!(parse_sse_frame(": just a comment\nid: x").is_none());
     }
+
+    /// Live end-to-end against the local daemon: mint a session, subscribe its
+    /// stream, submit a tiny turn, and require streamed events to arrive and
+    /// decode. Ignored by default (needs the daemon on :4780).
+    /// Run: cargo test -p ocean-tui -- --ignored --nocapture live_turn_streams
+    #[tokio::test]
+    #[ignore]
+    async fn live_turn_streams_events() {
+        let client = DaemonClient::new("http://127.0.0.1:4780").expect("client");
+        client.health().await.expect("daemon must be up");
+
+        let ws = "/tmp/ocean-tui-live-test";
+        std::fs::create_dir_all(ws).unwrap();
+        let sess = client.create_agent_session(ws).await.expect("mint session");
+        println!("session: {}", sess.session_id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.spawn_event_stream(sess.session_id, tx);
+
+        let req = AgentTurnRequest {
+            session_id: Some(sess.session_id),
+            prompt: "reply with exactly: ok".into(),
+            cwd: ws.into(),
+            guidance: None,
+            room_id: None,
+            project_id: None,
+            client_type: Some("tui".into()),
+            agent: None,
+            role: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+            decision_token: None,
+            client_context: None,
+        };
+        let client2 = client.clone();
+        let turn = tokio::spawn(async move { client2.agent_turn(&req).await });
+
+        let mut got_started = false;
+        let mut text = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, rx.recv()).await;
+            let Ok(Some(action)) = ev else { break };
+            match action {
+                Action::AgentEvent(evt) => match *evt {
+                    AgentTurnEvent::TurnStarted { .. } => got_started = true,
+                    AgentTurnEvent::AssistantTextDelta { ref delta, .. } => {
+                        text.push_str(delta);
+                    }
+                    AgentTurnEvent::TurnFinished { .. } => break,
+                    _ => {}
+                },
+                Action::Status(s) => println!("status: {s}"),
+                Action::Error(e) => panic!("stream error: {e}"),
+                _ => {}
+            }
+        }
+        let resp = turn.await.unwrap().expect("turn HTTP ok");
+        println!("turn ok={} streamed text: {text:?}", resp.ok);
+        assert!(got_started, "no TurnStarted arrived on the session stream");
+        assert!(!text.is_empty(), "no assistant text streamed");
+    }
 }
