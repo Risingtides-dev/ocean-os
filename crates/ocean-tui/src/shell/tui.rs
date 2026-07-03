@@ -5,7 +5,8 @@ use std::io::{self, Stdout};
 
 use crossterm::{
     event::{
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -21,7 +22,7 @@ pub type Tui = Terminal<Backend>;
 pub fn init() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     // Kitty keyboard protocol where supported (iTerm2, Ghostty, kitty, WezTerm):
     // without it, modifier combos like Ctrl+Opt+1 are ambiguous or dropped.
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
@@ -38,7 +39,7 @@ pub fn restore() -> io::Result<()> {
     // Pop is a no-op where enhancement was never pushed.
     let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     Ok(())
 }
 

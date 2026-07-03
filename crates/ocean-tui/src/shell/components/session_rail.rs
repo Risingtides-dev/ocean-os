@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ocean_agent_sdk::AgentSessionId;
 use ratatui::{
     layout::Rect,
@@ -34,6 +34,8 @@ pub struct SessionRailComponent {
     /// Session id currently open in the chat/PTY — gets the live dot.
     pub live_id: Option<String>,
     pub focused: bool,
+    /// Body rect from the last draw, for mouse hit-testing.
+    body_rect: Rect,
 }
 
 impl SessionRailComponent {
@@ -46,7 +48,29 @@ impl SessionRailComponent {
             scroll: 0,
             live_id: None,
             focused: true,
+            body_rect: Rect::default(),
         }
+    }
+
+    /// Which session row a screen position lands on, accounting for scroll and
+    /// the selected row's 2-line expansion (CTRL's session_row_at).
+    fn row_at(&self, pos: (u16, u16)) -> Option<usize> {
+        let body = self.body_rect;
+        if body.width == 0 || pos.1 < body.y || pos.1 >= body.y + body.height {
+            return None;
+        }
+        let mut y = body.y;
+        for i in self.scroll..self.sessions.len() {
+            let h = if i == self.selected { 2 } else { 1 };
+            if pos.1 >= y && pos.1 < y + h {
+                return Some(i);
+            }
+            y += h;
+            if y >= body.y + body.height {
+                break;
+            }
+        }
+        None
     }
 
     pub fn refresh(&mut self) {
@@ -120,6 +144,32 @@ impl Component for SessionRailComponent {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.selected = self.selected.saturating_sub(1);
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                if self.selected + 1 < self.sessions.len() {
+                    self.selected += 1;
+                }
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let i = self.row_at((mouse.column, mouse.row))?;
+                if i == self.selected {
+                    // click on the already-selected row opens it
+                    self.resume_selected()
+                } else {
+                    self.selected = i;
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let body = panel::draw(
             frame,
@@ -131,6 +181,7 @@ impl Component for SessionRailComponent {
         if body.width == 0 {
             return;
         }
+        self.body_rect = body;
 
         if self.sessions.is_empty() {
             let msg = "no ocean sessions for this project";

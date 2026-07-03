@@ -17,10 +17,12 @@
 //! Keys: ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat · ⌃⌥4 editor · ⌃⌥5 graph toggle ·
 //! ⌃⌥6 terminal · Tab cycles focus · ⌃Q quits (⌃C passes to the PTY).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseEventKind};
 use ocean_agent_sdk::{AgentSessionId, AgentTurnRequest};
+use ocean_core::RequestId;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -79,6 +81,16 @@ pub struct App {
     should_quit: bool,
     actions_tx: mpsc::UnboundedSender<Action>,
     actions_rx: mpsc::UnboundedReceiver<Action>,
+    /// OCEAN-185: the token minted for the in-flight submit, claimed by the
+    /// turn's first permission request (keyed by its request_id).
+    pending_submit_token: Option<String>,
+    decision_tokens: HashMap<RequestId, String>,
+    perm_request: HashMap<ocean_core::PermissionId, RequestId>,
+    /// Pane rects from the last draw, for mouse routing.
+    r_sessions: Rect,
+    r_tree: Rect,
+    r_center: Rect,
+    r_term: Rect,
 }
 
 impl App {
@@ -101,6 +113,13 @@ impl App {
             should_quit: false,
             actions_tx,
             actions_rx,
+            pending_submit_token: None,
+            decision_tokens: HashMap::new(),
+            perm_request: HashMap::new(),
+            r_sessions: Rect::default(),
+            r_tree: Rect::default(),
+            r_center: Rect::default(),
+            r_term: Rect::default(),
         };
         app.apply_focus();
         app
@@ -122,6 +141,9 @@ impl App {
                     }
                 }
             });
+            // Global /v1/events: permission requests/decisions live here.
+            self.client
+                .spawn_global_event_stream(self.actions_tx.clone());
         }
 
         while !self.should_quit {
@@ -148,6 +170,41 @@ impl App {
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // Mouse: a click focuses the pane under the cursor; wheel + clicks are
+        // forwarded to whichever pane the cursor is over (CTRL behavior).
+        if let CrosstermEvent::Mouse(m) = evt {
+            let pos = (m.column, m.row);
+            let target = if rect_has(self.r_sessions, pos) {
+                Some(Focus::Sessions)
+            } else if rect_has(self.r_tree, pos) {
+                Some(Focus::Tree)
+            } else if rect_has(self.r_term, pos) {
+                Some(Focus::Term)
+            } else if rect_has(self.r_center, pos) {
+                Some(Focus::Center)
+            } else {
+                None
+            };
+            if let Some(t) = target {
+                if matches!(m.kind, MouseEventKind::Down(_)) {
+                    self.focus_to(t);
+                }
+                let action = match t {
+                    Focus::Sessions => self.rail.handle_mouse(m),
+                    Focus::Tree => self.tree.handle_mouse(m),
+                    Focus::Term => self.pty.handle_mouse(m),
+                    Focus::Center => match self.center {
+                        Center::Chat => self.chat.handle_mouse(m),
+                        Center::Editor => self.editor.handle_mouse(m),
+                        Center::Graph => self.graph.handle_mouse(m),
+                    },
+                };
+                if let Some(a) = action {
+                    self.dispatch(a);
+                }
+            }
+            return;
+        }
         if let CrosstermEvent::Key(k) = evt {
             if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('q') {
                 self.should_quit = true;
@@ -260,6 +317,40 @@ impl App {
                 self.focus_to(Focus::Center);
             }
             Action::CycleFocus => self.cycle_focus(),
+            Action::OceanEvent(env) => {
+                // OCEAN-185: the turn's first permission request claims the
+                // pending submit token; remember permission→request for the POST.
+                if let ocean_core::OceanEvent::PermissionRequest { .. } = &env.event {
+                    if let (Some(rid), Some(pid)) = (env.request_id, env.permission_id) {
+                        self.perm_request.insert(pid, rid);
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            self.decision_tokens.entry(rid)
+                        {
+                            if let Some(token) = self.pending_submit_token.take() {
+                                slot.insert(token);
+                            }
+                        }
+                    }
+                }
+            }
+            Action::PermissionDecided {
+                permission_id,
+                allow,
+            } => {
+                let token = self
+                    .perm_request
+                    .get(permission_id)
+                    .and_then(|rid| self.decision_tokens.get(rid))
+                    .cloned();
+                let client = self.client.clone();
+                let tx = self.actions_tx.clone();
+                let (pid, allow) = (*permission_id, *allow);
+                tokio::spawn(async move {
+                    if let Err(e) = client.permission_decision(pid, allow, token).await {
+                        let _ = tx.send(Action::Error(format!("decision: {e}")));
+                    }
+                });
+            }
             _ => {}
         }
         if let Some(next) = self.chat.update(&action) {
@@ -287,6 +378,10 @@ impl App {
         let tx = self.actions_tx.clone();
         let workspace = self.workspace_root.clone();
         let existing = self.session_id;
+        // OCEAN-185: mint the per-turn permission secret; the turn's first
+        // permission request claims it (see Action::OceanEvent above).
+        let decision_token = ocean_core::mint_decision_token();
+        self.pending_submit_token = Some(decision_token.clone());
 
         tokio::spawn(async move {
             let session_id = match existing {
@@ -316,7 +411,7 @@ impl App {
                 thinking_level: None,
                 model_id: None,
                 images: None,
-                decision_token: None,
+                decision_token: Some(decision_token),
                 client_context: None,
             };
             if let Err(e) = client.agent_turn(&req).await {
@@ -363,25 +458,49 @@ impl App {
         let (r_sessions, r_split_a, center, r_split_b, r_tree) =
             (cols[0], cols[1], cols[2], cols[3], cols[4]);
 
-        // center: main surface + terminal docked at the bottom when live.
-        let (r_center, r_split_term, r_term) = if self.pty.is_active() {
+        // center: breadcrumb / main surface / docked terminal (CTRL's rows).
+        let (r_crumb, r_center, r_split_term, r_term) = if self.pty.is_active() {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
+                    Constraint::Length(1),
                     Constraint::Min(5),
                     Constraint::Length(1),
                     Constraint::Length(TERM_H),
                 ])
                 .split(center);
-            (rows[0], rows[1], rows[2])
+            (rows[0], rows[1], rows[2], rows[3])
         } else {
-            (center, Rect::default(), Rect::default())
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(5)])
+                .split(center);
+            (rows[0], rows[1], Rect::default(), Rect::default())
         };
+        self.r_sessions = r_sessions;
+        self.r_tree = r_tree;
+        self.r_center = r_center;
+        self.r_term = r_term;
 
         // deep chrome first
         frame.render_widget(
             Block::default().style(Style::default().bg(theme::BG)),
             full,
+        );
+
+        // breadcrumb: where the center surface is pointed (CTRL's crumb row).
+        let crumb = match self.center {
+            Center::Chat => match &self.session_id {
+                Some(id) => format!(" chat {} {:.8}", g("›", ">"), id.0.to_string()),
+                None => " chat › new session".to_string(),
+            },
+            Center::Editor => format!(" editor {} {}", g("›", ">"), self.editor.crumb()),
+            Center::Graph => " graph › project constellation".to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(crumb, Style::default().fg(theme::COMMENT)))
+                .style(Style::default().bg(theme::BG)),
+            r_crumb,
         );
 
         // panels — all visible, always.
@@ -457,6 +576,12 @@ impl App {
             area,
         );
     }
+}
+
+/// Does `pos` (col, row) fall inside `r`?
+fn rect_has(r: Rect, pos: (u16, u16)) -> bool {
+    let (x, y) = pos;
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 /// A 1-cell splitter line between panels, CTRL-style.

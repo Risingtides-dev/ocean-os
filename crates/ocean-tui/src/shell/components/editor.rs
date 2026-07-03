@@ -48,6 +48,19 @@ impl EditorComponent {
         !self.tabs.is_empty()
     }
 
+    /// Breadcrumb text: the open file's path relative to the project root.
+    pub fn crumb(&self) -> String {
+        match self.tabs.get(self.active) {
+            Some(t) => t
+                .path
+                .strip_prefix(&self.root)
+                .unwrap_or(&t.path)
+                .display()
+                .to_string(),
+            None => "no file".to_string(),
+        }
+    }
+
     /// Open `path`, focusing an existing tab if already open.
     pub fn open(&mut self, path: PathBuf) {
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {

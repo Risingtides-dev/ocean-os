@@ -32,4 +32,12 @@ pub enum Action {
     /// Resume a session natively in the chat: load its transcript from `path`
     /// and bind future turns to `id`.
     ResumeSession { id: AgentSessionId, path: PathBuf },
+    /// A global `/v1/events` envelope (permission requests/decisions ride here).
+    OceanEvent(Box<ocean_core::EventEnvelope>),
+    /// Operator decided a pending permission (⌃Y allow / ⌃N deny). The app
+    /// replays the turn's decision token on the POST (OCEAN-185).
+    PermissionDecided {
+        permission_id: ocean_core::PermissionId,
+        allow: bool,
+    },
 }

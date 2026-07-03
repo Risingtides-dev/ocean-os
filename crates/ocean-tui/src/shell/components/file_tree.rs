@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -25,6 +25,7 @@ pub struct FileTreeComponent {
     tree: Tree,
     scroll: usize,
     pub focused: bool,
+    body_rect: Rect,
 }
 
 impl FileTreeComponent {
@@ -33,6 +34,7 @@ impl FileTreeComponent {
             tree: Tree::new(root),
             scroll: 0,
             focused: false,
+            body_rect: Rect::default(),
         }
     }
 }
@@ -56,11 +58,43 @@ impl Component for FileTreeComponent {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.tree.move_sel(-1);
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                self.tree.move_sel(1);
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let body = self.body_rect;
+                if body.width == 0 || mouse.row < body.y || mouse.row >= body.y + body.height {
+                    return None;
+                }
+                let i = self.scroll + (mouse.row - body.y) as usize;
+                if i >= self.tree.entries.len() {
+                    return None;
+                }
+                if i == self.tree.selected {
+                    // click on the selected row toggles/opens (CTRL behavior)
+                    self.tree.activate().map(Action::OpenFile)
+                } else {
+                    self.tree.selected = i;
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let body = panel::draw(frame, area, "FILES", None, self.focused);
         if body.width == 0 {
             return;
         }
+        self.body_rect = body;
 
         let view_h = body.height as usize;
         let sel = self.tree.selected;

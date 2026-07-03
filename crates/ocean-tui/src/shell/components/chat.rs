@@ -1,13 +1,12 @@
 //! ChatComponent — the native agent surface. Re-houses the PM room's streaming
 //! model (structured blocks: text, thinking, tool calls) onto the component
-//! architecture. Phase 1 covers the core loop: compose a prompt, submit it,
-//! render streamed assistant text / thinking / tool-call status.
-//!
-//! ponytail: permission prompts, collapsible thinking pills, diff snippets, and
-//! markdown/syntax rendering land in later phases — noted, not built yet.
+//! architecture, plus: permission approval cards (⌃Y allow / ⌃N deny, the
+//! OCEAN-185 gated flow), markdown-lite rendering (headings, fences, bullets,
+//! inline code), multi-line input (⌃J newline), and wheel/PageUp scrollback.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ocean_agent_sdk::{AgentTurnEvent, ToolCallId};
+use ocean_core::{OceanEvent, PermissionId};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -45,6 +44,14 @@ enum Turn {
         severity: String,
         model: String,
     },
+    /// A gated tool waiting on the operator (OCEAN-185). `resolved` is `None`
+    /// while waiting, then Some(allowed).
+    Permission {
+        permission_id: PermissionId,
+        tool: String,
+        reason: String,
+        resolved: Option<bool>,
+    },
 }
 
 #[derive(PartialEq)]
@@ -60,6 +67,8 @@ pub struct ChatComponent {
     input: String,
     model: Option<String>,
     busy: bool,
+    /// Scrollback offset in lines from the bottom (0 = stick to live tail).
+    scroll_back: usize,
     pub focused: bool,
 }
 
@@ -126,17 +135,136 @@ impl ChatComponent {
             model,
         });
     }
+
+    /// The newest unresolved permission card, if any — the ⌃Y/⌃N target.
+    fn pending_permission(&self) -> Option<PermissionId> {
+        self.turns.iter().rev().find_map(|t| match t {
+            Turn::Permission {
+                permission_id,
+                resolved: None,
+                ..
+            } => Some(*permission_id),
+            _ => None,
+        })
+    }
+
+    fn resolve_permission(&mut self, id: PermissionId, allowed: bool) {
+        for t in self.turns.iter_mut().rev() {
+            if let Turn::Permission {
+                permission_id,
+                resolved,
+                ..
+            } = t
+            {
+                if *permission_id == id {
+                    *resolved = Some(allowed);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Markdown-lite: style one source line. Fence state is carried by the caller
+/// so code blocks render on the dark bed with plain text.
+fn md_line(l: &str, in_fence: &mut bool) -> Line<'static> {
+    let t = l.trim_start();
+    if t.starts_with("```") {
+        *in_fence = !*in_fence;
+        return Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
+        ));
+    }
+    if *in_fence {
+        return Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(theme::CYAN).bg(theme::BG_DARK),
+        ));
+    }
+    if t.starts_with('#') {
+        return Line::from(Span::styled(
+            l.to_string(),
+            Style::default()
+                .fg(theme::BLUE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if t.starts_with("- ") || t.starts_with("* ") {
+        return Line::from(vec![
+            Span::styled(
+                l[..l.len() - t.len()].to_string(),
+                Style::default().fg(theme::FG),
+            ),
+            Span::styled(format!("{} ", g("•", "-")), Style::default().fg(theme::CYAN)),
+            Span::styled(t[2..].to_string(), Style::default().fg(theme::FG)),
+        ]);
+    }
+    // inline `code` runs
+    if l.contains('`') {
+        let mut spans = Vec::new();
+        for (i, seg) in l.split('`').enumerate() {
+            if i % 2 == 1 {
+                spans.push(Span::styled(
+                    seg.to_string(),
+                    Style::default().fg(theme::CYAN).bg(theme::BG_DARK),
+                ));
+            } else {
+                spans.push(Span::styled(seg.to_string(), Style::default().fg(theme::FG)));
+            }
+        }
+        return Line::from(spans);
+    }
+    Line::from(Span::styled(l.to_string(), Style::default().fg(theme::FG)))
 }
 
 impl Component for ChatComponent {
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // Permission decisions work even mid-stream (legacy ⌃Y/⌃N bindings).
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('y') => {
+                    if let Some(id) = self.pending_permission() {
+                        return Some(Action::PermissionDecided {
+                            permission_id: id,
+                            allow: true,
+                        });
+                    }
+                    return None;
+                }
+                KeyCode::Char('n') => {
+                    if let Some(id) = self.pending_permission() {
+                        return Some(Action::PermissionDecided {
+                            permission_id: id,
+                            allow: false,
+                        });
+                    }
+                    return None;
+                }
+                // ⌃J: newline in the composer (legacy binding).
+                KeyCode::Char('j') => {
+                    self.input.push('\n');
+                    return None;
+                }
+                _ => {}
+            }
+        }
         match (key.code, key.modifiers) {
+            (KeyCode::PageUp, _) => {
+                self.scroll_back += 10;
+                None
+            }
+            (KeyCode::PageDown, _) => {
+                self.scroll_back = self.scroll_back.saturating_sub(10);
+                None
+            }
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
                     return None;
                 }
                 self.input.clear();
+                self.scroll_back = 0; // sending snaps to the live tail
                 self.turns.push(Turn::User(text.clone()));
                 self.busy = true;
                 Some(Action::SubmitPrompt(text))
@@ -153,7 +281,39 @@ impl Component for ChatComponent {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_back += 3,
+            MouseEventKind::ScrollDown => self.scroll_back = self.scroll_back.saturating_sub(3),
+            _ => {}
+        }
+        None
+    }
+
     fn update(&mut self, action: &Action) -> Option<Action> {
+        // Permission traffic rides the GLOBAL event stream, not the agent one.
+        if let Action::OceanEvent(env) = action {
+            match &env.event {
+                OceanEvent::PermissionRequest { tool, reason, .. } => {
+                    if let Some(pid) = env.permission_id {
+                        self.turns.push(Turn::Permission {
+                            permission_id: pid,
+                            tool: tool.clone(),
+                            reason: reason.clone(),
+                            resolved: None,
+                        });
+                        self.scroll_back = 0; // surface the prompt immediately
+                    }
+                }
+                OceanEvent::PermissionDecision { allowed, .. } => {
+                    if let Some(pid) = env.permission_id {
+                        self.resolve_permission(pid, *allowed);
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
         if let Action::AgentEvent(evt) = action {
             match evt.as_ref() {
                 AgentTurnEvent::TurnStarted { model, .. } => {
@@ -197,9 +357,11 @@ impl Component for ChatComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        // Composer grows with its content (multi-line via ⌃J), capped at 5.
+        let input_lines = (self.input.split('\n').count().max(1) as u16).min(5);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .constraints([Constraint::Min(3), Constraint::Length(input_lines + 1)])
             .split(area);
 
         // ── transcript panel in the CTRL skin ────────────────────────────────
@@ -220,11 +382,58 @@ impl Component for ChatComponent {
                     ]));
                 }
                 Turn::Assistant(s) => {
+                    let mut in_fence = false;
                     for l in s.lines() {
-                        lines.push(Line::from(Span::styled(
-                            l.to_string(),
-                            Style::default().fg(theme::FG),
-                        )));
+                        lines.push(md_line(l, &mut in_fence));
+                    }
+                }
+                Turn::Permission {
+                    tool,
+                    reason,
+                    resolved,
+                    ..
+                } => {
+                    // Approval card: loud while pending, quiet once decided.
+                    match resolved {
+                        None => {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("  {} approval needed: ", g("⚠", "!")),
+                                    Style::default()
+                                        .fg(theme::YELLOW)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    tool.clone(),
+                                    Style::default()
+                                        .fg(theme::FG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ]));
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("  {} ", g("▎", "|")),
+                                    Style::default().fg(theme::YELLOW),
+                                ),
+                                Span::styled(reason.clone(), Style::default().fg(theme::FG)),
+                            ]));
+                            lines.push(Line::from(Span::styled(
+                                "  ⌃Y allow · ⌃N deny",
+                                Style::default().fg(theme::YELLOW),
+                            )));
+                        }
+                        Some(true) => {
+                            lines.push(Line::from(Span::styled(
+                                format!("  {} allowed: {tool}", g("✓", "+")),
+                                Style::default().fg(theme::GREEN),
+                            )));
+                        }
+                        Some(false) => {
+                            lines.push(Line::from(Span::styled(
+                                format!("  {} denied: {tool}", g("✗", "x")),
+                                Style::default().fg(theme::RED),
+                            )));
+                        }
                     }
                 }
                 Turn::Thinking(s) => {
@@ -284,8 +493,13 @@ impl Component for ChatComponent {
             }
             lines.push(Line::from(""));
         }
+        // Bottom-anchor, then back off by the operator's scrollback offset.
         let total = lines.len() as u16;
-        let scroll = total.saturating_sub(body.height);
+        let max_back = total.saturating_sub(body.height) as usize;
+        self.scroll_back = self.scroll_back.min(max_back);
+        let scroll = total
+            .saturating_sub(body.height)
+            .saturating_sub(self.scroll_back as u16);
         frame.render_widget(
             Paragraph::new(lines)
                 .style(Style::default().bg(theme::SLATE))
@@ -293,39 +507,52 @@ impl Component for ChatComponent {
                 .scroll((scroll, 0)),
             body,
         );
-        let footer_hint = if self.busy {
-            " streaming…"
+        let footer_hint = if self.scroll_back > 0 {
+            format!(" ↑{} lines back · PgDn to tail", self.scroll_back)
+        } else if self.busy {
+            " streaming…".to_string()
         } else {
-            " ⏎ send"
+            " ⏎ send · ⌃J newline".to_string()
         };
-        panel::footer(frame, chunks[0], footer_hint);
+        panel::footer(frame, chunks[0], &footer_hint);
 
-        // ── composer: highlight bed with an accent bar + block cursor ────────
+        // ── composer: highlight bed, accent bar, multi-line, block cursor ────
         let comp = chunks[1];
         frame.render_widget(
             Block::default().style(Style::default().bg(theme::BG_HL)),
             comp,
         );
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                g("▎", "|"),
-                Style::default().fg(if self.busy { theme::COMMENT } else { theme::CYAN }),
-            ))
-            .style(Style::default().bg(theme::BG_HL)),
-            Rect::new(comp.x, comp.y, 1, comp.height.min(1)),
-        );
+        for k in 0..comp.height {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    g("▎", "|"),
+                    Style::default().fg(if self.busy { theme::COMMENT } else { theme::CYAN }),
+                ))
+                .style(Style::default().bg(theme::BG_HL)),
+                Rect::new(comp.x, comp.y + k, 1, 1),
+            );
+        }
         let input_fg = if self.busy { theme::COMMENT } else { theme::FG };
+        let mut input_render: Vec<Line> = self
+            .input
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(input_fg))))
+            .collect();
+        if input_render.is_empty() || self.input.ends_with('\n') {
+            input_render.push(Line::from(""));
+        }
+        // Block cursor rides the last line.
+        if let Some(last) = input_render.last_mut() {
+            last.spans
+                .push(Span::styled(g("▏", "_"), Style::default().fg(theme::CYAN)));
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(self.input.clone(), Style::default().fg(input_fg)),
-                Span::styled(g("▏", "_"), Style::default().fg(theme::CYAN)),
-            ]))
-            .style(Style::default().bg(theme::BG_HL)),
+            Paragraph::new(input_render).style(Style::default().bg(theme::BG_HL)),
             Rect::new(
                 comp.x + 2,
                 comp.y,
                 comp.width.saturating_sub(2),
-                comp.height.min(1),
+                comp.height,
             ),
         );
     }
@@ -388,6 +615,65 @@ mod tests {
         chat.update(&extension("advisor", json!({ "note": "   ", "severity": "info" })));
         chat.update(&extension("advisor", json!({ "severity": "blocker" })));
         assert!(chat.turns.is_empty());
+    }
+
+    fn perm_envelope(
+        pid: PermissionId,
+        event: OceanEvent,
+    ) -> Action {
+        Action::OceanEvent(Box::new(ocean_core::EventEnvelope {
+            id: ocean_core::EventId::new_v4(),
+            at: chrono::Utc::now(),
+            session_id: None,
+            request_id: Some(ocean_core::RequestId::new_v4()),
+            permission_id: Some(pid),
+            origin: None,
+            event,
+        }))
+    }
+
+    #[test]
+    fn permission_request_then_decision_resolves_card() {
+        let mut chat = ChatComponent::default();
+        let pid = PermissionId::new_v4();
+        chat.update(&perm_envelope(
+            pid,
+            OceanEvent::PermissionRequest {
+                tool: "bash".into(),
+                reason: "rm -rf build".into(),
+                args: json!({}),
+            },
+        ));
+        assert_eq!(chat.pending_permission(), Some(pid), "card should be pending");
+        // ⌃Y targets the pending card.
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            act,
+            Some(Action::PermissionDecided { permission_id, allow: true }) if permission_id == pid
+        ));
+        // The daemon's decision event resolves it.
+        chat.update(&perm_envelope(
+            pid,
+            OceanEvent::PermissionDecision {
+                allowed: true,
+                reason: None,
+            },
+        ));
+        assert_eq!(chat.pending_permission(), None, "card should be resolved");
+    }
+
+    #[test]
+    fn md_fence_toggles_and_headings_style() {
+        let mut fence = false;
+        md_line("```rust", &mut fence);
+        assert!(fence, "opening fence enters code mode");
+        md_line("let x = 1;", &mut fence);
+        assert!(fence, "code lines keep fence state");
+        md_line("```", &mut fence);
+        assert!(!fence, "closing fence exits code mode");
+        let heading = md_line("# Title", &mut fence);
+        assert!(!fence);
+        assert_eq!(heading.spans.len(), 1);
     }
 
     #[test]

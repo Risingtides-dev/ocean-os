@@ -19,7 +19,9 @@ use ocean_agent_sdk::{
     AgentSessionCreateRequest, AgentSessionCreateResponse, AgentSessionId, AgentTurnEvent,
     AgentTurnRequest, AgentTurnResponse,
 };
-use ocean_core::HealthResponse;
+use ocean_core::{
+    EventEnvelope, HealthResponse, PermissionDecision, PermissionDecisionRequest, PermissionId,
+};
 use tokio::sync::mpsc;
 
 use super::action::Action;
@@ -132,6 +134,86 @@ impl DaemonClient {
             let _ = actions.send(Action::Status("stream ended".into()));
         });
     }
+}
+
+impl DaemonClient {
+    /// Subscribe to the GLOBAL `/v1/events` stream (permission requests and
+    /// decisions ride here, not on the agent stream), forwarding each decoded
+    /// `EventEnvelope` onto the action channel. Fire-and-forget task.
+    pub fn spawn_global_event_stream(&self, actions: mpsc::UnboundedSender<Action>) {
+        let http = self.http.clone();
+        let url = format!("{}/v1/events", self.base);
+        tokio::spawn(async move {
+            let resp = match http.get(&url).send().await.and_then(|r| r.error_for_status()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = actions.send(Action::Error(format!("events: {e}")));
+                    return;
+                }
+            };
+            let mut stream = resp.bytes_stream();
+            let mut buf = String::new();
+            while let Some(chunk) = stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(idx) = buf.find("\n\n") {
+                    let frame = buf[..idx].to_string();
+                    buf.drain(..idx + 2);
+                    if let Some(env) = parse_sse_data::<EventEnvelope>(&frame) {
+                        let _ = actions.send(Action::OceanEvent(Box::new(env)));
+                    }
+                }
+            }
+        });
+    }
+
+    /// `POST /v1/permissions/{id}/decision`, replaying the turn's decision
+    /// token (OCEAN-185) so the daemon accepts the approval.
+    pub async fn permission_decision(
+        &self,
+        permission_id: PermissionId,
+        allow: bool,
+        decision_token: Option<String>,
+    ) -> Result<(), String> {
+        let decision = if allow {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny { reason: None }
+        };
+        let body = PermissionDecisionRequest {
+            permission_id,
+            decision,
+            decision_token,
+        };
+        self.http
+            .post(format!(
+                "{}/v1/permissions/{permission_id}/decision",
+                self.base
+            ))
+            .json(&body)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Decode one SSE frame's `data:` payload as `T`.
+fn parse_sse_data<T: serde::de::DeserializeOwned>(frame: &str) -> Option<T> {
+    let mut data = String::new();
+    for line in frame.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            data.push_str(rest.trim_start());
+        }
+    }
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<T>(&data).ok()
 }
 
 /// Pull the `data:` payload(s) out of one SSE frame and decode the JSON
