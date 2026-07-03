@@ -91,6 +91,23 @@ pub struct App {
     r_tree: Rect,
     r_center: Rect,
     r_term: Rect,
+    /// Panel visibility (CTRL's collapsible rails + terminal dock).
+    show_sessions: bool,
+    show_tree: bool,
+    show_term: bool,
+    /// Clickable title-bar buttons (CTRL's upper model): (rect, action).
+    buttons: Vec<(Rect, Btn)>,
+}
+
+/// A title-bar button — CTRL's icon toggles, extended with the center surfaces.
+#[derive(Clone, Copy, PartialEq)]
+enum Btn {
+    Sessions,
+    Chat,
+    Editor,
+    Graph,
+    Term,
+    Tree,
 }
 
 impl App {
@@ -120,6 +137,10 @@ impl App {
             r_tree: Rect::default(),
             r_center: Rect::default(),
             r_term: Rect::default(),
+            show_sessions: true,
+            show_tree: true,
+            show_term: true,
+            buttons: Vec::new(),
         };
         app.apply_focus();
         app
@@ -174,6 +195,18 @@ impl App {
         // forwarded to whichever pane the cursor is over (CTRL behavior).
         if let CrosstermEvent::Mouse(m) = evt {
             let pos = (m.column, m.row);
+            // Title-bar buttons win over pane routing (CTRL's upper model).
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                if let Some(btn) = self
+                    .buttons
+                    .iter()
+                    .find(|(r, _)| rect_has(*r, pos))
+                    .map(|(_, b)| *b)
+                {
+                    self.press(btn);
+                    return;
+                }
+            }
             let target = if rect_has(self.r_sessions, pos) {
                 Some(Focus::Sessions)
             } else if rect_has(self.r_tree, pos) {
@@ -267,6 +300,62 @@ impl App {
         };
         if let Some(a) = action {
             self.dispatch(a);
+        }
+    }
+
+    /// A title-bar button press: rails and the terminal TOGGLE visibility;
+    /// chat/editor/graph select the center surface (CTRL's editor↔graph swap).
+    fn press(&mut self, btn: Btn) {
+        match btn {
+            Btn::Sessions => {
+                self.show_sessions = !self.show_sessions;
+                if !self.show_sessions && self.focus == Focus::Sessions {
+                    self.focus_to(Focus::Center);
+                }
+            }
+            Btn::Tree => {
+                self.show_tree = !self.show_tree;
+                if !self.show_tree && self.focus == Focus::Tree {
+                    self.focus_to(Focus::Center);
+                }
+            }
+            Btn::Term => {
+                if !self.pty.is_active() {
+                    // Like CTRL's ensure_terminal: first press opens a plain
+                    // shell at the project root.
+                    self.pty
+                        .open(&PathBuf::from(&self.workspace_root), "");
+                    self.show_term = true;
+                    self.focus_to(Focus::Term);
+                } else {
+                    self.show_term = !self.show_term;
+                    if !self.show_term && self.focus == Focus::Term {
+                        self.focus_to(Focus::Center);
+                    }
+                }
+            }
+            Btn::Chat => {
+                self.center = Center::Chat;
+                self.focus_to(Focus::Center);
+            }
+            Btn::Editor => {
+                if self.editor.has_tabs() {
+                    self.center = Center::Editor;
+                }
+                self.focus_to(Focus::Center);
+            }
+            Btn::Graph => {
+                self.center = if self.center == Center::Graph {
+                    if self.editor.has_tabs() {
+                        Center::Editor
+                    } else {
+                        Center::Chat
+                    }
+                } else {
+                    Center::Graph
+                };
+                self.focus_to(Focus::Center);
+            }
         }
     }
 
@@ -445,21 +534,25 @@ impl App {
         let (title_row, body, status_row) = (root[0], root[1], root[2]);
 
         // body: [sessions][splitter][center][splitter][tree] — CTRL's columns.
+        // Rails collapse to 0 when toggled off from the title bar.
+        let sess_w = if self.show_sessions { SESS_W } else { 0 };
+        let tree_w = if self.show_tree { TREE_W } else { 0 };
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(SESS_W),
-                Constraint::Length(1),
+                Constraint::Length(sess_w),
+                Constraint::Length(if sess_w > 0 { 1 } else { 0 }),
                 Constraint::Min(40),
-                Constraint::Length(1),
-                Constraint::Length(TREE_W),
+                Constraint::Length(if tree_w > 0 { 1 } else { 0 }),
+                Constraint::Length(tree_w),
             ])
             .split(body);
         let (r_sessions, r_split_a, center, r_split_b, r_tree) =
             (cols[0], cols[1], cols[2], cols[3], cols[4]);
 
         // center: breadcrumb / main surface / docked terminal (CTRL's rows).
-        let (r_crumb, r_center, r_split_term, r_term) = if self.pty.is_active() {
+        let term_visible = self.pty.is_active() && self.show_term;
+        let (r_crumb, r_center, r_split_term, r_term) = if term_visible {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -503,43 +596,102 @@ impl App {
             r_crumb,
         );
 
-        // panels — all visible, always.
-        self.rail.draw(frame, r_sessions);
+        // panels — visible unless toggled off from the title bar.
+        if sess_w > 0 {
+            self.rail.draw(frame, r_sessions);
+            splitter(frame, r_split_a, true);
+        }
         match self.center {
             Center::Chat => self.chat.draw(frame, r_center),
             Center::Editor => self.editor.draw(frame, r_center),
             Center::Graph => self.graph.draw(frame, r_center),
         }
-        self.tree.draw(frame, r_tree);
-        if self.pty.is_active() {
+        if tree_w > 0 {
+            self.tree.draw(frame, r_tree);
+            splitter(frame, r_split_b, true);
+        }
+        if term_visible {
             self.pty.draw(frame, r_term);
             splitter(frame, r_split_term, false);
         }
-        splitter(frame, r_split_a, true);
-        splitter(frame, r_split_b, true);
 
         self.draw_title(frame, title_row);
         self.draw_status(frame, status_row);
     }
 
-    fn draw_title(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let spans = vec![
-            Span::styled(
-                format!(" {} OCEAN ", g("◇", "*")),
-                Style::default()
-                    .fg(theme::CYAN)
-                    .bg(theme::BG_DARK)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                self.workspace_root.clone(),
-                Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
-            ),
-        ];
+    /// CTRL's title row: project label left, status pill center, and the
+    /// clickable icon toggles right — each lit in its color when its panel is
+    /// on. This IS the primary way to drive the app; hotkeys are secondary.
+    fn draw_title(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.buttons.clear();
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
+            Block::default().style(Style::default().bg(theme::BG_DARK)),
             area,
         );
+
+        // project label, CTRL-style (blue bold + chevron)
+        let name = std::path::Path::new(&self.workspace_root)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ocean".into());
+        let proj = format!("  {} OCEAN · {} ", g("◇", "*"), name);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                proj.clone(),
+                Style::default()
+                    .fg(theme::BLUE)
+                    .bg(theme::BG_DARK)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(area.x, area.y, (proj.chars().count() as u16).min(area.width), 1),
+        );
+
+        // centered status pill
+        let pill = format!(" {} ", self.status);
+        let pillw = (pill.chars().count() as u16).min(area.width / 2);
+        let px = area.x + (area.width.saturating_sub(pillw)) / 2;
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                pill,
+                Style::default().fg(theme::CYAN).bg(theme::BG_HL),
+            )),
+            Rect::new(px, area.y, pillw, 1),
+        );
+
+        // right: icon buttons — CTRL's ⊞/⟠/⊟/◨ plus the center surfaces.
+        let items: Vec<(&str, Btn, bool, ratatui::style::Color)> = vec![
+            (g("⊞", "[S]"), Btn::Sessions, self.show_sessions, theme::BLUE),
+            (g("❯", "[C]"), Btn::Chat, self.center == Center::Chat, theme::CYAN),
+            (g("✎", "[F]"), Btn::Editor, self.center == Center::Editor, theme::YELLOW),
+            (g("⟠", "[G]"), Btn::Graph, self.center == Center::Graph, theme::MAGENTA),
+            (
+                g("⊟", "[T]"),
+                Btn::Term,
+                self.pty.is_active() && self.show_term,
+                theme::GREEN,
+            ),
+            (g("◨", "[E]"), Btn::Tree, self.show_tree, theme::CYAN),
+        ];
+        let total: u16 = items
+            .iter()
+            .map(|(s, ..)| s.chars().count() as u16 + 2)
+            .sum::<u16>()
+            + 2;
+        let mut x = area.x + area.width.saturating_sub(total);
+        for (icon, btn, on, color) in items {
+            let w = icon.chars().count() as u16;
+            let fg = if on { color } else { theme::COMMENT };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    icon.to_string(),
+                    Style::default().fg(fg).bg(theme::BG_DARK),
+                )),
+                Rect::new(x, area.y, w, 1),
+            );
+            // generous hit target: icon + trailing gap
+            self.buttons.push((Rect::new(x, area.y, w + 2, 1), btn));
+            x += w + 2;
+        }
     }
 
     fn draw_status(&self, frame: &mut ratatui::Frame, area: Rect) {
