@@ -17,30 +17,31 @@ use crate::shell::{
     action::Action,
     component::Component,
     editor::EditorTab,
+    git::Mark,
     highlight::Highlighter,
 };
 
 pub struct EditorComponent {
     hl: Highlighter,
+    root: PathBuf,
     tabs: Vec<EditorTab>,
     active: usize,
     pub focused: bool,
     last_body_h: usize,
 }
 
-impl Default for EditorComponent {
-    fn default() -> Self {
+impl EditorComponent {
+    pub fn new(root: PathBuf) -> Self {
         Self {
             hl: Highlighter::new(),
+            root,
             tabs: Vec::new(),
             active: 0,
             focused: false,
             last_body_h: 20,
         }
     }
-}
 
-impl EditorComponent {
     pub fn has_tabs(&self) -> bool {
         !self.tabs.is_empty()
     }
@@ -51,7 +52,8 @@ impl EditorComponent {
             self.active = i;
             return;
         }
-        if let Ok(tab) = EditorTab::open(path, &self.hl) {
+        if let Ok(mut tab) = EditorTab::open(path, &self.hl) {
+            tab.load_git(&self.root);
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
         }
@@ -130,10 +132,18 @@ impl Component for EditorComponent {
         };
 
         let rows = inner.height as usize;
-        let gutter_w = 5u16;
+        let gutter_w = 6u16; // 1 git mark + "{:>4} " line number
         let mut lines: Vec<Line> = Vec::new();
         for row in t.scroll..(t.scroll + rows).min(t.lines.len()) {
             let mut spans: Vec<Span> = Vec::new();
+            // git gutter mark (1 col): ▎ colored by change kind.
+            let (mark_ch, mark_color) = match t.git_lines.get(&row) {
+                Some(Mark::Added) => ("▎", Color::Green),
+                Some(Mark::Modified) => ("▎", Color::Yellow),
+                Some(Mark::Deleted) => ("▁", Color::Red),
+                None => (" ", Color::Reset),
+            };
+            spans.push(Span::styled(mark_ch, Style::default().fg(mark_color)));
             // line number gutter
             spans.push(Span::styled(
                 format!("{:>4} ", row + 1),

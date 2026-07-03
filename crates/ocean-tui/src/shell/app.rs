@@ -76,7 +76,7 @@ impl App {
             tree: FileTreeComponent::new(root.clone()),
             chat: ChatComponent::default(),
             pty: PtyComponent::default(),
-            editor: EditorComponent::default(),
+            editor: EditorComponent::new(root.clone()),
             graph: GraphComponent::new(root),
             left: Left::Sessions,
             main: Main::Chat,

@@ -117,6 +117,11 @@ impl EditorTab {
         Ok(())
     }
 
+    /// Load per-line git gutter marks for this file from `git diff HEAD`.
+    pub fn load_git(&mut self, root: &std::path::Path) {
+        self.git_lines = crate::shell::git::changed_lines(root, &self.path);
+    }
+
     fn clamp_col(&mut self) {
         let len = self
             .lines
