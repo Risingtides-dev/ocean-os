@@ -11,12 +11,12 @@ use ratatui::{
     symbols::Marker,
     widgets::{
         canvas::{Canvas, Context, Line as CanvasLine, Points},
-        Block, Borders,
+        Block,
     },
     Frame,
 };
 
-use crate::shell::{action::Action, component::Component, graph::ProjectGraph};
+use crate::shell::{action::Action, component::Component, graph::ProjectGraph, panel, theme};
 
 pub struct GraphComponent {
     root: PathBuf,
@@ -65,20 +65,20 @@ impl Component for GraphComponent {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.ensure();
-        let border = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let g = self.graph.as_ref();
-        let label = g.map(|g| g.selected_label()).unwrap_or_default();
-        let count = g.map(|g| g.nodes.len()).unwrap_or(0);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border)
-            .title(format!(" graph · {count} nodes · {label} "));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let gref = self.graph.as_ref();
+        let label = gref.map(|g| g.selected_label()).unwrap_or_default();
+        let count = gref.map(|g| g.nodes.len()).unwrap_or(0);
+        let pill = format!("{count} nodes");
+        let body = panel::draw(frame, area, "GRAPH", Some(&pill), self.focused);
+        if body.width == 0 {
+            return;
+        }
+        // Constellation floats on the dark void.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme::BG_DARK)),
+            body,
+        );
+        let inner = body;
 
         let Some(g) = self.graph.as_ref() else { return };
         let Some((min_x, max_x, min_y, max_y)) = g.bounds() else {
@@ -114,16 +114,16 @@ impl Component for GraphComponent {
                         y1: na.y as f64,
                         x2: nb.x as f64,
                         y2: nb.y as f64,
-                        color: if lit { Color::Cyan } else { Color::DarkGray },
+                        color: if lit { theme::CYAN } else { theme::BG_HL },
                     });
                 }
                 ctx.layer();
                 // nodes
                 for (i, n) in g.nodes.iter().enumerate() {
                     let color = if i == sel {
-                        Color::Yellow
+                        theme::YELLOW
                     } else if neighbors.contains(&i) {
-                        Color::Cyan
+                        theme::CYAN
                     } else {
                         node_color(n.kind)
                     };
@@ -139,21 +139,26 @@ impl Component for GraphComponent {
                         n.y as f64,
                         ratatui::text::Span::styled(
                             format!(" {}", n.title),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(theme::YELLOW),
                         ),
                     );
                 }
             });
         frame.render_widget(canvas, inner);
+        panel::footer(
+            frame,
+            area,
+            &format!(" {label}  ·  ↑↓ select · +/- zoom · hjkl pan · ⏎ open"),
+        );
     }
 }
 
 fn node_color(kind: crate::shell::graph::NodeKind) -> Color {
     use crate::shell::graph::NodeKind::*;
     match kind {
-        Markdown => Color::Green,
-        Source => Color::Blue,
-        Config => Color::Magenta,
-        Other => Color::Gray,
+        Markdown => theme::GREEN,
+        Source => theme::BLUE,
+        Config => theme::MAGENTA,
+        Other => theme::COMMENT,
     }
 }

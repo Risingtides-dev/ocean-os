@@ -228,6 +228,7 @@ impl App {
         let main_focused = self.focus == Focus::Main;
         self.rail.focused = left_focused && self.left == Left::Sessions;
         self.tree.focused = left_focused && self.left == Left::Files;
+        self.chat.focused = main_focused && self.main == Main::Chat;
         self.pty.focused = main_focused && self.main == Main::Pty;
         self.editor.focused = main_focused && self.main == Main::Editor;
         self.graph.focused = main_focused && self.main == Main::Graph;
@@ -277,35 +278,72 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::{
+            style::{Modifier, Style},
+            text::{Line, Span},
+            widgets::{Block, Paragraph},
+        };
+        use super::theme;
+
+        // The void: everything floats on CTRL's dark rail color.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme::BG_DARK)),
+            frame.area(),
+        );
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(frame.area());
+
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(34), Constraint::Min(20)])
-            .split(frame.area());
+            .split(rows[0]);
 
         match self.left {
             Left::Sessions => self.rail.draw(frame, cols[0]),
             Left::Files => self.tree.draw(frame, cols[0]),
         }
 
-        let main = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
-            .split(cols[1]);
-
         match self.main {
-            Main::Chat => self.chat.draw(frame, main[0]),
-            Main::Pty => self.pty.draw(frame, main[0]),
-            Main::Editor => self.editor.draw(frame, main[0]),
-            Main::Graph => self.graph.draw(frame, main[0]),
+            Main::Chat => self.chat.draw(frame, cols[1]),
+            Main::Pty => self.pty.draw(frame, cols[1]),
+            Main::Editor => self.editor.draw(frame, cols[1]),
+            Main::Graph => self.graph.draw(frame, cols[1]),
         }
 
+        // ── status bar: ◇ OCEAN glyph, dim status, key hints with lit digits ──
+        let mut spans: Vec<Span> = vec![
+            Span::styled(
+                " ◇ OCEAN ",
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&self.status, Style::default().fg(theme::COMMENT)),
+            Span::raw("   "),
+        ];
+        for (key, name, active) in [
+            ("⌃⌥1", "sessions", self.focus == Focus::Left && self.left == Left::Sessions),
+            ("⌃⌥2", "files", self.focus == Focus::Left && self.left == Left::Files),
+            ("⌃⌥3", "chat", self.main == Main::Chat && self.focus == Focus::Main),
+            ("⌃⌥4", "editor", self.main == Main::Editor && self.focus == Focus::Main),
+            ("⌃⌥5", "graph", self.main == Main::Graph && self.focus == Focus::Main),
+            ("⌃⌥6", "term", self.main == Main::Pty && self.focus == Focus::Main),
+        ] {
+            let (kf, nf) = if active {
+                (theme::CYAN, theme::FG)
+            } else {
+                (theme::COMMENT, theme::COMMENT)
+            };
+            spans.push(Span::styled(format!("{key} "), Style::default().fg(kf)));
+            spans.push(Span::styled(format!("{name}  "), Style::default().fg(nf)));
+        }
+        spans.push(Span::styled("⌃Q quit", Style::default().fg(theme::COMMENT)));
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(format!(
-                " {}   ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat · ⌃⌥4 editor · ⌃⌥5 graph · ⌃⌥6 term · ^Q quit",
-                self.status
-            ))
-            .style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
-            main[1],
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
+            rows[1],
         );
     }
 }

@@ -1,21 +1,29 @@
-//! FileTreeComponent — the project file explorer. Wraps `shell::tree::Tree`
-//! (harvested from CTRL). Arrow keys move, Enter expands a dir or opens a file.
+//! FileTreeComponent — the project explorer wearing CTRL's panel skin: slate
+//! bed, `◆ FILES` title, hairline, accent bar on the selected row, dirs in
+//! blue with ▸/▾ carets. Enter expands a dir or opens a file in the editor.
 
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-use crate::shell::{action::Action, component::Component, tree::Tree};
+use crate::shell::{
+    action::Action,
+    component::Component,
+    panel,
+    theme::{self, g},
+    tree::Tree,
+};
 
 pub struct FileTreeComponent {
     tree: Tree,
+    scroll: usize,
     pub focused: bool,
 }
 
@@ -23,6 +31,7 @@ impl FileTreeComponent {
     pub fn new(root: PathBuf) -> Self {
         Self {
             tree: Tree::new(root),
+            scroll: 0,
             focused: false,
         }
     }
@@ -48,48 +57,78 @@ impl Component for FileTreeComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let border = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border)
-            .title(" files ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let body = panel::draw(frame, area, "FILES", None, self.focused);
+        if body.width == 0 {
+            return;
+        }
 
-        let rows = inner.height as usize;
+        let view_h = body.height as usize;
         let sel = self.tree.selected;
-        let start = sel.saturating_sub(rows.saturating_sub(1));
-        let mut lines: Vec<Line> = Vec::new();
-        for (i, e) in self.tree.entries.iter().enumerate().skip(start).take(rows) {
+        if sel < self.scroll {
+            self.scroll = sel;
+        } else if view_h > 0 && sel >= self.scroll + view_h {
+            self.scroll = sel + 1 - view_h;
+        }
+
+        let bottom = body.y + body.height;
+        for (i, e) in self
+            .tree
+            .entries
+            .iter()
+            .enumerate()
+            .skip(self.scroll)
+            .take(view_h)
+        {
+            let y = body.y + (i - self.scroll) as u16;
+            if y >= bottom {
+                break;
+            }
+            let selected = i == sel;
+            let row_bg = if selected { theme::BG_HL } else { theme::SLATE };
             let name = e
                 .path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let icon = if e.is_dir {
-                if e.expanded { "▾ " } else { "▸ " }
+            let caret = if e.is_dir {
+                if e.expanded {
+                    g("▾ ", "v ")
+                } else {
+                    g("▸ ", "> ")
+                }
             } else {
                 "  "
             };
-            let indent = "  ".repeat(e.depth);
-            let selected = i == sel;
-            let style = if selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-            } else if e.is_dir {
-                Style::default().fg(Color::Cyan)
+            let fg = if e.is_dir { theme::BLUE } else { theme::FG };
+            let modif = if selected {
+                Modifier::BOLD
             } else {
-                Style::default().fg(Color::Gray)
+                Modifier::empty()
             };
-            let marker = if selected { "▎" } else { " " };
-            lines.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(Color::Cyan)),
-                Span::styled(format!("{indent}{icon}{name}"), style),
-            ]));
+
+            let bar = if selected { g("▎", "|") } else { " " };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    bar,
+                    Style::default().fg(theme::CYAN).bg(row_bg),
+                )),
+                Rect::new(body.x, y, 1, 1),
+            );
+            let txt = format!("{}{caret}{name}", "  ".repeat(e.depth));
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    panel::pad_to(&txt, body.width.saturating_sub(1) as usize),
+                    Style::default().fg(fg).add_modifier(modif),
+                )))
+                .style(Style::default().bg(row_bg)),
+                Rect::new(body.x + 1, y, body.width.saturating_sub(1), 1),
+            );
         }
-        frame.render_widget(Paragraph::new(lines), inner);
+
+        panel::footer(
+            frame,
+            area,
+            &format!(" {} entries", self.tree.entries.len()),
+        );
     }
 }

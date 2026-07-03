@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Paragraph},
     Frame,
 };
 
@@ -19,6 +19,8 @@ use crate::shell::{
     editor::EditorTab,
     git::Mark,
     highlight::Highlighter,
+    panel,
+    theme::{self, g},
 };
 
 pub struct EditorComponent {
@@ -105,49 +107,55 @@ impl Component for EditorComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let border = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
+        let (title, dirty) = match self.tabs.get(self.active) {
+            Some(t) => (t.name().to_uppercase(), t.dirty),
+            None => ("EDITOR".to_string(), false),
         };
-        let title = match self.tabs.get(self.active) {
-            Some(t) => format!(" {}{} ", t.name(), if t.dirty { " ●" } else { "" }),
-            None => " editor ".to_string(),
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border)
-            .title(title);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        self.last_body_h = inner.height as usize;
+        let pill = dirty.then(|| format!("{} unsaved", g("●", "*")));
+        let body = panel::draw(frame, area, &title, pill.as_deref(), self.focused);
+        if body.width == 0 {
+            return;
+        }
+        // Editor void bed over the slate (CTRL's editor sits on BG, not SLATE).
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme::BG)),
+            body,
+        );
+        self.last_body_h = body.height as usize;
 
         let Some(t) = self.tabs.get(self.active) else {
             frame.render_widget(
-                Paragraph::new("open a file from the tree (Tab to the files pane, Enter on a file)")
-                    .style(Style::default().fg(Color::DarkGray)),
-                inner,
+                Paragraph::new(Span::styled(
+                    " open a file: ⌃⌥2 files, Enter on a file",
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::BG)),
+                body,
             );
+            panel::footer(frame, area, " no file open");
             return;
         };
 
-        let rows = inner.height as usize;
+        let rows = body.height as usize;
         let gutter_w = 6u16; // 1 git mark + "{:>4} " line number
         let mut lines: Vec<Line> = Vec::new();
         for row in t.scroll..(t.scroll + rows).min(t.lines.len()) {
             let mut spans: Vec<Span> = Vec::new();
             // git gutter mark (1 col): ▎ colored by change kind.
             let (mark_ch, mark_color) = match t.git_lines.get(&row) {
-                Some(Mark::Added) => ("▎", Color::Green),
-                Some(Mark::Modified) => ("▎", Color::Yellow),
-                Some(Mark::Deleted) => ("▁", Color::Red),
-                None => (" ", Color::Reset),
+                Some(Mark::Added) => (g("▎", "+"), theme::GREEN),
+                Some(Mark::Modified) => (g("▎", "~"), theme::YELLOW),
+                Some(Mark::Deleted) => (g("▁", "-"), theme::RED),
+                None => (" ", theme::BG),
             };
-            spans.push(Span::styled(mark_ch, Style::default().fg(mark_color)));
-            // line number gutter
+            spans.push(Span::styled(
+                mark_ch,
+                Style::default().fg(mark_color).bg(theme::BG_DARK),
+            ));
+            // line number gutter on the dark void rail
             spans.push(Span::styled(
                 format!("{:>4} ", row + 1),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
             ));
             // syntect-highlighted runs, else raw
             if let Some(styled) = t.highlighted.get(row).filter(|s| !s.is_empty()) {
@@ -155,20 +163,28 @@ impl Component for EditorComponent {
                     spans.push(Span::styled(text.clone(), Style::default().fg(*color)));
                 }
             } else if let Some(raw) = t.lines.get(row) {
-                spans.push(Span::raw(raw.clone()));
+                spans.push(Span::styled(raw.clone(), Style::default().fg(theme::FG)));
             }
             lines.push(Line::from(spans));
         }
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme::BG)),
+            body,
+        );
 
         // Cursor.
         if self.focused {
-            let cy = inner.y + (t.cursor_row.saturating_sub(t.scroll)) as u16;
-            let cx = inner.x + gutter_w + t.cursor_col as u16;
-            if cy < inner.y + inner.height && cx < inner.x + inner.width {
+            let cy = body.y + (t.cursor_row.saturating_sub(t.scroll)) as u16;
+            let cx = body.x + gutter_w + t.cursor_col as u16;
+            if cy < body.y + body.height && cx < body.x + body.width {
                 frame.set_cursor_position((cx, cy));
             }
         }
+        panel::footer(
+            frame,
+            area,
+            &format!(" {}:{}  ·  ⌃S save", t.cursor_row + 1, t.cursor_col + 1),
+        );
         let _ = Modifier::BOLD;
     }
 }

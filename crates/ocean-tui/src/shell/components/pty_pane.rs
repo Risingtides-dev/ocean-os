@@ -8,13 +8,14 @@ use std::path::Path;
 use crossterm::event::KeyEvent;
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
+    style::Style,
+    text::Span,
+    widgets::{Block, Paragraph},
     Frame,
 };
 use tui_term::widget::PseudoTerminal;
 
-use crate::shell::{action::Action, component::Component, pty::TermPane};
+use crate::shell::{action::Action, component::Component, panel, pty::TermPane, theme};
 
 #[derive(Default)]
 pub struct PtyComponent {
@@ -72,29 +73,32 @@ impl Component for PtyComponent {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.last_area = area;
-        let border = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border)
-            .title(" session ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let body = panel::draw(frame, area, "TERMINAL", None, self.focused);
+        if body.width == 0 {
+            return;
+        }
+        // Terminal content sits on the dark void, like CTRL's embedded shells.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme::BG_DARK)),
+            body,
+        );
 
         match self.term.as_mut() {
             Some(t) => {
-                t.resize(inner.height.max(2), inner.width.max(8));
-                frame.render_widget(PseudoTerminal::new(t.parser.screen()), inner);
+                t.resize(body.height.max(2), body.width.max(8));
+                frame.render_widget(PseudoTerminal::new(t.parser.screen()), body);
+                panel::footer(frame, area, " live shell · keys pass through");
             }
             None => {
                 frame.render_widget(
-                    Paragraph::new("select a session on the left and press Enter to resume it here")
-                        .style(Style::default().fg(Color::DarkGray)),
-                    inner,
+                    Paragraph::new(Span::styled(
+                        " ⌃⌥1 sessions, then t to hydrate one here",
+                        Style::default().fg(theme::COMMENT),
+                    ))
+                    .style(Style::default().bg(theme::BG_DARK)),
+                    body,
                 );
+                panel::footer(frame, area, " no shell yet");
             }
         }
     }

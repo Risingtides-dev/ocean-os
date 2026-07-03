@@ -16,8 +16,10 @@ mod event;
 mod git;
 mod graph;
 mod highlight;
+mod panel;
 mod pty;
 mod sessions;
+mod theme;
 mod tree;
 mod tui;
 

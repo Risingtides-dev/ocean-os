@@ -10,13 +10,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ocean_agent_sdk::{AgentTurnEvent, ToolCallId};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
 
-use crate::shell::{action::Action, component::Component};
+use crate::shell::{
+    action::Action,
+    component::Component,
+    panel,
+    theme::{self, g},
+};
 
 /// One rendered unit of transcript.
 enum Turn {
@@ -55,6 +60,7 @@ pub struct ChatComponent {
     input: String,
     model: Option<String>,
     busy: bool,
+    pub focused: bool,
 }
 
 impl ChatComponent {
@@ -193,71 +199,85 @@ impl Component for ChatComponent {
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
             .split(area);
 
-        // Transcript (bottom-anchored via scroll offset).
+        // ── transcript panel in the CTRL skin ────────────────────────────────
+        let pill = self.model.clone();
+        let body = panel::draw(frame, chunks[0], "OCEAN", pill.as_deref(), self.focused);
+
+        // Transcript lines (bottom-anchored via scroll offset).
         let mut lines: Vec<Line> = Vec::new();
         for turn in &self.turns {
             match turn {
                 Turn::User(s) => {
-                    lines.push(Line::from(Span::styled(
-                        format!("› {s}"),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled(g("❯ ", "> "), Style::default().fg(theme::CYAN)),
+                        Span::styled(
+                            s.clone(),
+                            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
                 }
                 Turn::Assistant(s) => {
                     for l in s.lines() {
-                        lines.push(Line::from(l.to_string()));
+                        lines.push(Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default().fg(theme::FG),
+                        )));
                     }
                 }
                 Turn::Thinking(s) => {
                     lines.push(Line::from(Span::styled(
-                        format!("  thinking ({} chars)", s.len()),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        format!("  {} thinking ({} chars)", g("◌", "~"), s.len()),
+                        Style::default()
+                            .fg(theme::COMMENT)
+                            .add_modifier(Modifier::ITALIC),
                     )));
                 }
                 Turn::Tool { name, status, .. } => {
                     let (mark, color) = match status {
-                        ToolStatus::Running => ("◐", Color::Yellow),
-                        ToolStatus::Ok => ("✓", Color::Green),
-                        ToolStatus::Err => ("✗", Color::Red),
+                        ToolStatus::Running => (g("◐", "*"), theme::YELLOW),
+                        ToolStatus::Ok => (g("✓", "+"), theme::GREEN),
+                        ToolStatus::Err => (g("✗", "x"), theme::RED),
                     };
-                    lines.push(Line::from(Span::styled(
-                        format!("  {mark} {name}"),
-                        Style::default().fg(color),
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {mark} "), Style::default().fg(color)),
+                        Span::styled(name.clone(), Style::default().fg(theme::COMMENT)),
+                    ]));
                 }
                 Turn::Advisor {
                     note,
                     severity,
                     model,
                 } => {
-                    // Color the card by severity: info = blue/gray, concern =
-                    // amber, blocker = red. Set it off with a rule + label so it
-                    // reads as an aside, not the agent's own text.
+                    // Severity → theme accent: blocker red, concern amber,
+                    // info muted. Rendered as a set-off card with a │ gutter.
                     let accent = match severity.as_str() {
-                        "blocker" => Color::Red,
-                        "concern" => Color::Rgb(255, 176, 0), // amber
-                        _ => Color::Rgb(120, 144, 168),       // muted blue/gray
+                        "blocker" => theme::RED,
+                        "concern" => theme::YELLOW,
+                        _ => theme::COMMENT,
                     };
                     let mut header: Vec<Span> = vec![Span::styled(
-                        format!("  ⚑ advisor ({severity})"),
+                        format!("  {} advisor ({severity})", g("⚑", "!")),
                         Style::default().fg(accent).add_modifier(Modifier::BOLD),
                     )];
                     if !model.is_empty() {
                         header.push(Span::styled(
                             format!("  · {model}"),
                             Style::default()
-                                .fg(Color::DarkGray)
+                                .fg(theme::COMMENT)
                                 .add_modifier(Modifier::DIM),
                         ));
                     }
                     lines.push(Line::from(header));
                     for l in note.lines() {
                         lines.push(Line::from(vec![
-                            Span::styled("  │ ", Style::default().fg(accent)),
-                            Span::styled(l.to_string(), Style::default().fg(accent)),
+                            Span::styled(
+                                format!("  {} ", g("▎", "|")),
+                                Style::default().fg(accent),
+                            ),
+                            Span::styled(l.to_string(), Style::default().fg(theme::FG)),
                         ]));
                     }
                 }
@@ -265,32 +285,48 @@ impl Component for ChatComponent {
             lines.push(Line::from(""));
         }
         let total = lines.len() as u16;
-        let view_h = chunks[0].height.saturating_sub(2);
-        let scroll = total.saturating_sub(view_h);
-        let title = match &self.model {
-            Some(m) => format!(" ocean · {m} "),
-            None => " ocean ".to_string(),
-        };
+        let scroll = total.saturating_sub(body.height);
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(title))
+                .style(Style::default().bg(theme::SLATE))
                 .wrap(Wrap { trim: false })
                 .scroll((scroll, 0)),
-            chunks[0],
+            body,
         );
-
-        // Composer.
-        let prompt_style = if self.busy {
-            Style::default().fg(Color::DarkGray)
+        let footer_hint = if self.busy {
+            " streaming…"
         } else {
-            Style::default().fg(Color::White)
+            " ⏎ send"
         };
-        let hint = if self.busy { " (streaming…) " } else { " compose " };
+        panel::footer(frame, chunks[0], footer_hint);
+
+        // ── composer: highlight bed with an accent bar + block cursor ────────
+        let comp = chunks[1];
         frame.render_widget(
-            Paragraph::new(format!("{}▏", self.input))
-                .style(prompt_style)
-                .block(Block::default().borders(Borders::ALL).title(hint)),
-            chunks[1],
+            Block::default().style(Style::default().bg(theme::BG_HL)),
+            comp,
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                g("▎", "|"),
+                Style::default().fg(if self.busy { theme::COMMENT } else { theme::CYAN }),
+            ))
+            .style(Style::default().bg(theme::BG_HL)),
+            Rect::new(comp.x, comp.y, 1, comp.height.min(1)),
+        );
+        let input_fg = if self.busy { theme::COMMENT } else { theme::FG };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(self.input.clone(), Style::default().fg(input_fg)),
+                Span::styled(g("▏", "_"), Style::default().fg(theme::CYAN)),
+            ]))
+            .style(Style::default().bg(theme::BG_HL)),
+            Rect::new(
+                comp.x + 2,
+                comp.y,
+                comp.width.saturating_sub(2),
+                comp.height.min(1),
+            ),
         );
     }
 }
