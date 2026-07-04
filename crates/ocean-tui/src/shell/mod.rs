@@ -19,6 +19,7 @@ mod highlight;
 mod panel;
 mod pty;
 mod sessions;
+mod slash;
 mod theme;
 mod tree;
 mod tui;

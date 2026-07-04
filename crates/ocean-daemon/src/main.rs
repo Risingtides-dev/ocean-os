@@ -66,6 +66,11 @@ use uuid::Uuid;
 /// a boot-time readiness summary. Called once at the top of `main`.
 mod startup;
 
+/// W0 — per-surface harness-profile seam (OMP port foundation). Resolves a
+/// `HarnessProfile` (+ capability bundle) from the turn's `client_type` so
+/// future harness features scope per surface instead of behind a global flag.
+mod harness_profile;
+
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<AgentRuntime>,
@@ -8816,6 +8821,29 @@ async fn agent_turn(
         turn_id = %turn_id,
         request_id = %request_id,
         session_id = %session_id
+    );
+
+    // W0 — resolve the per-surface harness profile from `client_type`. This is
+    // the SEAM the OMP-port features attach to: future capability checks read
+    // `harness_caps.hashline_edits` / `.lsp` / `.stream_rules` / … (from
+    // `harness_profile.capabilities()`) instead of branching on `client_type`
+    // or a global flag. W0 only establishes that the profile resolves correctly
+    // and logs it; it does NOT yet gate any turn behaviour, so `harness_profile`
+    // / `harness_caps` are intentionally unread past this debug line for now.
+    let harness_profile =
+        harness_profile::HarnessProfile::from_client_type(client_type.as_deref());
+    let harness_caps = harness_profile.capabilities();
+    tracing::debug!(
+        client_type = client_type.as_deref().unwrap_or("<none>"),
+        ?harness_profile,
+        lsp = harness_caps.lsp,
+        hashline_edits = harness_caps.hashline_edits,
+        stream_rules = harness_caps.stream_rules,
+        rich_context = harness_caps.rich_context,
+        memory = harness_caps.memory,
+        artifacts = harness_caps.artifacts,
+        minimizer = harness_caps.minimizer,
+        "agent_turn: resolved harness profile (W0 seam; not yet gating behaviour)"
     );
 
     // Session↔workspace binding (OCEAN-52) + resume cwd selection (OCEAN-55).

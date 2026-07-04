@@ -11,14 +11,14 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
 use crate::shell::{
     action::Action,
     component::Component,
-    panel,
+    panel, slash,
     theme::{self, g},
 };
 
@@ -69,6 +69,8 @@ pub struct ChatComponent {
     busy: bool,
     /// Scrollback offset in lines from the bottom (0 = stick to live tail).
     scroll_back: usize,
+    /// Highlighted row in the `/` command palette (see `slash_matches`).
+    menu_sel: usize,
     pub focused: bool,
 }
 
@@ -163,6 +165,136 @@ impl ChatComponent {
             }
         }
     }
+
+    /// The ranked command palette for the current composer text, or empty when
+    /// the composer isn't in `/`-command mode. Active only when the input starts
+    /// with `/` and the query (everything after it) has no whitespace — so a
+    /// normal message that merely mentions a slash never triggers the menu.
+    fn slash_matches(&self) -> Vec<&'static slash::SlashCommand> {
+        match self.input.strip_prefix('/') {
+            Some(q) if !q.contains(char::is_whitespace) => {
+                slash::filter(q).into_iter().map(|(c, _)| c).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Execute a slash command by name. Clears the composer, then either mutates
+    /// the transcript locally (`/clear`, `/help`) or emits an [`Action`]. Pane
+    /// focus has no targeted action yet (the app owns `Focus` internally), so
+    /// those surface a status hint until that's wired.
+    fn run_slash(&mut self, name: &str) -> Option<Action> {
+        self.input.clear();
+        self.menu_sel = 0;
+        match name {
+            "/quit" => Some(Action::Quit),
+            "/clear" => {
+                self.turns.clear();
+                self.scroll_back = 0;
+                self.busy = false;
+                None
+            }
+            "/help" => {
+                self.push_help();
+                self.scroll_back = 0;
+                None
+            }
+            "/model" => Some(Action::Status(
+                "model switching isn't wired yet".to_string(),
+            )),
+            // TODO: wire to pane focus — there's no targeted focus Action; the
+            // app owns `Focus` internally (chat.rs must not reach into it). Emit
+            // a status hint pointing at the existing shortcut for now.
+            "/sessions" | "/resume" => Some(Action::Status(
+                "session rail: Tab or ⌃⌥1".to_string(),
+            )),
+            "/files" => Some(Action::Status("file tree: ⌃⌥2".to_string())),
+            "/graph" => Some(Action::Status("graph view: ⌃⌥5".to_string())),
+            "/terminal" => Some(Action::Status("terminal: ⌃⌥6".to_string())),
+            _ => Some(Action::Status(format!("unknown command: {name}"))),
+        }
+    }
+
+    /// Push `/help` output into the transcript as an assistant block — the
+    /// markdown-lite renderer styles the heading, bullets, and inline `code`.
+    fn push_help(&mut self) {
+        let mut body = String::from("# commands\n");
+        for c in slash::COMMANDS {
+            body.push_str(&format!("- `{}` — {}\n", c.name, c.desc));
+        }
+        self.turns.push(Turn::Assistant(body));
+    }
+
+    /// Render the floating command palette just above the composer, listing the
+    /// ranked matches with the selection on a `BG_HL` bed. Overlaid last so it
+    /// sits on top of the transcript.
+    fn draw_menu(&self, frame: &mut Frame, composer: Rect, matches: &[&slash::SlashCommand]) {
+        let shown = matches.len().min(8);
+        if shown == 0 {
+            return;
+        }
+        let sel = self.menu_sel.min(shown - 1);
+
+        // Width fits the widest "name — desc" row, capped to the composer width.
+        let content_w = matches
+            .iter()
+            .take(shown)
+            .map(|c| c.name.chars().count() + 3 + c.desc.chars().count())
+            .max()
+            .unwrap_or(24);
+        let width = ((content_w as u16) + 6)
+            .min(composer.width)
+            .max(24);
+        let height = shown as u16 + 3; // top+bottom border + footer row
+        let y = composer.y.saturating_sub(height);
+        let area = Rect::new(composer.x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} commands ", g("◆", "*")),
+                Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        for (i, c) in matches.iter().take(shown).enumerate() {
+            let selected = i == sel;
+            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+            let name_fg = if selected { theme::CYAN } else { theme::FG };
+            let marker = if selected { g("❯", ">") } else { " " };
+            let row = Line::from(vec![
+                Span::styled(format!(" {marker} "), Style::default().fg(theme::CYAN)),
+                Span::styled(
+                    format!("{:<11}", c.name),
+                    Style::default().fg(name_fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {} {}", g("—", "-"), c.desc),
+                    Style::default().fg(theme::COMMENT),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(row).style(Style::default().bg(bed)),
+                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            );
+        }
+        // Footer hint on the last inner row.
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {} select · ⏎ run · esc dismiss", g("↑↓", "^v")),
+                Style::default().fg(theme::COMMENT),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, inner.y + shown as u16, inner.width, 1),
+        );
+    }
 }
 
 /// Markdown-lite: style one source line. Fence state is carried by the caller
@@ -249,6 +381,42 @@ impl Component for ChatComponent {
                 _ => {}
             }
         }
+        // ── `/` command palette: nav + execute intercept ─────────────────────
+        // Active only while the composer is in command mode (input starts with
+        // `/`). These keys drive the menu instead of the composer. NOTE: Tab is
+        // swallowed by the app for focus-cycling before it reaches us, so Enter
+        // is the primary execute key; Tab-to-complete is handled defensively in
+        // case that routing ever changes.
+        let matches = self.slash_matches();
+        if !matches.is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    self.menu_sel = self.menu_sel.saturating_sub(1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.menu_sel = (self.menu_sel + 1).min(matches.len() - 1);
+                    return None;
+                }
+                KeyCode::Tab => {
+                    let sel = self.menu_sel.min(matches.len() - 1);
+                    self.input = matches[sel].name.to_string();
+                    self.menu_sel = 0;
+                    return None;
+                }
+                KeyCode::Enter => {
+                    let sel = self.menu_sel.min(matches.len() - 1);
+                    let name = matches[sel].name;
+                    return self.run_slash(name);
+                }
+                KeyCode::Esc => {
+                    self.input.clear();
+                    self.menu_sel = 0;
+                    return None;
+                }
+                _ => {}
+            }
+        }
         match (key.code, key.modifiers) {
             (KeyCode::PageUp, _) => {
                 self.scroll_back += 10;
@@ -271,10 +439,12 @@ impl Component for ChatComponent {
             }
             (KeyCode::Backspace, _) => {
                 self.input.pop();
+                self.menu_sel = 0; // query narrowed → reset palette cursor
                 None
             }
             (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
                 self.input.push(c);
+                self.menu_sel = 0; // query changed → reset palette cursor
                 None
             }
             _ => None,
@@ -363,6 +533,13 @@ impl Component for ChatComponent {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(input_lines + 1)])
             .split(area);
+
+        // Command palette state for this frame (empty unless in `/`-mode). Clamp
+        // the selection cursor in case the match set shrank since last keypress.
+        let menu = self.slash_matches();
+        if !menu.is_empty() {
+            self.menu_sel = self.menu_sel.min(menu.len() - 1);
+        }
 
         // ── transcript panel in the CTRL skin ────────────────────────────────
         let pill = self.model.clone();
@@ -508,12 +685,14 @@ impl Component for ChatComponent {
             .saturating_sub(body.height)
             .saturating_sub(self.scroll_back as u16);
         frame.render_widget(para.scroll((scroll, 0)), body);
-        let footer_hint = if self.scroll_back > 0 {
+        let footer_hint = if !menu.is_empty() {
+            " command palette · esc to dismiss".to_string()
+        } else if self.scroll_back > 0 {
             format!(" ↑{} lines back · PgDn to tail", self.scroll_back)
         } else if self.busy {
             " streaming…".to_string()
         } else {
-            " ⏎ send · ⌃J newline".to_string()
+            " ⏎ send · ⌃J newline · / for commands".to_string()
         };
         panel::footer(frame, chunks[0], &footer_hint);
 
@@ -556,6 +735,11 @@ impl Component for ChatComponent {
                 comp.height,
             ),
         );
+
+        // ── `/` command palette overlay, floated just above the composer ─────
+        if !menu.is_empty() {
+            self.draw_menu(frame, comp, &menu);
+        }
     }
 }
 
@@ -563,6 +747,15 @@ impl Component for ChatComponent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A chat with the composer pre-filled — avoids the `field_reassign_with_default`
+    /// clippy lint that fires on `let mut c = default(); c.input = …`.
+    fn chat_with(input: &str) -> ChatComponent {
+        ChatComponent {
+            input: input.to_string(),
+            ..Default::default()
+        }
+    }
 
     fn extension(extension: &str, payload: serde_json::Value) -> Action {
         Action::AgentEvent(Box::new(AgentTurnEvent::Extension {
@@ -675,6 +868,58 @@ mod tests {
         let heading = md_line("# Title", &mut fence);
         assert!(!fence);
         assert_eq!(heading.spans.len(), 1);
+    }
+
+    #[test]
+    fn slash_prefix_opens_palette() {
+        let chat = chat_with("/mod");
+        assert!(ChatComponent::default().slash_matches().is_empty());
+        let m = chat.slash_matches();
+        assert_eq!(m.first().map(|c| c.name), Some("/model"));
+        // A message that merely contains a slash mid-text is not command mode.
+        assert!(chat_with("/model with args").slash_matches().is_empty());
+    }
+
+    #[test]
+    fn enter_on_quit_command_emits_quit() {
+        let mut chat = chat_with("/quit");
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Some(Action::Quit)));
+        assert!(chat.input.is_empty(), "composer clears after a command");
+    }
+
+    #[test]
+    fn enter_on_clear_command_clears_transcript_and_does_not_submit() {
+        let mut chat = chat_with("/clear");
+        chat.turns.push(Turn::User("hello".into()));
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // No SubmitPrompt — the menu intercepts Enter.
+        assert!(!matches!(act, Some(Action::SubmitPrompt(_))));
+        assert!(chat.turns.is_empty(), "/clear empties the transcript");
+    }
+
+    #[test]
+    fn help_command_pushes_transcript_block() {
+        let mut chat = chat_with("/help");
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(chat.turns.len(), 1);
+        assert!(matches!(&chat.turns[0], Turn::Assistant(s) if s.contains("/quit")));
+    }
+
+    #[test]
+    fn arrows_move_palette_selection() {
+        let mut chat = chat_with("/"); // all commands shown
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(chat.menu_sel, 1);
+        chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(chat.menu_sel, 0);
+    }
+
+    #[test]
+    fn esc_dismisses_palette() {
+        let mut chat = chat_with("/quit");
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(chat.input.is_empty());
     }
 
     #[test]

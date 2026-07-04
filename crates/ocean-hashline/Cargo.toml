@@ -1,0 +1,16 @@
+[package]
+name = "ocean-hashline"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Ocean OS"]
+rust-version = "1.80"
+description = "Pure-Rust reimplementation of oh-my-pi's hashline edit algorithm: file-hash anchored line-precise patches with stale detection and snapshot-based recovery."
+
+[dependencies]
+twox-hash = "2"
+similar = "2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

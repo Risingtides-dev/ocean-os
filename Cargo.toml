@@ -20,6 +20,7 @@ members = [
   "crates/ocean-hooks",
   "crates/ocean-context",
   "crates/ocean-memory",
+  "crates/ocean-hashline",
   "xtask",
 ]
 # xtask is a dev-only task runner (the cargo-xtask pattern). It compiles under
@@ -48,6 +49,7 @@ default-members = [
   "crates/ocean-hooks",
   "crates/ocean-context",
   "crates/ocean-memory",
+  "crates/ocean-hashline",
 ]
 resolver = "2"
 
