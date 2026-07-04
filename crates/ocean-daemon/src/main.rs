@@ -9395,6 +9395,9 @@ async fn agent_turn(
         cancel,
         decision_token,
     )
+    // W1 harness profile: only surfaces whose profile grants it (tui/acp/cli)
+    // get hashline-tagged reads + the hashline_edit tool; web/voice stay plain.
+    .with_hashline_edits(harness_caps.hashline_edits)
     .with_event_sink(event_tx)
     // Per-turn reasoning override (OCEAN-28/41): threads the optional
     // request `thinking_level` into this turn's config only, leaving the

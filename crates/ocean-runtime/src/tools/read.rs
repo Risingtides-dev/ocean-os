@@ -1,14 +1,24 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use ocean_hashline::SnapshotStore;
 use serde_json::{json, Value};
 use tokio::fs;
 
 use crate::tools::path::resolve_against_cwd;
 use crate::types::{AgentTool, AgentToolResult};
 
+/// Shared, session-scoped hashline snapshot store (W1). `read` records the
+/// files it shows the model here; `hashline_edit` reads them back for
+/// content-hash validation and recovery.
+pub type SharedSnapshots = Arc<Mutex<SnapshotStore>>;
+
 pub struct ReadTool {
     cwd: Option<PathBuf>,
+    /// When set (hashline harness profile), `read` emits a `[path#HASH]` tag and
+    /// records a snapshot. `None` → the classic plain read, unchanged.
+    snapshots: Option<SharedSnapshots>,
 }
 
 impl Default for ReadTool {
@@ -19,11 +29,26 @@ impl Default for ReadTool {
 
 impl ReadTool {
     pub fn new() -> Self {
-        Self { cwd: None }
+        Self {
+            cwd: None,
+            snapshots: None,
+        }
     }
 
     pub fn for_cwd(cwd: PathBuf) -> Self {
-        Self { cwd: Some(cwd) }
+        Self {
+            cwd: Some(cwd),
+            snapshots: None,
+        }
+    }
+
+    /// Hashline-enabled read: tags output with the file content hash and records
+    /// a snapshot into the shared session store.
+    pub fn for_cwd_with_snapshots(cwd: PathBuf, snapshots: SharedSnapshots) -> Self {
+        Self {
+            cwd: Some(cwd),
+            snapshots: Some(snapshots),
+        }
     }
 }
 
@@ -79,6 +104,17 @@ impl AgentTool for ReadTool {
             .unwrap_or(lines.len());
 
         let mut buf = String::new();
+        // Hashline harness: prefix a `[path#HASH]` content tag and record the
+        // snapshot so `hashline_edit` can validate/recover against exactly what
+        // the model saw. The hash is over the WHOLE file (not the shown slice);
+        // `seen_lines` records the slice actually surfaced.
+        if let Some(store) = &self.snapshots {
+            if let Ok(mut store) = store.lock() {
+                // record() computes the hash; use it for the header too.
+                let hash = store.record(&display_path, &text, [(start + 1, end.max(start + 1))]);
+                buf.push_str(&format!("[{display_path}#{hash}]\n"));
+            }
+        }
         for (i, line) in lines[start..end].iter().enumerate() {
             buf.push_str(&format!("{:>5}\t{}\n", start + i + 1, line));
         }

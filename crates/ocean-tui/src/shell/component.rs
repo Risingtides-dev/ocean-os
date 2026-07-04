@@ -3,7 +3,7 @@
 //! to `Action`s. This is what keeps the app off the god-struct path: adding a
 //! panel is a new `Component`, not a new field on one struct.
 
-use crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEvent};
+use crossterm::event::{Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent};
 use ratatui::{layout::Rect, Frame};
 
 use super::action::Action;
@@ -14,7 +14,7 @@ pub trait Component {
     /// to `handle_key`/`handle_mouse`.
     fn handle_event(&mut self, event: &CrosstermEvent) -> Option<Action> {
         match event {
-            CrosstermEvent::Key(k) => self.handle_key(*k),
+            CrosstermEvent::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(*k),
             CrosstermEvent::Mouse(m) => self.handle_mouse(*m),
             _ => None,
         }

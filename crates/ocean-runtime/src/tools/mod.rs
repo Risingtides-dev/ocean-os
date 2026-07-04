@@ -7,6 +7,7 @@ pub mod browser;
 pub mod component;
 pub mod edit;
 pub mod glob_tool;
+pub mod hashline_edit;
 pub mod grep;
 pub mod ls;
 pub mod path;

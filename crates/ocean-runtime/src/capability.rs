@@ -39,6 +39,12 @@ pub struct SessionContext {
     pub cwd: PathBuf,
     /// Session id, when the turn belongs to a known session.
     pub session_id: Option<String>,
+    /// Hashline-edit harness capability (W1 / harness profiles). When true, the
+    /// builtin `read` emits a `[path#HASH]` content tag + records a session
+    /// snapshot, and a `hashline_edit` tool is offered. Off for lean surfaces
+    /// (web/voice) so their tool contract is unchanged. Resolved per-turn from
+    /// the daemon's `HarnessProfile`.
+    pub hashline: bool,
 }
 
 /// Coarse health of a capability provider, surfaced for diagnostics.
@@ -86,13 +92,33 @@ pub trait CapabilityProvider: Send + Sync {
 /// order, that the agent loop used before the registry existed.
 pub struct BuiltinProvider {
     tools: Vec<SharedTool>,
+    /// Session-scoped hashline snapshot stores, keyed by session id. Lives on
+    /// the provider (which the runtime `Arc`s for its whole life) so a `read`
+    /// in one turn and a `hashline_edit` in a later turn share one store.
+    snapshots: std::sync::Mutex<
+        std::collections::HashMap<String, crate::tools::read::SharedSnapshots>,
+    >,
 }
 
 impl BuiltinProvider {
     pub fn new() -> Self {
         Self {
             tools: default_tools(),
+            snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Get-or-create the snapshot store for a session (W1 hashline).
+    fn snapshots_for(&self, session_id: &str) -> crate::tools::read::SharedSnapshots {
+        let mut map = self.snapshots.lock().expect("snapshots map poisoned");
+        map.entry(session_id.to_string())
+            .or_insert_with(|| {
+                // LRU bounds match OMP: ~30 paths, 4 versions each.
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    ocean_hashline::SnapshotStore::new(30, 4),
+                ))
+            })
+            .clone()
     }
 }
 
@@ -137,7 +163,16 @@ impl CapabilityProvider for BuiltinProvider {
                         *tool = Arc::new(crate::tools::bash::BashTool::for_cwd(ctx.cwd.clone()));
                     }
                     "read" => {
-                        *tool = Arc::new(crate::tools::read::ReadTool::for_cwd(ctx.cwd.clone()));
+                        // Hashline profile: `read` tags output + records snapshots
+                        // into the session store. Otherwise the classic read.
+                        *tool = if ctx.hashline {
+                            Arc::new(crate::tools::read::ReadTool::for_cwd_with_snapshots(
+                                ctx.cwd.clone(),
+                                self.snapshots_for(session_id),
+                            ))
+                        } else {
+                            Arc::new(crate::tools::read::ReadTool::for_cwd(ctx.cwd.clone()))
+                        };
                     }
                     "write" => {
                         *tool = Arc::new(crate::tools::write::WriteTool::for_cwd(ctx.cwd.clone()));
@@ -157,6 +192,14 @@ impl CapabilityProvider for BuiltinProvider {
                     }
                     _ => {}
                 }
+            }
+            // Hashline profile: offer the content-anchored edit tool, sharing the
+            // same session snapshot store `read` records into.
+            if ctx.hashline {
+                tools.push(Arc::new(crate::tools::hashline_edit::HashlineEditTool::new(
+                    Some(ctx.cwd.clone()),
+                    self.snapshots_for(session_id),
+                )));
             }
         }
         tools
@@ -237,6 +280,7 @@ mod tests {
         SessionContext {
             cwd: PathBuf::from("/tmp"),
             session_id: Some("test-session".into()),
+            hashline: false,
         }
     }
 
@@ -341,6 +385,7 @@ mod tests {
         let no_sess = SessionContext {
             cwd: PathBuf::from("/tmp"),
             session_id: None,
+            hashline: false,
         };
         let got = provider.tools(&no_sess).await;
         let wait = got
@@ -398,6 +443,7 @@ mod tests {
         let no_sess = SessionContext {
             cwd: PathBuf::from("/tmp"),
             session_id: None,
+            hashline: false,
         };
         let got = provider.tools(&no_sess).await;
         let tool = got

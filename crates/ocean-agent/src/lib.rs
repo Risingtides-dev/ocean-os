@@ -1195,6 +1195,7 @@ impl AgentRuntime {
             agent_model: _,
             tool_allowlist,
             agent_capabilities,
+            hashline_edits,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
         // built-ins plus any connected MCP/skill providers, deduped first-wins.
@@ -1202,6 +1203,7 @@ impl AgentRuntime {
         let tool_ctx = SessionContext {
             cwd: PathBuf::from(&req.cwd),
             session_id: Some(session_id.to_string()),
+            hashline: hashline_edits,
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
         // Folder-as-agent tool narrowing: a named agent's declared `tools` list
@@ -1550,6 +1552,12 @@ pub struct PromptControl {
     /// unchanged. Fail-soft: a spec that can't spawn is warned and skipped, never
     /// breaking the turn.
     pub agent_capabilities: Option<(PathBuf, Vec<agentdir::SubprocessCapability>)>,
+    /// Hashline-edit harness capability for this turn (W1 / harness profiles).
+    /// When true the turn's `read` tags output + records snapshots and a
+    /// `hashline_edit` tool is offered. Set by the daemon from the surface's
+    /// `HarnessProfile`; `false` for lean surfaces (web/voice) and every
+    /// legacy caller (defaults off in `PromptControl::new`).
+    pub hashline_edits: bool,
 }
 
 /// Narrow a turn's toolset to `allowlist` (folder-as-agent tool restriction).
@@ -1591,7 +1599,15 @@ impl PromptControl {
             tool_allowlist: None,
             agent_model: None,
             agent_capabilities: None,
+            hashline_edits: false,
         }
+    }
+
+    /// Enable the hashline-edit harness for this turn (W1). Set from the
+    /// surface's `HarnessProfile` capabilities on the daemon side.
+    pub fn with_hashline_edits(mut self, on: bool) -> Self {
+        self.hashline_edits = on;
+        self
     }
 
     /// Narrow this turn's toolset to the named tools (folder-as-agent allowlist).

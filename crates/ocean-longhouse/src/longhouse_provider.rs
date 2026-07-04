@@ -319,6 +319,7 @@ mod tests {
         SessionContext {
             cwd: PathBuf::from("/tmp"),
             session_id: Some("test".into()),
+            hashline: false,
         }
     }
 

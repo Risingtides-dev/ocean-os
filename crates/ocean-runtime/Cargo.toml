@@ -22,6 +22,7 @@ ignore = "0.4"
 ocean-protocol = { path = "../ocean-protocol" }
 ocean-agent-sdk = { workspace = true }
 ocean-browser = { workspace = true }
+ocean-hashline = { path = "../ocean-hashline" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -52,3 +53,7 @@ path = "tests/agent_loop_e2e.rs"
 [[test]]
 name = "turn_tracing_spans"
 path = "tests/turn_tracing_spans.rs"
+
+[[test]]
+name = "hashline_wiring"
+path = "tests/hashline_wiring.rs"
