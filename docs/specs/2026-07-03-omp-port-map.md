@@ -357,6 +357,20 @@ fails loud. Snapshot store: LRU 30 paths × 4 versions, realpath-keyed, records 
 (edits into unread regions rejected). Their test suite (`packages/hashline/test/`) is the
 port contract. ~61% output-token reduction claimed. → `ocean-hashline`, profile: tui/acp.
 
+## Scoping principle (John, 2026-07-03)
+
+**Port the mechanism, skip the integration long-tail.** ~99% of what OMP does to steer the
+harness is valuable; the wide per-integration option surface is not. Concretely: the LSP
+*tool* (multiplexing, rename, deferred diagnostics) ships with servers for the languages
+Ocean actually works in (Rust, TS/JS, Python, Go, shell) — no Ruby-on-Rails-grade long tail.
+Same rule everywhere: minimizer filters for our commands (cargo/git/gh/npm/pytest), grammars
+for our languages, web-search providers we'd use. The mechanism must make adding an
+integration a config entry, never a code change.
+
+**Committed TUI gap (John):** ocean-tui's shell has NO slash-command menu. A real `/` command
+palette (fuzzy menu on `/` in the composer, ↑↓ + Enter, extensible registry) is pulled
+forward out of W2 — it's the discoverability surface every other feature hangs off.
+
 ## Build waves (final)
 
 0. **W0 — profile seam** (small, first): `HarnessProfile` resolved from `client_type` in
