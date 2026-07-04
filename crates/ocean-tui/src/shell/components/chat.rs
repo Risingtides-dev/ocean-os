@@ -493,20 +493,21 @@ impl Component for ChatComponent {
             }
             lines.push(Line::from(""));
         }
-        // Bottom-anchor, then back off by the operator's scrollback offset.
-        let total = lines.len() as u16;
-        let max_back = total.saturating_sub(body.height) as usize;
+        // Bottom-anchor on the WRAPPED row count, not the raw line count — long
+        // streamed lines reflow into multiple rows, and Paragraph's scroll
+        // offset is in wrapped rows. Counting unwrapped lines made the live
+        // tail jitter/scroll off as text arrived. `line_count` uses the exact
+        // same wrap algorithm the render will.
+        let para = Paragraph::new(lines)
+            .style(Style::default().bg(theme::SLATE))
+            .wrap(Wrap { trim: false });
+        let wrapped = para.line_count(body.width) as u16;
+        let max_back = wrapped.saturating_sub(body.height) as usize;
         self.scroll_back = self.scroll_back.min(max_back);
-        let scroll = total
+        let scroll = wrapped
             .saturating_sub(body.height)
             .saturating_sub(self.scroll_back as u16);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .style(Style::default().bg(theme::SLATE))
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0)),
-            body,
-        );
+        frame.render_widget(para.scroll((scroll, 0)), body);
         let footer_hint = if self.scroll_back > 0 {
             format!(" ↑{} lines back · PgDn to tail", self.scroll_back)
         } else if self.busy {
