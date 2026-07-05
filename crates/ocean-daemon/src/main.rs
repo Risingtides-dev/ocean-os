@@ -19,11 +19,11 @@ use axum::{
 use chrono::{DateTime, TimeZone, Utc};
 use ocean_agent::{room_guidance, AgentRuntime, PromptControl};
 use ocean_agent_sdk::{
-    AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse, AgentSessionId,
-    AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurn, AgentTurnEvent,
-    AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus, ConveneTrigger, Federation,
-    LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally, ToolCall, ToolCallId,
-    ToolResult,
+    AgentOwningProject, AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse,
+    AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurn,
+    AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
+    ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
+    ToolCall, ToolCallId, ToolResult,
 };
 // OCEAN-277: surface-patch op vocabulary the per-room component ledger folds.
 use ocean_agent_sdk::surface::{CanvasId, ComponentId, SurfacePatch};
@@ -10684,6 +10684,16 @@ async fn agent_sessions(
             updated_at: s.updated_ms.map(ms_to_datetime).unwrap_or_else(Utc::now),
             active_turn: active_turn_for_session(&requests, s.id),
             turn_count: s.turns,
+            workspace_root: s.workspace_root.clone(),
+            git_branch: s.git_branch.clone(),
+            owning_project: s
+                .workspace_root
+                .as_deref()
+                .and_then(|root| state.runtime.owning_project_for_root(root))
+                .map(|p| AgentOwningProject {
+                    id: p.id.to_string(),
+                    name: p.name,
+                }),
         })
         .collect();
     Json(AgentSessionsResponse {

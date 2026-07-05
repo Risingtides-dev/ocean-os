@@ -897,6 +897,50 @@ impl AgentRuntime {
         project::find_by_workspace(&self.config_dir, workspace_root)
     }
 
+    /// Resolve the project that owns a session's workspace, following git
+    /// worktrees back to their main checkout. First tries an exact match on the
+    /// given root; if that misses, resolves the git common-dir's main worktree
+    /// (`git -C <root> rev-parse --path-format=absolute --git-common-dir` → the
+    /// enclosing repo root) and matches THAT. None on any git/lookup failure.
+    pub fn owning_project_for_root(&self, workspace_root: &str) -> Option<Project> {
+        if let Ok(Some(project)) = self.project_for_workspace(workspace_root) {
+            return Some(project);
+        }
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .arg("rev-parse")
+            .arg("--path-format=absolute")
+            .arg("--git-common-dir")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+
+        let common_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if common_dir.is_empty() {
+            return None;
+        }
+
+        let common_dir = PathBuf::from(common_dir);
+        let common_dir = if common_dir.is_absolute() {
+            common_dir
+        } else {
+            Path::new(workspace_root).join(common_dir)
+        };
+        let common_dir = common_dir.canonicalize().ok()?;
+        let main_root = common_dir.parent()?.canonicalize().ok()?;
+        let main_root = main_root.to_string_lossy();
+        let main_root = main_root.trim_end_matches(std::path::MAIN_SEPARATOR);
+        if main_root.is_empty() {
+            return None;
+        }
+
+        self.project_for_workspace(main_root).ok().flatten()
+    }
+
     /// Create or replace a project (by id), stamping `updated_ms` to `now_ms`.
     pub fn upsert_project(&self, p: Project, now_ms: i64) -> anyhow::Result<Project> {
         project::upsert(&self.config_dir, p, now_ms)
@@ -4710,6 +4754,110 @@ done
         assert_eq!(projects[0].updated_ms, 300);
         assert_eq!(projects[1].updated_ms, 200);
         assert_eq!(projects[2].updated_ms, 100);
+    }
+
+    #[test]
+    fn owning_project_for_root_resolves_registered_main_repo_for_linked_worktree() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let assert_command = |command: &mut std::process::Command, label: &str| {
+            let status = command.status().expect(label);
+            assert!(status.success(), "{label} failed with status {status}");
+        };
+
+        let config_dir = temp_config_dir("worktree-project-owner");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let repos = tempfile::tempdir().expect("tempdir");
+        let main_root = repos.path().join("main");
+        assert_command(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&main_root),
+            "git init",
+        );
+
+        std::fs::write(main_root.join("README.md"), "ocean\n").expect("write seed file");
+        assert_command(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main_root)
+                .args(["add", "README.md"]),
+            "git add",
+        );
+        assert_command(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main_root)
+                .args([
+                    "-c",
+                    "user.name=Ocean Test",
+                    "-c",
+                    "user.email=ocean-test@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "initial",
+                ]),
+            "git commit",
+        );
+
+        let worktree_root = repos.path().join("linked");
+        assert_command(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main_root)
+                .args(["worktree", "add", "-q", "-b", "linked-worktree-test"])
+                .arg(&worktree_root),
+            "git worktree add",
+        );
+
+        let main_root = main_root.canonicalize().expect("canonical main root");
+        let main_root_str = main_root.to_string_lossy().into_owned();
+        let project_id = uuid::Uuid::new_v4();
+        let stored = runtime
+            .upsert_project(
+                Project {
+                    id: project_id,
+                    name: "main repo".into(),
+                    workspace_root: main_root_str,
+                    config: ocean_core::ProjectConfig::default(),
+                    created_ms: 10,
+                    updated_ms: 10,
+                },
+                20,
+            )
+            .unwrap();
+
+        let worktree_root = worktree_root.canonicalize().expect("canonical worktree root");
+        let worktree_root_str = worktree_root.to_string_lossy();
+        let owner = runtime
+            .owning_project_for_root(&worktree_root_str)
+            .expect("linked worktree should resolve to the registered main repo project");
+        assert_eq!(owner.id, stored.id);
+        assert_eq!(owner.workspace_root, stored.workspace_root);
+
+        let unrelated = tempfile::tempdir().expect("unrelated tempdir");
+        let unrelated = unrelated
+            .path()
+            .canonicalize()
+            .expect("canonical unrelated dir");
+        let unrelated_str = unrelated.to_string_lossy();
+        assert!(
+            runtime.owning_project_for_root(&unrelated_str).is_none(),
+            "an unrelated directory must not claim the registered repo project"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
     }
 
     #[test]

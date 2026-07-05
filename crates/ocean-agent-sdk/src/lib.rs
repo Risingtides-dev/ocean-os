@@ -412,6 +412,12 @@ pub struct AgentSessionCreateResponse {
     pub client_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentOwningProject {
+    pub id: String,
+    pub name: String,
+}
+
 /// Summary item returned by `GET /v1/agent/sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionSummary {
@@ -422,6 +428,12 @@ pub struct AgentSessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn: Option<AgentTurnId>,
     pub turn_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_project: Option<AgentOwningProject>,
 }
 
 /// Response payload for `GET /v1/agent/sessions`.
