@@ -1389,3 +1389,30 @@ area:      [backend]
 
 Enriched the daemon session-list contract so `GET /v1/agent/sessions` keeps the existing `cwd` field unchanged while also exposing optional `workspace_root`, `git_branch`, and `owning_project { id, name }`. Added `AgentRuntime::owning_project_for_root`, which first exact-matches the session workspace root and then resolves linked git worktrees through `git -C <root> rev-parse --path-format=absolute --git-common-dir` back to the main checkout before matching project ownership. Verified the new worktree resolver test, full `ocean-agent` tests, SDK check, and daemon build; did not restart the daemon.
 _________________________________________________________________________________
+
+time:      [ 5:27PM] [07-05-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      frontend
+
+Burned down the ocean-tui workbench punch list from the last self-drive via a
+2-agent worktree fan-out (branched from the feat tip, not main, since the shell
+rebuild lives only here). Agent A (punch/nav): wired the dead `/` palette
+pane-focus stubs to a real `Action::Navigate(Nav)`, added an Esc escape hatch
+(Esc → back to chat from editor/graph/sessions/tree; double-Esc latch to leave
+the terminal dock while single Esc still reaches the shell), collapsed the
+doubled `▏▏▏` splitter to one clean EDGE rule by dropping the panels' redundant
+per-panel edge/shadow columns, and fixed the `/` palette width undercount that
+truncated descriptions mid-word. Agent B (punch/sessions): stripped the leaked
+client tag from single-line resumed history and forced `--legacy` on the resume
+/hydrate command so a hydrated session can't recurse the workbench into itself
+post-merge. Integration-time finding while driving the merge live: the session
+rail preview titles leaked the same tags ([TUI]/[ACP]/[?]) via a second cleaner
+(ocean_clean_user_text) with the identical single-line bug — fixed to reuse
+strip_client_tag. All verified in a tmux PTY drive: single splitter, full-width
+palette, /graph+/terminal nav, Esc + double-Esc + disarm, clean rail titles.
+137 tests green, clippy -D clean. Merged both branches to feat/ocean-tui-shell
+-rebuild; left for John's drive + review before main. Surface files (ci.yml,
+ocean-daemon, ocean-agent, ocean-runtime, bus.rs) untouched.
+_________________________________________________________________________________
