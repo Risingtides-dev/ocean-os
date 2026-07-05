@@ -6,6 +6,18 @@ use std::path::PathBuf;
 
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 
+/// A workbench navigation target — a pane or center surface. Emitted by the `/`
+/// palette so chat never reaches into the app's private `Focus`/`Center`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nav {
+    Sessions,
+    Files,
+    Chat,
+    Editor,
+    Graph,
+    Terminal,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     /// Redraw requested (coalesced with the render tick).
@@ -27,6 +39,9 @@ pub enum Action {
     OpenSession { line: String, cwd: PathBuf },
     /// Move keyboard focus to the next pane.
     CycleFocus,
+    /// Navigate the workbench to a pane/center surface — emitted by the `/`
+    /// palette so chat never reaches into the app's private Focus/Center.
+    Navigate(Nav),
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
     /// Resume a session natively in the chat: load its transcript from `path`
