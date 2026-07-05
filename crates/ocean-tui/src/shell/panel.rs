@@ -28,16 +28,12 @@ pub fn draw(f: &mut Frame, area: Rect, title: &str, pill: Option<&str>, focused:
         Block::default().style(Style::default().bg(theme::SLATE)),
         area,
     );
-    // left light-edge + right shadow columns (the depth-fill)
-    paint_col(f, area.x, area.y, area.height, theme::EDGE, theme::SLATE);
-    paint_col(
-        f,
-        area.x + area.width - 1,
-        area.y,
-        area.height,
-        theme::SLATE,
-        theme::SHADOW,
-    );
+    // NOTE: the panels no longer paint their own left light-edge / right shadow
+    // columns. Adjacent panes are separated by the dedicated `splitter()` rule
+    // drawn between them (app::draw); painting a per-panel edge PLUS a shadow
+    // PLUS the splitter stacked 2–3 vertical bars (▏▏▏) at every seam. The
+    // splitter is now the single, clean, theme::EDGE divider. The 1-col inner
+    // inset is kept as breathing room so pane content never abuts the seam.
 
     let inner = Rect::new(
         area.x + 1,
@@ -111,22 +107,5 @@ pub fn pad_to(s: &str, w: usize) -> String {
         s.chars().take(w).collect()
     } else {
         format!("{s}{}", " ".repeat(w - n))
-    }
-}
-
-fn paint_col(
-    f: &mut Frame,
-    x: u16,
-    y: u16,
-    h: u16,
-    fg: ratatui::style::Color,
-    bg: ratatui::style::Color,
-) {
-    for k in 0..h {
-        f.render_widget(
-            Paragraph::new(Span::styled("▏", Style::default().fg(fg)))
-                .style(Style::default().bg(bg)),
-            Rect::new(x, y + k, 1, 1),
-        );
     }
 }

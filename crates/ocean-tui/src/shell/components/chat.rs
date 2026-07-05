@@ -18,7 +18,7 @@ use ratatui::{
 };
 
 use crate::shell::{
-    action::Action,
+    action::{Action, Nav},
     component::Component,
     diff::{self, DiffKind, DiffRow},
     history::PromptHistory,
@@ -475,8 +475,8 @@ impl ChatComponent {
 
     /// Execute a slash command by name. Clears the composer, then either mutates
     /// the transcript locally (`/clear`, `/help`) or emits an [`Action`]. Pane
-    /// focus has no targeted action yet (the app owns `Focus` internally), so
-    /// those surface a status hint until that's wired.
+    /// focus rides [`Action::Navigate`] — chat never reaches into the app's
+    /// private `Focus`/`Center`; the app maps the [`Nav`] target.
     fn run_slash(&mut self, name: &str) -> Option<Action> {
         self.input.clear();
         self.menu_sel = 0;
@@ -497,15 +497,12 @@ impl ChatComponent {
             "/model" => Some(Action::Status(
                 "model switching isn't wired yet".to_string(),
             )),
-            // TODO: wire to pane focus — there's no targeted focus Action; the
-            // app owns `Focus` internally (chat.rs must not reach into it). Emit
-            // a status hint pointing at the existing shortcut for now.
-            "/sessions" | "/resume" => Some(Action::Status(
-                "session rail: Tab or ⌃⌥1".to_string(),
-            )),
-            "/files" => Some(Action::Status("file tree: ⌃⌥2".to_string())),
-            "/graph" => Some(Action::Status("graph view: ⌃⌥5".to_string())),
-            "/terminal" => Some(Action::Status("terminal: ⌃⌥6".to_string())),
+            // Pane/center navigation — the app owns Focus/Center, so emit a
+            // targeted Navigate and let it move there.
+            "/sessions" | "/resume" => Some(Action::Navigate(Nav::Sessions)),
+            "/files" => Some(Action::Navigate(Nav::Files)),
+            "/graph" => Some(Action::Navigate(Nav::Graph)),
+            "/terminal" => Some(Action::Navigate(Nav::Terminal)),
             _ => Some(Action::Status(format!("unknown command: {name}"))),
         }
     }
@@ -530,14 +527,17 @@ impl ChatComponent {
         }
         let sel = self.menu_sel.min(shown - 1);
 
-        // Width fits the widest "name — desc" row, capped to the composer width.
+        // Width fits the widest ACTUAL row, capped to the composer width. Each
+        // row renders as ` {marker} ` (3 cols) + `{:<11}` name (min 11 cols) +
+        // ` — ` (3 cols) + desc — so the content width must mirror that exactly
+        // or long descriptions clip mid-word against the composer cap.
         let content_w = matches
             .iter()
             .take(shown)
-            .map(|c| c.name.chars().count() + 3 + c.desc.chars().count())
+            .map(|c| 3 + c.name.chars().count().max(11) + 3 + c.desc.chars().count())
             .max()
             .unwrap_or(24);
-        let width = ((content_w as u16) + 6)
+        let width = ((content_w as u16) + 2 /* borders */)
             .min(composer.width)
             .max(24);
         let height = shown as u16 + 3; // top+bottom border + footer row

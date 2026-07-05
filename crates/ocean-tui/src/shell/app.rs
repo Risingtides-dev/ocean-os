@@ -15,7 +15,8 @@
 //! the same way CTRL swaps its center between editor and graph.
 //!
 //! Keys: ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat · ⌃⌥4 editor · ⌃⌥5 graph toggle ·
-//! ⌃⌥6 terminal · Tab cycles focus · ⌃Q quits (⌃C passes to the PTY).
+//! ⌃⌥6 terminal · Tab cycles focus · Esc → back to chat (double-Esc leaves the
+//! terminal dock) · ⌃Q quits (⌃C passes to the PTY).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use super::{
-    action::Action,
+    action::{Action, Nav},
     client::DaemonClient,
     component::Component,
     components::{
@@ -101,6 +102,10 @@ pub struct App {
     show_term: bool,
     /// Clickable title-bar buttons (CTRL's upper model): (rect, action).
     buttons: Vec<(Rect, Btn)>,
+    /// Double-Esc latch for the terminal dock: a single Esc belongs to the
+    /// shell, so leaving the dock by keyboard takes two. Armed on the first Esc
+    /// while focus is Term, disarmed on any other key or when focus leaves Term.
+    esc_armed: bool,
 }
 
 /// A title-bar button — CTRL's icon toggles, extended with the center surfaces.
@@ -147,6 +152,7 @@ impl App {
             show_tree: true,
             show_term: true,
             buttons: Vec::new(),
+            esc_armed: false,
         };
         app.apply_focus();
         app
@@ -293,6 +299,34 @@ impl App {
                     _ => {}
                 }
             }
+            // Esc escape hatch: ⌃⌥N are dead on the wire in legacy terminals
+            // (Ctrl+3 IS ESC), so a keyboard-only user gets stranded in the
+            // editor/graph/terminal. Esc gets them back to chat from anywhere.
+            if k.code == KeyCode::Esc {
+                match self.focus {
+                    // Chat owns Esc (its `/` palette dismiss) — don't intercept.
+                    Focus::Center if self.center == Center::Chat => {}
+                    // Editor/graph and the side rails → straight back to chat.
+                    Focus::Center | Focus::Sessions | Focus::Tree => {
+                        self.center = Center::Chat;
+                        self.focus_to(Focus::Center);
+                        return;
+                    }
+                    // Terminal: a single Esc belongs to the shell, so leaving the
+                    // dock takes a double-Esc. First Esc arms the latch and is
+                    // still forwarded to the PTY (fall through); the second leaves.
+                    Focus::Term => {
+                        if self.esc_armed {
+                            self.esc_armed = false;
+                            return self.focus_to(Focus::Center);
+                        }
+                        self.esc_armed = true;
+                    }
+                }
+            } else if self.focus == Focus::Term {
+                // Any non-Esc key in the terminal disarms the double-Esc latch.
+                self.esc_armed = false;
+            }
         }
         let action = match self.focus {
             Focus::Sessions => self.rail.handle_event(&evt),
@@ -421,6 +455,48 @@ impl App {
                 self.focus_to(Focus::Center);
             }
             Action::CycleFocus => self.cycle_focus(),
+            // `/` palette navigation — reuse the exact patterns from `press()`
+            // and the ⌃⌥ handler so keyboard and palette stay consistent.
+            Action::Navigate(nav) => match *nav {
+                Nav::Sessions => {
+                    self.show_sessions = true;
+                    self.focus_to(Focus::Sessions);
+                }
+                Nav::Files => {
+                    self.show_tree = true;
+                    self.focus_to(Focus::Tree);
+                }
+                Nav::Chat => {
+                    self.center = Center::Chat;
+                    self.focus_to(Focus::Center);
+                }
+                Nav::Editor => {
+                    if self.editor.has_tabs() {
+                        self.center = Center::Editor;
+                    }
+                    self.focus_to(Focus::Center);
+                }
+                Nav::Graph => {
+                    // Mirror the ⌃⌥5 toggle: off returns to editor (if tabs) else chat.
+                    self.center = if self.center == Center::Graph {
+                        if self.editor.has_tabs() {
+                            Center::Editor
+                        } else {
+                            Center::Chat
+                        }
+                    } else {
+                        Center::Graph
+                    };
+                    self.focus_to(Focus::Center);
+                }
+                Nav::Terminal => {
+                    if !self.pty.is_active() {
+                        self.pty.open(&PathBuf::from(&self.workspace_root), "");
+                        self.show_term = true;
+                    }
+                    self.focus_to(Focus::Term);
+                }
+            },
             Action::OceanEvent(env) => {
                 // OCEAN-185: the turn's first permission request claims the
                 // pending submit token; remember permission→request for the POST.
@@ -463,6 +539,11 @@ impl App {
     }
 
     fn focus_to(&mut self, focus: Focus) {
+        // Leaving the terminal clears the double-Esc latch so it can't fire on a
+        // later re-entry.
+        if focus != Focus::Term {
+            self.esc_armed = false;
+        }
         self.focus = focus;
         self.apply_focus();
     }
