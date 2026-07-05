@@ -6,6 +6,7 @@ use ocean_hashline::SnapshotStore;
 use serde_json::{json, Value};
 use tokio::fs;
 
+use crate::artifacts::SharedArtifacts;
 use crate::tools::path::resolve_against_cwd;
 use crate::types::{AgentTool, AgentToolResult};
 
@@ -14,11 +15,19 @@ use crate::types::{AgentTool, AgentToolResult};
 /// content-hash validation and recovery.
 pub type SharedSnapshots = Arc<Mutex<SnapshotStore>>;
 
+/// URI scheme for reading a spilled artifact back (W3 output-meta + spill).
+const ARTIFACT_SCHEME: &str = "artifact://";
+
 pub struct ReadTool {
     cwd: Option<PathBuf>,
     /// When set (hashline harness profile), `read` emits a `[path#HASH]` tag and
     /// records a snapshot. `None` → the classic plain read, unchanged.
     snapshots: Option<SharedSnapshots>,
+    /// When set (artifact-spill harness profile), a `path` of the form
+    /// `artifact://<id>` resolves from this session store instead of disk. `None`
+    /// → `artifact://` paths are treated as ordinary (and failing) file reads,
+    /// so the classic behavior is unchanged.
+    artifacts: Option<SharedArtifacts>,
 }
 
 impl Default for ReadTool {
@@ -32,6 +41,7 @@ impl ReadTool {
         Self {
             cwd: None,
             snapshots: None,
+            artifacts: None,
         }
     }
 
@@ -39,6 +49,7 @@ impl ReadTool {
         Self {
             cwd: Some(cwd),
             snapshots: None,
+            artifacts: None,
         }
     }
 
@@ -48,7 +59,52 @@ impl ReadTool {
         Self {
             cwd: Some(cwd),
             snapshots: Some(snapshots),
+            artifacts: None,
         }
+    }
+
+    /// Bind the session artifact store so `read artifact://<id>` resolves spilled
+    /// tool outputs (W3). Composable with the hashline constructors. `None`-op
+    /// when never called — the classic read is unchanged.
+    pub fn with_artifacts(mut self, artifacts: SharedArtifacts) -> Self {
+        self.artifacts = Some(artifacts);
+        self
+    }
+
+    /// Resolve an `artifact://<id>` path against the session store, applying
+    /// `offset`/`limit` as a 1-based line window. A read with neither returns the
+    /// artifact's exact bytes (the "nothing is lost" round-trip); a windowed read
+    /// returns the selected lines joined by `\n`, no line-number gutter — the
+    /// spilled bytes are tool output, not a file, so they're handed back verbatim.
+    fn read_artifact(
+        &self,
+        id: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<AgentToolResult, String> {
+        let store = self
+            .artifacts
+            .as_ref()
+            .ok_or("artifact:// reads are not enabled for this session")?;
+        let guard = store.lock().map_err(|_| "artifact store poisoned")?;
+        let artifact = guard
+            .get(id)
+            .ok_or_else(|| format!("artifact not found: {ARTIFACT_SCHEME}{id}"))?;
+
+        // Full read (no window): return the exact spilled bytes.
+        if offset.is_none() && limit.is_none() {
+            return Ok(AgentToolResult::text(artifact.text.clone()));
+        }
+
+        let lines: Vec<&str> = artifact.text.lines().collect();
+        let start = offset
+            .map(|o| o.saturating_sub(1))
+            .unwrap_or(0)
+            .min(lines.len());
+        let end = limit
+            .map(|l| std::cmp::min(start.saturating_add(l), lines.len()))
+            .unwrap_or(lines.len());
+        Ok(AgentToolResult::text(lines[start..end].join("\n")))
     }
 }
 
@@ -84,6 +140,17 @@ impl AgentTool for ReadTool {
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+
+        // Internal URI: `artifact://<id>` reads a spilled tool output back from
+        // the session store instead of touching disk (W3). Only intercepted when
+        // the session has an artifact store bound; otherwise it falls through to
+        // the disk path (and fails as an ordinary missing file), preserving the
+        // classic contract.
+        if self.artifacts.is_some() {
+            if let Some(id) = path.strip_prefix(ARTIFACT_SCHEME) {
+                return self.read_artifact(id, offset, limit);
+            }
+        }
 
         let display_path = path.to_string();
         let path = resolve_against_cwd(self.cwd.as_deref(), path);

@@ -42,6 +42,7 @@ async fn hashline_read_then_edit_roundtrip() {
         cwd: dir.clone(),
         session_id: Some("s-hl".into()),
         hashline: true,
+        artifacts: false,
     };
 
     // 1. read emits a [path#HASH] tag.
@@ -104,6 +105,7 @@ async fn non_hashline_profile_is_untagged_and_has_no_edit_tool() {
         cwd: dir.clone(),
         session_id: Some("s-plain".into()),
         hashline: false,
+        artifacts: false,
     };
 
     let read = tool_named(&provider, &ctx, "read").await.expect("read tool");

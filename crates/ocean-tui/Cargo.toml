@@ -31,3 +31,7 @@ tui-term = "0.2"
 # Phase-3 shell: editor / file tree / graph workbench surfaces (harvested from CTRL).
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 ignore = "0.4"
+# Slice-4 edit-preview diff cards: line + word-level diffing (matches ocean-hashline).
+similar = "2"
+# Non-fatal warn logging for best-effort prompt-history I/O.
+tracing.workspace = true

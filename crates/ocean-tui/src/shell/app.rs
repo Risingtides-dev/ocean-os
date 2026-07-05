@@ -119,7 +119,7 @@ impl App {
             workspace_root,
             rail: SessionRailComponent::new(root.clone()),
             tree: FileTreeComponent::new(root.clone()),
-            chat: ChatComponent::default(),
+            chat: ChatComponent::new(),
             pty: PtyComponent::default(),
             editor: EditorComponent::new(root.clone()),
             graph: GraphComponent::new(root),

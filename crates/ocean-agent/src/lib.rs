@@ -1196,6 +1196,7 @@ impl AgentRuntime {
             tool_allowlist,
             agent_capabilities,
             hashline_edits,
+            artifact_spill,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
         // built-ins plus any connected MCP/skill providers, deduped first-wins.
@@ -1204,6 +1205,7 @@ impl AgentRuntime {
             cwd: PathBuf::from(&req.cwd),
             session_id: Some(session_id.to_string()),
             hashline: hashline_edits,
+            artifacts: artifact_spill,
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
         // Folder-as-agent tool narrowing: a named agent's declared `tools` list
@@ -1558,6 +1560,13 @@ pub struct PromptControl {
     /// `HarnessProfile`; `false` for lean surfaces (web/voice) and every
     /// legacy caller (defaults off in `PromptControl::new`).
     pub hashline_edits: bool,
+    /// Artifact-spill harness capability for this turn (W3 / harness profiles).
+    /// When true, oversized tool output is truncated for the model with a notice
+    /// and the full output is spilled to the session artifact store (readable via
+    /// `read artifact://<id>`). Set by the daemon from the surface's
+    /// `HarnessProfile`; `false` for lean surfaces (web/voice) and every legacy
+    /// caller (defaults off in `PromptControl::new`).
+    pub artifact_spill: bool,
 }
 
 /// Narrow a turn's toolset to `allowlist` (folder-as-agent tool restriction).
@@ -1600,6 +1609,7 @@ impl PromptControl {
             agent_model: None,
             agent_capabilities: None,
             hashline_edits: false,
+            artifact_spill: false,
         }
     }
 
@@ -1607,6 +1617,13 @@ impl PromptControl {
     /// surface's `HarnessProfile` capabilities on the daemon side.
     pub fn with_hashline_edits(mut self, on: bool) -> Self {
         self.hashline_edits = on;
+        self
+    }
+
+    /// Enable the artifact-spill harness for this turn (W3). Set from the
+    /// surface's `HarnessProfile` capabilities on the daemon side.
+    pub fn with_artifact_spill(mut self, on: bool) -> Self {
+        self.artifact_spill = on;
         self
     }
 

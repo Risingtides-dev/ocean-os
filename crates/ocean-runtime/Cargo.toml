@@ -57,3 +57,7 @@ path = "tests/turn_tracing_spans.rs"
 [[test]]
 name = "hashline_wiring"
 path = "tests/hashline_wiring.rs"
+
+[[test]]
+name = "artifact_spill_wiring"
+path = "tests/artifact_spill_wiring.rs"

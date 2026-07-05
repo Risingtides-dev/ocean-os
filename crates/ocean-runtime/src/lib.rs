@@ -7,6 +7,7 @@
 //! - Builtin tools under [`tools`]
 
 pub mod agent_loop;
+pub mod artifacts;
 pub mod capability;
 pub mod error;
 pub mod fake_tool_provider;
@@ -14,6 +15,7 @@ pub mod tools;
 pub mod types;
 
 pub use agent_loop::{run_agent, run_agent_with_history, AgentRun};
+pub use artifacts::{Artifact, ArtifactStore, SharedArtifacts};
 pub use capability::{
     BuiltinProvider, CapabilityProvider, CapabilityRegistry, ProviderHealth, SessionContext,
     SharedTool,

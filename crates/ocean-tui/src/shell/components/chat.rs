@@ -20,6 +20,8 @@ use ratatui::{
 use crate::shell::{
     action::Action,
     component::Component,
+    diff::{self, DiffKind, DiffRow},
+    history::PromptHistory,
     markdown::Markdown,
     panel, slash,
     theme::{self, g},
@@ -28,6 +30,13 @@ use crate::shell::{
 /// Collapsed tool cards show at most this many trailing output lines; ⌃O
 /// expands to the full output.
 const TOOL_TAIL_ROWS: usize = 3;
+
+/// Collapsed diff cards show at most this many rows; ⌃O (the same global expand
+/// toggle as tool output) reveals the full hunk.
+const DIFF_TAIL_ROWS: usize = 12;
+
+/// Kill-ring depth (⌃U / ⌃K push, ⌃Y yanks the newest).
+const KILL_RING_CAP: usize = 10;
 
 /// One rendered unit of transcript.
 enum Turn {
@@ -38,13 +47,16 @@ enum Turn {
     /// Extended-thinking text (accumulates deltas).
     Thinking(String),
     /// A tool call: keyed by call id, with name + a one-line args summary +
-    /// streamed output + status. Rendered as a card (⌃O toggles collapse).
+    /// streamed output + status. Rendered as a card (⌃O toggles collapse). When
+    /// the tool is an edit tool, `diff` carries the pre-computed diff-card rows
+    /// and the card renders those instead of raw output.
     Tool {
         id: ToolCallId,
         name: String,
         args: String,
         output: String,
         status: ToolStatus,
+        diff: Option<Vec<DiffRow>>,
     },
     /// An advisor aside — a note from the observer/advisor extension. Rendered as
     /// a set-off amber card, clearly not the agent's own output.
@@ -70,6 +82,15 @@ enum ToolStatus {
     Err,
 }
 
+/// The ⌃R fuzzy history-search overlay state (present only while open).
+#[derive(Default)]
+struct HistorySearch {
+    /// Typed query, fuzzy-matched against history entries.
+    query: String,
+    /// Highlighted row in the match list.
+    sel: usize,
+}
+
 #[derive(Default)]
 pub struct ChatComponent {
     turns: Vec<Turn>,
@@ -84,6 +105,18 @@ pub struct ChatComponent {
     md: Markdown,
     /// When true, tool cards render their full output instead of a tail window.
     tools_expanded: bool,
+    /// Persisted prompt history (↑/↓ recall, ⌃R search). Loaded at startup.
+    history: PromptHistory,
+    /// Cursor into `history` while navigating with ↑/↓; `None` when editing a
+    /// fresh line rather than walking history.
+    history_idx: Option<usize>,
+    /// The in-progress composer text saved when ↑ first enters history, restored
+    /// when ↓ walks back past the newest entry.
+    draft: String,
+    /// Kill ring: ⌃U / ⌃K push, ⌃Y yanks the newest (cap [`KILL_RING_CAP`]).
+    kill_ring: Vec<String>,
+    /// The ⌃R history-search overlay, when open.
+    search: Option<HistorySearch>,
     pub focused: bool,
 }
 
@@ -121,6 +154,33 @@ fn inline_value(v: &serde_json::Value) -> String {
     }
 }
 
+/// Render one diff-card row: a coloured gutter sigil + the (possibly word-diffed)
+/// body on the dark bed. Changed word runs carry `Modifier::REVERSED` (SGR
+/// inverse), matching OMP's intra-line diff highlight.
+fn diff_line(row: &DiffRow) -> Line<'static> {
+    let (gutter, gutter_fg, body_fg, dim) = match row.kind {
+        DiffKind::Del => (g("-", "-"), theme::RED, theme::RED, false),
+        DiffKind::Add => (g("+", "+"), theme::GREEN, theme::GREEN, false),
+        DiffKind::Context => (" ", theme::EDGE, theme::COMMENT, false),
+        DiffKind::Header => (g("┆", ":"), theme::COMMENT, theme::COMMENT, true),
+    };
+    let mut spans = vec![Span::styled(
+        format!("    {gutter} "),
+        Style::default().fg(gutter_fg),
+    )];
+    for seg in &row.segs {
+        let mut style = Style::default().fg(body_fg).bg(theme::BG_DARK);
+        if dim {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        if seg.changed {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(seg.text.clone(), style));
+    }
+    Line::from(spans)
+}
+
 /// Flatten whitespace to single spaces and truncate to `max` chars with an
 /// ellipsis.
 fn one_line(s: &str, max: usize) -> String {
@@ -134,6 +194,180 @@ fn one_line(s: &str, max: usize) -> String {
 }
 
 impl ChatComponent {
+    /// Construct the chat surface with prompt history loaded from disk (for
+    /// ↑/↓ recall and ⌃R search). `Default` leaves history empty — used in
+    /// tests that don't touch disk.
+    pub fn new() -> Self {
+        Self {
+            history: PromptHistory::load(),
+            ..Default::default()
+        }
+    }
+
+    // ── prompt history: ↑/↓ recall ───────────────────────────────────────────
+
+    /// Leave history-navigation mode (any edit or submit resets it).
+    fn reset_history_nav(&mut self) {
+        self.history_idx = None;
+        self.draft.clear();
+    }
+
+    /// ↑ — walk one step back through history. Only fires when the composer is
+    /// empty or already navigating, so it never hijacks an in-progress draft.
+    fn history_prev(&mut self) {
+        if self.history_idx.is_none() && !self.input.is_empty() {
+            return; // non-history text in the composer — don't hijack ↑
+        }
+        if self.history.is_empty() {
+            return;
+        }
+        let idx = match self.history_idx {
+            None => {
+                self.draft = self.input.clone(); // stash the (empty) draft
+                self.history.len() - 1
+            }
+            Some(0) => 0, // already at the oldest entry — stay put
+            Some(i) => i - 1,
+        };
+        self.history_idx = Some(idx);
+        self.input = self.history.get(idx).unwrap_or("").to_string();
+        self.menu_sel = 0;
+    }
+
+    /// ↓ — walk one step forward through history. Only fires while navigating;
+    /// walking past the newest entry restores the stashed draft.
+    fn history_next(&mut self) {
+        let Some(i) = self.history_idx else {
+            return; // not navigating — don't hijack ↓
+        };
+        if i + 1 < self.history.len() {
+            self.history_idx = Some(i + 1);
+            self.input = self.history.get(i + 1).unwrap_or("").to_string();
+        } else {
+            self.input = std::mem::take(&mut self.draft);
+            self.history_idx = None;
+        }
+        self.menu_sel = 0;
+    }
+
+    // ── kill ring: ⌃U / ⌃K / ⌃Y ───────────────────────────────────────────────
+
+    /// Push killed text onto the ring (newest last), capped at [`KILL_RING_CAP`].
+    fn push_kill(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.kill_ring.push(text);
+        if self.kill_ring.len() > KILL_RING_CAP {
+            self.kill_ring.remove(0);
+        }
+    }
+
+    /// ⌃U — kill the whole composer (cursor is pinned to the end, so kill-to-
+    /// start is the entire line) onto the ring.
+    fn kill_to_start(&mut self) {
+        if !self.input.is_empty() {
+            let killed = std::mem::take(&mut self.input);
+            self.push_kill(killed);
+            self.reset_history_nav();
+            self.menu_sel = 0;
+        }
+    }
+
+    /// ⌃K — kill the current (last) line's content onto the ring. With the
+    /// cursor at the end, "kill-to-end" is empty, so this is adapted to trim the
+    /// final line (equals ⌃U on a single-line composer, trims just the tail line
+    /// on a multi-line one). Judgment call — the composer has no horizontal
+    /// cursor.
+    fn kill_to_end(&mut self) {
+        let killed = match self.input.rfind('\n') {
+            Some(nl) => self.input.split_off(nl + 1),
+            None => std::mem::take(&mut self.input),
+        };
+        if !killed.is_empty() {
+            self.push_kill(killed);
+            self.reset_history_nav();
+            self.menu_sel = 0;
+        }
+    }
+
+    /// ⌃Y — yank the newest kill at the cursor (end). NOTE: a pending permission
+    /// takes precedence over yank (see `handle_key`); this only runs when none
+    /// is pending.
+    fn yank(&mut self) {
+        if let Some(kill) = self.kill_ring.last().cloned() {
+            self.input.push_str(&kill);
+            self.reset_history_nav();
+            self.menu_sel = 0;
+        }
+    }
+
+    // ── ⌃R history search ──────────────────────────────────────────────────────
+
+    /// History entries matching the current search query, best-first then newest-
+    /// first, as indices into the history ring. Empty query matches everything.
+    fn search_matches(&self) -> Vec<usize> {
+        let Some(s) = self.search.as_ref() else {
+            return Vec::new();
+        };
+        let mut scored: Vec<(usize, i32)> = self
+            .history
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| slash::subseq_score(&s.query, e).map(|sc| (i, sc)))
+            .collect();
+        // Best score first; ties break to the newer entry (higher index).
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        scored.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// Drive the ⌃R search overlay. Enter inserts the selection into the
+    /// composer; Esc dismisses; ↑/↓ move the cursor; typing filters.
+    fn handle_search_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let matches = self.search_matches();
+        match key.code {
+            KeyCode::Esc => self.search = None,
+            KeyCode::Enter => {
+                let sel = self.search.as_ref().map(|s| s.sel).unwrap_or(0);
+                if let Some(&idx) = matches.get(sel) {
+                    if let Some(entry) = self.history.get(idx) {
+                        self.input = entry.to_string();
+                    }
+                }
+                self.search = None;
+                self.reset_history_nav();
+                self.menu_sel = 0;
+            }
+            KeyCode::Up => {
+                if let Some(s) = self.search.as_mut() {
+                    s.sel = s.sel.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = self.search.as_mut() {
+                    if !matches.is_empty() {
+                        s.sel = (s.sel + 1).min(matches.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.pop();
+                    s.sel = 0;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.push(c);
+                    s.sel = 0;
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Replace the transcript with a resumed session's history (from disk).
     pub fn load_history(&mut self, msgs: Vec<crate::shell::sessions::HistoryMsg>) {
         self.turns = msgs
@@ -356,20 +590,108 @@ impl ChatComponent {
             Rect::new(inner.x, inner.y + shown as u16, inner.width, 1),
         );
     }
+
+    /// Render the ⌃R history-search overlay above the composer: a title row
+    /// carrying the live query, then fuzzy-matched history entries (newest
+    /// first) with the selection on a `BG_HL` bed. Same popup skin as the `/`
+    /// palette.
+    fn draw_search(&self, frame: &mut Frame, composer: Rect) {
+        let matches = self.search_matches();
+        let query = self.search.as_ref().map(|s| s.query.as_str()).unwrap_or("");
+        let sel = self.search.as_ref().map(|s| s.sel).unwrap_or(0);
+        let shown = matches.len().min(8);
+        let sel = sel.min(shown.saturating_sub(1));
+
+        // Width fits the widest entry (capped), with a sane floor.
+        let content_w = matches
+            .iter()
+            .take(shown)
+            .filter_map(|&i| self.history.get(i))
+            .map(|e| e.chars().take(60).count())
+            .max()
+            .unwrap_or(24)
+            .max(query.chars().count() + 4);
+        let width = ((content_w as u16) + 6).min(composer.width).max(24);
+        let height = shown.max(1) as u16 + 3; // top+bottom border + footer row
+        let y = composer.y.saturating_sub(height);
+        let area = Rect::new(composer.x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} history: {query}", g("⌕", "?")),
+                Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        if matches.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    " no matching history",
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+        }
+        for (i, &hidx) in matches.iter().take(shown).enumerate() {
+            let selected = i == sel;
+            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+            let fg = if selected { theme::CYAN } else { theme::FG };
+            let marker = if selected { g("❯", ">") } else { " " };
+            // Flatten newlines (multi-line prompts) into the one-row preview.
+            let preview = self
+                .history
+                .get(hidx)
+                .map(|e| one_line(e, inner.width.saturating_sub(4) as usize))
+                .unwrap_or_default();
+            let row = Line::from(vec![
+                Span::styled(format!(" {marker} "), Style::default().fg(theme::CYAN)),
+                Span::styled(preview, Style::default().fg(fg)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(row).style(Style::default().bg(bed)),
+                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            );
+        }
+        // Footer hint on the last inner row.
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {} select · ⏎ insert · esc dismiss", g("↑↓", "^v")),
+                Style::default().fg(theme::COMMENT),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, inner.y + shown.max(1) as u16, inner.width, 1),
+        );
+    }
 }
 
 impl Component for ChatComponent {
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // The ⌃R history-search overlay is modal: while open, all keys drive it.
+        if self.search.is_some() {
+            return self.handle_search_key(key);
+        }
         // Permission decisions work even mid-stream (legacy ⌃Y/⌃N bindings).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('y') => {
+                    // Permission-pending takes precedence over yank; ⌃Y only
+                    // yanks the kill ring when no permission is waiting.
                     if let Some(id) = self.pending_permission() {
                         return Some(Action::PermissionDecided {
                             permission_id: id,
                             allow: true,
                         });
                     }
+                    self.yank();
                     return None;
                 }
                 KeyCode::Char('n') => {
@@ -386,9 +708,24 @@ impl Component for ChatComponent {
                     self.input.push('\n');
                     return None;
                 }
-                // ⌃O: toggle tool-card expansion (full output ↔ tail window).
+                // ⌃O: toggle tool-card expansion (full output/diff ↔ tail window).
                 KeyCode::Char('o') => {
                     self.tools_expanded = !self.tools_expanded;
+                    return None;
+                }
+                // ⌃R: open the fuzzy prompt-history search overlay.
+                KeyCode::Char('r') => {
+                    self.search = Some(HistorySearch::default());
+                    return None;
+                }
+                // ⌃U: kill the whole composer to the ring.
+                KeyCode::Char('u') => {
+                    self.kill_to_start();
+                    return None;
+                }
+                // ⌃K: kill the current line's tail to the ring.
+                KeyCode::Char('k') => {
+                    self.kill_to_end();
                     return None;
                 }
                 _ => {}
@@ -439,11 +776,23 @@ impl Component for ChatComponent {
                 self.scroll_back = self.scroll_back.saturating_sub(10);
                 None
             }
+            // ↑/↓ recall history when the composer is empty or already
+            // navigating; otherwise they no-op (scrolling is wheel/PgUp).
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                self.history_prev();
+                None
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                self.history_next();
+                None
+            }
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
                     return None;
                 }
+                self.history.push(&text); // persist for ↑/↓ + ⌃R recall
+                self.reset_history_nav();
                 self.input.clear();
                 self.scroll_back = 0; // sending snaps to the live tail
                 self.turns.push(Turn::User(text.clone()));
@@ -452,11 +801,13 @@ impl Component for ChatComponent {
             }
             (KeyCode::Backspace, _) => {
                 self.input.pop();
+                self.history_idx = None; // editing exits history navigation
                 self.menu_sel = 0; // query narrowed → reset palette cursor
                 None
             }
             (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
                 self.input.push(c);
+                self.history_idx = None; // editing exits history navigation
                 self.menu_sel = 0; // query changed → reset palette cursor
                 None
             }
@@ -508,12 +859,19 @@ impl Component for ChatComponent {
                 AgentTurnEvent::AssistantTextDelta { delta, .. } => self.push_assistant(delta),
                 AgentTurnEvent::ThinkingDelta { delta, .. } => self.push_thinking(delta),
                 AgentTurnEvent::ToolCallStarted { call, .. } => {
+                    let name = call.name.to_string();
+                    // Edit tools render as diff cards; a malformed payload yields
+                    // `None` and falls back to the plain output card.
+                    let diff = diff::is_edit_tool(&name)
+                        .then(|| diff::edit_tool_diff(&name, &call.args_json))
+                        .flatten();
                     self.turns.push(Turn::Tool {
                         id: call.id.clone(),
-                        name: call.name.to_string(),
+                        name,
                         args: summarize_args(&call.args_json),
                         output: String::new(),
                         status: ToolStatus::Running,
+                        diff,
                     });
                 }
                 AgentTurnEvent::ToolCallChunk { call_id, chunk, .. } => {
@@ -548,9 +906,14 @@ impl Component for ChatComponent {
             .constraints([Constraint::Min(3), Constraint::Length(input_lines + 1)])
             .split(area);
 
-        // Command palette state for this frame (empty unless in `/`-mode). Clamp
-        // the selection cursor in case the match set shrank since last keypress.
-        let menu = self.slash_matches();
+        // Command palette state for this frame (empty unless in `/`-mode, and
+        // suppressed while the ⌃R search overlay owns the screen). Clamp the
+        // selection cursor in case the match set shrank since last keypress.
+        let menu = if self.search.is_some() {
+            Vec::new()
+        } else {
+            self.slash_matches()
+        };
         if !menu.is_empty() {
             self.menu_sel = self.menu_sel.min(menu.len() - 1);
         }
@@ -643,6 +1006,7 @@ impl Component for ChatComponent {
                     args,
                     output,
                     status,
+                    diff,
                     ..
                 } => {
                     // Card header: status glyph + tool name + one-line args.
@@ -666,32 +1030,60 @@ impl Component for ChatComponent {
                     }
                     lines.push(Line::from(header));
 
-                    // Body: full output when expanded (⌃O), else a tail window
-                    // with a "+N more" hint on the rail.
-                    let body: Vec<&str> = output.lines().collect();
-                    if !body.is_empty() {
-                        let hidden = if tools_expanded {
-                            0
-                        } else {
-                            body.len().saturating_sub(TOOL_TAIL_ROWS)
-                        };
-                        for l in &body[hidden..] {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("    {} ", g("│", "|")),
-                                    Style::default().fg(theme::EDGE),
-                                ),
-                                Span::styled(
-                                    l.to_string(),
-                                    Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
-                                ),
-                            ]));
+                    match diff {
+                        // Edit tools render a diff card: removed/added gutters in
+                        // theme colours, word-level intra-line changes reversed,
+                        // truncated to DIFF_TAIL_ROWS unless expanded (⌃O).
+                        Some(rows) => {
+                            let total = rows.len();
+                            let shown = if tools_expanded {
+                                total
+                            } else {
+                                total.min(DIFF_TAIL_ROWS)
+                            };
+                            for row in &rows[..shown] {
+                                lines.push(diff_line(row));
+                            }
+                            if shown < total {
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "    {} +{} more · ⌃O expand",
+                                        g("┄", ".."),
+                                        total - shown
+                                    ),
+                                    Style::default().fg(theme::COMMENT),
+                                )));
+                            }
                         }
-                        if hidden > 0 {
-                            lines.push(Line::from(Span::styled(
-                                format!("    {} +{hidden} more · ⌃O expand", g("┄", "..")),
-                                Style::default().fg(theme::COMMENT),
-                            )));
+                        // Plain card: full output when expanded (⌃O), else a tail
+                        // window with a "+N more" hint on the rail.
+                        None => {
+                            let body: Vec<&str> = output.lines().collect();
+                            if !body.is_empty() {
+                                let hidden = if tools_expanded {
+                                    0
+                                } else {
+                                    body.len().saturating_sub(TOOL_TAIL_ROWS)
+                                };
+                                for l in &body[hidden..] {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(
+                                            format!("    {} ", g("│", "|")),
+                                            Style::default().fg(theme::EDGE),
+                                        ),
+                                        Span::styled(
+                                            l.to_string(),
+                                            Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
+                                        ),
+                                    ]));
+                                }
+                                if hidden > 0 {
+                                    lines.push(Line::from(Span::styled(
+                                        format!("    {} +{hidden} more · ⌃O expand", g("┄", "..")),
+                                        Style::default().fg(theme::COMMENT),
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
@@ -748,14 +1140,16 @@ impl Component for ChatComponent {
             .saturating_sub(body.height)
             .saturating_sub(self.scroll_back as u16);
         frame.render_widget(para.scroll((scroll, 0)), body);
-        let footer_hint = if !menu.is_empty() {
+        let footer_hint = if self.search.is_some() {
+            " history search · ⏎ insert · esc dismiss".to_string()
+        } else if !menu.is_empty() {
             " command palette · esc to dismiss".to_string()
         } else if self.scroll_back > 0 {
             format!(" ↑{} lines back · PgDn to tail", self.scroll_back)
         } else if self.busy {
             " streaming…".to_string()
         } else {
-            " ⏎ send · ⌃J newline · ⌃O tools · / for commands".to_string()
+            " ⏎ send · ⌃J newline · ⌃O tools · ⌃R history · / commands".to_string()
         };
         panel::footer(frame, chunks[0], &footer_hint);
 
@@ -802,6 +1196,10 @@ impl Component for ChatComponent {
         // ── `/` command palette overlay, floated just above the composer ─────
         if !menu.is_empty() {
             self.draw_menu(frame, comp, &menu);
+        }
+        // ── ⌃R history-search overlay, floated just above the composer ───────
+        if self.search.is_some() {
+            self.draw_search(frame, comp);
         }
     }
 }
@@ -997,5 +1395,159 @@ mod tests {
         chat.update(&extension("longhouse", json!({ "note": "not for us" })));
         chat.update(&extension("advisor", json!({ "note": 42 })));
         assert!(chat.turns.is_empty());
+    }
+
+    // ── composer history + kill ring (W2 slice) ───────────────────────────────
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// A chat seeded with an in-memory prompt history (no disk I/O: the default
+    /// `PromptHistory` has no backing file, so `push` never persists).
+    fn chat_with_hist(entries: &[&str]) -> ChatComponent {
+        let mut chat = ChatComponent::default();
+        for e in entries {
+            chat.history.push(e);
+        }
+        chat
+    }
+
+    #[test]
+    fn up_down_walks_history_when_composer_empty() {
+        let mut chat = chat_with_hist(&["first", "second"]);
+        chat.handle_key(key(KeyCode::Up)); // → newest
+        assert_eq!(chat.input, "second");
+        chat.handle_key(key(KeyCode::Up)); // → older
+        assert_eq!(chat.input, "first");
+        chat.handle_key(key(KeyCode::Up)); // clamps at oldest
+        assert_eq!(chat.input, "first");
+        chat.handle_key(key(KeyCode::Down)); // → newer
+        assert_eq!(chat.input, "second");
+        chat.handle_key(key(KeyCode::Down)); // past newest → restore draft (empty)
+        assert_eq!(chat.input, "");
+        assert!(chat.history_idx.is_none());
+    }
+
+    #[test]
+    fn up_down_do_not_hijack_a_draft() {
+        let mut chat = chat_with_hist(&["recall me"]);
+        chat.input = "in-progress draft".into();
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "in-progress draft", "↑ must not clobber a draft");
+        chat.handle_key(key(KeyCode::Down));
+        assert_eq!(chat.input, "in-progress draft", "↓ no-ops when not navigating");
+    }
+
+    #[test]
+    fn history_dedupes_and_persists_on_submit() {
+        let mut chat = chat_with("build it");
+        chat.handle_key(key(KeyCode::Enter));
+        chat.input = "build it".into(); // consecutive repeat
+        chat.handle_key(key(KeyCode::Enter));
+        assert_eq!(chat.history.len(), 1, "consecutive repeat is deduped");
+        // ↑ recalls the submitted prompt.
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "build it");
+    }
+
+    #[test]
+    fn ctrl_r_opens_fuzzy_history_search_reusing_slash_scorer() {
+        let mut chat = chat_with_hist(&["cargo build", "git status", "cargo test"]);
+        chat.handle_key(ctrl('r'));
+        assert!(chat.search.is_some(), "⌃R opens the search overlay");
+        for c in "crg".chars() {
+            chat.handle_key(key(KeyCode::Char(c)));
+        }
+        // Fuzzy subsequence "crg" hits both cargo entries, newest first; the
+        // ranking reuses slash::subseq_score.
+        let texts: Vec<&str> = chat
+            .search_matches()
+            .iter()
+            .map(|&i| chat.history.get(i).unwrap())
+            .collect();
+        assert_eq!(texts, vec!["cargo test", "cargo build"]);
+        // Enter inserts the selected (top) match into the composer and closes.
+        chat.handle_key(key(KeyCode::Enter));
+        assert_eq!(chat.input, "cargo test");
+        assert!(chat.search.is_none());
+    }
+
+    #[test]
+    fn ctrl_r_search_esc_dismisses_without_touching_composer() {
+        let mut chat = chat_with_hist(&["something"]);
+        chat.input = "keep me".into();
+        chat.handle_key(ctrl('r'));
+        chat.handle_key(key(KeyCode::Esc));
+        assert!(chat.search.is_none());
+        assert_eq!(chat.input, "keep me");
+    }
+
+    #[test]
+    fn kill_to_start_then_yank_roundtrips() {
+        let mut chat = chat_with("hello world");
+        chat.handle_key(ctrl('u'));
+        assert_eq!(chat.input, "");
+        assert_eq!(chat.kill_ring.last().map(String::as_str), Some("hello world"));
+        chat.handle_key(ctrl('y'));
+        assert_eq!(chat.input, "hello world", "⌃Y yanks the newest kill at the end");
+    }
+
+    #[test]
+    fn kill_to_end_trims_the_last_line() {
+        let mut chat = chat_with("line one\nline two");
+        chat.handle_key(ctrl('k'));
+        assert_eq!(chat.input, "line one\n");
+        assert_eq!(chat.kill_ring.last().map(String::as_str), Some("line two"));
+    }
+
+    #[test]
+    fn kill_ring_is_capped() {
+        let mut chat = chat_with("");
+        for i in 0..(KILL_RING_CAP + 3) {
+            chat.input = format!("kill {i}");
+            chat.handle_key(ctrl('u'));
+        }
+        assert_eq!(chat.kill_ring.len(), KILL_RING_CAP);
+        // Newest survives; oldest was dropped from the front.
+        assert_eq!(
+            chat.kill_ring.last().map(String::as_str),
+            Some(&format!("kill {}", KILL_RING_CAP + 2)[..])
+        );
+    }
+
+    #[test]
+    fn ctrl_y_precedence_permission_beats_yank() {
+        let mut chat = chat_with("yankable");
+        chat.handle_key(ctrl('u')); // ring = ["yankable"], composer empty
+        let pid = PermissionId::new_v4();
+        chat.update(&perm_envelope(
+            pid,
+            OceanEvent::PermissionRequest {
+                tool: "bash".into(),
+                reason: "rm -rf x".into(),
+                args: json!({}),
+            },
+        ));
+        // Permission pending → ⌃Y allows, does NOT yank.
+        let act = chat.handle_key(ctrl('y'));
+        assert!(matches!(
+            act,
+            Some(Action::PermissionDecided { permission_id, allow: true }) if permission_id == pid
+        ));
+        assert_eq!(chat.input, "", "yank must not fire while a permission is pending");
+        // Resolve the permission; now ⌃Y yanks.
+        chat.update(&perm_envelope(
+            pid,
+            OceanEvent::PermissionDecision {
+                allowed: true,
+                reason: None,
+            },
+        ));
+        chat.handle_key(ctrl('y'));
+        assert_eq!(chat.input, "yankable");
     }
 }

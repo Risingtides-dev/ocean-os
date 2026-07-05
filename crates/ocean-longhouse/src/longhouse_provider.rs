@@ -320,6 +320,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             session_id: Some("test".into()),
             hashline: false,
+            artifacts: false,
         }
     }
 

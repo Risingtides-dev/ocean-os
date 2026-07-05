@@ -55,7 +55,16 @@ pub fn filter(query: &str) -> Vec<(&'static SlashCommand, i32)> {
 /// order. Score rewards start-of-name hits, contiguous runs, and a whole-query
 /// prefix, so `/model` beats a scattered match for `mod`.
 fn fuzzy_score(query: &str, cmd: &SlashCommand) -> Option<i32> {
-    let name = cmd.name.trim_start_matches('/').to_lowercase();
+    subseq_score(query, cmd.name.trim_start_matches('/'))
+}
+
+/// Subsequence fuzzy scorer over an arbitrary haystack (case-folded). Shared by
+/// the `/` palette and the ⌃R prompt-history search so both rank identically.
+/// Returns `None` when `query` is not an in-order subsequence of `hay`; an empty
+/// query scores 0 (matches everything). Rewards start-of-string hits, contiguous
+/// runs, and a whole-query prefix.
+pub(crate) fn subseq_score(query: &str, hay: &str) -> Option<i32> {
+    let name = hay.to_lowercase();
     let q = query.to_lowercase();
     if q.is_empty() {
         return Some(0);

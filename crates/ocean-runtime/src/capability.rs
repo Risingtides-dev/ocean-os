@@ -18,9 +18,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ocean_protocol::Content;
+use serde_json::Value;
 
+use crate::artifacts::{ArtifactStore, SharedArtifacts};
 use crate::tools::default_tools;
-use crate::types::AgentTool;
+use crate::types::{AgentTool, AgentToolResult};
 
 /// Shared, reference-counted tool handle. The loop and registry pass these
 /// around; cloning is a cheap `Arc` bump.
@@ -45,6 +48,13 @@ pub struct SessionContext {
     /// (web/voice) so their tool contract is unchanged. Resolved per-turn from
     /// the daemon's `HarnessProfile`.
     pub hashline: bool,
+    /// Artifact-spill harness capability (W3 / harness profiles). When true,
+    /// every tool's oversized text output is truncated for the model with an
+    /// explicit notice and the full output is spilled to the session artifact
+    /// store, readable back via `read artifact://<id>`; `read` also gains
+    /// `artifact://` resolution. Off for lean surfaces (web/voice). Resolved
+    /// per-turn from the daemon's `HarnessProfile`.
+    pub artifacts: bool,
 }
 
 /// Coarse health of a capability provider, surfaced for diagnostics.
@@ -83,6 +93,16 @@ pub trait CapabilityProvider: Send + Sync {
     async fn health(&self) -> ProviderHealth {
         ProviderHealth::Ready
     }
+
+    /// The session-scoped artifact store this provider owns, if any (W3). The
+    /// [`CapabilityRegistry`] asks each provider for one so it can wrap the whole
+    /// merged toolset (built-ins + MCP) in a spill decorator sharing exactly the
+    /// store `read` resolves `artifact://` against. Only [`BuiltinProvider`] owns
+    /// a store; every other provider returns `None` (the default) and the
+    /// registry uses the first store offered.
+    fn artifacts_store(&self, _session_id: &str) -> Option<SharedArtifacts> {
+        None
+    }
 }
 
 /// The built-in toolset, wrapped as a [`CapabilityProvider`].
@@ -98,6 +118,12 @@ pub struct BuiltinProvider {
     snapshots: std::sync::Mutex<
         std::collections::HashMap<String, crate::tools::read::SharedSnapshots>,
     >,
+    /// Session-scoped artifact spill stores, keyed by session id (W3). Lives on
+    /// the provider (Arc'd for the runtime's life) so a spill in one turn and a
+    /// `read artifact://` in a later turn share one store — same shape as
+    /// `snapshots` above.
+    artifacts:
+        std::sync::Mutex<std::collections::HashMap<String, SharedArtifacts>>,
 }
 
 impl BuiltinProvider {
@@ -105,6 +131,7 @@ impl BuiltinProvider {
         Self {
             tools: default_tools(),
             snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
+            artifacts: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -120,6 +147,14 @@ impl BuiltinProvider {
             })
             .clone()
     }
+
+    /// Get-or-create the artifact spill store for a session (W3).
+    fn artifacts_for(&self, session_id: &str) -> SharedArtifacts {
+        let mut map = self.artifacts.lock().expect("artifacts map poisoned");
+        map.entry(session_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(ArtifactStore::default())))
+            .clone()
+    }
 }
 
 impl Default for BuiltinProvider {
@@ -132,6 +167,12 @@ impl Default for BuiltinProvider {
 impl CapabilityProvider for BuiltinProvider {
     fn id(&self) -> &str {
         "builtin"
+    }
+
+    /// The built-in provider owns the session artifact stores (W3); the registry
+    /// wraps the merged toolset in a spill decorator sharing this exact store.
+    fn artifacts_store(&self, session_id: &str) -> Option<SharedArtifacts> {
+        Some(self.artifacts_for(session_id))
     }
 
     async fn tools(&self, ctx: &SessionContext) -> Vec<SharedTool> {
@@ -165,14 +206,22 @@ impl CapabilityProvider for BuiltinProvider {
                     "read" => {
                         // Hashline profile: `read` tags output + records snapshots
                         // into the session store. Otherwise the classic read.
-                        *tool = if ctx.hashline {
-                            Arc::new(crate::tools::read::ReadTool::for_cwd_with_snapshots(
+                        let mut read = if ctx.hashline {
+                            crate::tools::read::ReadTool::for_cwd_with_snapshots(
                                 ctx.cwd.clone(),
                                 self.snapshots_for(session_id),
-                            ))
+                            )
                         } else {
-                            Arc::new(crate::tools::read::ReadTool::for_cwd(ctx.cwd.clone()))
+                            crate::tools::read::ReadTool::for_cwd(ctx.cwd.clone())
                         };
+                        // Artifact-spill profile: bind the session store so
+                        // `read artifact://<id>` resolves spilled outputs. Same
+                        // store the spill decorator writes into. Independent of
+                        // the hashline flag.
+                        if ctx.artifacts {
+                            read = read.with_artifacts(self.artifacts_for(session_id));
+                        }
+                        *tool = Arc::new(read);
                     }
                     "write" => {
                         *tool = Arc::new(crate::tools::write::WriteTool::for_cwd(ctx.cwd.clone()));
@@ -266,7 +315,140 @@ impl CapabilityRegistry {
                 }
             }
         }
+        // W3 — output-meta + artifact spill. When the turn's artifact capability
+        // is on, wrap EVERY merged tool (built-ins + MCP) in a `SpillingTool`
+        // decorator that truncates oversized text output with a notice and spills
+        // the full output to the session store. The store comes from the first
+        // provider that owns one (the built-in provider) so it's exactly the
+        // store `read` resolves `artifact://` against. Off (or no session / no
+        // store) → the toolset is returned byte-for-byte unchanged.
+        if ctx.artifacts {
+            if let Some(session_id) = &ctx.session_id {
+                if let Some(store) = self
+                    .providers
+                    .iter()
+                    .find_map(|p| p.artifacts_store(session_id))
+                {
+                    out = out
+                        .into_iter()
+                        .map(|t| Arc::new(SpillingTool::new(t, store.clone())) as SharedTool)
+                        .collect();
+                }
+            }
+        }
         out
+    }
+}
+
+/// Byte threshold above which a single tool-result text block is spilled to an
+/// artifact (W3). ~24 KB — well below the transcript cap in the agent loop, so a
+/// spilled result is small enough that the model reasons over the HEAD + notice
+/// while the full bytes stay one `read artifact://<id>` away. Bytes ≈ characters
+/// for the ASCII-heavy tool output this fires on.
+pub const SPILL_THRESHOLD_BYTES: usize = 24_000;
+
+/// Bytes of the HEAD kept in-context when a text block is spilled (W3). The cut
+/// is backed up to the last line boundary so the model never sees a half-line.
+pub const SPILL_HEAD_BYTES: usize = 16_000;
+
+/// A [`SharedTool`] decorator that spills oversized text output to a session
+/// artifact store (W3 output-meta + artifact spill).
+///
+/// It forwards every part of the tool contract (name, label, description,
+/// parameters, permission, execute) to the inner tool, then post-processes the
+/// result: any text block over [`SPILL_THRESHOLD_BYTES`] is replaced with its
+/// HEAD (cut at a line boundary) plus a truncation notice stating the shown
+/// range and the `read artifact://<id>` handle for the full output, which is
+/// `put` into the store. Under-threshold blocks, non-text blocks, `details`,
+/// `terminate`, and `side_effects` pass through untouched — so with the same
+/// input a small result is byte-identical to the undecorated tool.
+pub struct SpillingTool {
+    inner: SharedTool,
+    store: SharedArtifacts,
+}
+
+impl SpillingTool {
+    pub fn new(inner: SharedTool, store: SharedArtifacts) -> Self {
+        Self { inner, store }
+    }
+
+    /// Spill one oversized text block: `put` the full text and return the HEAD +
+    /// notice. `tool` names the producing tool (recorded on the artifact).
+    fn spill_text(&self, tool: &str, text: String) -> String {
+        // Cut the HEAD at a char boundary at or before the byte budget, then back
+        // up to the last newline so we never show a partial line.
+        let mut head_end = SPILL_HEAD_BYTES.min(text.len());
+        while head_end > 0 && !text.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        if let Some(nl) = text[..head_end].rfind('\n') {
+            head_end = nl + 1; // keep the newline so the head ends cleanly
+        }
+        let head = &text[..head_end];
+        let shown_lines = head.lines().count();
+        let total_lines = text.lines().count();
+
+        let id = match self.store.lock() {
+            Ok(mut store) => store.put(tool, text.clone()),
+            // Store poisoned: fall back to the raw text rather than losing it.
+            Err(_) => return text,
+        };
+
+        format!(
+            "{head}\n[output truncated: showing lines 1-{shown_lines} of {total_lines} · \
+             full output: read artifact://{id}]"
+        )
+    }
+}
+
+#[async_trait]
+impl AgentTool for SpillingTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+    fn requires_permission(&self) -> bool {
+        self.inner.requires_permission()
+    }
+    async fn execute(&self, tool_call_id: &str, args: Value) -> Result<AgentToolResult, String> {
+        // A `read artifact://<id>` is the model deliberately pulling spilled
+        // content back. Re-spilling that output would be circular — it would
+        // mint a fresh artifact of an artifact and stop the model ever
+        // retrieving the full thing. So this one call bypasses the decorator and
+        // returns the (windowed) artifact bytes verbatim. The agent loop's
+        // transcript cap is the backstop against an unbounded full read.
+        let is_artifact_read = self.inner.name() == "read"
+            && args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|p| p.starts_with("artifact://"))
+                .unwrap_or(false);
+        let mut result = self.inner.execute(tool_call_id, args).await?;
+        if is_artifact_read {
+            return Ok(result);
+        }
+        let tool = self.inner.name().to_string();
+        result.content = result
+            .content
+            .into_iter()
+            .map(|c| match c {
+                Content::Text { text } if text.len() > SPILL_THRESHOLD_BYTES => {
+                    Content::Text {
+                        text: self.spill_text(&tool, text),
+                    }
+                }
+                other => other,
+            })
+            .collect();
+        Ok(result)
     }
 }
 
@@ -281,6 +463,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             session_id: Some("test-session".into()),
             hashline: false,
+            artifacts: false,
         }
     }
 
@@ -386,6 +569,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             session_id: None,
             hashline: false,
+            artifacts: false,
         };
         let got = provider.tools(&no_sess).await;
         let wait = got
@@ -444,6 +628,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             session_id: None,
             hashline: false,
+            artifacts: false,
         };
         let got = provider.tools(&no_sess).await;
         let tool = got
