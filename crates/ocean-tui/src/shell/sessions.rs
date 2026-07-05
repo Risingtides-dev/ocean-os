@@ -24,6 +24,14 @@ pub struct Session {
 
 impl Session {
     /// The command that resumes this session, run in `cwd`.
+    ///
+    /// Always forces `--legacy`: this spawns inside the workbench's own
+    /// terminal dock, and once this branch merges, `ocean` (no flags) IS the
+    /// workbench. Without `--legacy` here, resuming a session from the dock
+    /// would recursively launch a whole second workbench inside its own PTY
+    /// pane. `--legacy` is the escape hatch main.rs already wires up
+    /// (`OCEAN_TUI_LEGACY` / `--legacy`, see `main.rs`) to force the old,
+    /// non-workbench TUI — exactly what a nested dock session needs.
     pub fn resume_command(&self) -> (String, Vec<String>) {
         (
             "ocean".into(),
@@ -32,6 +40,7 @@ impl Session {
                 self.cwd.display().to_string(),
                 "--session".into(),
                 self.id.clone(),
+                "--legacy".into(),
             ],
         )
     }
@@ -275,15 +284,45 @@ fn message_text(m: &serde_json::Value) -> String {
     String::new()
 }
 
-/// Strip the `[TUI]`/`[ACP]` surface prefix operators prepend to prompts.
+/// Client-type flags the daemon stamps onto every user turn (see
+/// `ocean-agent`'s `surface_flag`, the single source of truth this mirrors:
+/// `TUI`, `BRWSR`, `WEB`, `GUI`, `CLI`, `VOX`, `ACP`, `SLACK`, `CNVS`, `MOBL`,
+/// and `?` for an unrecognised surface). Matched case-insensitively so
+/// `[tui]`/`[Tui]`/`[TUI]` are all caught.
+const CLIENT_TAGS: [&str; 11] = [
+    "tui", "brwsr", "web", "gui", "cli", "vox", "acp", "slack", "cnvs", "mobl", "?",
+];
+
+/// Strip a leading client-type tag (`[TUI]`, `[ACP]`, ...) the daemon writes
+/// ahead of the real prompt text, returning the text with the tag (and its
+/// brackets) removed.
+fn strip_client_tag(t: &str) -> Option<&str> {
+    let inner = t.strip_prefix('[')?;
+    let end = inner.find(']')?;
+    let tag = inner[..end].to_ascii_lowercase();
+    if CLIENT_TAGS.contains(&tag.as_str()) {
+        Some(inner[end + 1..].trim_start())
+    } else {
+        None
+    }
+}
+
+/// Clean a transcript line of its client-type tag. Handles both the
+/// multi-line shape (tag + a one-line notice, blank line, then the real
+/// body — the notice line is discarded along with the tag) and the
+/// single-line shape (tag directly followed by the text on the same line,
+/// nothing else to discard). The single-line shape used to leak the raw
+/// `[TUI]` tag into resumed history because the old check only fired when a
+/// `"\n\n"` separator was present.
 fn clean_history_text(s: &str) -> String {
     let t = s.trim();
-    if (t.starts_with("[TUI]") || t.starts_with("[ACP]")) && t.contains("\n\n") {
-        if let Some((_, rest)) = t.split_once("\n\n") {
-            return rest.trim().to_string();
-        }
+    match strip_client_tag(t) {
+        Some(rest) => match rest.split_once("\n\n") {
+            Some((_, after_blank)) => after_blank.trim().to_string(),
+            None => rest.to_string(),
+        },
+        None => t.to_string(),
     }
-    t.to_string()
 }
 
 /// Human "2h", "3d", "now" from a unix-seconds mtime.
@@ -342,6 +381,79 @@ mod tests {
         let root = PathBuf::from("/tmp/project-a");
         let v = json!({ "id": "x", "workspace_root": "/tmp/project-b", "messages": [] });
         assert!(ocean_session_from_value(&root, Path::new("/tmp/s.json"), &v).is_none());
+    }
+
+    /// Defect 5: resuming a session from the dock must never re-launch the
+    /// workbench recursively. Once `ocean` (no flags) IS the workbench, the
+    /// resume command MUST force `--legacy` so the hydrated PTY runs the old
+    /// TUI, not another copy of the shell it's embedded in.
+    #[test]
+    fn resume_command_forces_legacy_flag() {
+        let s = Session {
+            id: "7f99e2ec-2d8e-44d4-b61c-8c4d40bd850b".into(),
+            title: "t".into(),
+            cwd: PathBuf::from("/tmp/ocean-tui-root"),
+            worktree: "main".into(),
+            mtime: 0,
+            path: PathBuf::from("/tmp/s.json"),
+        };
+        let (cmd, args) = s.resume_command();
+        assert_eq!(cmd, "ocean");
+        assert!(
+            args.iter().any(|a| a == "--legacy"),
+            "resume command must pass --legacy to avoid launching the workbench inside its own dock: {args:?}"
+        );
+    }
+
+    /// Defect 4: the `[TUI]` client-type tag must be stripped from
+    /// single-line resumed history entries too, not just multi-line ones
+    /// (which already worked via the `"\n\n"` separator check).
+    #[test]
+    fn clean_history_text_strips_tag_from_single_line_entry() {
+        assert_eq!(clean_history_text("[TUI] hello there"), "hello there");
+        // Case-insensitive, and other bracketed client-type tags the daemon
+        // may emit (see `ocean-agent::surface_flag`) are stripped the same way.
+        assert_eq!(clean_history_text("[tui] hello there"), "hello there");
+        assert_eq!(clean_history_text("[ACP] fix the bug"), "fix the bug");
+        assert_eq!(clean_history_text("[WEB] ship it"), "ship it");
+        // Multi-line shape (tag + notice line, blank line, then body) keeps
+        // working exactly as before.
+        assert_eq!(
+            clean_history_text("[TUI] PM room.\n\nmake sessions visible"),
+            "make sessions visible"
+        );
+        // Untagged text is left untouched.
+        assert_eq!(clean_history_text("no tag here"), "no tag here");
+    }
+
+    #[test]
+    fn load_transcript_strips_tag_from_single_line_history_message() {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-tui-sessions-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("session.json");
+        let v = json!({
+            "id": "x",
+            "messages": [{
+                "role": "user",
+                "content": "[TUI] hello there"
+            }]
+        });
+        fs::write(&path, v.to_string()).expect("write fixture");
+
+        let hist = load_transcript(&path);
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].role, "user");
+        assert_eq!(hist[0].text, "hello there");
+        assert!(!hist[0].text.contains("[TUI]"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Live check against the real session store. Ignored by default (machine-
