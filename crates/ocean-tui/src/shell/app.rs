@@ -77,6 +77,10 @@ pub struct App {
     center: Center,
     focus: Focus,
     session_id: Option<AgentSessionId>,
+    /// The live SSE subscription for `session_id`. Held so a session switch
+    /// aborts the superseded stream instead of leaking it (a leaked stream
+    /// kept pumping a stale session's events into the chat).
+    stream_task: Option<tokio::task::JoinHandle<()>>,
     status: String,
     should_quit: bool,
     actions_tx: mpsc::UnboundedSender<Action>,
@@ -127,6 +131,7 @@ impl App {
             center: Center::Chat,
             focus: Focus::Center,
             session_id: None,
+            stream_task: None,
             status: "connecting…".into(),
             should_quit: false,
             actions_tx,
@@ -383,7 +388,17 @@ impl App {
                 return;
             }
             Action::Status(s) | Action::Error(s) => self.status = s.clone(),
-            Action::SessionBound(id) => self.session_id = Some(*id),
+            Action::SessionBound(id) => self.bind_session(*id),
+            // Session hygiene: only fold in agent events for the BOUND session.
+            // A superseded stream's last envelopes (or an unscoped daemon echo)
+            // must never pollute the current chat.
+            Action::AgentEvent(evt) => {
+                if let (Some(bound), Some(evt_sid)) = (self.session_id, evt.session_id()) {
+                    if bound != evt_sid {
+                        return;
+                    }
+                }
+            }
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
             Action::OpenSession { line, cwd } => {
                 // Hydrate into the terminal DOCK (appears at the bottom of the
@@ -399,9 +414,8 @@ impl App {
             Action::ResumeSession { id, path } => {
                 self.chat
                     .load_history(crate::shell::sessions::load_transcript(path));
-                self.session_id = Some(*id);
+                self.bind_session_with(*id, false); // transcript came from disk
                 self.rail.live_id = Some(id.0.to_string());
-                self.client.spawn_event_stream(*id, self.actions_tx.clone());
                 self.status = format!("resumed session {:.8}", id.0.to_string());
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
@@ -453,6 +467,29 @@ impl App {
         self.apply_focus();
     }
 
+    /// Bind the chat to `id`: abort any superseded stream and subscribe a fresh
+    /// self-healing one. Idempotent for the already-bound session.
+    fn bind_session_with(&mut self, id: AgentSessionId, replay_first: bool) {
+        if self.session_id == Some(id) && self.stream_task.as_ref().is_some_and(|t| !t.is_finished())
+        {
+            return;
+        }
+        if let Some(task) = self.stream_task.take() {
+            task.abort();
+        }
+        self.session_id = Some(id);
+        self.stream_task = Some(self.client.spawn_event_stream(
+            id,
+            self.actions_tx.clone(),
+            replay_first,
+        ));
+    }
+
+    /// Mint-path bind: fresh chat, replay the session's buffered head.
+    fn bind_session(&mut self, id: AgentSessionId) {
+        self.bind_session_with(id, true);
+    }
+
     fn apply_focus(&mut self) {
         self.rail.focused = self.focus == Focus::Sessions;
         self.tree.focused = self.focus == Focus::Tree;
@@ -478,7 +515,8 @@ impl App {
                 Some(id) => id,
                 None => match client.create_agent_session(&workspace).await {
                     Ok(resp) => {
-                        client.spawn_event_stream(resp.session_id, tx.clone());
+                        // SessionBound → App::bind_session spawns the (single,
+                        // self-healing) stream and holds its handle.
                         let _ = tx.send(Action::SessionBound(resp.session_id));
                         resp.session_id
                     }

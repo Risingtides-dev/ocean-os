@@ -93,46 +93,82 @@ impl DaemonClient {
     }
 
     /// Subscribe to `/v1/agent/events` scoped to `session_id`, forwarding each
-    /// decoded `AgentTurnEvent` onto the action channel until the stream ends.
-    /// Spawned as a background task; returns immediately.
+    /// decoded `AgentTurnEvent` onto the action channel. SELF-HEALING: when the
+    /// stream drops (daemon restart, idle timeout, network blip), it reconnects
+    /// with the daemon's `Last-Event-ID` replay (OCEAN-129) so no deltas are
+    /// lost — a dead stream was silently eating turn output before this.
+    /// Returns the task handle so a superseding subscription (session switch)
+    /// can abort this one.
     pub fn spawn_event_stream(
         &self,
         session_id: AgentSessionId,
         actions: mpsc::UnboundedSender<Action>,
-    ) {
+        replay_first: bool,
+    ) -> tokio::task::JoinHandle<()> {
         let http = self.http.clone();
+        // `replay=1` (OCEAN-305): a scoped subscriber with no Last-Event-ID gets
+        // the session's buffered history replayed — closing the race where the
+        // subscription lands moments after the turn's first deltas.
+        // Replay only for a FRESH chat (mint path): it closes the race where
+        // the subscription lands after the turn's first deltas. A resumed chat
+        // already loaded its transcript from disk — replay would duplicate it.
         let url = format!(
-            "{}/v1/agent/events?session_id={}",
-            self.base, session_id
+            "{}/v1/agent/events?session_id={}{}",
+            self.base,
+            session_id,
+            if replay_first { "&replay=1" } else { "" }
         );
         tokio::spawn(async move {
-            let resp = match http.get(&url).send().await.and_then(|r| r.error_for_status()) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = actions.send(Action::Error(format!("stream: {e}")));
-                    return;
+            let mut last_event_id: Option<String> = None;
+            let mut first = true;
+            loop {
+                // The client's default 120s TOTAL timeout would kill a live
+                // SSE body after 2 minutes (the original silent-stream-death
+                // bug) — override per-request with an effectively-infinite cap.
+                let mut req = http
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(60 * 60 * 24 * 365));
+                if let Some(id) = &last_event_id {
+                    req = req.header("Last-Event-ID", id.clone());
                 }
-            };
-            let _ = actions.send(Action::Status("stream connected".into()));
-            let mut stream = resp.bytes_stream();
-            let mut buf = String::new();
-            while let Some(chunk) = stream.next().await {
-                let bytes = match chunk {
-                    Ok(b) => b,
-                    Err(_) => break, // ponytail: drop on read error; next turn re-subscribes
-                };
-                buf.push_str(&String::from_utf8_lossy(&bytes));
-                // SSE frames are separated by a blank line.
-                while let Some(idx) = buf.find("\n\n") {
-                    let frame = buf[..idx].to_string();
-                    buf.drain(..idx + 2);
-                    if let Some(evt) = parse_sse_frame(&frame) {
-                        let _ = actions.send(Action::AgentEvent(Box::new(evt)));
+                match req.send().await.and_then(|r| r.error_for_status()) {
+                    Ok(resp) => {
+                        let _ = actions.send(Action::Status(if first {
+                            "stream connected".into()
+                        } else {
+                            "stream reconnected".into()
+                        }));
+                        first = false;
+                        let mut stream = resp.bytes_stream();
+                        let mut buf = String::new();
+                        while let Some(chunk) = stream.next().await {
+                            let Ok(bytes) = chunk else { break };
+                            buf.push_str(&String::from_utf8_lossy(&bytes));
+                            while let Some(idx) = buf.find("\n\n") {
+                                let frame = buf[..idx].to_string();
+                                buf.drain(..idx + 2);
+                                if let Some(id) = parse_sse_id(&frame) {
+                                    last_event_id = Some(id);
+                                }
+                                if let Some(evt) = parse_sse_frame(&frame) {
+                                    let _ = actions.send(Action::AgentEvent(Box::new(evt)));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if first {
+                            let _ = actions.send(Action::Error(format!("stream: {e}")));
+                            first = false;
+                        }
                     }
                 }
+                // Dropped (or failed to connect): brief backoff, then resubscribe
+                // with the last seen id so the daemon replays what we missed.
+                let _ = actions.send(Action::Status("stream reconnecting…".into()));
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            let _ = actions.send(Action::Status("stream ended".into()));
-        });
+        })
     }
 }
 
@@ -144,28 +180,32 @@ impl DaemonClient {
         let http = self.http.clone();
         let url = format!("{}/v1/events", self.base);
         tokio::spawn(async move {
-            let resp = match http.get(&url).send().await.and_then(|r| r.error_for_status()) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = actions.send(Action::Error(format!("events: {e}")));
-                    return;
-                }
-            };
-            let mut stream = resp.bytes_stream();
-            let mut buf = String::new();
-            while let Some(chunk) = stream.next().await {
-                let bytes = match chunk {
-                    Ok(b) => b,
-                    Err(_) => break,
+            loop {
+                let req = http
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(60 * 60 * 24 * 365));
+                let resp = match req.send().await.and_then(|r| r.error_for_status()) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue; // self-heal: permissions must keep flowing
+                    }
                 };
-                buf.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(idx) = buf.find("\n\n") {
-                    let frame = buf[..idx].to_string();
-                    buf.drain(..idx + 2);
-                    if let Some(env) = parse_sse_data::<EventEnvelope>(&frame) {
-                        let _ = actions.send(Action::OceanEvent(Box::new(env)));
+                let mut stream = resp.bytes_stream();
+                let mut buf = String::new();
+                while let Some(chunk) = stream.next().await {
+                    let Ok(bytes) = chunk else { break };
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(idx) = buf.find("\n\n") {
+                        let frame = buf[..idx].to_string();
+                        buf.drain(..idx + 2);
+                        if let Some(env) = parse_sse_data::<EventEnvelope>(&frame) {
+                            let _ = actions.send(Action::OceanEvent(Box::new(env)));
+                        }
                     }
                 }
+                // Dropped: brief backoff, then resubscribe.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
     }
@@ -200,6 +240,15 @@ impl DaemonClient {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+}
+
+/// Pull the `id:` line out of one SSE frame (for Last-Event-ID replay).
+fn parse_sse_id(frame: &str) -> Option<String> {
+    frame.lines().find_map(|l| {
+        l.strip_prefix("id:")
+            .map(|rest| rest.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// Decode one SSE frame's `data:` payload as `T`.
@@ -265,7 +314,7 @@ mod tests {
         println!("session: {}", sess.session_id);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        client.spawn_event_stream(sess.session_id, tx);
+        let _stream = client.spawn_event_stream(sess.session_id, tx, true);
 
         let req = AgentTurnRequest {
             session_id: Some(sess.session_id),
