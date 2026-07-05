@@ -181,10 +181,15 @@ fn ocean_title(v: &serde_json::Value) -> Option<String> {
 
 fn ocean_clean_user_text(s: &str) -> Option<String> {
     let mut t = s.trim();
-    if t.starts_with("[TUI]") {
-        if let Some((_, rest)) = t.split_once("\n\n") {
-            t = rest.trim();
-        }
+    // Strip the daemon's client tag ([TUI]/[ACP]/[?]/…) the same way resumed
+    // history is cleaned. The rail preview used to leak the raw tag on
+    // single-line first messages because the old check matched only a literal
+    // `[TUI]` and only when a `"\n\n"` notice separator was present.
+    if let Some(rest) = strip_client_tag(t) {
+        t = match rest.split_once("\n\n") {
+            Some((_, after_blank)) => after_blank.trim(),
+            None => rest,
+        };
     }
     t = t.trim_start_matches('`').trim();
     if is_real_message(t) {
@@ -374,6 +379,34 @@ mod tests {
         assert_eq!(cmd, "ocean");
         assert_eq!(args.first().map(String::as_str), Some("--project"));
         assert_eq!(args.get(3).map(String::as_str), Some(s.id.as_str()));
+    }
+
+    #[test]
+    fn rail_title_strips_single_line_client_tags() {
+        // The rail preview leaked the raw tag on single-line first messages
+        // ([TUI]/[ACP]/[?]/…) because the old cleaner needed a "\n\n" separator.
+        assert_eq!(
+            ocean_clean_user_text("[TUI] hey there").as_deref(),
+            Some("hey there")
+        );
+        assert_eq!(
+            ocean_clean_user_text("[ACP] hey").as_deref(),
+            Some("hey")
+        );
+        assert_eq!(
+            ocean_clean_user_text("[?] say pong").as_deref(),
+            Some("say pong")
+        );
+        // Case-insensitive, and the multi-line notice shape still resolves to body.
+        assert_eq!(
+            ocean_clean_user_text("[tui] notice\n\nreal body").as_deref(),
+            Some("real body")
+        );
+        // An untagged message is untouched.
+        assert_eq!(
+            ocean_clean_user_text("plain message").as_deref(),
+            Some("plain message")
+        );
     }
 
     #[test]
