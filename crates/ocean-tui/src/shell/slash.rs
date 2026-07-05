@@ -9,26 +9,52 @@
 //! `chat::run_slash`, keyed on `name`.
 
 /// One entry in the palette. `name` carries the leading `/` (it's what renders
-/// and what execution matches on); `desc` is the one-line hint.
+/// and what execution matches on); `desc` is the one-line hint. `soon` marks a
+/// roadmap command whose backend isn't built on this branch yet — it renders
+/// greyed with a "soon" badge and, when run, surfaces an honest "not wired"
+/// hint instead of pretending. The palette is the discoverability surface for
+/// Ocean's harness capabilities, so the roadmap shows even before it's live.
 pub struct SlashCommand {
     pub name: &'static str,
     pub desc: &'static str,
+    pub soon: bool,
 }
 
 /// The built-in command set. One line per command — the palette, the fuzzy
 /// filter, and `/help` all read from here, so this is the single source of
 /// truth. Keep names short and lower-case; execution matches on `name`.
+///
+/// LIVE commands work when pressed. `soon: true` commands advertise where the
+/// harness is going (the W3–W7 slices) and say so honestly when run.
 pub const COMMANDS: &[SlashCommand] = &[
-    SlashCommand { name: "/model", desc: "switch the active model" },
-    SlashCommand { name: "/clear", desc: "clear the chat transcript" },
-    SlashCommand { name: "/sessions", desc: "focus the session rail" },
-    SlashCommand { name: "/files", desc: "focus the file tree" },
-    SlashCommand { name: "/graph", desc: "open the graph view" },
-    SlashCommand { name: "/terminal", desc: "focus the terminal" },
-    SlashCommand { name: "/resume", desc: "resume a past session" },
-    SlashCommand { name: "/help", desc: "list all commands" },
-    SlashCommand { name: "/quit", desc: "exit ocean" },
+    // ── live: wired to real behavior ──────────────────────────────────────
+    SlashCommand { name: "/new", desc: "start a fresh session", soon: false },
+    SlashCommand { name: "/model", desc: "set the model for this session (/model <id>)", soon: false },
+    SlashCommand { name: "/copy", desc: "copy the last reply to the clipboard", soon: false },
+    SlashCommand { name: "/resume", desc: "resume a past session", soon: false },
+    SlashCommand { name: "/sessions", desc: "focus the session rail", soon: false },
+    SlashCommand { name: "/files", desc: "focus the file tree", soon: false },
+    SlashCommand { name: "/graph", desc: "open the graph view", soon: false },
+    SlashCommand { name: "/terminal", desc: "focus the terminal", soon: false },
+    SlashCommand { name: "/clear", desc: "clear the chat transcript", soon: false },
+    SlashCommand { name: "/help", desc: "list all commands", soon: false },
+    SlashCommand { name: "/quit", desc: "exit ocean", soon: false },
+    // ── soon: roadmap surface (W3–W7), honest when run ────────────────────
+    SlashCommand { name: "/compact", desc: "prune + shake the context (W3)", soon: true },
+    SlashCommand { name: "/context", desc: "context-economy panel (W3)", soon: true },
+    SlashCommand { name: "/diff", desc: "review pending edits (W3)", soon: true },
+    SlashCommand { name: "/lsp", desc: "diagnostics / rename (W5)", soon: true },
+    SlashCommand { name: "/rules", desc: "manage stream rules (W6)", soon: true },
+    SlashCommand { name: "/memory", desc: "recall / retain memory — OKF (W7)", soon: true },
+    SlashCommand { name: "/goal", desc: "set the session goal (W7)", soon: true },
+    SlashCommand { name: "/handoff", desc: "write handoff.md (W7)", soon: true },
 ];
+
+/// Is `name` (with leading `/`) a known command? Used by the composer to decide
+/// whether a typed `/foo bar` line is a command invocation or a plain message.
+pub fn is_command(name: &str) -> bool {
+    COMMANDS.iter().any(|c| c.name == name)
+}
 
 /// Filter + rank the registry against `query` (the composer text *after* the
 /// leading `/`). Returns matches best-first, each paired with its score. An
@@ -44,6 +70,9 @@ pub fn filter(query: &str) -> Vec<(&'static SlashCommand, i32)> {
         .collect();
     out.sort_by(|a, b| {
         b.1.cmp(&a.1)
+            // live (soon=false) sorts ahead of roadmap (soon=true) on score ties,
+            // so the bare `/` menu groups working commands above the roadmap.
+            .then_with(|| a.0.soon.cmp(&b.0.soon))
             .then_with(|| a.0.name.len().cmp(&b.0.name.len()))
             .then_with(|| a.0.name.cmp(b.0.name))
     });
@@ -148,6 +177,25 @@ mod tests {
     fn non_subsequence_is_dropped() {
         // "zzz" is a subsequence of nothing in the registry.
         assert!(filter("zzz").is_empty());
+    }
+
+    #[test]
+    fn live_commands_group_ahead_of_roadmap() {
+        // On the bare `/` menu, every live command sorts above every soon one.
+        let ranked = filter("");
+        let first_soon = ranked.iter().position(|(c, _)| c.soon);
+        let last_live = ranked.iter().rposition(|(c, _)| !c.soon);
+        if let (Some(fs), Some(ll)) = (first_soon, last_live) {
+            assert!(ll < fs, "a soon command sorted ahead of a live one");
+        }
+    }
+
+    #[test]
+    fn is_command_recognizes_registry_only() {
+        assert!(is_command("/model"));
+        assert!(is_command("/compact"));
+        assert!(!is_command("/home")); // a path, not a command
+        assert!(!is_command("/nope"));
     }
 
     #[test]

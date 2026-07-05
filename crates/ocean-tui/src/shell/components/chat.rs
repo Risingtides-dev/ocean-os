@@ -473,13 +473,16 @@ impl ChatComponent {
         }
     }
 
-    /// Execute a slash command by name. Clears the composer, then either mutates
-    /// the transcript locally (`/clear`, `/help`) or emits an [`Action`]. Pane
-    /// focus rides [`Action::Navigate`] — chat never reaches into the app's
-    /// private `Focus`/`Center`; the app maps the [`Nav`] target.
-    fn run_slash(&mut self, name: &str) -> Option<Action> {
+    /// Execute a slash command by name, with any trailing `args` (empty for a
+    /// palette pick; the tail of a typed `/name args` line otherwise). Clears
+    /// the composer, then either mutates the transcript locally (`/clear`,
+    /// `/help`), emits an [`Action`], or — for a `soon` roadmap command —
+    /// surfaces an honest "not wired on this branch" hint. Pane focus rides
+    /// [`Action::Navigate`]; chat never reaches into the app's Focus/Center.
+    fn run_slash(&mut self, name: &str, args: &str) -> Option<Action> {
         self.input.clear();
         self.menu_sel = 0;
+        let args = args.trim();
         match name {
             "/quit" => Some(Action::Quit),
             "/clear" => {
@@ -494,17 +497,54 @@ impl ChatComponent {
                 self.scroll_back = 0;
                 None
             }
-            "/model" => Some(Action::Status(
-                "model switching isn't wired yet".to_string(),
-            )),
+            "/new" => {
+                // Fresh session: wipe the transcript locally, then let the app
+                // unbind so the next turn mints a new session id.
+                self.turns.clear();
+                self.md.clear();
+                self.scroll_back = 0;
+                self.busy = false;
+                Some(Action::NewSession)
+            }
+            "/model" => {
+                if args.is_empty() {
+                    Some(Action::Status(
+                        "usage: /model <provider/model> (e.g. anthropic/claude-opus-4-8)".into(),
+                    ))
+                } else {
+                    Some(Action::SetModel(args.to_string()))
+                }
+            }
+            "/copy" => match self.last_reply() {
+                Some(text) => Some(Action::CopyToClipboard(text)),
+                None => Some(Action::Status("nothing to copy yet".into())),
+            },
             // Pane/center navigation — the app owns Focus/Center, so emit a
             // targeted Navigate and let it move there.
             "/sessions" | "/resume" => Some(Action::Navigate(Nav::Sessions)),
             "/files" => Some(Action::Navigate(Nav::Files)),
             "/graph" => Some(Action::Navigate(Nav::Graph)),
             "/terminal" => Some(Action::Navigate(Nav::Terminal)),
-            _ => Some(Action::Status(format!("unknown command: {name}"))),
+            // Roadmap commands: present in the palette as a discoverability map,
+            // but honest that the backend isn't on this branch yet.
+            _ => {
+                let hint = slash::COMMANDS
+                    .iter()
+                    .find(|c| c.name == name)
+                    .filter(|c| c.soon)
+                    .map(|c| format!("{} — {} · not wired on this branch yet", c.name, c.desc))
+                    .unwrap_or_else(|| format!("unknown command: {name}"));
+                Some(Action::Status(hint))
+            }
         }
+    }
+
+    /// The text of the newest assistant reply, for `/copy`.
+    fn last_reply(&self) -> Option<String> {
+        self.turns.iter().rev().find_map(|t| match t {
+            Turn::Assistant(s) if !s.trim().is_empty() => Some(s.clone()),
+            _ => None,
+        })
     }
 
     /// Push `/help` output into the transcript as an assistant block — the
@@ -521,20 +561,30 @@ impl ChatComponent {
     /// ranked matches with the selection on a `BG_HL` bed. Overlaid last so it
     /// sits on top of the transcript.
     fn draw_menu(&self, frame: &mut Frame, composer: Rect, matches: &[&slash::SlashCommand]) {
-        let shown = matches.len().min(8);
-        if shown == 0 {
+        if matches.is_empty() {
             return;
         }
+        // Show as many as fit in the space above the composer, capped so the
+        // roadmap is visible without the popup running off the top of the frame.
+        let cap = (composer.y as usize).saturating_sub(3).clamp(1, 20);
+        let shown = matches.len().min(cap);
         let sel = self.menu_sel.min(shown - 1);
 
-        // Width fits the widest ACTUAL row, capped to the composer width. Each
-        // row renders as ` {marker} ` (3 cols) + `{:<11}` name (min 11 cols) +
-        // ` — ` (3 cols) + desc — so the content width must mirror that exactly
-        // or long descriptions clip mid-word against the composer cap.
+        // `soon` rows carry a right-aligned " · soon" badge (7 cols). Width fits
+        // the widest ACTUAL row, capped to the composer width. Each row renders
+        // as ` {marker} ` (3) + `{:<11}` name (min 11) + ` — ` (3) + desc, plus
+        // the badge on roadmap rows — mirror that exactly or long descriptions
+        // clip mid-word against the composer cap.
+        const BADGE_W: usize = 7; // " · soon"
         let content_w = matches
             .iter()
             .take(shown)
-            .map(|c| 3 + c.name.chars().count().max(11) + 3 + c.desc.chars().count())
+            .map(|c| {
+                3 + c.name.chars().count().max(11)
+                    + 3
+                    + c.desc.chars().count()
+                    + if c.soon { BADGE_W } else { 0 }
+            })
             .max()
             .unwrap_or(24);
         let width = ((content_w as u16) + 2 /* borders */)
@@ -562,28 +612,52 @@ impl ChatComponent {
         for (i, c) in matches.iter().take(shown).enumerate() {
             let selected = i == sel;
             let bed = if selected { theme::BG_HL } else { theme::SLATE };
-            let name_fg = if selected { theme::CYAN } else { theme::FG };
+            // Live rows read bold in FG/CYAN; roadmap (soon) rows are muted so
+            // the working commands stay visually dominant.
+            let (name_fg, name_mod) = match (selected, c.soon) {
+                (true, false) => (theme::CYAN, Modifier::BOLD),
+                (true, true) => (theme::YELLOW, Modifier::empty()),
+                (false, false) => (theme::FG, Modifier::BOLD),
+                (false, true) => (theme::COMMENT, Modifier::empty()),
+            };
             let marker = if selected { g("❯", ">") } else { " " };
-            let row = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {marker} "), Style::default().fg(theme::CYAN)),
                 Span::styled(
                     format!("{:<11}", c.name),
-                    Style::default().fg(name_fg).add_modifier(Modifier::BOLD),
+                    Style::default().fg(name_fg).add_modifier(name_mod),
                 ),
                 Span::styled(
                     format!(" {} {}", g("—", "-"), c.desc),
                     Style::default().fg(theme::COMMENT),
                 ),
-            ]);
+            ];
+            if c.soon {
+                let left_w = 3 + c.name.chars().count().max(11) + 3 + c.desc.chars().count();
+                let target = inner.width as usize;
+                if target > left_w + BADGE_W {
+                    spans.push(Span::raw(" ".repeat(target - left_w - BADGE_W)));
+                }
+                spans.push(Span::styled(
+                    format!(" {} soon", g("·", "-")),
+                    Style::default().fg(theme::YELLOW),
+                ));
+            }
             frame.render_widget(
-                Paragraph::new(row).style(Style::default().bg(bed)),
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(bed)),
                 Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
             );
         }
-        // Footer hint on the last inner row.
+        // Footer hint on the last inner row; note the truncation when the list
+        // is longer than what fits.
+        let more = if shown < matches.len() {
+            format!(" · {shown}/{}", matches.len())
+        } else {
+            String::new()
+        };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                format!(" {} select · ⏎ run · esc dismiss", g("↑↓", "^v")),
+                format!(" {} select · ⏎ run · esc dismiss{more}", g("↑↓", "^v")),
                 Style::default().fg(theme::COMMENT),
             ))
             .style(Style::default().bg(theme::SLATE)),
@@ -757,7 +831,7 @@ impl Component for ChatComponent {
                 KeyCode::Enter => {
                     let sel = self.menu_sel.min(matches.len() - 1);
                     let name = matches[sel].name;
-                    return self.run_slash(name);
+                    return self.run_slash(name, "");
                 }
                 KeyCode::Esc => {
                     self.input.clear();
@@ -790,6 +864,19 @@ impl Component for ChatComponent {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
                     return None;
+                }
+                // A typed `/name args…` line (the palette closes once a space is
+                // typed) is a command invocation when the first token is a known
+                // command — e.g. `/model anthropic/claude-opus-4-8`. Anything
+                // else starting with `/` (a path, say) falls through and sends.
+                if text.starts_with('/') {
+                    let (name, args) = match text.split_once(char::is_whitespace) {
+                        Some((n, a)) => (n, a),
+                        None => (text.as_str(), ""),
+                    };
+                    if slash::is_command(name) {
+                        return self.run_slash(name, args);
+                    }
                 }
                 self.history.push(&text); // persist for ↑/↓ + ⌃R recall
                 self.reset_history_nav();
@@ -1387,6 +1474,59 @@ mod tests {
         let mut chat = chat_with("/quit");
         chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(chat.input.is_empty());
+    }
+
+    #[test]
+    fn slash_new_clears_and_requests_new_session() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::User("hi".into()));
+        let act = chat.run_slash("/new", "");
+        assert!(chat.turns.is_empty(), "/new wipes the transcript");
+        assert!(matches!(act, Some(Action::NewSession)));
+    }
+
+    #[test]
+    fn slash_model_routes_arg_and_usage() {
+        let mut chat = ChatComponent::default();
+        match chat.run_slash("/model", "anthropic/claude-opus-4-8") {
+            Some(Action::SetModel(id)) => assert_eq!(id, "anthropic/claude-opus-4-8"),
+            other => panic!("expected SetModel, got {other:?}"),
+        }
+        // Bare `/model` is a usage hint, not a model change.
+        assert!(matches!(chat.run_slash("/model", ""), Some(Action::Status(_))));
+    }
+
+    #[test]
+    fn slash_copy_uses_last_reply() {
+        let mut chat = ChatComponent::default();
+        assert!(matches!(chat.run_slash("/copy", ""), Some(Action::Status(_)))); // nothing yet
+        chat.turns.push(Turn::Assistant("the answer".into()));
+        match chat.run_slash("/copy", "") {
+            Some(Action::CopyToClipboard(t)) => assert_eq!(t, "the answer"),
+            other => panic!("expected CopyToClipboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn soon_command_surfaces_honest_hint() {
+        let mut chat = ChatComponent::default();
+        match chat.run_slash("/compact", "") {
+            Some(Action::Status(s)) => assert!(s.contains("not wired"), "got: {s}"),
+            other => panic!("expected a Status hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_command_line_routes_not_submits() {
+        // A typed `/model <id>\n` line invokes the command instead of sending.
+        let mut chat = chat_with("/model anthropic/claude-opus-4-8");
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Some(Action::SetModel(_))));
+        assert!(chat.turns.is_empty(), "command line must not become a User turn");
+        // A `/`-path that is NOT a command still sends as a normal message.
+        let mut chat2 = chat_with("/etc/hosts is a file");
+        let act2 = chat2.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act2, Some(Action::SubmitPrompt(_))));
     }
 
     #[test]

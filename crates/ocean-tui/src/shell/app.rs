@@ -78,6 +78,8 @@ pub struct App {
     center: Center,
     focus: Focus,
     session_id: Option<AgentSessionId>,
+    /// `/model <id>` override applied to subsequent turns (None → daemon default).
+    model_override: Option<String>,
     /// The live SSE subscription for `session_id`. Held so a session switch
     /// aborts the superseded stream instead of leaking it (a leaked stream
     /// kept pumping a stale session's events into the chat).
@@ -136,6 +138,7 @@ impl App {
             center: Center::Chat,
             focus: Focus::Center,
             session_id: None,
+            model_override: None,
             stream_task: None,
             status: "connecting…".into(),
             should_quit: false,
@@ -497,6 +500,34 @@ impl App {
                     self.focus_to(Focus::Term);
                 }
             },
+            // `/new`: drop the bound session (and its stream) so the next turn
+            // mints a fresh one; the chat cleared its own transcript already.
+            Action::NewSession => {
+                if let Some(task) = self.stream_task.take() {
+                    task.abort();
+                }
+                self.session_id = None;
+                self.center = Center::Chat;
+                self.focus_to(Focus::Center);
+                self.status = "new session".into();
+            }
+            // `/model <id>`: remember the override for subsequent turns.
+            Action::SetModel(id) => {
+                self.model_override = Some(id.clone());
+                self.status = format!("model → {id}");
+            }
+            // `/copy`: hand the last reply to the system clipboard via pbcopy.
+            Action::CopyToClipboard(text) => {
+                let text = text.clone();
+                let tx = self.actions_tx.clone();
+                tokio::spawn(async move {
+                    let msg = match copy_to_clipboard(&text) {
+                        Ok(()) => "copied last reply to clipboard".to_string(),
+                        Err(e) => format!("copy failed: {e}"),
+                    };
+                    let _ = tx.send(Action::Status(msg));
+                });
+            }
             Action::OceanEvent(env) => {
                 // OCEAN-185: the turn's first permission request claims the
                 // pending submit token; remember permission→request for the POST.
@@ -586,6 +617,7 @@ impl App {
         let tx = self.actions_tx.clone();
         let workspace = self.workspace_root.clone();
         let existing = self.session_id;
+        let model_id = self.model_override.clone();
         // OCEAN-185: mint the per-turn permission secret; the turn's first
         // permission request claims it (see Action::OceanEvent above).
         let decision_token = ocean_core::mint_decision_token();
@@ -618,7 +650,7 @@ impl App {
                 agent: None,
                 role: None,
                 thinking_level: None,
-                model_id: None,
+                model_id,
                 images: None,
                 decision_token: Some(decision_token),
                 client_context: None,
@@ -880,4 +912,23 @@ fn splitter(frame: &mut ratatui::Frame, area: Rect, vertical: bool) {
             area,
         );
     }
+}
+
+/// Put `text` on the system clipboard via `pbcopy` (the workbench is macOS-first
+/// today; Linux would add xclip/wl-copy here). Runs off the UI thread.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "no stdin".to_string())?
+        .write_all(text.as_bytes())
+        .map_err(|e| e.to_string())?;
+    child.wait().map_err(|e| e.to_string())?;
+    Ok(())
 }

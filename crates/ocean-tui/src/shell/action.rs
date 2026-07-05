@@ -42,6 +42,12 @@ pub enum Action {
     /// Navigate the workbench to a pane/center surface — emitted by the `/`
     /// palette so chat never reaches into the app's private Focus/Center.
     Navigate(Nav),
+    /// `/new` — drop the bound session so the next turn mints a fresh one.
+    NewSession,
+    /// `/copy` — put the given text (the last reply) on the system clipboard.
+    CopyToClipboard(String),
+    /// `/model <id>` — override the model for subsequent turns this session.
+    SetModel(String),
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
     /// Resume a session natively in the chat: load its transcript from `path`
