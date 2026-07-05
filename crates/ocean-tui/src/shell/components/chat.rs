@@ -1,8 +1,10 @@
 //! ChatComponent — the native agent surface. Re-houses the PM room's streaming
 //! model (structured blocks: text, thinking, tool calls) onto the component
 //! architecture, plus: permission approval cards (⌃Y allow / ⌃N deny, the
-//! OCEAN-185 gated flow), markdown-lite rendering (headings, fences, bullets,
-//! inline code), multi-line input (⌃J newline), and wheel/PageUp scrollback.
+//! OCEAN-185 gated flow), streaming markdown with prefix-freeze (via
+//! `shell::markdown` — headings, syntax-highlighted fences, lists, blockquotes,
+//! inline `code`/**bold**/*italic*), tool cards with ⌃O collapse/expand,
+//! multi-line input (⌃J newline), and wheel/PageUp scrollback.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ocean_agent_sdk::{AgentTurnEvent, ToolCallId};
@@ -18,9 +20,14 @@ use ratatui::{
 use crate::shell::{
     action::Action,
     component::Component,
+    markdown::Markdown,
     panel, slash,
     theme::{self, g},
 };
+
+/// Collapsed tool cards show at most this many trailing output lines; ⌃O
+/// expands to the full output.
+const TOOL_TAIL_ROWS: usize = 3;
 
 /// One rendered unit of transcript.
 enum Turn {
@@ -30,10 +37,12 @@ enum Turn {
     Assistant(String),
     /// Extended-thinking text (accumulates deltas).
     Thinking(String),
-    /// A tool call: keyed by call id, with name + streamed output + status.
+    /// A tool call: keyed by call id, with name + a one-line args summary +
+    /// streamed output + status. Rendered as a card (⌃O toggles collapse).
     Tool {
         id: ToolCallId,
         name: String,
+        args: String,
         output: String,
         status: ToolStatus,
     },
@@ -71,7 +80,57 @@ pub struct ChatComponent {
     scroll_back: usize,
     /// Highlighted row in the `/` command palette (see `slash_matches`).
     menu_sel: usize,
+    /// Streaming markdown renderer + frozen-block cache for assistant text.
+    md: Markdown,
+    /// When true, tool cards render their full output instead of a tail window.
+    tools_expanded: bool,
     pub focused: bool,
+}
+
+/// Collapse a tool's `args_json` into a single-line summary for the card header:
+/// prefer a well-known primary key, else compact-serialize the whole object;
+/// newlines flattened and truncated so the header never wraps.
+fn summarize_args(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    const KEYS: &[&str] = &[
+        "command",
+        "cmd",
+        "path",
+        "file_path",
+        "pattern",
+        "query",
+        "url",
+        "content",
+    ];
+    let raw = match v {
+        Value::Object(map) => KEYS
+            .iter()
+            .find_map(|k| map.get(*k))
+            .map(inline_value)
+            .unwrap_or_else(|| v.to_string()),
+        Value::Null => String::new(),
+        other => inline_value(other),
+    };
+    one_line(&raw, 72)
+}
+
+fn inline_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Flatten whitespace to single spaces and truncate to `max` chars with an
+/// ellipsis.
+fn one_line(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        let head: String = flat.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}{}", g("…", "..."))
+    } else {
+        flat
+    }
 }
 
 impl ChatComponent {
@@ -87,6 +146,7 @@ impl ChatComponent {
                 }
             })
             .collect();
+        self.md.clear();
         self.busy = false;
     }
 
@@ -190,6 +250,7 @@ impl ChatComponent {
             "/quit" => Some(Action::Quit),
             "/clear" => {
                 self.turns.clear();
+                self.md.clear();
                 self.scroll_back = 0;
                 self.busy = false;
                 None
@@ -297,59 +358,6 @@ impl ChatComponent {
     }
 }
 
-/// Markdown-lite: style one source line. Fence state is carried by the caller
-/// so code blocks render on the dark bed with plain text.
-fn md_line(l: &str, in_fence: &mut bool) -> Line<'static> {
-    let t = l.trim_start();
-    if t.starts_with("```") {
-        *in_fence = !*in_fence;
-        return Line::from(Span::styled(
-            l.to_string(),
-            Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
-        ));
-    }
-    if *in_fence {
-        return Line::from(Span::styled(
-            l.to_string(),
-            Style::default().fg(theme::CYAN).bg(theme::BG_DARK),
-        ));
-    }
-    if t.starts_with('#') {
-        return Line::from(Span::styled(
-            l.to_string(),
-            Style::default()
-                .fg(theme::BLUE)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    if t.starts_with("- ") || t.starts_with("* ") {
-        return Line::from(vec![
-            Span::styled(
-                l[..l.len() - t.len()].to_string(),
-                Style::default().fg(theme::FG),
-            ),
-            Span::styled(format!("{} ", g("•", "-")), Style::default().fg(theme::CYAN)),
-            Span::styled(t[2..].to_string(), Style::default().fg(theme::FG)),
-        ]);
-    }
-    // inline `code` runs
-    if l.contains('`') {
-        let mut spans = Vec::new();
-        for (i, seg) in l.split('`').enumerate() {
-            if i % 2 == 1 {
-                spans.push(Span::styled(
-                    seg.to_string(),
-                    Style::default().fg(theme::CYAN).bg(theme::BG_DARK),
-                ));
-            } else {
-                spans.push(Span::styled(seg.to_string(), Style::default().fg(theme::FG)));
-            }
-        }
-        return Line::from(spans);
-    }
-    Line::from(Span::styled(l.to_string(), Style::default().fg(theme::FG)))
-}
-
 impl Component for ChatComponent {
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         // Permission decisions work even mid-stream (legacy ⌃Y/⌃N bindings).
@@ -376,6 +384,11 @@ impl Component for ChatComponent {
                 // ⌃J: newline in the composer (legacy binding).
                 KeyCode::Char('j') => {
                     self.input.push('\n');
+                    return None;
+                }
+                // ⌃O: toggle tool-card expansion (full output ↔ tail window).
+                KeyCode::Char('o') => {
+                    self.tools_expanded = !self.tools_expanded;
                     return None;
                 }
                 _ => {}
@@ -498,6 +511,7 @@ impl Component for ChatComponent {
                     self.turns.push(Turn::Tool {
                         id: call.id.clone(),
                         name: call.name.to_string(),
+                        args: summarize_args(&call.args_json),
                         output: String::new(),
                         status: ToolStatus::Running,
                     });
@@ -545,7 +559,11 @@ impl Component for ChatComponent {
         let pill = self.model.clone();
         let body = panel::draw(frame, chunks[0], "OCEAN", pill.as_deref(), self.focused);
 
-        // Transcript lines (bottom-anchored via scroll offset).
+        // Transcript lines (bottom-anchored via scroll offset). Split the
+        // borrow: the markdown cache (`md`) is a distinct field from `turns`, so
+        // the loop can read turns while `md.render` mutates its cache.
+        let md = &mut self.md;
+        let tools_expanded = self.tools_expanded;
         let mut lines: Vec<Line> = Vec::new();
         for turn in &self.turns {
             match turn {
@@ -559,10 +577,9 @@ impl Component for ChatComponent {
                     ]));
                 }
                 Turn::Assistant(s) => {
-                    let mut in_fence = false;
-                    for l in s.lines() {
-                        lines.push(md_line(l, &mut in_fence));
-                    }
+                    // Streaming markdown with prefix-freeze: frozen head blocks
+                    // are served from cache, only the growing tail re-renders.
+                    lines.extend(md.render(s));
                 }
                 Turn::Permission {
                     tool,
@@ -621,16 +638,62 @@ impl Component for ChatComponent {
                             .add_modifier(Modifier::ITALIC),
                     )));
                 }
-                Turn::Tool { name, status, .. } => {
+                Turn::Tool {
+                    name,
+                    args,
+                    output,
+                    status,
+                    ..
+                } => {
+                    // Card header: status glyph + tool name + one-line args.
                     let (mark, color) = match status {
                         ToolStatus::Running => (g("◐", "*"), theme::YELLOW),
                         ToolStatus::Ok => (g("✓", "+"), theme::GREEN),
                         ToolStatus::Err => (g("✗", "x"), theme::RED),
                     };
-                    lines.push(Line::from(vec![
+                    let mut header = vec![
                         Span::styled(format!("  {mark} "), Style::default().fg(color)),
-                        Span::styled(name.clone(), Style::default().fg(theme::COMMENT)),
-                    ]));
+                        Span::styled(
+                            name.clone(),
+                            Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    if !args.is_empty() {
+                        header.push(Span::styled(
+                            format!("  {args}"),
+                            Style::default().fg(theme::COMMENT),
+                        ));
+                    }
+                    lines.push(Line::from(header));
+
+                    // Body: full output when expanded (⌃O), else a tail window
+                    // with a "+N more" hint on the rail.
+                    let body: Vec<&str> = output.lines().collect();
+                    if !body.is_empty() {
+                        let hidden = if tools_expanded {
+                            0
+                        } else {
+                            body.len().saturating_sub(TOOL_TAIL_ROWS)
+                        };
+                        for l in &body[hidden..] {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("    {} ", g("│", "|")),
+                                    Style::default().fg(theme::EDGE),
+                                ),
+                                Span::styled(
+                                    l.to_string(),
+                                    Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
+                                ),
+                            ]));
+                        }
+                        if hidden > 0 {
+                            lines.push(Line::from(Span::styled(
+                                format!("    {} +{hidden} more · ⌃O expand", g("┄", "..")),
+                                Style::default().fg(theme::COMMENT),
+                            )));
+                        }
+                    }
                 }
                 Turn::Advisor {
                     note,
@@ -692,7 +755,7 @@ impl Component for ChatComponent {
         } else if self.busy {
             " streaming…".to_string()
         } else {
-            " ⏎ send · ⌃J newline · / for commands".to_string()
+            " ⏎ send · ⌃J newline · ⌃O tools · / for commands".to_string()
         };
         panel::footer(frame, chunks[0], &footer_hint);
 
@@ -857,17 +920,23 @@ mod tests {
     }
 
     #[test]
-    fn md_fence_toggles_and_headings_style() {
-        let mut fence = false;
-        md_line("```rust", &mut fence);
-        assert!(fence, "opening fence enters code mode");
-        md_line("let x = 1;", &mut fence);
-        assert!(fence, "code lines keep fence state");
-        md_line("```", &mut fence);
-        assert!(!fence, "closing fence exits code mode");
-        let heading = md_line("# Title", &mut fence);
-        assert!(!fence);
-        assert_eq!(heading.spans.len(), 1);
+    fn ctrl_o_toggles_tool_expansion() {
+        let mut chat = ChatComponent::default();
+        assert!(!chat.tools_expanded);
+        chat.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(chat.tools_expanded);
+        chat.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!chat.tools_expanded);
+    }
+
+    #[test]
+    fn summarize_args_is_single_line_and_prefers_primary_key() {
+        let s = summarize_args(&json!({ "command": "echo hi\nrm x", "cwd": "/tmp" }));
+        assert!(!s.contains('\n'), "args summary must be one line");
+        assert!(s.contains("echo hi"));
+        // No recognised key → compact-serialize the whole object.
+        let s2 = summarize_args(&json!({ "foo": 1 }));
+        assert!(s2.contains("foo"));
     }
 
     #[test]

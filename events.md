@@ -1360,3 +1360,10 @@ type:      [feature-request]
 area:      [backend]
 
 W1 hashline WIRED end-to-end through the real tool path (the delicate integration, done by orchestrator not a fanned agent). SessionContext gains `hashline: bool`; ReadTool::for_cwd_with_snapshots emits a `[path#HASH]` tag + records a session snapshot; new tools/hashline_edit.rs applies patches with 3-strategy recovery + stale rejection; BuiltinProvider holds a session-keyed SnapshotStore map (shared read↔edit across turns) and injects the hashline read + hashline_edit tool only when ctx.hashline. Plumbed via PromptControl::with_hashline_edits (default false — every legacy caller unchanged) set in the daemon agent_turn from harness_caps.hashline_edits — so ONLY tui/acp/cli profiles get it; web/voice keep the plain read contract untouched. ocean-runtime now deps ocean-hashline. Verified: new tests/hashline_wiring.rs drives read→tag→hashline_edit→file-rewritten + stale-tag-rejected + profile-gate-off (no tag, no edit tool); workspace clippy -D clean, all touched-crate tests green (runtime 103+2, agent 248, daemon, hashline 61, longhouse). NOTE: branch stays PR-gated to main (John's drive-test + Codex review) — not merged; daemon deploys from main only.
+time:      [morning] [07-04-26]
+agent:     [claude] [fable 5 + opus agent]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      [feature-request]
+area:      [frontend]
+
+W2 part 1 landed: shell/markdown.rs — streaming markdown renderer with OMP's prefix-freeze (fence-aware block splitting, frozen blocks served from a content-hash cache, only the growing tail re-renders; CacheStats proven by test: streaming a tail keeps misses==1). Syntect code fences on the dark bed, headings/lists/quotes/inline styles; `_` deliberately not italic so snake_case survives. Chat: assistant text streams through it; tool cards get args summaries + collapsed 3-line tail window + ⌃O global expand toggle. 107 tui tests green, clippy -D clean. Skipped for later: read-coalescing, phase-locked spinners.

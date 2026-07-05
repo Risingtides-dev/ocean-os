@@ -16,6 +16,7 @@ mod event;
 mod git;
 mod graph;
 mod highlight;
+mod markdown;
 mod panel;
 mod pty;
 mod sessions;
