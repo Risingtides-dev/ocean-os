@@ -1416,3 +1416,26 @@ palette, /graph+/terminal nav, Esc + double-Esc + disarm, clean rail titles.
 -rebuild; left for John's drive + review before main. Surface files (ci.yml,
 ocean-daemon, ocean-agent, ocean-runtime, bus.rs) untouched.
 _________________________________________________________________________________
+
+time:      [ 5:55PM] [07-05-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+John: "the menu is still not really populating what we want from this." The `/`
+palette existed but was 9 thin nav stubs, not the discoverability surface the
+port map committed to. He chose the full-roadmap direction (breadth now, honest
+about what's live). Expanded slash.rs to 19 commands with a `soon` flag: 11 live
+(/new, /model <id> override, /copy via pbcopy, nav, /clear /help /quit) wired
+end-to-end, and 8 roadmap (W3-W7: /compact /context /diff /lsp /rules /memory
+/goal /handoff) rendered greyed with a right-aligned "soon" badge that surface an
+honest "not wired on this branch yet" hint when run. Added typed `/name args`
+routing (e.g. `/model anthropic/claude-opus-4-8`) that fires the command instead
+of sending, while a real `/`-path still sends. Palette groups live-above-soon,
+caps to fit the roadmap, footers N/M when truncated. New Actions: NewSession,
+SetModel, CopyToClipboard; App gained a model_override threaded into the turn
+request. Verified in a tmux drive: all 19 render correctly, /compact hint,
+/model sets the override, /new resets. 144 tests green, clippy -D clean. Pushed
+to feat/ocean-tui-shell-rebuild for John's drive.
+_________________________________________________________________________________
