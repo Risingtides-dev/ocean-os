@@ -1,0 +1,82 @@
+# Ocean OS — cargo-deny configuration (supply-chain audit gate).
+#
+# Runs in CI (`.github/workflows/ci.yml` → `deny` job) as `cargo deny check`:
+#   1. Licenses  — every crate in the tree must use an allowed license.
+#   2. Advisories — no known-vulnerable or unsound crates (RustSec DB).
+#   3. Sources   — only crates.io + the workspace are trusted.
+#
+# Config is the modern cargo-deny v2 schema. It is intentionally permissive to
+# start (warn, not fail, on duplicates); tighten over time.
+
+[graph]
+# All crates are first-party; nothing is published to crates.io today.
+all-features = true
+no-default-features = false
+
+[advisories]
+version = 2
+# Vulnerabilities and unsound advisories are always errors in v2 — silence a
+# specific one by adding its RUSTSEC id here after review.
+ignore = [
+    # rsa 0.9.x — Marvin timing side-channel. No patched version exists upstream
+    # (advisory: "No safe upgrade is available"). Reaches us only transitively
+    # through livekit-api → jsonwebtoken on the voice/call path, never for
+    # primary auth, and only exploitable by an attacker observing our signing
+    # timing over the network. Re-check when RustCrypto/RSA#626 lands a
+    # constant-time impl, then drop this ignore.
+    "RUSTSEC-2023-0071",
+]
+# Yanked crates warn rather than fail (a yanked transitive dep shouldn't block a
+# hotfix); flip to "deny" once the tree is clean.
+yanked = "warn"
+# Only flag `unmaintained` advisories for workspace-relevant crates, not every
+# transitive dep — keeps the gate signal high and avoids noise from deep deps.
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# The workspace is MIT. Allow the common permissive Rust-ecosystem licenses;
+# anything NOT in this list is denied automatically (v2 has no separate deny
+# list), which is how copyleft (GPL/AGPL/LGPL) gets blocked.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",   # Boost — tokio ecosystem
+    "CC0-1.0",   # public-domain dedication
+    "OpenSSL",   # required by some TLS bindings
+    "MPL-2.0",   # file-level copyleft, MIT-compatible for use
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle) — permissive
+]
+confidence-threshold = 0.8
+# We list a few licenses that may not appear in every feature/platform build;
+# don't fail the run just because an allowed license went unused.
+unused-allowed-license = "allow"
+
+# Exemptions: crates with a known SPDX gap or multi-license expression that are
+# broadly MIT-compatible. Add entries here after manual review.
+[[licenses.exceptions]]
+name = "ring"
+# ring is ISC + OpenSSL + SSLeay; the combined work is MIT-compatible.
+allow = ["ISC", "OpenSSL"]
+
+[bans]
+# Duplicate crate versions warn (not fail) to start — a large tokio/axum tree
+# always carries a few (syn, windows-sys, hashbrown). Tighten to "deny" once
+# the tree is deduped.
+multiple-versions = "warn"
+wildcards = "warn"
+deny = []
+skip = []
+
+[sources]
+# Only crates.io and the workspace are trusted. Ocean uses no git deps today.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

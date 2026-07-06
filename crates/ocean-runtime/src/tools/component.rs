@@ -452,4 +452,174 @@ mod tests {
             .expect_err("should time out, not error on args");
         assert!(err.contains("timed out"), "unexpected error: {err}");
     }
+
+    // -----------------------------------------------------------------------
+    // component_render tests
+    // -----------------------------------------------------------------------
+
+    /// Every known component kind must render without error and produce a
+    /// Render side effect with the correct id and kind.
+    #[tokio::test]
+    async fn all_known_kinds_render_successfully() {
+        for kind in VALID_KINDS {
+            let tool = ComponentRenderTool;
+            let args = json!({
+                "id": format!("comp-{kind}"),
+                "kind": kind,
+                "props": {}
+            });
+            let res = tool.execute("call-1", args).await.expect(&format!("{kind} must render"));
+            let summary = res.content[0].as_text().unwrap();
+            assert!(summary.contains("rendered"), "summary missing for {kind}: {summary}");
+            assert!(!summary.contains("warning"), "unexpected warning for {kind}: {summary}");
+
+            // Side effect must carry the Render variant.
+            assert_eq!(res.side_effects.len(), 1);
+            match &res.side_effects[0] {
+                ToolSideEffect::Render { id, kind: ek, .. } => {
+                    assert_eq!(id, &format!("comp-{kind}"));
+                    assert_eq!(ek, kind);
+                }
+                other => panic!("expected Render side effect for {kind}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Unknown component kinds are still accepted (forward-compat) but produce a
+    /// warning in the result text.
+    #[tokio::test]
+    async fn unknown_kind_renders_with_warning() {
+        let tool = ComponentRenderTool;
+        let args = json!({ "id": "comp-future", "kind": "hologram", "props": {} });
+        let res = tool.execute("call-1", args).await.expect("unknown kind still renders");
+        let summary = res.content[0].as_text().unwrap();
+        assert!(summary.contains("warning"), "unknown kind must produce warning: {summary}");
+        assert!(summary.contains("hologram"), "warning must name the kind: {summary}");
+    }
+
+    /// Missing `id` is rejected.
+    #[tokio::test]
+    async fn component_render_rejects_missing_id() {
+        let tool = ComponentRenderTool;
+        let args = json!({ "kind": "progress", "props": {} });
+        let err = tool
+            .execute("call-1", args)
+            .await
+            .expect_err("missing id must be rejected");
+        assert!(err.contains("id"), "unexpected error: {err}");
+    }
+
+    /// Missing `kind` is rejected.
+    #[tokio::test]
+    async fn component_render_rejects_missing_kind() {
+        let tool = ComponentRenderTool;
+        let args = json!({ "id": "comp-1", "props": {} });
+        let err = tool
+            .execute("call-1", args)
+            .await
+            .expect_err("missing kind must be rejected");
+        assert!(err.contains("kind"), "unexpected error: {err}");
+    }
+
+    /// `replace: true` is accepted and reflected; the result text does not
+    /// change shape (the flag is for the client, not the text summary).
+    #[tokio::test]
+    async fn component_render_with_replace_flag() {
+        let tool = ComponentRenderTool;
+        let args = json!({ "id": "comp-1", "kind": "progress", "props": {"label":"ok"}, "replace": true });
+        let res = tool.execute("call-1", args).await.expect("replace flag accepted");
+        assert_eq!(res.side_effects.len(), 1);
+        match &res.side_effects[0] {
+            ToolSideEffect::Render { replace, .. } => assert!(replace, "replace must be true"),
+            other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    /// `replace` defaults to false when omitted.
+    #[tokio::test]
+    async fn component_render_replace_defaults_to_false() {
+        let tool = ComponentRenderTool;
+        let args = json!({ "id": "comp-1", "kind": "progress", "props": {} });
+        let res = tool.execute("call-1", args).await.expect("valid");
+        match &res.side_effects[0] {
+            ToolSideEffect::Render { replace, .. } => assert!(!replace, "replace must default to false"),
+            other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    /// Props are forwarded verbatim in the side effect.
+    #[tokio::test]
+    async fn component_render_forwards_props() {
+        let tool = ComponentRenderTool;
+        let props = json!({"label": "Building", "value": 0.5, "max": 1.0});
+        let args = json!({ "id": "prog-1", "kind": "progress", "props": props });
+        let res = tool.execute("call-1", args).await.expect("valid");
+        match &res.side_effects[0] {
+            ToolSideEffect::Render { props: forwarded, .. } => {
+                assert_eq!(forwarded["label"], "Building");
+                assert_eq!(forwarded["value"], 0.5);
+                assert_eq!(forwarded["max"], 1.0);
+            }
+            other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    /// `props` defaults to empty object when not supplied (the tool signature
+    /// says it's required, but the implementation copes).
+    #[tokio::test]
+    async fn component_render_missing_props_defaults_to_empty() {
+        let tool = ComponentRenderTool;
+        // Even though the schema says "required":["id","kind","props"], the
+        // execute fn uses `args.get("props").cloned().unwrap_or(…)` and won't
+        // reject a missing props key.
+        let args = json!({ "id": "comp-1", "kind": "table" });
+        let res = tool.execute("call-1", args).await.expect("missing props handled");
+        match &res.side_effects[0] {
+            ToolSideEffect::Render { props, .. } => {
+                assert_eq!(props, &json!({}), "missing props must default to empty object");
+            }
+            other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    /// The details field in the tool result carries `component_id` and `kind`.
+    #[tokio::test]
+    async fn component_render_result_details() {
+        let tool = ComponentRenderTool;
+        let args = json!({ "id": "kan-1", "kind": "kanban", "props": {} });
+        let res = tool.execute("call-1", args).await.expect("valid");
+        assert_eq!(res.details["component_id"], "kan-1");
+        assert_eq!(res.details["kind"], "kanban");
+    }
+
+    // -----------------------------------------------------------------------
+    // component_unmount tests
+    // -----------------------------------------------------------------------
+
+    /// Valid unmount returns success and emits an Unmount side effect.
+    #[tokio::test]
+    async fn component_unmount_removes_component() {
+        let tool = ComponentUnmountTool;
+        let args = json!({ "id": "kan-1" });
+        let res = tool.execute("call-1", args).await.expect("unmount works");
+        assert!(res.content[0].as_text().unwrap().contains("unmounted"));
+        assert_eq!(res.details["component_id"], "kan-1");
+        assert_eq!(res.side_effects.len(), 1);
+        match &res.side_effects[0] {
+            ToolSideEffect::Unmount { id } => assert_eq!(id, "kan-1"),
+            other => panic!("expected Unmount, got {other:?}"),
+        }
+    }
+
+    /// Missing `id` is rejected.
+    #[tokio::test]
+    async fn component_unmount_rejects_missing_id() {
+        let tool = ComponentUnmountTool;
+        let args = json!({});
+        let err = tool
+            .execute("call-1", args)
+            .await
+            .expect_err("missing id must be rejected");
+        assert!(err.contains("id"), "unexpected error: {err}");
+    }
 }

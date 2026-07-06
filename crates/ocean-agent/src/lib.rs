@@ -2757,6 +2757,16 @@ mod session {
                 .cmp(&a.updated_ms.unwrap_or(0))
                 .then_with(|| b.id.cmp(&a.id))
         });
+        // Cluster by workspace_root so a project's sessions stay together in the
+        // rail, while preserving the newest-first recency order WITHIN each
+        // cluster (sort_by is stable). Rootless sessions sort last. Group order
+        // is by root path so the same project always lands in the same place.
+        out.sort_by(|a, b| match (&a.workspace_root, &b.workspace_root) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
         Ok(out)
     }
 
@@ -4957,6 +4967,60 @@ done
         let page_default = runtime.list_sessions_page(None, None, None).unwrap();
         assert_eq!(page_default.items.len(), 3);
         assert!(!page_default.has_more);
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn list_sessions_groups_workspace_root_before_recency() {
+        let config_dir = temp_config_dir("list-sessions-workspace-root-order");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+
+        let mut a_new = session::Session::new(&model);
+        a_new.workspace_root = Some("/tmp/project-a".into());
+        a_new.cwd = Some("/tmp/project-a/app".into());
+        a_new.updated_ms = 300;
+
+        let mut b_newest = session::Session::new(&model);
+        b_newest.workspace_root = Some("/tmp/project-b".into());
+        b_newest.cwd = Some("/tmp/project-b/app".into());
+        b_newest.updated_ms = 400;
+
+        let mut a_old = session::Session::new(&model);
+        a_old.workspace_root = Some("/tmp/project-a".into());
+        a_old.cwd = Some("/tmp/project-a/worker".into());
+        a_old.updated_ms = 200;
+
+        let mut b_old = session::Session::new(&model);
+        b_old.workspace_root = Some("/tmp/project-b".into());
+        b_old.cwd = Some("/tmp/project-b/worker".into());
+        b_old.updated_ms = 100;
+
+        for session in [&b_newest, &a_new, &a_old, &b_old] {
+            session::save(&config_dir, session).unwrap();
+        }
+
+        let listed = session::list(&config_dir, None).unwrap();
+        let roots: Vec<&str> = listed
+            .iter()
+            .map(|session| session.workspace_root.as_deref().unwrap_or(""))
+            .collect();
+        let updated: Vec<i64> = listed
+            .iter()
+            .map(|session| session.updated_ms.unwrap_or_default())
+            .collect();
+
+        assert_eq!(
+            roots,
+            vec![
+                "/tmp/project-a",
+                "/tmp/project-a",
+                "/tmp/project-b",
+                "/tmp/project-b",
+            ],
+            "workspace roots should cluster together before recency ordering"
+        );
+        assert_eq!(updated, vec![300, 200, 400, 100]);
 
         let _ = std::fs::remove_dir_all(config_dir);
     }

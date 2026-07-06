@@ -16,13 +16,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── build / test / clippy ────────────────────────────────────────────────
   check:
-    name: build / test / clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # macOS is the production deploy target; Ubuntu catches Linux-specific
+        # breakage and exercises the full workspace on a second platform.
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # macOS may need pkg-config for crate feature-detection (e.g. openssl-sys
+      # probes, though the workspace pins rustls where possible). Install it
+      # early so native deps can resolve headers.
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkg-config
 
       - name: Install Rust toolchain (stable + clippy)
         uses: dtolnay/rust-toolchain@stable
@@ -50,3 +64,20 @@ jobs:
       # The tree is now formatted — enforce it in CI.
       - name: Format check
         run: cargo fmt --all -- --check
+
+  # ── supply-chain audit ───────────────────────────────────────────────────
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check licenses + advisories
+        run: cargo deny check
