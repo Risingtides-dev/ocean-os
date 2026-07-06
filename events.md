@@ -1439,3 +1439,37 @@ request. Verified in a tmux drive: all 19 render correctly, /compact hint,
 /model sets the override, /new resets. 144 tests green, clippy -D clean. Pushed
 to feat/ocean-tui-shell-rebuild for John's drive.
 _________________________________________________________________________________
+
+time:      [ 5:20PM] [07-06-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      backend
+
+Landed the parked plumbing under the --next shell as one verified unit — the
+dirty tree that had been left uncommitted was NOT a side refactor, it was the
+daemon-side streaming + interactive-component spine the shell rides. Extracted
+EventBus + AgentEventBus (OCEAN-129/305/368 SSE replay-ring + 3s keepalive) out
+of the 1.9k-line main.rs into bus.rs. The release build compiled clean and hid
+an incomplete extraction: cfg(test) daemon tests still poke the ring internals,
+so exposed AgentEventBus.history pub(crate) and scoped broadcast /
+AGENT_EVENT_REPLAY_BUFFER imports to test builds (I first trusted the "unused"
+warning and cut them, which broke the test build — the release build doesn't
+compile the test module). Wired the runtime component lifecycle: 10
+render/unmount unit tests + component_lifecycle.rs (289 LOC) driving
+render→wait→inject→resolve through the shared COMPONENT_WAIT_REGISTRY the
+/v1/component/event route feeds. Fixed a second parked failure: the new
+list_sessions_groups_workspace_root_before_recency test encoded unimplemented
+behavior — session::list was pure recency; added a stable secondary sort by
+workspace_root so a project's sessions cluster in the rail, newest-first within
+each cluster. CI: added a macOS matrix leg (deploy target was untested) + a
+cargo-deny job. deny.toml was written against the OLD cargo-deny schema and
+would have failed CI on its first run; rewrote it for v2, then ran the real
+binary and cleared every finding — bumped anyhow 1.0.103, plist 1.10 /
+quick-xml 0.41 to fix RUSTSEC-2026-0190/0194/0195, and ignored the unfixable
+rsa Marvin advisory (livekit transitive, no upstream patch) with a documented
+rationale. Verified: cargo deny all-green, workspace build + clippy clean,
+daemon 248 / agent 105 / runtime 16+7 / tui 144 tests pass. Committed 088fd97 +
+pushed to feat/ocean-tui-shell-rebuild. Branch stays PR-gated to main (John's
+drive + Codex review); daemon deploys from main only.
+_________________________________________________________________________________
