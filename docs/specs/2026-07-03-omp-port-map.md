@@ -357,6 +357,46 @@ fails loud. Snapshot store: LRU 30 paths × 4 versions, realpath-keyed, records 
 (edits into unread regions rejected). Their test suite (`packages/hashline/test/`) is the
 port contract. ~61% output-token reduction claimed. → `ocean-hashline`, profile: tui/acp.
 
+## Implementation status audit (2026-07-05, 4-agent evidence sweep)
+
+Ground truth as of this date — what is actually in `crates/*/src`, not the plan. Verified by
+four parallel read-only agents citing `crate::file:sym`. Key correction to the earlier
+"we only reimplemented hashline" read: a large slice of the OMP *harness* is already carried
+out under Ocean's own crate names — but the four **lift-as-is Rust crates** (walker, iso,
+uu-grep, minimizer) are confirmed absent.
+
+**BUILT (wired, working):**
+- Artifact spill / output-meta — `ocean-runtime::capability.rs:SpillingTool` + `artifacts.rs:ArtifactStore` (24 KB → head cut + `artifact://` spill; wraps every tool incl. MCP).
+- Hashline edits — `ocean-hashline` wired end-to-end via `capability.rs:206` / `read.rs:178` / `hashline_edit.rs`; gated by profile.
+- Harness profile seam — `ocean-daemon::harness_profile.rs` resolves per-turn from `client_type`. **Gates only 2 of its 7 flags today** (`hashline_edits`, `artifacts`); `lsp/stream_rules/rich_context/memory/minimizer` are declared + logged but wire to nothing.
+- Provider layer — `ocean-providers::lib.rs` 7 providers, 2-tier auth cascade (env → `auth.json`), retry+backoff (`ocean-protocol::retry.rs`), model fallback chains (`fallback_candidates`, OCEAN-275). Gaps: no OAuth *refresh*, no timed cooldown.
+- Advisor observer (roles v1 delta) — `ocean-daemon::main.rs:9313` post-turn fire-and-forget on `roles["advisor"]`.
+- AST read-time summary — `ocean-ast` (reimplemented from pi-ast, not lifted).
+- PTY — `ocean-tui::shell/pty.rs` (portable-pty, harvested from CTRL). Glob tool — `ocean-runtime::tools/glob_tool.rs` (basic). `artifact://` URI — `read.rs:19`.
+
+**PARTIAL (thin or scaffolded):**
+- Grep — `ocean-runtime::tools/grep.rs` is fixed-**substring** (no regex/cross-line/mtime-sort); no ripgrep libs.
+- Compaction — `ocean-runtime::agent_loop.rs:729 trim_to_context_window` is single-tier drop-oldest; no promote/prune/shake/summarize, no protection matchers.
+- Context assembler — `ocean-agent::lib.rs:5536 load_project_prompt` walks AGENTS.md/CLAUDE.md ancestors; no `@`-imports, no skills/tree/rule-index in the prompt (skills live in a separate Longhouse `/v1/skills/query`).
+- Capability registry — `ocean-runtime::capability.rs:264` is a prioritized **tool-source** seam only; no typed rules/context/skills taxonomy, no 3-tier rule delivery.
+- Memory — `ocean-memory` = store (`put/get/list/delete`) + deterministic OKF ingest only; **no retain/recall/reflect verbs, no BM25 recall, no LLM reflect (`ingest.rs:158 NoResidue`), not wired into the daemon**.
+- Models catalog — `ocean-providers::lib.rs:457 known_models` is hardcoded id/provider/label; no cost/contextWindow/compat/discovery, no `[models]` in `DaemonConfig`.
+- Role grammar — `ocean-agent::config.rs:48 roles` is a flat `role→provider/model` map; no role-to-role, no `:low/:high` suffix, no per-role fallback, no path-scoped `enabledModels`.
+- Loop guards — `ocean-hashline::guard.rs:NoopLoopGuard` built + exported but **has zero call sites (dead)**; auto-generated + plan-mode guards absent.
+- ANSI-aware text util (`unicode-width` used in spots, no dedicated truncate); semantic syntax highlight (syntect present, no 11-category mapping).
+
+**ABSENT (not started):**
+- Parallel FS **walker** engine (pi-walker) — only ad-hoc `ignore`/`walkdir`/`read_dir`, no scan cache/ranked-N/cancel.
+- In-process **regex grep** / typed search (pi-uu-grep). **Minimizer** / per-command output filters (pi-shell) — `bash.rs` raw passthrough, `minimizer` flag unwired.
+- **CoW isolation** (pi-iso) — no clonefile/reflink/worktree-CoW; subagent path assembles a spec only.
+- **BM25 tool discovery**, **resolve/preview-accept**, **TTSR/stream-rules engine**, **checkpoint/rewind**, **plan mode**, **contextPromotionTarget**.
+- Token counting (tiktoken — only a `len/4` heuristic), **sixel/kitty** image render, `rule://`/`skill://`/`local://` URI schemes.
+
+**Cheapest wins (already 80% there, just disconnected):** wire the 5 dormant harness-profile
+flags; wire `NoopLoopGuard` into `hashline_edit`; wire `ocean-memory` into the daemon +
+add recall. Highest-leverage fresh lifts: `pi-walker` and `pi-iso` (drop-in Rust, MIT, at
+`/tmp/oh-my-pi/crates`).
+
 ## Scoping principle (John, 2026-07-03)
 
 **Port the mechanism, skip the integration long-tail.** ~99% of what OMP does to steer the
