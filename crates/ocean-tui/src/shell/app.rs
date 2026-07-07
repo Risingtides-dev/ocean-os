@@ -199,18 +199,26 @@ impl App {
                 .spawn_global_event_stream(self.actions_tx.clone());
         }
 
+        // Render-on-demand: draw INSTANTLY in response to input (buttery scroll/
+        // typing), coalesce async/streaming redraws onto the render tick, and do
+        // NOT repaint when nothing changed. The old loop drew the whole workbench
+        // unconditionally at render_hz and never on input, so a keypress waited a
+        // frame and, if a draw ran long, input backed up behind the timer.
+        let mut dirty = true; // paint the first frame
         while !self.should_quit {
             let Some(event) = events.next().await else { break };
+            let is_render = matches!(event, Event::Render);
+            let mut immediate = false;
             match event {
-                Event::Render => {
-                    terminal.draw(|f| self.draw(f))?;
-                }
+                Event::Render => {}
                 Event::Tick => {
                     if let Some(a) = self.pty.tick() {
                         self.dispatch(a);
+                        dirty = true;
                     }
                     if let Some(a) = self.editor.tick() {
                         self.dispatch(a);
+                        dirty = true;
                     }
                     // Live-reflect files the agent (or the terminal) creates in
                     // the Files sidebar without a manual refresh. Throttled to
@@ -218,12 +226,30 @@ impl App {
                     if self.last_tree_scan.elapsed() >= Duration::from_millis(1000) {
                         self.tree.rescan();
                         self.last_tree_scan = Instant::now();
+                        dirty = true;
+                    }
+                    // Keep animating while a turn streams (incoming text/spinner)
+                    // or the PTY is live, so those repaint at the tick cadence.
+                    if self.stream_task.as_ref().is_some_and(|t| !t.is_finished())
+                        || self.pty.is_active()
+                    {
+                        dirty = true;
                     }
                 }
-                Event::Crossterm(evt) => self.on_crossterm(evt),
+                Event::Crossterm(evt) => {
+                    self.on_crossterm(evt);
+                    immediate = true; // paint this frame now — no timer wait
+                }
             }
             while let Ok(action) = self.actions_rx.try_recv() {
                 self.dispatch(action);
+                dirty = true;
+            }
+            // Input paints immediately; streaming/async changes coalesce onto the
+            // render tick (≤ render_hz); idle frames draw nothing.
+            if immediate || (is_render && dirty) {
+                terminal.draw(|f| self.draw(f))?;
+                dirty = false;
             }
         }
         Ok(())
