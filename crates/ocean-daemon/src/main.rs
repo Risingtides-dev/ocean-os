@@ -1635,10 +1635,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agents", get(agents_list))
         .route("/v1/agents/{name}", get(agent_def))
         .route("/v1/projects", get(projects_list).post(project_create))
-        .route(
-            "/v1/projects/{id}",
-            get(project_get).patch(project_patch).delete(project_delete),
-        )
+        .route("/v1/projects/{id}", get(project_get).patch(project_patch).delete(project_delete))
+        .route("/v1/fs/dirs", get(fs_dirs))
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
         .route(
@@ -1927,6 +1925,7 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/projects/{id}",
         "PATCH /v1/projects/{id}",
         "DELETE /v1/projects/{id}",
+        "GET /v1/fs/dirs",
         "GET /v1/model",
         "POST /v1/model",
         "GET /v1/models",
@@ -6843,6 +6842,39 @@ async fn model_set(
     }
 }
 
+// ---- Filesystem helpers (tilde expansion + path sandboxing) -----------------
+
+/// Expand a leading `~` to `$HOME`. Returns the literal path unchanged when
+/// `HOME` is unset or the path doesn't start with `~`.
+fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") || path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            if path == "~" {
+                return home;
+            }
+            return format!("{}/{}", home, &path[2..]);
+        }
+    }
+    path.to_string()
+}
+
+/// True when `child` is exactly `parent` or a direct descendant
+/// (`parent/something`), guarding against sibling-prefix attacks like
+/// `/home/user2` passing a `/home/user` sandbox check.
+fn path_is_under(child: &str, parent: &str) -> bool {
+    child == parent
+        || (child.starts_with(parent)
+            && child.as_bytes().get(parent.len()) == Some(&b'/'))
+}
+
+/// Canonicalize `path`, mapping the OS error to a short string suitable for
+/// the `error` field of an API response.
+fn try_canonicalize(path: &str) -> Result<String, String> {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| format!("cannot resolve path: {e}"))
+}
+
 // ---- Projects --------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -6909,10 +6941,43 @@ async fn project_create(
     Json(req): Json<CreateProjectRequest>,
 ) -> (StatusCode, Json<ProjectResponse>) {
     let now = Utc::now().timestamp_millis();
+
+    // Expand ~ → $HOME, create_dir_all, canonicalize. An empty workspace_root
+    // passes through unchanged (existing behavior — the project is created with
+    // an empty string and the daemon treats it as project-less).
+    let workspace_root = if req.workspace_root.is_empty() {
+        req.workspace_root
+    } else {
+        let expanded = expand_tilde(&req.workspace_root);
+        if let Err(e) = std::fs::create_dir_all(&expanded) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ProjectResponse {
+                    ok: false,
+                    project: None,
+                    error: Some(format!("cannot create workspace directory: {e}")),
+                }),
+            );
+        }
+        match try_canonicalize(&expanded) {
+            Ok(canon) => canon,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ProjectResponse {
+                        ok: false,
+                        project: None,
+                        error: Some(e),
+                    }),
+                );
+            }
+        }
+    };
+
     let project = Project {
         id: uuid::Uuid::new_v4(),
         name: req.name,
-        workspace_root: req.workspace_root,
+        workspace_root,
         config: req.config,
         created_ms: now,
         updated_ms: now,
@@ -7037,6 +7102,125 @@ async fn project_delete(
             Json(json!({ "ok": false, "error": e.to_string() })),
         ),
     }
+}
+
+/// Query for `GET /v1/fs/dirs`.
+#[derive(Debug, serde::Deserialize)]
+struct FsDirsQuery {
+    /// Path to list subdirectories of. Defaults to `$HOME` when omitted.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `GET /v1/fs/dirs?path=` — list subdirectories under a path, sandboxed to
+/// `$HOME`. Dot-directories are skipped; only directories are returned (no
+/// files); alphabetical; an `"git"` boolean flag per entry.  `parent` is the
+/// canonical parent directory, `null` at `$HOME` or the filesystem root.
+async fn fs_dirs(
+    Query(q): Query<FsDirsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let home_raw = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "HOME not set"})),
+            );
+        }
+    };
+    let home_canon = match std::fs::canonicalize(&home_raw) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": format!("cannot resolve HOME: {e}")})),
+            );
+        }
+    };
+    let home_canon_str = home_canon.to_string_lossy().to_string();
+
+    let raw = q.path.as_deref().unwrap_or(&home_raw);
+    let expanded = expand_tilde(raw);
+
+    // Must exist — canonicalize fails for a non-existent path.
+    let target = match std::fs::canonicalize(&expanded) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": format!("path does not exist: {e}")})),
+            );
+        }
+    };
+    let target_str = target.to_string_lossy().to_string();
+
+    // Sandbox: the resolved path must be under $HOME.
+    if !path_is_under(&target_str, &home_canon_str) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": format!("access denied: {raw} is outside home directory"),
+            })),
+        );
+    }
+
+    // Parent is null at $HOME or at the filesystem root.
+    let parent: Option<String> = if target_str == home_canon_str {
+        None
+    } else {
+        target.parent().and_then(|p| {
+            let ps = p.to_string_lossy().to_string();
+            if ps.is_empty() { None } else { Some(ps) }
+        })
+    };
+
+    let mut dirs: Vec<serde_json::Value> = Vec::new();
+    match std::fs::read_dir(&target) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().to_string();
+                // Skip dot-directories.
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let git = path.join(".git").exists();
+                let path_str = path.to_string_lossy().to_string();
+                dirs.push(json!({
+                    "name": name_str,
+                    "path": path_str,
+                    "git": git,
+                }));
+            }
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": format!("cannot read directory: {e}")})),
+            );
+        }
+    }
+
+    dirs.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "path": target_str,
+            "parent": parent,
+            "home": home_canon_str,
+            "dirs": dirs,
+        })),
+    )
 }
 
 async fn session(
@@ -20214,5 +20398,95 @@ mod tests {
                 "banner entry {route:?} path does not start with '/'"
             );
         }
+    }
+
+    // ---- Filesystem helpers (unit) ------------------------------------------
+
+    #[test]
+    fn expand_tilde_replaces_leading_tilde_with_home() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~/dev"), format!("{home}/dev"));
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn expand_tilde_preserves_non_tilde_paths() {
+        assert_eq!(expand_tilde("/etc/passwd"), "/etc/passwd");
+        assert_eq!(expand_tilde("relative/path"), "relative/path");
+        // Mid-path tilde is not expanded.
+        assert_eq!(expand_tilde("/home/~user"), "/home/~user");
+    }
+
+    #[test]
+    fn path_is_under_rejects_sibling_prefix() {
+        assert!(path_is_under("/home/user/dev", "/home/user"));
+        assert!(path_is_under("/home/user", "/home/user")); // exact match
+        assert!(!path_is_under("/home/user2", "/home/user")); // sibling prefix
+        assert!(!path_is_under("/etc", "/home/user"));
+    }
+
+    // ---- Project create: mkdir-on-create ------------------------------------
+
+    /// Creating a project with a workspace_root that doesn't exist yet succeeds
+    /// — the daemon creates the directory and stores its canonical path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_create_mkdir_and_canonicalize() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // nested path that doesn't exist yet
+        let sub = tmp.path().join("new-project/src");
+        let sub_str = sub.to_string_lossy().to_string();
+
+        let (status, Json(resp)) = project_create(
+            State(state.clone()),
+            Json(CreateProjectRequest {
+                name: "test-proj".into(),
+                workspace_root: sub_str.clone(),
+                config: ProjectConfig::default(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(resp.ok);
+        let proj = resp.project.unwrap();
+        // The stored path must be canonical (tempdirs on macOS live under
+        // /private/var/…, so canonicalize will differ from the raw input).
+        let expected_canon = std::fs::canonicalize(&sub_str)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(proj.workspace_root, expected_canon);
+        // Directory must actually exist now.
+        assert!(sub.exists(), "workspace directory was created");
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// An empty workspace_root passes through unchanged (existing behavior
+    /// report: the project is created with workspace_root="").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_create_empty_workspace_root_is_unchanged() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        let (status, Json(resp)) = project_create(
+            State(state.clone()),
+            Json(CreateProjectRequest {
+                name: "empty-ws".into(),
+                workspace_root: String::new(),
+                config: ProjectConfig::default(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(resp.ok);
+        assert_eq!(resp.project.unwrap().workspace_root, "");
+
+        std::env::remove_var("OCEAN_YOLO");
     }
 }

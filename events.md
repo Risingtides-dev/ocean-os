@@ -1473,3 +1473,11 @@ daemon 248 / agent 105 / runtime 16+7 / tui 144 tests pass. Committed 088fd97 +
 pushed to feat/ocean-tui-shell-rebuild. Branch stays PR-gated to main (John's
 drive + Codex review); daemon deploys from main only.
 _________________________________________________________________________________
+time:      [12:42am] [07-07-26]
+agent:     [codex] [gpt-5.5]
+worktree:  main
+type:      [feature]
+area:      [backend]
+
+POST /v1/projects now creates the workspace directory on disk and stores a canonical path. expand_tilde() resolves leading ~ to $HOME; create_dir_all runs on the expanded path before canonicalize; the canonical path is stored in Project.workspace_root. Empty workspace_root passes through unchanged (existing behavior). On mkdir or canonicalize failure, returns 400 with a concise error. Added GET /v1/fs/dirs?path=<abs-or-~path>: sandboxed to $HOME (403 outside), skips dot-directories, dirs only, alphabetical, git flag when child/.git exists. Response includes home, parent (null at $HOME), and per-entry path+name+git. 5 new unit tests (expand_tilde, path_is_under, mkdir+canonicalize, empty root passthrough, banner well-formed). Verification: cargo test (253 passed), live smoke test through proxy confirmed ~/dev/... expanded, directory created on disk, canonical path stored.
+_________________________________________________________________________________
