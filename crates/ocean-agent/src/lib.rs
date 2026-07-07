@@ -2130,13 +2130,22 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
         ProviderId::OpenAi => Ok(match selection.model.as_str() {
             "gpt-4o" => Model::openai_gpt_4o(),
             "gpt-4o-mini" => Model::openai_gpt_4o_mini(),
-            _ => Model::openai_compat(
-                selection.provider.as_str(),
-                selection.model.clone(),
-                selection.base_url.clone(),
-                selection.context_window,
-                selection.max_output_tokens,
-            ),
+            _ => {
+                // Genuine OpenAI endpoint, just an id outside the named
+                // constructors (gpt-4.1 / gpt-5 / o3 …) — all current OpenAI
+                // chat models take image parts, so keep vision on even though
+                // the compat constructor defaults it off for third-party
+                // backends (OCEAN-386).
+                let mut m = Model::openai_compat(
+                    selection.provider.as_str(),
+                    selection.model.clone(),
+                    selection.base_url.clone(),
+                    selection.context_window,
+                    selection.max_output_tokens,
+                );
+                m.supports_images = true;
+                m
+            }
         }),
         ProviderId::OpenAiCodex => Ok(Model::codex(
             selection.model.clone(),

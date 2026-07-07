@@ -1039,6 +1039,7 @@ mod tests {
             provider: "codex".into(),
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             reasoning: true,
+            supports_images: true,
             context_window: 272_000,
             max_tokens: 16_384,
         }

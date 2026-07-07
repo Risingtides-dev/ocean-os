@@ -199,7 +199,11 @@ impl Default for OpenAiProvider {
     }
 }
 
-fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Value> {
+fn convert_messages(
+    system_prompt: Option<&str>,
+    messages: &[Message],
+    supports_images: bool,
+) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     if let Some(sp) = system_prompt {
         out.push(json!({"role": "system", "content": sp}));
@@ -207,10 +211,14 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
     for m in messages {
         match m {
             Message::User { content, .. } => {
-                // If any image is present, emit the content-array form so vision
-                // turns survive. Otherwise keep the simple string form.
+                // If any image is present AND the model takes image parts, emit
+                // the content-array form so vision turns survive. Otherwise keep
+                // the text form — strict text-only backends (DeepSeek, Kimi,
+                // MiniMax) reject unknown content variants with a 400, which
+                // permanently bricks any session whose history holds an image
+                // (OCEAN-386).
                 let has_image = content.iter().any(|c| matches!(c, Content::Image { .. }));
-                if has_image {
+                if has_image && supports_images {
                     let parts: Vec<Value> = content
                         .iter()
                         .filter_map(|c| match c {
@@ -226,11 +234,25 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
                         .collect();
                     out.push(json!({"role": "user", "content": parts}));
                 } else {
-                    let text = content
-                        .iter()
-                        .filter_map(|c| c.as_text().map(|s| s.to_string()))
-                        .collect::<Vec<_>>()
-                        .join("");
+                    // Text form. Each image (only reachable on a no-vision
+                    // model) degrades to a bracketed note so the model still
+                    // learns an attachment existed instead of silently losing
+                    // the turn's meaning.
+                    let mut text = String::new();
+                    for c in content {
+                        match c {
+                            Content::Text { text: t } => text.push_str(t),
+                            Content::Image { mime_type, .. } => {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&format!(
+                                    "[image attached ({mime_type}) — omitted: this model has no image input]"
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
                     out.push(json!({"role": "user", "content": text}));
                 }
             }
@@ -276,12 +298,25 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
                 out.push(msg);
             }
             Message::ToolResult(tr) => {
-                let text = tr
+                let mut text = tr
                     .content
                     .iter()
                     .filter_map(|c| c.as_text().map(|s| s.to_string()))
                     .collect::<Vec<_>>()
                     .join("");
+                let has_images = tr
+                    .content
+                    .iter()
+                    .any(|c| matches!(c, Content::Image { .. }));
+                // On a no-vision model a screenshot tool result would otherwise
+                // vanish without a trace — leave a note in the tool text so the
+                // model knows the tool DID return something visual (OCEAN-386).
+                if has_images && !supports_images {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str("[screenshot omitted: this model has no image input]");
+                }
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": tr.tool_call_id,
@@ -298,20 +333,24 @@ fn convert_messages(system_prompt: Option<&str>, messages: &[Message]) -> Vec<Va
                 // `role:user` message carrying the image(s) as image_url
                 // data-URL parts — the same encoding used for user-message
                 // images (OCEAN-99). This is what surfaces the screenshot to the
-                // model. Text-only tool results add no extra message.
-                let image_parts: Vec<Value> = tr
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        Content::Image { data, mime_type } => Some(json!({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": format!("data:{};base64,{}", mime_type, data)
-                            }
-                        })),
-                        _ => None,
-                    })
-                    .collect();
+                // model. Text-only tool results add no extra message, and a
+                // no-vision model gets no image message at all (gated above).
+                let image_parts: Vec<Value> = if supports_images {
+                    tr.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            Content::Image { data, mime_type } => Some(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", mime_type, data)
+                                }
+                            })),
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 if !image_parts.is_empty() {
                     out.push(json!({"role": "user", "content": image_parts}));
                 }
@@ -389,7 +428,11 @@ fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut body = json!({
         "model": model.id,
-        "messages": convert_messages(context.system_prompt.as_deref(), &context.messages),
+        "messages": convert_messages(
+            context.system_prompt.as_deref(),
+            &context.messages,
+            model.supports_images,
+        ),
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -845,7 +888,7 @@ mod tests {
             timestamp: now_ms(),
         }];
 
-        let out = convert_messages(None, &messages);
+        let out = convert_messages(None, &messages, true);
         assert_eq!(out.len(), 1);
         let content = &out[0]["content"];
         // Must be the array form, not a bare string.
@@ -871,7 +914,7 @@ mod tests {
     #[test]
     fn text_only_user_stays_string() {
         let messages = vec![Message::user_text("hello")];
-        let out = convert_messages(None, &messages);
+        let out = convert_messages(None, &messages, true);
         assert_eq!(out[0]["content"], "hello");
     }
 
@@ -896,7 +939,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(None, &messages);
+        let out = convert_messages(None, &messages, true);
         // Two messages: the tool message, then a following user image message.
         assert_eq!(
             out.len(),
@@ -925,6 +968,73 @@ mod tests {
         );
     }
 
+    // OCEAN-386: a no-vision model (DeepSeek / Kimi / MiniMax via
+    // `openai_compat`) rejects `image_url` parts with a 400, permanently
+    // bricking any session whose history holds an image. With
+    // `supports_images: false` a user image must degrade to the string form
+    // with a bracketed placeholder — no `image_url` anywhere in the payload.
+    #[test]
+    fn user_image_degrades_to_text_placeholder_without_vision() {
+        let messages = vec![Message::User {
+            content: vec![
+                Content::text("describe this"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            timestamp: now_ms(),
+        }];
+
+        let out = convert_messages(None, &messages, false);
+        assert_eq!(out.len(), 1);
+        let content = &out[0]["content"];
+        let text = content.as_str().expect("expected string content form");
+        assert!(text.starts_with("describe this"), "text lost: {text}");
+        assert!(
+            text.contains("[image attached (image/png)"),
+            "placeholder missing: {text}"
+        );
+        assert!(
+            !serde_json::to_string(&out).unwrap().contains("image_url"),
+            "image_url leaked into a no-vision payload: {out:?}"
+        );
+    }
+
+    // OCEAN-386: on a no-vision model a screenshot tool result must NOT grow a
+    // following `role:user` image message; the tool text carries a note so the
+    // model knows the tool returned something visual.
+    #[test]
+    fn tool_result_image_is_gated_without_vision() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "call_123".into(),
+            tool_name: "browser_screenshot".into(),
+            content: vec![
+                Content::text("here is the screenshot"),
+                Content::Image {
+                    data: "AAECAwQ=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(None, &messages, false);
+        assert_eq!(out.len(), 1, "no follow-up image message: {out:?}");
+        assert_eq!(out[0]["role"], "tool");
+        let text = out[0]["content"].as_str().expect("tool text");
+        assert!(text.starts_with("here is the screenshot"));
+        assert!(
+            text.contains("[screenshot omitted"),
+            "omission note missing: {text}"
+        );
+        assert!(
+            !serde_json::to_string(&out).unwrap().contains("image_url"),
+            "image_url leaked into a no-vision payload: {out:?}"
+        );
+    }
+
     // A text-only tool result stays a single text-only `role:tool` message —
     // no spurious following user message.
     #[test]
@@ -937,7 +1047,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(None, &messages);
+        let out = convert_messages(None, &messages, true);
         assert_eq!(
             out.len(),
             1,
@@ -976,7 +1086,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(None, &messages);
+        let out = convert_messages(None, &messages, true);
         assert_eq!(out.len(), 1, "expected a single assistant message");
         let msg = &out[0];
         assert_eq!(msg["role"], "assistant");

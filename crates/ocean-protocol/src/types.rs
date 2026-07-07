@@ -180,6 +180,13 @@ pub struct Model {
     pub provider: String,
     pub base_url: String,
     pub reasoning: bool,
+    /// Whether the model's API accepts image content parts. When false the
+    /// encoders degrade `Content::Image` to a short text placeholder instead
+    /// of emitting `image_url` parts — strict text-only OpenAI-compatible
+    /// backends (DeepSeek, Kimi, MiniMax) reject unknown content variants with
+    /// a 400, which permanently bricks any session whose history contains an
+    /// image (OCEAN-386).
+    pub supports_images: bool,
     pub context_window: u32,
     pub max_tokens: u32,
 }
@@ -194,6 +201,7 @@ impl Model {
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
             reasoning: true,
+            supports_images: true,
             context_window: 200_000,
             max_tokens: 8_192,
         }
@@ -207,6 +215,7 @@ impl Model {
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
             reasoning: true,
+            supports_images: true,
             context_window: 200_000,
             max_tokens: 8_192,
         }
@@ -220,6 +229,7 @@ impl Model {
             provider: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             reasoning: false,
+            supports_images: true,
             context_window: 128_000,
             max_tokens: 16_384,
         }
@@ -233,6 +243,7 @@ impl Model {
             provider: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             reasoning: false,
+            supports_images: true,
             context_window: 128_000,
             max_tokens: 16_384,
         }
@@ -246,6 +257,7 @@ impl Model {
             provider: "google".into(),
             base_url: "https://generativelanguage.googleapis.com".into(),
             reasoning: false,
+            supports_images: true,
             context_window: 1_000_000,
             max_tokens: 8_192,
         }
@@ -262,6 +274,7 @@ impl Model {
             provider: "openai-codex".into(),
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             reasoning: true,
+            supports_images: true,
             context_window,
             max_tokens,
         }
@@ -286,6 +299,11 @@ impl Model {
             provider: provider.into(),
             base_url: base_url.into(),
             reasoning: false,
+            // Text-only by default: the compat lane serves DeepSeek / Kimi /
+            // MiniMax / custom gateways, none of which take image parts. A
+            // caller that KNOWS its compat endpoint is vision-capable flips
+            // this after construction.
+            supports_images: false,
             context_window,
             max_tokens,
         }
