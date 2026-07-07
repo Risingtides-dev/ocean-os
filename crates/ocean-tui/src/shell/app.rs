@@ -48,7 +48,20 @@ use super::{
 
 const SESS_W: u16 = 30;
 const TREE_W: u16 = 30;
+/// Default terminal-dock height; resizable at runtime (drag the splitter / ⌃⌥↑↓).
 const TERM_H: u16 = 14;
+/// Floor for the dock and the main surface so neither can be squeezed to nothing.
+const MIN_TERM_H: u16 = 3;
+const MIN_CENTER_H: u16 = 5;
+
+/// Largest dock height that still leaves the main surface `MIN_CENTER_H` rows,
+/// given the center column's total height (crumb + surface + splitter + dock).
+fn max_term_h(center_h: u16) -> u16 {
+    // reserve: 1 crumb + 1 splitter + MIN_CENTER_H surface.
+    center_h
+        .saturating_sub(2 + MIN_CENTER_H)
+        .max(MIN_TERM_H)
+}
 
 /// What the center surface is showing (CTRL swaps editor↔graph the same way).
 #[derive(Clone, Copy, PartialEq)]
@@ -99,6 +112,14 @@ pub struct App {
     r_tree: Rect,
     r_center: Rect,
     r_term: Rect,
+    /// The full center COLUMN (crumb + surface + splitter + dock), for clamping
+    /// a terminal-dock resize against the available height.
+    r_center_col: Rect,
+    r_split_term: Rect,
+    /// Terminal dock height in rows — resizable (drag the splitter or ⌃⌥↑/↓).
+    term_h: u16,
+    /// True while the operator is dragging the horizontal dock splitter.
+    dragging_term: bool,
     /// Panel visibility (CTRL's collapsible rails + terminal dock).
     show_sessions: bool,
     show_tree: bool,
@@ -154,6 +175,10 @@ impl App {
             r_tree: Rect::default(),
             r_center: Rect::default(),
             r_term: Rect::default(),
+            r_center_col: Rect::default(),
+            r_split_term: Rect::default(),
+            term_h: TERM_H,
+            dragging_term: false,
             show_sessions: true,
             show_tree: true,
             show_term: true,
@@ -260,6 +285,28 @@ impl App {
         // forwarded to whichever pane the cursor is over (CTRL behavior).
         if let CrosstermEvent::Mouse(m) = evt {
             let pos = (m.column, m.row);
+            // Terminal-dock resize: grab the horizontal splitter and drag it up
+            // (taller) or down (shorter). Wins over pane routing while dragging.
+            match m.kind {
+                MouseEventKind::Down(_) if rect_has(self.r_split_term, pos) => {
+                    self.dragging_term = true;
+                    return;
+                }
+                MouseEventKind::Drag(_) if self.dragging_term => {
+                    // The dock runs from just below the cursor to the bottom of
+                    // the center column, so dropping the splitter on row `m.row`
+                    // makes the dock exactly that tall.
+                    let bottom = self.r_center_col.y + self.r_center_col.height;
+                    let h = bottom.saturating_sub(m.row).saturating_sub(1);
+                    self.term_h = h.clamp(MIN_TERM_H, max_term_h(self.r_center_col.height));
+                    return;
+                }
+                MouseEventKind::Up(_) if self.dragging_term => {
+                    self.dragging_term = false;
+                    return;
+                }
+                _ => {}
+            }
             // Title-bar buttons win over pane routing (CTRL's upper model).
             if matches!(m.kind, MouseEventKind::Down(_)) {
                 if let Some(btn) = self
@@ -349,6 +396,9 @@ impl App {
                         }
                         return;
                     }
+                    // ⌃⌥↑ / ⌃⌥↓ — stretch / shrink the terminal dock.
+                    KeyCode::Up => return self.resize_term(2),
+                    KeyCode::Down => return self.resize_term(-2),
                     _ => {}
                 }
             }
@@ -690,6 +740,13 @@ impl App {
         self.last_tree_scan = Instant::now() - Duration::from_secs(2);
     }
 
+    /// Grow (+) or shrink (−) the terminal dock by `delta` rows, clamped so the
+    /// dock stays ≥ MIN_TERM_H and the main surface keeps ≥ MIN_CENTER_H.
+    fn resize_term(&mut self, delta: i16) {
+        let max = max_term_h(self.r_center_col.height) as i16;
+        self.term_h = (self.term_h as i16 + delta).clamp(MIN_TERM_H as i16, max) as u16;
+    }
+
     fn apply_focus(&mut self) {
         self.rail.focused = self.focus == Focus::Sessions;
         self.tree.focused = self.focus == Focus::Tree;
@@ -792,14 +849,17 @@ impl App {
 
         // center: breadcrumb / main surface / docked terminal (CTRL's rows).
         let term_visible = self.pty.is_active() && self.show_term;
+        // Clamp the (resizable) dock height to the space available this frame so
+        // the main surface always keeps at least MIN_CENTER_H rows.
+        self.term_h = self.term_h.clamp(MIN_TERM_H, max_term_h(center.height));
         let (r_crumb, r_center, r_split_term, r_term) = if term_visible {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1),
-                    Constraint::Min(5),
+                    Constraint::Min(MIN_CENTER_H),
                     Constraint::Length(1),
-                    Constraint::Length(TERM_H),
+                    Constraint::Length(self.term_h),
                 ])
                 .split(center);
             (rows[0], rows[1], rows[2], rows[3])
@@ -814,6 +874,8 @@ impl App {
         self.r_tree = r_tree;
         self.r_center = r_center;
         self.r_term = r_term;
+        self.r_center_col = center;
+        self.r_split_term = r_split_term;
 
         // deep chrome first
         frame.render_widget(
