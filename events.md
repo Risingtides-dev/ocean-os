@@ -1481,3 +1481,31 @@ area:      [backend]
 
 POST /v1/projects now creates the workspace directory on disk and stores a canonical path. expand_tilde() resolves leading ~ to $HOME; create_dir_all runs on the expanded path before canonicalize; the canonical path is stored in Project.workspace_root. Empty workspace_root passes through unchanged (existing behavior). On mkdir or canonicalize failure, returns 400 with a concise error. Added GET /v1/fs/dirs?path=<abs-or-~path>: sandboxed to $HOME (403 outside), skips dot-directories, dirs only, alphabetical, git flag when child/.git exists. Response includes home, parent (null at $HOME), and per-entry path+name+git. 5 new unit tests (expand_tilde, path_is_under, mkdir+canonicalize, empty root passthrough, banner well-formed). Verification: cargo test (253 passed), live smoke test through proxy confirmed ~/dev/... expanded, directory created on disk, canonical path stored.
 _________________________________________________________________________________
+
+time:      [ 6:40PM] [07-06-26]
+agent:     [claude] [opus 4.8]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+Reworked the session rail per John: "sort by projects, breadcrumbed like the
+filetree, not sprawl" + "no OC badge (CTRL harness remnant)." Regrouped the flat
+date-sorted list into collapsible WORKTREE nodes mirroring the file tree — blue
+▸/▾ headers with a session count, sessions nested one level under with title +
+age, most-recently-active worktree floats up and starts expanded, rest collapse.
+Enter toggles a header or resumes a session; expand state survives rescan;
+.claude/worktrees/<name> headers show just the leaf. Killed the per-row OC badge
+(remnant from when CTRL organized by harness); the live session now just gets a
+small green ● dot. Also fixed auto-resume: `ocean` with no --session resumed
+only when a dir had EXACTLY ONE session — now it resumes the MOST RECENT for the
+cwd every time (`cd project && ocean` continues where you left off; `/new` for a
+clean one). Honest limit surfaced by driving it in a PTY: grouping keys on the
+physical worktree dir, and John works from the main checkout across branches, so
+34 sessions still cluster under "main" — session records store workspace_root/
+cwd but NO git branch, so true per-branch grouping needs the daemon to stamp
+git_branch onto records going forward. Verified: build/clippy clean, 144 tui
+tests, PTY frame shows ▾ main (34) / ▸ longhouse-engine (1), zero OC badges.
+Committed ea96a3a. TUI-only (no daemon redeploy); ocean binary rebuilt so it's
+live on next launch. Separately, the concurrent fs/dirs session landed its work
+as 0000549 on this branch. main stays at f123ae3 (the deployed daemon).
+_________________________________________________________________________________
