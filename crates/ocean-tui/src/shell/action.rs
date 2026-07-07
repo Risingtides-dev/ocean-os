@@ -42,17 +42,26 @@ pub enum Action {
     /// Navigate the workbench to a pane/center surface — emitted by the `/`
     /// palette so chat never reaches into the app's private Focus/Center.
     Navigate(Nav),
-    /// `/new` — drop the bound session so the next turn mints a fresh one.
+    /// `/new` — drop the bound session so the next turn mints a fresh one
+    /// (stays in the current active project).
     NewSession,
+    /// `+ new` on a project header in the rail: start a fresh session AND
+    /// re-root the workbench (cwd for turns, file tree, graph) to `cwd`.
+    NewSessionInProject { cwd: PathBuf },
     /// `/copy` — put the given text (the last reply) on the system clipboard.
     CopyToClipboard(String),
     /// `/model <id>` — override the model for subsequent turns this session.
     SetModel(String),
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
-    /// Resume a session natively in the chat: load its transcript from `path`
-    /// and bind future turns to `id`.
-    ResumeSession { id: AgentSessionId, path: PathBuf },
+    /// Resume a session natively in the chat: load its transcript from `path`,
+    /// bind future turns to `id`, and re-root the workbench to `cwd` (the dir
+    /// the session ran in) so files/graph/turns follow the session.
+    ResumeSession {
+        id: AgentSessionId,
+        path: PathBuf,
+        cwd: PathBuf,
+    },
     /// A global `/v1/events` envelope (permission requests/decisions ride here).
     OceanEvent(Box<ocean_core::EventEnvelope>),
     /// Operator decided a pending permission (⌃Y allow / ⌃N deny). The app

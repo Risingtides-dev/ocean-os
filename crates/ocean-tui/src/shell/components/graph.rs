@@ -39,6 +39,15 @@ impl GraphComponent {
             self.graph = Some(ProjectGraph::scan(&self.root));
         }
     }
+
+    /// Re-root the graph at a new project directory; drops the cached scan so it
+    /// lazily re-scans the new root on the next draw.
+    pub fn set_root(&mut self, root: PathBuf) {
+        if self.root != root {
+            self.root = root;
+            self.graph = None;
+        }
+    }
 }
 
 impl Component for GraphComponent {

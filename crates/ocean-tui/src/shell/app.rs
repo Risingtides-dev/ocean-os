@@ -472,14 +472,34 @@ impl App {
                 self.center = Center::Editor;
                 self.focus_to(Focus::Center);
             }
-            Action::ResumeSession { id, path } => {
+            Action::ResumeSession { id, path, cwd } => {
                 self.chat
                     .load_history(crate::shell::sessions::load_transcript(path));
                 self.bind_session_with(*id, false); // transcript came from disk
                 self.rail.live_id = Some(id.0.to_string());
+                // Re-root the workbench to the dir this session ran in, so the
+                // file tree, graph, and future turns follow the session.
+                self.set_active_project(cwd.clone());
                 self.status = format!("resumed session {:.8}", id.0.to_string());
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
+            }
+            // `+ new` on a project header: fresh session, re-rooted to `cwd`.
+            Action::NewSessionInProject { cwd } => {
+                if let Some(task) = self.stream_task.take() {
+                    task.abort();
+                }
+                self.session_id = None;
+                self.chat.load_history(Vec::new()); // clear the transcript
+                self.rail.live_id = None;
+                self.set_active_project(cwd.clone());
+                self.center = Center::Chat;
+                self.focus_to(Focus::Center);
+                let leaf = cwd
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+                self.status = format!("new session · {leaf}");
             }
             Action::CycleFocus => self.cycle_focus(),
             // `/` palette navigation — reuse the exact patterns from `press()`
@@ -624,6 +644,24 @@ impl App {
     /// Mint-path bind: fresh chat, replay the session's buffered head.
     fn bind_session(&mut self, id: AgentSessionId) {
         self.bind_session_with(id, true);
+    }
+
+    /// Re-root the active project: the cwd new turns mint against AND the roots
+    /// of the file tree and graph, so the whole workbench follows when you pick
+    /// or `+`-create a session in another worktree. The session rail stays (it
+    /// lists the launch project's worktrees); the PTY is left alone (it may have
+    /// a live shell). No-ops if already there.
+    fn set_active_project(&mut self, cwd: PathBuf) {
+        let s = cwd.to_string_lossy().into_owned();
+        if s == self.workspace_root {
+            return;
+        }
+        self.workspace_root = s;
+        self.tree.set_root(cwd.clone());
+        self.graph.set_root(cwd);
+        // Force the file tree to re-read on the next tick rather than waiting
+        // out the throttle window.
+        self.last_tree_scan = Instant::now() - Duration::from_secs(2);
     }
 
     fn apply_focus(&mut self) {

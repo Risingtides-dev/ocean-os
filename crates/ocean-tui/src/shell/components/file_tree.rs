@@ -43,6 +43,15 @@ impl FileTreeComponent {
     pub fn rescan(&mut self) {
         self.tree.rescan();
     }
+
+    /// Re-root the explorer at a new project directory (switching worktrees /
+    /// starting a session in another project). Resets expansion + selection.
+    pub fn set_root(&mut self, root: PathBuf) {
+        if self.tree.root != root {
+            self.tree = Tree::new(root);
+            self.scroll = 0;
+        }
+    }
 }
 
 impl Component for FileTreeComponent {

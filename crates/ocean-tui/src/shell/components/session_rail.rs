@@ -34,9 +34,11 @@ use crate::shell::{
 };
 
 /// One worktree group: a header ("main", "feat/x", …) over its sessions,
-/// newest-first, with a collapse flag.
+/// newest-first, with a collapse flag. `cwd` is the project dir a `+ new`
+/// session in this group is rooted at.
 struct Group {
     worktree: String,
+    cwd: PathBuf,
     sessions: Vec<Session>,
     expanded: bool,
 }
@@ -49,6 +51,11 @@ enum Row {
     Header(usize),
     Session(usize, usize),
 }
+
+/// Width of the clickable "＋ (n)" button zone at the right edge of a header
+/// row — a left-click landing here starts a new session in that worktree.
+/// Covers "＋ (999)" comfortably.
+const PLUS_ZONE: u16 = 8;
 
 pub struct SessionRailComponent {
     root: PathBuf,
@@ -64,7 +71,7 @@ pub struct SessionRailComponent {
 
 impl SessionRailComponent {
     pub fn new(root: PathBuf) -> Self {
-        let groups = build_groups(discover(&root, Sort::Date));
+        let groups = build_groups(&root, discover(&root, Sort::Date));
         Self {
             root,
             groups,
@@ -117,7 +124,7 @@ impl SessionRailComponent {
             .filter(|g| g.expanded)
             .map(|g| g.worktree.clone())
             .collect();
-        self.groups = build_groups(discover(&self.root, Sort::Date));
+        self.groups = build_groups(&self.root, discover(&self.root, Sort::Date));
         if !expanded.is_empty() {
             for group in &mut self.groups {
                 group.expanded = expanded.contains(&group.worktree);
@@ -156,9 +163,23 @@ impl SessionRailComponent {
             Ok(uuid) => Some(Action::ResumeSession {
                 id: AgentSessionId(uuid),
                 path: s.path.clone(),
+                cwd: s.cwd.clone(),
             }),
             Err(_) => self.open_in_terminal(row),
         }
+    }
+
+    /// `+ new` in the group the given row belongs to: start a fresh session
+    /// rooted at that worktree's dir.
+    fn new_session_in(&self, row: Row) -> Option<Action> {
+        let gi = match row {
+            Row::Header(gi) => gi,
+            Row::Session(gi, _) => gi,
+        };
+        let group = self.groups.get(gi)?;
+        Some(Action::NewSessionInProject {
+            cwd: group.cwd.clone(),
+        })
     }
 
     fn open_in_terminal(&self, row: Row) -> Option<Action> {
@@ -238,6 +259,10 @@ impl Component for SessionRailComponent {
             }
             KeyCode::Enter => self.activate(),
             KeyCode::Char('t') => self.selected_row().and_then(|r| self.open_in_terminal(r)),
+            // `n` (or `+`): new session in the selected row's project/worktree.
+            KeyCode::Char('n') | KeyCode::Char('+') => {
+                self.selected_row().and_then(|r| self.new_session_in(r))
+            }
             _ => None,
         }
     }
@@ -254,6 +279,16 @@ impl Component for SessionRailComponent {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let i = self.row_at((mouse.column, mouse.row))?;
+                let row = self.rows().get(i).copied();
+                // Click on the rightmost "＋" zone of a header = new session in
+                // that project (the button John wants), regardless of selection.
+                if let Some(r @ Row::Header(_)) = row {
+                    let plus_x = self.body_rect.x + self.body_rect.width.saturating_sub(PLUS_ZONE);
+                    if mouse.column >= plus_x {
+                        self.selected = i;
+                        return self.new_session_in(r);
+                    }
+                }
                 if i == self.selected {
                     // click the already-selected row: toggle header / open session
                     self.activate()
@@ -319,20 +354,32 @@ impl Component for SessionRailComponent {
                         g("▸ ", "> ")
                     };
                     let count = format!("({})", group.sessions.len());
+                    let plus = g("＋", "+");
                     let label = format!("{caret}{}", display_worktree(&group.worktree));
-                    justified(
-                        &label,
-                        &count,
-                        inner,
-                        Style::default()
-                            .fg(theme::BLUE)
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                        Style::default().fg(theme::COMMENT),
-                    )
+                    // Right cluster: a green "＋" button + the session count. The
+                    // ＋ starts a new session in this worktree (click it or press
+                    // n). Build the spans by hand so ＋ and count get their own
+                    // colors and the label truncates to fit.
+                    let right_w = plus.chars().count() + 1 + count.chars().count();
+                    let left = truncate(&label, inner.saturating_sub(right_w + 1));
+                    let pad = inner.saturating_sub(left.chars().count() + right_w);
+                    let label_style = Style::default().fg(theme::BLUE).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    });
+                    Line::from(vec![
+                        Span::styled(left, label_style),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(
+                            plus,
+                            Style::default()
+                                .fg(theme::GREEN)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(count, Style::default().fg(theme::COMMENT)),
+                    ])
                 }
                 Row::Session(gi, si) => {
                     let s = &self.groups[gi].sessions[si];
@@ -383,7 +430,7 @@ impl Component for SessionRailComponent {
 /// top; within a group, sessions stay newest-first. The most-recently-active
 /// group starts expanded, the rest collapsed — so `ocean` opens on your latest
 /// work without the whole history sprawling open.
-fn build_groups(sessions: Vec<Session>) -> Vec<Group> {
+fn build_groups(root: &std::path::Path, sessions: Vec<Session>) -> Vec<Group> {
     let mut map: HashMap<String, Vec<Session>> = HashMap::new();
     for s in sessions {
         map.entry(s.worktree.clone()).or_default().push(s);
@@ -392,8 +439,16 @@ fn build_groups(sessions: Vec<Session>) -> Vec<Group> {
         .into_iter()
         .map(|(worktree, mut sessions)| {
             sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
+            // The worktree label IS the cwd's path relative to root ("main" ==
+            // root itself), so a `+ new` session here roots at exactly that dir.
+            let cwd = if worktree == "main" {
+                root.to_path_buf()
+            } else {
+                root.join(&worktree)
+            };
             Group {
                 worktree,
+                cwd,
                 sessions,
                 expanded: false,
             }
@@ -409,26 +464,6 @@ fn build_groups(sessions: Vec<Session>) -> Vec<Group> {
         first.expanded = true;
     }
     groups
-}
-
-/// A `left … right` line padded to `width`, with `left` truncated (…) if the
-/// two would collide. Used for the worktree header's "name (count)".
-fn justified(
-    left: &str,
-    right: &str,
-    width: usize,
-    left_style: Style,
-    right_style: Style,
-) -> Line<'static> {
-    let r = right.chars().count();
-    let max_left = width.saturating_sub(r + 1);
-    let left = truncate(left, max_left);
-    let pad = width.saturating_sub(left.chars().count() + r);
-    Line::from(vec![
-        Span::styled(left, left_style),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(right.to_string(), right_style),
-    ])
 }
 
 /// Header label for a worktree. Git worktrees for this repo live under
