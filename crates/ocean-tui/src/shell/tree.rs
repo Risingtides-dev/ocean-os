@@ -59,6 +59,20 @@ impl Tree {
         }
     }
 
+    /// Re-read the tree from disk, preserving expansion state (already keyed by
+    /// path) AND the current selection by PATH — so a file appearing above the
+    /// cursor doesn't yank the selection to a different entry. Used to live-
+    /// reflect files the agent (or a terminal) creates without a manual refresh.
+    pub fn rescan(&mut self) {
+        let sel_path = self.entries.get(self.selected).map(|e| e.path.clone());
+        self.rebuild();
+        if let Some(p) = sel_path {
+            if let Some(i) = self.entries.iter().position(|e| e.path == p) {
+                self.selected = i;
+            }
+        }
+    }
+
     fn walk(&self, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
         for (path, is_dir) in Self::read_dir_sorted(dir) {
             let expanded = self.expanded.contains(&path);

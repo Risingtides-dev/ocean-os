@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseEventKind};
 use ocean_agent_sdk::{AgentSessionId, AgentTurnRequest};
@@ -108,6 +109,8 @@ pub struct App {
     /// shell, so leaving the dock by keyboard takes two. Armed on the first Esc
     /// while focus is Term, disarmed on any other key or when focus leaves Term.
     esc_armed: bool,
+    /// Last time the file tree was re-read from disk (throttles the live rescan).
+    last_tree_scan: Instant,
 }
 
 /// A title-bar button — CTRL's icon toggles, extended with the center surfaces.
@@ -156,6 +159,7 @@ impl App {
             show_term: true,
             buttons: Vec::new(),
             esc_armed: false,
+            last_tree_scan: Instant::now(),
         };
         app.apply_focus();
         // Auto-resume the most recent session for this workspace so `ocean`
@@ -207,6 +211,13 @@ impl App {
                     }
                     if let Some(a) = self.editor.tick() {
                         self.dispatch(a);
+                    }
+                    // Live-reflect files the agent (or the terminal) creates in
+                    // the Files sidebar without a manual refresh. Throttled to
+                    // ~1s so it's a couple of cheap read_dirs, not per-tick.
+                    if self.last_tree_scan.elapsed() >= Duration::from_millis(1000) {
+                        self.tree.rescan();
+                        self.last_tree_scan = Instant::now();
                     }
                 }
                 Event::Crossterm(evt) => self.on_crossterm(evt),

@@ -37,6 +37,12 @@ impl FileTreeComponent {
             body_rect: Rect::default(),
         }
     }
+
+    /// Live-reflect on-disk changes (new files the agent/terminal created)
+    /// while preserving expansion + selection. Called on a throttled tick.
+    pub fn rescan(&mut self) {
+        self.tree.rescan();
+    }
 }
 
 impl Component for FileTreeComponent {
