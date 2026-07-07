@@ -1,34 +1,38 @@
-//! Tokyo Night palette + depth-fill system, shared across panes.
+//! Ocean palette — aligned to the `ocean-surface` product tokens
+//! (`ocean-surface/styles/tokens.css`): true-black grounds + the aqua "ocean
+//! ramp" accent + shared semantics, so the terminal reads as the same product
+//! as the web surface. (Was CTRL's Tokyo Night.) The editor's syntect code
+//! theme is deliberately left on its own scheme — code colors aren't UI chrome.
 #![allow(dead_code)]
 use ratatui::style::Color;
 
-// ── base tiers ────────────────────────────────────────────────────────────────
-pub const BG: Color = Color::Rgb(0x1a, 0x1b, 0x26); // editor void
-pub const BG_DARK: Color = Color::Rgb(0x16, 0x16, 0x1e); // gutter / void rail
-pub const SLATE: Color = Color::Rgb(0x1f, 0x23, 0x35); // panel bed (invented)
-pub const BG_HL: Color = Color::Rgb(0x29, 0x2e, 0x42); // selected / segment
-pub const EDGE: Color = Color::Rgb(0x3b, 0x42, 0x61); // light-edge column
-pub const SHADOW: Color = Color::Rgb(0x0f, 0x0f, 0x16); // faux drop-shadow column
-pub const CURLINE: Color = Color::Rgb(0x1e, 0x20, 0x2e); // current line bg
-pub const HOVER: Color = Color::Rgb(0x20, 0x23, 0x2f); // hover row bg
+// ── base tiers (ocean-surface bg ramp: #060606 → #23252B) ───────────────────────
+pub const BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a); // editor void — bg-raised
+pub const BG_DARK: Color = Color::Rgb(0x06, 0x06, 0x06); // deepest void / gutter — bg
+pub const SLATE: Color = Color::Rgb(0x14, 0x14, 0x14); // panel bed — bg-elevated
+pub const BG_HL: Color = Color::Rgb(0x23, 0x25, 0x2b); // selected / segment — bg-well
+pub const EDGE: Color = Color::Rgb(0x2e, 0x32, 0x3c); // light-edge column — card line
+pub const SHADOW: Color = Color::Rgb(0x00, 0x00, 0x00); // faux drop-shadow column
+pub const CURLINE: Color = Color::Rgb(0x12, 0x13, 0x17); // current line bg (subtle raise)
+pub const HOVER: Color = Color::Rgb(0x1b, 0x1c, 0x21); // hover row bg — bg-hover
 
-// ── accents ───────────────────────────────────────────────────────────────────
-pub const FG: Color = Color::Rgb(0xc0, 0xca, 0xf5);
-pub const COMMENT: Color = Color::Rgb(0x56, 0x5f, 0x89);
-pub const BLUE: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
-pub const CYAN: Color = Color::Rgb(0x7d, 0xcf, 0xff);
-pub const DEEPBLUE: Color = Color::Rgb(0x3d, 0x59, 0xa1); // deep blue (logo caret) — darkest of the 3 logo shades
-pub const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
-pub const YELLOW: Color = Color::Rgb(0xe0, 0xaf, 0x68);
-pub const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
-pub const MAGENTA: Color = Color::Rgb(0xbb, 0x9a, 0xf7);
-pub const ORANGE: Color = Color::Rgb(0xff, 0x9e, 0x64);
+// ── accents (ocean ramp + surface semantics) ────────────────────────────────────
+pub const FG: Color = Color::Rgb(0xfa, 0xfc, 0xff); // fg — near-white
+pub const COMMENT: Color = Color::Rgb(0x90, 0x90, 0x98); // fg-3 — muted label
+pub const BLUE: Color = Color::Rgb(0x6a, 0xa6, 0xff); // info — dirs/headers (readable blue, distinct from aqua)
+pub const CYAN: Color = Color::Rgb(0x00, 0xd7, 0xd7); // ocean-6 — PRIMARY aqua accent (bars, prompts, titles)
+pub const DEEPBLUE: Color = Color::Rgb(0x00, 0x5f, 0xaf); // ocean-3 — deep logo shade
+pub const GREEN: Color = Color::Rgb(0x1e, 0xd7, 0x60); // ok
+pub const YELLOW: Color = Color::Rgb(0xff, 0xb2, 0x24); // warn
+pub const RED: Color = Color::Rgb(0xff, 0x4d, 0x67); // err
+pub const MAGENTA: Color = Color::Rgb(0xb7, 0x94, 0xf6); // soft violet — thinking (no surface token; harmonized)
+pub const ORANGE: Color = Color::Rgb(0xff, 0x9e, 0x64); // orange — distinct from warn amber
 
-// ── program badge beds (Yazi graft, 2-char filled pill) ─────────────────────────
-pub const BADGE_CLAUDE_BG: Color = Color::Rgb(0x2d, 0x24, 0x38);
-pub const BADGE_CODEX_BG: Color = Color::Rgb(0x1e, 0x2b, 0x1e);
-pub const BADGE_PI_BG: Color = Color::Rgb(0x1b, 0x24, 0x38);
-pub const BADGE_OCEAN_BG: Color = Color::Rgb(0x16, 0x2f, 0x3d);
+// ── program badge beds (2-char filled pill) — dark tints on true black ──────────
+pub const BADGE_CLAUDE_BG: Color = Color::Rgb(0x24, 0x18, 0x30);
+pub const BADGE_CODEX_BG: Color = Color::Rgb(0x14, 0x21, 0x0f);
+pub const BADGE_PI_BG: Color = Color::Rgb(0x0a, 0x1a, 0x2a);
+pub const BADGE_OCEAN_BG: Color = Color::Rgb(0x04, 0x25, 0x2b); // deep aqua bed
 
 /// Nerd-font / fancy-glyph rendering. Flip to `false` to test the ASCII fallback.
 pub const NERD: bool = true;
