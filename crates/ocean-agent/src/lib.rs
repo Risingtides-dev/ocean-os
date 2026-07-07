@@ -4901,6 +4901,174 @@ done
     }
 
     #[test]
+    fn owning_project_index_maps_each_distinct_root_to_its_project() {
+        // Two projects at distinct roots → the index holds both, each root keyed
+        // to its own project by id. No git is involved: owning_project_index
+        // reads projects.json once (the perf fix for the sessions endpoint).
+        let config_dir = temp_config_dir("owning-project-index-distinct");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        let mk = |id: uuid::Uuid, name: &str, root: &str, ts: i64| Project {
+            id,
+            name: name.into(),
+            workspace_root: root.into(),
+            config: ocean_core::ProjectConfig::default(),
+            created_ms: ts,
+            updated_ms: ts,
+        };
+
+        let alpha_id = uuid::Uuid::new_v4();
+        let beta_id = uuid::Uuid::new_v4();
+        // upsert appends distinct-id projects in insertion order.
+        runtime
+            .upsert_project(mk(alpha_id, "alpha", "/srv/alpha", 100), 100)
+            .unwrap();
+        runtime
+            .upsert_project(mk(beta_id, "beta", "/srv/beta", 200), 200)
+            .unwrap();
+
+        let index = runtime.owning_project_index().unwrap();
+        assert_eq!(index.len(), 2, "both distinct-root projects are present");
+        assert_eq!(
+            index.get("/srv/alpha").map(|p| p.id),
+            Some(alpha_id),
+            "alpha's root maps to alpha"
+        );
+        assert_eq!(
+            index.get("/srv/beta").map(|p| p.id),
+            Some(beta_id),
+            "beta's root maps to beta"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn owning_project_index_keeps_first_stored_project_for_a_duplicate_root() {
+        // Two projects claim the SAME workspace_root. owning_project_index walks
+        // projects in stored order and is first-match-wins (entry().or_insert),
+        // exactly mirroring project_for_workspace / find_by_workspace
+        // (load_all().into_iter().find). The batch path and the per-session
+        // detail path MUST resolve a duplicate root to the same owner, so we
+        // assert agreement between the two here.
+        let config_dir = temp_config_dir("owning-project-index-duplicate-root");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        let mk = |id: uuid::Uuid, name: &str, root: &str, ts: i64| Project {
+            id,
+            name: name.into(),
+            workspace_root: root.into(),
+            config: ocean_core::ProjectConfig::default(),
+            created_ms: ts,
+            updated_ms: ts,
+        };
+
+        let shared_root = "/srv/shared";
+        let first_id = uuid::Uuid::new_v4();
+        let second_id = uuid::Uuid::new_v4();
+        // upsert appends distinct-id projects in stored order, so `first` leads.
+        runtime
+            .upsert_project(mk(first_id, "first", shared_root, 100), 100)
+            .unwrap();
+        runtime
+            .upsert_project(mk(second_id, "second", shared_root, 200), 200)
+            .unwrap();
+
+        let index = runtime.owning_project_index().unwrap();
+        assert_eq!(
+            index.len(),
+            1,
+            "a duplicate root collapses to a single entry"
+        );
+        let indexed = index
+            .get(shared_root)
+            .expect("the shared root is present once");
+        assert_eq!(
+            indexed.id, first_id,
+            "the first-stored project wins for a duplicate root"
+        );
+
+        // Consistency: the single-root lookup the detail path uses agrees.
+        let lookup = runtime
+            .project_for_workspace(shared_root)
+            .unwrap()
+            .expect("project_for_workspace resolves the shared root");
+        assert_eq!(
+            lookup.id, first_id,
+            "project_for_workspace and owning_project_index agree on duplicate roots"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn owning_project_index_skips_empty_root_and_misses_unregistered_roots() {
+        // A project whose workspace_root is the empty string is skipped (never
+        // keyed), and a root no project claims is simply absent from the map.
+        let config_dir = temp_config_dir("owning-project-index-empty-and-miss");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        let claimed_id = uuid::Uuid::new_v4();
+        runtime
+            .upsert_project(
+                Project {
+                    id: claimed_id,
+                    name: "claimed".into(),
+                    workspace_root: "/srv/claimed".into(),
+                    config: ocean_core::ProjectConfig::default(),
+                    created_ms: 100,
+                    updated_ms: 100,
+                },
+                100,
+            )
+            .unwrap();
+        runtime
+            .upsert_project(
+                Project {
+                    id: uuid::Uuid::new_v4(),
+                    name: "rootless".into(),
+                    workspace_root: String::new(),
+                    config: ocean_core::ProjectConfig::default(),
+                    created_ms: 200,
+                    updated_ms: 200,
+                },
+                200,
+            )
+            .unwrap();
+
+        let index = runtime.owning_project_index().unwrap();
+        assert_eq!(
+            index.len(),
+            1,
+            "only the project with a non-empty root is indexed"
+        );
+        assert!(
+            !index.contains_key(""),
+            "an empty workspace_root is never a key"
+        );
+        assert_eq!(
+            index.get("/srv/claimed").map(|p| p.id),
+            Some(claimed_id),
+            "the claimed root maps to its project"
+        );
+        assert!(
+            index.get("/srv/nobody-claims-this").is_none(),
+            "an unregistered root is absent"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
     fn list_projects_page_is_bounded_and_pageable() {
         let config_dir = temp_config_dir("list-projects-page");
         let runtime = runtime(
