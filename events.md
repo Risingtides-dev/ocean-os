@@ -1509,3 +1509,12 @@ Committed ea96a3a. TUI-only (no daemon redeploy); ocean binary rebuilt so it's
 live on next launch. Separately, the concurrent fs/dirs session landed its work
 as 0000549 on this branch. main stays at f123ae3 (the deployed daemon).
 _________________________________________________________________________________
+
+time:      [ 4:42PM] [07-07-26]
+agent:     [codex] [gpt-5.5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Extended provider auth/model routing for Ocean. Added GLM/Zhipu as an OpenAI-compatible provider (`glm-4.6`, `glm-4.5`, `glm-4.5-flash`) with GLM/Zhipu/ZAI env-key support. Added Claude Code plan OAuth as a separate `claude-code` provider: Ocean auth-file OAuth blocks (`claude-code`, `anthropic-oauth`) and Claude Code bearer env tokens resolve to bearer credentials, the agent maps public `claude-code-*` aliases onto Anthropic Messages API model ids, and ocean-protocol now switches Anthropic auth between `x-api-key` and `Authorization: Bearer`. Hardened Codex OAuth by rejecting expired Ocean `openai-codex` blocks and falling back to Codex CLI auth JSON (`OCEAN_CODEX_AUTH_FILE` or `$HOME/.codex/auth.json`) for token/account id. Fixed the Anthropic registry base URL to the host root so protocol appends `/v1/messages` exactly once. Verification: `cargo test -p ocean-providers` 33 passed, `cargo test -p ocean-protocol` 115 passed, `cargo test -p ocean-agent` 112 passed, `cargo check --workspace` OK. `cargo fmt --check` is still blocked by broad pre-existing formatting diffs across unrelated files on this branch.
+_________________________________________________________________________________

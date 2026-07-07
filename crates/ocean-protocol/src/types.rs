@@ -157,6 +157,28 @@ pub struct Context {
     pub tools: Vec<Tool>,
 }
 
+/// How a provider should present its credential on the request wire.
+///
+/// Carries no secret material — the token still arrives via
+/// [`StreamOptions::api_key`]. The enum only selects the header convention.
+///
+/// Defaults to [`AuthMethod::ApiKey`], the Anthropic Messages convention of an
+/// `x-api-key: <secret>` header, so existing callers using default options keep
+/// their historical wire shape. [`AuthMethod::Bearer`] is for OAuth-style
+/// providers (e.g. Claude Code plan OAuth, OpenAI Codex OAuth) whose credential
+/// is an access token sent as `authorization: Bearer <secret>` instead of an
+/// API key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    /// API-key auth: `x-api-key: <secret>`. Anthropic default; preserved for
+    /// backward compatibility.
+    #[default]
+    ApiKey,
+    /// OAuth bearer auth: `authorization: Bearer <secret>`.
+    Bearer,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
     pub temperature: Option<f32>,
@@ -169,6 +191,10 @@ pub struct StreamOptions {
     pub base_url: Option<String>,
     /// Optional custom request headers.
     pub headers: std::collections::BTreeMap<String, String>,
+    /// How to present `api_key` on the wire. Defaults to [`AuthMethod::ApiKey`],
+    /// preserving the historical Anthropic `x-api-key` behavior for callers
+    /// using default options.
+    pub auth: AuthMethod,
 }
 
 /// Model descriptor — analogous to the Model<TApi> interface in ocean-protocol.

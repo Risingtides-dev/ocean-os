@@ -19,8 +19,8 @@ pub use providers::{
 };
 pub use stream::AssistantMessageEventStream;
 pub use types::{
-    now_ms, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, StopReason,
-    StreamOptions, ThinkingLevel, Tool, ToolResultMessage, Usage,
+    now_ms, AssistantMessage, AssistantMessageEvent, AuthMethod, Content, Context, Message, Model,
+    StopReason, StreamOptions, ThinkingLevel, Tool, ToolResultMessage, Usage,
 };
 
 /// Entry point that mirrors `streamSimple()` in ocean-protocol TS: pick the provider

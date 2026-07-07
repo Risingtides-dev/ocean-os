@@ -485,6 +485,7 @@ impl AgentRuntime {
         let mut options = ocean_protocol::StreamOptions {
             api_key: state.api_key.clone(),
             base_url: Some(state.provider_config.selection.base_url.clone()),
+            auth: auth_method_for(&state.provider_config),
             ..Default::default()
         };
         if let Some(account_id) = &state.provider_config.account_id {
@@ -1330,6 +1331,7 @@ impl AgentRuntime {
         }
         cfg.stream_options.api_key = snapshot.api_key.clone();
         cfg.stream_options.base_url = Some(snapshot.provider_config.selection.base_url.clone());
+        cfg.stream_options.auth = auth_method_for(&snapshot.provider_config);
         cfg.stream_options.cancel = cancel;
         if let Some(account_id) = &snapshot.provider_config.account_id {
             cfg.stream_options
@@ -2141,6 +2143,7 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
         | ProviderId::OpenAiCompatible
         | ProviderId::MiniMax
         | ProviderId::Kimi
+        | ProviderId::Glm
         | ProviderId::Fake => Ok(Model::openai_compat(
             selection.provider.as_str(),
             selection.model.clone(),
@@ -2186,6 +2189,33 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
                 anyhow::bail!("unsupported google model '{}'", selection.model);
             }
         }),
+        ProviderId::ClaudeCode => Ok(match selection.model.as_str() {
+            "claude-code-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
+            "claude-code-opus-4-7" => Model::anthropic_claude_opus_4_7(),
+            _ => {
+                anyhow::bail!("unsupported claude-code model '{}'", selection.model);
+            }
+        }),
+    }
+}
+
+/// Map a resolved provider credential's kind onto the protocol wire auth
+/// method so the request presents the token correctly. OAuth providers
+/// (openai-codex, claude-code) resolve a bearer-kind credential and must
+/// authenticate with `authorization: Bearer`; every other provider — including
+/// a missing credential (e.g. the keyless fake provider) — keeps the default
+/// `x-api-key`-style API-key auth so existing callers are unchanged. Carries
+/// no secret: the token still arrives via `StreamOptions::api_key`.
+fn auth_method_for(config: &ProviderConfig) -> ocean_protocol::types::AuthMethod {
+    match config
+        .credential
+        .as_ref()
+        .map(|credential| &credential.kind)
+    {
+        Some(ocean_providers::CredentialKind::OAuthBearer) => {
+            ocean_protocol::types::AuthMethod::Bearer
+        }
+        _ => ocean_protocol::types::AuthMethod::ApiKey,
     }
 }
 
@@ -3642,6 +3672,7 @@ done
                 source: ocean_providers::CredentialSource::Env {
                     name: "OCEAN_TEST_API_KEY".into(),
                 },
+                kind: ocean_providers::CredentialKind::ApiKey,
             }),
             account_id: None,
         }
@@ -3668,6 +3699,82 @@ done
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             test_env,
         }
+    }
+
+    #[test]
+    fn glm_provider_config_maps_to_openai_compat_model() {
+        // GLM (Zhipu) is an OpenAI-compatible chat-completions endpoint: the
+        // resolved Model must carry provider "glm", the openai-completions api,
+        // the selected model id, and preserve the selection's base URL and
+        // token limits verbatim.
+        let config = provider_config(ProviderId::Glm, "glm-4.6", true);
+        let model = model_from_provider_config(&config).expect("glm model resolves");
+
+        assert_eq!(model.provider, "glm");
+        assert_eq!(model.api, "openai-completions");
+        assert_eq!(model.id, "glm-4.6");
+        assert_eq!(model.base_url, "fake://local");
+        assert_eq!(model.context_window, 1_000);
+        assert_eq!(model.max_tokens, 1_000);
+    }
+
+    #[test]
+    fn claude_code_sonnet_alias_maps_to_anthropic_messages_model() {
+        // Claude Code plan OAuth speaks the Anthropic Messages wire protocol;
+        // the public picker alias must resolve to the real Anthropic model id
+        // so ocean-agent never sends "claude-code-sonnet-4-6" on the wire.
+        let config = provider_config(ProviderId::ClaudeCode, "claude-code-sonnet-4-6", true);
+        let model =
+            model_from_provider_config(&config).expect("claude-code sonnet alias resolves");
+
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.api, "anthropic-messages");
+        assert_eq!(model.id, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn claude_code_opus_alias_maps_to_anthropic_messages_model() {
+        let config = provider_config(ProviderId::ClaudeCode, "claude-code-opus-4-7", true);
+        let model =
+            model_from_provider_config(&config).expect("claude-code opus alias resolves");
+
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.api, "anthropic-messages");
+        assert_eq!(model.id, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn auth_method_follows_resolved_credential_kind() {
+        use ocean_protocol::types::AuthMethod;
+
+        // OAuth bearer credential (Codex / Claude Code) → Bearer.
+        let bearer = ProviderConfig {
+            selection: ocean_providers::ModelSelection {
+                provider: ProviderId::OpenAiCodex,
+                model: "gpt-5.4".into(),
+                base_url: "fake://local".into(),
+                context_window: 1_000,
+                max_output_tokens: 1_000,
+            },
+            credential: Some(ocean_providers::ResolvedCredential {
+                secret: ocean_providers::SecretString::new("oauth-access-token").unwrap(),
+                source: ocean_providers::CredentialSource::OceanAuthFile {
+                    path: "auth.json".into(),
+                },
+                kind: ocean_providers::CredentialKind::OAuthBearer,
+            }),
+            account_id: None,
+        };
+        assert_eq!(auth_method_for(&bearer), AuthMethod::Bearer);
+
+        // Regular env API-key credential → ApiKey (default wire shape).
+        let api_key = provider_config(ProviderId::DeepSeek, "deepseek-chat", true);
+        assert_eq!(auth_method_for(&api_key), AuthMethod::ApiKey);
+
+        // No credential at all (keyless fake provider) → ApiKey default, never
+        // Bearer: a missing token must not flip the wire convention.
+        let none = provider_config(ProviderId::Fake, "fake-ok", false);
+        assert_eq!(auth_method_for(&none), AuthMethod::ApiKey);
     }
 
     #[test]
@@ -4053,7 +4160,7 @@ done
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
-            auth_file: None,
+            ..Default::default()
         }
     }
 

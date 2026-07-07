@@ -19,8 +19,8 @@ use crate::providers::Provider;
 use crate::retry::{classify_status, parse_retry_after, retry_config, with_retry, Attempt};
 use crate::stream::AssistantMessageEventStream;
 use crate::types::{
-    now_ms, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, StopReason,
-    StreamOptions, ThinkingLevel, Usage,
+    now_ms, AssistantMessage, AssistantMessageEvent, AuthMethod, Content, Context, Message, Model,
+    StopReason, StreamOptions, ThinkingLevel, Usage,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -375,6 +375,23 @@ enum BlockKind {
     ToolUse,
 }
 
+/// Apply the chosen auth method to an Anthropic request builder.
+///
+/// `ApiKey` (the default, and the historical Anthropic convention) sets
+/// `x-api-key: <secret>`. `Bearer` uses `reqwest`'s `bearer_auth`, which sets
+/// `authorization: Bearer <secret>` and does NOT set `x-api-key` — the OAuth
+/// path used when the credential is an access token (Claude Code plan OAuth,
+/// OpenAI Codex OAuth) rather than an API key.
+///
+/// Extracted from the retry closure so the wire shape is directly testable
+/// without an HTTP round-trip; `AnthropicProvider::stream` delegates here.
+fn apply_auth(req: reqwest::RequestBuilder, method: AuthMethod, secret: &str) -> reqwest::RequestBuilder {
+    match method {
+        AuthMethod::ApiKey => req.header("x-api-key", secret),
+        AuthMethod::Bearer => req.bearer_auth(secret),
+    }
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn stream(
@@ -396,6 +413,7 @@ impl Provider for AnthropicProvider {
         let body = build_body(model, context, options);
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
+        let auth = options.auth;
 
         let resp = with_retry(retry_config(), cancel.as_ref(), |_attempt| {
             let client = self.client.clone();
@@ -403,13 +421,14 @@ impl Provider for AnthropicProvider {
             let api_key = api_key.clone();
             let body = body.clone();
             let extra_headers = extra_headers.clone();
+            let auth = auth;
             async move {
                 let mut req = client
                     .post(&url)
-                    .header("x-api-key", &api_key)
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .header("accept", "text/event-stream")
                     .header("content-type", "application/json");
+                req = apply_auth(req, auth, &api_key);
                 for (k, v) in extra_headers {
                     req = req.header(k, v);
                 }
@@ -1002,5 +1021,74 @@ mod tests {
         // System + tool breakpoints are still present.
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+    // Helper: read a header off a built request as a &str (None if absent or
+    // non-utf8). Keeps the auth assertions below compact and unambiguous.
+    fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    // AuthMethod::ApiKey (the default) must produce `x-api-key: <secret>` and
+    // must NOT set an `authorization` header — the historical Anthropic wire
+    // shape, unchanged for existing callers. Exercises the production
+    // `apply_auth` helper directly so no real HTTP round-trip is needed.
+    #[test]
+    fn anthropic_api_key_auth_sets_x_api_key_header() {
+        let client = reqwest::Client::new();
+        let req = client
+            .post("https://example.test/v1/messages")
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        let built = apply_auth(req, AuthMethod::ApiKey, "sk-test-123")
+            .build()
+            .expect("request builds");
+        let headers = built.headers();
+        assert_eq!(
+            header_str(headers, "x-api-key"),
+            Some("sk-test-123"),
+            "ApiKey must set x-api-key to the secret",
+        );
+        assert_eq!(
+            header_str(headers, "authorization"),
+            None,
+            "ApiKey must not set an authorization header",
+        );
+    }
+
+    // AuthMethod::Bearer must produce `authorization: Bearer <secret>` and
+    // must NOT set `x-api-key` — the OAuth path (Claude Code plan OAuth, Codex
+    // OAuth) distinct from the API-key default. Proves the bearer branch of
+    // `apply_auth` selects a different header convention than ApiKey.
+    #[test]
+    fn anthropic_bearer_auth_sets_authorization_and_not_x_api_key() {
+        let client = reqwest::Client::new();
+        let req = client
+            .post("https://example.test/v1/messages")
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        let built = apply_auth(req, AuthMethod::Bearer, "oauth-token-456")
+            .build()
+            .expect("request builds");
+        let headers = built.headers();
+        assert_eq!(
+            header_str(headers, "authorization"),
+            Some("Bearer oauth-token-456"),
+            "Bearer must set authorization to 'Bearer <secret>'",
+        );
+        assert_eq!(
+            header_str(headers, "x-api-key"),
+            None,
+            "Bearer must not set x-api-key",
+        );
+    }
+
+    // Backward-compatibility invariant: the default StreamOptions auth method
+    // must remain ApiKey, so existing callers that never set `auth` keep
+    // emitting `x-api-key` exactly as before the AuthMethod enum existed.
+    #[test]
+    fn anthropic_default_stream_options_use_api_key_auth() {
+        assert_eq!(
+            StreamOptions::default().auth,
+            AuthMethod::ApiKey,
+            "default StreamOptions must select ApiKey to preserve x-api-key behavior",
+        );
     }
 }

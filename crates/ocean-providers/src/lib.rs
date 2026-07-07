@@ -4,14 +4,14 @@
 //! provider/auth decision for Ocean callers; temporary adapters can translate the
 //! resolved config into legacy runtime structs at the edge.
 
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::{Path, PathBuf}};
 
 use serde::{Deserialize, Serialize};
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 // OpenAI-compatible chat-completions endpoints. Both expose `/chat/completions`
 // under these bases and stream reasoning separately (MiniMax via `<think>`
 // tags / `reasoning_split`, Kimi via a thinking channel), so they ride the
@@ -22,6 +22,8 @@ const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 // `google-generative-ai` provider, which targets the v1beta surface under
 // this base — not an OpenAI-compatible endpoint.
 const GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+// Zhipu AI / GLM (OpenAI-compatible chat-completions; GLM-4 family).
+const GLM_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 
 /// Stable provider identifier used by Ocean runtime components.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,10 +34,15 @@ pub enum ProviderId {
     /// OpenAI Codex over a ChatGPT subscription OAuth token (Responses API).
     OpenAiCodex,
     Anthropic,
+    /// Claude Code over Anthropic Messages wire protocol, authenticated with a
+    /// Claude Code OAuth bearer token (not an x-api-key).
+    ClaudeCode,
     /// MiniMax (OpenAI-compatible chat-completions; M2 family).
     MiniMax,
     /// Moonshot AI / Kimi (OpenAI-compatible chat-completions; K2 family).
     Kimi,
+    /// Zhipu AI / GLM (OpenAI-compatible chat-completions; GLM-4 family).
+    Glm,
     /// Google Generative AI (Gemini family; v1beta generativelanguage API).
     Google,
     OpenAiCompatible,
@@ -49,8 +56,10 @@ impl ProviderId {
             Self::OpenAi => "openai",
             Self::OpenAiCodex => "openai-codex",
             Self::Anthropic => "anthropic",
+            Self::ClaudeCode => "claude-code",
             Self::MiniMax => "minimax",
             Self::Kimi => "kimi",
+            Self::Glm => "glm",
             Self::Google => "google",
             Self::OpenAiCompatible => "openai-compatible",
             Self::Fake => "fake",
@@ -61,11 +70,21 @@ impl ProviderId {
         match self {
             Self::DeepSeek => &["OCEAN_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
             Self::OpenAi | Self::OpenAiCompatible => &["OCEAN_OPENAI_API_KEY", "OPENAI_API_KEY"],
-            // Codex uses the OAuth token from auth.json, not an env API key.
+            // Codex uses the OAuth token from auth.json / Codex CLI auth, not
+            // an env API key.
             Self::OpenAiCodex => &[],
+            // Claude Code env credentials are OAuth bearer access tokens.
+            Self::ClaudeCode => &["OCEAN_CLAUDE_CODE_ACCESS_TOKEN", "CLAUDE_CODE_ACCESS_TOKEN"],
             Self::Anthropic => &["OCEAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             Self::MiniMax => &["OCEAN_MINIMAX_API_KEY", "MINIMAX_API_KEY"],
             Self::Kimi => &["OCEAN_MOONSHOT_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"],
+            Self::Glm => &[
+                "OCEAN_GLM_API_KEY",
+                "GLM_API_KEY",
+                "ZHIPUAI_API_KEY",
+                "ZAI_API_KEY",
+                "BIGMODEL_API_KEY",
+            ],
             // `GEMINI_API_KEY` is Google's own canonical env var (their SDKs
             // default to it). The GoogleProvider in ocean-protocol reads both
             // GOOGLE_API_KEY and GEMINI_API_KEY, so the registry's readiness
@@ -88,7 +107,21 @@ impl ProviderId {
 pub enum CredentialSource {
     Env { name: String },
     OceanAuthFile { path: String },
+    /// Codex CLI auth JSON (`OCEAN_CODEX_AUTH_FILE` / `$HOME/.codex/auth.json`),
+    /// used as a fallback when the Ocean `openai-codex` OAuth block is absent or
+    /// expired.
+    CodexCliAuthFile { path: String },
     NotRequired,
+}
+
+/// Non-secret credential kind: a regular API key vs an OAuth bearer token.
+/// Lets Ocean pick a wire auth method (x-api-key vs Authorization: Bearer)
+/// without inspecting the secret. See [`ResolvedCredential::kind`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    ApiKey,
+    OAuthBearer,
 }
 
 /// Secret-bearing credential wrapper. Debug/Display intentionally redact.
@@ -123,6 +156,8 @@ impl fmt::Display for SecretString {
 pub struct ResolvedCredential {
     pub secret: SecretString,
     pub source: CredentialSource,
+    /// How this credential authenticates on the wire — API key vs OAuth bearer.
+    pub kind: CredentialKind,
 }
 
 impl fmt::Debug for ResolvedCredential {
@@ -130,6 +165,7 @@ impl fmt::Debug for ResolvedCredential {
         f.debug_struct("ResolvedCredential")
             .field("secret", &self.secret)
             .field("source", &self.source)
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -158,6 +194,7 @@ impl ProviderConfig {
     pub fn readiness(&self) -> ProviderReadiness {
         let credential_present = self.credential.is_some();
         let credential_source = self.credential.as_ref().map(|cred| cred.source.clone());
+        let credential_kind = self.credential.as_ref().map(|cred| cred.kind.clone());
         let ok = credential_present || !self.selection.provider.requires_credential();
         ProviderReadiness {
             ok,
@@ -166,6 +203,7 @@ impl ProviderConfig {
             base_url_host: base_url_host(&self.selection.base_url),
             credential_present,
             credential_source,
+            credential_kind,
             error: (!ok).then_some(ProviderConfigError::MissingCredential {
                 provider: self.selection.provider.as_str().to_string(),
             }),
@@ -183,6 +221,8 @@ pub struct ProviderReadiness {
     pub credential_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_source: Option<CredentialSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_kind: Option<CredentialKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ProviderConfigError>,
 }
@@ -238,6 +278,10 @@ impl std::error::Error for ProviderConfigError {}
 pub struct ProviderEnv {
     pub vars: BTreeMap<String, String>,
     pub auth_file: Option<PathBuf>,
+    /// Codex CLI auth JSON path (`OCEAN_CODEX_AUTH_FILE`, else
+    /// `$HOME/.codex/auth.json`). Fallback credential source for `openai-codex`
+    /// when the Ocean auth-file OAuth block is absent or expired.
+    pub codex_auth_file: Option<PathBuf>,
 }
 
 impl ProviderEnv {
@@ -247,6 +291,7 @@ impl ProviderEnv {
             auth_file: std::env::var_os("OCEAN_AUTH_FILE")
                 .map(PathBuf::from)
                 .or_else(default_ocean_auth_file),
+            codex_auth_file: default_codex_auth_file(),
         }
     }
 
@@ -410,16 +455,90 @@ pub fn resolve_fallback_config(
         .next()
 }
 
-/// Read the ChatGPT account id from the `openai-codex` auth.json block.
+/// Read the ChatGPT account id from the same source that supplied the Codex
+/// credential (valid Ocean `openai-codex` OAuth block, else Codex CLI auth
+/// JSON), so the account id and the access token always come from the same
+/// place. Returns `None` when no Codex auth source is available.
 fn resolve_codex_account_id(env: &ProviderEnv) -> Option<String> {
-    let path = env.auth_file.as_ref()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    json.pointer("/openai-codex/accountId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
+    resolve_codex_auth(env)
+        .ok()
+        .flatten()
+        .and_then(|auth| auth.account_id)
+}
+
+/// Codex auth resolved from the best available source: the raw access token, the
+/// optional ChatGPT account id, and a non-secret source label. The token and
+/// account id always come from the same source so a request never mixes an Ocean
+/// OAuth token with a CLI account id (or vice versa).
+struct CodexAuth {
+    access_token: String,
+    account_id: Option<String>,
+    source: CredentialSource,
+}
+
+/// Resolve Codex auth from the first source with a usable OAuth access token:
+/// 1. A valid (non-expired) `openai-codex` OAuth block in the Ocean auth file.
+/// 2. The Codex CLI auth JSON at `OCEAN_CODEX_AUTH_FILE` (or
+///    `$HOME/.codex/auth.json` when unset); shape
+///    `{ "tokens": { "access_token": "...", "account_id": "..." } }`.
+///
+/// The Ocean auth file is the configured Ocean credential store, so a read or
+/// parse failure there is surfaced as [`ProviderConfigError::InvalidAuthFile`];
+/// the CLI fallback is best-effort and silently skipped on any error.
+fn resolve_codex_auth(env: &ProviderEnv) -> Result<Option<CodexAuth>, ProviderConfigError> {
+    // 1. Ocean auth-file `openai-codex` OAuth block.
+    if let Some(path) = &env.auth_file {
+        if path.exists() {
+            let json = read_auth_json(path)?;
+            // `oauth_access_token` rejects missing / expired blocks.
+            if let Some(token) = oauth_access_token(&json, "openai-codex") {
+                let account_id = json
+                    .pointer("/openai-codex/accountId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string);
+                return Ok(Some(CodexAuth {
+                    access_token: token.to_string(),
+                    account_id,
+                    source: CredentialSource::OceanAuthFile {
+                        path: path.display().to_string(),
+                    },
+                }));
+            }
+        }
+    }
+
+    // 2. Codex CLI auth JSON fallback.
+    if let Some(path) = &env.codex_auth_file {
+        if path.exists() {
+            // Best-effort: a malformed CLI file must not break Codex auth.
+            if let Ok(json) = read_auth_json(path) {
+                if let Some(token) = json
+                    .pointer("/tokens/access_token")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    let account_id = json
+                        .pointer("/tokens/account_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string);
+                    return Ok(Some(CodexAuth {
+                        access_token: token.to_string(),
+                        account_id,
+                        source: CredentialSource::CodexCliAuthFile {
+                            path: path.display().to_string(),
+                        },
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// A user-selectable model: the canonical id to pass to `OCEAN_MODEL` /
@@ -473,6 +592,8 @@ pub fn known_models() -> Vec<KnownModel> {
         m("gpt-4o-mini", "openai", "GPT-4o Mini"),
         m("claude-opus-4-7", "anthropic", "Claude Opus 4.7"),
         m("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6"),
+        m("claude-code-sonnet-4-6", "claude-code", "Claude Code Sonnet 4.6"),
+        m("claude-code-opus-4-7", "claude-code", "Claude Code Opus 4.7"),
         // MiniMax ids use the API casing the resolver returns as current.model
         // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
         // holds for every entry — ACP/Zed match the selected mode id against the
@@ -482,6 +603,9 @@ pub fn known_models() -> Vec<KnownModel> {
         m("MiniMax-M2", "minimax", "MiniMax M2"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
+        m("glm-4.6", "glm", "GLM 4.6"),
+        m("glm-4.5", "glm", "GLM 4.5"),
+        m("glm-4.5-flash", "glm", "GLM 4.5 Flash"),
         m("gemini-2.0-flash", "google", "Gemini 2.0 Flash"),
     ]
 }
@@ -593,6 +717,23 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             200_000,
             16_384,
         )),
+        // Claude Code (Anthropic Messages wire protocol, OAuth bearer auth).
+        // selection.model preserves the public alias id; ocean-agent maps it to
+        // the real Anthropic API model id.
+        "claude-code-sonnet-4-6" | "claude-code-sonnet" | "cc-sonnet" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-sonnet-4-6",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        "claude-code-opus-4-7" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-opus-4-7",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
         // MiniMax M2 family. `normalize_model_id` lowercases the lookup key, but
         // MiniMax's API expects the original `MiniMax-…` casing, so the value we
         // pass through preserves it.
@@ -624,6 +765,28 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             "kimi-k2",
             MOONSHOT_BASE_URL,
             128_000,
+            8_192,
+        )),
+        // Zhipu AI / GLM-4 family (OpenAI-compatible chat-completions).
+        "glm" | "glm-4.6" | "glm-4-6" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-4.6",
+            GLM_BASE_URL,
+            200_000,
+            8_192,
+        )),
+        "glm-4.5" | "glm-4-5" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-4.5",
+            GLM_BASE_URL,
+            200_000,
+            8_192,
+        )),
+        "glm-4.5-flash" | "glm-4-5-flash" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-4.5-flash",
+            GLM_BASE_URL,
+            200_000,
             8_192,
         )),
         // Google Gemini family. Routed through ocean-protocol's
@@ -733,6 +896,13 @@ fn model_for_explicit_provider(
             200_000,
             16_384,
         )),
+        "claude-code" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            model,
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
         // MiniMax's API is case-sensitive on model ids (`MiniMax-M2`), but `model`
         // arrives lowercased (normalize_model_id). Restore the API casing for
         // known forms so the explicit-provider path matches the bare-alias path —
@@ -750,6 +920,13 @@ fn model_for_explicit_provider(
             model,
             MOONSHOT_BASE_URL,
             256_000,
+            8_192,
+        )),
+        "glm" | "zhipu" | "zhipuai" => Ok(model_selection(
+            ProviderId::Glm,
+            model,
+            GLM_BASE_URL,
+            200_000,
             8_192,
         )),
         "google" | "gemini" => Ok(model_selection(
@@ -810,13 +987,32 @@ fn resolve_credential(
         return Ok(None);
     }
 
+    // Codex auth has its own resolution chain (valid Ocean `openai-codex` OAuth
+    // block, else Codex CLI auth JSON) that also keeps the account id in sync,
+    // so delegate to the dedicated helper.
+    if matches!(provider, ProviderId::OpenAiCodex) {
+        return Ok(resolve_codex_auth(env)?.map(|auth| ResolvedCredential {
+            secret: SecretString::new(auth.access_token)
+                .expect("resolve_codex_auth only yields non-empty tokens"),
+            source: auth.source,
+            kind: CredentialKind::OAuthBearer,
+        }));
+    }
+
+    // 1. Plain API keys and provider-specific env credentials.
     for name in provider.credential_env_names() {
         if let Some(secret) = env.get(name).and_then(SecretString::new) {
+            let kind = if matches!(provider, ProviderId::ClaudeCode) {
+                CredentialKind::OAuthBearer
+            } else {
+                CredentialKind::ApiKey
+            };
             return Ok(Some(ResolvedCredential {
                 secret,
                 source: CredentialSource::Env {
                     name: (*name).into(),
                 },
+                kind,
             }));
         }
     }
@@ -828,29 +1024,26 @@ fn resolve_credential(
         return Ok(None);
     }
 
-    let text =
-        std::fs::read_to_string(path).map_err(|err| ProviderConfigError::InvalidAuthFile {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        })?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|err| ProviderConfigError::InvalidAuthFile {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        })?;
-
+    let json = read_auth_json(path)?;
     let source = CredentialSource::OceanAuthFile {
         path: path.display().to_string(),
     };
 
-    // The Codex provider authenticates with the OAuth access token from the
-    // "openai-codex" block; everyone else uses a plain api_key.
-    let secret = if matches!(provider, ProviderId::OpenAiCodex) {
-        oauth_access_token(&json, "openai-codex").and_then(SecretString::new)
+    // Claude Code authenticates with the OAuth access token from a `claude-code`
+    // block (the `anthropic-oauth` block name is accepted as a synonym);
+    // everyone else uses a plain api_key.
+    let (secret, kind) = if matches!(provider, ProviderId::ClaudeCode) {
+        let token = oauth_access_token(&json, "claude-code")
+            .or_else(|| oauth_access_token(&json, "anthropic-oauth"));
+        (token, CredentialKind::OAuthBearer)
     } else {
-        auth_file_key(&json, provider.as_str()).and_then(SecretString::new)
+        (auth_file_key(&json, provider.as_str()), CredentialKind::ApiKey)
     };
-    Ok(secret.map(|secret| ResolvedCredential { secret, source }))
+    Ok(secret.and_then(SecretString::new).map(|secret| ResolvedCredential {
+        secret,
+        source,
+        kind,
+    }))
 }
 
 fn auth_file_key<'a>(json: &'a serde_json::Value, provider: &str) -> Option<&'a str> {
@@ -870,11 +1063,34 @@ fn oauth_access_token<'a>(json: &'a serde_json::Value, block: &str) -> Option<&'
     if entry.pointer("/type").and_then(serde_json::Value::as_str) != Some("oauth") {
         return None;
     }
-    entry
+    let token = entry
         .pointer("/access")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty())?;
+    // Reject expired blocks. `expires` is milliseconds since epoch when large,
+    // seconds otherwise; a missing `expires` means "accept" (no expiry known).
+    if let Some(expires) = entry.pointer("/expires").and_then(serde_json::Value::as_i64) {
+        let now_secs = unix_epoch_secs();
+        let expires_secs = if expires >= 1_000_000_000_000 {
+            expires / 1_000
+        } else {
+            expires
+        };
+        if expires_secs <= now_secs {
+            return None;
+        }
+    }
+    Some(token)
+}
+
+/// Current wall clock as Unix seconds, saturating to 0 if the clock is somehow
+/// before the epoch (only on a badly misconfigured system).
+fn unix_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn default_ocean_auth_file() -> Option<PathBuf> {
@@ -885,6 +1101,31 @@ fn default_ocean_auth_file() -> Option<PathBuf> {
         return Some(PathBuf::from(xdg).join("ocean-rs").join("auth.json"));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/ocean-rs/auth.json"))
+}
+
+/// Default Codex CLI auth file: `OCEAN_CODEX_AUTH_FILE` when set, otherwise
+/// `$HOME/.codex/auth.json` (the Codex CLI's own default location). Mirrors the
+/// `auth_file` resolution pattern — the path is populated (when HOME is set) and
+/// the reader checks existence.
+fn default_codex_auth_file() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("OCEAN_CODEX_AUTH_FILE") {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex/auth.json"))
+}
+
+/// Read and parse an auth JSON file. Read/parse failures are surfaced as
+/// [`ProviderConfigError::InvalidAuthFile`] so a malformed configured file is
+/// visible rather than silently dropping credentials.
+fn read_auth_json(path: &Path) -> Result<serde_json::Value, ProviderConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|err| ProviderConfigError::InvalidAuthFile {
+        path: path.display().to_string(),
+        message: err.to_string(),
+    })?;
+    serde_json::from_str(&text).map_err(|err| ProviderConfigError::InvalidAuthFile {
+        path: path.display().to_string(),
+        message: err.to_string(),
+    })
 }
 
 fn base_url_host(base_url: &str) -> String {
@@ -921,6 +1162,7 @@ mod tests {
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
             auth_file: None,
+            codex_auth_file: None,
         }
     }
 
@@ -1082,6 +1324,21 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_base_url_has_no_version_suffix() {
+        // ocean-protocol's Anthropic provider appends `/v1/messages`; the
+        // registry base must therefore be the host root, not `/v1`.
+        let selection =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "claude-sonnet-4-6")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::Anthropic);
+        assert_eq!(selection.base_url, "https://api.anthropic.com");
+
+        let claude_code =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "claude-code-sonnet-4-6")])).unwrap();
+        assert_eq!(claude_code.provider, ProviderId::ClaudeCode);
+        assert_eq!(claude_code.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
     fn ocean_auth_file_can_supply_key() {
         let dir = std::env::temp_dir().join(format!("ocean-providers-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1096,6 +1353,7 @@ mod tests {
         let config = resolve_provider_config(&ProviderEnv {
             vars: BTreeMap::from([("OCEAN_MODEL".into(), "deepseek-chat".into())]),
             auth_file: Some(path.clone()),
+            codex_auth_file: None,
         })
         .unwrap();
         let credential = config.credential.unwrap();
@@ -1124,6 +1382,7 @@ mod tests {
         let config = resolve_provider_config(&ProviderEnv {
             vars: BTreeMap::from([("OCEAN_MODEL".into(), "gpt-5.5".into())]),
             auth_file: Some(path.clone()),
+            codex_auth_file: None,
         })
         .unwrap();
         let credential = config.credential.expect("oauth token should resolve");
@@ -1224,12 +1483,17 @@ mod tests {
             "gpt-5.3-codex-spark",
             "claude-sonnet-4-6",
             "claude-opus-4-7",
+            "claude-code-sonnet-4-6",
+            "claude-code-opus-4-7",
             // API-cased ids: `resolve_model_selection` returns these as
             // current.model, and known_models() advertises the same string.
             "MiniMax-M2",
             "MiniMax-M2.7",
             "kimi-k2.6",
             "kimi-k2",
+            "glm-4.6",
+            "glm-4.5",
+            "glm-4.5-flash",
             "gemini-2.0-flash",
         ];
         let listed: std::collections::BTreeSet<String> =
@@ -1374,5 +1638,191 @@ mod tests {
         ]);
         let alt = resolve_fallback_config(&e, &ProviderId::Google).unwrap();
         assert_eq!(alt.selection.provider, ProviderId::Anthropic);
+    }
+    // ---- GLM provider (Zhipu AI) -----------------------------------------
+
+    #[test]
+    fn glm_routes_and_resolves_zhipuai_credential() {
+        // GLM routes through a new OpenAI-compatible provider and resolves a
+        // credential from any of the Zhipu/GLM env names (ZHIPUAI_API_KEY here).
+        let config = resolve_provider_config(&env(&[
+            ("OCEAN_MODEL", "glm-4.6"),
+            ("ZHIPUAI_API_KEY", "glm-secret"),
+        ]))
+        .unwrap();
+        assert_eq!(config.selection.provider, ProviderId::Glm);
+        assert_eq!(config.selection.model, "glm-4.6");
+        assert_eq!(config.selection.base_url, GLM_BASE_URL);
+        assert_eq!(config.selection.context_window, 200_000);
+        assert_eq!(config.selection.max_output_tokens, 8_192);
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("ZHIPUAI_API_KEY should resolve a GLM credential");
+        assert_eq!(credential.secret.expose(), "glm-secret");
+        assert_eq!(credential.kind, CredentialKind::ApiKey);
+        assert!(config.readiness().ok);
+    }
+
+    #[test]
+    fn glm_45_flash_routes_to_glm_provider() {
+        let selection =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "glm-4.5-flash")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::Glm);
+        assert_eq!(selection.model, "glm-4.5-flash");
+        assert_eq!(selection.base_url, GLM_BASE_URL);
+    }
+
+    // ---- Claude Code provider (Anthropic Messages + OAuth bearer) --------
+
+    #[test]
+    fn claude_code_alias_routes_with_oauth_and_is_listed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-claude-code-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(
+            &path,
+            r#"{"claude-code":{"type":"oauth","access":"cc-bearer-token","refresh":"rt_cc","expires":9999999999999}}"#,
+        )
+        .unwrap();
+
+        let config = resolve_provider_config(&ProviderEnv {
+            vars: BTreeMap::from([("OCEAN_MODEL".into(), "claude-code-sonnet-4-6".into())]),
+            auth_file: Some(path.clone()),
+            codex_auth_file: None,
+        })
+        .unwrap();
+        assert_eq!(config.selection.provider, ProviderId::ClaudeCode);
+        // selection.model preserves the public alias id; ocean-agent maps it to
+        // the real Anthropic API model id.
+        assert_eq!(config.selection.model, "claude-code-sonnet-4-6");
+        assert_eq!(config.selection.base_url, ANTHROPIC_BASE_URL);
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("claude-code oauth block should resolve");
+        assert_eq!(credential.secret.expose(), "cc-bearer-token");
+        assert_eq!(credential.kind, CredentialKind::OAuthBearer);
+        assert!(config.readiness().ok);
+
+        // Both public Claude Code aliases are advertised in the model picker.
+        let listed: std::collections::BTreeSet<String> =
+            known_models().into_iter().map(|m| m.id).collect();
+        assert!(listed.contains("claude-code-sonnet-4-6"));
+        assert!(listed.contains("claude-code-opus-4-7"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_code_accepts_anthropic_oauth_block_synonym() {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-claude-code-syn-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(
+            &path,
+            r#"{"anthropic-oauth":{"type":"oauth","access":"syn-bearer","refresh":"rt","expires":9999999999999}}"#,
+        )
+        .unwrap();
+
+        let config = resolve_provider_config(&ProviderEnv {
+            vars: BTreeMap::from([("OCEAN_MODEL".into(), "claude-code-opus-4-7".into())]),
+            auth_file: Some(path.clone()),
+            codex_auth_file: None,
+        })
+        .unwrap();
+        assert_eq!(config.selection.provider, ProviderId::ClaudeCode);
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("anthropic-oauth synonym should resolve");
+        assert_eq!(credential.secret.expose(), "syn-bearer");
+        assert_eq!(credential.kind, CredentialKind::OAuthBearer);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_code_env_bearer_token_is_used() {
+        // With no auth file, an env bearer token authenticates Claude Code.
+        let config = resolve_provider_config(&env(&[
+            ("OCEAN_MODEL", "claude-code-sonnet-4-6"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "env-bearer"),
+        ]))
+        .unwrap();
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("env bearer token should resolve");
+        assert_eq!(credential.secret.expose(), "env-bearer");
+        assert_eq!(credential.kind, CredentialKind::OAuthBearer);
+        assert_eq!(
+            credential.source,
+            CredentialSource::Env {
+                name: "CLAUDE_CODE_ACCESS_TOKEN".into()
+            }
+        );
+    }
+
+    // ---- Codex OAuth fallback to Codex CLI auth JSON ---------------------
+
+    #[test]
+    fn expired_codex_oauth_ignored_codex_cli_fallback_supplies_token_and_account_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-codex-cli-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Ocean auth file carries an EXPIRED openai-codex OAuth block, so it must
+        // be ignored in favor of the Codex CLI fallback below.
+        let ocean_path = dir.join("auth.json");
+        fs::write(
+            &ocean_path,
+            r#"{"openai-codex":{"type":"oauth","access":"ocean-bearer-expired","refresh":"rt","expires":1,"accountId":"ocean-acct-should-not-win"}}"#,
+        )
+        .unwrap();
+
+        // Codex CLI auth JSON (the shape the Codex CLI writes), pointed at by
+        // OCEAN_CODEX_AUTH_FILE (modeled here via ProviderEnv.codex_auth_file).
+        let cli_path = dir.join("codex-auth.json");
+        fs::write(
+            &cli_path,
+            r#"{"tokens":{"access_token":"cli-token","account_id":"cli-acct-456"}}"#,
+        )
+        .unwrap();
+
+        let config = resolve_provider_config(&ProviderEnv {
+            vars: BTreeMap::from([("OCEAN_MODEL".into(), "gpt-5.4".into())]),
+            auth_file: Some(ocean_path.clone()),
+            codex_auth_file: Some(cli_path.clone()),
+        })
+        .unwrap();
+        assert_eq!(config.selection.provider, ProviderId::OpenAiCodex);
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("codex cli fallback should resolve a credential");
+        assert_eq!(credential.secret.expose(), "cli-token");
+        assert_eq!(credential.kind, CredentialKind::OAuthBearer);
+        assert_eq!(
+            credential.source,
+            CredentialSource::CodexCliAuthFile {
+                path: cli_path.display().to_string()
+            }
+        );
+        // account id must come from the SAME source as the token (CLI fallback).
+        assert_eq!(config.account_id.as_deref(), Some("cli-acct-456"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
