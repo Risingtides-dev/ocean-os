@@ -941,6 +941,27 @@ impl AgentRuntime {
         self.project_for_workspace(main_root).ok().flatten()
     }
 
+    /// A cheap owning-project index: each project's `workspace_root` → the
+    /// project, first-match-wins in stored order (mirrors
+    /// [`Self::project_for_workspace`]'s exact-root semantics). Built from ONE
+    /// `projects.json` read so a caller resolving many sessions' owners does a
+    /// single load + O(1) lookups instead of one disk read AND a `git` spawn
+    /// per session — the fix for `GET /v1/agent/sessions` taking ~10s to list
+    /// a few hundred sessions (the per-row `owning_project_for_root` spawned a
+    /// `git rev-parse` for every session that was not an exact project root).
+    /// Exact-root grouping is all the session panel needs; worktree→main-repo
+    /// resolution stays in the single-session detail path.
+    pub fn owning_project_index(&self) -> anyhow::Result<HashMap<String, Project>> {
+        let mut index: HashMap<String, Project> = HashMap::new();
+        for project in project::load_all(&self.config_dir)? {
+            if project.workspace_root.is_empty() {
+                continue;
+            }
+            index.entry(project.workspace_root.clone()).or_insert(project);
+        }
+        Ok(index)
+    }
+
     /// Create or replace a project (by id), stamping `updated_ms` to `now_ms`.
     pub fn upsert_project(&self, p: Project, now_ms: i64) -> anyhow::Result<Project> {
         project::upsert(&self.config_dir, p, now_ms)

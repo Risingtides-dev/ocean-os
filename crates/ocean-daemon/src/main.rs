@@ -10646,6 +10646,11 @@ async fn agent_sessions(
         let guard = state.requests.read().await;
         guard.values().map(|ctl| ctl.status.clone()).collect()
     };
+    // Resolve owning projects from a SINGLE projects.json read: the old per-row
+    // `owning_project_for_root` spawned a `git` subprocess for every session
+    // that was not an exact project root — hundreds of spawns, ~10s to list a
+    // few hundred sessions. Exact-root lookups cover the panel's grouping.
+    let project_index = state.runtime.owning_project_index().unwrap_or_default();
     let summaries: Vec<AgentSessionSummary> = page
         .items
         .into_iter()
@@ -10663,10 +10668,10 @@ async fn agent_sessions(
             owning_project: s
                 .workspace_root
                 .as_deref()
-                .and_then(|root| state.runtime.owning_project_for_root(root))
+                .and_then(|root| project_index.get(root))
                 .map(|p| AgentOwningProject {
                     id: p.id.to_string(),
-                    name: p.name,
+                    name: p.name.clone(),
                 }),
         })
         .collect();
