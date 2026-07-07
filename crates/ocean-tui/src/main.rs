@@ -2412,14 +2412,15 @@ fn run_daemon(url: String, project: Option<String>, session: Option<String>) -> 
     let resumed = match session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(wanted) => Some(resolve_resume_session(&client, &url, wanted)?),
         None => {
-            // Auto-resume: if exactly one session is scoped to this workspace,
-            // resume it so `cd project && ocean` continues where you left off.
+            // Auto-resume the MOST RECENT session scoped to this workspace, so
+            // `cd project && ocean` always drops back into where you left off —
+            // even in a busy repo with many sessions. The daemon returns this
+            // cwd's sessions newest-first, so the head is the latest. Start a
+            // clean session from inside the shell with `/new` when you want one.
             let cwd_str = launch_root.to_string_lossy();
             match client.sessions(&url, Some(cwd_str.as_ref()), false) {
-                Ok(resp) if resp.sessions.len() == 1 => {
-                    Some(resp.sessions.into_iter().next().unwrap())
-                }
-                _ => None,
+                Ok(resp) => resp.sessions.into_iter().next(),
+                Err(_) => None,
             }
         }
     };
