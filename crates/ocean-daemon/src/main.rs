@@ -31,7 +31,7 @@ use ocean_core::{
     evaluate_trigger_policy, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectRef,
-    ProjectResponse, ProjectsResponse, PromptRequest, RequestControlResponse,
+    ProjectResponse, PromptRequest, RequestControlResponse,
     RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse,
     RoomEventsResponse, RoomId, RoomKey, RoomMessageKind, RoomPanelSnapshot, RoomParticipant,
     RoomParticipantKind, RoomProjectedMessage, RoomProjection, RoomProjectionProvenance,
@@ -6908,30 +6908,44 @@ struct ProjectsListQuery {
 
 /// `GET /v1/projects?limit=&cursor=` — list registered projects, one bounded
 /// page at a time (OCEAN-250). Projects are ordered newest-first; the `projects`
-/// array shape is unchanged, with additive `next_cursor`/`has_more` so a client
-/// can page instead of fetching every project on each call.
+/// array shape is unchanged except for additive git fields (`git_branch`,
+/// `git_dirty`, `worktrees`) computed at response time on each project's
+/// `workspace_root`. Fields are additive; clients that don't know them ignore
+/// them. Pagination fields `next_cursor`/`has_more` are unchanged.
 async fn projects_list(
     State(state): State<AppState>,
     Query(q): Query<ProjectsListQuery>,
-) -> Json<ProjectsResponse> {
+) -> (StatusCode, Json<serde_json::Value>) {
     match state
         .runtime
         .list_projects_page(q.cursor.as_deref(), q.limit)
     {
-        Ok(page) => Json(ProjectsResponse {
-            ok: true,
-            projects: page.items,
-            error: None,
-            next_cursor: page.next_cursor,
-            has_more: page.has_more,
-        }),
-        Err(e) => Json(ProjectsResponse {
-            ok: false,
-            projects: vec![],
-            error: Some(e.to_string()),
-            next_cursor: None,
-            has_more: false,
-        }),
+        Ok(page) => {
+            let mut projects_json: Vec<serde_json::Value> =
+                Vec::with_capacity(page.items.len());
+            for p in &page.items {
+                projects_json.push(enriched_project_json(p).await);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "projects": projects_json,
+                    "next_cursor": page.next_cursor,
+                    "has_more": page.has_more,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "projects": [],
+                "error": e.to_string(),
+                "next_cursor": null,
+                "has_more": false,
+            })),
+        ),
     }
 }
 
@@ -7000,6 +7014,110 @@ async fn project_create(
             }),
         ),
     }
+}
+
+/// Build a project JSON value with live git fields computed on its
+/// `workspace_root`.  Non-repo or any failure → nulls/empty vec — the surface
+/// hides git chrome when the fields are absent.
+async fn enriched_project_json(project: &Project) -> serde_json::Value {
+    let mut j = serde_json::to_value(project).unwrap_or(json!({}));
+
+    let proj_root = &project.workspace_root;
+    let root_path = std::path::Path::new(proj_root);
+
+    // -- git_branch (pure filesystem) ------------------------------------
+    let (is_repo, git_branch) = if !proj_root.is_empty() {
+        ocean_agent::git_head_info(root_path)
+    } else {
+        (false, None)
+    };
+    j["git_branch"] = json!(git_branch);
+
+    // -- git_dirty (subprocess, ~1.5s timeout) ---------------------------
+    let git_dirty: Option<bool> = if is_repo && !proj_root.is_empty() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(proj_root)
+                .arg("status")
+                .arg("--porcelain")
+                .output(),
+        )
+        .await;
+        match result {
+            Ok(Ok(out)) if out.status.success() => Some(!out.stdout.is_empty()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    j["git_dirty"] = json!(git_dirty);
+
+    // -- worktrees (subprocess) ------------------------------------------
+    let worktrees: Vec<ocean_agent::WorktreeInfo> = if is_repo && !proj_root.is_empty() {
+        match tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(proj_root)
+            .arg("worktree")
+            .arg("list")
+            .arg("--porcelain")
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                parse_worktree_list(&String::from_utf8_lossy(&out.stdout))
+                    .into_iter()
+                    .filter(|wt| &wt.path != proj_root)
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    j["worktrees"] = serde_json::to_value(&worktrees).unwrap_or(json!([]));
+
+    j
+}
+
+/// Parse `git worktree list --porcelain` output into WorktreeInfo entries.
+/// Strips `refs/heads/` from branch refs.
+fn parse_worktree_list(raw: &str) -> Vec<ocean_agent::WorktreeInfo> {
+    let mut out = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if let Some(path) = current_path.take() {
+                out.push(ocean_agent::WorktreeInfo {
+                    path,
+                    branch: current_branch.take(),
+                });
+            }
+            continue;
+        }
+        if let Some(path) = trimmed.strip_prefix("worktree ") {
+            current_path = Some(path.trim().to_string());
+        } else if let Some(branch) = trimmed.strip_prefix("branch ") {
+            let b = branch.trim();
+            current_branch = Some(
+                b.strip_prefix("refs/heads/")
+                    .unwrap_or(b)
+                    .to_string(),
+            );
+        }
+    }
+    // Flush last entry if no trailing blank line.
+    if let Some(path) = current_path {
+        out.push(ocean_agent::WorktreeInfo {
+            path,
+            branch: current_branch,
+        });
+    }
+    out
 }
 
 /// `GET /v1/projects/{id}` — one project plus its sessions (the sessions in the
@@ -7114,8 +7232,9 @@ struct FsDirsQuery {
 
 /// `GET /v1/fs/dirs?path=` — list subdirectories under a path, sandboxed to
 /// `$HOME`. Dot-directories are skipped; only directories are returned (no
-/// files); alphabetical; an `"git"` boolean flag per entry.  `parent` is the
-/// canonical parent directory, `null` at `$HOME` or the filesystem root.
+/// files); alphabetical; `"is_repo"` and `"git_branch"` per entry via pure
+/// filesystem HEAD read. `parent` is the canonical parent directory, `null` at
+/// `$HOME` or the filesystem root.
 async fn fs_dirs(
     Query(q): Query<FsDirsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -7189,12 +7308,13 @@ async fn fs_dirs(
                 if !path.is_dir() {
                     continue;
                 }
-                let git = path.join(".git").exists();
+                let (is_repo, git_branch) = ocean_agent::git_head_info(&path);
                 let path_str = path.to_string_lossy().to_string();
                 dirs.push(json!({
                     "name": name_str,
                     "path": path_str,
-                    "git": git,
+                    "is_repo": is_repo,
+                    "git_branch": git_branch,
                 }));
             }
         }
@@ -17385,7 +17505,7 @@ mod tests {
         }
 
         // First page of 3.
-        let Json(first) = projects_list(
+        let (status, Json(first)) = projects_list(
             State(state.clone()),
             Query(ProjectsListQuery {
                 limit: Some(3),
@@ -17393,17 +17513,22 @@ mod tests {
             }),
         )
         .await;
-        assert!(first.ok);
-        assert_eq!(first.projects.len(), 3);
-        assert!(first.has_more);
-        let cursor = first.next_cursor.clone().expect("has_more ⇒ cursor");
+        assert_eq!(status, StatusCode::OK);
+        assert!(first["ok"].as_bool().unwrap_or(false));
+        let projs = first["projects"].as_array().unwrap();
+        assert_eq!(projs.len(), 3);
+        assert!(first["has_more"].as_bool().unwrap_or(false));
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
 
         // Walk to the end, collecting names.
-        let mut names: Vec<String> = first.projects.iter().map(|p| p.name.clone()).collect();
+        let mut names: Vec<String> = projs
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect();
         let mut after = Some(cursor);
         let mut pages = 1;
         loop {
-            let Json(p) = projects_list(
+            let (_, Json(p)) = projects_list(
                 State(state.clone()),
                 Query(ProjectsListQuery {
                     limit: Some(3),
@@ -17413,11 +17538,17 @@ mod tests {
             .await;
             pages += 1;
             assert!(pages <= total + 2, "paging must terminate");
-            names.extend(p.projects.iter().map(|pr| pr.name.clone()));
-            if p.has_more {
-                after = Some(p.next_cursor.clone().unwrap());
+            names.extend(
+                p["projects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|pr| pr["name"].as_str().unwrap().to_string()),
+            );
+            if p["has_more"].as_bool().unwrap_or(false) {
+                after = Some(p["next_cursor"].as_str().unwrap().to_string());
             } else {
-                assert!(p.next_cursor.is_none(), "final page has no cursor");
+                assert!(p["next_cursor"].is_null(), "final page has no cursor");
                 break;
             }
         }
@@ -17431,7 +17562,7 @@ mod tests {
         );
 
         // No limit ⇒ default cap; 7 < 100 so all in one page, no more.
-        let Json(all) = projects_list(
+        let (_, Json(all)) = projects_list(
             State(state.clone()),
             Query(ProjectsListQuery {
                 limit: None,
@@ -17439,9 +17570,9 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(all.projects.len(), total);
-        assert!(!all.has_more);
-        assert!(all.next_cursor.is_none());
+        assert_eq!(all["projects"].as_array().unwrap().len(), total);
+        assert!(!all["has_more"].as_bool().unwrap_or(true));
+        assert!(all["next_cursor"].is_null());
 
         std::env::remove_var("OCEAN_YOLO");
     }
@@ -20491,6 +20622,86 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         assert!(resp.ok);
         assert_eq!(resp.project.unwrap().workspace_root, "");
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    // -- parse_worktree_list --------------------------------------------------
+
+    #[test]
+    fn parse_worktree_list_parses_porcelain_output() {
+        let raw = "\
+worktree /Users/x/project/main
+bare
+
+worktree /Users/x/project/feat-branch
+branch refs/heads/feat-x
+
+worktree /Users/x/project/bugfix
+branch refs/heads/bug-fix
+";
+        let wts = parse_worktree_list(raw);
+        assert_eq!(wts.len(), 3);
+
+        assert_eq!(wts[0].path, "/Users/x/project/main");
+        assert!(wts[0].branch.is_none());
+
+        assert_eq!(wts[1].path, "/Users/x/project/feat-branch");
+        assert_eq!(wts[1].branch.as_deref(), Some("feat-x"));
+
+        assert_eq!(wts[2].path, "/Users/x/project/bugfix");
+        assert_eq!(wts[2].branch.as_deref(), Some("bug-fix"));
+    }
+
+    #[test]
+    fn parse_worktree_list_empty_output_is_empty_vec() {
+        let wts = parse_worktree_list("");
+        assert!(wts.is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_list_no_trailing_blank_line_flushes_last() {
+        let raw = "worktree /a/path\nbranch refs/heads/main\n";
+        let wts = parse_worktree_list(raw);
+        assert_eq!(wts.len(), 1);
+        assert_eq!(wts[0].path, "/a/path");
+        assert_eq!(wts[0].branch.as_deref(), Some("main"));
+    }
+
+    // -- project_create existing-dir -----------------------------------------
+
+    /// Registering an existing directory as a project must not touch its
+    /// contents. `create_dir_all` is idempotent; this asserts that a
+    /// pre-existing file survives the project-create without modification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_create_existing_dir_preserves_contents() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        // Pre-populate the directory with an arbitrary file.
+        let proj_dir = tmp.path().join("my-existing-project");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let readme = proj_dir.join("README.md");
+        let original = "## My Project\n";
+        std::fs::write(&readme, original).unwrap();
+
+        let (status, Json(resp)) = project_create(
+            State(state.clone()),
+            Json(CreateProjectRequest {
+                name: "existing-project".into(),
+                workspace_root: proj_dir.to_string_lossy().to_string(),
+                config: ProjectConfig::default(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(resp.ok);
+
+        // The pre-existing file must survive untouched.
+        let after = std::fs::read_to_string(&readme).unwrap();
+        assert_eq!(after, original, "project_create must not modify pre-existing files");
 
         std::env::remove_var("OCEAN_YOLO");
     }

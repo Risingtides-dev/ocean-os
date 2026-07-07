@@ -39,6 +39,7 @@ pub use config::{DaemonConfig, McpSection};
 pub mod agentdir;
 pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;
+pub use project::{git_head_info, WorktreeInfo};
 mod rooms;
 pub use rooms::{RoomRecord, RoomRegistry, RoomStoreError};
 

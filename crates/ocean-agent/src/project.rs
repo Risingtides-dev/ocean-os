@@ -92,6 +92,85 @@ pub fn delete(config_dir: &Path, id: ProjectId) -> anyhow::Result<bool> {
     Ok(removed)
 }
 
+/// Lightweight WorktreeInfo: path + branch (or None when unresolvable).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorktreeInfo {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Pure-filesystem HEAD reader — no subprocess.
+///
+/// Returns `(is_repo, branch_or_short_sha)`.  Handles:
+/// - `.git` directory → read `HEAD`, parse `ref: refs/heads/<branch>` → branch
+/// - detached HEAD (raw SHA) → first 8 chars as the label
+/// - `.git` as a **file** (linked worktree) → parse `gitdir: <path>`, resolve
+///   relative paths against the containing directory, read `HEAD` there
+/// - any malformed or missing state → `(false, None)`
+pub fn git_head_info(dir: &Path) -> (bool, Option<String>) {
+    let dot_git = dir.join(".git");
+    let head_path = if dot_git.is_dir() {
+        dot_git.join("HEAD")
+    } else if dot_git.is_file() {
+        match std::fs::read_to_string(&dot_git) {
+            Ok(content) => {
+                let gitdir_line = content.lines().next().unwrap_or("");
+                let inner = gitdir_line
+                    .strip_prefix("gitdir:")
+                    .map(|s| s.trim())
+                    .unwrap_or("");
+                if inner.is_empty() {
+                    return (false, None);
+                }
+                let git_dir = Path::new(inner);
+                let resolved = if git_dir.is_absolute() {
+                    git_dir.to_path_buf()
+                } else {
+                    dot_git
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(git_dir)
+                };
+                resolved.join("HEAD")
+            }
+            Err(_) => return (false, None),
+        }
+    } else {
+        // No .git at all
+        return (false, None);
+    };
+
+    let head_content = match std::fs::read_to_string(&head_path) {
+        Ok(c) => c,
+        Err(_) => return (true, None), // .git exists but HEAD is unreadable
+    };
+
+    let head_line = head_content.lines().next().unwrap_or("").trim().to_string();
+
+    if head_line.is_empty() {
+        return (true, None);
+    }
+
+    if let Some(ref_path) = head_line.strip_prefix("ref: ") {
+        // ref: refs/heads/branch-name → extract branch
+        let branch = ref_path
+            .trim()
+            .strip_prefix("refs/heads/")
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| ref_path.trim().to_string());
+        (true, Some(branch))
+    } else {
+        // Detached HEAD (raw SHA) → first 8 chars
+        let label = head_line.chars().take(8).collect::<String>();
+        if label.is_empty() {
+            (true, None)
+        } else {
+            (true, Some(label))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +292,110 @@ mod tests {
         assert!(find_by_workspace(&empty, "/dev/ocean-os")
             .unwrap()
             .is_none());
+    }
+
+    // -- git_head_info tests -------------------------------------------------
+
+    fn make_git_dir(path: &std::path::Path, head_content: &str) {
+        let dot_git = path.join(".git");
+        std::fs::create_dir_all(dot_git.join("refs").join("heads")).unwrap();
+        std::fs::write(dot_git.join("HEAD"), head_content).unwrap();
+    }
+
+    fn make_worktree_git_file(path: &std::path::Path, gitdir_target: &str) {
+        std::fs::write(path.join(".git"), format!("gitdir: {gitdir_target}\n")).unwrap();
+    }
+
+    #[test]
+    fn git_head_info_normal_branch() {
+        let dir = tmp_dir();
+        make_git_dir(&dir, "ref: refs/heads/main\n");
+
+        let (is_repo, branch) = git_head_info(&dir);
+        assert!(is_repo);
+        assert_eq!(branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn git_head_info_detached_sha() {
+        let dir = tmp_dir();
+        let sha = "a1b2c3d4e5f67890abcdef1234567890abcdef00\n";
+        make_git_dir(&dir, sha);
+
+        let (is_repo, label) = git_head_info(&dir);
+        assert!(is_repo);
+        assert_eq!(label.as_deref(), Some("a1b2c3d4"));
+    }
+
+    #[test]
+    fn git_head_info_worktree_gitdir_file_absolute() {
+        let main_dir = tmp_dir();
+        make_git_dir(&main_dir, "ref: refs/heads/feature\n");
+
+        // Create a worktree dir whose .git file points at the main repo.
+        let wt_dir = tmp_dir();
+        let gitdir_target = main_dir.join(".git");
+        make_worktree_git_file(&wt_dir, &gitdir_target.to_string_lossy());
+
+        let (is_repo, branch) = git_head_info(&wt_dir);
+        assert!(is_repo);
+        assert_eq!(branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn git_head_info_worktree_gitdir_file_relative() {
+        let main_dir = tmp_dir();
+        make_git_dir(&main_dir, "ref: refs/heads/bugfix\n");
+
+        // The worktree .git file uses a relative gitdir path.
+        let wt_dir = tmp_dir();
+        // Construct a relative path manually: ../<parent_dir>/<main_dir>/.git
+        let parent = wt_dir.parent().unwrap();
+        let rel = std::path::Path::new("..")
+            .join(main_dir.strip_prefix(parent).unwrap_or(&main_dir))
+            .join(".git");
+        make_worktree_git_file(&wt_dir, &rel.to_string_lossy());
+
+        let (is_repo, branch) = git_head_info(&wt_dir);
+        assert!(is_repo);
+        assert_eq!(branch.as_deref(), Some("bugfix"));
+    }
+
+    #[test]
+    fn git_head_info_no_git_dir() {
+        let dir = tmp_dir();
+
+        let (is_repo, branch) = git_head_info(&dir);
+        assert!(!is_repo);
+        assert!(branch.is_none());
+    }
+    #[test]
+    fn git_head_info_garbage_git_file() {
+        let dir = tmp_dir();
+        std::fs::write(dir.join(".git"), "not a valid gitdir line\n").unwrap();
+
+        let (is_repo, branch) = git_head_info(&dir);
+        assert!(!is_repo);
+        assert!(branch.is_none());
+    }
+
+    #[test]
+    fn git_head_info_empty_head_file() {
+        let dir = tmp_dir();
+        make_git_dir(&dir, "\n");
+
+        let (is_repo, branch) = git_head_info(&dir);
+        assert!(is_repo); // .git dir exists
+        assert!(branch.is_none());
+    }
+
+    #[test]
+    fn git_head_info_short_sha_detached() {
+        let dir = tmp_dir();
+        make_git_dir(&dir, "abc\n");
+
+        let (is_repo, label) = git_head_info(&dir);
+        assert!(is_repo);
+        assert_eq!(label.as_deref(), Some("abc"));
     }
 }
