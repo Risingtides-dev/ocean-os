@@ -158,6 +158,19 @@ impl App {
             esc_armed: false,
         };
         app.apply_focus();
+        // Auto-resume the most recent session for this workspace so `ocean`
+        // (or `cd project && ocean`) drops you BACK INTO your last conversation
+        // — transcript rehydrated from disk, not just the session id bound (the
+        // replay ring only holds recent events, so binding alone shows an empty
+        // pane for anything older). `/new` starts a clean session. Legacy/
+        // non-UUID records are skipped.
+        if let Some((id, path)) = app.rail.latest_resumable() {
+            app.chat
+                .load_history(crate::shell::sessions::load_transcript(&path));
+            app.bind_session_with(id, false); // transcript came from disk
+            app.rail.live_id = Some(id.0.to_string());
+            app.status = format!("resumed {:.8}", id.0.to_string());
+        }
         app
     }
 

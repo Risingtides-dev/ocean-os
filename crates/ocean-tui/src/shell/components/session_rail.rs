@@ -179,6 +179,24 @@ impl SessionRailComponent {
         self.groups.iter().map(|g| g.sessions.len()).sum()
     }
 
+    /// The most-recently-active session for this project that can be resumed
+    /// natively (its id parses as a session UUID). Used by the shell at launch
+    /// so `ocean` / `cd project && ocean` drops back into the last conversation.
+    /// Scans all groups by mtime rather than trusting group order, and skips
+    /// legacy/non-UUID records (nothing to bind natively).
+    pub fn latest_resumable(&self) -> Option<(AgentSessionId, PathBuf)> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.sessions.iter())
+            .filter_map(|s| {
+                uuid::Uuid::parse_str(&s.id)
+                    .ok()
+                    .map(|u| (AgentSessionId(u), s.path.clone(), s.mtime))
+            })
+            .max_by_key(|(_, _, mtime)| *mtime)
+            .map(|(id, path, _)| (id, path))
+    }
+
     fn move_sel(&mut self, delta: isize) {
         let n = self.rows().len();
         if n == 0 {
