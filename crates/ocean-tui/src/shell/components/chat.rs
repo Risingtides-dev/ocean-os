@@ -117,6 +117,14 @@ pub struct ChatComponent {
     kill_ring: Vec<String>,
     /// The ⌃R history-search overlay, when open.
     search: Option<HistorySearch>,
+    /// Project root for `@`-file mentions; set by the app (follows the active
+    /// project). `None` until first set.
+    mention_root: Option<std::path::PathBuf>,
+    /// Lazy, per-project file index for the `@` picker (scanned on first `@`,
+    /// invalidated when `mention_root` changes).
+    mention_index: Option<Vec<String>>,
+    /// Highlighted row in the `@` mention picker.
+    mention_sel: usize,
     pub focused: bool,
 }
 
@@ -473,6 +481,64 @@ impl ChatComponent {
         }
     }
 
+    // ── `@` file mentions ────────────────────────────────────────────────────
+
+    /// Point `@`-mentions at a project root. Invalidates the file index when the
+    /// root actually changes (the app calls this on every project re-root).
+    pub fn set_mention_root(&mut self, root: std::path::PathBuf) {
+        if self.mention_root.as_deref() != Some(root.as_path()) {
+            self.mention_root = Some(root);
+            self.mention_index = None; // rescan lazily on next `@`
+        }
+    }
+
+    /// The active `@` mention in the composer: the trailing token, when it
+    /// starts with `@`. Returns (byte offset of the `@`, query after it).
+    /// Token = everything after the last whitespace, so `fix @src/ma` matches
+    /// and `email me a@b.com` does not (the `@` must LEAD the token).
+    fn mention_query(&self) -> Option<(usize, &str)> {
+        let start = self
+            .input
+            .rfind(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let token = &self.input[start..];
+        token.starts_with('@').then(|| (start, &token[1..]))
+    }
+
+    /// Ranked file matches for the current `@` query (empty when not in mention
+    /// mode). Scans the project lazily on first use.
+    fn mention_matches(&mut self) -> Vec<String> {
+        let Some((_, query)) = self.mention_query() else {
+            return Vec::new();
+        };
+        let query = query.to_string();
+        if self.mention_index.is_none() {
+            let root = self
+                .mention_root
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            self.mention_index = Some(crate::shell::mentions::scan(&root));
+        }
+        let index = self.mention_index.as_deref().unwrap_or(&[]);
+        crate::shell::mentions::filter(index, &query, 8)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Replace the active `@token` with the picked path (plus a trailing space)
+    /// so the composer reads `… @src/main.rs `.
+    fn insert_mention(&mut self, path: &str) {
+        if let Some((at, _)) = self.mention_query() {
+            self.input.truncate(at);
+            self.input.push('@');
+            self.input.push_str(path);
+            self.input.push(' ');
+            self.mention_sel = 0;
+        }
+    }
+
     /// Execute a slash command by name, with any trailing `args` (empty for a
     /// palette pick; the tail of a typed `/name args` line otherwise). Clears
     /// the composer, then either mutates the transcript locally (`/clear`,
@@ -665,6 +731,83 @@ impl ChatComponent {
         );
     }
 
+    /// Render the `@` file-mention picker just above the composer: ranked file
+    /// paths with the basename emphasized, selection on a `BG_HL` bed. Same
+    /// floating idiom as the `/` palette.
+    fn draw_mentions(&self, frame: &mut Frame, composer: Rect, matches: &[String]) {
+        if matches.is_empty() {
+            return;
+        }
+        let cap = (composer.y as usize).saturating_sub(3).clamp(1, 8);
+        let shown = matches.len().min(cap);
+        let sel = self.mention_sel.min(shown - 1);
+
+        let content_w = matches
+            .iter()
+            .take(shown)
+            .map(|p| 3 + 1 + p.chars().count()) // " ❯ " + "@" + path
+            .max()
+            .unwrap_or(24);
+        let width = ((content_w as u16) + 2).min(composer.width).max(24);
+        let height = shown as u16 + 3;
+        let y = composer.y.saturating_sub(height);
+        let area = Rect::new(composer.x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} files ", g("◆", "*")),
+                Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        for (i, p) in matches.iter().take(shown).enumerate() {
+            let selected = i == sel;
+            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+            let marker = if selected { g("❯", ">") } else { " " };
+            // dir prefix muted, basename bright — you pick by basename.
+            let (dir, base) = match p.rsplit_once('/') {
+                Some((d, b)) => (format!("{d}/"), b.to_string()),
+                None => (String::new(), p.clone()),
+            };
+            let spans = vec![
+                Span::styled(format!(" {marker} "), Style::default().fg(theme::CYAN)),
+                Span::styled("@", Style::default().fg(theme::CYAN)),
+                Span::styled(dir, Style::default().fg(theme::COMMENT)),
+                Span::styled(
+                    base,
+                    Style::default()
+                        .fg(if selected { theme::CYAN } else { theme::FG })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(bed)),
+                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            );
+        }
+        let more = if shown < matches.len() {
+            format!(" · {shown}/{}", matches.len())
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {} select · ⏎ insert · esc dismiss{more}", g("↑↓", "^v")),
+                Style::default().fg(theme::COMMENT),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, inner.y + shown as u16, inner.width, 1),
+        );
+    }
+
     /// Render the ⌃R history-search overlay above the composer: a title row
     /// carrying the live query, then fuzzy-matched history entries (newest
     /// first) with the selection on a `BG_HL` bed. Same popup skin as the `/`
@@ -841,6 +984,38 @@ impl Component for ChatComponent {
                 _ => {}
             }
         }
+        // ── `@` file-mention picker: nav + insert intercept ──────────────────
+        // Active while the trailing token starts with `@` and files match. Enter
+        // / Tab insert the selected path into the composer (send stays a second
+        // Enter); Esc drops the `@` sigil, closing the picker but keeping the
+        // typed text.
+        let mentions = self.mention_matches();
+        if !mentions.is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    self.mention_sel = self.mention_sel.saturating_sub(1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.mention_sel = (self.mention_sel + 1).min(mentions.len() - 1);
+                    return None;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    let sel = self.mention_sel.min(mentions.len() - 1);
+                    let path = mentions[sel].clone();
+                    self.insert_mention(&path);
+                    return None;
+                }
+                KeyCode::Esc => {
+                    if let Some((at, _)) = self.mention_query() {
+                        self.input.remove(at); // drop the `@`, keep the text
+                    }
+                    self.mention_sel = 0;
+                    return None;
+                }
+                _ => {}
+            }
+        }
         match (key.code, key.modifiers) {
             (KeyCode::PageUp, _) => {
                 self.scroll_back += 10;
@@ -890,12 +1065,14 @@ impl Component for ChatComponent {
                 self.input.pop();
                 self.history_idx = None; // editing exits history navigation
                 self.menu_sel = 0; // query narrowed → reset palette cursor
+                self.mention_sel = 0;
                 None
             }
             (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
                 self.input.push(c);
                 self.history_idx = None; // editing exits history navigation
                 self.menu_sel = 0; // query changed → reset palette cursor
+                self.mention_sel = 0;
                 None
             }
             _ => None,
@@ -1283,6 +1460,11 @@ impl Component for ChatComponent {
         // ── `/` command palette overlay, floated just above the composer ─────
         if !menu.is_empty() {
             self.draw_menu(frame, comp, &menu);
+        }
+        // ── `@` file-mention picker, floated just above the composer ─────────
+        let mentions = self.mention_matches();
+        if !mentions.is_empty() {
+            self.draw_mentions(frame, comp, &mentions);
         }
         // ── ⌃R history-search overlay, floated just above the composer ───────
         if self.search.is_some() {

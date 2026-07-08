@@ -187,6 +187,9 @@ impl App {
             last_tree_scan: Instant::now(),
         };
         app.apply_focus();
+        // `@` file mentions index the launch project from the start.
+        app.chat
+            .set_mention_root(PathBuf::from(&app.workspace_root));
         // Auto-resume the most recent session for this workspace so `ocean`
         // (or `cd project && ocean`) drops you BACK INTO your last conversation
         // — transcript rehydrated from disk, not just the session id bound (the
@@ -734,7 +737,8 @@ impl App {
         }
         self.workspace_root = s;
         self.tree.set_root(cwd.clone());
-        self.graph.set_root(cwd);
+        self.graph.set_root(cwd.clone());
+        self.chat.set_mention_root(cwd); // `@` picker follows the project
         // Force the file tree to re-read on the next tick rather than waiting
         // out the throttle window.
         self.last_tree_scan = Instant::now() - Duration::from_secs(2);

@@ -19,6 +19,7 @@ mod graph;
 mod highlight;
 mod history;
 mod markdown;
+mod mentions;
 mod panel;
 mod pty;
 mod sessions;
