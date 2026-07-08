@@ -7,7 +7,7 @@
 //! multi-line input (⌃J newline), and wheel/PageUp scrollback.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ocean_agent_sdk::{AgentTurnEvent, ToolCallId};
+use ocean_agent_sdk::{AgentTurnEvent, ThinkingLevel, ToolCallId};
 use ocean_core::{OceanEvent, PermissionId};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -593,17 +593,34 @@ impl ChatComponent {
         }
     }
 
-fn login_target(args: &str) -> Result<LoginTarget, String> {
-    let target = args.trim();
-    if target.is_empty() {
-        return Ok(LoginTarget::Claude);
+    fn login_target(args: &str) -> Result<LoginTarget, String> {
+        let target = args.trim();
+        if target.is_empty() {
+            return Ok(LoginTarget::Claude);
+        }
+        match target.to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" | "anthropic" => Ok(LoginTarget::Claude),
+            "codex" | "openai-codex" | "chatgpt" | "openai" => Ok(LoginTarget::Codex),
+            _ => Err("usage: /login [claude|codex]".into()),
+        }
     }
-    match target.to_ascii_lowercase().as_str() {
-        "claude" | "claude-code" | "anthropic" => Ok(LoginTarget::Claude),
-        "codex" | "openai-codex" | "chatgpt" | "openai" => Ok(LoginTarget::Codex),
-        _ => Err("usage: /login [claude|codex]".into()),
+
+    fn parse_thinking(args: &str) -> Result<Option<ThinkingLevel>, String> {
+        let level = args.trim();
+        if level.is_empty() {
+            return Err("usage: /thinking default|off|minimal|low|medium|high|xhigh".into());
+        }
+        match level.to_ascii_lowercase().as_str() {
+            "default" | "auto" | "daemon" => Ok(None),
+            "off" | "none" => Ok(Some(ThinkingLevel::Off)),
+            "minimal" | "min" => Ok(Some(ThinkingLevel::Minimal)),
+            "low" => Ok(Some(ThinkingLevel::Low)),
+            "medium" | "med" => Ok(Some(ThinkingLevel::Medium)),
+            "high" => Ok(Some(ThinkingLevel::High)),
+            "xhigh" | "x-high" | "extra-high" => Ok(Some(ThinkingLevel::Xhigh)),
+            _ => Err("usage: /thinking default|off|minimal|low|medium|high|xhigh".into()),
+        }
     }
-}
 
     /// Execute a slash command by name, with any trailing `args` (empty for a
     /// palette pick; the tail of a typed `/name args` line otherwise). Clears
@@ -646,6 +663,10 @@ fn login_target(args: &str) -> Result<LoginTarget, String> {
                     Some(Action::SetModel(args.to_string()))
                 }
             }
+            "/thinking" => match Self::parse_thinking(args) {
+                Ok(level) => Some(Action::SetThinking(level)),
+                Err(usage) => Some(Action::Status(usage)),
+            },
             "/models" => Some(Action::OpenModels),
             "/login" => match Self::login_target(args) {
                 Ok(target) => Some(Action::Login(target)),
@@ -761,7 +782,7 @@ fn login_target(args: &str) -> Result<LoginTarget, String> {
             })
             .max()
             .unwrap_or(24);
-        let width = ((content_w as u16) + 2 /* borders */)
+        let width = ((content_w as u16) + 2/* borders */)
             .min(composer.width)
             .max(24);
         let height = shown as u16 + 3; // top+bottom border + footer row
@@ -775,7 +796,9 @@ fn login_target(args: &str) -> Result<LoginTarget, String> {
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
                 format!(" {} commands ", g("◆", "*")),
-                Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::BLUE)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -908,7 +931,9 @@ fn login_target(args: &str) -> Result<LoginTarget, String> {
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
                 format!(" {} files ", g("◆", "*")),
-                Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::BLUE)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -988,7 +1013,9 @@ fn login_target(args: &str) -> Result<LoginTarget, String> {
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
                 format!(" {} history: {query}", g("⌕", "?")),
-                Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::BLUE)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1325,7 +1352,9 @@ impl Component for ChatComponent {
                         output.push_str(chunk);
                     }
                 }
-                AgentTurnEvent::ToolCallFinished { call_id, result, .. } => {
+                AgentTurnEvent::ToolCallFinished {
+                    call_id, result, ..
+                } => {
                     let ok = result.ok;
                     if let Some(Turn::Tool { status, output, .. }) = self.tool_by_id(call_id) {
                         *status = if ok { ToolStatus::Ok } else { ToolStatus::Err };
@@ -1345,8 +1374,25 @@ impl Component for ChatComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        // Composer grows with its content (multi-line via ⌃J), capped at 5.
-        let input_lines = (self.input.split('\n').count().max(1) as u16).min(5);
+        // Composer grows with its content — explicit ⌃J lines AND soft-wrapped
+        // rows of long lines (typing past the right edge used to just clip:
+        // the words kept landing but never showed). Capped so the transcript
+        // keeps the room; past the cap the composer scrolls to the cursor.
+        let usable = (area.width.saturating_sub(2)).max(1) as usize;
+        let logical: Vec<&str> = self.input.split('\n').collect();
+        let last = logical.len() - 1;
+        let input_rows: u16 = logical
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                // The block cursor occupies one extra cell on the last line, so
+                // a line exactly at the width still wraps its cursor visibly.
+                let w = l.chars().count() + usize::from(i == last);
+                (w.max(1)).div_ceil(usable) as u16
+            })
+            .sum::<u16>()
+            .max(1);
+        let input_lines = input_rows.min(8).min((area.height / 2).max(1));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(input_lines + 1)])
@@ -1384,7 +1430,9 @@ impl Component for ChatComponent {
                         Span::styled(g("❯ ", "> "), Style::default().fg(theme::CYAN)),
                         Span::styled(
                             s.clone(),
-                            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(theme::CYAN)
+                                .add_modifier(Modifier::BOLD),
                         ),
                     ]));
                 }
@@ -1411,9 +1459,7 @@ impl Component for ChatComponent {
                                 ),
                                 Span::styled(
                                     tool.clone(),
-                                    Style::default()
-                                        .fg(theme::FG)
-                                        .add_modifier(Modifier::BOLD),
+                                    Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
                                 ),
                             ]));
                             lines.push(Line::from(vec![
@@ -1623,7 +1669,11 @@ impl Component for ChatComponent {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     g("▎", "|"),
-                    Style::default().fg(if self.busy { theme::COMMENT } else { theme::CYAN }),
+                    Style::default().fg(if self.busy {
+                        theme::COMMENT
+                    } else {
+                        theme::CYAN
+                    }),
                 ))
                 .style(Style::default().bg(theme::BG_HL)),
                 Rect::new(comp.x, comp.y + k, 1, 1),
@@ -1643,14 +1693,18 @@ impl Component for ChatComponent {
             last.spans
                 .push(Span::styled(g("▏", "_"), Style::default().fg(theme::CYAN)));
         }
+        // Soft-wrap long lines (typing past the right edge used to just clip)
+        // and scroll so the cursor's row stays visible once wrapped content
+        // exceeds the composer's capped height.
+        let input_w = comp.width.saturating_sub(2);
+        let input_para = Paragraph::new(input_render)
+            .style(Style::default().bg(theme::BG_HL))
+            .wrap(Wrap { trim: false });
+        let wrapped_rows = input_para.line_count(input_w) as u16;
+        let input_scroll = wrapped_rows.saturating_sub(comp.height);
         frame.render_widget(
-            Paragraph::new(input_render).style(Style::default().bg(theme::BG_HL)),
-            Rect::new(
-                comp.x + 2,
-                comp.y,
-                comp.width.saturating_sub(2),
-                comp.height,
-            ),
+            input_para.scroll((input_scroll, 0)),
+            Rect::new(comp.x + 2, comp.y, input_w, comp.height),
         );
 
         // ── `/` command palette overlay, floated just above the composer ─────
@@ -1733,15 +1787,15 @@ mod tests {
     #[test]
     fn empty_note_is_skipped() {
         let mut chat = ChatComponent::default();
-        chat.update(&extension("advisor", json!({ "note": "   ", "severity": "info" })));
+        chat.update(&extension(
+            "advisor",
+            json!({ "note": "   ", "severity": "info" }),
+        ));
         chat.update(&extension("advisor", json!({ "severity": "blocker" })));
         assert!(chat.turns.is_empty());
     }
 
-    fn perm_envelope(
-        pid: PermissionId,
-        event: OceanEvent,
-    ) -> Action {
+    fn perm_envelope(pid: PermissionId, event: OceanEvent) -> Action {
         Action::OceanEvent(Box::new(ocean_core::EventEnvelope {
             id: ocean_core::EventId::new_v4(),
             at: chrono::Utc::now(),
@@ -1765,7 +1819,11 @@ mod tests {
                 args: json!({}),
             },
         ));
-        assert_eq!(chat.pending_permission(), Some(pid), "card should be pending");
+        assert_eq!(
+            chat.pending_permission(),
+            Some(pid),
+            "card should be pending"
+        );
         // ⌃Y targets the pending card.
         let act = chat.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
         assert!(matches!(
@@ -1907,6 +1965,23 @@ mod tests {
     }
 
     #[test]
+    fn slash_thinking_routes_levels_and_usage() {
+        let mut chat = ChatComponent::default();
+        match chat.run_slash("/thinking", "high") {
+            Some(Action::SetThinking(Some(ThinkingLevel::High))) => {}
+            other => panic!("expected SetThinking(high), got {other:?}"),
+        }
+        match chat.run_slash("/thinking", "default") {
+            Some(Action::SetThinking(None)) => {}
+            other => panic!("expected SetThinking(default), got {other:?}"),
+        }
+        match chat.run_slash("/thinking", "") {
+            Some(Action::Status(s)) => assert!(s.contains("usage: /thinking"), "got: {s}"),
+            other => panic!("expected usage Status, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn slash_login_without_args_routes_claude_login() {
         let mut chat = ChatComponent::default();
 
@@ -1918,7 +1993,10 @@ mod tests {
     #[test]
     fn slash_copy_uses_last_reply() {
         let mut chat = ChatComponent::default();
-        assert!(matches!(chat.run_slash("/copy", ""), Some(Action::Status(_)))); // nothing yet
+        assert!(matches!(
+            chat.run_slash("/copy", ""),
+            Some(Action::Status(_))
+        )); // nothing yet
         chat.turns.push(Turn::Assistant("the answer".into()));
         match chat.run_slash("/copy", "") {
             Some(Action::CopyToClipboard(t)) => assert_eq!(t, "the answer"),
@@ -1941,7 +2019,10 @@ mod tests {
         let mut chat = chat_with("/model anthropic/claude-opus-4-8");
         let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(act, Some(Action::SetModel(_))));
-        assert!(chat.turns.is_empty(), "command line must not become a User turn");
+        assert!(
+            chat.turns.is_empty(),
+            "command line must not become a User turn"
+        );
         // A `/`-path that is NOT a command still sends as a normal message.
         let mut chat2 = chat_with("/etc/hosts is a file");
         let act2 = chat2.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1955,7 +2036,10 @@ mod tests {
         let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(matches!(act, Some(Action::Login(LoginTarget::Codex))));
-        assert!(chat.turns.is_empty(), "command line must not become a User turn");
+        assert!(
+            chat.turns.is_empty(),
+            "command line must not become a User turn"
+        );
     }
 
     #[test]
@@ -2006,9 +2090,15 @@ mod tests {
         let mut chat = chat_with_hist(&["recall me"]);
         chat.input = "in-progress draft".into();
         chat.handle_key(key(KeyCode::Up));
-        assert_eq!(chat.input, "in-progress draft", "↑ must not clobber a draft");
+        assert_eq!(
+            chat.input, "in-progress draft",
+            "↑ must not clobber a draft"
+        );
         chat.handle_key(key(KeyCode::Down));
-        assert_eq!(chat.input, "in-progress draft", "↓ no-ops when not navigating");
+        assert_eq!(
+            chat.input, "in-progress draft",
+            "↓ no-ops when not navigating"
+        );
     }
 
     #[test]
@@ -2060,9 +2150,15 @@ mod tests {
         let mut chat = chat_with("hello world");
         chat.handle_key(ctrl('u'));
         assert_eq!(chat.input, "");
-        assert_eq!(chat.kill_ring.last().map(String::as_str), Some("hello world"));
+        assert_eq!(
+            chat.kill_ring.last().map(String::as_str),
+            Some("hello world")
+        );
         chat.handle_key(ctrl('y'));
-        assert_eq!(chat.input, "hello world", "⌃Y yanks the newest kill at the end");
+        assert_eq!(
+            chat.input, "hello world",
+            "⌃Y yanks the newest kill at the end"
+        );
     }
 
     #[test]
@@ -2107,7 +2203,10 @@ mod tests {
             act,
             Some(Action::PermissionDecided { permission_id, allow: true }) if permission_id == pid
         ));
-        assert_eq!(chat.input, "", "yank must not fire while a permission is pending");
+        assert_eq!(
+            chat.input, "",
+            "yank must not fire while a permission is pending"
+        );
         // Resolve the permission; now ⌃Y yanks.
         chat.update(&perm_envelope(
             pid,

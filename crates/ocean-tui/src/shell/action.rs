@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
+use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, ThinkingLevel};
 
 /// A workbench navigation target — a pane or center surface. Emitted by the `/`
 /// palette so chat never reaches into the app's private `Focus`/`Center`.
@@ -26,7 +26,6 @@ pub enum LoginTarget {
     /// Codex / ChatGPT subscription OAuth.
     Codex,
 }
-
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -66,6 +65,9 @@ pub enum Action {
     CopyToClipboard(String),
     /// `/model <id>` — override the model for subsequent turns this session.
     SetModel(String),
+    /// `/thinking <level>` — override the thinking level for subsequent turns
+    /// this session (`None` = daemon default; rides `AgentTurnRequest`).
+    SetThinking(Option<ThinkingLevel>),
     /// `/login [claude|codex]` — open a browser login flow for provider OAuth.
     Login(LoginTarget),
     /// Terminal status of an async `/login` OAuth flow (begin → browser → token

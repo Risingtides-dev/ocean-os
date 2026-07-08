@@ -33,33 +33,149 @@ pub struct SlashCommand {
 /// harness is going (the W3–W7 slices) and say so honestly when run.
 pub const COMMANDS: &[SlashCommand] = &[
     // ── session ────────────────────────────────────────────────────────────
-    SlashCommand { name: "/new", desc: "start a fresh session", group: "session", soon: false },
-    SlashCommand { name: "/resume", desc: "resume a past session", group: "session", soon: false },
-    SlashCommand { name: "/sessions", desc: "focus the session rail", group: "session", soon: false },
-    SlashCommand { name: "/models", desc: "pick a model + thinking level (live registry)", group: "session", soon: false },
-    SlashCommand { name: "/model", desc: "set the model directly (/model <id>; bare opens the picker)", group: "session", soon: false },
-    SlashCommand { name: "/login", desc: "open provider login in browser (/login [claude|codex])", group: "session", soon: false },
+    SlashCommand {
+        name: "/new",
+        desc: "start a fresh session",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/resume",
+        desc: "resume a past session",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/sessions",
+        desc: "focus the session rail",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/models",
+        desc: "pick a model + thinking level (live registry)",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/model",
+        desc: "set the model directly (/model <id>; bare opens the picker)",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/thinking",
+        desc: "set thinking directly (/thinking default|off|minimal|low|medium|high|xhigh)",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/login",
+        desc: "open provider login in browser (/login [claude|codex])",
+        group: "session",
+        soon: false,
+    },
     // ── workspace ──────────────────────────────────────────────────────────
-    SlashCommand { name: "/files", desc: "focus the file tree", group: "workspace", soon: false },
-    SlashCommand { name: "/graph", desc: "open the graph view", group: "workspace", soon: false },
-    SlashCommand { name: "/terminal", desc: "focus the terminal", group: "workspace", soon: false },
-    SlashCommand { name: "/settings", desc: "open the settings panel", group: "workspace", soon: false },
+    SlashCommand {
+        name: "/files",
+        desc: "focus the file tree",
+        group: "workspace",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/graph",
+        desc: "open the graph view",
+        group: "workspace",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/terminal",
+        desc: "focus the terminal",
+        group: "workspace",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/settings",
+        desc: "open the settings panel",
+        group: "workspace",
+        soon: false,
+    },
     // ── chat ───────────────────────────────────────────────────────────────
-    SlashCommand { name: "/copy", desc: "copy the last reply to the clipboard", group: "chat", soon: false },
-    SlashCommand { name: "/clear", desc: "clear the chat transcript", group: "chat", soon: false },
-    SlashCommand { name: "/help", desc: "list all commands", group: "chat", soon: false },
-    SlashCommand { name: "/quit", desc: "exit ocean", group: "chat", soon: false },
+    SlashCommand {
+        name: "/copy",
+        desc: "copy the last reply to the clipboard",
+        group: "chat",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/clear",
+        desc: "clear the chat transcript",
+        group: "chat",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/help",
+        desc: "list all commands",
+        group: "chat",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/quit",
+        desc: "exit ocean",
+        group: "chat",
+        soon: false,
+    },
     // ── context (W3 roadmap) ───────────────────────────────────────────────
-    SlashCommand { name: "/compact", desc: "prune + shake the context (W3)", group: "context", soon: true },
-    SlashCommand { name: "/context", desc: "context-economy panel (W3)", group: "context", soon: true },
-    SlashCommand { name: "/diff", desc: "review pending edits (W3)", group: "context", soon: true },
+    SlashCommand {
+        name: "/compact",
+        desc: "prune + shake the context (W3)",
+        group: "context",
+        soon: true,
+    },
+    SlashCommand {
+        name: "/context",
+        desc: "context-economy panel (W3)",
+        group: "context",
+        soon: true,
+    },
+    SlashCommand {
+        name: "/diff",
+        desc: "review pending edits (W3)",
+        group: "context",
+        soon: true,
+    },
     // ── intel (W5–W6 roadmap) ──────────────────────────────────────────────
-    SlashCommand { name: "/lsp", desc: "diagnostics / rename (W5)", group: "intel", soon: true },
-    SlashCommand { name: "/rules", desc: "manage stream rules (W6)", group: "intel", soon: true },
+    SlashCommand {
+        name: "/lsp",
+        desc: "diagnostics / rename (W5)",
+        group: "intel",
+        soon: true,
+    },
+    SlashCommand {
+        name: "/rules",
+        desc: "manage stream rules (W6)",
+        group: "intel",
+        soon: true,
+    },
     // ── agent (W7 roadmap) ─────────────────────────────────────────────────
-    SlashCommand { name: "/memory", desc: "recall / retain memory — OKF (W7)", group: "agent", soon: true },
-    SlashCommand { name: "/goal", desc: "set the session goal (W7)", group: "agent", soon: true },
-    SlashCommand { name: "/handoff", desc: "write handoff.md (W7)", group: "agent", soon: true },
+    SlashCommand {
+        name: "/memory",
+        desc: "recall / retain memory — OKF (W7)",
+        group: "agent",
+        soon: true,
+    },
+    SlashCommand {
+        name: "/goal",
+        desc: "set the session goal (W7)",
+        group: "agent",
+        soon: true,
+    },
+    SlashCommand {
+        name: "/handoff",
+        desc: "write handoff.md (W7)",
+        group: "agent",
+        soon: true,
+    },
 ];
 
 /// Is `name` (with leading `/`) a known command? Used by the composer to decide
@@ -166,12 +282,18 @@ mod tests {
     #[test]
     fn mod_ranks_model_first() {
         let ranked = filter("mod");
-        assert_eq!(ranked[0].0.name, "/model", "\"mod\" should rank /model first");
+        assert_eq!(
+            ranked[0].0.name, "/model",
+            "\"mod\" should rank /model first"
+        );
     }
 
     #[test]
     fn login_is_registered_and_log_ranks_it_first() {
-        assert!(is_command("/login"), "/login should be a live slash command");
+        assert!(
+            is_command("/login"),
+            "/login should be a live slash command"
+        );
 
         let ranked = filter("log");
 

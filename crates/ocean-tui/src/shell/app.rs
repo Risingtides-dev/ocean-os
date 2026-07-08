@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnRequest, ThinkingLevel};
 use ocean_core::RequestId;
 use ratatui::{
@@ -58,9 +60,7 @@ const MIN_CENTER_H: u16 = 5;
 /// given the center column's total height (crumb + surface + splitter + dock).
 fn max_term_h(center_h: u16) -> u16 {
     // reserve: 1 crumb + 1 splitter + MIN_CENTER_H surface.
-    center_h
-        .saturating_sub(2 + MIN_CENTER_H)
-        .max(MIN_TERM_H)
+    center_h.saturating_sub(2 + MIN_CENTER_H).max(MIN_TERM_H)
 }
 
 /// What the center surface is showing (CTRL swaps editor↔graph the same way).
@@ -275,7 +275,9 @@ impl App {
         // frame and, if a draw ran long, input backed up behind the timer.
         let mut dirty = true; // paint the first frame
         while !self.should_quit {
-            let Some(event) = events.next().await else { break };
+            let Some(event) = events.next().await else {
+                break;
+            };
             let is_render = matches!(event, Event::Render);
             let mut immediate = false;
             match event {
@@ -569,8 +571,7 @@ impl App {
                 if !self.pty.is_active() {
                     // Like CTRL's ensure_terminal: first press opens a plain
                     // shell at the project root.
-                    self.pty
-                        .open(&PathBuf::from(&self.workspace_root), "");
+                    self.pty.open(&PathBuf::from(&self.workspace_root), "");
                     self.show_term = true;
                     self.focus_to(Focus::Term);
                 } else {
@@ -755,6 +756,13 @@ impl App {
                 self.model_override = Some(id.clone());
                 self.status = format!("model → {id}");
             }
+            // `/thinking <level>`: remember the override for subsequent turns.
+            // `default` clears the per-turn override so the daemon's global
+            // setting is in force again.
+            Action::SetThinking(level) => {
+                self.thinking_override = *level;
+                self.status = format!("thinking → {}", thinking_label(self.thinking_override));
+            }
             // `/models`: open the picker and fetch the live registry (with
             // readiness) off-thread — the overlay shows "loading…" until
             // ModelsLoaded lands.
@@ -814,9 +822,8 @@ impl App {
                         let session = match ocean_oauth::begin(provider, None).await {
                             Ok(s) => s,
                             Err(e) => {
-                                let _ = tx.send(Action::LoginDone(format!(
-                                    "{label} login failed: {e}"
-                                )));
+                                let _ = tx
+                                    .send(Action::LoginDone(format!("{label} login failed: {e}")));
                                 return;
                             }
                         };
@@ -926,7 +933,8 @@ impl App {
     /// Bind the chat to `id`: abort any superseded stream and subscribe a fresh
     /// self-healing one. Idempotent for the already-bound session.
     fn bind_session_with(&mut self, id: AgentSessionId, replay_first: bool) {
-        if self.session_id == Some(id) && self.stream_task.as_ref().is_some_and(|t| !t.is_finished())
+        if self.session_id == Some(id)
+            && self.stream_task.as_ref().is_some_and(|t| !t.is_finished())
         {
             return;
         }
@@ -960,8 +968,8 @@ impl App {
         self.tree.set_root(cwd.clone());
         self.graph.set_root(cwd.clone());
         self.chat.set_mention_root(cwd); // `@` picker follows the project
-        // Force the file tree to re-read on the next tick rather than waiting
-        // out the throttle window.
+                                         // Force the file tree to re-read on the next tick rather than waiting
+                                         // out the throttle window.
         self.last_tree_scan = Instant::now() - Duration::from_secs(2);
     }
 
@@ -1039,11 +1047,7 @@ impl App {
                     } else {
                         self.models_sel = idx;
                     }
-                } else if !self
-                    .models_hit
-                    .iter()
-                    .any(|(r, _)| rect_has(*r, pos))
-                {
+                } else if !self.models_hit.iter().any(|(r, _)| rect_has(*r, pos)) {
                     // Outside every row: close only when outside the modal
                     // frame entirely (the hit list spans the modal body, so a
                     // click on padding keeps it open harmlessly).
@@ -1141,9 +1145,9 @@ impl App {
             .iter()
             .position(|r| *r == Some(self.models_sel))
             .unwrap_or(0);
-        let scroll = sel_row.saturating_sub(view_h.saturating_sub(1)).min(
-            rows.len().saturating_sub(view_h),
-        );
+        let scroll = sel_row
+            .saturating_sub(view_h.saturating_sub(1))
+            .min(rows.len().saturating_sub(view_h));
 
         for (vi, row) in rows.iter().enumerate().skip(scroll).take(view_h) {
             let ry = inner.y + (vi - scroll) as u16;
@@ -1156,7 +1160,9 @@ impl App {
                         .map(|e| (e.provider.clone(), e.ready))
                         .unwrap_or_default();
                     let style = if ready {
-                        Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme::BLUE)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(theme::COMMENT)
                     };
@@ -1211,11 +1217,8 @@ impl App {
             g("▸", ">"),
         );
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                footer,
-                Style::default().fg(theme::CYAN),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
+            Paragraph::new(Span::styled(footer, Style::default().fg(theme::CYAN)))
+                .style(Style::default().bg(theme::SLATE)),
             Rect::new(inner.x, footer_y, inner.width, 1),
         );
     }
@@ -1273,7 +1276,10 @@ impl App {
                     Style::default().fg(theme::CYAN),
                 ),
             ),
-            ("tool cards expanded".into(), pill(self.chat.tools_expanded())),
+            (
+                "tool cards expanded".into(),
+                pill(self.chat.tools_expanded()),
+            ),
         ];
         for (i, (label, value)) in rows.iter().enumerate() {
             let selected = i == self.settings_sel;
@@ -1517,10 +1523,7 @@ impl App {
         self.r_split_term = r_split_term;
 
         // deep chrome first
-        frame.render_widget(
-            Block::default().style(Style::default().bg(theme::BG)),
-            full,
-        );
+        frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), full);
 
         // breadcrumb: where the center surface is pointed (CTRL's crumb row).
         let crumb = match self.center {
@@ -1627,7 +1630,12 @@ impl App {
                     .bg(theme::BG_DARK)
                     .add_modifier(Modifier::BOLD),
             )),
-            Rect::new(area.x, area.y, (proj.chars().count() as u16).min(area.width), 1),
+            Rect::new(
+                area.x,
+                area.y,
+                (proj.chars().count() as u16).min(area.width),
+                1,
+            ),
         );
 
         // centered status pill
@@ -1644,10 +1652,30 @@ impl App {
 
         // right: icon buttons — CTRL's ⊞/⟠/⊟/◨ plus the center surfaces.
         let items: Vec<(&str, Btn, bool, ratatui::style::Color)> = vec![
-            (g("⊞", "[S]"), Btn::Sessions, self.show_sessions, theme::BLUE),
-            (g("❯", "[C]"), Btn::Chat, self.center == Center::Chat, theme::CYAN),
-            (g("✎", "[F]"), Btn::Editor, self.center == Center::Editor, theme::YELLOW),
-            (g("⟠", "[G]"), Btn::Graph, self.center == Center::Graph, theme::MAGENTA),
+            (
+                g("⊞", "[S]"),
+                Btn::Sessions,
+                self.show_sessions,
+                theme::BLUE,
+            ),
+            (
+                g("❯", "[C]"),
+                Btn::Chat,
+                self.center == Center::Chat,
+                theme::CYAN,
+            ),
+            (
+                g("✎", "[F]"),
+                Btn::Editor,
+                self.center == Center::Editor,
+                theme::YELLOW,
+            ),
+            (
+                g("⟠", "[G]"),
+                Btn::Graph,
+                self.center == Center::Graph,
+                theme::MAGENTA,
+            ),
             (
                 g("⊟", "[T]"),
                 Btn::Term,
@@ -1702,10 +1730,7 @@ impl App {
                 format!("  {}", self.status),
                 Style::default().fg(theme::COMMENT),
             ),
-            Span::styled(
-                "   ⇥ move · ⌃Q quit",
-                Style::default().fg(theme::COMMENT),
-            ),
+            Span::styled("   ⇥ move · ⌃Q quit", Style::default().fg(theme::COMMENT)),
         ];
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),

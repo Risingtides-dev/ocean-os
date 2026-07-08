@@ -1946,3 +1946,11 @@ area:      frontend
 
 Fixed the tool-card cell bleed John screenshotted ("1108ore" smears, code fragments painting over later transcript rows): the enriched read tool emits `<lineno>\t<code>` lines, and ratatui does NOT expand tabs — the terminal jumps to its own tab stops, every cell after paints misaligned, and ratatui's cell-diffing leaves smears that never clear. New sanitize_line (tabs → 4 spaces, other control chars dropped) applied to tool-card output lines AND diff-card segments before clamp/render. Also triaged his "massive delays": not the deploy — his session was pinned to gpt-5.5 and chatgpt.com was intermittently hanging ~10s/attempt from this box (retry ladder → 30s+ turns before failover); deepseek turns measured 1.9-6.7s normal, daemon healthy. Suite 163/0.
 _________________________________________________________________________________
+time:      [6:20pm] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      frontend
+
+Composer soft-wrap: typing past the right edge used to clip (words landed but never showed) — the input Paragraph had no wrap and the composer height counted only ⌃J lines. Now: wrapped-row-aware growth (cap 8 rows / half the pane), Wrap{trim:false} on the input, scroll keeps the cursor row visible past the cap. PTY-verified 280-char input wraps across 3 rows with first+last words visible. Also reconciled the in-TUI agent's /thinking command (it replaced SetModel with SetThinking in action.rs, breaking 4 call sites): both actions now coexist — /thinking default|off|minimal|low|medium|high|xhigh sets the same per-turn override as the picker's ←/→. Suite 164/0.
+_________________________________________________________________________________
