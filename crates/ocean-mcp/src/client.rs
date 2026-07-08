@@ -474,12 +474,44 @@ async fn fail_all_pending(pending: &Pending) {
 ///   unsupported by the content model today: it is logged clearly and replaced
 ///   with a text placeholder so the model knows content was elided rather than
 ///   the call having returned nothing.
+/// Total bytes of TEXT content retained per MCP tool call. Servers are
+/// third-party processes — a rogue or verbose one can return a response of any
+/// size, and pre-cap that arrived as one unbounded `String` in daemon RAM (the
+/// transcript cap only bounds what the MODEL re-reads, not what the daemon
+/// holds or ships over SSE). Text past the cap is dropped with a loud marker;
+/// 2 MiB matches the bash/web_fetch output caps.
+const MAX_TEXT_BYTES_PER_CALL: usize = 2 * 1024 * 1024;
+
 fn map_content(tool_name: &str, blocks: &[Value]) -> Vec<Content> {
     let mut out = Vec::new();
+    let mut text_budget = MAX_TEXT_BYTES_PER_CALL;
+    let mut capped = false;
     for b in blocks {
         match b.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    if capped {
+                        continue; // budget already spent; the marker was pushed
+                    }
+                    if t.len() > text_budget {
+                        // Cut on a char boundary at the remaining budget.
+                        let mut cut = text_budget;
+                        while cut > 0 && !t.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        out.push(Content::text(&t[..cut]));
+                        out.push(Content::text(format!(
+                            "[MCP result capped at {MAX_TEXT_BYTES_PER_CALL} bytes of text; \
+                             remainder dropped]"
+                        )));
+                        tracing::warn!(
+                            tool = %tool_name,
+                            "MCP tool text result exceeded the per-call cap; truncated"
+                        );
+                        capped = true;
+                        continue;
+                    }
+                    text_budget -= t.len();
                     out.push(Content::text(t));
                 }
             }
@@ -533,6 +565,41 @@ fn image_block(b: &Value) -> Option<Content> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn oversized_text_result_is_capped_with_marker() {
+        // One giant block + one that would follow it: the giant is cut at the
+        // budget, a loud marker is appended, and later text is dropped.
+        let giant = "x".repeat(MAX_TEXT_BYTES_PER_CALL + 1024);
+        let blocks = vec![
+            json!({ "type": "text", "text": giant }),
+            json!({ "type": "text", "text": "after" }),
+        ];
+        let content = map_content("t", &blocks);
+        let total: usize = content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.len())
+            .sum();
+        assert!(
+            total < MAX_TEXT_BYTES_PER_CALL + 256,
+            "retained text must stay near the cap, got {total}"
+        );
+        assert!(
+            content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .any(|t| t.contains("MCP result capped")),
+            "cap marker present"
+        );
+        assert!(
+            !content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .any(|t| t == "after"),
+            "text after the cap is dropped"
+        );
+    }
 
     #[test]
     fn text_blocks_map_to_text_content() {
