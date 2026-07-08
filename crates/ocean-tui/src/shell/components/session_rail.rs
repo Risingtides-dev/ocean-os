@@ -1,10 +1,11 @@
 //! SessionRailComponent — the left rail listing Ocean sessions for the current
-//! project, grouped into collapsible WORKTREE nodes so a busy repo reads as a
-//! tree (like the file explorer) instead of a flat sprawl. Wears CTRL's
-//! SESSIONS-panel skin: slate bed, `◆ SESSIONS` title, worktree headers in blue
-//! with ▸/▾ carets + a session count, sessions indented one level with their
-//! title + relative age, a cyan accent bar on the selected row, and a live `●`
-//! dot on the session currently open in the chat/PTY.
+//! project, grouped into collapsible BRANCH nodes (git branch stamped on each
+//! session record; physical worktree dir for legacy records) so a busy repo
+//! reads as a tree (like the file explorer) instead of a flat sprawl. Wears
+//! CTRL's SESSIONS-panel skin: slate bed, `◆ SESSIONS` title, branch headers
+//! in blue with ▸/▾ carets + a session count, sessions indented one level with
+//! their title + relative age, a cyan accent bar on the selected row, and a
+//! live `●` dot on the session currently open in the chat/PTY.
 //!
 //! Enter on a header toggles the group; Enter on a session resumes it natively
 //! into the chat; `t` opens the session in the embedded terminal; `r` rescans.
@@ -33,11 +34,16 @@ use crate::shell::{
     theme::{self, g},
 };
 
-/// One worktree group: a header ("main", "feat/x", …) over its sessions,
-/// newest-first, with a collapse flag. `cwd` is the project dir a `+ new`
-/// session in this group is rooted at.
+/// One branch group: a header ("main", "feat/x", …) over its sessions,
+/// newest-first, with a collapse flag. Sessions group by the git branch the
+/// daemon stamped on their record at creation; records that predate the
+/// `git_branch` field fall back to their physical worktree dir. `key` is the
+/// stable grouping identity (expansion survives rescans on it); `label` is the
+/// display form; `cwd` is where a `+ new` session in this group roots — the
+/// dir the group's newest session actually ran in.
 struct Group {
-    worktree: String,
+    key: String,
+    label: String,
     cwd: PathBuf,
     sessions: Vec<Session>,
     expanded: bool,
@@ -117,17 +123,17 @@ impl SessionRailComponent {
     }
 
     pub fn refresh(&mut self) {
-        // Preserve which worktrees are expanded across a rescan.
+        // Preserve which groups are expanded across a rescan.
         let expanded: Vec<String> = self
             .groups
             .iter()
             .filter(|g| g.expanded)
-            .map(|g| g.worktree.clone())
+            .map(|g| g.key.clone())
             .collect();
         self.groups = build_groups(&self.root, discover(&self.root, Sort::Date));
         if !expanded.is_empty() {
             for group in &mut self.groups {
-                group.expanded = expanded.contains(&group.worktree);
+                group.expanded = expanded.contains(&group.key);
             }
         }
         let n = self.rows().len();
@@ -355,7 +361,7 @@ impl Component for SessionRailComponent {
                     };
                     let count = format!("({})", group.sessions.len());
                     let plus = g("＋", "+");
-                    let label = format!("{caret}{}", display_worktree(&group.worktree));
+                    let label = format!("{caret}{}", group.label);
                     // Right cluster: a green "＋" button + the session count. The
                     // ＋ starts a new session in this worktree (click it or press
                     // n). Build the spans by hand so ＋ and count get their own
@@ -425,40 +431,58 @@ impl Component for SessionRailComponent {
     }
 }
 
-/// Group `sessions` (newest-first from `discover`) into collapsible worktree
-/// nodes. Group order: the worktree with the most recent activity floats to the
-/// top; within a group, sessions stay newest-first. The most-recently-active
-/// group starts expanded, the rest collapsed — so `ocean` opens on your latest
-/// work without the whole history sprawling open.
+/// Group `sessions` (newest-first from `discover`) into collapsible branch
+/// nodes. The grouping key is the git branch the daemon stamped on the session
+/// record at creation — so two sessions run in the same checkout on different
+/// branches land in different groups, which matches how the work actually
+/// forked. Records that predate the `git_branch` field group by their physical
+/// worktree dir instead (keyed with a `dir:` prefix so an old rootside record
+/// never merges into a real `main` branch group by accident).
+///
+/// Group order: the branch with the most recent activity floats to the top;
+/// within a group, sessions stay newest-first. The most-recently-active group
+/// starts expanded, the rest collapsed — so `ocean` opens on your latest work
+/// without the whole history sprawling open.
 fn build_groups(root: &std::path::Path, sessions: Vec<Session>) -> Vec<Group> {
     let mut map: HashMap<String, Vec<Session>> = HashMap::new();
     for s in sessions {
-        map.entry(s.worktree.clone()).or_default().push(s);
+        let key = match &s.branch {
+            Some(branch) => branch.clone(),
+            None => format!("dir:{}", s.worktree),
+        };
+        map.entry(key).or_default().push(s);
     }
     let mut groups: Vec<Group> = map
         .into_iter()
-        .map(|(worktree, mut sessions)| {
+        .map(|(key, mut sessions)| {
             sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
-            // The worktree label IS the cwd's path relative to root ("main" ==
-            // root itself), so a `+ new` session here roots at exactly that dir.
-            let cwd = if worktree == "main" {
-                root.to_path_buf()
-            } else {
-                root.join(&worktree)
+            let label = match key.strip_prefix("dir:") {
+                // Legacy dir-keyed group: show the worktree leaf, as before.
+                Some(dir) => display_worktree(dir).to_string(),
+                // Branch group: the branch name verbatim ("feat/x" stays whole
+                // — the slash is signal, not a path to leaf).
+                None => key.clone(),
             };
+            // `+ new` roots where this group's latest session actually ran —
+            // the branch's live checkout — not a path guessed from the label.
+            let cwd = sessions
+                .first()
+                .map(|s| s.cwd.clone())
+                .unwrap_or_else(|| root.to_path_buf());
             Group {
-                worktree,
+                key,
+                label,
                 cwd,
                 sessions,
                 expanded: false,
             }
         })
         .collect();
-    // Most-recently-active worktree first (by its newest session).
+    // Most-recently-active branch first (by its newest session).
     groups.sort_by(|a, b| {
         let am = a.sessions.first().map(|s| s.mtime).unwrap_or(0);
         let bm = b.sessions.first().map(|s| s.mtime).unwrap_or(0);
-        bm.cmp(&am).then_with(|| a.worktree.cmp(&b.worktree))
+        bm.cmp(&am).then_with(|| a.label.cmp(&b.label))
     });
     if let Some(first) = groups.first_mut() {
         first.expanded = true;
@@ -487,5 +511,93 @@ fn truncate(s: &str, max: usize) -> String {
             "{}…",
             s.chars().take(max.saturating_sub(1)).collect::<String>()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sess(id: &str, branch: Option<&str>, worktree: &str, cwd: &str, mtime: u64) -> Session {
+        Session {
+            id: id.into(),
+            title: format!("session {id}"),
+            cwd: PathBuf::from(cwd),
+            worktree: worktree.into(),
+            branch: branch.map(str::to_string),
+            mtime,
+            path: PathBuf::from(format!("/tmp/{id}.json")),
+        }
+    }
+
+    #[test]
+    fn groups_by_recorded_branch_not_directory() {
+        // Two sessions ran in the SAME checkout dir but on different branches
+        // (John's actual workflow: work a branch, merge, forget to switch).
+        // They must land in separate groups keyed by branch.
+        let root = PathBuf::from("/repo");
+        let groups = build_groups(
+            &root,
+            vec![
+                sess("a", Some("feat/x"), "main", "/repo", 100),
+                sess("b", Some("main"), "main", "/repo", 50),
+            ],
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "feat/x"); // newest activity floats up
+        assert_eq!(groups[1].label, "main");
+        // Branch names keep their slash — "feat/x" is not leafed to "x".
+        assert_eq!(groups[0].key, "feat/x");
+    }
+
+    #[test]
+    fn legacy_records_fall_back_to_worktree_dir_without_merging_into_main() {
+        // A pre-git_branch record at the repo root must NOT merge into a real
+        // `main` branch group — its key carries the `dir:` prefix.
+        let root = PathBuf::from("/repo");
+        let groups = build_groups(
+            &root,
+            vec![
+                sess("new", Some("main"), "main", "/repo", 100),
+                sess("old", None, "main", "/repo", 50),
+            ],
+        );
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().any(|g| g.key == "main"));
+        assert!(groups.iter().any(|g| g.key == "dir:main"));
+        // Both still *display* as "main" — the dir fallback shows the leaf.
+        assert!(groups.iter().all(|g| g.label == "main"));
+    }
+
+    #[test]
+    fn new_session_roots_at_the_groups_latest_cwd() {
+        // `+ new` in a branch group roots where that branch's newest session
+        // actually ran, not at a path guessed from the label.
+        let root = PathBuf::from("/repo");
+        let groups = build_groups(
+            &root,
+            vec![
+                sess("a", Some("feat/x"), "wt/feat-x", "/repo/.claude/worktrees/feat-x", 200),
+                sess("b", Some("feat/x"), "main", "/repo", 100),
+            ],
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].cwd, PathBuf::from("/repo/.claude/worktrees/feat-x"));
+    }
+
+    #[test]
+    fn most_recent_group_starts_expanded_rest_collapsed() {
+        let root = PathBuf::from("/repo");
+        let groups = build_groups(
+            &root,
+            vec![
+                sess("a", Some("feat/x"), "main", "/repo", 300),
+                sess("b", Some("main"), "main", "/repo", 200),
+                sess("c", None, "wt/old", "/repo/wt/old", 100),
+            ],
+        );
+        assert_eq!(groups.len(), 3);
+        assert!(groups[0].expanded);
+        assert!(groups[1..].iter().all(|g| !g.expanded));
     }
 }

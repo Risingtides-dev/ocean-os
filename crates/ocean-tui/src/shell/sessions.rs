@@ -18,6 +18,9 @@ pub struct Session {
     pub cwd: PathBuf,
     /// "main" or the worktree folder name beneath the project root.
     pub worktree: String,
+    /// Git branch stamped onto the record at session creation (daemon-side
+    /// `bind_workspace`). Older records predate the field → `None`.
+    pub branch: Option<String>,
     pub mtime: u64, // unix seconds
     pub path: PathBuf,
 }
@@ -148,6 +151,7 @@ fn ocean_session_from_value(root: &Path, path: &Path, v: &serde_json::Value) -> 
         title,
         cwd: run_cwd,
         worktree,
+        branch: json_str(v, "git_branch").map(str::to_string),
         mtime,
         path: path.to_path_buf(),
     })
@@ -365,6 +369,7 @@ mod tests {
             "provider": "deepseek",
             "workspace_root": "/tmp/ocean-tui-root",
             "cwd": "/tmp/ocean-tui-root",
+            "git_branch": "feat/sessions",
             "messages": [{
                 "role": "user",
                 "content": [{ "type": "text", "text": "[TUI] PM room.\n\n```make sessions visible" }]
@@ -373,6 +378,7 @@ mod tests {
         let s = ocean_session_from_value(&root, Path::new("/tmp/s.json"), &v)
             .expect("ocean session should match project root");
         assert_eq!(s.worktree, "main");
+        assert_eq!(s.branch.as_deref(), Some("feat/sessions"));
         assert_eq!(s.title, "make sessions visible");
         assert_eq!(s.mtime, 1_781_151_304);
         let (cmd, args) = s.resume_command();
@@ -427,6 +433,7 @@ mod tests {
             title: "t".into(),
             cwd: PathBuf::from("/tmp/ocean-tui-root"),
             worktree: "main".into(),
+            branch: None,
             mtime: 0,
             path: PathBuf::from("/tmp/s.json"),
         };
