@@ -1851,3 +1851,25 @@ real failure in the pyte harness: dead port → send → retries → stub daemon
 mid-window → session+turn POSTs land, no error wall; and the give-up path shows
 the note + restored prompt after 7 attempts. 150 tests. Binary rebuilt.
 _________________________________________________________________________________
+
+time:      [12:55AM] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  main
+type:      merge
+area:      infra
+
+Merged feat/ocean-tui-shell-rebuild → main (clean fast-forward, f123ae3 →
+789036d, 33 commits) and redeployed the daemon from main, per John: get the
+work onto main and keep progress alive. The tree carried the runtime lane's
+in-flight uncommitted WIP, so the deploy binary was built from main's clean
+COMMITTED source (their half-done edits stayed out of prod). Full workspace
+suite at the merge point: 1532 passed / 0 failed. kickstart -k → new PID 62522,
+healthy in 2s; proof-of-new-code probe: GET /v1/fs/dirs 200 (404 on the prior
+running build), /v1/models 200. Now live on main: the whole TUI shell rebuild +
+experience pass (ocean palette, @-mentions, grouped rail/palette, /settings,
+resizable dock, blip-retry, perf), OMP W0-W3 spine (hashline, artifact spill,
+profiles, ocean-ast), the runtime lane's committed hardening (regex grep, bash/
+read/web_fetch/ls/MCP caps, loop guard, round retry), ocean-lsp, oauth
+providers + /login, fs/dirs. Deploy-from-main discipline restored (previous
+running build had been a mid-branch deploy at 63f40ca).
+_________________________________________________________________________________
