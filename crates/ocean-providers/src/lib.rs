@@ -20,7 +20,11 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 // under these bases and stream reasoning separately (MiniMax via `<think>`
 // tags / `reasoning_split`, Kimi via a thinking channel), so they ride the
 // same streaming path as DeepSeek's reasoner models.
-const MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/v1";
+// MiniMax INTERNATIONAL platform. John's key is an intl key: verified live
+// 2026-07-08 — 200 OK on api.minimax.io, 401 "invalid api key (2049)" on the
+// mainland api.minimaxi.com host. Override with `OCEAN_MINIMAX_BASE_URL`
+// (see `minimax_base_url`) to point back at the mainland platform.
+const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 // Google Generative AI (Gemini). Routed through ocean-protocol's
 // `google-generative-ai` provider, which targets the v1beta surface under
@@ -882,14 +886,14 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         "minimax" | "minimax-m2" => Ok(model_selection(
             ProviderId::MiniMax,
             "MiniMax-M2",
-            MINIMAX_BASE_URL,
+            minimax_base_url(env),
             200_000,
             8_192,
         )),
         "minimax-m2.7" | "minimax-m2-7" => Ok(model_selection(
             ProviderId::MiniMax,
             "MiniMax-M2.7",
-            MINIMAX_BASE_URL,
+            minimax_base_url(env),
             200_000,
             8_192,
         )),
@@ -1038,6 +1042,20 @@ fn glm_base_url(env: &ProviderEnv) -> &str {
     }
 }
 
+/// Resolve the MiniMax base URL: a non-empty `OCEAN_MINIMAX_BASE_URL` override
+/// wins, otherwise the international platform default ([`MINIMAX_BASE_URL`]).
+/// Same blank-is-unset rule as [`glm_base_url`].
+fn minimax_base_url(env: &ProviderEnv) -> &str {
+    match env
+        .get("OCEAN_MINIMAX_BASE_URL")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(override_url) => override_url,
+        None => MINIMAX_BASE_URL,
+    }
+}
+
 fn model_for_explicit_provider(
     provider: &str,
     model: &str,
@@ -1087,7 +1105,7 @@ fn model_for_explicit_provider(
         "minimax" => Ok(model_selection(
             ProviderId::MiniMax,
             minimax_api_casing(model),
-            MINIMAX_BASE_URL,
+            minimax_base_url(env),
             200_000,
             8_192,
         )),
