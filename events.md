@@ -1810,3 +1810,25 @@ parse/error-hygiene/empty-token (3, protocol, vs fake endpoint), needs-refresh
 matrix + atomic-write key preservation + e2e rewrite via endpoint override
 (3, agent). ocean-agent 126 + ocean-protocol 113 green, workspace clean.
 _________________________________________________________________________________
+
+time:      [12:26am] [07-08-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Memory verbs wired (the port map's literal "cheapest win": ocean-memory
+existed as a typed SQLite store but nothing connected it to the daemon — no
+turn could remember anything across sessions). New ocean-agent::memory_tools
+— MemoryToolsProvider registered through the same CapabilityProvider seam as
+MCP/LSP, store at <config>/memory.sqlite, fail-soft on open. Two tools:
+`retain {text, kind}` persists one durable operator-scoped fact (4k-char cap
+with a "facts not dumps" rejection; trust=Asserted, provenance-bearing rows
+per the claim-engine contract), `recall {query, limit}` does newest-first
+case-insensitive substring search over a bounded paged scan (500-row cap,
+Shared concurrency so it parallelizes with reads; BM25 is the later tier —
+substring is deterministic and useful today). Sync rusqlite behind a Mutex,
+guard never across an await, per the crate's own discipline. Tests: retain→
+recall round-trip (substring hit, newest-first order, clean miss), oversized-
+retain rejection. ocean-agent 128 green, workspace check clean.
+_________________________________________________________________________________

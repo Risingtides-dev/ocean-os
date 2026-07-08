@@ -37,6 +37,7 @@ pub use config::{DaemonConfig, McpSection};
 /// avoid colliding with `ocean_runtime::AgentConfig`; refer to the folder-agent
 /// config as `agentdir::AgentConfig`.
 pub mod agentdir;
+mod memory_tools;
 mod oauth_refresh;
 pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;
@@ -1838,6 +1839,16 @@ async fn build_capability_registry(
     // pyright, gopls); servers spawn lazily on first use and are shared
     // process-wide per (server, workspace-root).
     providers.push(Arc::new(ocean_lsp::LspProvider));
+
+    // Memory verbs (port-map "cheapest win"): `retain`/`recall` over the typed
+    // SQLite store at <config>/memory.sqlite. Fail-soft — a store that can't
+    // open logs and is skipped; the turn runs without memory tools.
+    match memory_tools::MemoryToolsProvider::open(&config_dir.join("memory.sqlite")) {
+        Ok(p) => providers.push(Arc::new(p)),
+        Err(e) => {
+            tracing::warn!(error = %e, "memory store unavailable; retain/recall tools disabled");
+        }
+    }
 
     let cfg = match config::DaemonConfig::load(config_dir) {
         Ok(c) => c,

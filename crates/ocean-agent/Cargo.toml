@@ -15,6 +15,8 @@ ocean-providers.workspace = true
 ocean-runtime.workspace = true
 ocean-mcp.workspace = true
 ocean-lsp = { path = "../ocean-lsp" }
+ocean-memory = { path = "../ocean-memory" }
+ocean-context = { path = "../ocean-context" }
 ocean-plugin.workspace = true
 ocean-hooks.workspace = true
 # Longhouse council ops exposed to agents as tools via LonghouseProvider
