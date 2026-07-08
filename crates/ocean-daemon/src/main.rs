@@ -1276,7 +1276,12 @@ fn parse_allowed_origins(raw: &str) -> Vec<String> {
 /// 2. Any `chrome-extension://...` origin — the Ocean side-panel extension runs
 ///    from a per-install id we can't enumerate, and it already declares the
 ///    daemon in its MV3 `host_permissions`/CSP `connect-src`.
-/// 3. Exact matches against operator-configured `OCEAN_ALLOWED_ORIGINS` (e.g. a
+/// 3. The Tauri desktop shell's webview origin — `tauri://localhost` (macOS /
+///    Linux custom protocol) and `https://tauri.localhost` (Windows). The
+///    shell hosts the same Leptos bundle as the PWA but serves it from the
+///    `tauri:` custom protocol, so unlike the proxy path its daemon calls are
+///    cross-origin and WKWebView enforces CORS on them.
+/// 4. Exact matches against operator-configured `OCEAN_ALLOWED_ORIGINS` (e.g. a
 ///    tunnel hostname for phone access).
 ///
 /// Everything else (arbitrary public web pages) is rejected.
@@ -1286,6 +1291,8 @@ fn is_trusted_origin(origin: &HeaderValue, extra: &[String]) -> bool {
     };
     is_loopback_origin(origin)
         || origin.starts_with("chrome-extension://")
+        || origin == "tauri://localhost"
+        || origin == "https://tauri.localhost"
         || extra.iter().any(|allowed| allowed == origin)
 }
 
@@ -15886,6 +15893,17 @@ mod tests {
             is_trusted_origin(&origin("chrome-extension://abcdefghijklmnop"), &extra),
             "the Ocean side-panel extension origin must be allowed"
         );
+    }
+
+    #[test]
+    fn cors_allows_tauri_shell_origin() {
+        let extra: Vec<String> = vec![];
+        for o in ["tauri://localhost", "https://tauri.localhost"] {
+            assert!(
+                is_trusted_origin(&origin(o), &extra),
+                "the Tauri desktop shell origin {o} must be allowed"
+            );
+        }
     }
 
     #[test]
