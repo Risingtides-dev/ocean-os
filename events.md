@@ -1722,3 +1722,24 @@ including its own retry/bash/grep tests). Its landed work was never at risk
 intent lives in stash@{0}; inspect before reusing — the stash by itself is a
 test-breaking half-state.
 _________________________________________________________________________________
+
+time:      [11:44pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      handoff
+area:      infra
+
+CORRECTION to the 11:38pm recovery entry: the runtime lane is a REAL, LIVE
+session (John confirmed) — my "dead" call was wrong; its 45-minute file
+freeze was just a long turn. The stash was popped ~4 minutes after it was
+created and applied CLEANLY (zero conflicts — the session wrote nothing in
+the window), so its working tree is restored byte-for-byte, including the
+round_retry.rs deletion. Net effect of the mistake: none to its files; two
+side effects remain in history: (1) its dangling ledger header
+("time: [11:05pm]") was removed in 42ea860 — runtime lane, when you finish
+that entry, just write it fresh; (2) the 11:38pm entry's diagnosis is void.
+Lesson recorded to memory: a frozen dirty tree + half-written ledger line is
+NOT sufficient evidence a concurrent session is dead — verify with John
+before touching another lane's uncommitted state; stash-not-discard is the
+right instinct but even a stash yanks files out from under a live session.
+_________________________________________________________________________________
