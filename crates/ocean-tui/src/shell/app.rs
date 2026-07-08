@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ocean_agent_sdk::{AgentSessionId, AgentTurnRequest};
 use ocean_core::RequestId;
 use ratatui::{
@@ -124,6 +124,15 @@ pub struct App {
     term_h: u16,
     /// True while the operator is dragging the horizontal dock splitter.
     dragging_term: bool,
+    /// Mouse text selection. `sel_press` arms on any left-down that isn't a
+    /// splitter grab; the first drag promotes it into `selection` — a linear
+    /// (terminal-style) sweep in screen cells, anchor → head. Releasing the
+    /// button auto-copies the swept text to the system clipboard.
+    sel_press: Option<(u16, u16)>,
+    selection: Option<((u16, u16), (u16, u16))>,
+    /// Cell symbols of the last drawn frame (row-major), captured only while a
+    /// selection is live, so release-time copy reads exactly what was shown.
+    frame_cells: Vec<Vec<String>>,
     /// Panel visibility (CTRL's collapsible rails + terminal dock).
     show_sessions: bool,
     show_tree: bool,
@@ -187,6 +196,9 @@ impl App {
             r_split_term: Rect::default(),
             term_h: TERM_H,
             dragging_term: false,
+            sel_press: None,
+            selection: None,
+            frame_cells: Vec::new(),
             show_sessions: true,
             show_tree: true,
             show_term: true,
@@ -328,6 +340,39 @@ impl App {
                 MouseEventKind::Up(_) if self.dragging_term => {
                     self.dragging_term = false;
                     return;
+                }
+                _ => {}
+            }
+            // Mouse text selection: holding the left button and dragging sweeps
+            // a linear (terminal-style) selection across the whole frame;
+            // releasing auto-copies it to the system clipboard. A plain click
+            // (down + up, no drag) falls through to the panes untouched.
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.sel_press = Some(pos);
+                    self.selection = None;
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(anchor) = self.sel_press {
+                        self.selection = Some((anchor, pos));
+                        return; // selection owns the drag; panes don't see it
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.sel_press = None;
+                    if let Some((a, b)) = self.selection.take() {
+                        let text = selection_text(&self.frame_cells, a, b);
+                        if !text.is_empty() {
+                            let msg = match copy_to_clipboard(&text) {
+                                Ok(()) => {
+                                    format!("copied {} chars", text.chars().count())
+                                }
+                                Err(e) => format!("copy failed: {e}"),
+                            };
+                            self.dispatch(Action::Status(msg));
+                        }
+                        return; // this Up ends a selection, not a click
+                    }
                 }
                 _ => {}
             }
@@ -1200,6 +1245,40 @@ impl App {
         self.draw_title(frame, title_row);
         self.draw_status(frame, status_row);
 
+        // Mouse-selection overlay: reverse-video the swept cells and snapshot
+        // the frame's cell text so releasing the button copies exactly what's
+        // on screen. Drawn over everything — a selection is a selection.
+        if let Some((a, b)) = self.selection {
+            let buf = frame.buffer_mut();
+            let area = buf.area;
+            self.frame_cells = (area.top()..area.bottom())
+                .map(|y| {
+                    (area.left()..area.right())
+                        .map(|x| {
+                            buf.cell((x, y))
+                                .map(|c| c.symbol().to_string())
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .collect();
+            let (s, e) = order_cells(a, b);
+            for y in s.1..=e.1.min(area.bottom().saturating_sub(1)) {
+                let x0 = if y == s.1 { s.0 } else { area.left() };
+                let x1 = if y == e.1 {
+                    e.0.min(area.right().saturating_sub(1))
+                } else {
+                    area.right().saturating_sub(1)
+                };
+                for x in x0..=x1 {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        let style = cell.style().add_modifier(Modifier::REVERSED);
+                        cell.set_style(style);
+                    }
+                }
+            }
+        }
+
         // `/settings` modal overlay — drawn last so it floats over everything.
         if self.settings_open {
             self.draw_settings(frame);
@@ -1349,6 +1428,53 @@ fn splitter(frame: &mut ratatui::Frame, area: Rect, vertical: bool) {
     }
 }
 
+/// Order two selection endpoints into (start, end) reading order — by row,
+/// then column — so a drag upward/leftward selects the same span as one
+/// downward/rightward.
+fn order_cells(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Extract the text of a linear (terminal-style) selection from a frame's cell
+/// snapshot: first row from the anchor column, middle rows whole, last row up
+/// to the head column. Rows are right-trimmed (panel padding isn't content);
+/// a selection of pure padding yields the empty string so releasing on a blank
+/// area copies nothing.
+fn selection_text(cells: &[Vec<String>], a: (u16, u16), b: (u16, u16)) -> String {
+    let (s, e) = order_cells(a, b);
+    let mut out: Vec<String> = Vec::new();
+    for y in s.1..=e.1 {
+        let Some(row) = cells.get(y as usize) else {
+            continue;
+        };
+        if row.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let x0 = if y == s.1 { s.0 as usize } else { 0 };
+        let x1 = if y == e.1 {
+            (e.0 as usize).min(row.len() - 1)
+        } else {
+            row.len() - 1
+        };
+        if x0 > x1 || x0 >= row.len() {
+            out.push(String::new());
+            continue;
+        }
+        out.push(row[x0..=x1].concat().trim_end().to_string());
+    }
+    let text = out.join("\n");
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        text
+    }
+}
+
 /// Put `text` on the system clipboard via `pbcopy` (the workbench is macOS-first
 /// today; Linux would add xclip/wl-copy here). Runs off the UI thread.
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
@@ -1372,6 +1498,43 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use tokio::sync::mpsc::error::TryRecvError;
+
+    fn grid(rows: &[&str]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|r| r.chars().map(|c| c.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn selection_orders_endpoints_both_drag_directions() {
+        // Dragging up-left must select the same span as down-right.
+        assert_eq!(order_cells((5, 2), (1, 0)), ((1, 0), (5, 2)));
+        assert_eq!(order_cells((1, 0), (5, 2)), ((1, 0), (5, 2)));
+        // Same row: earlier column first.
+        assert_eq!(order_cells((7, 3), (2, 3)), ((2, 3), (7, 3)));
+    }
+
+    #[test]
+    fn selection_text_is_linear_like_a_terminal() {
+        let cells = grid(&["hello world", "second line", "tail row   "]);
+        // Mid-first-row through mid-last-row: first row from anchor, middle
+        // whole, last row up to the head. Trailing padding trimmed.
+        let text = selection_text(&cells, (6, 0), (3, 2));
+        assert_eq!(text, "world\nsecond line\ntail");
+        // Same-row span.
+        assert_eq!(selection_text(&cells, (0, 1), (5, 1)), "second");
+        // Reverse drag selects the same text.
+        assert_eq!(
+            selection_text(&cells, (3, 2), (6, 0)),
+            selection_text(&cells, (6, 0), (3, 2)),
+        );
+    }
+
+    #[test]
+    fn selection_of_pure_padding_copies_nothing() {
+        let cells = grid(&["          ", "          "]);
+        assert_eq!(selection_text(&cells, (1, 0), (8, 1)), "");
+    }
 
     /// Build an `App` against a throwaway workspace root so `App::new`'s
     /// auto-resume finds no session and never spawns a network stream — keeping
