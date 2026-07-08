@@ -7,6 +7,7 @@
 
 pub mod error;
 pub mod http;
+pub mod oauth;
 pub mod providers;
 pub mod retry;
 pub mod stream;

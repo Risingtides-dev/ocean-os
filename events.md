@@ -1782,3 +1782,31 @@ pairing-intact; immediate second pass rewrites 0 (cache stability). ocean-agent
 123 green, workspace check clean. LLM summarize tier + tiktoken-real counts
 remain W3 follow-ups.
 _________________________________________________________________________________
+
+time:      [12:14am] [07-08-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+OAuth refresh (the "expired token = dead turn" gap, flagged by both the loop
+audit and the surface agent's open-items list). Ocean only ever READ oauth
+blocks that vendor CLIs wrote into auth.json — an expired claude-code/codex
+token resolved to "missing credential" and every turn hard-failed until John
+re-ran the vendor CLI's login. Two pieces: ocean-protocol::oauth::
+refresh_token() — pure HTTP refresh-grant exchange, 15s deadline, errors carry
+status + endpoint but NEVER echo the response body (bodies can quote tokens);
+and ocean-agent::oauth_refresh::ensure_fresh() — runs at the top of prompt()
+before credential resolution: for each refreshable block (claude-code /
+anthropic-oauth / openai-codex) in OCEAN'S OWN auth.json (never ~/.codex's
+file — that fallback stays read-only) expiring within a 300s margin, exchanges
+the refresh token at the issuer's public-client endpoint (endpoint + client_id
+env-overridable: OCEAN_OAUTH_{ANTHROPIC,OPENAI}_{TOKEN_URL,CLIENT_ID}) and
+rewrites the block ATOMICALLY (temp+rename; unrelated provider keys survive
+byte-for-byte). Single-flight global lock (concurrent turns can't double-spend
+a rotating refresh token), 60s per-block cooldown after a failure, and failure
+degrades to exactly today's behavior. Cheap no-op when fresh. Tests: refresh
+parse/error-hygiene/empty-token (3, protocol, vs fake endpoint), needs-refresh
+matrix + atomic-write key preservation + e2e rewrite via endpoint override
+(3, agent). ocean-agent 126 + ocean-protocol 113 green, workspace clean.
+_________________________________________________________________________________

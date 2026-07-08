@@ -37,6 +37,7 @@ pub use config::{DaemonConfig, McpSection};
 /// avoid colliding with `ocean_runtime::AgentConfig`; refer to the folder-agent
 /// config as `agentdir::AgentConfig`.
 pub mod agentdir;
+mod oauth_refresh;
 pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;
 pub use project::{git_head_info, WorktreeInfo};
@@ -542,6 +543,15 @@ impl AgentRuntime {
         // made legacy `/v1/prompt` clients look bound to wherever the daemon was
         // launched even when tool/session execution used a different cwd.
         let cwd = req.cwd.clone();
+
+        // Keep OAuth subscription tokens fresh BEFORE credential resolution
+        // reads auth.json — an expired claude-code/codex block used to
+        // hard-fail the turn as "missing credential" until the user re-ran the
+        // vendor CLI's login. Cheap no-op when everything is fresh;
+        // single-flight + per-block cooldown inside; never errors the turn.
+        if let Some(auth_file) = self.turn_env().auth_file.clone() {
+            oauth_refresh::ensure_fresh(&auth_file).await;
+        }
 
         // Resolve the EFFECTIVE turn state before any readiness/dispatch check
         // (OCEAN-36 + Codex). When the turn pins a per-session `model_id`, the
