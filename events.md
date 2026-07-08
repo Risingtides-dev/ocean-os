@@ -1634,3 +1634,29 @@ addition. 3 new tests (regex matches, literal fallback w/ note, giant-line
 clip). tools_smoke 12/12, full runtime suite 11/11 targets green, workspace
 check clean.
 _________________________________________________________________________________
+
+time:      [11:05pm] [07-07-26
+time:      [11:25PM] [07-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+TUI UX batch on John's direction (stay heads-down on ocean-tui experience; the
+OMP port belongs to the other agent). (1) @-file mentions: new shell/mentions.rs
+— gitignore-respecting index (6k cap) + basename-biased fuzzy ranking on the
+palette's subseq scorer; trailing-@ token opens a floating picker (↑↓, ⏎/Tab
+inserts `@path `, Esc drops the sigil), index follows the active project.
+(2) Breadcrumbed / palette: SlashCommand gains a group; bare `/` renders ▾
+section headers (session/workspace/chat/context/intel/agent) file-tree style,
+filtered rows carry a `group ›` prefix, /help sections likewise. (3) /settings
+(live): modal overlay — rail/tree/dock toggles, terminal-height stepper,
+tool-cards toggle, model/session/project info. (4) Perf: found the shell
+full-redrawing at 60Hz forever — the "animate while streaming" clause keyed on
+SSE-task liveness, but that task is a self-healing reconnect loop that never
+finishes; rekeyed on chat.is_busy() → idle CPU 18.5%→1.2%. Also built a pyte
+reassembled-screen PTY harness after raw captures gave false negatives on cell
+diffs — verified all features on real frames with it. Commits be93c29,
+48455da; 147 tests; binary rebuilt. Interleaved cleanly with the other agent's
+runtime lane (9fa43fa, 5319a0f, 21eefdf — no file overlap).
+_________________________________________________________________________________
