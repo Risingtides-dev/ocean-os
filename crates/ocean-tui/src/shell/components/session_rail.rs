@@ -1,13 +1,14 @@
 //! SessionRailComponent — the left rail listing Ocean sessions for the current
-//! project, grouped into collapsible BRANCH nodes (git branch stamped on each
-//! session record; physical worktree dir for legacy records) so a busy repo
-//! reads as a tree (like the file explorer) instead of a flat sprawl. Wears
-//! CTRL's SESSIONS-panel skin: slate bed, `◆ SESSIONS` title, branch headers
-//! in blue with ▸/▾ carets + a session count, sessions indented one level with
-//! their title + relative age, a cyan accent bar on the selected row, and a
-//! live `●` dot on the session currently open in the chat/PTY.
+//! project as a two-level tree, breadcrumbed like the file explorer:
+//! DIRECTORY nodes (the main checkout or a worktree dir beneath it) contain
+//! BRANCH nodes (the git branch stamped on each session record at creation)
+//! which contain the sessions. Wears CTRL's SESSIONS-panel skin: slate bed,
+//! `◆ SESSIONS` title, dir headers in blue and branch headers in cyan with
+//! ▸/▾ carets + a session count, sessions indented beneath with their title +
+//! relative age, a cyan accent bar on the selected row, and a live `●` dot on
+//! the session currently open in the chat/PTY.
 //!
-//! Enter on a header toggles the group; Enter on a session resumes it natively
+//! Enter on a header toggles the node; Enter on a session resumes it natively
 //! into the chat; `t` opens the session in the embedded terminal; `r` rescans.
 //!
 //! (The old per-row `OC` badge was a CTRL remnant from when the rail organized
@@ -34,14 +35,12 @@ use crate::shell::{
     theme::{self, g},
 };
 
-/// One branch group: a header ("main", "feat/x", …) over its sessions,
-/// newest-first, with a collapse flag. Sessions group by the git branch the
-/// daemon stamped on their record at creation; records that predate the
-/// `git_branch` field fall back to their physical worktree dir. `key` is the
-/// stable grouping identity (expansion survives rescans on it); `label` is the
-/// display form; `cwd` is where a `+ new` session in this group roots — the
-/// dir the group's newest session actually ran in.
-struct Group {
+/// A branch node under a directory: the sessions created on one git branch,
+/// newest-first. `key` is the recorded branch name (or [`NO_BRANCH`] for
+/// records that predate the `git_branch` field); `cwd` is where a `+ new`
+/// session in this branch roots — the dir the branch's newest session actually
+/// ran in.
+struct BranchGroup {
     key: String,
     label: String,
     cwd: PathBuf,
@@ -49,23 +48,49 @@ struct Group {
     expanded: bool,
 }
 
-/// A reference to a currently-visible row: either a worktree header or a
-/// session nested under one. Rebuilt each draw from `groups` + expand state,
-/// exactly like the file tree's flattened `entries`.
+/// A directory node: the main checkout ("main" worktree label) or a worktree
+/// dir beneath the project root, holding its branches. `key` is the worktree
+/// label (stable across rescans — expansion is preserved on it); `label` is
+/// the display form (the project folder name for the root checkout, the
+/// worktree leaf otherwise).
+struct DirGroup {
+    key: String,
+    label: String,
+    cwd: PathBuf,
+    branches: Vec<BranchGroup>,
+    expanded: bool,
+}
+
+impl DirGroup {
+    fn session_count(&self) -> usize {
+        self.branches.iter().map(|b| b.sessions.len()).sum()
+    }
+}
+
+/// Pseudo-branch bucket for legacy records that predate `git_branch` stamping.
+/// Distinct from any real branch name (parentheses are illegal in git refs),
+/// so an old record never falsely merges into a real `main` branch group.
+const NO_BRANCH: &str = "(no branch)";
+
+/// A reference to a currently-visible row: a directory header, a branch header
+/// nested under one, or a session nested under a branch. Rebuilt each draw
+/// from `groups` + expand state, exactly like the file tree's flattened
+/// `entries`.
 #[derive(Clone, Copy)]
 enum Row {
-    Header(usize),
-    Session(usize, usize),
+    Dir(usize),
+    Branch(usize, usize),
+    Session(usize, usize, usize),
 }
 
 /// Width of the clickable "＋ (n)" button zone at the right edge of a header
-/// row — a left-click landing here starts a new session in that worktree.
+/// row — a left-click landing here starts a new session in that dir/branch.
 /// Covers "＋ (999)" comfortably.
 const PLUS_ZONE: u16 = 8;
 
 pub struct SessionRailComponent {
     root: PathBuf,
-    groups: Vec<Group>,
+    groups: Vec<DirGroup>,
     selected: usize,
     scroll: usize,
     /// Session id currently open in the chat/PTY — gets the live dot.
@@ -89,26 +114,37 @@ impl SessionRailComponent {
         }
     }
 
-    /// Flatten `groups` into the ordered list of visible rows: every header,
-    /// plus the sessions of any expanded group. Selection/scroll index into
-    /// this. Cheap enough to rebuild per draw (matches the file tree).
+    /// Flatten `groups` into the ordered list of visible rows: every dir
+    /// header; the branch headers of expanded dirs; the sessions of expanded
+    /// branches. Selection/scroll index into this. Cheap enough to rebuild per
+    /// draw (matches the file tree).
     fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        for (gi, group) in self.groups.iter().enumerate() {
-            rows.push(Row::Header(gi));
-            if group.expanded {
-                for si in 0..group.sessions.len() {
-                    rows.push(Row::Session(gi, si));
+        for (di, dir) in self.groups.iter().enumerate() {
+            rows.push(Row::Dir(di));
+            if !dir.expanded {
+                continue;
+            }
+            for (bi, branch) in dir.branches.iter().enumerate() {
+                rows.push(Row::Branch(di, bi));
+                if branch.expanded {
+                    for si in 0..branch.sessions.len() {
+                        rows.push(Row::Session(di, bi, si));
+                    }
                 }
             }
         }
         rows
     }
 
+    fn branch_at(&self, di: usize, bi: usize) -> Option<&BranchGroup> {
+        self.groups.get(di).and_then(|d| d.branches.get(bi))
+    }
+
     fn session_at(&self, row: Row) -> Option<&Session> {
         match row {
-            Row::Session(gi, si) => self.groups.get(gi).and_then(|g| g.sessions.get(si)),
-            Row::Header(_) => None,
+            Row::Session(di, bi, si) => self.branch_at(di, bi).and_then(|b| b.sessions.get(si)),
+            _ => None,
         }
     }
 
@@ -123,17 +159,32 @@ impl SessionRailComponent {
     }
 
     pub fn refresh(&mut self) {
-        // Preserve which groups are expanded across a rescan.
-        let expanded: Vec<String> = self
+        // Preserve expansion across a rescan: dir keys, and dir+branch
+        // composite keys (a NUL join — neither side can contain one).
+        let dirs_open: Vec<String> = self
             .groups
             .iter()
-            .filter(|g| g.expanded)
-            .map(|g| g.key.clone())
+            .filter(|d| d.expanded)
+            .map(|d| d.key.clone())
+            .collect();
+        let branches_open: Vec<String> = self
+            .groups
+            .iter()
+            .flat_map(|d| {
+                d.branches
+                    .iter()
+                    .filter(|b| b.expanded)
+                    .map(move |b| format!("{}\u{0}{}", d.key, b.key))
+            })
             .collect();
         self.groups = build_groups(&self.root, discover(&self.root, Sort::Date));
-        if !expanded.is_empty() {
-            for group in &mut self.groups {
-                group.expanded = expanded.contains(&group.key);
+        if !dirs_open.is_empty() || !branches_open.is_empty() {
+            for dir in &mut self.groups {
+                dir.expanded = dirs_open.contains(&dir.key);
+                for branch in &mut dir.branches {
+                    branch.expanded =
+                        branches_open.contains(&format!("{}\u{0}{}", dir.key, branch.key));
+                }
             }
         }
         let n = self.rows().len();
@@ -149,9 +200,23 @@ impl SessionRailComponent {
     /// Enter: toggle a header, or resume a session.
     fn activate(&mut self) -> Option<Action> {
         match self.selected_row()? {
-            Row::Header(gi) => {
-                if let Some(group) = self.groups.get_mut(gi) {
-                    group.expanded = !group.expanded;
+            Row::Dir(di) => {
+                if let Some(dir) = self.groups.get_mut(di) {
+                    dir.expanded = !dir.expanded;
+                }
+                let n = self.rows().len();
+                if self.selected >= n {
+                    self.selected = n.saturating_sub(1);
+                }
+                None
+            }
+            Row::Branch(di, bi) => {
+                if let Some(branch) = self
+                    .groups
+                    .get_mut(di)
+                    .and_then(|d| d.branches.get_mut(bi))
+                {
+                    branch.expanded = !branch.expanded;
                 }
                 let n = self.rows().len();
                 if self.selected >= n {
@@ -175,17 +240,15 @@ impl SessionRailComponent {
         }
     }
 
-    /// `+ new` in the group the given row belongs to: start a fresh session
-    /// rooted at that worktree's dir.
+    /// `+ new` in the node the given row belongs to: a dir header roots at the
+    /// dir itself; a branch header (or a session under one) roots where that
+    /// branch's newest session ran.
     fn new_session_in(&self, row: Row) -> Option<Action> {
-        let gi = match row {
-            Row::Header(gi) => gi,
-            Row::Session(gi, _) => gi,
+        let cwd = match row {
+            Row::Dir(di) => self.groups.get(di)?.cwd.clone(),
+            Row::Branch(di, bi) | Row::Session(di, bi, _) => self.branch_at(di, bi)?.cwd.clone(),
         };
-        let group = self.groups.get(gi)?;
-        Some(Action::NewSessionInProject {
-            cwd: group.cwd.clone(),
-        })
+        Some(Action::NewSessionInProject { cwd })
     }
 
     fn open_in_terminal(&self, row: Row) -> Option<Action> {
@@ -203,7 +266,7 @@ impl SessionRailComponent {
     }
 
     fn total_sessions(&self) -> usize {
-        self.groups.iter().map(|g| g.sessions.len()).sum()
+        self.groups.iter().map(|d| d.session_count()).sum()
     }
 
     /// The most-recently-active session for this project that can be resumed
@@ -214,7 +277,8 @@ impl SessionRailComponent {
     pub fn latest_resumable(&self) -> Option<(AgentSessionId, PathBuf)> {
         self.groups
             .iter()
-            .flat_map(|g| g.sessions.iter())
+            .flat_map(|d| d.branches.iter())
+            .flat_map(|b| b.sessions.iter())
             .filter_map(|s| {
                 uuid::Uuid::parse_str(&s.id)
                     .ok()
@@ -265,7 +329,7 @@ impl Component for SessionRailComponent {
             }
             KeyCode::Enter => self.activate(),
             KeyCode::Char('t') => self.selected_row().and_then(|r| self.open_in_terminal(r)),
-            // `n` (or `+`): new session in the selected row's project/worktree.
+            // `n` (or `+`): new session in the selected row's dir/branch.
             KeyCode::Char('n') | KeyCode::Char('+') => {
                 self.selected_row().and_then(|r| self.new_session_in(r))
             }
@@ -287,8 +351,9 @@ impl Component for SessionRailComponent {
                 let i = self.row_at((mouse.column, mouse.row))?;
                 let row = self.rows().get(i).copied();
                 // Click on the rightmost "＋" zone of a header = new session in
-                // that project (the button John wants), regardless of selection.
-                if let Some(r @ Row::Header(_)) = row {
+                // that dir/branch (the button John wants), regardless of
+                // selection.
+                if let Some(r @ (Row::Dir(_) | Row::Branch(..))) = row {
                     let plus_x = self.body_rect.x + self.body_rect.width.saturating_sub(PLUS_ZONE);
                     if mouse.column >= plus_x {
                         self.selected = i;
@@ -333,6 +398,40 @@ impl Component for SessionRailComponent {
         let inner = body.width.saturating_sub(1) as usize; // width after the accent bar
         let bottom = body.y + body.height;
 
+        // Header line shared by dir + branch rows: `indent caret label … ＋ (n)`.
+        // The label truncates to fit; ＋ and count keep their own colors.
+        let header_line = |indent: &str,
+                           expanded: bool,
+                           label: &str,
+                           count: usize,
+                           color: ratatui::style::Color,
+                           selected: bool| {
+            let caret = if expanded { g("▾ ", "v ") } else { g("▸ ", "> ") };
+            let count = format!("({count})");
+            let plus = g("＋", "+");
+            let text = format!("{indent}{caret}{label}");
+            let right_w = plus.chars().count() + 1 + count.chars().count();
+            let left = truncate(&text, inner.saturating_sub(right_w + 1));
+            let pad = inner.saturating_sub(left.chars().count() + right_w);
+            let label_style = Style::default().fg(color).add_modifier(if selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+            Line::from(vec![
+                Span::styled(left, label_style),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(
+                    plus,
+                    Style::default()
+                        .fg(theme::GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(count, Style::default().fg(theme::COMMENT)),
+            ])
+        };
+
         for (i, row) in rows.iter().enumerate().skip(self.scroll).take(view_h) {
             let y = body.y + (i - self.scroll) as u16;
             if y >= bottom {
@@ -352,55 +451,42 @@ impl Component for SessionRailComponent {
             );
 
             let line = match *row {
-                Row::Header(gi) => {
-                    let group = &self.groups[gi];
-                    let caret = if group.expanded {
-                        g("▾ ", "v ")
-                    } else {
-                        g("▸ ", "> ")
-                    };
-                    let count = format!("({})", group.sessions.len());
-                    let plus = g("＋", "+");
-                    let label = format!("{caret}{}", group.label);
-                    // Right cluster: a green "＋" button + the session count. The
-                    // ＋ starts a new session in this worktree (click it or press
-                    // n). Build the spans by hand so ＋ and count get their own
-                    // colors and the label truncates to fit.
-                    let right_w = plus.chars().count() + 1 + count.chars().count();
-                    let left = truncate(&label, inner.saturating_sub(right_w + 1));
-                    let pad = inner.saturating_sub(left.chars().count() + right_w);
-                    let label_style = Style::default().fg(theme::BLUE).add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    });
-                    Line::from(vec![
-                        Span::styled(left, label_style),
-                        Span::raw(" ".repeat(pad)),
-                        Span::styled(
-                            plus,
-                            Style::default()
-                                .fg(theme::GREEN)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(count, Style::default().fg(theme::COMMENT)),
-                    ])
+                Row::Dir(di) => {
+                    let dir = &self.groups[di];
+                    header_line(
+                        "",
+                        dir.expanded,
+                        &dir.label,
+                        dir.session_count(),
+                        theme::BLUE,
+                        selected,
+                    )
                 }
-                Row::Session(gi, si) => {
-                    let s = &self.groups[gi].sessions[si];
+                Row::Branch(di, bi) => {
+                    let branch = &self.groups[di].branches[bi];
+                    header_line(
+                        "  ",
+                        branch.expanded,
+                        &branch.label,
+                        branch.sessions.len(),
+                        theme::CYAN,
+                        selected,
+                    )
+                }
+                Row::Session(di, bi, si) => {
+                    let s = &self.groups[di].branches[bi].sessions[si];
                     let live = self.live_id.as_deref() == Some(s.id.as_str());
                     let ago_s = ago(s.mtime);
-                    // one level of indent + a live-dot slot, matching the tree's
-                    // "  " depth step.
+                    // two levels of indent + a live-dot slot, matching the
+                    // tree's "  " depth step.
                     let dot = if live { g("● ", "* ") } else { "  " };
                     let dot_style = if live {
                         Style::default().fg(theme::GREEN)
                     } else {
                         Style::default().fg(theme::COMMENT)
                     };
-                    // budget: indent(2) + dot(2) + title + sp + ago
-                    let left_cols = 2 + 2;
+                    // budget: indent(4) + dot(2) + title + sp + ago
+                    let left_cols = 4 + 2;
                     let title_max = inner.saturating_sub(left_cols + 1 + ago_s.chars().count());
                     let title = truncate(&s.title, title_max);
                     let title_style = Style::default().fg(theme::FG).add_modifier(if selected {
@@ -408,11 +494,11 @@ impl Component for SessionRailComponent {
                     } else {
                         Modifier::empty()
                     });
-                    // Build: "  " indent, dot, title … right-justified ago.
+                    // Build: "    " indent, dot, title … right-justified ago.
                     let used = left_cols + title.chars().count();
                     let pad = inner.saturating_sub(used + ago_s.chars().count());
                     Line::from(vec![
-                        Span::styled("  ", Style::default()),
+                        Span::styled("    ", Style::default()),
                         Span::styled(dot, dot_style),
                         Span::styled(title, title_style),
                         Span::raw(" ".repeat(pad)),
@@ -431,63 +517,101 @@ impl Component for SessionRailComponent {
     }
 }
 
-/// Group `sessions` (newest-first from `discover`) into collapsible branch
-/// nodes. The grouping key is the git branch the daemon stamped on the session
-/// record at creation — so two sessions run in the same checkout on different
-/// branches land in different groups, which matches how the work actually
-/// forked. Records that predate the `git_branch` field group by their physical
-/// worktree dir instead (keyed with a `dir:` prefix so an old rootside record
-/// never merges into a real `main` branch group by accident).
+/// Group `sessions` (newest-first from `discover`) into the two-level tree:
+/// directory nodes (the physical checkout/worktree a session ran in) holding
+/// branch nodes (the git branch the daemon stamped on the record at creation)
+/// holding the sessions. Two sessions run in the same checkout on different
+/// branches land under the same dir but different branch nodes — which matches
+/// how the work actually forked. Records that predate `git_branch` bucket
+/// under [`NO_BRANCH`] within their dir, so they never falsely merge into a
+/// real `main` branch group.
 ///
-/// Group order: the branch with the most recent activity floats to the top;
-/// within a group, sessions stay newest-first. The most-recently-active group
-/// starts expanded, the rest collapsed — so `ocean` opens on your latest work
-/// without the whole history sprawling open.
-fn build_groups(root: &std::path::Path, sessions: Vec<Session>) -> Vec<Group> {
-    let mut map: HashMap<String, Vec<Session>> = HashMap::new();
+/// Order at every level: most recent activity first; sessions newest-first.
+/// The most-recently-active dir AND its most-recently-active branch start
+/// expanded, the rest collapsed — so `ocean` opens on your latest work without
+/// the whole history sprawling open.
+fn build_groups(root: &std::path::Path, sessions: Vec<Session>) -> Vec<DirGroup> {
+    let mut by_dir: HashMap<String, Vec<Session>> = HashMap::new();
     for s in sessions {
-        let key = match &s.branch {
-            Some(branch) => branch.clone(),
-            None => format!("dir:{}", s.worktree),
-        };
-        map.entry(key).or_default().push(s);
+        by_dir.entry(s.worktree.clone()).or_default().push(s);
     }
-    let mut groups: Vec<Group> = map
+    let mut dirs: Vec<DirGroup> = by_dir
         .into_iter()
-        .map(|(key, mut sessions)| {
-            sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
-            let label = match key.strip_prefix("dir:") {
-                // Legacy dir-keyed group: show the worktree leaf, as before.
-                Some(dir) => display_worktree(dir).to_string(),
-                // Branch group: the branch name verbatim ("feat/x" stays whole
-                // — the slash is signal, not a path to leaf).
-                None => key.clone(),
+        .map(|(key, sessions)| {
+            let mut by_branch: HashMap<String, Vec<Session>> = HashMap::new();
+            for s in sessions {
+                let bkey = s.branch.clone().unwrap_or_else(|| NO_BRANCH.to_string());
+                by_branch.entry(bkey).or_default().push(s);
+            }
+            let mut branches: Vec<BranchGroup> = by_branch
+                .into_iter()
+                .map(|(bkey, mut sessions)| {
+                    sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
+                    // `+ new` roots where this branch's latest session actually
+                    // ran — the branch's live checkout — not a path guessed
+                    // from the label.
+                    let cwd = sessions
+                        .first()
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| root.to_path_buf());
+                    BranchGroup {
+                        label: bkey.clone(),
+                        key: bkey,
+                        cwd,
+                        sessions,
+                        expanded: false,
+                    }
+                })
+                .collect();
+            // Most-recently-active branch first (by its newest session).
+            branches.sort_by(|a, b| {
+                let am = a.sessions.first().map(|s| s.mtime).unwrap_or(0);
+                let bm = b.sessions.first().map(|s| s.mtime).unwrap_or(0);
+                bm.cmp(&am).then_with(|| a.label.cmp(&b.label))
+            });
+            // The worktree key IS the cwd's path relative to root ("main" ==
+            // root itself), so a `+ new` session on the dir header roots at
+            // exactly that dir.
+            let cwd = if key == "main" {
+                root.to_path_buf()
+            } else {
+                root.join(&key)
             };
-            // `+ new` roots where this group's latest session actually ran —
-            // the branch's live checkout — not a path guessed from the label.
-            let cwd = sessions
-                .first()
-                .map(|s| s.cwd.clone())
-                .unwrap_or_else(|| root.to_path_buf());
-            Group {
+            // Display: the project folder name for the root checkout (calling
+            // it "main" reads as the branch, which it no longer is); the
+            // worktree leaf otherwise.
+            let label = if key == "main" {
+                root.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "main".to_string())
+            } else {
+                display_worktree(&key).to_string()
+            };
+            DirGroup {
                 key,
                 label,
                 cwd,
-                sessions,
+                branches,
                 expanded: false,
             }
         })
         .collect();
-    // Most-recently-active branch first (by its newest session).
-    groups.sort_by(|a, b| {
-        let am = a.sessions.first().map(|s| s.mtime).unwrap_or(0);
-        let bm = b.sessions.first().map(|s| s.mtime).unwrap_or(0);
-        bm.cmp(&am).then_with(|| a.label.cmp(&b.label))
-    });
-    if let Some(first) = groups.first_mut() {
+    // Most-recently-active dir first (by its newest session anywhere within).
+    let newest = |d: &DirGroup| {
+        d.branches
+            .iter()
+            .filter_map(|b| b.sessions.first().map(|s| s.mtime))
+            .max()
+            .unwrap_or(0)
+    };
+    dirs.sort_by(|a, b| newest(b).cmp(&newest(a)).then_with(|| a.label.cmp(&b.label)));
+    if let Some(first) = dirs.first_mut() {
         first.expanded = true;
+        if let Some(branch) = first.branches.first_mut() {
+            branch.expanded = true;
+        }
     }
-    groups
+    dirs
 }
 
 /// Header label for a worktree. Git worktrees for this repo live under
@@ -531,73 +655,86 @@ mod tests {
     }
 
     #[test]
-    fn groups_by_recorded_branch_not_directory() {
+    fn branches_nest_under_their_directory() {
         // Two sessions ran in the SAME checkout dir but on different branches
         // (John's actual workflow: work a branch, merge, forget to switch).
-        // They must land in separate groups keyed by branch.
+        // One dir node, two branch nodes nested inside it.
         let root = PathBuf::from("/repo");
-        let groups = build_groups(
+        let dirs = build_groups(
             &root,
             vec![
                 sess("a", Some("feat/x"), "main", "/repo", 100),
                 sess("b", Some("main"), "main", "/repo", 50),
             ],
         );
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].label, "feat/x"); // newest activity floats up
-        assert_eq!(groups[1].label, "main");
+        assert_eq!(dirs.len(), 1);
+        // Root checkout displays as the project folder, not "main" (which now
+        // reads as the branch).
+        assert_eq!(dirs[0].label, "repo");
+        assert_eq!(dirs[0].branches.len(), 2);
+        assert_eq!(dirs[0].branches[0].label, "feat/x"); // newest floats up
+        assert_eq!(dirs[0].branches[1].label, "main");
         // Branch names keep their slash — "feat/x" is not leafed to "x".
-        assert_eq!(groups[0].key, "feat/x");
+        assert_eq!(dirs[0].branches[0].key, "feat/x");
     }
 
     #[test]
-    fn legacy_records_fall_back_to_worktree_dir_without_merging_into_main() {
-        // A pre-git_branch record at the repo root must NOT merge into a real
-        // `main` branch group — its key carries the `dir:` prefix.
+    fn worktree_dirs_get_their_own_node() {
+        // Same branch, two physical checkouts → two dir nodes, each holding
+        // that branch.
         let root = PathBuf::from("/repo");
-        let groups = build_groups(
+        let dirs = build_groups(
+            &root,
+            vec![
+                sess("a", Some("feat/x"), "wt/feat-x", "/repo/wt/feat-x", 200),
+                sess("b", Some("feat/x"), "main", "/repo", 100),
+            ],
+        );
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].label, "feat-x"); // worktree leaf, newest first
+        assert_eq!(dirs[1].label, "repo");
+        assert!(dirs.iter().all(|d| d.branches.len() == 1));
+        // A branch's `+ new` roots where its newest session ran.
+        assert_eq!(dirs[0].branches[0].cwd, PathBuf::from("/repo/wt/feat-x"));
+        // A dir's `+ new` roots at the dir itself.
+        assert_eq!(dirs[1].cwd, PathBuf::from("/repo"));
+    }
+
+    #[test]
+    fn legacy_records_bucket_as_no_branch_without_merging_into_main() {
+        // A pre-git_branch record must NOT merge into a real `main` branch
+        // group — it buckets under the NO_BRANCH pseudo-branch in its dir.
+        let root = PathBuf::from("/repo");
+        let dirs = build_groups(
             &root,
             vec![
                 sess("new", Some("main"), "main", "/repo", 100),
                 sess("old", None, "main", "/repo", 50),
             ],
         );
-        assert_eq!(groups.len(), 2);
-        assert!(groups.iter().any(|g| g.key == "main"));
-        assert!(groups.iter().any(|g| g.key == "dir:main"));
-        // Both still *display* as "main" — the dir fallback shows the leaf.
-        assert!(groups.iter().all(|g| g.label == "main"));
+        assert_eq!(dirs.len(), 1);
+        let labels: Vec<&str> = dirs[0].branches.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, vec!["main", NO_BRANCH]);
+        assert_eq!(dirs[0].branches[0].sessions.len(), 1);
+        assert_eq!(dirs[0].branches[1].sessions.len(), 1);
     }
 
     #[test]
-    fn new_session_roots_at_the_groups_latest_cwd() {
-        // `+ new` in a branch group roots where that branch's newest session
-        // actually ran, not at a path guessed from the label.
+    fn most_recent_dir_and_branch_start_expanded_rest_collapsed() {
         let root = PathBuf::from("/repo");
-        let groups = build_groups(
-            &root,
-            vec![
-                sess("a", Some("feat/x"), "wt/feat-x", "/repo/.claude/worktrees/feat-x", 200),
-                sess("b", Some("feat/x"), "main", "/repo", 100),
-            ],
-        );
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].cwd, PathBuf::from("/repo/.claude/worktrees/feat-x"));
-    }
-
-    #[test]
-    fn most_recent_group_starts_expanded_rest_collapsed() {
-        let root = PathBuf::from("/repo");
-        let groups = build_groups(
+        let dirs = build_groups(
             &root,
             vec![
                 sess("a", Some("feat/x"), "main", "/repo", 300),
                 sess("b", Some("main"), "main", "/repo", 200),
-                sess("c", None, "wt/old", "/repo/wt/old", 100),
+                sess("c", Some("feat/y"), "wt/old", "/repo/wt/old", 100),
             ],
         );
-        assert_eq!(groups.len(), 3);
-        assert!(groups[0].expanded);
-        assert!(groups[1..].iter().all(|g| !g.expanded));
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].expanded);
+        assert!(dirs[0].branches[0].expanded); // feat/x — the newest
+        assert!(!dirs[0].branches[1].expanded);
+        assert!(!dirs[1].expanded);
+        assert!(dirs[1].branches.iter().all(|b| !b.expanded));
     }
 }

@@ -1881,3 +1881,11 @@ area:      frontend
 
 Session rail now groups by git branch, not physical checkout dir. The daemon's git_branch stamping (bind_workspace → probe_git) landed end-to-end while the TUI lane was heads-down, so the rail's dir-grouping was leaving branch context on the floor — 112 of 374 on-disk records carry a branch, spanning 8+ branches mostly run from the same ocean-os checkout, all previously flattened under one "main" header. Rail groups key on the recorded branch (full name shown, feat/x not leafed), legacy records fall back to dir-grouping under a dir:-prefixed key so they never falsely merge into a real main group, and + new roots at the branch's newest session cwd. 4 new unit tests; ocean-tui suite 156/0.
 _________________________________________________________________________________
+time:      [2:20am] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+Session rail is now a two-level tree: directory nodes (main checkout / worktree dirs, blue) contain branch nodes (cyan) contain sessions — breadcrumbed like the file explorer, per John's ask to nest branches under the directory they relate to. Root checkout displays as the project folder name instead of "main" (which now reads as a branch). Legacy pre-git_branch records bucket under a "(no branch)" pseudo-branch inside their dir. + new on a dir header roots at the dir; on a branch header at the branch's newest session cwd. Expansion (dir keys + dir/branch composite keys) survives rescans; most-recent dir and its most-recent branch open by default. Suite 156/0.
+_________________________________________________________________________________
