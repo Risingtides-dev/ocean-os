@@ -1214,6 +1214,24 @@ impl AgentRuntime {
         }
 
         let mut history = session.messages.clone();
+        // Token-budgeted compaction (the "402M-token finding"): the loop trims
+        // each REQUEST to the model window, but nothing bounded the cumulative
+        // cost below it — a 150K-token transcript that fits was re-sent on
+        // every round of every turn, forever. When stored history crosses the
+        // trigger, elide OLD tool-result bodies (the token-dominant content)
+        // outside a protected recent window. The elision lands in `history`,
+        // flows through the run, and is PERSISTED at turn end — so the prompt
+        // prefix stays byte-stable between compactions and provider prompt
+        // caching keeps working (a per-turn rolling rewrite would invalidate
+        // the cache every turn and could cost MORE than it saves).
+        let elided = compact_history(&mut history, snapshot.model.context_window);
+        if elided > 0 {
+            tracing::info!(
+                session_id = %session_id,
+                elided,
+                "compacted session history: elided old tool results past the token trigger"
+            );
+        }
         // OpenAI-compatible providers (DeepSeek, OpenAI o-series, xAI, etc.)
         // do not accept assistant `thinking` blocks as input on the next turn —
         // reasoning is output-only. Strip them on replay. Anthropic stores
@@ -2322,6 +2340,82 @@ fn strip_assistant_thinking_content(messages: &mut [Message]) {
 /// cost, well above what any single coherent task needs.
 const MAX_SESSION_MESSAGES: usize = 200;
 
+/// Marker replacing an elided tool-result body during compaction. Tells the
+/// model exactly what happened and how to recover, instead of silently
+/// vanishing content it may reference.
+const COMPACTION_MARKER: &str =
+    "[old tool output elided to keep this session inside its token budget; \
+     re-run the tool if you need it]";
+
+/// Rough token estimate: serialized JSON length / 4 — the same heuristic the
+/// runtime's request trim uses, so the two layers agree about sizes.
+fn estimate_tokens<T: serde::Serialize>(value: &T) -> usize {
+    serde_json::to_string(value).map(|s| s.len()).unwrap_or(0) / 4
+}
+
+/// Threshold-based, cache-stable compaction of stored session history.
+///
+/// Trigger: estimated history tokens exceed 50% of the model's context window.
+/// Action: walk newest → oldest reserving a PROTECTED window (20% of the model
+/// window) of most-recent messages kept verbatim; every `ToolResult` OLDER than
+/// the protected window has its content replaced by [`COMPACTION_MARKER`].
+/// Tool-call/result pairing is untouched (the result message stays, only its
+/// body shrinks), so the transcript remains provider-valid by construction.
+///
+/// Why elide-only (no summarize, no drop): tool results dominate transcript
+/// tokens by an order of magnitude, eliding is deterministic (no LLM call on
+/// the turn's critical path), and idempotent — an already-elided result is
+/// tiny and skipped, so re-running compaction as the protected window slides
+/// forward only touches results that newly aged out. The messages BEFORE the
+/// newly-elided region are byte-identical across turns, which is what keeps
+/// the provider prompt-cache prefix warm. The runtime's per-request
+/// `trim_to_context_window` remains the hard floor beneath this.
+///
+/// Returns how many tool results were elided this pass.
+fn compact_history(messages: &mut [Message], context_window: u32) -> usize {
+    let window = context_window as usize;
+    let trigger = window / 2;
+    let protect = window / 5;
+
+    let total: usize = messages.iter().map(estimate_tokens).sum();
+    if total <= trigger {
+        return 0;
+    }
+
+    // Find the protection boundary: the oldest index whose suffix (newest
+    // messages) still fits the protected budget. Everything before it is
+    // eligible for elision.
+    let mut kept = 0usize;
+    let mut boundary = 0usize;
+    for (idx, msg) in messages.iter().enumerate().rev() {
+        kept += estimate_tokens(msg);
+        if kept > protect {
+            boundary = idx + 1;
+            break;
+        }
+    }
+
+    let mut elided = 0usize;
+    for msg in &mut messages[..boundary] {
+        if let Message::ToolResult(tr) = msg {
+            // Skip results that are already tiny (incl. previously-elided
+            // ones) — rewriting them would churn bytes for no savings.
+            let body: usize = tr
+                .content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .map(str::len)
+                .sum();
+            let has_non_text = tr.content.iter().any(|c| c.as_text().is_none());
+            if body > COMPACTION_MARKER.len() * 2 || has_non_text {
+                tr.content = vec![Content::text(COMPACTION_MARKER)];
+                elided += 1;
+            }
+        }
+    }
+    elided
+}
+
 fn cap_session_history(mut messages: Vec<Message>) -> Vec<Message> {
     if messages.len() <= MAX_SESSION_MESSAGES {
         return messages;
@@ -3342,6 +3436,82 @@ mod tests {
             .map(|i| Message::user_text(format!("m{i}")))
             .collect();
         assert_eq!(cap_session_history(msgs).len(), 10);
+    }
+
+    /// One assistant tool_call + its big tool_result pair, ~`kb` KB of result.
+    fn tool_round(id: &str, kb: usize) -> [Message; 2] {
+        let call = Message::Assistant(ocean_protocol::AssistantMessage {
+            content: vec![ocean_protocol::Content::ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            usage: Default::default(),
+            stop_reason: ocean_protocol::StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        });
+        let result = Message::ToolResult(ocean_protocol::ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "read".into(),
+            content: vec![ocean_protocol::Content::text("x".repeat(kb * 1024))],
+            is_error: false,
+            timestamp: 0,
+        });
+        [call, result]
+    }
+
+    #[test]
+    fn compact_history_is_noop_under_trigger() {
+        let mut msgs: Vec<Message> = tool_round("a", 4).into_iter().collect();
+        // 4KB ≈ 1K tokens against a 200K window — far under the 50% trigger.
+        assert_eq!(compact_history(&mut msgs, 200_000), 0);
+        let Message::ToolResult(tr) = &msgs[1] else {
+            panic!()
+        };
+        assert!(tr.content[0].as_text().unwrap().len() > 4000, "untouched");
+    }
+
+    /// Over the trigger: OLD tool results are elided to the marker, results in
+    /// the protected recent window keep their bodies, and pairing is intact.
+    /// A second pass elides nothing (byte-stable prefix = warm prompt cache).
+    #[test]
+    fn compact_history_elides_old_tool_results_and_is_idempotent() {
+        // Window 40K tokens → trigger 20K, protect 8K. Ten 20KB (≈5K-token)
+        // rounds ≈ 50K tokens total → well over trigger; protect covers ~the
+        // newest 1-2 rounds.
+        let mut msgs: Vec<Message> = (0..10)
+            .flat_map(|i| tool_round(&format!("c{i}"), 20))
+            .collect();
+        let elided = compact_history(&mut msgs, 40_000);
+        assert!(elided >= 5, "old results must be elided, got {elided}");
+
+        // Newest result keeps its body (inside the protected window).
+        let Message::ToolResult(newest) = &msgs[19] else {
+            panic!()
+        };
+        assert!(
+            newest.content[0].as_text().unwrap().len() > 10_000,
+            "the newest tool result must stay verbatim"
+        );
+        // Oldest result is the marker.
+        let Message::ToolResult(oldest) = &msgs[1] else {
+            panic!()
+        };
+        assert_eq!(oldest.content[0].as_text(), Some(COMPACTION_MARKER));
+        // Pairing intact: every tool_call id still has a result message.
+        for i in (0..20).step_by(2) {
+            assert!(matches!(&msgs[i], Message::Assistant(_)));
+            assert!(matches!(&msgs[i + 1], Message::ToolResult(_)));
+        }
+
+        // Idempotent while nothing new ages out: an immediate second pass
+        // rewrites zero messages, so the prefix stays byte-identical.
+        let again = compact_history(&mut msgs, 40_000);
+        assert_eq!(again, 0, "second pass must not churn bytes");
     }
 
     /// Write a tiny stdio "plugin" — a shell script that speaks the same

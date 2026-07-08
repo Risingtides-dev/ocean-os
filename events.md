@@ -1752,3 +1752,33 @@ area:      frontend
 
 Added a live `/login` slash command to the ocean-tui shell. Registry gains `/login` in the session group; `run_slash` routes bare `/login` (and `claude|claude-code|anthropic`) to `Action::Login(LoginTarget::Claude)` and `codex|openai-codex|chatgpt|openai` to `LoginTarget::Codex`, unknown args get a usage hint; `App::dispatch` opens the provider login URL in the default browser off-thread via the new `open` dependency (same async pattern as `/copy`) and reports success/failure in the status line with a post-auth readiness hint. TUI-only slice — no daemon endpoint; credentials still land via provider CLI/auth-file flows resolved by ocean-providers. TDD: three RED tests first (`login_is_registered_and_log_ranks_it_first`, `slash_login_without_args_routes_claude_login`, `typed_login_codex_routes_login_action_not_user_turn`). Verification: `cargo test -p ocean-tui` 150 passed, `cargo build -p ocean-tui --release` OK, `cargo check --workspace` OK. Cargo.lock delta is the `open` dep only. Concurrent runtime-lane files left untouched.
 _________________________________________________________________________________
+
+time:      [11:58pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Token-budgeted history compaction in ocean-agent (the ocean-surface agent's
+"402M-token finding", verified and corrected). Their diagnosis was half-right:
+the runtime DOES trim every request to the model window
+(trim_to_context_window, orphan-safe) — but nothing bounded cumulative cost
+BELOW the window, so a 150K-token transcript that fits was re-sent on every
+round of every turn indefinitely. Their proposed per-turn rolling summary had
+a trap: rewriting the prefix every turn invalidates provider prompt caching
+(the thing currently keeping the bill sane). Built the cache-stable version
+instead: compact_history() in ocean-agent runs on history load — when
+estimated tokens cross 50% of the model window, tool-result BODIES older than
+a protected 20%-of-window recent zone are replaced with an explicit
+"[old tool output elided… re-run the tool]" marker. Pairing untouched by
+construction (the result message stays, only its body shrinks); deterministic
+(no LLM call on the turn path); idempotent — already-elided results are
+skipped, so as the protected window slides, only newly-aged results change and
+the older prefix stays byte-identical across turns → prompt cache stays warm.
+Elisions flow through the run and persist at turn-end save. Runtime per-request
+trim remains the hard floor. Every surface benefits (web/TUI/ACP/voice all ride
+this loop). Tests: no-op under trigger; over trigger old-elided/new-verbatim/
+pairing-intact; immediate second pass rewrites 0 (cache stability). ocean-agent
+123 green, workspace check clean. LLM summarize tier + tiktoken-real counts
+remain W3 follow-ups.
+_________________________________________________________________________________
