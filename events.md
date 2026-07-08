@@ -1938,3 +1938,11 @@ area:      backend
 
 ModelRerouted event — failover honesty end to end. The OCEAN-275 failover silently swapped models (John's claude-code 429 → gpt-5.4 with zero signal). New runtime AgentEvent::ModelRerouted emitted at BOTH failover sites (degraded-at-selection + pre-stream call failure, reason clamped to 200 chars), bridged by the daemon onto the scoped SSE as AgentTurnEvent::ModelRerouted {requested, effective, reason}, surfaced in the workbench chat as a concern card + status line, in the legacy TUI transcript, and in ACP as a visible message chunk. All exhaustive matchers updated across acp/daemon/sdk/tui. Suites: runtime 84+12, agent 128, sdk 48, daemon 258, acp 19+3, tui 162 — all green.
 _________________________________________________________________________________
+time:      [5:40pm] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      frontend
+
+Fixed the tool-card cell bleed John screenshotted ("1108ore" smears, code fragments painting over later transcript rows): the enriched read tool emits `<lineno>\t<code>` lines, and ratatui does NOT expand tabs — the terminal jumps to its own tab stops, every cell after paints misaligned, and ratatui's cell-diffing leaves smears that never clear. New sanitize_line (tabs → 4 spaces, other control chars dropped) applied to tool-card output lines AND diff-card segments before clamp/render. Also triaged his "massive delays": not the deploy — his session was pinned to gpt-5.5 and chatgpt.com was intermittently hanging ~10s/attempt from this box (retry ladder → 30s+ turns before failover); deepseek turns measured 1.9-6.7s normal, daemon healthy. Suite 163/0.
+_________________________________________________________________________________

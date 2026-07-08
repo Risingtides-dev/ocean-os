@@ -162,6 +162,27 @@ fn inline_value(v: &serde_json::Value) -> String {
     }
 }
 
+/// Make a line of tool/diff output terminal-safe. ratatui does NOT expand
+/// tabs: a raw `\t` makes the terminal jump to its own tab stop, every cell
+/// after it paints misaligned, and ratatui's diffing (which believes its own
+/// cell math) leaves smeared "bleed" that never clears. Other control chars
+/// (ESC sequences, `\r`) can recolor or move the cursor under ratatui's feet
+/// the same way. Tabs become 4 spaces; other control chars drop.
+fn sanitize_line(s: &str) -> String {
+    if !s.chars().any(|c| c.is_control()) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Render one diff-card row: a coloured gutter sigil + the (possibly word-diffed)
 /// body on the dark bed. Changed word runs carry `Modifier::REVERSED` (SGR
 /// inverse), matching OMP's intra-line diff highlight.
@@ -184,7 +205,7 @@ fn diff_line(row: &DiffRow) -> Line<'static> {
         if seg.changed {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        spans.push(Span::styled(seg.text.clone(), style));
+        spans.push(Span::styled(sanitize_line(&seg.text), style));
     }
     Line::from(spans)
 }
@@ -1494,13 +1515,16 @@ impl Component for ChatComponent {
                                     body.len().saturating_sub(TOOL_TAIL_ROWS)
                                 };
                                 for l in &body[hidden..] {
-                                    // Collapsed: one screen row per line, hard
+                                    // Terminal-safe first (tabs/controls smear
+                                    // cells — see `sanitize_line`), then when
+                                    // collapsed: one screen row per line, hard
                                     // stop — a single giant line (JSON blobs)
                                     // must not wrap into a wall. ⌃O shows all.
+                                    let l = sanitize_line(l);
                                     let text = if tools_expanded {
-                                        l.to_string()
+                                        l
                                     } else {
-                                        clamp_line(l, clamp_w)
+                                        clamp_line(&l, clamp_w)
                                     };
                                     lines.push(Line::from(vec![
                                         Span::styled(
@@ -1767,6 +1791,17 @@ mod tests {
         assert!(chat.tools_expanded);
         chat.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(!chat.tools_expanded);
+    }
+
+    #[test]
+    fn sanitize_line_expands_tabs_and_drops_controls() {
+        // Raw tabs make the terminal jump to ITS tab stops while ratatui
+        // paints at its own cell math — the smeared-bleed bug John hit with
+        // the read tool's `<lineno>\t<code>` output lines.
+        assert_eq!(sanitize_line("1108\t}"), "1108    }");
+        // ESC/CR and friends drop; plain text passes through untouched.
+        assert_eq!(sanitize_line("a\x1b[31mred\rb"), "a[31mredb");
+        assert_eq!(sanitize_line("plain text"), "plain text");
     }
 
     #[test]
