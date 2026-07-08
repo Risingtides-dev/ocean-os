@@ -67,6 +67,15 @@ impl AgentTool for EditTool {
             .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Degenerate no-op: identical strings can never change the file. Reject
+        // up front so a model looping on a changeless edit gets an actionable
+        // error instead of an "edited" success that alters nothing.
+        if old_s == new_s {
+            return Err(format!(
+                "old_string and new_string are identical — this edit changes nothing in {path}. \
+                 Re-read the file if you expected different content."
+            ));
+        }
 
         let display_path = path.to_string();
         let path = resolve_against_cwd(self.cwd.as_deref(), path);

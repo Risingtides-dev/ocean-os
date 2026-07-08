@@ -46,7 +46,9 @@ async fn hashline_read_then_edit_roundtrip() {
     };
 
     // 1. read emits a [path#HASH] tag.
-    let read = tool_named(&provider, &ctx, "read").await.expect("read tool");
+    let read = tool_named(&provider, &ctx, "read")
+        .await
+        .expect("read tool");
     let out = read
         .execute("1", json!({ "path": path }))
         .await
@@ -92,6 +94,86 @@ async fn hashline_read_then_edit_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// No-op loop guard wiring: a `hashline_edit` whose patch applies cleanly but
+/// changes NOTHING (the file already matches the target content) is tolerated
+/// once, then the identical repeat trips the session guard to a hard error —
+/// the model gets told to stop re-issuing the changeless edit. A genuinely
+/// changing edit to the same path clears the counter.
+#[tokio::test]
+async fn repeated_noop_hashline_edit_trips_the_loop_guard() {
+    let dir = std::env::temp_dir().join(format!("ocean-hl-noop-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+    let path = file.to_string_lossy().to_string();
+
+    let provider = BuiltinProvider::new();
+    let ctx = SessionContext {
+        cwd: dir.clone(),
+        session_id: Some("s-noop".into()),
+        hashline: true,
+        artifacts: false,
+    };
+
+    // Read to record a snapshot + get the live tag.
+    let read = tool_named(&provider, &ctx, "read")
+        .await
+        .expect("read tool");
+    let out = read
+        .execute("1", json!({ "path": path }))
+        .await
+        .expect("read ok");
+    let first = body(&out).lines().next().unwrap_or("").to_string();
+    let hash = first
+        .rsplit_once('#')
+        .and_then(|(_, rest)| rest.strip_suffix(']'))
+        .expect("hash in tag")
+        .to_string();
+
+    let edit = tool_named(&provider, &ctx, "hashline_edit")
+        .await
+        .expect("hashline_edit tool");
+
+    // A patch that swaps line 2 to its EXISTING content — applies cleanly,
+    // changes nothing.
+    let noop_patch = format!("[{path}#{hash}]\nSWAP 2:\n+beta\n");
+
+    // First no-op: tolerated, reported honestly as a no-op.
+    let res = edit
+        .execute("2", json!({ "patch": noop_patch }))
+        .await
+        .expect("first no-op edit is tolerated");
+    assert!(
+        body(&res).contains("no-op"),
+        "a changeless edit must be reported as a no-op, got: {}",
+        body(&res)
+    );
+
+    // Second identical no-op: the guard trips (default tolerance is 2).
+    let err = edit
+        .execute("3", json!({ "patch": noop_patch }))
+        .await
+        .expect_err("the repeated identical no-op must trip the loop guard");
+    assert!(
+        err.contains("no change") && err.contains("Stop re-issuing"),
+        "guard error must tell the model to stop looping, got: {err}"
+    );
+
+    // A REAL edit to the same path succeeds and clears the counter.
+    let changing_patch = format!("[{path}#{hash}]\nSWAP 2:\n+BETA\n");
+    let res = edit
+        .execute("4", json!({ "patch": changing_patch }))
+        .await
+        .expect("a changing edit succeeds after the guard tripped");
+    assert!(body(&res).contains("applied"));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "alpha\nBETA\ngamma\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn non_hashline_profile_is_untagged_and_has_no_edit_tool() {
     let dir = std::env::temp_dir().join(format!("ocean-hl-off-{}", std::process::id()));
@@ -108,7 +190,9 @@ async fn non_hashline_profile_is_untagged_and_has_no_edit_tool() {
         artifacts: false,
     };
 
-    let read = tool_named(&provider, &ctx, "read").await.expect("read tool");
+    let read = tool_named(&provider, &ctx, "read")
+        .await
+        .expect("read tool");
     let out = read
         .execute("1", json!({ "path": path }))
         .await

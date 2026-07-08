@@ -1552,3 +1552,37 @@ ocean-tui `mentions` work in the tree. Next arcs scoped: LSP tool (Diagnostics
 Ledger + writethrough), steering (steer-queue + between-tool interrupt), in-loop
 classified retry, wire the dead NoopLoopGuard.
 _________________________________________________________________________________
+
+time:      [10:35pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Two more self-contained loop hardening wins (continuing the holistic pass).
+(1) In-loop round retry: the provider layer retries the INITIAL request, but a
+stream dropping mid-flight killed the whole turn. The loop now re-attempts a
+round up to 3 times with 500ms/1s backoff — ONLY when the round is clean
+(nothing emitted to the event sink this attempt), so a retry is invisible
+rather than a duplicated partial. Classification is narrow: raw Http transport
+drops + 429/5xx stream items retry; RetryExhausted deliberately bubbles to the
+daemon's model-failover (OCEAN-275) instead of compounding; provider Error
+frames (content blocks) and all 4xx are deterministic and fail immediately.
+The round deadline is shared ACROSS retries (timeout_at, retries don't extend
+it) and the backoff sleep races the cancel token. 4 new tests in round_retry.rs
+(clean retry to success incl. real backoff timing, dirty round NOT retried,
+non-transient NOT retried, budget exhaustion = exactly 3 provider calls).
+(2) Wired the DEAD NoopLoopGuard (built in ocean-hashline, zero call sites):
+hashline_edit now detects an apply that changes nothing, reports it honestly
+as "(no-op: file already matched)" once, and the identical repeat trips the
+session-scoped guard to a hard error telling the model to stop re-issuing;
+a changing edit resets the path counter. Guard is session-keyed on
+BuiltinProvider (same lifetime shape as the snapshot store). Also killed the
+degenerate case in plain edit: old_string == new_string now errors up front
+instead of returning a fake "edited" success. New guard e2e test in
+hashline_wiring.rs. Verification: 120 ocean-runtime tests green, cargo check
+--workspace clean, clippy clean on new code (2 pre-existing warnings
+elsewhere). A scout is concurrently hunting the next batch of harness defects
+(incl. URGENT check: does the TUI chat render interleaved Start/Start/End/End
+correctly now that tools parallelize).
+_________________________________________________________________________________

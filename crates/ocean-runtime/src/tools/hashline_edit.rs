@@ -10,9 +10,10 @@
 //! caught before they corrupt, and edit-retry loops mostly disappear.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ocean_hashline::{apply_patch, ApplyError, Patch, Recovery};
+use ocean_hashline::{apply_patch, ApplyError, NoopLoopGuard, Patch, Recovery};
 use serde_json::{json, Value};
 use tokio::fs;
 
@@ -20,14 +21,25 @@ use crate::tools::path::resolve_against_cwd;
 use crate::tools::read::SharedSnapshots;
 use crate::types::{AgentTool, AgentToolResult};
 
+/// Shared, session-scoped no-op loop guard. Tracks consecutive byte-identical
+/// no-op edits per path across the session's turns; trips to a hard error so a
+/// model stuck re-applying the same changeless patch stops looping instead of
+/// burning the whole `max_turns` budget.
+pub type SharedNoopGuard = Arc<Mutex<NoopLoopGuard>>;
+
 pub struct HashlineEditTool {
     cwd: Option<PathBuf>,
     snapshots: SharedSnapshots,
+    guard: SharedNoopGuard,
 }
 
 impl HashlineEditTool {
-    pub fn new(cwd: Option<PathBuf>, snapshots: SharedSnapshots) -> Self {
-        Self { cwd, snapshots }
+    pub fn new(cwd: Option<PathBuf>, snapshots: SharedSnapshots, guard: SharedNoopGuard) -> Self {
+        Self {
+            cwd,
+            snapshots,
+            guard,
+        }
     }
 }
 
@@ -112,6 +124,24 @@ impl AgentTool for HashlineEditTool {
                 }
                 Err(e) => return Err(format!("apply {}: {e}", section.path)),
             };
+
+            // No-op loop guard: the patch applied cleanly but changed nothing.
+            // Count it (per path, per identical patch); after the tolerance the
+            // guard escalates to a hard error so a model stuck re-issuing the
+            // same changeless edit breaks out instead of burning `max_turns`.
+            // A genuinely changing edit clears the path's counter.
+            if new_text == current {
+                if let Ok(mut guard) = self.guard.lock() {
+                    guard
+                        .observe_noop(&section.path, patch_src)
+                        .map_err(|e| e.to_string())?;
+                }
+                applied.push(format!("{} (no-op: file already matched)", section.path));
+                continue;
+            }
+            if let Ok(mut guard) = self.guard.lock() {
+                guard.reset(&section.path);
+            }
 
             fs::write(&resolved, &new_text)
                 .await

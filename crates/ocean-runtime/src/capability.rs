@@ -115,15 +115,20 @@ pub struct BuiltinProvider {
     /// Session-scoped hashline snapshot stores, keyed by session id. Lives on
     /// the provider (which the runtime `Arc`s for its whole life) so a `read`
     /// in one turn and a `hashline_edit` in a later turn share one store.
-    snapshots: std::sync::Mutex<
-        std::collections::HashMap<String, crate::tools::read::SharedSnapshots>,
-    >,
+    snapshots:
+        std::sync::Mutex<std::collections::HashMap<String, crate::tools::read::SharedSnapshots>>,
     /// Session-scoped artifact spill stores, keyed by session id (W3). Lives on
     /// the provider (Arc'd for the runtime's life) so a spill in one turn and a
     /// `read artifact://` in a later turn share one store — same shape as
     /// `snapshots` above.
-    artifacts:
-        std::sync::Mutex<std::collections::HashMap<String, SharedArtifacts>>,
+    artifacts: std::sync::Mutex<std::collections::HashMap<String, SharedArtifacts>>,
+    /// Session-scoped no-op loop guards, keyed by session id. Same lifetime
+    /// shape as `snapshots`: a `hashline_edit` that repeats the identical
+    /// changeless patch across turns of one session accumulates against one
+    /// guard and trips to a hard error.
+    noop_guards: std::sync::Mutex<
+        std::collections::HashMap<String, crate::tools::hashline_edit::SharedNoopGuard>,
+    >,
 }
 
 impl BuiltinProvider {
@@ -132,6 +137,7 @@ impl BuiltinProvider {
             tools: default_tools(),
             snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             artifacts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            noop_guards: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -141,9 +147,9 @@ impl BuiltinProvider {
         map.entry(session_id.to_string())
             .or_insert_with(|| {
                 // LRU bounds match OMP: ~30 paths, 4 versions each.
-                std::sync::Arc::new(std::sync::Mutex::new(
-                    ocean_hashline::SnapshotStore::new(30, 4),
-                ))
+                std::sync::Arc::new(std::sync::Mutex::new(ocean_hashline::SnapshotStore::new(
+                    30, 4,
+                )))
             })
             .clone()
     }
@@ -153,6 +159,18 @@ impl BuiltinProvider {
         let mut map = self.artifacts.lock().expect("artifacts map poisoned");
         map.entry(session_id.to_string())
             .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(ArtifactStore::default())))
+            .clone()
+    }
+
+    /// Get-or-create the no-op loop guard for a session.
+    fn noop_guard_for(&self, session_id: &str) -> crate::tools::hashline_edit::SharedNoopGuard {
+        let mut map = self.noop_guards.lock().expect("noop guards map poisoned");
+        map.entry(session_id.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    ocean_hashline::NoopLoopGuard::default(),
+                ))
+            })
             .clone()
     }
 }
@@ -245,10 +263,13 @@ impl CapabilityProvider for BuiltinProvider {
             // Hashline profile: offer the content-anchored edit tool, sharing the
             // same session snapshot store `read` records into.
             if ctx.hashline {
-                tools.push(Arc::new(crate::tools::hashline_edit::HashlineEditTool::new(
-                    Some(ctx.cwd.clone()),
-                    self.snapshots_for(session_id),
-                )));
+                tools.push(Arc::new(
+                    crate::tools::hashline_edit::HashlineEditTool::new(
+                        Some(ctx.cwd.clone()),
+                        self.snapshots_for(session_id),
+                        self.noop_guard_for(session_id),
+                    ),
+                ));
             }
         }
         tools
@@ -440,11 +461,9 @@ impl AgentTool for SpillingTool {
             .content
             .into_iter()
             .map(|c| match c {
-                Content::Text { text } if text.len() > SPILL_THRESHOLD_BYTES => {
-                    Content::Text {
-                        text: self.spill_text(&tool, text),
-                    }
-                }
+                Content::Text { text } if text.len() > SPILL_THRESHOLD_BYTES => Content::Text {
+                    text: self.spill_text(&tool, text),
+                },
                 other => other,
             })
             .collect();

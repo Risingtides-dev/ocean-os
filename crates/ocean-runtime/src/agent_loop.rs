@@ -161,96 +161,147 @@ pub async fn run_agent_with_history(
         let mut stop = StopReason::Stop;
         let mut streamed_text = String::new();
 
-        // Bound the entire turn — provider request + full stream consumption —
-        // by a single wall-clock deadline. A hung or slow provider that never
-        // finishes streaming would otherwise block this turn forever; on elapse
-        // we abort with `AgentError::Timeout` and unwind the run. This is a
-        // *total* per-turn deadline (not an idle/inter-chunk timeout): the whole
-        // round must complete within the window, matching the intent of bounding
-        // a turn that a provider has hung on.
+        // Bound the entire round — provider request + full stream consumption,
+        // ACROSS retries — by a single wall-clock deadline. A hung or slow
+        // provider that never finishes streaming would otherwise block this turn
+        // forever; on elapse we abort with `AgentError::Timeout` and unwind the
+        // run. This is a *total* per-round deadline (not an idle/inter-chunk
+        // timeout, and retries do not extend it).
         let timeout_secs = config.turn_timeout_secs();
-        let stream_work = async {
-            // Stream from the injected provider when one is set (the e2e-test
-            // seam), otherwise dispatch to the real provider via `stream_simple`
-            // (`model.api` → Anthropic/OpenAI/…). Production never sets the
-            // override, so this is an unconditional `stream_simple` in practice.
-            let mut stream = match &config.provider {
-                Some(provider) => provider.stream(&config.model, &ctx, &options).await?,
-                None => stream_simple(&config.model, &ctx, &options).await?,
-            };
-            while let Some(ev) = stream.next().await {
-                // A cancel can land mid-stream (client hit halt while the
-                // assistant was still typing). The provider also yields
-                // `Error::Cancelled` on its own, but checking here breaks out
-                // immediately and surfaces a clean `AgentError::Cancelled`
-                // rather than waiting on the next chunk.
-                if is_cancelled(config) {
-                    return Err(AgentError::Cancelled);
-                }
-                let ev = match ev {
-                    Ok(ev) => ev,
-                    // The provider maps a cancel-token trip to `Error::Cancelled`;
-                    // normalize it to the agent-level `Cancelled` so callers see a
-                    // single cancellation type regardless of where it tripped.
-                    Err(ocean_protocol::Error::Cancelled) => return Err(AgentError::Cancelled),
-                    Err(e) => return Err(AgentError::from(e)),
-                };
-                match ev {
-                    AssistantMessageEvent::Done { reason, message } => {
-                        stop = reason;
-                        // Accumulate this round's real provider usage.
-                        total_usage.input += message.usage.input;
-                        total_usage.output += message.usage.output;
-                        total_usage.cache_read += message.usage.cache_read;
-                        total_usage.cache_write += message.usage.cache_write;
-                        total_usage.total_tokens += message.usage.total_tokens;
-                        final_message = Some(message);
-                        break;
-                    }
-                    AssistantMessageEvent::Error { reason: _, error } => {
-                        let err_msg = error
-                            .error_message
-                            .clone()
-                            .unwrap_or_else(|| "provider error".into());
-                        return Err(AgentError::Other(err_msg));
-                    }
-                    AssistantMessageEvent::TextDelta { delta, .. } => {
-                        streamed_text.push_str(&delta);
-                        emit(
-                            &events,
-                            AgentEvent::TextDelta {
-                                session_id: sid.clone(),
-                                delta,
-                            },
-                        );
-                    }
-                    AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                        emit(
-                            &events,
-                            AgentEvent::ThinkingDelta {
-                                session_id: sid.clone(),
-                                delta,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<(), AgentError>(())
-        };
+        let round_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
 
-        // Drive the provider stream inside the round span so `provider_stream`
-        // (emitted by `stream_simple`) nests under `round` → `agent_loop`.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs as u64),
-            stream_work,
-        )
-        .instrument(round_span.clone())
-        .await
-        {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                return Err(AgentError::Timeout { secs: timeout_secs });
+        // In-loop retry for transient stream failures (OMP-port). The provider
+        // layer already retries the *initial request* (ocean-protocol::retry),
+        // but a stream that drops mid-flight — connection reset while the model
+        // was typing — surfaced here as a hard turn failure. We re-attempt the
+        // round ONLY when it is clean: nothing was emitted to the event sink this
+        // attempt (no text/thinking reached a client, no tool ran, so a retry is
+        // invisible rather than a duplicated partial). A round that already
+        // streamed output fails as before — replaying it would re-show text and
+        // re-bill the tokens. `RetryExhausted` is deliberately NOT retried here:
+        // the provider layer already spent its budget on that request, and the
+        // daemon's model-failover (OCEAN-275) is the right next step, not more
+        // waiting.
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            // Reset per-attempt round state. `final_message` needs no reset — a
+            // `Done` breaks the stream loop with `Ok`, so a failed attempt can
+            // never have set it — and `total_usage` is only touched on `Done`,
+            // so failed attempts never double-count.
+            streamed_text.clear();
+            let mut attempt_emitted = false;
+
+            let stream_work = async {
+                // Stream from the injected provider when one is set (the e2e-test
+                // seam), otherwise dispatch to the real provider via `stream_simple`
+                // (`model.api` → Anthropic/OpenAI/…). Production never sets the
+                // override, so this is an unconditional `stream_simple` in practice.
+                let mut stream = match &config.provider {
+                    Some(provider) => provider.stream(&config.model, &ctx, &options).await?,
+                    None => stream_simple(&config.model, &ctx, &options).await?,
+                };
+                while let Some(ev) = stream.next().await {
+                    // A cancel can land mid-stream (client hit halt while the
+                    // assistant was still typing). The provider also yields
+                    // `Error::Cancelled` on its own, but checking here breaks out
+                    // immediately and surfaces a clean `AgentError::Cancelled`
+                    // rather than waiting on the next chunk.
+                    if is_cancelled(config) {
+                        return Err(AgentError::Cancelled);
+                    }
+                    let ev = match ev {
+                        Ok(ev) => ev,
+                        // The provider maps a cancel-token trip to `Error::Cancelled`;
+                        // normalize it to the agent-level `Cancelled` so callers see a
+                        // single cancellation type regardless of where it tripped.
+                        Err(ocean_protocol::Error::Cancelled) => return Err(AgentError::Cancelled),
+                        Err(e) => return Err(AgentError::from(e)),
+                    };
+                    match ev {
+                        AssistantMessageEvent::Done { reason, message } => {
+                            stop = reason;
+                            // Accumulate this round's real provider usage.
+                            total_usage.input += message.usage.input;
+                            total_usage.output += message.usage.output;
+                            total_usage.cache_read += message.usage.cache_read;
+                            total_usage.cache_write += message.usage.cache_write;
+                            total_usage.total_tokens += message.usage.total_tokens;
+                            final_message = Some(message);
+                            break;
+                        }
+                        AssistantMessageEvent::Error { reason: _, error } => {
+                            let err_msg = error
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "provider error".into());
+                            return Err(AgentError::Other(err_msg));
+                        }
+                        AssistantMessageEvent::TextDelta { delta, .. } => {
+                            attempt_emitted = true;
+                            streamed_text.push_str(&delta);
+                            emit(
+                                &events,
+                                AgentEvent::TextDelta {
+                                    session_id: sid.clone(),
+                                    delta,
+                                },
+                            );
+                        }
+                        AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                            attempt_emitted = true;
+                            emit(
+                                &events,
+                                AgentEvent::ThinkingDelta {
+                                    session_id: sid.clone(),
+                                    delta,
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Ok::<(), AgentError>(())
+            };
+
+            // Drive the provider stream inside the round span so `provider_stream`
+            // (emitted by `stream_simple`) nests under `round` → `agent_loop`.
+            let result = match tokio::time::timeout_at(round_deadline, stream_work)
+                .instrument(round_span.clone())
+                .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    return Err(AgentError::Timeout { secs: timeout_secs });
+                }
+            };
+
+            match result {
+                Ok(()) => break,
+                Err(e) => {
+                    let retryable = attempt < MAX_ROUND_ATTEMPTS
+                        && !attempt_emitted
+                        && is_transient_stream_error(&e);
+                    if !retryable {
+                        return Err(e);
+                    }
+                    // Exponential backoff (500ms, 1s, …), racing the cancel token
+                    // so a user halt during the wait still lands promptly.
+                    let delay =
+                        std::time::Duration::from_millis(ROUND_RETRY_BASE_MS << (attempt - 1));
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "transient provider stream failure on a clean round; retrying"
+                    );
+                    tokio::select! {
+                        biased;
+                        () = cancelled(config) => return Err(AgentError::Cancelled),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
             }
         }
 
@@ -520,6 +571,38 @@ pub async fn run_agent_with_history(
         stopped_at_turn_limit,
         usage: total_usage,
     })
+}
+
+/// Max attempts for one provider round (initial try + retries). Kept small:
+/// this only covers transient *stream* failures on clean rounds — the provider
+/// layer has its own request-level retry budget, and the daemon's model
+/// failover is the recovery path beyond this.
+const MAX_ROUND_ATTEMPTS: u32 = 3;
+/// First-step backoff between round retries, in milliseconds (doubles per
+/// attempt: 500ms, 1s).
+const ROUND_RETRY_BASE_MS: u64 = 500;
+
+/// Whether a round failure is a transient transport/availability error worth
+/// re-attempting in-loop (given the round was clean — nothing streamed).
+///
+/// `true` only for raw transport failures (`Http`: connection reset, broken
+/// pipe, TLS drop mid-stream) and upstream-degraded statuses (429/5xx) that
+/// arrive as stream items. Everything else is NOT retried here:
+/// - `RetryExhausted` — the provider layer already spent its request-level
+///   budget; the daemon's model failover (OCEAN-275) is the right next step.
+/// - `MissingApiKey` — a credential problem; failover material, not transient.
+/// - `Cancelled`, content/4xx, invalid responses — deterministic or user-driven.
+fn is_transient_stream_error(err: &AgentError) -> bool {
+    match err {
+        AgentError::Provider(pe) => match pe {
+            ocean_protocol::Error::Http(_) => true,
+            ocean_protocol::Error::ProviderError { status, .. } => {
+                *status == 429 || (500..=599).contains(status)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// A tool call after the permission gate: either cleared to run or denied.
