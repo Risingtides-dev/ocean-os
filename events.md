@@ -1832,3 +1832,22 @@ guard never across an await, per the crate's own discipline. Tests: retain→
 recall round-trip (substring hit, newest-first order, clean miss), oversized-
 retain rejection. ocean-agent 128 green, workspace check clean.
 _________________________________________________________________________________
+
+time:      [12:20AM] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+Mid-turn daemon-blip retry, closing the error wall John hit when the daemon
+restarted under his prompt. client.rs gains post_json_retrying (shared by
+agent_turn + session mint): retries ONLY is_connect failures — refused/reset
+means the request never landed, so retrying can't double-submit; status/timeout/
+decode errors surface immediately. Backoff 0.5-5s ≈ 15.5s covers the ~8s launchd
+respawn; the status line narrates "daemon unreachable — retrying turn (2/7)…".
+Final failure → Action::TurnSendFailed: spinner unwound, transcript note, and
+the PROMPT RESTORED to the composer — typed text is never lost. Reproduced the
+real failure in the pyte harness: dead port → send → retries → stub daemon up
+mid-window → session+turn POSTs land, no error wall; and the give-up path shows
+the note + restored prompt after 7 attempts. 150 tests. Binary rebuilt.
+_________________________________________________________________________________
