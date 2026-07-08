@@ -1,9 +1,12 @@
 //! W0 — harness-profile seam (OMP port foundation).
 //!
-//! Ocean's IDE-grade harness (LSP, hashline edits, stream rules, rich context
-//! collection, memory, artifacts, the context minimizer) is not a single global
-//! flag: it is scoped **per surface**. A voice turn and a full TUI turn should
-//! not carry the same harness weight. Every turn already arrives tagged with a
+//! Ocean's IDE-grade harness (hashline edits, stream rules, rich context
+//! collection, artifacts, the context minimizer) is not a single global flag: it
+//! is scoped **per surface**. A voice turn and a full TUI turn should not carry
+//! the same *presentation* harness weight. The two harness *tools* — LSP code
+//! intelligence and long-term memory (`retain`/`recall`) — are the exception:
+//! they belong to the harness regardless of surface and every profile carries
+//! them (LSP self-gates on server detection). Every turn already arrives with a
 //! `client_type` (`"tui"`, `"surface-web"`, `"surface-gpui"`, `"surface-native"`,
 //! `"cli"`, `"leo-voice"`, `"surface-extension"`, …), so we collapse that raw
 //! string into a small [`HarnessProfile`] enum and expose a
@@ -105,13 +108,20 @@ impl HarnessProfile {
     /// Hardcoded sensible defaults (see the module-level TODO for the planned
     /// config override). The matrix:
     ///
+    /// `lsp` and `memory` are surface-UNIVERSAL: they are code-intelligence and
+    /// long-term-recall *tools* that belong to the harness itself, not to any one
+    /// face, so every profile carries them. Only the presentation-shaped
+    /// capabilities (hashline edits, stream rules, rich context, minimizer,
+    /// artifacts) are scoped per surface. `lsp` still self-gates at the provider:
+    /// the tool is only offered when a language server is actually detected.
+    ///
     /// | profile | lsp | hashline | stream_rules | rich_context | memory | artifacts | minimizer |
     /// |---------|-----|----------|--------------|--------------|--------|-----------|-----------|
     /// | Tui     |  ✓  |    ✓     |      ✓       |      ✓       |   ✓    |     ✓     |     ✓     |
     /// | Acp     |  ✓  |    ✓     |      ✓       |      ✓       |   ✓    |     ✓     |     ✓     |
-    /// | Web     |  ✗  |    ✗     |      ✗       |      ✗       |   ✓    |     ✓     |     ✗     |
-    /// | Voice   |  ✗  |    ✗     |      ✗       |      ✗       |   ✓    |     ✗     |     ✗     |
-    /// | Cli     |  ✗  |    ✓     |      ✗       |      ✗       |   ✗    |     ✓     |     ✓     |
+    /// | Web     |  ✓  |    ✗     |      ✗       |      ✗       |   ✓    |     ✓     |     ✗     |
+    /// | Voice   |  ✓  |    ✗     |      ✗       |      ✗       |   ✓    |     ✗     |     ✗     |
+    /// | Cli     |  ✓  |    ✓     |      ✗       |      ✗       |   ✓    |     ✓     |     ✓     |
     pub fn capabilities(&self) -> HarnessCapabilities {
         match self {
             // Full IDE-grade harness. ACP matches Tui for backend capabilities:
@@ -125,9 +135,10 @@ impl HarnessProfile {
                 artifacts: true,
                 minimizer: true,
             },
-            // Lean conversational surface: keep memory + artifacts, drop the IDE.
+            // Lean conversational surface: universal tools (lsp + memory), plus
+            // artifacts; drop the presentation-heavy IDE machinery.
             HarnessProfile::Web => HarnessCapabilities {
-                lsp: false,
+                lsp: true,
                 hashline_edits: false,
                 stream_rules: false,
                 rich_context: false,
@@ -135,9 +146,9 @@ impl HarnessProfile {
                 artifacts: true,
                 minimizer: false,
             },
-            // Minimal hands-free surface: memory only.
+            // Minimal hands-free surface: universal tools only (lsp + memory).
             HarnessProfile::Voice => HarnessCapabilities {
-                lsp: false,
+                lsp: true,
                 hashline_edits: false,
                 stream_rules: false,
                 rich_context: false,
@@ -145,13 +156,14 @@ impl HarnessProfile {
                 artifacts: false,
                 minimizer: false,
             },
-            // Scripting surface: reliable edits + minimizer + artifacts, no IDE.
+            // Scripting surface: universal tools + reliable edits + minimizer +
+            // artifacts, no presentation IDE.
             HarnessProfile::Cli => HarnessCapabilities {
-                lsp: false,
+                lsp: true,
                 hashline_edits: true,
                 stream_rules: false,
                 rich_context: false,
-                memory: false,
+                memory: true,
                 artifacts: true,
                 minimizer: true,
             },
@@ -237,24 +249,24 @@ mod tests {
     #[test]
     fn web_profile_is_lean_conversational() {
         let caps = HarnessProfile::Web.capabilities();
-        // Memory + artifacts stay on…
+        // Universal harness tools (lsp + memory) + artifacts stay on…
+        assert!(caps.lsp);
         assert!(caps.memory);
         assert!(caps.artifacts);
-        // …the IDE machinery is off.
-        assert!(!caps.lsp);
+        // …the presentation IDE machinery is off.
         assert!(!caps.hashline_edits);
         assert!(!caps.stream_rules);
         assert!(!caps.rich_context);
         assert!(!caps.minimizer);
-        // Contrast with the reference surface.
-        assert!(HarnessProfile::Tui.capabilities().lsp && !caps.lsp);
     }
 
     #[test]
-    fn voice_profile_is_memory_only() {
+    fn voice_profile_carries_universal_tools_only() {
         let caps = HarnessProfile::Voice.capabilities();
+        // Universal harness tools reach even the leanest surface.
         assert!(caps.memory);
-        assert!(!caps.lsp);
+        assert!(caps.lsp);
+        // Everything presentation-shaped is off.
         assert!(!caps.hashline_edits);
         assert!(!caps.stream_rules);
         assert!(!caps.rich_context);
@@ -265,14 +277,14 @@ mod tests {
     #[test]
     fn cli_profile_is_a_reliable_scripting_surface() {
         let caps = HarnessProfile::Cli.capabilities();
-        // Reliable edits + minimizer + artifacts on…
+        // Reliable edits + minimizer + artifacts on, plus the universal tools…
         assert!(caps.hashline_edits);
         assert!(caps.minimizer);
         assert!(caps.artifacts);
-        // …no full IDE, no memory.
-        assert!(!caps.lsp);
+        assert!(caps.lsp);
+        assert!(caps.memory);
+        // …no presentation IDE machinery.
         assert!(!caps.stream_rules);
         assert!(!caps.rich_context);
-        assert!(!caps.memory);
     }
 }
