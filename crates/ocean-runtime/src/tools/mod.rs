@@ -35,7 +35,7 @@ pub fn default_tools() -> Vec<Arc<dyn AgentTool>> {
         Arc::new(ls::LsTool::new()),
         Arc::new(grep::GrepTool::new()),
         Arc::new(glob_tool::GlobTool::new()),
-        Arc::new(web_fetch::WebFetchTool),
+        Arc::new(web_fetch::WebFetchTool::new()),
         Arc::new(todo::TodoTool::new()),
         Arc::new(component::ComponentRenderTool),
         Arc::new(component::ComponentUnmountTool),
