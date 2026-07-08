@@ -31,12 +31,12 @@ use ocean_core::{
     evaluate_trigger_policy, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectRef,
-    ProjectResponse, PromptRequest, RequestControlResponse,
-    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse,
-    RoomEventsResponse, RoomId, RoomKey, RoomMessageKind, RoomPanelSnapshot, RoomParticipant,
-    RoomParticipantKind, RoomProjectedMessage, RoomProjection, RoomProjectionProvenance,
-    RoomProjectionResponse, RoomSnapshot, RoomTriggerEvent, RoomTriggerPolicy, RoomTurn,
-    RoomsResponse, SessionDetail, SessionId, SessionResponse, SessionRunState, SessionSummary,
+    ProjectResponse, PromptRequest, RequestControlResponse, RequestCreateResponse, RequestId,
+    RequestState, RequestStatus, RequestsResponse, RoomEventsResponse, RoomId, RoomKey,
+    RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind, RoomProjectedMessage,
+    RoomProjection, RoomProjectionProvenance, RoomProjectionResponse, RoomSnapshot,
+    RoomTriggerEvent, RoomTriggerPolicy, RoomTurn, RoomsResponse, SessionDetail, SessionId,
+    SessionResponse, SessionRunState, SessionSummary,
 };
 use ocean_runtime::{
     tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
@@ -1642,8 +1642,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agents", get(agents_list))
         .route("/v1/agents/{name}", get(agent_def))
         .route("/v1/projects", get(projects_list).post(project_create))
-        .route("/v1/projects/{id}", get(project_get).patch(project_patch).delete(project_delete))
+        .route(
+            "/v1/projects/{id}",
+            get(project_get).patch(project_patch).delete(project_delete),
+        )
         .route("/v1/fs/dirs", get(fs_dirs))
+        .route("/v1/fs/file", get(fs_file))
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
         .route(
@@ -1681,24 +1685,58 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%addr, "ocean-daemon listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // The graceful-shutdown future: wait for the first SIGTERM/SIGINT, then fire
-    // the shutdown token so every live SSE stream ends (OCEAN-300). Only after
-    // that can axum finish draining HTTP connections and return from `.await`.
-    let serve_shutdown = {
+    // Companion IPv6 loopback listener. macOS resolves `localhost` ::1-first,
+    // so a client holding an `http://localhost:4780` URL (WKWebView in the
+    // Tauri shell especially — its v6→v4 fallback is unreliable for
+    // EventSource) dials [::1] and gets connection-refused when we bind the
+    // IPv4 loopback only. Bind [::1] on the same port whenever OCEAN_BIND is
+    // the v4 loopback; failure is non-fatal (v6 may be disabled).
+    let listener_v6 = if addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()));
+        match tokio::net::TcpListener::bind(v6).await {
+            Ok(l) => {
+                tracing::info!(%v6, "ocean-daemon listening (v6 loopback companion)");
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!(%v6, error = %e, "could not bind v6 loopback companion");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // One signal watcher fires the daemon-wide token; each serve's
+    // graceful-shutdown future then completes off that token. Firing it is
+    // what terminates the live SSE streams (`/v1/events`, `/v1/agent/events`)
+    // and lets `with_graceful_shutdown` actually complete (OCEAN-300).
+    tokio::spawn({
         let shutdown_token = shutdown_token.clone();
         async move {
             wait_for_signal().await;
             tracing::info!("shutdown signal received; terminating live SSE streams and draining");
-            // Terminating the streams here is the crux of OCEAN-300: without it,
-            // the never-ending broadcast streams keep their connections open and
-            // graceful shutdown blocks indefinitely.
             shutdown_token.cancel();
         }
-    };
+    });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(serve_shutdown)
-        .await?;
+    match listener_v6 {
+        Some(l6) => {
+            let (r4, r6) = tokio::join!(
+                axum::serve(listener, app.clone())
+                    .with_graceful_shutdown(shutdown_token.clone().cancelled_owned()),
+                axum::serve(l6, app)
+                    .with_graceful_shutdown(shutdown_token.clone().cancelled_owned()),
+            );
+            r4?;
+            r6?;
+        }
+        None => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_token.clone().cancelled_owned())
+                .await?;
+        }
+    }
 
     // OCEAN-301: the drain is now supervised. A wedged, non-cancellable turn
     // handle must never hang the process past a hard ceiling, and a SECOND
@@ -1933,6 +1971,7 @@ fn banner_routes() -> &'static [&'static str] {
         "PATCH /v1/projects/{id}",
         "DELETE /v1/projects/{id}",
         "GET /v1/fs/dirs",
+        "GET /v1/fs/file",
         "GET /v1/model",
         "POST /v1/model",
         "GET /v1/models",
@@ -6880,8 +6919,7 @@ fn expand_tilde(path: &str) -> String {
 /// `/home/user2` passing a `/home/user` sandbox check.
 fn path_is_under(child: &str, parent: &str) -> bool {
     child == parent
-        || (child.starts_with(parent)
-            && child.as_bytes().get(parent.len()) == Some(&b'/'))
+        || (child.starts_with(parent) && child.as_bytes().get(parent.len()) == Some(&b'/'))
 }
 
 /// Canonicalize `path`, mapping the OS error to a short string suitable for
@@ -6890,6 +6928,82 @@ fn try_canonicalize(path: &str) -> Result<String, String> {
     std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| format!("cannot resolve path: {e}"))
+}
+
+/// Structured outcome of resolving an fs-endpoint path against the `$HOME`
+/// sandbox. The resolution logic is shared (`resolve_under_home`); each handler
+/// maps a variant to its own status code so the security-critical sandbox check
+/// lives in exactly one place.
+enum FsResolveError {
+    /// `$HOME` is unset.
+    HomeUnset,
+    /// `$HOME` itself cannot be canonicalized (server misconfig).
+    HomeUnresolved(String),
+    /// The requested path does not exist (canonicalize failed).
+    NotFound(String),
+    /// The requested path resolves outside `$HOME`.
+    OutsideHome { raw: String },
+}
+
+impl FsResolveError {
+    /// Stable message for the `error` JSON field, matching the wording `fs_dirs`
+    /// has always produced.
+    fn message(&self) -> String {
+        match self {
+            Self::HomeUnset => "HOME not set".to_string(),
+            Self::HomeUnresolved(e) => format!("cannot resolve HOME: {e}"),
+            Self::NotFound(e) => format!("path does not exist: {e}"),
+            Self::OutsideHome { raw } => {
+                format!("access denied: {raw} is outside home directory")
+            }
+        }
+    }
+
+    /// Status code `fs_dirs` returns for this error (preserved verbatim from
+    /// the pre-extraction inline handling).
+    fn dirs_status(&self) -> StatusCode {
+        match self {
+            Self::OutsideHome { .. } => StatusCode::FORBIDDEN,
+            Self::NotFound(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Status code `fs/file` returns: 403 outside `$HOME`, 404 for a missing
+    /// file, 500 for a server-side `$HOME` misconfig.
+    fn file_status(&self) -> StatusCode {
+        match self {
+            Self::OutsideHome { .. } => StatusCode::FORBIDDEN,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Resolve `raw` against the shared `$HOME` sandbox used by the fs endpoints:
+/// expand a leading `~`, canonicalize, and require the result to live under
+/// `$HOME`. Returns `(home_canonical, target_canonical)` on success, or a
+/// structured error each handler maps to its own status code. This is the ONE
+/// place the sandbox check is performed — `fs_dirs` and `fs/file` both go
+/// through it.
+fn resolve_under_home(raw: &str) -> Result<(String, std::path::PathBuf), FsResolveError> {
+    let home_raw = std::env::var("HOME").map_err(|_| FsResolveError::HomeUnset)?;
+    let home_canon = std::fs::canonicalize(&home_raw)
+        .map_err(|e| FsResolveError::HomeUnresolved(e.to_string()))?;
+    let home_canon_str = home_canon.to_string_lossy().to_string();
+
+    let expanded = expand_tilde(raw);
+    let target =
+        std::fs::canonicalize(&expanded).map_err(|e| FsResolveError::NotFound(e.to_string()))?;
+
+    let target_str = target.to_string_lossy().to_string();
+    if !path_is_under(&target_str, &home_canon_str) {
+        return Err(FsResolveError::OutsideHome {
+            raw: raw.to_string(),
+        });
+    }
+
+    Ok((home_canon_str, target))
 }
 
 // ---- Projects --------------------------------------------------------------
@@ -6938,8 +7052,7 @@ async fn projects_list(
         .list_projects_page(q.cursor.as_deref(), q.limit)
     {
         Ok(page) => {
-            let mut projects_json: Vec<serde_json::Value> =
-                Vec::with_capacity(page.items.len());
+            let mut projects_json: Vec<serde_json::Value> = Vec::with_capacity(page.items.len());
             for p in &page.items {
                 projects_json.push(enriched_project_json(p).await);
             }
@@ -7120,11 +7233,7 @@ fn parse_worktree_list(raw: &str) -> Vec<ocean_agent::WorktreeInfo> {
             current_path = Some(path.trim().to_string());
         } else if let Some(branch) = trimmed.strip_prefix("branch ") {
             let b = branch.trim();
-            current_branch = Some(
-                b.strip_prefix("refs/heads/")
-                    .unwrap_or(b)
-                    .to_string(),
-            );
+            current_branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
         }
     }
     // Flush last entry if no trailing blank line.
@@ -7245,61 +7354,44 @@ struct FsDirsQuery {
     /// Path to list subdirectories of. Defaults to `$HOME` when omitted.
     #[serde(default)]
     path: Option<String>,
+    /// When truthy (`1`/`true`/`yes`/`on`, parsed like the SSE `?all=` flag),
+    /// the response also includes `files[]` — the regular files in the
+    /// directory (dotfiles INCLUDED; the workspace tree filters client-side).
+    /// Defaults off, in which case `files[]` is omitted entirely.
+    #[serde(default)]
+    files: Option<String>,
 }
 
-/// `GET /v1/fs/dirs?path=` — list subdirectories under a path, sandboxed to
-/// `$HOME`. Dot-directories are skipped; only directories are returned (no
-/// files); alphabetical; `"is_repo"` and `"git_branch"` per entry via pure
-/// filesystem HEAD read. `parent` is the canonical parent directory, `null` at
-/// `$HOME` or the filesystem root.
+/// `GET /v1/fs/dirs?path=&files=1` — list subdirectories under a path,
+/// sandboxed to `$HOME`. Dot-directories are skipped; only directories are
+/// returned under `dirs[]` (alphabetical) with `"is_repo"` and `"git_branch"`
+/// per entry via a pure filesystem HEAD read. `parent` is the canonical parent
+/// directory, `null` at `$HOME` or the filesystem root. With `files=1` the
+/// response also gains `files[]` — the regular files in the directory (dotfiles
+/// INCLUDED), each `{name, path, size}`, sorted by name; `files[]` is omitted
+/// entirely when the flag is unset, so callers that never ask for it see the
+/// same body they always have.
 async fn fs_dirs(
     Query(q): Query<FsDirsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let home_raw = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"ok": false, "error": "HOME not set"})),
-            );
-        }
+    // Default the path to `$HOME`; `resolve_under_home` reports HomeUnset
+    // (→ 500 "HOME not set") when `$HOME` is unset, matching the old behavior.
+    let raw = match q.path {
+        Some(p) => p,
+        None => std::env::var("HOME").unwrap_or_default(),
     };
-    let home_canon = match std::fs::canonicalize(&home_raw) {
-        Ok(p) => p,
+
+    let (home_canon_str, target) = match resolve_under_home(&raw) {
+        Ok(v) => v,
         Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"ok": false, "error": format!("cannot resolve HOME: {e}")})),
-            );
-        }
-    };
-    let home_canon_str = home_canon.to_string_lossy().to_string();
-
-    let raw = q.path.as_deref().unwrap_or(&home_raw);
-    let expanded = expand_tilde(raw);
-
-    // Must exist — canonicalize fails for a non-existent path.
-    let target = match std::fs::canonicalize(&expanded) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"ok": false, "error": format!("path does not exist: {e}")})),
+                e.dirs_status(),
+                Json(json!({"ok": false, "error": e.message()})),
             );
         }
     };
     let target_str = target.to_string_lossy().to_string();
-
-    // Sandbox: the resolved path must be under $HOME.
-    if !path_is_under(&target_str, &home_canon_str) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "ok": false,
-                "error": format!("access denied: {raw} is outside home directory"),
-            })),
-        );
-    }
+    let include_files = query_flag_truthy(q.files.as_deref());
 
     // Parent is null at $HOME or at the filesystem root.
     let parent: Option<String> = if target_str == home_canon_str {
@@ -7312,27 +7404,35 @@ async fn fs_dirs(
     };
 
     let mut dirs: Vec<serde_json::Value> = Vec::new();
+    let mut files: Vec<serde_json::Value> = Vec::new();
     match std::fs::read_dir(&target) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_string();
-                // Skip dot-directories.
-                if name_str.starts_with('.') {
-                    continue;
-                }
                 let path = entry.path();
-                if !path.is_dir() {
-                    continue;
+                if path.is_dir() {
+                    // Dot-directories are skipped (existing behavior).
+                    if name_str.starts_with('.') {
+                        continue;
+                    }
+                    let (is_repo, git_branch) = ocean_agent::git_head_info(&path);
+                    dirs.push(json!({
+                        "name": name_str,
+                        "path": path.to_string_lossy().to_string(),
+                        "is_repo": is_repo,
+                        "git_branch": git_branch,
+                    }));
+                } else if include_files && path.is_file() {
+                    // Regular files — dotfiles INCLUDED; the workspace tree
+                    // filters client-side. `size` falls back to 0 if stat fails.
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    files.push(json!({
+                        "name": name_str,
+                        "path": path.to_string_lossy().to_string(),
+                        "size": size,
+                    }));
                 }
-                let (is_repo, git_branch) = ocean_agent::git_head_info(&path);
-                let path_str = path.to_string_lossy().to_string();
-                dirs.push(json!({
-                    "name": name_str,
-                    "path": path_str,
-                    "is_repo": is_repo,
-                    "git_branch": git_branch,
-                }));
             }
         }
         Err(e) => {
@@ -7344,20 +7444,134 @@ async fn fs_dirs(
     }
 
     dirs.sort_by(|a, b| {
-        a["name"].as_str().unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
+        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
     });
+    files.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+    });
+
+    // Build the response; only attach `files[]` when requested so the no-flag
+    // body is byte-compatible with the pre-existing shape.
+    let mut resp = json!({
+        "ok": true,
+        "path": target_str,
+        "parent": parent,
+        "home": home_canon_str,
+        "dirs": dirs,
+    });
+    if include_files {
+        resp["files"] = json!(files);
+    }
+    (StatusCode::OK, Json(resp))
+}
+
+/// Query for `GET /v1/fs/file`.
+#[derive(Debug, serde::Deserialize)]
+struct FsFileQuery {
+    /// Absolute (or `~`-relative) path of the file to read. Required.
+    path: String,
+}
+
+/// Maximum number of bytes returned in `content`. Reads fetch `cap + 1` bytes
+/// so truncation is detectable without a second syscall; `content` is capped at
+/// exactly `FS_FILE_CAP` lossy-UTF-8 bytes.
+const FS_FILE_CAP: usize = 512 * 1024;
+
+/// Number of leading bytes inspected for a NUL when deciding the file is binary.
+const FS_FILE_BINARY_SNIFF: usize = 8 * 1024;
+
+/// `GET /v1/fs/file?path=<abs>` — read a (small) file sandboxed to `$HOME`,
+/// the same guard `fs_dirs` uses. Returns up to `FS_FILE_CAP` bytes as lossy
+/// UTF-8 text; a NUL byte in the first 8 KiB marks the file binary (empty
+/// content). The response is a uniform envelope `{path, content, truncated,
+/// binary, size, error}` — `error` is `null` on success and the consumer's
+/// success predicate is `error.is_none()` (the daemon does NOT send an `ok`
+/// field on this route). Errors map to 403 (outside `$HOME`) or 404
+/// (missing/unreadable).
+async fn fs_file(
+    Query(q): Query<FsFileQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let raw = q.path;
+    let (_home, target) = match resolve_under_home(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (e.file_status(), Json(fs_file_error_body(&e.message())));
+        }
+    };
+    let target_str = target.to_string_lossy().to_string();
+
+    // Stat first for an honest `size` and a clean 404 when the path is gone.
+    let size = match std::fs::metadata(&target) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(fs_file_error_body(&format!("cannot read file: {e}"))),
+            );
+        }
+    };
+
+    // Read up to cap + 1 bytes: the +1 lets us detect truncation precisely.
+    let mut bytes = match read_capped(&target, FS_FILE_CAP) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(fs_file_error_body(&format!("cannot read file: {e}"))),
+            );
+        }
+    };
+    let truncated = bytes.len() > FS_FILE_CAP;
+
+    // Binary sniff: a NUL anywhere in the first 8 KiB.
+    let sniff_end = bytes.len().min(FS_FILE_BINARY_SNIFF);
+    let binary = bytes[..sniff_end].contains(&0u8);
+
+    let content = if binary {
+        String::new()
+    } else {
+        if bytes.len() > FS_FILE_CAP {
+            bytes.truncate(FS_FILE_CAP);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
 
     (
         StatusCode::OK,
         Json(json!({
-            "ok": true,
             "path": target_str,
-            "parent": parent,
-            "home": home_canon_str,
-            "dirs": dirs,
+            "content": content,
+            "truncated": truncated,
+            "binary": binary,
+            "size": size,
+            "error": null,
         })),
     )
+}
+
+/// Read at most `cap + 1` bytes of `path`. Returns the bytes actually read
+/// (length `0..=cap+1`) so the caller detects truncation via `len > cap`.
+fn read_capped(path: &std::path::Path, cap: usize) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; cap + 1];
+    let n = f.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Uniform error envelope for `fs_file` — every field the success body carries
+/// is present (defaults for the non-error fields) so a single consumer struct
+/// deserializes both success and error and keys off `error.is_none()`.
+fn fs_file_error_body(message: &str) -> serde_json::Value {
+    json!({
+        "path": "",
+        "content": "",
+        "truncated": false,
+        "binary": false,
+        "size": 0,
+        "error": message,
+    })
 }
 
 async fn session(
@@ -8781,7 +8995,14 @@ fn advisor_severity(note: &str) -> &'static str {
         "corrupt",
         "irreversible",
     ];
-    const MILD: &[&str] = &["minor", "nitpick", "consider", "might want", "optional", "cosmetic"];
+    const MILD: &[&str] = &[
+        "minor",
+        "nitpick",
+        "consider",
+        "might want",
+        "optional",
+        "cosmetic",
+    ];
     if BLOCKER.iter().any(|w| lower.contains(w)) {
         "blocker"
     } else if MILD.iter().any(|w| lower.contains(w)) {
@@ -8941,8 +9162,7 @@ async fn agent_turn(
     // or a global flag. W0 only establishes that the profile resolves correctly
     // and logs it; it does NOT yet gate any turn behaviour, so `harness_profile`
     // / `harness_caps` are intentionally unread past this debug line for now.
-    let harness_profile =
-        harness_profile::HarnessProfile::from_client_type(client_type.as_deref());
+    let harness_profile = harness_profile::HarnessProfile::from_client_type(client_type.as_deref());
     let harness_caps = harness_profile.capabilities();
     tracing::debug!(
         client_type = client_type.as_deref().unwrap_or("<none>"),
@@ -11306,9 +11526,15 @@ mod tests {
             advisor_severity("This will break the migration and cause data loss."),
             "blocker"
         );
-        assert_eq!(advisor_severity("You must not drop the table here."), "blocker");
+        assert_eq!(
+            advisor_severity("You must not drop the table here."),
+            "blocker"
+        );
         // Mild/hedged → info.
-        assert_eq!(advisor_severity("Minor nitpick: rename the variable."), "info");
+        assert_eq!(
+            advisor_severity("Minor nitpick: rename the variable."),
+            "info"
+        );
         assert_eq!(advisor_severity("Consider adding a doc comment."), "info");
         // Default → concern.
         assert_eq!(
@@ -11321,7 +11547,10 @@ mod tests {
     fn role_resolution_known_unknown_and_model_id_precedence() {
         let mut roles = std::collections::HashMap::new();
         roles.insert("fast".to_string(), "deepseek/deepseek-chat".to_string());
-        roles.insert("advisor".to_string(), "anthropic/claude-sonnet-4".to_string());
+        roles.insert(
+            "advisor".to_string(),
+            "anthropic/claude-sonnet-4".to_string(),
+        );
 
         // Known role → its alias, no warning.
         assert_eq!(
@@ -11339,7 +11568,10 @@ mod tests {
             (Some("openai/gpt-4o".to_string()), false)
         );
         // Neither → global model.
-        assert_eq!(resolve_effective_model_id(None, None, &roles), (None, false));
+        assert_eq!(
+            resolve_effective_model_id(None, None, &roles),
+            (None, false)
+        );
     }
 
     #[test]
@@ -20609,6 +20841,164 @@ mod tests {
         assert!(!path_is_under("/etc", "/home/user"));
     }
 
+    // ---- fs_dirs / fs_file (home-sandboxed) --------------------------------
+    //
+    // These handlers read `$HOME` from the environment, so the sandbox tests
+    // build their tempdirs *under* the real `$HOME` (via `TempDir::new_in`)
+    // rather than mutating the env — that keeps them race-free against the
+    // `expand_tilde` tests above, which read `HOME` without a lock.
+
+    /// A fresh tempdir created directly under the current `$HOME`, so the home
+    /// sandbox admits it without touching the process environment.
+    fn home_tempdir() -> tempfile::TempDir {
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let home =
+            std::fs::canonicalize(&home).unwrap_or_else(|_| std::path::PathBuf::from(home));
+        tempfile::TempDir::new_in(&home).expect("tempdir under $HOME")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_file_reads_text_under_home() {
+        let dir = home_tempdir();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "hello ocean\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery { path })).await;
+        assert_eq!(status, StatusCode::OK);
+        // No `ok` field on the fs/file envelope — the predicate is error.is_none().
+        assert!(resp.get("ok").is_none());
+        assert!(resp["error"].is_null());
+        assert_eq!(resp["content"].as_str().unwrap(), "hello ocean\n");
+        assert!(!resp["binary"].as_bool().unwrap());
+        assert!(!resp["truncated"].as_bool().unwrap());
+        assert_eq!(resp["size"].as_u64().unwrap(), 12);
+        assert!(resp["path"].as_str().unwrap().ends_with("note.txt"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_file_rejects_path_outside_home() {
+        // The default tempdir lives under `$TMPDIR` (outside `$HOME`) → 403.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret.txt");
+        std::fs::write(&file, "top secret").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery { path })).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            resp["error"].as_str().unwrap().contains("outside home directory"),
+            "unexpected error: {resp}"
+        );
+        assert_eq!(resp["content"].as_str().unwrap(), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_file_detects_binary_via_nul_sniff() {
+        let dir = home_tempdir();
+        let file = dir.path().join("blob.bin");
+        // A NUL byte within the first 8 KiB ⇒ binary, content emptied.
+        std::fs::write(&file, b"abc\x00def").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery { path })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp["binary"].as_bool().unwrap());
+        assert_eq!(resp["content"].as_str().unwrap(), "");
+        assert!(resp["error"].is_null());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_file_truncates_past_cap_and_reports_true_size() {
+        let dir = home_tempdir();
+        let over = FS_FILE_CAP + 1;
+        let file = dir.path().join("big.txt");
+        std::fs::write(&file, "a".repeat(over)).unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery { path })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp["truncated"].as_bool().unwrap());
+        // content is capped at exactly FS_FILE_CAP lossy bytes.
+        assert_eq!(resp["content"].as_str().unwrap().len(), FS_FILE_CAP);
+        // size reports the true on-disk length, not the truncated read.
+        assert_eq!(resp["size"].as_u64().unwrap(), over as u64);
+
+        // Boundary: exactly cap bytes ⇒ NOT truncated, full content returned.
+        let exact = dir.path().join("exact.txt");
+        std::fs::write(&exact, "a".repeat(FS_FILE_CAP)).unwrap();
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery {
+            path: exact.to_string_lossy().to_string(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!resp["truncated"].as_bool().unwrap());
+        assert_eq!(resp["content"].as_str().unwrap().len(), FS_FILE_CAP);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_file_missing_path_is_404() {
+        let dir = home_tempdir();
+        let missing = dir.path().join("does-not-exist.txt");
+        let path = missing.to_string_lossy().to_string();
+
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery { path })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            resp["error"].as_str().unwrap().contains("path does not exist"),
+            "unexpected error: {resp}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_dirs_files_flag_lists_regular_files_including_dotfiles() {
+        let dir = home_tempdir();
+        // One regular file, one dotfile, one nested directory, one dot-directory.
+        std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+        std::fs::write(dir.path().join(".envrc"), "b").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        // files=1: files[] present, sorted, dotfile included; dirs[] still
+        // skips dot-directories.
+        let (status, Json(resp)) = fs_dirs(Query(FsDirsQuery {
+            path: Some(path.clone()),
+            files: Some("1".into()),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let files = resp["files"].as_array().expect("files[] present");
+        let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec![".envrc", "alpha.txt"], "sorted, dotfile included");
+        // Each file entry is exactly {name, path, size}.
+        for f in files {
+            let obj = f.as_object().unwrap();
+            assert_eq!(obj.len(), 3, "file entry must be exactly {{name, path, size}}");
+            assert!(obj.contains_key("name"));
+            assert!(obj.contains_key("path"));
+            assert!(obj.contains_key("size"));
+        }
+        assert_eq!(files[0]["size"].as_u64().unwrap(), 1, ".envrc is 1 byte");
+        assert_eq!(files[1]["size"].as_u64().unwrap(), 1, "alpha.txt is 1 byte");
+
+        let dirs = resp["dirs"].as_array().expect("dirs[] present");
+        let dir_names: Vec<&str> =
+            dirs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert_eq!(dir_names, vec!["sub"], ".hidden skipped, only sub");
+        assert!(dirs[0].get("is_repo").is_some());
+        assert!(dirs[0].get("git_branch").is_some());
+
+        // files[] omitted entirely when the flag is absent — byte-compatible
+        // with the pre-existing body.
+        let (status, Json(resp)) =
+            fs_dirs(Query(FsDirsQuery { path: Some(path), files: None })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp.get("files").is_none(), "files[] must be absent without files=1");
+        assert_eq!(resp["dirs"].as_array().unwrap().len(), 1);
+    }
+
     // ---- Project create: mkdir-on-create ------------------------------------
 
     /// Creating a project with a workspace_root that doesn't exist yet succeeds
@@ -20749,7 +21139,10 @@ branch refs/heads/bug-fix
 
         // The pre-existing file must survive untouched.
         let after = std::fs::read_to_string(&readme).unwrap();
-        assert_eq!(after, original, "project_create must not modify pre-existing files");
+        assert_eq!(
+            after, original,
+            "project_create must not modify pre-existing files"
+        );
 
         std::env::remove_var("OCEAN_YOLO");
     }
