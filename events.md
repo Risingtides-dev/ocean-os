@@ -1889,3 +1889,11 @@ area:      frontend
 
 Session rail is now a two-level tree: directory nodes (main checkout / worktree dirs, blue) contain branch nodes (cyan) contain sessions — breadcrumbed like the file explorer, per John's ask to nest branches under the directory they relate to. Root checkout displays as the project folder name instead of "main" (which now reads as a branch). Legacy pre-git_branch records bucket under a "(no branch)" pseudo-branch inside their dir. + new on a dir header roots at the dir; on a branch header at the branch's newest session cwd. Expansion (dir keys + dir/branch composite keys) survives rescans; most-recent dir and its most-recent branch open by default. Suite 156/0.
 _________________________________________________________________________________
+time:      [2:50am] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      frontend
+
+Fixed John's "tool calls printing massive outputs": collapsed tool cards capped line COUNT (3-row tail) but not line LENGTH, and the transcript Paragraph wraps — so a tool returning one giant single-line blob (JSON from recall/lsp/MCP results) wrapped into hundreds of rows, defeating the tail window. Collapsed cards now clamp each tail line to one screen row (char-truncate + ellipsis, whitespace preserved — new clamp_line, distinct from one_line which flattens indentation); ⌃O still opts into full wrapped output. Suite 157/0.
+_________________________________________________________________________________

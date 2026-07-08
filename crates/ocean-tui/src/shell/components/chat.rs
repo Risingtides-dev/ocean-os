@@ -201,6 +201,21 @@ fn one_line(s: &str, max: usize) -> String {
     }
 }
 
+/// Truncate a single line to `max` chars with an ellipsis, preserving internal
+/// whitespace (unlike [`one_line`], which flattens it — wrong for tool-output
+/// previews where indentation is signal). Used by collapsed tool cards so each
+/// tail line costs exactly one screen row: without this, a tool returning one
+/// giant single-line blob (JSON from recall/lsp/MCP results) wraps into
+/// hundreds of rows and defeats the tail window entirely.
+fn clamp_line(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}{}", g("…", "..."))
+    } else {
+        s.to_string()
+    }
+}
+
 impl ChatComponent {
     /// Construct the chat surface with prompt history loaded from disk (for
     /// ↑/↓ recall and ⌃R search). `Default` leaves history empty — used in
@@ -1318,6 +1333,9 @@ impl Component for ChatComponent {
         // the loop can read turns while `md.render` mutates its cache.
         let md = &mut self.md;
         let tools_expanded = self.tools_expanded;
+        // Collapsed tool-card tail lines clamp to one screen row each (gutter
+        // "    │ " = 6 cols + 1 spare); ⌃O opts into full wrapped output.
+        let clamp_w = (body.width as usize).saturating_sub(7);
         let mut lines: Vec<Line> = Vec::new();
         for turn in &self.turns {
             match turn {
@@ -1457,13 +1475,21 @@ impl Component for ChatComponent {
                                     body.len().saturating_sub(TOOL_TAIL_ROWS)
                                 };
                                 for l in &body[hidden..] {
+                                    // Collapsed: one screen row per line, hard
+                                    // stop — a single giant line (JSON blobs)
+                                    // must not wrap into a wall. ⌃O shows all.
+                                    let text = if tools_expanded {
+                                        l.to_string()
+                                    } else {
+                                        clamp_line(l, clamp_w)
+                                    };
                                     lines.push(Line::from(vec![
                                         Span::styled(
                                             format!("    {} ", g("│", "|")),
                                             Style::default().fg(theme::EDGE),
                                         ),
                                         Span::styled(
-                                            l.to_string(),
+                                            text,
                                             Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
                                         ),
                                     ]));
@@ -1722,6 +1748,19 @@ mod tests {
         assert!(chat.tools_expanded);
         chat.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(!chat.tools_expanded);
+    }
+
+    #[test]
+    fn clamp_line_truncates_but_preserves_whitespace() {
+        // Unlike one_line, indentation must survive — it's signal in tool
+        // output previews.
+        assert_eq!(clamp_line("  indented ok", 40), "  indented ok");
+        // A giant single line hard-stops at max chars (one screen row), with
+        // an ellipsis marking the cut.
+        let blob = "x".repeat(500);
+        let clamped = clamp_line(&blob, 40);
+        assert_eq!(clamped.chars().count(), 40);
+        assert!(clamped.ends_with('…'));
     }
 
     #[test]
