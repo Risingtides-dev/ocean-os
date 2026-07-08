@@ -1,0 +1,201 @@
+//! Ocean OAuth 2.0 + PKCE login.
+//!
+//! Binds a localhost callback server, builds the provider's authorize URL for
+//! the caller to open in a browser, catches the redirect, exchanges the
+//! authorization code for tokens, and writes the credential block into Ocean's
+//! auth file in the exact shape [`ocean_providers`] (and the turn-time refresh
+//! pass in `ocean-agent`) already consume.
+//!
+//! This crate performs fresh logins only — token refresh already exists
+//! (`ocean-agent::oauth_refresh`) and reuses the block shape written here.
+
+mod pkce;
+mod providers;
+mod server;
+mod store;
+mod util;
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Result};
+
+use providers::{bind_spec, build_authorize_url, build_block, consts, exchange};
+use server::{CallbackResult, CallbackServer};
+
+/// Browser-callback grace period before a pending login is abandoned.
+const FLOW_TIMEOUT_SECS: u64 = 300;
+
+/// Environment override for the Anthropic (Claude) token endpoint. Matches the
+/// same variable `ocean-agent::oauth_refresh` honors, so a test or operator can
+/// point both the login and the refresh pass at a shared mock/issuer.
+const ENV_ANTHROPIC_TOKEN_URL: &str = "OCEAN_OAUTH_ANTHROPIC_TOKEN_URL";
+/// Environment override for the OpenAI Codex token endpoint. See
+/// [`ENV_ANTHROPIC_TOKEN_URL`].
+const ENV_OPENAI_TOKEN_URL: &str = "OCEAN_OAUTH_OPENAI_TOKEN_URL";
+
+/// The provider whose OAuth flow is being driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthProvider {
+    /// Anthropic — Claude Pro/Max subscription (`claude-code` auth block).
+    Claude,
+    /// OpenAI Codex — ChatGPT plan (`openai-codex` auth block).
+    Codex,
+}
+
+impl OAuthProvider {
+    /// Short human-facing identifier: `"claude"` or `"codex"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            OAuthProvider::Claude => "claude",
+            OAuthProvider::Codex => "codex",
+        }
+    }
+
+    /// Key under which this provider's block is stored in Ocean's auth JSON:
+    /// `"claude-code"` or `"openai-codex"`.
+    pub fn auth_json_key(self) -> &'static str {
+        match self {
+            OAuthProvider::Claude => "claude-code",
+            OAuthProvider::Codex => "openai-codex",
+        }
+    }
+
+    fn token_url_env(self) -> &'static str {
+        match self {
+            OAuthProvider::Claude => ENV_ANTHROPIC_TOKEN_URL,
+            OAuthProvider::Codex => ENV_OPENAI_TOKEN_URL,
+        }
+    }
+}
+
+/// A login in progress: the callback server is bound and the authorize URL is
+/// ready to open. Call [`LoginSession::finish`] to await the browser callback,
+/// exchange the code, and persist the credential.
+pub struct LoginSession {
+    /// Full authorize URL — open this in the browser.
+    pub authorize_url: String,
+    /// `http://localhost:{port}/launch` — a short copy/paste target that 302s
+    /// to [`LoginSession::authorize_url`] (survives TUI viewport truncation).
+    pub launch_url: String,
+    provider: OAuthProvider,
+    server: CallbackServer,
+    verifier: String,
+    redirect_uri: String,
+    auth_path: PathBuf,
+    /// Token endpoint override (from the per-provider env var); `None` falls
+    /// back to the provider's public default. Read once at [`begin`] time.
+    token_url_override: Option<String>,
+}
+
+/// Result of a completed login.
+#[derive(Debug)]
+pub struct LoginOutcome {
+    /// The provider that was logged in.
+    pub provider: OAuthProvider,
+    /// The auth file the credential block was written to.
+    pub auth_file: PathBuf,
+    /// Absolute expiry of the access token, in milliseconds since the Unix
+    /// epoch (matches the `expires` field consumed by `ocean_providers`).
+    pub expires_ms: i64,
+    /// Account identifier carried by the token, when available
+    /// (`account.uuid` for Claude, the JWT `chatgpt_account_id` for Codex).
+    pub account_id: Option<String>,
+}
+
+/// Resolve the Ocean auth file path: an explicit argument wins, otherwise the
+/// configured environment location (`ocean_providers::ProviderEnv`).
+fn resolve_auth_path(auth_file: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = auth_file {
+        return Ok(path);
+    }
+    ocean_providers::ProviderEnv::from_process()
+        .auth_file
+        .ok_or_else(|| anyhow!("no Ocean auth file configured (set OCEAN_AUTH_FILE)"))
+}
+
+/// Read the per-provider token-endpoint override from the environment, if any.
+/// An empty value is treated as unset.
+fn env_token_url(provider: OAuthProvider) -> Option<String> {
+    std::env::var(provider.token_url_env())
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Bind the callback server and build the authorize URL. Does NOT open a
+/// browser — the caller decides how to present [`LoginSession::authorize_url`]
+/// / [`LoginSession::launch_url`].
+pub async fn begin(provider: OAuthProvider, auth_file: Option<PathBuf>) -> Result<LoginSession> {
+    let pkce_pair = pkce::generate();
+    let state = pkce::generate_state();
+    let auth_path = resolve_auth_path(auth_file)?;
+    let token_url_override = env_token_url(provider);
+
+    let spec = bind_spec(provider);
+    let server = CallbackServer::bind(&spec, state.clone()).await?;
+    let redirect_uri = server.redirect_uri.clone();
+    let launch_url = server.launch_url.clone();
+    let authorize_url =
+        build_authorize_url(provider, &state, &pkce_pair.challenge, &redirect_uri);
+    server.set_pending_url(authorize_url.clone());
+
+    Ok(LoginSession {
+        authorize_url,
+        launch_url,
+        provider,
+        server,
+        verifier: pkce_pair.verifier,
+        redirect_uri,
+        auth_path,
+        token_url_override,
+    })
+}
+
+impl LoginSession {
+    /// Await the browser callback (300s timeout), exchange the authorization
+    /// code for tokens, and persist the credential block. Consumes the session;
+    /// the callback server shuts down on return.
+    pub async fn finish(mut self) -> Result<LoginOutcome> {
+        let callback = match tokio::time::timeout(
+            Duration::from_secs(FLOW_TIMEOUT_SECS),
+            self.server.next_result(),
+        )
+        .await
+        {
+            Ok(resolved) => resolved?,
+            Err(_elapsed) => {
+                bail!("login timed out waiting for browser callback after {FLOW_TIMEOUT_SECS}s")
+            }
+        };
+        // `/launch` is no longer active once the flow has resolved.
+        self.server.clear_pending();
+
+        let (code, state) = match callback {
+            CallbackResult::Ok { code, state } => (code, state),
+            CallbackResult::Err(message) => bail!("{message}"),
+        };
+
+        let token_url = self
+            .token_url_override
+            .as_deref()
+            .unwrap_or_else(|| consts(self.provider).token_url);
+        let token = exchange(
+            self.provider,
+            token_url,
+            &code,
+            &state,
+            &self.redirect_uri,
+            &self.verifier,
+        )
+        .await?;
+        let block = build_block(self.provider, &token);
+        store::merge_and_write(&self.auth_path, self.provider.auth_json_key(), block)?;
+
+        Ok(LoginOutcome {
+            provider: self.provider,
+            auth_file: self.auth_path.clone(),
+            expires_ms: token.expires_ms,
+            account_id: token.account_id,
+        })
+    }
+}

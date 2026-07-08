@@ -63,20 +63,6 @@ fn max_term_h(center_h: u16) -> u16 {
         .max(MIN_TERM_H)
 }
 
-fn login_url(target: LoginTarget) -> &'static str {
-    match target {
-        LoginTarget::Claude => "https://claude.ai/login",
-        LoginTarget::Codex => "https://chatgpt.com/auth/login",
-    }
-}
-
-fn login_label(target: LoginTarget) -> &'static str {
-    match target {
-        LoginTarget::Claude => "Claude",
-        LoginTarget::Codex => "Codex",
-    }
-}
-
 /// What the center surface is showing (CTRL swaps editor↔graph the same way).
 #[derive(Clone, Copy, PartialEq)]
 enum Center {
@@ -113,6 +99,10 @@ pub struct App {
     /// kept pumping a stale session's events into the chat).
     stream_task: Option<tokio::task::JoinHandle<()>>,
     status: String,
+    /// True while a `/login` OAuth flow is running off-thread. A second
+    /// `/login` while set is rejected with a busy status instead of racing a
+    /// second callback server / browser launch.
+    login_in_flight: bool,
     should_quit: bool,
     actions_tx: mpsc::UnboundedSender<Action>,
     actions_rx: mpsc::UnboundedReceiver<Action>,
@@ -182,6 +172,7 @@ impl App {
             model_override: None,
             stream_task: None,
             status: "connecting…".into(),
+            login_in_flight: false,
             should_quit: false,
             actions_tx,
             actions_rx,
@@ -672,22 +663,66 @@ impl App {
                 self.model_override = Some(id.clone());
                 self.status = format!("model → {id}");
             }
-            // `/login [claude|codex]`: open provider login in the browser
-            // off-thread so the TUI never blocks on browser/OS integration.
+            // `/login [claude|codex]`: run the REAL OAuth flow off-thread
+            // (begin → browser → token exchange → persist) so the TUI never
+            // blocks on the callback server or browser/OS integration. A second
+            // `/login` while one is already running is rejected with a busy
+            // status instead of racing a second callback server.
             Action::Login(target) => {
-                let tx = self.actions_tx.clone();
-                let target = *target;
-                tokio::spawn(async move {
-                    let label = login_label(target);
-                    let url = login_url(target);
-                    let msg = match open::that(url) {
-                        Ok(()) => format!(
-                            "opened {label} login in browser; after auth, restart daemon or reselect model if readiness still shows missing credential"
-                        ),
-                        Err(e) => format!("could not open {label} login: {e}"),
+                if self.login_in_flight {
+                    self.status = "login already in progress".into();
+                } else {
+                    self.login_in_flight = true;
+                    let tx = self.actions_tx.clone();
+                    let provider = match *target {
+                        LoginTarget::Claude => ocean_oauth::OAuthProvider::Claude,
+                        LoginTarget::Codex => ocean_oauth::OAuthProvider::Codex,
                     };
-                    let _ = tx.send(Action::Status(msg));
-                });
+                    tokio::spawn(async move {
+                        let label = provider.label();
+                        let session = match ocean_oauth::begin(provider, None).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = tx.send(Action::LoginDone(format!(
+                                    "{label} login failed: {e}"
+                                )));
+                                return;
+                            }
+                        };
+                        let _ = tx.send(Action::Status(format!(
+                            "{label} login: complete auth in your browser (or open {})",
+                            session.launch_url
+                        )));
+                        if open::that(&session.authorize_url).is_err() {
+                            let _ = tx.send(Action::Status(format!(
+                                "browser did not open — visit {}",
+                                session.launch_url
+                            )));
+                        }
+                        let msg = match session.finish().await {
+                            Ok(outcome) => {
+                                // Measure remaining TTL from when the token was
+                                // actually issued (after browser auth), not from
+                                // before finish() — else the auth duration is
+                                // counted as still-valid time.
+                                let now_ms = chrono::Utc::now().timestamp_millis();
+                                let h = ((outcome.expires_ms - now_ms) / 3_600_000).max(0);
+                                format!(
+                                    "{label} login complete — credential saved (expires in ~{h}h); /ready picks it up on next poll"
+                                )
+                            }
+                            Err(e) => format!("{label} login failed: {e}"),
+                        };
+                        let _ = tx.send(Action::LoginDone(msg));
+                    });
+                }
+            }
+            // `/login` finished (success or failure): the spawned flow emits
+            // `LoginDone` carrying the final message. Lands it in the status
+            // line and clears the `login_in_flight` guard for the next attempt.
+            Action::LoginDone(msg) => {
+                self.status = msg.clone();
+                self.login_in_flight = false;
             }
             // `/settings`: open the modal settings overlay.
             Action::OpenSettings => {
@@ -1331,4 +1366,66 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     child.wait().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    /// Build an `App` against a throwaway workspace root so `App::new`'s
+    /// auto-resume finds no session and never spawns a network stream — keeping
+    /// these `/login` dispatch tests fully offline (no daemon, no browser, no
+    /// OAuth callback). `DaemonClient::new` only builds a `reqwest::Client`; it
+    /// does not connect.
+    fn offline_app() -> App {
+        let client = DaemonClient::new("http://127.0.0.1:1")
+            .expect("DaemonClient builds without connecting");
+        let root = std::env::temp_dir().join(format!(
+            "ocean-tui-login-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        App::new(client, root.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn login_done_sets_status_and_clears_in_flight() {
+        let mut app = offline_app();
+        app.login_in_flight = true;
+        app.status = "pending".into();
+
+        app.dispatch(Action::LoginDone("claude login complete".into()));
+
+        assert_eq!(app.status, "claude login complete");
+        assert!(
+            !app.login_in_flight,
+            "LoginDone must clear the in-flight guard"
+        );
+    }
+
+    #[test]
+    fn login_while_in_flight_reports_busy_without_spawning() {
+        let mut app = offline_app();
+        app.login_in_flight = true;
+        // Drain anything `App::new` may have queued before the assertion.
+        while app.actions_rx.try_recv().is_ok() {}
+
+        app.dispatch(Action::Login(LoginTarget::Claude));
+
+        assert_eq!(app.status, "login already in progress");
+        assert!(
+            app.login_in_flight,
+            "guard must stay set while a login is in flight"
+        );
+        // The busy guard must NOT spawn the OAuth flow — nothing is emitted.
+        assert!(matches!(
+            app.actions_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
 }

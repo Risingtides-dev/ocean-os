@@ -31,6 +31,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 | `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
 | `ocean-lsp` | Code intelligence: the `lsp` tool over auto-detected workspace language servers |
 | `ocean-memory` | Typed SQLite memory store and ingest helpers |
+| `ocean-oauth` | Browser OAuth + PKCE login flows (Claude/Codex); writes Ocean auth-file blocks |
 | `ocean-daemon` | Long-running HTTP service on `:4780` |
 | `ocean-cli` | CLI client |
 | `ocean-tui` | Terminal steering cockpit (`ocean` binary) |

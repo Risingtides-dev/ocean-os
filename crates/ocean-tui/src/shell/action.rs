@@ -68,6 +68,10 @@ pub enum Action {
     SetModel(String),
     /// `/login [claude|codex]` — open a browser login flow for provider OAuth.
     Login(LoginTarget),
+    /// Terminal status of an async `/login` OAuth flow (begin → browser → token
+    /// exchange). Lands the final success/failure message in the status line and
+    /// clears the `login_in_flight` guard so a fresh login can start.
+    LoginDone(String),
     /// `/settings` — open the app's settings overlay (panel toggles, dock
     /// height, live session info).
     OpenSettings,

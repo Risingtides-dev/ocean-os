@@ -23,6 +23,7 @@ members = [
   "crates/ocean-context",
   "crates/ocean-memory",
   "crates/ocean-hashline",
+  "crates/ocean-oauth",
   "xtask",
 ]
 # xtask is a dev-only task runner (the cargo-xtask pattern). It compiles under
@@ -53,6 +54,7 @@ default-members = [
   "crates/ocean-context",
   "crates/ocean-memory",
   "crates/ocean-hashline",
+  "crates/ocean-oauth",
 ]
 resolver = "2"
 
@@ -111,3 +113,7 @@ ocean-memory = { path = "crates/ocean-memory" }
 tree-sitter = "=0.26.9"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-typescript = "=0.23.2"
+sha2 = "0.10"
+getrandom = "0.3"
+ocean-oauth = { path = "crates/ocean-oauth" }
+parking_lot = "0.12"
