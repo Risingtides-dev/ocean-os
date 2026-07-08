@@ -113,6 +113,9 @@ impl AgentTool for ReadTool {
     fn name(&self) -> &str {
         "read"
     }
+    fn concurrency(&self) -> crate::types::Concurrency {
+        crate::types::Concurrency::Shared
+    }
     fn description(&self) -> &str {
         "Read the contents of a file from disk. Returns text content with optional line numbers."
     }

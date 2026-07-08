@@ -30,6 +30,9 @@ impl AgentTool for GlobTool {
     fn name(&self) -> &str {
         "glob"
     }
+    fn concurrency(&self) -> crate::types::Concurrency {
+        crate::types::Concurrency::Shared
+    }
     fn description(&self) -> &str {
         "Expand a glob pattern (e.g. 'src/**/*.rs') and return matching paths."
     }

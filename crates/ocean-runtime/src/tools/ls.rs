@@ -32,6 +32,9 @@ impl AgentTool for LsTool {
     fn name(&self) -> &str {
         "ls"
     }
+    fn concurrency(&self) -> crate::types::Concurrency {
+        crate::types::Concurrency::Shared
+    }
     fn description(&self) -> &str {
         "List entries in a directory. Returns name and kind (file/dir/symlink)."
     }

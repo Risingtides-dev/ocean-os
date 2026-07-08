@@ -14,6 +14,9 @@ impl AgentTool for WebFetchTool {
     fn name(&self) -> &str {
         "web_fetch"
     }
+    fn concurrency(&self) -> crate::types::Concurrency {
+        crate::types::Concurrency::Shared
+    }
     fn description(&self) -> &str {
         "Fetch a URL via HTTPS and return a text-only excerpt of the response body. Use for documentation pages, GitHub READMEs, status checks, etc."
     }

@@ -324,18 +324,38 @@ pub async fn run_agent_with_history(
             break 'outer;
         }
 
-        let mut any_terminate = false;
+        // Execute this batch of tool calls. Two phases (OCEAN — parallel tools):
+        //
+        // 1. Permission (SEQUENTIAL): a permission check may prompt the user, so
+        //    the batch is gated one call at a time, in order — two concurrent
+        //    interactive prompts would race the user. Each call resolves to
+        //    either "run" or "denied" (with a ready synthetic error result).
+        //
+        // 2. Execution (SCHEDULED): the gated batch is walked in order and split
+        //    into segments — a maximal run of consecutive `Shared` (read-only)
+        //    calls forms ONE segment executed concurrently; every `Exclusive`
+        //    call, unknown tool, or denied slot is its own singleton. Segments
+        //    run sequentially, so an `Exclusive` tool is a full barrier:
+        //    everything before it finishes, it runs alone, everything after
+        //    waits. This fans out the read-heavy common case (several
+        //    read/grep/glob in one batch) while never racing a mutating tool
+        //    against a neighbour. Mirrors oh-my-pi's `executeToolCalls`.
+        //
+        // Transcript order is ALWAYS the original batch order: results are
+        // emitted and pushed in index order regardless of which finished first,
+        // so the persisted tool_use/tool_result pairing stays deterministic and
+        // provider-valid. `ToolExecutionStart` is still emitted only for calls
+        // that actually run (never a denied one — OCEAN-60), and every Start is
+        // paired with a `ToolExecutionEnd`.
+
+        // Phase 1 — permission gate, in order.
+        let mut gated: Vec<Gated> = Vec::with_capacity(tool_calls.len());
         for (id, name, args) in tool_calls {
-            // Permission gate (only for tools that require it, and only once
-            // per name per run if the user said "allow session").
-            //
-            // ToolExecutionStart MUST be emitted *after* this gate (OCEAN-60):
-            // a denied tool takes the `Deny` arm's `continue` below and never
-            // reaches the Start emit, so it never produces a Start-without-End
-            // orphan on the event stream. Only tools that are actually about to
-            // run emit Start, and every Start is paired with a ToolExecutionEnd.
-            let tool_obj = tool_index.get(&name);
-            let needs_perm = tool_obj.map(|t| t.requires_permission()).unwrap_or(false)
+            let tool_obj = tool_index.get(&name).cloned();
+            let needs_perm = tool_obj
+                .as_ref()
+                .map(|t| t.requires_permission())
+                .unwrap_or(false)
                 && !session_allowed.contains(&name);
             if needs_perm {
                 match config.permission.check(&name, &args).await {
@@ -352,182 +372,108 @@ pub async fn run_agent_with_history(
                                 reason: reason.clone(),
                             },
                         );
-                        let tr = ToolResultMessage {
-                            tool_call_id: id,
-                            tool_name: name,
-                            content: vec![Content::text(format!("permission denied: {reason}"))],
-                            is_error: true,
-                            timestamp: ocean_protocol::now_ms(),
-                        };
-                        messages.push(Message::ToolResult(tr));
+                        gated.push(Gated::Denied { id, name, reason });
                         continue;
                     }
                 }
             }
+            let shared = tool_obj
+                .as_ref()
+                .map(|t| t.concurrency() == crate::types::Concurrency::Shared)
+                .unwrap_or(false);
+            gated.push(Gated::Run {
+                id,
+                name,
+                args,
+                tool: tool_obj,
+                shared,
+            });
+        }
 
-            emit(
-                &events,
-                AgentEvent::ToolExecutionStart {
-                    session_id: sid.clone(),
+        // Phase 2 — execute in original order, fanning out consecutive Shared
+        // runs into one concurrent segment each.
+        let mut any_terminate = false;
+        let mut i = 0usize;
+        while i < gated.len() {
+            // A denied slot never executes: emit nothing new (PermissionDenied
+            // already fired) and drop its ready error result in place so the
+            // transcript stays call/result-paired.
+            if let Gated::Denied { id, name, reason } = &gated[i] {
+                let tr = ToolResultMessage {
                     tool_call_id: id.clone(),
                     tool_name: name.clone(),
-                    args: args.clone(),
-                },
-            );
-            let (content, is_error, terminate, side_effects, details) = match tool_obj {
-                // Race tool execution against cancellation (OCEAN-116). A
-                // long-running tool (slow bash, a network call that hangs) would
-                // otherwise block the loop until it completed even if the user
-                // cancelled the turn — the mid-stream check (OCEAN-57) only fires
-                // between provider chunks, never while a tool is in flight. We
-                // select between the tool future and the same `StreamOptions::cancel`
-                // token the rest of the loop reads: if cancellation wins we drop
-                // the tool future (which stops polling it — no task leak) and
-                // unwind the run with `AgentError::Cancelled`.
-                Some(tool) => {
-                    // Per-tool span (OCEAN-274): a `tool_exec` child of this
-                    // round's span, tagging the tool name and call id so a tool
-                    // hop is followable as turn → round → tool_exec. Parented
-                    // explicitly to `round_span` (the ambient span here is the
-                    // `agent_loop`, not the round). Only the name and id are
-                    // recorded — `args` are deliberately NOT a span field (they
-                    // can carry file contents, prompts, or secrets).
-                    let tool_span = tracing::info_span!(
-                        parent: &round_span,
-                        "tool_exec",
-                        tool_name = %name,
-                        tool_call_id = %id
-                    );
-                    let exec = tool.execute(&id, args).instrument(tool_span);
-                    tokio::select! {
-                        biased;
-                        () = cancelled(config) => {
-                            // Cancellation fired while the tool was running. The
-                            // ToolExecutionStart emitted above has no paired End,
-                            // but the whole turn is being torn down: the caller
-                            // sees a clean `Cancelled` and discards the run.
-                            return Err(AgentError::Cancelled);
-                        }
-                        result = exec => match result {
-                            Ok(AgentToolResult {
-                                content,
-                                details,
-                                terminate,
-                                side_effects,
-                            }) => (content, false, terminate, side_effects, details),
-                            Err(e) => (
-                                vec![Content::text(format!("tool error: {e}"))],
-                                true,
-                                false,
-                                Vec::new(),
-                                Value::Null,
-                            ),
-                        },
-                    }
-                }
-                None => (
-                    vec![Content::text(format!("unknown tool: {name}"))],
-                    true,
-                    false,
-                    Vec::new(),
-                    Value::Null,
-                ),
-            };
-            if terminate {
-                any_terminate = true;
+                    content: vec![Content::text(format!("permission denied: {reason}"))],
+                    is_error: true,
+                    timestamp: ocean_protocol::now_ms(),
+                };
+                messages.push(Message::ToolResult(tr));
+                i += 1;
+                continue;
             }
-            emit(
-                &events,
-                AgentEvent::ToolExecutionEnd {
-                    session_id: sid.clone(),
-                    tool_call_id: id.clone(),
-                    tool_name: name.clone(),
-                    is_error,
-                    content: content.clone(),
-                    details: details.clone(),
-                },
-            );
-            // Emit any side-effect events the tool requested (render, unmount, etc.)
-            for effect in &side_effects {
-                match effect {
-                    ToolSideEffect::Render {
-                        id,
-                        kind,
-                        props,
-                        replace,
-                    } => {
-                        emit(
-                            &events,
-                            AgentEvent::Render {
-                                session_id: sid.clone(),
-                                id: id.clone(),
-                                kind: kind.clone(),
-                                props: props.clone(),
-                                replace: *replace,
-                            },
-                        );
-                    }
-                    ToolSideEffect::Unmount { id } => {
-                        emit(
-                            &events,
-                            AgentEvent::Unmount {
-                                session_id: sid.clone(),
-                                id: id.clone(),
-                            },
-                        );
-                    }
-                    ToolSideEffect::BrowserActivity { active } => {
-                        emit(
-                            &events,
-                            AgentEvent::BrowserActivity {
-                                session_id: sid.clone(),
-                                active: *active,
-                            },
-                        );
-                    }
-                    ToolSideEffect::SurfacePatch { canvas_id, patches } => {
-                        // Slice 3: forward the validated patches onto the event
-                        // bus stamped with this run's session id. The daemon's
-                        // SSE bridge wraps each patch in a `SurfacePatchEnvelope`
-                        // and relays it as `AgentTurnEvent::SurfacePatch` over
-                        // `/v1/agent/events`, scoped to `session_id`.
-                        emit(
-                            &events,
-                            AgentEvent::SurfacePatch {
-                                session_id: sid.clone(),
-                                canvas_id: canvas_id.clone(),
-                                patches: patches.clone(),
-                            },
-                        );
-                    }
-                    ToolSideEffect::SlackCanvas { op } => {
-                        // OCEAN-214 ph2: forward the validated slack_canvas op onto
-                        // the event bus stamped with this run's session id. The
-                        // Slack canvas bridge (a later phase) consumes it and
-                        // round-trips to the Slack Canvas API.
-                        emit(
-                            &events,
-                            AgentEvent::SlackCanvas {
-                                session_id: sid.clone(),
-                                op: op.clone(),
-                            },
-                        );
-                    }
+
+            // A shared run: gather the maximal run of consecutive Shared calls.
+            // An exclusive/unknown call yields a segment of exactly one.
+            let start = i;
+            let is_shared = matches!(gated[i], Gated::Run { shared: true, .. });
+            if is_shared {
+                while i < gated.len() && matches!(gated[i], Gated::Run { shared: true, .. }) {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            let segment = &gated[start..i];
+
+            // Emit Start for every member (in order), then run the whole segment
+            // concurrently, racing it against cancellation (OCEAN-116). If cancel
+            // wins we drop the in-flight futures (they stop being polled — no
+            // leak) and unwind with `Cancelled`; the emitted Starts have no End,
+            // but the whole turn is being torn down and the caller discards it.
+            let mut futs = Vec::with_capacity(segment.len());
+            for g in segment {
+                let Gated::Run {
+                    id,
+                    name,
+                    args,
+                    tool,
+                    ..
+                } = g
+                else {
+                    unreachable!("segment holds only Run entries");
+                };
+                emit(
+                    &events,
+                    AgentEvent::ToolExecutionStart {
+                        session_id: sid.clone(),
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        args: args.clone(),
+                    },
+                );
+                futs.push(run_one(
+                    tool.clone(),
+                    id.clone(),
+                    name.clone(),
+                    args.clone(),
+                    &round_span,
+                ));
+            }
+            let outcomes = tokio::select! {
+                biased;
+                () = cancelled(config) => return Err(AgentError::Cancelled),
+                outcomes = futures::future::join_all(futs) => outcomes,
+            };
+
+            // Assemble in index order: emit End + side effects and push the
+            // capped tool result for each member, deterministically.
+            for (g, outcome) in segment.iter().zip(outcomes) {
+                let Gated::Run { id, name, .. } = g else {
+                    unreachable!("segment holds only Run entries");
+                };
+                if apply_outcome(&events, &sid, &mut messages, id, name, outcome) {
+                    any_terminate = true;
                 }
             }
-            // The live SSE display (ToolExecutionEnd above) got the FULL output.
-            // What we push into the transcript is capped, because this result
-            // is resent on every subsequent round of this turn AND reloaded on
-            // every future turn of the session — an uncapped `read`/`bash`/`ls`
-            // dump would otherwise be paid for in input tokens indefinitely.
-            let tr = ToolResultMessage {
-                tool_call_id: id,
-                tool_name: name,
-                content: cap_tool_content(content),
-                is_error,
-                timestamp: ocean_protocol::now_ms(),
-            };
-            messages.push(Message::ToolResult(tr));
         }
         emit(
             &events,
@@ -574,6 +520,199 @@ pub async fn run_agent_with_history(
         stopped_at_turn_limit,
         usage: total_usage,
     })
+}
+
+/// A tool call after the permission gate: either cleared to run or denied.
+///
+/// Denied calls carry a ready reason and never execute (no Start/End emitted —
+/// OCEAN-60); run calls carry the resolved tool handle (`None` for an unknown
+/// tool name — it still runs the error path and emits Start/End) and whether the
+/// tool opted into [`Concurrency::Shared`](crate::types::Concurrency::Shared).
+enum Gated {
+    Denied {
+        id: String,
+        name: String,
+        reason: String,
+    },
+    Run {
+        id: String,
+        name: String,
+        args: Value,
+        tool: Option<Arc<dyn AgentTool>>,
+        shared: bool,
+    },
+}
+
+/// The result of executing one tool call, assembled back into the transcript in
+/// batch order after a (possibly concurrent) segment completes.
+struct Outcome {
+    content: Vec<Content>,
+    is_error: bool,
+    terminate: bool,
+    side_effects: Vec<ToolSideEffect>,
+    details: Value,
+}
+
+/// Execute a single tool call, producing its [`Outcome`]. Owns everything it
+/// touches (cloned id/name/args/tool and a child span) so a batch of these can
+/// be polled concurrently by `join_all` with no borrow of the loop's state.
+///
+/// The per-tool `tool_exec` span (OCEAN-274) is parented to the round span so a
+/// tool hop is followable as turn → round → tool_exec. Only the name and id are
+/// recorded — `args` are deliberately NOT a span field (they can carry file
+/// contents, prompts, or secrets).
+async fn run_one(
+    tool: Option<Arc<dyn AgentTool>>,
+    id: String,
+    name: String,
+    args: Value,
+    round_span: &tracing::Span,
+) -> Outcome {
+    let tool_span = tracing::info_span!(
+        parent: round_span,
+        "tool_exec",
+        tool_name = %name,
+        tool_call_id = %id
+    );
+    match tool {
+        Some(tool) => match tool.execute(&id, args).instrument(tool_span).await {
+            Ok(AgentToolResult {
+                content,
+                details,
+                terminate,
+                side_effects,
+            }) => Outcome {
+                content,
+                is_error: false,
+                terminate,
+                side_effects,
+                details,
+            },
+            Err(e) => Outcome {
+                content: vec![Content::text(format!("tool error: {e}"))],
+                is_error: true,
+                terminate: false,
+                side_effects: Vec::new(),
+                details: Value::Null,
+            },
+        },
+        None => Outcome {
+            content: vec![Content::text(format!("unknown tool: {name}"))],
+            is_error: true,
+            terminate: false,
+            side_effects: Vec::new(),
+            details: Value::Null,
+        },
+    }
+}
+
+/// Assemble one tool [`Outcome`] into the transcript: emit `ToolExecutionEnd`
+/// (with the FULL output, for the live SSE display) and any side-effect events
+/// the tool requested, then push a `ToolResult` whose content is *capped* —
+/// because that copy is resent on every subsequent round of the turn AND
+/// reloaded on every future turn of the session, so an uncapped dump would be
+/// paid for in input tokens indefinitely. Returns whether the tool asked to
+/// terminate the run.
+fn apply_outcome(
+    events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+    sid: &Option<String>,
+    messages: &mut Vec<Message>,
+    id: &str,
+    name: &str,
+    outcome: Outcome,
+) -> bool {
+    let Outcome {
+        content,
+        is_error,
+        terminate,
+        side_effects,
+        details,
+    } = outcome;
+    emit(
+        events,
+        AgentEvent::ToolExecutionEnd {
+            session_id: sid.clone(),
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            is_error,
+            content: content.clone(),
+            details,
+        },
+    );
+    for effect in &side_effects {
+        match effect {
+            ToolSideEffect::Render {
+                id,
+                kind,
+                props,
+                replace,
+            } => {
+                emit(
+                    events,
+                    AgentEvent::Render {
+                        session_id: sid.clone(),
+                        id: id.clone(),
+                        kind: kind.clone(),
+                        props: props.clone(),
+                        replace: *replace,
+                    },
+                );
+            }
+            ToolSideEffect::Unmount { id } => {
+                emit(
+                    events,
+                    AgentEvent::Unmount {
+                        session_id: sid.clone(),
+                        id: id.clone(),
+                    },
+                );
+            }
+            ToolSideEffect::BrowserActivity { active } => {
+                emit(
+                    events,
+                    AgentEvent::BrowserActivity {
+                        session_id: sid.clone(),
+                        active: *active,
+                    },
+                );
+            }
+            ToolSideEffect::SurfacePatch { canvas_id, patches } => {
+                // Slice 3: forward the validated patches onto the event bus
+                // stamped with this run's session id. The daemon's SSE bridge
+                // wraps each patch in a `SurfacePatchEnvelope` and relays it as
+                // `AgentTurnEvent::SurfacePatch` over `/v1/agent/events`.
+                emit(
+                    events,
+                    AgentEvent::SurfacePatch {
+                        session_id: sid.clone(),
+                        canvas_id: canvas_id.clone(),
+                        patches: patches.clone(),
+                    },
+                );
+            }
+            ToolSideEffect::SlackCanvas { op } => {
+                // OCEAN-214 ph2: forward the validated slack_canvas op onto the
+                // event bus stamped with this run's session id. The Slack canvas
+                // bridge (a later phase) round-trips it to the Slack Canvas API.
+                emit(
+                    events,
+                    AgentEvent::SlackCanvas {
+                        session_id: sid.clone(),
+                        op: op.clone(),
+                    },
+                );
+            }
+        }
+    }
+    let tr = ToolResultMessage {
+        tool_call_id: id.to_string(),
+        tool_name: name.to_string(),
+        content: cap_tool_content(content),
+        is_error,
+        timestamp: ocean_protocol::now_ms(),
+    };
+    messages.push(Message::ToolResult(tr));
+    terminate
 }
 
 fn tool_limit_fallback_reply(messages: &[Message]) -> String {

@@ -1518,3 +1518,37 @@ area:      backend
 
 Extended provider auth/model routing for Ocean. Added GLM/Zhipu as an OpenAI-compatible provider (`glm-4.6`, `glm-4.5`, `glm-4.5-flash`) with GLM/Zhipu/ZAI env-key support. Added Claude Code plan OAuth as a separate `claude-code` provider: Ocean auth-file OAuth blocks (`claude-code`, `anthropic-oauth`) and Claude Code bearer env tokens resolve to bearer credentials, the agent maps public `claude-code-*` aliases onto Anthropic Messages API model ids, and ocean-protocol now switches Anthropic auth between `x-api-key` and `Authorization: Bearer`. Hardened Codex OAuth by rejecting expired Ocean `openai-codex` blocks and falling back to Codex CLI auth JSON (`OCEAN_CODEX_AUTH_FILE` or `$HOME/.codex/auth.json`) for token/account id. Fixed the Anthropic registry base URL to the host root so protocol appends `/v1/messages` exactly once. Verification: `cargo test -p ocean-providers` 33 passed, `cargo test -p ocean-protocol` 115 passed, `cargo test -p ocean-agent` 112 passed, `cargo check --workspace` OK. `cargo fmt --check` is still blocked by broad pre-existing formatting diffs across unrelated files on this branch.
 _________________________________________________________________________________
+
+time:      [10:14pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Parallel tool execution in the agent loop (OMP-port, holistic loop pass). Two
+independent scouts mapped Ocean's loop end-to-end and re-read oh-my-pi's actual
+source; the standout gap was the runtime executing a tool-call BATCH strictly
+sequentially (agent_loop.rs one-await-at-a-time). Ported OMP's executeToolCalls
+concurrency-mode scheduler. Added a `Concurrency` enum + `AgentTool::concurrency()`
+(default `Exclusive` — the SAFE default, a tool parallelizes only by opting in);
+marked the five pure read-only builtins (read/ls/grep/glob/web_fetch) `Shared`.
+Rewrote the tool-execution section as two phases: (1) permission gate SEQUENTIAL
+(an interactive prompt must not race), (2) execute — walk the gated batch in
+order, run maximal runs of consecutive `Shared` calls in one concurrent segment
+(futures::join_all, racing the whole segment against the cancel token), while an
+`Exclusive` call / unknown tool / denied slot is a singleton barrier: everything
+before finishes, it runs alone, everything after waits. Transcript stays in
+ORIGINAL batch order regardless of finish order (provider tool_use/tool_result
+pairing depends on it); ToolExecutionStart still only fires for calls that run
+(OCEAN-60), every Start paired with an End; per-tool cancel/span/side-effect/cap
+invariants preserved (extracted run_one + apply_outcome helpers). New test file
+parallel_tools.rs proves: shared batch overlaps (peak≥2, 3×200ms reads finish
+<500ms), exclusive tool never sees a peer (barrier), transcript follows call
+order not finish order, default tools never parallelize. Verification: ocean-
+runtime 115 tests green (incl. full pre-existing loop/cancel/permission e2e),
+cargo check --workspace clean. Committed to feat/ocean-tui-shell-rebuild; branch
+stays PR+Codex-gated to main (core loop logic). Did NOT bundle the concurrent
+ocean-tui `mentions` work in the tree. Next arcs scoped: LSP tool (Diagnostics
+Ledger + writethrough), steering (steer-queue + between-tool interrupt), in-loop
+classified retry, wire the dead NoopLoopGuard.
+_________________________________________________________________________________

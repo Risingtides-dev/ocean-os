@@ -32,6 +32,9 @@ impl AgentTool for GrepTool {
     fn name(&self) -> &str {
         "grep"
     }
+    fn concurrency(&self) -> crate::types::Concurrency {
+        crate::types::Concurrency::Shared
+    }
     fn description(&self) -> &str {
         "Search file contents under a directory for a fixed substring. Honors .gitignore by default."
     }

@@ -18,6 +18,7 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - Assistant text present in a provider's terminal message must be emitted as `TextDelta` when the provider did not stream text chunks, so SSE clients always render the final reply.
 - Runtime events must remain compatible with `ocean-core` event contracts and daemon SSE streaming.
 - Keep provider concerns outside runtime unless mediated through the protocol/provider layers.
+- A tool-call batch runs through the concurrency scheduler (`agent_loop.rs`): consecutive `Concurrency::Shared` (read-only) tools run in one concurrent segment; a `Concurrency::Exclusive` tool (the default) is a full barrier. A new tool defaults to `Exclusive` — only override `concurrency()` to `Shared` when the tool is genuinely side-effect-free. The persisted transcript MUST stay in original batch order regardless of finish order (provider tool_use/tool_result pairing depends on it).
 
 ## Work Guidance
 

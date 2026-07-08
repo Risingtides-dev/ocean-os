@@ -71,6 +71,32 @@ impl AgentToolResult {
     }
 }
 
+/// How a tool may be scheduled relative to the other tool calls in the same
+/// assistant batch.
+///
+/// The agent loop executes a batch of tool calls by walking it in order and
+/// running maximal runs of consecutive [`Shared`](Concurrency::Shared) tools
+/// *concurrently*, while an [`Exclusive`](Concurrency::Exclusive) tool acts as a
+/// barrier: everything before it finishes first, it runs alone, and everything
+/// after it waits. This mirrors oh-my-pi's `executeToolCalls` scheduler — the
+/// read-heavy common case (several `read`/`grep`/`glob` in one batch) fans out,
+/// while a mutating tool (`write`/`edit`/`bash`) never races a neighbour it
+/// could observe or corrupt.
+///
+/// The default is [`Exclusive`](Concurrency::Exclusive) — the *safe* default:
+/// a tool parallelizes only when it explicitly opts in by returning `Shared`,
+/// so a new side-effecting tool is never accidentally run concurrently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Concurrency {
+    /// Free of side effects a sibling could observe; safe to run concurrently
+    /// with other `Shared` tools. Pure reads: `read`, `ls`, `grep`, `glob`,
+    /// `web_fetch`.
+    Shared,
+    /// Mutates state or has side effects; must run alone — a full barrier
+    /// against every other tool in the batch. The default.
+    Exclusive,
+}
+
 /// Permission outcome for a tool call. Returned by a [`PermissionPolicy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
@@ -114,6 +140,13 @@ pub trait AgentTool: Send + Sync {
     /// tools (`bash`, `write`, `edit`) return `true`.
     fn requires_permission(&self) -> bool {
         false
+    }
+    /// How this tool may be scheduled against its batch-mates. Defaults to
+    /// [`Concurrency::Exclusive`] (the safe default — a tool runs alone unless it
+    /// opts into concurrency). Pure read-only tools override this to
+    /// [`Concurrency::Shared`] so a batch of reads fans out. See [`Concurrency`].
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Exclusive
     }
     async fn execute(&self, tool_call_id: &str, args: Value) -> Result<AgentToolResult, String>;
 }

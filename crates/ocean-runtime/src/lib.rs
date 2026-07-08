@@ -26,6 +26,6 @@ pub use fake_tool_provider::{
     FAKE_TOOL_CALL_ID, FAKE_TOOL_CONTENT, FAKE_TOOL_MODEL, FAKE_TOOL_TARGET_PATH,
 };
 pub use types::{
-    tool_def, AgentConfig, AgentEvent, AgentTool, AgentToolResult, AllowAllPolicy,
+    tool_def, AgentConfig, AgentEvent, AgentTool, AgentToolResult, AllowAllPolicy, Concurrency,
     PermissionDecision, PermissionPolicy,
 };
