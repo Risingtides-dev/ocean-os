@@ -37,3 +37,4 @@ similar = "2"
 tracing.workspace = true
 open = "5"
 ocean-oauth.workspace = true
+ocean-providers.workspace = true

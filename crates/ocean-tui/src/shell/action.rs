@@ -77,6 +77,10 @@ pub enum Action {
     /// `/settings` — open the app's settings overlay (panel toggles, dock
     /// height, live session info).
     OpenSettings,
+    /// `/providers` (or bare `/login`) — open the provider auth popup. Lists
+    /// every provider with its live auth status; Enter triggers OAuth login
+    /// (Claude/Codex) or inline API-key entry (GLM, DeepSeek, Kimi, …).
+    OpenProviders,
     /// `/models` (or bare `/model`) — open the model picker overlay. The list
     /// is fetched fresh from the daemon so it reflects the REAL registry and
     /// per-model readiness, not a hardcoded menu.

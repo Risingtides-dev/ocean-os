@@ -668,10 +668,19 @@ impl ChatComponent {
                 Err(usage) => Some(Action::Status(usage)),
             },
             "/models" => Some(Action::OpenModels),
-            "/login" => match Self::login_target(args) {
-                Ok(target) => Some(Action::Login(target)),
-                Err(usage) => Some(Action::Status(usage)),
-            },
+            "/login" => {
+                // Bare `/login` opens the provider popup (OAuth + API keys);
+                // `/login claude|codex` keeps the direct browser flow.
+                if args.trim().is_empty() {
+                    Some(Action::OpenProviders)
+                } else {
+                    match Self::login_target(args) {
+                        Ok(target) => Some(Action::Login(target)),
+                        Err(usage) => Some(Action::Status(usage)),
+                    }
+                }
+            }
+            "/providers" => Some(Action::OpenProviders),
             "/copy" => match self.last_reply() {
                 Some(text) => Some(Action::CopyToClipboard(text)),
                 None => Some(Action::Status("nothing to copy yet".into())),
@@ -1995,12 +2004,23 @@ mod tests {
     }
 
     #[test]
-    fn slash_login_without_args_routes_claude_login() {
+    fn slash_login_without_args_opens_providers_popup() {
+        // Bare `/login` opens the provider popup (OAuth + API keys); the
+        // direct browser flow is still reachable via `/login claude|codex`.
         let mut chat = ChatComponent::default();
 
         let act = chat.run_slash("/login", "");
 
-        assert!(matches!(act, Some(Action::Login(LoginTarget::Claude))));
+        assert!(matches!(act, Some(Action::OpenProviders)));
+    }
+
+    #[test]
+    fn slash_providers_opens_popup() {
+        let mut chat = ChatComponent::default();
+
+        let act = chat.run_slash("/providers", "");
+
+        assert!(matches!(act, Some(Action::OpenProviders)));
     }
 
     #[test]

@@ -71,7 +71,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/login",
-        desc: "open provider login in browser (/login [claude|codex])",
+        desc: "provider logins (popup) or /login [claude|codex] browser flow",
         group: "session",
         soon: false,
     },
@@ -97,6 +97,12 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/settings",
         desc: "open the settings panel",
+        group: "workspace",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/providers",
+        desc: "provider logins & API keys",
         group: "workspace",
         soon: false,
     },

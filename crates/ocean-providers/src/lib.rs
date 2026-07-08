@@ -26,8 +26,11 @@ const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 // `google-generative-ai` provider, which targets the v1beta surface under
 // this base — not an OpenAI-compatible endpoint.
 const GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com";
-// Zhipu AI / GLM (OpenAI-compatible chat-completions; GLM-4 family).
-const GLM_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+// Z.AI / Zhipu GLM coding plan (OpenAI-compatible chat-completions; GLM-4/5
+// family). The default targets the Z.AI coding plan; override the base with
+// `OCEAN_GLM_BASE_URL` to reach the Zhipu coding plan or the bigmodel open
+// platform instead.
+const GLM_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 
 /// Stable provider identifier used by Ocean runtime components.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +48,7 @@ pub enum ProviderId {
     MiniMax,
     /// Moonshot AI / Kimi (OpenAI-compatible chat-completions; K2 family).
     Kimi,
-    /// Zhipu AI / GLM (OpenAI-compatible chat-completions; GLM-4 family).
+    /// Z.AI / Zhipu GLM (OpenAI-compatible chat-completions; GLM-4/5 family).
     Glm,
     /// Google Generative AI (Gemini family; v1beta generativelanguage API).
     Google,
@@ -85,8 +88,8 @@ impl ProviderId {
             Self::Glm => &[
                 "OCEAN_GLM_API_KEY",
                 "GLM_API_KEY",
-                "ZHIPUAI_API_KEY",
                 "ZAI_API_KEY",
+                "ZHIPUAI_API_KEY",
                 "BIGMODEL_API_KEY",
             ],
             // `GEMINI_API_KEY` is Google's own canonical env var (their SDKs
@@ -632,6 +635,8 @@ pub fn known_models() -> Vec<KnownModel> {
         m("MiniMax-M2", "minimax", "MiniMax M2"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
+m("glm-5.2", "glm", "GLM 5.2"),
+m("glm-4.7", "glm", "GLM 4.7"),
         m("glm-4.6", "glm", "GLM 4.6"),
         m("glm-4.5", "glm", "GLM 4.5"),
         m("glm-4.5-flash", "glm", "GLM 4.5 Flash"),
@@ -904,25 +909,43 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             128_000,
             8_192,
         )),
-        // Zhipu AI / GLM-4 family (OpenAI-compatible chat-completions).
+        // Z.AI / Zhipu GLM family (OpenAI-compatible chat-completions). The
+        // base defaults to the Z.AI coding plan; `glm_base_url(env)` applies an
+        // `OCEAN_GLM_BASE_URL` override (non-empty wins, else the default), so
+        // every GLM route — bare alias, explicit provider, and any fallback
+        // alias — honors the same override.
         "glm" | "glm-4.6" | "glm-4-6" => Ok(model_selection(
             ProviderId::Glm,
             "glm-4.6",
-            GLM_BASE_URL,
+            glm_base_url(env),
+            200_000,
+            8_192,
+        )),
+        "glm-4.7" | "glm-4-7" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-4.7",
+            glm_base_url(env),
+            200_000,
+            8_192,
+        )),
+        "glm-5.2" | "glm-5-2" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-5.2",
+            glm_base_url(env),
             200_000,
             8_192,
         )),
         "glm-4.5" | "glm-4-5" => Ok(model_selection(
             ProviderId::Glm,
             "glm-4.5",
-            GLM_BASE_URL,
+            glm_base_url(env),
             200_000,
             8_192,
         )),
         "glm-4.5-flash" | "glm-4-5-flash" => Ok(model_selection(
             ProviderId::Glm,
             "glm-4.5-flash",
-            GLM_BASE_URL,
+            glm_base_url(env),
             200_000,
             8_192,
         )),
@@ -999,6 +1022,22 @@ fn minimax_api_casing(model: &str) -> String {
     }
 }
 
+/// Resolve the GLM base URL for the current environment: a non-empty
+/// `OCEAN_GLM_BASE_URL` override wins, otherwise the Z.AI coding plan default
+/// ([`GLM_BASE_URL`]). Mirrors how `OCEAN_OPENAI_BASE_URL` threads through
+/// resolution — a set-but-blank value is treated as unset so a misconfigured
+/// override can never yield an empty base URL and break a turn.
+fn glm_base_url(env: &ProviderEnv) -> &str {
+    match env
+        .get("OCEAN_GLM_BASE_URL")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(override_url) => override_url,
+        None => GLM_BASE_URL,
+    }
+}
+
 fn model_for_explicit_provider(
     provider: &str,
     model: &str,
@@ -1062,7 +1101,7 @@ fn model_for_explicit_provider(
         "glm" | "zhipu" | "zhipuai" => Ok(model_selection(
             ProviderId::Glm,
             model,
-            GLM_BASE_URL,
+            glm_base_url(env),
             200_000,
             8_192,
         )),
@@ -1663,6 +1702,8 @@ mod tests {
             "MiniMax-M2.7",
             "kimi-k2.6",
             "kimi-k2",
+            "glm-5.2",
+            "glm-4.7",
             "glm-4.6",
             "glm-4.5",
             "glm-4.5-flash",
@@ -1842,6 +1883,132 @@ mod tests {
         assert_eq!(selection.provider, ProviderId::Glm);
         assert_eq!(selection.model, "glm-4.5-flash");
         assert_eq!(selection.base_url, GLM_BASE_URL);
+    }
+
+    #[test]
+    fn glm_default_base_is_the_zai_coding_plan() {
+        // The default GLM base targets the Z.AI coding plan (OpenAI-compatible
+        // chat-completions), not the legacy bigmodel open platform. Asserted
+        // literally so a future const edit can't silently drift the default,
+        // and a blank OCEAN_GLM_BASE_URL is treated as unset (can't yield an
+        // empty base).
+        assert_eq!(GLM_BASE_URL, "https://api.z.ai/api/coding/paas/v4");
+        let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", "glm-4.6")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::Glm);
+        assert_eq!(selection.base_url, "https://api.z.ai/api/coding/paas/v4");
+        let blank = resolve_model_selection(&env(&[
+            ("OCEAN_MODEL", "glm-4.6"),
+            ("OCEAN_GLM_BASE_URL", "   "),
+        ]))
+        .unwrap();
+        assert_eq!(
+            blank.base_url,
+            "https://api.z.ai/api/coding/paas/v4",
+            "a blank override must fall back to the default base"
+        );
+    }
+
+    #[test]
+    fn ocean_glm_base_url_override_wins_on_every_glm_route() {
+        // A non-empty override must win on both the known-id path
+        // (resolve_model_selection) and the explicit-provider path
+        // (model_for_explicit_provider via OCEAN_PROVIDER), mirroring how
+        // OCEAN_OPENAI_BASE_URL threads through resolution.
+        const ZHIPU_CODING: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+        let known = resolve_model_selection(&env(&[
+            ("OCEAN_MODEL", "glm-4.5"),
+            ("OCEAN_GLM_BASE_URL", ZHIPU_CODING),
+        ]))
+        .unwrap();
+        assert_eq!(known.base_url, ZHIPU_CODING);
+        let explicit = resolve_model_selection(&env(&[
+            ("OCEAN_PROVIDER", "glm"),
+            ("OCEAN_MODEL", "glm-4.5"),
+            ("OCEAN_GLM_BASE_URL", ZHIPU_CODING),
+        ]))
+        .unwrap();
+        assert_eq!(explicit.provider, ProviderId::Glm);
+        assert_eq!(explicit.base_url, ZHIPU_CODING);
+        // The zhipu/zhipuai synonyms hit the same explicit arm and the same
+        // override.
+        let synonym = resolve_model_selection(&env(&[
+            ("OCEAN_PROVIDER", "zhipuai"),
+            ("OCEAN_MODEL", "glm-4.5"),
+            ("OCEAN_GLM_BASE_URL", ZHIPU_CODING),
+        ]))
+        .unwrap();
+        assert_eq!(synonym.base_url, ZHIPU_CODING);
+    }
+
+    #[test]
+    fn zai_api_key_resolves_a_ready_glm_credential() {
+        // ZAI_API_KEY is promoted above ZHIPUAI_API_KEY (the default base is
+        // now z.ai), so it alone must authenticate a ready GLM config.
+        let config = resolve_provider_config(&env(&[
+            ("OCEAN_MODEL", "glm-4.6"),
+            ("ZAI_API_KEY", "zai-secret"),
+        ]))
+        .unwrap();
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("ZAI_API_KEY should resolve a GLM credential");
+        assert_eq!(credential.secret.expose(), "zai-secret");
+        assert_eq!(credential.kind, CredentialKind::ApiKey);
+        assert_eq!(
+            credential.source,
+            CredentialSource::Env {
+                name: "ZAI_API_KEY".into()
+            }
+        );
+        assert!(config.readiness().ok);
+    }
+
+    #[test]
+    fn glm_47_and_52_route_and_round_trip_through_known_models() {
+        // New GLM ids route to ProviderId::Glm with the coding-plan base and
+        // the shared 200k/8k limits, their hyphen aliases normalize to the same
+        // canonical id, and they survive the known_models round-trip.
+        for (id, hyphen) in [("glm-4.7", "glm-4-7"), ("glm-5.2", "glm-5-2")] {
+            let sel = resolve_model_selection(&env(&[("OCEAN_MODEL", id)])).unwrap();
+            assert_eq!(sel.provider, ProviderId::Glm);
+            assert_eq!(sel.model, id);
+            assert_eq!(sel.base_url, GLM_BASE_URL);
+            assert_eq!(sel.context_window, 200_000);
+            assert_eq!(sel.max_output_tokens, 8_192);
+            let hyphenated = resolve_model_selection(&env(&[("OCEAN_MODEL", hyphen)])).unwrap();
+            assert_eq!(hyphenated.model, id);
+            assert_eq!(hyphenated.provider, ProviderId::Glm);
+        }
+        let listed: std::collections::BTreeSet<String> =
+            known_models().into_iter().map(|m| m.id).collect();
+        assert!(listed.contains("glm-4.7"), "glm-4.7 must be in the picker");
+        assert!(listed.contains("glm-5.2"), "glm-5.2 must be in the picker");
+    }
+
+    #[test]
+    fn glm_env_order_picks_glm_api_key_over_zai_api_key() {
+        // credential_env_names order is OCEAN_GLM_API_KEY, GLM_API_KEY,
+        // ZAI_API_KEY, ZHIPUAI_API_KEY, BIGMODEL_API_KEY. When both GLM_API_KEY
+        // and ZAI_API_KEY are set, the earlier name wins and is reported as the
+        // credential source.
+        let config = resolve_provider_config(&env(&[
+            ("OCEAN_MODEL", "glm-4.6"),
+            ("GLM_API_KEY", "glm-first"),
+            ("ZAI_API_KEY", "zai-second"),
+        ]))
+        .unwrap();
+        let credential = config
+            .credential
+            .as_ref()
+            .expect("credential should resolve");
+        assert_eq!(credential.secret.expose(), "glm-first");
+        assert_eq!(
+            credential.source,
+            CredentialSource::Env {
+                name: "GLM_API_KEY".into()
+            }
+        );
     }
 
     // ---- Claude Code provider (Anthropic Messages + OAuth bearer) --------

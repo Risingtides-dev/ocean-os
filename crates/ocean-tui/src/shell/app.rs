@@ -80,6 +80,123 @@ enum Focus {
     Term,
 }
 
+/// One row in the `/providers` auth popup: a static descriptor (label, auth-file
+/// block key, credential env vars) plus a status string computed at open time
+/// and refreshed after an inline API-key save.
+#[derive(Clone)]
+struct ProviderRow {
+    label: &'static str,
+    block_key: &'static str,
+    env_vars: &'static [&'static str],
+    status: String,
+}
+
+impl ProviderRow {
+    /// OAuth providers (Claude Code, Codex) auth via a `type:"oauth"` block and
+    /// a browser flow — every other row is a plain API key. Drives the Enter
+    /// behavior in the popup (login vs inline key entry).
+    fn is_oauth(&self) -> bool {
+        matches!(self.block_key, "claude-code" | "openai-codex")
+    }
+}
+
+/// Static descriptor (no per-open status) for [`ProviderRow`].
+const PROVIDER_TABLE: &[(&str, &str, &[&str])] = &[
+    ("Claude (Claude Code OAuth)", "claude-code", &[]),
+    ("Codex (ChatGPT OAuth)", "openai-codex", &[]),
+    ("GLM — Z.AI coding plan", "glm", &["ZAI_API_KEY", "GLM_API_KEY", "OCEAN_GLM_API_KEY", "ZHIPUAI_API_KEY", "BIGMODEL_API_KEY"]),
+    ("DeepSeek", "deepseek", &["DEEPSEEK_API_KEY", "OCEAN_DEEPSEEK_API_KEY"]),
+    ("Kimi (Moonshot)", "kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY", "OCEAN_MOONSHOT_API_KEY"]),
+    ("MiniMax", "minimax", &["MINIMAX_API_KEY", "OCEAN_MINIMAX_API_KEY"]),
+    ("Google (Gemini)", "google", &["GEMINI_API_KEY", "GOOGLE_API_KEY", "OCEAN_GOOGLE_API_KEY"]),
+    ("OpenAI", "openai", &["OPENAI_API_KEY", "OCEAN_OPENAI_API_KEY"]),
+];
+
+/// `/providers` popup mode: list navigation, or inline API-key entry for the
+/// selected API-key row.
+#[derive(Clone)]
+enum ProvidersMode {
+    List,
+    KeyEntry { block_key: String, buffer: String },
+}
+
+/// Derive a `/providers` row status: env var (first hit) > auth-file block >
+/// "not configured". OAuth blocks (`claude-code`, `openai-codex`) report
+/// `oauth ok` / `oauth expired` based on the block's `expires` field; API-key
+/// blocks report `auth file` when a non-empty key is present.
+fn provider_status(
+    block_key: &str,
+    env_vars: &[&str],
+    auth_json: &Option<serde_json::Value>,
+) -> String {
+    if let Some(var) = env_vars
+        .iter()
+        .find(|v| std::env::var(v).ok().filter(|x| !x.trim().is_empty()).is_some())
+    {
+        return format!("env:{var}");
+    }
+    let Some(json) = auth_json else {
+        return "not configured".into();
+    };
+    let Some(entry) = json.pointer(&format!("/{block_key}")) else {
+        return "not configured".into();
+    };
+    if matches!(block_key, "claude-code" | "openai-codex") {
+        let is_oauth = entry
+            .pointer("/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("oauth");
+        if !is_oauth {
+            return "not configured".into();
+        }
+        let access = entry
+            .pointer("/access")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if access.is_none() {
+            return "not configured".into();
+        }
+        // `expires` is ms since epoch when large, seconds otherwise. Treat a
+        // missing `expires` as "accept" (no expiry known), matching
+        // ocean-providers' oauth_access_token.
+        match entry.pointer("/expires").and_then(serde_json::Value::as_i64) {
+            Some(ms) => {
+                let now_ms = unix_epoch_ms();
+                let expires_ms = if ms >= 1_000_000_000_000 { ms } else { ms * 1000 };
+                if expires_ms <= now_ms {
+                    "oauth expired".into()
+                } else {
+                    "oauth ok".into()
+                }
+            }
+            None => "oauth ok".into(),
+        }
+    } else {
+        let has_key = entry
+            .pointer("/api_key")
+            .or_else(|| entry.pointer("/key"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some();
+        if has_key {
+            "auth file".into()
+        } else {
+            "not configured".into()
+        }
+    }
+}
+
+/// Current time in milliseconds since the Unix epoch (mirrors Ocean's auth-file
+/// `expires` convention).
+fn unix_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub struct App {
     client: DaemonClient,
     workspace_root: String,
@@ -160,6 +277,11 @@ pub struct App {
     /// `/settings` overlay: open flag + selected row.
     settings_open: bool,
     settings_sel: usize,
+    /// `/providers` popup: auth-status list + inline API-key entry.
+    providers_open: bool,
+    providers_sel: usize,
+    providers_rows: Vec<ProviderRow>,
+    providers_mode: ProvidersMode,
 }
 
 /// A title-bar button — CTRL's icon toggles, extended with the center surfaces.
@@ -226,6 +348,10 @@ impl App {
             last_tree_scan: Instant::now(),
             settings_open: false,
             settings_sel: 0,
+            providers_open: false,
+            providers_sel: 0,
+            providers_rows: Vec::new(),
+            providers_mode: ProvidersMode::List,
         };
         app.apply_focus();
         // `@` file mentions index the launch project from the start.
@@ -350,6 +476,14 @@ impl App {
         if self.settings_open {
             if let CrosstermEvent::Key(k) = evt {
                 self.settings_key(k);
+                return;
+            }
+        }
+        // The `/providers` popup is modal too, and mutually exclusive with the
+        // settings overlay: opening one closes the other.
+        if self.providers_open {
+            if let CrosstermEvent::Key(k) = evt {
+                self.providers_key(k);
                 return;
             }
         }
@@ -862,10 +996,22 @@ impl App {
                 self.status = msg.clone();
                 self.login_in_flight = false;
             }
-            // `/settings`: open the modal settings overlay.
+            // `/settings`: open the modal settings overlay. Mutually exclusive
+            // with the providers popup — opening one closes the other.
             Action::OpenSettings => {
+                self.providers_open = false;
                 self.settings_open = true;
                 self.settings_sel = 0;
+            }
+            // `/providers` (or bare `/login`): open the provider auth popup.
+            // Builds the status rows fresh from the auth file + process env so
+            // the list reflects the live state every time it's opened.
+            Action::OpenProviders => {
+                self.settings_open = false;
+                self.providers_open = true;
+                self.providers_sel = 0;
+                self.providers_mode = ProvidersMode::List;
+                self.providers_rows = Self::build_provider_rows();
             }
             // `/copy`: hand the last reply to the system clipboard via pbcopy.
             Action::CopyToClipboard(text) => {
@@ -1222,6 +1368,260 @@ impl App {
             Rect::new(inner.x, footer_y, inner.width, 1),
         );
     }
+    /// Build the `/providers` rows from the static [`PROVIDER_TABLE`], computing
+    /// each row's status from the process env (first hit wins) then the Ocean
+    /// auth file (oauth block presence/expiry, or `api_key`). Read from the
+    /// main thread at open time and after an inline save — the auth file is
+    /// tiny, so the cost is negligible.
+    fn build_provider_rows() -> Vec<ProviderRow> {
+        let auth_json = ocean_providers::ProviderEnv::from_process()
+            .auth_file
+            .filter(|p| p.exists())
+            .and_then(|p| std::fs::read(&p).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        PROVIDER_TABLE
+            .iter()
+            .map(|(label, block_key, env_vars)| ProviderRow {
+                label,
+                block_key,
+                env_vars,
+                status: provider_status(*block_key, env_vars, &auth_json),
+            })
+            .collect()
+    }
+
+    /// Drive the `/providers` popup. List mode: ↑/↓ move, ⏎ triggers OAuth
+    /// login (closes the popup, reuses the existing `/login` flow) or enters
+    /// inline API-key entry. Key-entry mode: type/paste, ⏎ saves via
+    /// [`ocean_oauth::store_api_key`] + refreshes the row, Esc cancels back to
+    /// the list. Esc/q in the list closes the popup.
+    fn providers_key(&mut self, k: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        match &mut self.providers_mode {
+            ProvidersMode::KeyEntry { block_key, buffer } => {
+                let block_key = block_key.clone();
+                match k.code {
+                    KeyCode::Esc => self.providers_mode = ProvidersMode::List,
+                    KeyCode::Enter => {
+                        let key = buffer.clone();
+                        match ocean_oauth::store_api_key(&block_key, &key, None) {
+                            Ok(path) => {
+                                self.status = format!(
+                                    "{} key saved to {}",
+                                    block_key,
+                                    path.display()
+                                );
+                                self.providers_mode = ProvidersMode::List;
+                                // Refresh only the saved row's status in place.
+                                if let Some(row) = self
+                                    .providers_rows
+                                    .iter_mut()
+                                    .find(|r| r.block_key == block_key)
+                                {
+                                    let auth_json = ocean_providers::ProviderEnv::from_process()
+                                        .auth_file
+                                        .filter(|p| p.exists())
+                                        .and_then(|p| std::fs::read(&p).ok())
+                                        .and_then(|b| {
+                                            serde_json::from_slice::<serde_json::Value>(&b).ok()
+                                        });
+                                    row.status =
+                                        provider_status(row.block_key, row.env_vars, &auth_json);
+                                }
+                            }
+                            Err(e) => self.status = format!("save failed: {e}"),
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    // Paste arrives as a raw char stream on macOS Terminal, so
+                    // no explicit Ctrl+V handler is needed.
+                    KeyCode::Char(c) => buffer.push(c),
+                    _ => {}
+                }
+            }
+            ProvidersMode::List => {
+                let count = self.providers_rows.len();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.providers_open = false,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.providers_sel = self.providers_sel.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if count > 0 {
+                            self.providers_sel = (self.providers_sel + 1).min(count - 1);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let Some(row) = self.providers_rows.get(self.providers_sel).cloned() else {
+                            return;
+                        };
+                        if row.is_oauth() {
+                            // Dispatch the existing OAuth flow and close the
+                            // popup so the in-flight guard + status wiring runs
+                            // exactly as a `/login <target>` would.
+                            let target = match row.block_key {
+                                "claude-code" => LoginTarget::Claude,
+                                _ => LoginTarget::Codex,
+                            };
+                            self.providers_open = false;
+                            self.dispatch(Action::Login(target));
+                        } else {
+                            self.providers_mode = ProvidersMode::KeyEntry {
+                                block_key: row.block_key.to_string(),
+                                buffer: String::new(),
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Render the `/providers` popup: a centered modal mirroring the settings
+    /// overlay — one row per provider with a live auth status, plus an inline
+    /// masked-key entry field when a row is being edited.
+    fn draw_providers(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        let full = frame.area();
+        let rows = self.providers_rows.len().max(1) as u16;
+        let width = 60u16.min(full.width.saturating_sub(4));
+        // list + title + footer; a touch more room in key-entry mode.
+        let base = rows + 5;
+        let height = (if matches!(self.providers_mode, ProvidersMode::KeyEntry { .. }) {
+            base + 2
+        } else {
+            base
+        })
+        .clamp(10, full.height.saturating_sub(2));
+        let x = full.x + (full.width.saturating_sub(width)) / 2;
+        let y = full.y + (full.height.saturating_sub(height)) / 2;
+        let area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} PROVIDERS ", g("◆", "*")),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        match &self.providers_mode {
+            ProvidersMode::KeyEntry { block_key, buffer } => {
+                let label = self
+                    .providers_rows
+                    .iter()
+                    .find(|r| r.block_key == block_key.as_str())
+                    .map(|r| r.label)
+                    .unwrap_or(block_key);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!(" paste {label} API key "),
+                        Style::default().fg(theme::FG),
+                    ))
+                    .style(Style::default().bg(theme::SLATE)),
+                    Rect::new(inner.x, inner.y, inner.width, 1),
+                );
+                let masked = "•".repeat(buffer.chars().count());
+                let cursor = g("▎", "|");
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!(" {masked}{cursor}"),
+                        Style::default().fg(theme::GREEN),
+                    ))
+                    .style(Style::default().bg(theme::BG_HL)),
+                    Rect::new(inner.x, inner.y + 2, inner.width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!(
+                            " {} save · esc cancel",
+                            g("⏎", "<enter>")
+                        ),
+                        Style::default().fg(theme::COMMENT),
+                    ))
+                    .style(Style::default().bg(theme::SLATE)),
+                    Rect::new(
+                        inner.x,
+                        inner.y + inner.height.saturating_sub(1),
+                        inner.width,
+                        1,
+                    ),
+                );
+            }
+            ProvidersMode::List => {
+                for (i, row) in self.providers_rows.iter().enumerate() {
+                    let selected = i == self.providers_sel;
+                    let bed = if selected { theme::BG_HL } else { theme::SLATE };
+                    let marker = if selected { g("▎", "|") } else { " " };
+                    let left = format!(" {marker} {}", row.label);
+                    let status_fg = if row.status.starts_with("env:")
+                        || row.status == "oauth ok"
+                        || row.status == "auth file"
+                    {
+                        theme::GREEN
+                    } else if row.status == "oauth expired" {
+                        theme::CYAN
+                    } else {
+                        theme::COMMENT
+                    };
+                    let value = Span::styled(
+                        row.status.clone(),
+                        Style::default().fg(status_fg),
+                    );
+                    let pad = (inner.width as usize)
+                        .saturating_sub(left.chars().count() + value.content.chars().count() + 1);
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(
+                                left,
+                                if selected {
+                                    Style::default()
+                                        .fg(theme::FG)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme::FG)
+                                },
+                            ),
+                            Span::raw(" ".repeat(pad)),
+                            value,
+                        ]))
+                        .style(Style::default().bg(bed)),
+                        Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+                    );
+                }
+                let footer = format!(
+                    " {} move · ⏎ login / paste key · esc close",
+                    g("↑↓", "^v")
+                );
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        footer,
+                        Style::default().fg(theme::COMMENT),
+                    ))
+                    .style(Style::default().bg(theme::SLATE)),
+                    Rect::new(
+                        inner.x,
+                        inner.y + inner.height.saturating_sub(1),
+                        inner.width,
+                        1,
+                    ),
+                );
+            }
+        }
+    }
+
 
     /// Render the `/settings` overlay: a centered modal on the SLATE bed with
     /// toggle rows (on/off pills), the dock-height stepper, and a read-only
@@ -1603,6 +2003,9 @@ impl App {
         }
         if self.models_open {
             self.draw_models(frame);
+        }
+        if self.providers_open {
+            self.draw_providers(frame);
         }
     }
 

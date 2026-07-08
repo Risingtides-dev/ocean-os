@@ -114,6 +114,31 @@ fn resolve_auth_path(auth_file: Option<PathBuf>) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no Ocean auth file configured (set OCEAN_AUTH_FILE)"))
 }
 
+/// Persist a plain API key for `provider_key` (e.g. `"glm"`, `"deepseek"`) into
+/// Ocean's auth file as `{provider_key: {"api_key": key}}`. Returns the path
+/// written.
+///
+/// `auth_file` overrides the configured location; `None` resolves the same way
+/// the OAuth login flows do (`resolve_auth_path`: `OCEAN_AUTH_FILE`, then the
+/// default config path). The key is trimmed and a blank key is rejected. The
+/// write reuses [`store::merge_and_write`] — atomic (temp + rename, 0600) and
+/// every unrelated provider block is preserved. Env vars always win over a
+/// file key at resolve time; this fn only writes the file side.
+pub fn store_api_key(
+    provider_key: &str,
+    key: &str,
+    auth_file: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        bail!("api key for {provider_key} is empty");
+    }
+    let path = resolve_auth_path(auth_file)?;
+    let block = serde_json::json!({ "api_key": trimmed });
+    store::merge_and_write(&path, provider_key, block)?;
+    Ok(path)
+}
+
 /// Read the per-provider token-endpoint override from the environment, if any.
 /// An empty value is treated as unset.
 fn env_token_url(provider: OAuthProvider) -> Option<String> {
@@ -135,8 +160,7 @@ pub async fn begin(provider: OAuthProvider, auth_file: Option<PathBuf>) -> Resul
     let server = CallbackServer::bind(&spec, state.clone()).await?;
     let redirect_uri = server.redirect_uri.clone();
     let launch_url = server.launch_url.clone();
-    let authorize_url =
-        build_authorize_url(provider, &state, &pkce_pair.challenge, &redirect_uri);
+    let authorize_url = build_authorize_url(provider, &state, &pkce_pair.challenge, &redirect_uri);
     server.set_pending_url(authorize_url.clone());
 
     Ok(LoginSession {
@@ -197,5 +221,95 @@ impl LoginSession {
             expires_ms: token.expires_ms,
             account_id: token.account_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_api_key;
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// RAII temp dir; cleaned up even on panic (mirrors `store::tests`).
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fresh() -> (TempDir, PathBuf) {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("ocean-oauth-store-api-key-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let auth = dir.join("auth.json");
+        (TempDir(dir), auth)
+    }
+
+    #[cfg(unix)]
+    fn mode_is_0600(path: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777 == 0o600)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn writes_api_key_block_preserving_unrelated_keys() {
+        let (_guard, auth) = fresh();
+        // Seed an unrelated provider block AND a stale glm block — the stale
+        // glm block must be fully replaced, the unrelated block preserved.
+        std::fs::write(
+            &auth,
+            r#"{"deepseek":{"api_key":"sk-ds"},"glm":{"api_key":"OLD"}}"#,
+        )
+        .unwrap();
+
+        let written = store_api_key("glm", "  sk-glm-new  ", Some(auth.clone())).unwrap();
+        assert_eq!(written, auth);
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
+        assert_eq!(v["deepseek"]["api_key"], "sk-ds", "unrelated block preserved");
+        assert_eq!(v["glm"]["api_key"], "sk-glm-new");
+        assert!(
+            v["glm"].get("api_key").and_then(Value::as_str) != Some("OLD"),
+            "stale glm block must be replaced"
+        );
+        #[cfg(unix)]
+        assert!(mode_is_0600(&auth), "expected 0600 on auth file");
+    }
+
+    #[test]
+    fn rejects_empty_key_after_trim() {
+        let (_guard, auth) = fresh();
+        let err = store_api_key("glm", "   \n  ", Some(auth.clone())).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty-key error, got: {err}"
+        );
+        // Nothing written — the temp file was never created.
+        assert!(!auth.exists());
+    }
+
+    #[test]
+    fn creates_file_and_parent_dirs_when_absent() {
+        let (_guard, auth) = fresh();
+        // Wipe the parent so the file's directory doesn't exist yet.
+        let parent = auth.parent().unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+        assert!(!parent.exists());
+
+        let written = store_api_key("deepseek", "sk-ds", Some(auth.clone())).unwrap();
+        assert_eq!(written, auth);
+        assert!(auth.exists());
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
+        assert_eq!(v["deepseek"]["api_key"], "sk-ds");
+        #[cfg(unix)]
+        assert!(mode_is_0600(&auth));
     }
 }
