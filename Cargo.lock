@@ -3004,6 +3004,7 @@ dependencies = [
  "ocean-core",
  "ocean-hooks",
  "ocean-longhouse",
+ "ocean-lsp",
  "ocean-mcp",
  "ocean-plugin",
  "ocean-protocol",
@@ -3224,6 +3225,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ocean-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ocean-mcp"
 version = "0.1.0"
 dependencies = [
@@ -3315,7 +3329,6 @@ dependencies = [
  "ocean-hashline",
  "ocean-protocol",
  "proptest",
- "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

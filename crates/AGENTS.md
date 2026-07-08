@@ -33,6 +33,7 @@ This child doc governs the `crates/` workspace directory. It indexes Ocean OS Ru
 - `ocean-agent/` — session/history layer and system prompt loading → `ocean-agent/AGENTS.md`
 - `ocean-core/` — shared protocol types → `ocean-core/AGENTS.md`
 - `ocean-daemon/` — long-running HTTP daemon and API surface → `ocean-daemon/AGENTS.md`
+- `ocean-lsp/` — code intelligence: the `lsp` tool over workspace language servers → `ocean-lsp/AGENTS.md`
 - `ocean-protocol/` — multi-provider LLM wire protocol → `ocean-protocol/AGENTS.md`
 - `ocean-runtime/` — agent loop and permission-gated tool execution → `ocean-runtime/AGENTS.md`
 - `ocean-tui/` — terminal steering cockpit → `ocean-tui/AGENTS.md`

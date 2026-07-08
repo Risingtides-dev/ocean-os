@@ -1804,6 +1804,13 @@ async fn build_capability_registry(
         ),
     ));
 
+    // Code intelligence (W5 of the OMP port). Cheap to register: the provider
+    // offers the `lsp` tool only for workspaces where a known language server's
+    // root marker AND binary are both present (rust-analyzer, tsserver,
+    // pyright, gopls); servers spawn lazily on first use and are shared
+    // process-wide per (server, workspace-root).
+    providers.push(Arc::new(ocean_lsp::LspProvider));
+
     let cfg = match config::DaemonConfig::load(config_dir) {
         Ok(c) => c,
         Err(e) => {

@@ -1660,3 +1660,43 @@ diffs — verified all features on real frames with it. Commits be93c29,
 48455da; 147 tests; binary rebuilt. Interleaved cleanly with the other agent's
 runtime lane (9fa43fa, 5319a0f, 21eefdf — no file overlap).
 _________________________________________________________________________________
+
+time:      [11:59pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+W5 lands: ocean-lsp — code intelligence for the agent loop, the biggest gap in
+the OMP port map (the harness-profile `lsp` flag existed but gated NOTHING).
+New crate, zero contended files (deliberate: the other live lane owns the
+runtime tool files tonight). One `lsp` tool, action-dispatched (status /
+diagnostics / definition / references / hover / symbols / rename / reload),
+registered through the same CapabilityProvider seam as MCP in
+build_capability_registry. Servers auto-detect on oh-my-pi's rule — root
+marker present AND binary on $PATH (rust-analyzer, typescript-language-server,
+pyright, gopls; adding a language = one ServerDef entry) — and the tool only
+appears in workspaces that actually have one. Client mirrors ocean-mcp's
+multiplexed-IO-task design over LSP's Content-Length framing; clients shared
+process-wide per (server, root) so N sessions share one rust-analyzer.
+Positions are file+line+symbol-substring (never character columns, which
+models get wrong); unmatched symbol = error + "re-read", never a guess.
+DiagnosticsLedger (session-scoped) dedupes by location-stripped message so the
+model only reads NEWLY-introduced problems. Rename returns preview by default,
+apply:true writes WorkspaceEdits (overlap-refusing, resource-ops refused).
+Hard-won correctness bits from driving REAL rust-analyzer, not just tests: RA
+answers null mid-indexing, so the client advertises window.workDoneProgress +
+serverStatusNotification, answers server→client requests (unanswered
+workDoneProgress/create stalls RA's startup), and wait_quiescent trusts
+serverStatus quiescent:true or requires $/progress to hold at zero through a
+settle window (a gap between metadata-fetch and indexing fooled the naive
+check). Verified: 14 deterministic tests against an in-repo fake_lsp stdio
+server + a real-rust-analyzer smoke (#[ignore]d, run tonight: hover signature,
+definition, unresolved-call diagnostic all live), ocean-agent 121 green,
+workspace check + clippy clean. Also this session, committed earlier:
+9fa43fa-lane parallel tool scheduler (6ce7f5b), read/web_fetch bounding
+(5319a0f), ls determinism + project-prompt ingestion budget (21eefdf). Known
+deferred: TodoTool/web_fetch session-rebind bleed (capability.rs is the other
+lane's file tonight), per-profile lsp gating via SessionContext (same file),
+TUI cancel in the new shell.
+_________________________________________________________________________________
