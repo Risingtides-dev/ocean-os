@@ -959,7 +959,9 @@ impl AgentRuntime {
             if project.workspace_root.is_empty() {
                 continue;
             }
-            index.entry(project.workspace_root.clone()).or_insert(project);
+            index
+                .entry(project.workspace_root.clone())
+                .or_insert(project);
         }
         Ok(index)
     }
@@ -3725,8 +3727,7 @@ done
         // the public picker alias must resolve to the real Anthropic model id
         // so ocean-agent never sends "claude-code-sonnet-4-6" on the wire.
         let config = provider_config(ProviderId::ClaudeCode, "claude-code-sonnet-4-6", true);
-        let model =
-            model_from_provider_config(&config).expect("claude-code sonnet alias resolves");
+        let model = model_from_provider_config(&config).expect("claude-code sonnet alias resolves");
 
         assert_eq!(model.provider, "anthropic");
         assert_eq!(model.api, "anthropic-messages");
@@ -3736,8 +3737,7 @@ done
     #[test]
     fn claude_code_opus_alias_maps_to_anthropic_messages_model() {
         let config = provider_config(ProviderId::ClaudeCode, "claude-code-opus-4-7", true);
-        let model =
-            model_from_provider_config(&config).expect("claude-code opus alias resolves");
+        let model = model_from_provider_config(&config).expect("claude-code opus alias resolves");
 
         assert_eq!(model.provider, "anthropic");
         assert_eq!(model.api, "anthropic-messages");
@@ -4986,7 +4986,9 @@ done
             )
             .unwrap();
 
-        let worktree_root = worktree_root.canonicalize().expect("canonical worktree root");
+        let worktree_root = worktree_root
+            .canonicalize()
+            .expect("canonical worktree root");
         let worktree_root_str = worktree_root.to_string_lossy();
         let owner = runtime
             .owning_project_for_root(&worktree_root_str)
@@ -5849,6 +5851,16 @@ is the user's real, signed-in browser session.\n\n\
         format!("{prompt}\n\n## Current client\n\n{MOBILE_SURFACE_PROMPT}\n")
     }
 
+    /// Per-file byte budget for one project instruction file. An oversized
+    /// AGENTS.md/CLAUDE.md is clipped with an explicit marker instead of riding
+    /// into EVERY turn's system prompt whole — pre-cap, one bloated instruction
+    /// file anywhere up the ancestor walk taxed every turn's input tokens
+    /// forever, silently.
+    const MAX_PROJECT_PROMPT_FILE_BYTES: usize = 64 * 1024;
+    /// Total byte budget across all ingested instruction files. Files beyond
+    /// the budget are named-but-skipped so the model knows they exist.
+    const MAX_PROJECT_PROMPT_TOTAL_BYTES: usize = 192 * 1024;
+
     fn load_project_prompt(start: &Path) -> String {
         const FILES: &[&str] = &[
             "AGENTS.md",
@@ -5872,9 +5884,27 @@ is the user's real, signed-in browser session.\n\n\
             return String::new();
         }
         let mut out = String::new();
+        let mut total = 0usize;
         for (path, content) in found {
+            let mut body = content;
+            if body.len() > MAX_PROJECT_PROMPT_FILE_BYTES {
+                let mut cut = MAX_PROJECT_PROMPT_FILE_BYTES;
+                while cut > 0 && !body.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                body.truncate(cut);
+                body.push_str("\n[instruction file truncated to fit the prompt budget]");
+            }
+            if total.saturating_add(body.len()) > MAX_PROJECT_PROMPT_TOTAL_BYTES {
+                out.push_str(&format!(
+                    "\n\n----- {} -----\n[skipped: project-instruction budget exhausted]",
+                    path.display()
+                ));
+                continue;
+            }
+            total += body.len();
             out.push_str(&format!("\n\n----- {} -----\n", path.display()));
-            out.push_str(&content);
+            out.push_str(&body);
         }
         out
     }
@@ -5913,6 +5943,45 @@ is the user's real, signed-in browser session.\n\n\
             std::fs::create_dir_all(&dir).expect("create surface dir");
             std::fs::write(dir.join("system.md"), body).expect("write seeded profile");
             root
+        }
+
+        /// One bloated instruction file is clipped, not ingested whole — and a
+        /// pile of files beyond the total budget is named-but-skipped. Pre-cap,
+        /// a huge AGENTS.md anywhere up the ancestor walk rode into EVERY
+        /// turn's system prompt in full.
+        #[test]
+        fn project_prompt_ingestion_is_budgeted() {
+            let root = tempfile::Builder::new()
+                .prefix("ocean-project-prompt-")
+                .tempdir()
+                .expect("temp project root");
+            // A file 4x over the per-file cap.
+            let big = "R".repeat(super::MAX_PROJECT_PROMPT_FILE_BYTES * 4);
+            std::fs::write(root.path().join("AGENTS.md"), &big).unwrap();
+            // A second file that pushes past the TOTAL budget once the first
+            // (clipped to the per-file cap) is in. 3 more capped files would
+            // exceed 192 KiB, so nest dirs so the walk finds several.
+            let sub = root.path().join("a/b/c");
+            std::fs::create_dir_all(&sub).unwrap();
+            for anc in [root.path().join("a"), root.path().join("a/b"), sub.clone()] {
+                std::fs::write(anc.join("CLAUDE.md"), &big).unwrap();
+            }
+
+            let prompt = super::load_project_prompt(&sub);
+            assert!(
+                prompt.len()
+                    < super::MAX_PROJECT_PROMPT_TOTAL_BYTES + super::MAX_PROJECT_PROMPT_FILE_BYTES,
+                "total ingestion stays near the budget, got {} bytes",
+                prompt.len()
+            );
+            assert!(
+                prompt.contains("[instruction file truncated to fit the prompt budget]"),
+                "oversized file carries the clip marker"
+            );
+            assert!(
+                prompt.contains("[skipped: project-instruction budget exhausted]"),
+                "beyond-budget files are named but skipped"
+            );
         }
 
         #[test]
