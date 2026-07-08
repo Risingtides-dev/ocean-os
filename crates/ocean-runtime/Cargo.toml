@@ -23,6 +23,7 @@ ocean-protocol = { path = "../ocean-protocol" }
 ocean-agent-sdk = { workspace = true }
 ocean-browser = { workspace = true }
 ocean-hashline = { path = "../ocean-hashline" }
+regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

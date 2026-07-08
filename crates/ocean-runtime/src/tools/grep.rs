@@ -7,6 +7,22 @@ use std::path::PathBuf;
 use crate::tools::path::resolve_against_cwd;
 use crate::types::{AgentTool, AgentToolResult};
 
+/// Files larger than this are skipped entirely (almost certainly generated or
+/// binary-ish; reading them into memory per-search is pure waste).
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Max chars of a matched line shown in the output. A minified bundle with one
+/// enormous line would otherwise dump hundreds of KB into a single match row.
+const MAX_LINE_CHARS: usize = 500;
+
+fn clip_line(line: &str) -> String {
+    if line.chars().count() <= MAX_LINE_CHARS {
+        return line.to_string();
+    }
+    let clipped: String = line.chars().take(MAX_LINE_CHARS).collect();
+    format!("{clipped}… [line clipped]")
+}
+
 pub struct GrepTool {
     cwd: Option<PathBuf>,
 }
@@ -36,13 +52,14 @@ impl AgentTool for GrepTool {
         crate::types::Concurrency::Shared
     }
     fn description(&self) -> &str {
-        "Search file contents under a directory for a fixed substring. Honors .gitignore by default."
+        "Search file contents under a directory with a regular expression (falls back to a \
+         literal substring if the pattern is not valid regex). Honors .gitignore by default."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Substring to search for"},
+                "pattern": {"type": "string", "description": "Regex to search for (Rust regex syntax); an invalid regex is searched as a literal substring"},
                 "path": {"type": "string", "description": "Directory to search (default: cwd)"},
                 "max_matches": {"type": "integer", "default": 200}
             },
@@ -66,8 +83,24 @@ impl AgentTool for GrepTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(200) as usize;
 
+        // Regex when the pattern compiles, literal substring otherwise. The
+        // fallback keeps the tool forgiving: a model that meant `foo(` literally
+        // still gets matches instead of a hard error, and the note in the output
+        // makes the interpretation explicit.
+        let compiled = regex::Regex::new(&pattern).ok();
+        let literal_fallback = compiled.is_none();
+
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let matches_line = |line: &str| -> bool {
+                match &compiled {
+                    Some(re) => re.is_match(line),
+                    None => line.contains(&pattern),
+                }
+            };
             let mut buf = String::new();
+            if literal_fallback {
+                buf.push_str("(pattern is not valid regex; searched as a literal substring)\n");
+            }
             let mut hits = 0usize;
             let walker = WalkBuilder::new(&path).follow_links(false).build();
             for entry in walker.flatten() {
@@ -79,13 +112,22 @@ impl AgentTool for GrepTool {
                 if !p.is_file() {
                     continue;
                 }
+                // Size guard: skip anything over the cap rather than pulling a
+                // multi-hundred-MB artifact into memory per file.
+                if entry
+                    .metadata()
+                    .map(|m| m.len() > MAX_FILE_BYTES)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let text = match fs::read_to_string(p) {
                     Ok(t) => t,
                     Err(_) => continue, // skip binary or unreadable
                 };
                 for (i, line) in text.lines().enumerate() {
-                    if line.contains(&pattern) {
-                        buf.push_str(&format!("{}:{}:{}\n", p.display(), i + 1, line));
+                    if matches_line(line) {
+                        buf.push_str(&format!("{}:{}:{}\n", p.display(), i + 1, clip_line(line)));
                         hits += 1;
                         if hits >= max {
                             break;

@@ -213,3 +213,66 @@ async fn bash_output_capture_is_capped() {
     );
     assert!(text.contains("[exit 0]"));
 }
+
+/// grep is regex-first: a pattern with regex syntax matches structurally.
+#[tokio::test]
+async fn grep_matches_regex_patterns() {
+    let dir = scratch_dir();
+    std::fs::write(
+        dir.join("code.rs"),
+        "fn run_agent() {}\nfn   run_helper() {}\nlet x = 1;\n",
+    )
+    .unwrap();
+
+    let res = grep::GrepTool::for_cwd(dir.clone())
+        .execute("1", json!({ "pattern": r"fn\s+run_\w+" }))
+        .await
+        .unwrap();
+    let text = res.content[0].as_text().unwrap();
+    assert!(text.contains("run_agent"), "regex must match, got: {text}");
+    assert!(
+        text.contains("run_helper"),
+        "multi-space regex must match, got: {text}"
+    );
+    assert!(!text.contains("let x"), "non-matches excluded");
+}
+
+/// An invalid regex falls back to literal substring search with an explicit
+/// note — a model that meant `foo(` literally still gets its matches.
+#[tokio::test]
+async fn grep_invalid_regex_falls_back_to_literal() {
+    let dir = scratch_dir();
+    std::fs::write(dir.join("code.rs"), "call foo( now\nother line\n").unwrap();
+
+    let res = grep::GrepTool::for_cwd(dir.clone())
+        .execute("1", json!({ "pattern": "foo(" }))
+        .await
+        .unwrap();
+    let text = res.content[0].as_text().unwrap();
+    assert!(
+        text.contains("not valid regex"),
+        "fallback note present, got: {text}"
+    );
+    assert!(text.contains("call foo( now"), "literal match found");
+}
+
+/// A matched line is clipped, never dumped whole: one giant minified line must
+/// not balloon the output.
+#[tokio::test]
+async fn grep_clips_enormous_matched_lines() {
+    let dir = scratch_dir();
+    let giant = format!("needle {}", "x".repeat(100_000));
+    std::fs::write(dir.join("min.js"), &giant).unwrap();
+
+    let res = grep::GrepTool::for_cwd(dir.clone())
+        .execute("1", json!({ "pattern": "needle" }))
+        .await
+        .unwrap();
+    let text = res.content[0].as_text().unwrap();
+    assert!(text.contains("[line clipped]"), "clip marker present");
+    assert!(
+        text.len() < 2_000,
+        "output stays small, got {} bytes",
+        text.len()
+    );
+}

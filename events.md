@@ -1612,3 +1612,25 @@ URGENT parallel-tools question from the last entry: the shell chat keys tool
 cards by call_id (chat.rs tool_by_id), so interleaved concurrent Start/End
 events render correctly — no TUI fix needed.
 _________________________________________________________________________________
+
+time:      [10:55pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Grep tool: regex support + output/memory bounds (harness self-audit, cont.).
+The builtin grep was FIXED-SUBSTRING only — a model sending `fn\s+run_agent`
+got "(no matches)" and wrongly concluded the code didn't exist, wasting rounds
+or derailing the task. Now regex-first (Rust regex syntax) with a forgiving
+fallback: an invalid regex (e.g. a literal `foo(`) is searched as a substring
+with an explicit "(pattern is not valid regex…)" note in the output, so
+existing literal-pattern behavior can only improve, never break. Two bounds
+added: files >4MiB are skipped (generated/binary-ish; reading them per-search
+was pure waste) and matched lines are clipped at 500 chars with a "[line
+clipped]" marker (one minified-bundle line could previously dump 100KB+ into a
+single match row). regex crate was already a workspace dep — one-line Cargo
+addition. 3 new tests (regex matches, literal fallback w/ note, giant-line
+clip). tools_smoke 12/12, full runtime suite 11/11 targets green, workspace
+check clean.
+_________________________________________________________________________________
