@@ -1586,3 +1586,29 @@ elsewhere). A scout is concurrently hunting the next batch of harness defects
 (incl. URGENT check: does the TUI chat render interleaved Start/Start/End/End
 correctly now that tools parallelize).
 _________________________________________________________________________________
+
+time:      [10:45pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      backend
+
+Bash tool hardening — found in the continuing harness self-audit. THREE real
+defects in tools/bash.rs: (1) ORPHAN PROCESS LEAK — `timeout(fut)` dropped the
+future on elapse but the spawned child kept running (a timed-out `sleep 600` or
+hung server survived forever); same leak on turn CANCEL, which drops in-flight
+tool futures — and the new parallel scheduler makes that path hotter. Fixed
+with kill_on_drop(true): the child dies with its handle. (2) UNBOUNDED MEMORY —
+`Command::output()` buffered everything; a runaway `yes` filled daemon RAM
+until timeout. Replaced with piped spawn + read_capped() streams: capture
+bounded at 2MiB per stream, DRAINING continues past the cap so the child never
+blocks on a full pipe and runs to completion (side effects + exit code
+preserved, explicit "[stdout capped]" notice). (3) stdin was inherited — an
+interactive prompt (sudo, pager, `read`) hung until timeout; now Stdio::null so
+reads hit EOF immediately. 3 new tests prove each: orphan-marker never lands
+after a timeout kill, `cat` on closed stdin returns instantly, 8MiB flood
+capped with notice + completion. tools_smoke 9/9 green. Also verified the
+URGENT parallel-tools question from the last entry: the shell chat keys tool
+cards by call_id (chat.rs tool_by_id), so interleaved concurrent Start/End
+events render correctly — no TUI fix needed.
+_________________________________________________________________________________

@@ -126,3 +126,90 @@ async fn bash_runs_simple_command() {
     assert!(text.contains("hi-from-bash"));
     assert!(text.contains("[exit 0]"));
 }
+
+/// A timed-out bash command must not survive as an orphan process. The child
+/// writes a marker file AFTER a sleep longer than the tool timeout; if the
+/// process were leaked (the old `timeout(fut)`-drops-the-future bug), the
+/// marker would appear shortly after the timeout returned. With kill_on_drop
+/// the child dies with the future and the marker never lands.
+#[tokio::test]
+async fn bash_timeout_kills_the_child_no_orphan() {
+    let dir = scratch_dir();
+    let marker = dir.join("orphan-marker");
+    let marker_s = marker.to_string_lossy().to_string();
+
+    let start = std::time::Instant::now();
+    let err = bash::BashTool::for_cwd(dir.clone())
+        .execute(
+            "1",
+            json!({
+                "command": format!("sleep 2 && touch '{marker_s}'"),
+                "timeout_ms": 300
+            }),
+        )
+        .await
+        .expect_err("the command must time out");
+    assert!(err.contains("timed out"), "timeout error, got: {err}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(1500),
+        "timeout must return promptly"
+    );
+
+    // Give a leaked child ample time to reach the `touch`. If the kill worked,
+    // the marker never appears.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(
+        !marker.exists(),
+        "the timed-out child kept running and touched the marker — orphan process leak"
+    );
+}
+
+/// stdin is closed, not inherited: a command that reads stdin terminates
+/// immediately (EOF) instead of hanging until the timeout.
+#[tokio::test]
+async fn bash_stdin_is_closed_so_reads_terminate() {
+    let start = std::time::Instant::now();
+    let res = bash::BashTool::new()
+        .execute(
+            "1",
+            json!({ "command": "cat; echo done-after-cat", "timeout_ms": 5000 }),
+        )
+        .await
+        .expect("cat on closed stdin returns immediately");
+    let text = res.content[0].as_text().unwrap();
+    assert!(text.contains("done-after-cat"));
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(2000),
+        "must not hang waiting for stdin"
+    );
+}
+
+/// Output capture is bounded: a command that floods stdout is capped at the
+/// capture limit with an explicit notice, while still running to completion
+/// (exit code preserved).
+#[tokio::test]
+async fn bash_output_capture_is_capped() {
+    // ~8MiB of zeros, well over the 2MiB cap.
+    let res = bash::BashTool::new()
+        .execute(
+            "1",
+            json!({ "command": "head -c 8388608 /dev/zero | tr '\\0' 'x'; echo; echo tail-marker >&2", "timeout_ms": 30000 }),
+        )
+        .await
+        .expect("flooding command still completes");
+    let text = res.content[0].as_text().unwrap();
+    assert!(
+        text.contains("[stdout capped at 2MiB"),
+        "cap notice must be present"
+    );
+    assert!(
+        text.len() < 3 * 1024 * 1024,
+        "captured output must be bounded, got {} bytes",
+        text.len()
+    );
+    assert!(
+        text.contains("tail-marker"),
+        "stderr still captured; command ran to completion"
+    );
+    assert!(text.contains("[exit 0]"));
+}
