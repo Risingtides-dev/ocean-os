@@ -1635,7 +1635,6 @@ clip). tools_smoke 12/12, full runtime suite 11/11 targets green, workspace
 check clean.
 _________________________________________________________________________________
 
-time:      [11:05pm] [07-07-26
 time:      [11:25PM] [07-07-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1699,4 +1698,27 @@ workspace check + clippy clean. Also this session, committed earlier:
 deferred: TodoTool/web_fetch session-rebind bleed (capability.rs is the other
 lane's file tonight), per-profile lsp gating via SessionContext (same file),
 TUI cancel in the new shell.
+_________________________________________________________________________________
+
+time:      [11:38pm] [07-07-26]
+agent:     [claude] [fable-5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      handoff
+area:      infra
+
+Orphaned-lane recovery. John flagged that concurrent sessions may have died;
+checked all three lanes. TUI lane: ALIVE (files touched 23:30, mid-building a
+/login feature — left strictly alone). Runtime/OMP-port lane: DEAD ~23:05 —
+its working tree had been frozen since 22:46 mid-operation: it had REVERTED
+its own committed implementations (508085d retry, c7708ff bash, 9fa43fa grep)
+in the working tree while keeping the tests, deleted tests/round_retry.rs, and
+died 2 lines into its ledger entry (the dangling "time: [11:05pm]" header,
+removed by this entry's commit). That tree state failed 5 runtime tests.
+Recovery: stashed the dead lane's WIP as stash@{0} ("orphaned runtime-lane
+WIP…") — recoverable, not discarded — which restored its committed
+implementations; full ocean-runtime suite green again (132 tests, 11 targets,
+including its own retry/bash/grep tests). Its landed work was never at risk
+(all in history). If the revert had a reason (e.g. a planned rewrite), the
+intent lives in stash@{0}; inspect before reusing — the stash by itself is a
+test-breaking half-state.
 _________________________________________________________________________________
