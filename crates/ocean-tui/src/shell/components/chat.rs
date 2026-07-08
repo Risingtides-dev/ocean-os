@@ -1201,6 +1201,21 @@ impl Component for ChatComponent {
     }
 
     fn update(&mut self, action: &Action) -> Option<Action> {
+        // The turn (or its session mint) never reached the daemon, even after
+        // the blip-retry window: unwind the spinner, say so in the transcript,
+        // and put the prompt back in the composer so nothing typed is lost.
+        if let Action::TurnSendFailed { prompt, err } = action {
+            self.busy = false;
+            self.turns.push(Turn::Assistant(format!(
+                "{} couldn't reach the daemon — {err}\n\nYour prompt is back in the composer; press ⏎ to retry.",
+                g("⚠", "!")
+            )));
+            if self.input.is_empty() {
+                self.input = prompt.clone();
+            }
+            self.scroll_back = 0;
+            return None;
+        }
         // Permission traffic rides the GLOBAL event stream, not the agent one.
         if let Action::OceanEvent(env) = action {
             match &env.event {

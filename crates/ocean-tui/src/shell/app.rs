@@ -558,6 +558,9 @@ impl App {
                 return;
             }
             Action::Status(s) | Action::Error(s) => self.status = s.clone(),
+            // Chat unwinds busy + restores the prompt (see its update arm);
+            // the status line carries the error.
+            Action::TurnSendFailed { err, .. } => self.status = err.clone(),
             Action::SessionBound(id) => self.bind_session(*id),
             // Session hygiene: only fold in agent events for the BOUND session.
             // A superseded stream's last envelopes (or an unscoped daemon echo)
@@ -986,24 +989,45 @@ impl App {
         self.pending_submit_token = Some(decision_token.clone());
 
         tokio::spawn(async move {
+            // Both the session mint and the turn POST ride the daemon-blip
+            // retry (connect-class failures only — a restart mid-prompt used to
+            // surface a hard "error sending request" wall and eat the prompt).
+            // Each retry narrates in the status line; final failure unwinds the
+            // chat's busy state and RESTORES the prompt via TurnSendFailed.
+            let retry_status = |what: &'static str, tx: mpsc::UnboundedSender<Action>| {
+                move |attempt: usize, total: usize| {
+                    let _ = tx.send(Action::Status(format!(
+                        "daemon unreachable — retrying {what} ({attempt}/{total})…"
+                    )));
+                }
+            };
             let session_id = match existing {
                 Some(id) => id,
-                None => match client.create_agent_session(&workspace).await {
-                    Ok(resp) => {
-                        // SessionBound → App::bind_session spawns the (single,
-                        // self-healing) stream and holds its handle.
-                        let _ = tx.send(Action::SessionBound(resp.session_id));
-                        resp.session_id
+                None => {
+                    let on_retry = retry_status("session", tx.clone());
+                    match client
+                        .create_agent_session_retrying(&workspace, on_retry)
+                        .await
+                    {
+                        Ok(resp) => {
+                            // SessionBound → App::bind_session spawns the (single,
+                            // self-healing) stream and holds its handle.
+                            let _ = tx.send(Action::SessionBound(resp.session_id));
+                            resp.session_id
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Action::TurnSendFailed {
+                                prompt,
+                                err: format!("session: {e}"),
+                            });
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Action::Error(format!("session: {e}")));
-                        return;
-                    }
-                },
+                }
             };
             let req = AgentTurnRequest {
                 session_id: Some(session_id),
-                prompt,
+                prompt: prompt.clone(),
                 cwd: workspace,
                 guidance: None,
                 room_id: None,
@@ -1017,8 +1041,12 @@ impl App {
                 decision_token: Some(decision_token),
                 client_context: None,
             };
-            if let Err(e) = client.agent_turn(&req).await {
-                let _ = tx.send(Action::Error(format!("turn: {e}")));
+            let on_retry = retry_status("turn", tx.clone());
+            if let Err(e) = client.agent_turn_retrying(&req, on_retry).await {
+                let _ = tx.send(Action::TurnSendFailed {
+                    prompt,
+                    err: format!("turn: {e}"),
+                });
             }
         });
     }

@@ -59,37 +59,84 @@ impl DaemonClient {
         &self,
         workspace_root: &str,
     ) -> Result<AgentSessionCreateResponse, String> {
+        self.create_agent_session_retrying(workspace_root, |_, _| {})
+            .await
+    }
+
+    /// Session mint with mid-blip retry — see [`Self::agent_turn_retrying`] for
+    /// the policy (connect-class failures only).
+    pub async fn create_agent_session_retrying(
+        &self,
+        workspace_root: &str,
+        on_retry: impl FnMut(usize, usize),
+    ) -> Result<AgentSessionCreateResponse, String> {
         let req = AgentSessionCreateRequest {
             workspace_root: workspace_root.to_string(),
             project_id: None,
             client_type: Some("tui".into()),
         };
-        self.http
-            .post(format!("{}/v1/agent/sessions", self.base))
-            .json(&req)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| e.to_string())?
-            .json::<AgentSessionCreateResponse>()
-            .await
-            .map_err(|e| e.to_string())
+        let url = format!("{}/v1/agent/sessions", self.base);
+        self.post_json_retrying(&url, &req, on_retry).await
     }
 
     pub async fn agent_turn(
         &self,
         req: &AgentTurnRequest,
     ) -> Result<AgentTurnResponse, String> {
-        self.http
-            .post(format!("{}/v1/agent/turns", self.base))
-            .json(req)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| e.to_string())?
-            .json::<AgentTurnResponse>()
-            .await
-            .map_err(|e| e.to_string())
+        self.agent_turn_retrying(req, |_, _| {}).await
+    }
+
+    /// Submit a turn, riding out a daemon blip (restart/redeploy) instead of
+    /// failing the operator's prompt with a hard error. Retries ONLY
+    /// connect-class failures — connection refused/reset means the request
+    /// never reached a daemon, so a retry can't double-submit a turn. HTTP
+    /// status errors, timeouts, and decode errors surface immediately (the
+    /// daemon spoke, or may have started processing — retrying those is not
+    /// idempotent-safe). `on_retry(attempt, total)` fires before each backoff
+    /// sleep so the caller can show "retrying…" progress. The schedule spans
+    /// ~15.5s, comfortably covering the ~8s launchd respawn.
+    pub async fn agent_turn_retrying(
+        &self,
+        req: &AgentTurnRequest,
+        on_retry: impl FnMut(usize, usize),
+    ) -> Result<AgentTurnResponse, String> {
+        let url = format!("{}/v1/agent/turns", self.base);
+        self.post_json_retrying(&url, req, on_retry).await
+    }
+
+    /// POST `body` as JSON and decode a JSON response, retrying connect-class
+    /// transport failures on [`RETRY_DELAYS_MS`] backoff. Shared engine for the
+    /// turn + session-mint paths.
+    async fn post_json_retrying<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        mut on_retry: impl FnMut(usize, usize),
+    ) -> Result<T, String> {
+        /// Backoff before attempts 2..=N (attempt 1 fires immediately).
+        const RETRY_DELAYS_MS: &[u64] = &[500, 1000, 2000, 3000, 4000, 5000];
+        let total = RETRY_DELAYS_MS.len() + 1;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let sent = self.http.post(url).json(body).send().await;
+            match sent.and_then(|r| r.error_for_status()) {
+                Ok(resp) => return resp.json::<T>().await.map_err(|e| e.to_string()),
+                // Connection refused/reset: the daemon is down or mid-restart
+                // and the request never landed — safe to retry.
+                Err(e) if e.is_connect() && attempt < total => {
+                    on_retry(attempt, total);
+                    tokio::time::sleep(Duration::from_millis(RETRY_DELAYS_MS[attempt - 1])).await;
+                }
+                Err(e) => {
+                    return Err(if e.is_connect() {
+                        format!("daemon unreachable after {attempt} attempts: {e}")
+                    } else {
+                        e.to_string()
+                    });
+                }
+            }
+        }
     }
 
     /// Subscribe to `/v1/agent/events` scoped to `session_id`, forwarding each

@@ -43,6 +43,10 @@ pub enum Action {
     SubmitPrompt(String),
     /// A non-fatal error to surface in the status line.
     Error(String),
+    /// A turn (or its session mint) could not be sent even after the daemon-blip
+    /// retry window. The chat unwinds its busy state, surfaces the error in the
+    /// transcript, and restores `prompt` to the composer so nothing typed is lost.
+    TurnSendFailed { prompt: String, err: String },
     /// Transient status message (connection state, etc.).
     Status(String),
     /// Open a discovered session in the PTY: run `line` in a shell rooted at `cwd`.
