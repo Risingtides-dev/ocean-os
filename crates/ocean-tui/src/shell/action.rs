@@ -75,6 +75,15 @@ pub enum Action {
     /// `/settings` — open the app's settings overlay (panel toggles, dock
     /// height, live session info).
     OpenSettings,
+    /// `/models` (or bare `/model`) — open the model picker overlay. The list
+    /// is fetched fresh from the daemon so it reflects the REAL registry and
+    /// per-model readiness, not a hardcoded menu.
+    OpenModels,
+    /// The async `GET /v1/models` fetch for the picker came back.
+    ModelsLoaded {
+        current: String,
+        entries: Vec<crate::shell::client::ModelEntry>,
+    },
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
     /// Resume a session natively in the chat: load its transcript from `path`,

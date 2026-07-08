@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
-use ocean_agent_sdk::{AgentSessionId, AgentTurnRequest};
+use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnRequest, ThinkingLevel};
 use ocean_core::RequestId;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 
 use super::{
     action::{Action, LoginTarget, Nav},
-    client::DaemonClient,
+    client::{DaemonClient, ModelEntry},
     component::Component,
     components::{
         chat::ChatComponent, editor::EditorComponent, file_tree::FileTreeComponent,
@@ -124,6 +124,18 @@ pub struct App {
     term_h: u16,
     /// True while the operator is dragging the horizontal dock splitter.
     dragging_term: bool,
+    /// `/models` picker overlay. `models_entries` is fetched fresh from the
+    /// daemon on open (ready models first, registry order within); `models_sel`
+    /// indexes into it; `models_hit` maps drawn rows back to entries for mouse
+    /// clicks; `thinking_override` rides every subsequent turn as the per-turn
+    /// `thinking_level` (None = daemon default).
+    models_open: bool,
+    models_loading: bool,
+    models_entries: Vec<ModelEntry>,
+    models_current: String,
+    models_sel: usize,
+    models_hit: Vec<(Rect, usize)>,
+    thinking_override: Option<ThinkingLevel>,
     /// Mouse text selection. `sel_press` arms on any left-down that isn't a
     /// splitter grab; the first drag promotes it into `selection` — a linear
     /// (terminal-style) sweep in screen cells, anchor → head. Releasing the
@@ -196,6 +208,13 @@ impl App {
             r_split_term: Rect::default(),
             term_h: TERM_H,
             dragging_term: false,
+            models_open: false,
+            models_loading: false,
+            models_entries: Vec::new(),
+            models_current: String::new(),
+            models_sel: 0,
+            models_hit: Vec::new(),
+            thinking_override: None,
             sel_press: None,
             selection: None,
             frame_cells: Vec::new(),
@@ -308,6 +327,21 @@ impl App {
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // The `/models` picker is modal: keys and mouse both drive it while
+        // open (clicking a row selects/applies, clicking outside closes).
+        if self.models_open {
+            match evt {
+                CrosstermEvent::Key(k) => {
+                    self.models_key(k);
+                    return;
+                }
+                CrosstermEvent::Mouse(m) => {
+                    self.models_mouse(m);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The `/settings` overlay is modal: while open, keys drive it and
         // everything else waits. (Mouse falls through — clicking outside is
         // harmless; Esc/q closes.)
@@ -607,6 +641,22 @@ impl App {
                         return;
                     }
                 }
+                // Honesty check: the daemon fails degraded providers over to a
+                // ready alternate at selection time. That resilience is right
+                // for unattended loops but WRONG to hide from an operator who
+                // explicitly pinned a model — surface the reroute the moment
+                // the turn starts on something else.
+                if let AgentTurnEvent::TurnStarted {
+                    model: Some(got), ..
+                } = evt.as_ref()
+                {
+                    if let Some(want) = &self.model_override {
+                        if got != want {
+                            self.status =
+                                format!("⚠ {want} unavailable — turn running on {got} (fallback)");
+                        }
+                    }
+                }
             }
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
             Action::OpenSession { line, cwd } => {
@@ -707,6 +757,45 @@ impl App {
             Action::SetModel(id) => {
                 self.model_override = Some(id.clone());
                 self.status = format!("model → {id}");
+            }
+            // `/models`: open the picker and fetch the live registry (with
+            // readiness) off-thread — the overlay shows "loading…" until
+            // ModelsLoaded lands.
+            Action::OpenModels => {
+                self.models_open = true;
+                self.models_loading = true;
+                self.models_hit.clear();
+                let client = self.client.clone();
+                let tx = self.actions_tx.clone();
+                tokio::spawn(async move {
+                    match client.models().await {
+                        Ok(r) => {
+                            let _ = tx.send(Action::ModelsLoaded {
+                                current: r.current.model,
+                                entries: r.models,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Action::Error(format!("models: {e}")));
+                        }
+                    }
+                });
+            }
+            Action::ModelsLoaded { current, entries } => {
+                self.models_loading = false;
+                self.models_entries = order_models(entries.clone());
+                self.models_current = current.clone();
+                // Start the cursor on the model in force: the pinned override,
+                // else the daemon's current global model.
+                let active = self
+                    .model_override
+                    .clone()
+                    .unwrap_or_else(|| current.clone());
+                self.models_sel = self
+                    .models_entries
+                    .iter()
+                    .position(|m| m.id == active)
+                    .unwrap_or(0);
             }
             // `/login [claude|codex]`: run the REAL OAuth flow off-thread
             // (begin → browser → token exchange → persist) so the TUI never
@@ -907,6 +996,233 @@ impl App {
         }
     }
 
+    /// Keys for the `/models` picker overlay: ↑/↓ move, ⏎ applies the model
+    /// (+ the thinking level shown in the footer), ←/→ cycle thinking, Esc/q
+    /// close. Enter on a not-ready model explains why instead of pretending.
+    fn models_key(&mut self, k: crossterm::event::KeyEvent) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.models_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.models_sel = self.models_sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.models_entries.is_empty() {
+                    self.models_sel = (self.models_sel + 1).min(self.models_entries.len() - 1);
+                }
+            }
+            KeyCode::Left => self.thinking_override = cycle_thinking(self.thinking_override, -1),
+            KeyCode::Right => self.thinking_override = cycle_thinking(self.thinking_override, 1),
+            KeyCode::Enter | KeyCode::Char(' ') => self.models_apply(),
+            KeyCode::Char('r') => self.dispatch(Action::OpenModels),
+            _ => {}
+        }
+    }
+
+    /// Mouse for the `/models` picker: click a row to select it, click the
+    /// selected row (or double-click) to apply, wheel scrolls the cursor,
+    /// click outside the modal closes it.
+    fn models_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        let pos = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollUp => self.models_sel = self.models_sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                if !self.models_entries.is_empty() {
+                    self.models_sel = (self.models_sel + 1).min(self.models_entries.len() - 1);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, idx)) = self
+                    .models_hit
+                    .iter()
+                    .find(|(r, _)| rect_has(*r, pos))
+                    .copied()
+                {
+                    if idx == self.models_sel {
+                        self.models_apply();
+                    } else {
+                        self.models_sel = idx;
+                    }
+                } else if !self
+                    .models_hit
+                    .iter()
+                    .any(|(r, _)| rect_has(*r, pos))
+                {
+                    // Outside every row: close only when outside the modal
+                    // frame entirely (the hit list spans the modal body, so a
+                    // click on padding keeps it open harmlessly).
+                    self.models_open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply the picker selection: pin the model for subsequent turns and keep
+    /// the thinking level shown in the footer. Not-ready models don't apply —
+    /// the status line says what's missing instead.
+    fn models_apply(&mut self) {
+        let Some(entry) = self.models_entries.get(self.models_sel) else {
+            return;
+        };
+        if !entry.ready {
+            self.status = format!(
+                "{} has no credential — configure {} (env key or /login)",
+                entry.id, entry.provider
+            );
+            return;
+        }
+        self.model_override = Some(entry.id.clone());
+        self.models_open = false;
+        self.status = format!(
+            "model → {} · thinking {}",
+            entry.id,
+            thinking_label(self.thinking_override)
+        );
+    }
+
+    /// Render the `/models` picker: a centered modal listing the daemon's live
+    /// registry grouped by provider — ready providers first, not-ready ones
+    /// greyed with the reason — plus the thinking-level control in the footer.
+    fn draw_models(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        let full = frame.area();
+        let width = 64u16.min(full.width.saturating_sub(4));
+        let height = full.height.saturating_sub(4).min(34).max(8);
+        let x = full.x + (full.width.saturating_sub(width)) / 2;
+        let y = full.y + (full.height.saturating_sub(height)) / 2;
+        let area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} MODELS ", g("◆", "*")),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.models_hit.clear();
+        if inner.width == 0 || inner.height < 3 {
+            return;
+        }
+
+        if self.models_loading || self.models_entries.is_empty() {
+            let msg = if self.models_loading {
+                "loading registry…"
+            } else {
+                "no models — is the daemon up?"
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(msg, Style::default().fg(theme::COMMENT)))
+                    .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1),
+            );
+            return;
+        }
+
+        // Flatten to display rows: a provider header before each provider run
+        // (entries arrive ready-first, registry order within — see
+        // `order_models`). `None` = header row, `Some(i)` = entry row.
+        let mut rows: Vec<Option<usize>> = Vec::new();
+        let mut last: Option<(&str, bool)> = None;
+        for (i, e) in self.models_entries.iter().enumerate() {
+            if last != Some((e.provider.as_str(), e.ready)) {
+                rows.push(None);
+                last = Some((e.provider.as_str(), e.ready));
+            }
+            rows.push(Some(i));
+        }
+
+        // Scroll the flattened rows so the selected entry stays visible.
+        // The last inner row is the footer (thinking control + keys).
+        let view_h = inner.height.saturating_sub(1) as usize;
+        let sel_row = rows
+            .iter()
+            .position(|r| *r == Some(self.models_sel))
+            .unwrap_or(0);
+        let scroll = sel_row.saturating_sub(view_h.saturating_sub(1)).min(
+            rows.len().saturating_sub(view_h),
+        );
+
+        for (vi, row) in rows.iter().enumerate().skip(scroll).take(view_h) {
+            let ry = inner.y + (vi - scroll) as u16;
+            match row {
+                None => {
+                    // Provider header for the run that starts on the next row.
+                    let (prov, ready) = rows[vi..]
+                        .iter()
+                        .find_map(|r| r.map(|i| &self.models_entries[i]))
+                        .map(|e| (e.provider.clone(), e.ready))
+                        .unwrap_or_default();
+                    let style = if ready {
+                        Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::COMMENT)
+                    };
+                    let tag = if ready { "" } else { " · no credential" };
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(format!("{prov}{tag}"), style))
+                            .style(Style::default().bg(theme::SLATE)),
+                        Rect::new(inner.x, ry, inner.width, 1),
+                    );
+                }
+                Some(i) => {
+                    let e = &self.models_entries[*i];
+                    let selected = *i == self.models_sel;
+                    let active = self.model_override.as_deref() == Some(e.id.as_str())
+                        || (self.model_override.is_none() && e.id == self.models_current);
+                    let bed = if selected { theme::BG_HL } else { theme::SLATE };
+                    let marker = if selected { g("▎", "|") } else { " " };
+                    let dot = if active { g("● ", "* ") } else { "  " };
+                    let fg = if e.ready { theme::FG } else { theme::COMMENT };
+                    let left = format!("{marker} {dot}{}", e.label);
+                    let right = e.id.clone();
+                    let pad = (inner.width as usize)
+                        .saturating_sub(left.chars().count() + right.chars().count() + 1);
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(left, {
+                                let s = Style::default().fg(fg);
+                                if selected {
+                                    s.add_modifier(Modifier::BOLD)
+                                } else {
+                                    s
+                                }
+                            }),
+                            Span::raw(" ".repeat(pad)),
+                            Span::styled(right, Style::default().fg(theme::COMMENT)),
+                        ]))
+                        .style(Style::default().bg(bed)),
+                        Rect::new(inner.x, ry, inner.width, 1),
+                    );
+                    self.models_hit
+                        .push((Rect::new(inner.x, ry, inner.width, 1), *i));
+                }
+            }
+        }
+
+        // Footer: the thinking-level control + key hints.
+        let footer_y = inner.y + inner.height - 1;
+        let footer = format!(
+            " {} thinking: {} {}  ·  ⏎ select · esc close",
+            g("◂", "<"),
+            thinking_label(self.thinking_override),
+            g("▸", ">"),
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                footer,
+                Style::default().fg(theme::CYAN),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+    }
+
     /// Render the `/settings` overlay: a centered modal on the SLATE bed with
     /// toggle rows (on/off pills), the dock-height stepper, and a read-only
     /// info section for the live session.
@@ -1063,6 +1379,7 @@ impl App {
         let workspace = self.workspace_root.clone();
         let existing = self.session_id;
         let model_id = self.model_override.clone();
+        let thinking = self.thinking_override;
         // OCEAN-185: mint the per-turn permission secret; the turn's first
         // permission request claims it (see Action::OceanEvent above).
         let decision_token = ocean_core::mint_decision_token();
@@ -1115,7 +1432,7 @@ impl App {
                 client_type: Some("tui".into()),
                 agent: None,
                 role: None,
-                thinking_level: None,
+                thinking_level: thinking,
                 model_id,
                 images: None,
                 decision_token: Some(decision_token),
@@ -1279,9 +1596,13 @@ impl App {
             }
         }
 
-        // `/settings` modal overlay — drawn last so it floats over everything.
+        // `/settings` + `/models` modal overlays — drawn last so they float
+        // over everything.
         if self.settings_open {
             self.draw_settings(frame);
+        }
+        if self.models_open {
+            self.draw_models(frame);
         }
     }
 
@@ -1428,6 +1749,45 @@ fn splitter(frame: &mut ratatui::Frame, area: Rect, vertical: bool) {
     }
 }
 
+/// Order the `/models` picker entries: ready providers' models first (registry
+/// order within), not-ready ones after — so the list opens on what John can
+/// actually use, with the unconfigured rest visible-but-grey below.
+fn order_models(entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    let (ready, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| e.ready);
+    ready.into_iter().chain(rest).collect()
+}
+
+/// Footer label for the per-turn thinking level (`None` = daemon default).
+fn thinking_label(t: Option<ThinkingLevel>) -> &'static str {
+    match t {
+        None => "default",
+        Some(ThinkingLevel::Off) => "off",
+        Some(ThinkingLevel::Minimal) => "minimal",
+        Some(ThinkingLevel::Low) => "low",
+        Some(ThinkingLevel::Medium) => "medium",
+        Some(ThinkingLevel::High) => "high",
+        Some(ThinkingLevel::Xhigh) => "xhigh",
+    }
+}
+
+/// Cycle the thinking level through `default → off → minimal → low → medium →
+/// high → xhigh` (wrapping both directions). `default` (None) sends nothing so
+/// the daemon's global setting stays in force.
+fn cycle_thinking(cur: Option<ThinkingLevel>, dir: i8) -> Option<ThinkingLevel> {
+    const ORDER: [Option<ThinkingLevel>; 7] = [
+        None,
+        Some(ThinkingLevel::Off),
+        Some(ThinkingLevel::Minimal),
+        Some(ThinkingLevel::Low),
+        Some(ThinkingLevel::Medium),
+        Some(ThinkingLevel::High),
+        Some(ThinkingLevel::Xhigh),
+    ];
+    let i = ORDER.iter().position(|o| *o == cur).unwrap_or(0) as i8;
+    let n = ORDER.len() as i8;
+    ORDER[(((i + dir) % n + n) % n) as usize]
+}
+
 /// Order two selection endpoints into (start, end) reading order — by row,
 /// then column — so a drag upward/leftward selects the same span as one
 /// downward/rightward.
@@ -1534,6 +1894,53 @@ mod tests {
     fn selection_of_pure_padding_copies_nothing() {
         let cells = grid(&["          ", "          "]);
         assert_eq!(selection_text(&cells, (1, 0), (8, 1)), "");
+    }
+
+    fn entry(id: &str, provider: &str, ready: bool) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            provider: provider.into(),
+            label: id.into(),
+            ready,
+        }
+    }
+
+    #[test]
+    fn picker_orders_ready_models_first() {
+        let ordered = order_models(vec![
+            entry("glm-4.6", "glm", false),
+            entry("deepseek-v4-pro", "deepseek", true),
+            entry("gemini-2.0-flash", "google", false),
+            entry("gpt-5.5", "openai-codex", true),
+        ]);
+        let ids: Vec<&str> = ordered.iter().map(|e| e.id.as_str()).collect();
+        // Ready first, original order preserved within each half.
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-pro", "gpt-5.5", "glm-4.6", "gemini-2.0-flash"]
+        );
+    }
+
+    #[test]
+    fn thinking_cycles_through_all_levels_and_wraps() {
+        // Forward from default hits every level then wraps home.
+        let mut cur = None;
+        let mut seen = vec![thinking_label(cur)];
+        for _ in 0..6 {
+            cur = cycle_thinking(cur, 1);
+            seen.push(thinking_label(cur));
+        }
+        assert_eq!(
+            seen,
+            vec!["default", "off", "minimal", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(cycle_thinking(cur, 1), None, "xhigh wraps to default");
+        // Backward from default wraps to xhigh.
+        assert_eq!(
+            thinking_label(cycle_thinking(None, -1)),
+            "xhigh",
+            "default wraps backward to xhigh"
+        );
     }
 
     /// Build an `App` against a throwaway workspace root so `App::new`'s

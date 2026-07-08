@@ -619,13 +619,13 @@ fn login_target(args: &str) -> Result<LoginTarget, String> {
             }
             "/model" => {
                 if args.is_empty() {
-                    Some(Action::Status(
-                        "usage: /model <provider/model> (e.g. anthropic/claude-opus-4-8)".into(),
-                    ))
+                    // Bare `/model` opens the picker — nobody memorizes ids.
+                    Some(Action::OpenModels)
                 } else {
                     Some(Action::SetModel(args.to_string()))
                 }
             }
+            "/models" => Some(Action::OpenModels),
             "/login" => match Self::login_target(args) {
                 Ok(target) => Some(Action::Login(target)),
                 Err(usage) => Some(Action::Status(usage)),
@@ -1841,8 +1841,15 @@ mod tests {
             Some(Action::SetModel(id)) => assert_eq!(id, "anthropic/claude-opus-4-8"),
             other => panic!("expected SetModel, got {other:?}"),
         }
-        // Bare `/model` is a usage hint, not a model change.
-        assert!(matches!(chat.run_slash("/model", ""), Some(Action::Status(_))));
+        // Bare `/model` (and `/models`) open the picker — nobody memorizes ids.
+        assert!(matches!(
+            chat.run_slash("/model", ""),
+            Some(Action::OpenModels)
+        ));
+        assert!(matches!(
+            chat.run_slash("/models", ""),
+            Some(Action::OpenModels)
+        ));
     }
 
     #[test]

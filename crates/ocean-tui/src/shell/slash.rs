@@ -36,7 +36,8 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/new", desc: "start a fresh session", group: "session", soon: false },
     SlashCommand { name: "/resume", desc: "resume a past session", group: "session", soon: false },
     SlashCommand { name: "/sessions", desc: "focus the session rail", group: "session", soon: false },
-    SlashCommand { name: "/model", desc: "set the model for this session (/model <id>)", group: "session", soon: false },
+    SlashCommand { name: "/models", desc: "pick a model + thinking level (live registry)", group: "session", soon: false },
+    SlashCommand { name: "/model", desc: "set the model directly (/model <id>; bare opens the picker)", group: "session", soon: false },
     SlashCommand { name: "/login", desc: "open provider login in browser (/login [claude|codex])", group: "session", soon: false },
     // ── workspace ──────────────────────────────────────────────────────────
     SlashCommand { name: "/files", desc: "focus the file tree", group: "workspace", soon: false },

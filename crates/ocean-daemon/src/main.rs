@@ -2818,10 +2818,20 @@ async fn model_get(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// for a client model picker.
 async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
     let (provider, model) = state.runtime.current_model();
+    // Per-model readiness (credential visible to THIS daemon process) so a
+    // picker can tell the menu apart from what's actually selectable. Additive:
+    // entries keep id/provider/label top-level and gain ready/credential_source.
+    // Auth-file reads are blocking I/O, so they ride spawn_blocking.
+    let models = tokio::task::spawn_blocking(|| {
+        let env = ocean_agent::ProviderEnv::from_process();
+        ocean_agent::known_models_with_readiness(&env)
+    })
+    .await
+    .unwrap_or_default();
     Json(json!({
         "ok": true,
         "current": { "provider": provider, "model": model },
-        "models": ocean_agent::known_models(),
+        "models": models,
     }))
 }
 

@@ -289,6 +289,54 @@ impl DaemonClient {
     }
 }
 
+/// One entry from `GET /v1/models` — the daemon's model registry plus the
+/// readiness stamp (is the provider's credential visible to the daemon?).
+/// `ready` defaults to true so a pre-readiness daemon still yields a fully
+/// selectable menu instead of an all-grey one.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModelEntry {
+    pub id: String,
+    pub provider: String,
+    pub label: String,
+    #[serde(default = "bool_true")]
+    pub ready: bool,
+}
+
+fn bool_true() -> bool {
+    true
+}
+
+/// The daemon's currently-selected global model.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CurrentModel {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Response shape of `GET /v1/models`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModelsResponse {
+    pub current: CurrentModel,
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
+}
+
+impl DaemonClient {
+    /// `GET /v1/models` — the registry with per-model readiness, for the
+    /// `/models` picker overlay.
+    pub async fn models(&self) -> Result<ModelsResponse, String> {
+        self.http
+            .get(format!("{}/v1/models", self.base))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json::<ModelsResponse>()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Pull the `id:` line out of one SSE frame (for Last-Event-ID replay).
 fn parse_sse_id(frame: &str) -> Option<String> {
     frame.lines().find_map(|l| {

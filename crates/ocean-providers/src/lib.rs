@@ -610,6 +610,58 @@ pub fn known_models() -> Vec<KnownModel> {
     ]
 }
 
+/// A known model plus whether its provider credential is actually present in
+/// the given environment — the difference between "the menu" and "what the
+/// kitchen can cook". `credential_source` names where the credential came from
+/// (env var / auth file) when present, so a picker can show it. Serialized
+/// flat: `id`/`provider`/`label` stay top-level, keeping `GET /v1/models`
+/// backward compatible (readiness is purely additive).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyModel {
+    #[serde(flatten)]
+    pub model: KnownModel,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<CredentialSource>,
+}
+
+/// Per-model readiness for `GET /v1/models`: resolve each distinct provider's
+/// credential once (env vars → Ocean auth file → Codex CLI fallback — the same
+/// chain a real turn's selection uses) and stamp every model of that provider.
+/// A resolver error (unreadable auth file, unroutable alias) marks the
+/// provider not-ready rather than failing the listing.
+///
+/// Readiness is CONFIGURATION truth, not a liveness probe: a ready provider
+/// can still 429/5xx at call time. It answers "could a turn select this model
+/// right now", which is what a model picker needs.
+pub fn known_models_with_readiness(env: &ProviderEnv) -> Vec<ReadyModel> {
+    let mut by_provider: BTreeMap<String, (bool, Option<CredentialSource>)> = BTreeMap::new();
+    known_models()
+        .into_iter()
+        .map(|m| {
+            let (ready, credential_source) = by_provider
+                .entry(m.provider.clone())
+                .or_insert_with(|| {
+                    let mut probe = env.clone();
+                    probe.vars.insert("OCEAN_MODEL".into(), m.id.clone());
+                    match resolve_provider_config(&probe) {
+                        Ok(cfg) => {
+                            let r = cfg.readiness();
+                            (r.ok, r.credential_source)
+                        }
+                        Err(_) => (false, None),
+                    }
+                })
+                .clone();
+            ReadyModel {
+                model: m,
+                ready,
+                credential_source,
+            }
+        })
+        .collect()
+}
+
 /// Resolve model selection without reading credential values.
 pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, ProviderConfigError> {
     // No hardcoded model. The operator's choice flows in as OCEAN_MODEL (set
@@ -1418,6 +1470,26 @@ mod tests {
     }
 
     // ---- known_models() <-> resolve_model_selection() (OCEAN-369) ---------
+
+    #[test]
+    fn readiness_reflects_which_providers_have_credentials() {
+        // Only deepseek gets a key: its models are ready, everyone else's are
+        // not, and the flat serde shape keeps id/provider/label at top level.
+        let env = env(&[("DEEPSEEK_API_KEY", "sk-test")]);
+        let listed = known_models_with_readiness(&env);
+        assert_eq!(listed.len(), known_models().len());
+        for entry in &listed {
+            let expect = entry.model.provider == "deepseek";
+            assert_eq!(
+                entry.ready, expect,
+                "model {:?} (provider {}) readiness should be {expect}",
+                entry.model.id, entry.model.provider,
+            );
+        }
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert!(json.get("id").is_some(), "flatten keeps id top-level");
+        assert!(json.get("ready").is_some());
+    }
 
     #[test]
     fn known_models_are_all_routable() {

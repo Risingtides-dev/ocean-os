@@ -14,12 +14,15 @@ use ocean_core::{
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
 use ocean_providers::{
-    resolve_provider_config, resolve_provider_config_from_env, ProviderConfig, ProviderEnv,
-    ProviderId, ProviderReadiness,
+    resolve_provider_config, resolve_provider_config_from_env, ProviderConfig, ProviderId,
+    ProviderReadiness,
 };
-// Re-export the model catalogue so the daemon can serve a picker without taking
-// a direct ocean-providers dependency.
-pub use ocean_providers::{known_models, KnownModel};
+// Re-export the model catalogue (and the env snapshot readiness reads from) so
+// the daemon can serve a picker without taking a direct ocean-providers
+// dependency.
+pub use ocean_providers::{
+    known_models, known_models_with_readiness, KnownModel, ProviderEnv, ReadyModel,
+};
 use ocean_runtime::{
     run_agent_with_history, AgentConfig, AgentError, AgentEvent, BuiltinProvider,
     CapabilityProvider, CapabilityRegistry, PermissionDecision, PermissionPolicy, SessionContext,
