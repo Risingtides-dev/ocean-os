@@ -132,6 +132,9 @@ pub struct App {
     esc_armed: bool,
     /// Last time the file tree was re-read from disk (throttles the live rescan).
     last_tree_scan: Instant,
+    /// `/settings` overlay: open flag + selected row.
+    settings_open: bool,
+    settings_sel: usize,
 }
 
 /// A title-bar button — CTRL's icon toggles, extended with the center surfaces.
@@ -185,6 +188,8 @@ impl App {
             buttons: Vec::new(),
             esc_armed: false,
             last_tree_scan: Instant::now(),
+            settings_open: false,
+            settings_sel: 0,
         };
         app.apply_focus();
         // `@` file mentions index the launch project from the start.
@@ -256,11 +261,13 @@ impl App {
                         self.last_tree_scan = Instant::now();
                         dirty = true;
                     }
-                    // Keep animating while a turn streams (incoming text/spinner)
-                    // or the PTY is live, so those repaint at the tick cadence.
-                    if self.stream_task.as_ref().is_some_and(|t| !t.is_finished())
-                        || self.pty.is_active()
-                    {
+                    // Keep animating while a turn is actually streaming or the
+                    // PTY is live, so those repaint at the tick cadence. NOTE:
+                    // this must key off chat.is_busy(), NOT stream_task liveness
+                    // — the SSE task is a self-healing reconnect loop that never
+                    // finishes, and gating on it forced 60Hz full redraws (and
+                    // ~20% CPU) forever once a session was bound.
+                    if self.chat.is_busy() || self.pty.is_active() {
                         dirty = true;
                     }
                 }
@@ -284,6 +291,15 @@ impl App {
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // The `/settings` overlay is modal: while open, keys drive it and
+        // everything else waits. (Mouse falls through — clicking outside is
+        // harmless; Esc/q closes.)
+        if self.settings_open {
+            if let CrosstermEvent::Key(k) = evt {
+                self.settings_key(k);
+                return;
+            }
+        }
         // Mouse: a click focuses the pane under the cursor; wheel + clicks are
         // forwarded to whichever pane the cursor is over (CTRL behavior).
         if let CrosstermEvent::Mouse(m) = evt {
@@ -639,6 +655,11 @@ impl App {
                 self.model_override = Some(id.clone());
                 self.status = format!("model → {id}");
             }
+            // `/settings`: open the modal settings overlay.
+            Action::OpenSettings => {
+                self.settings_open = true;
+                self.settings_sel = 0;
+            }
             // `/copy`: hand the last reply to the system clipboard via pbcopy.
             Action::CopyToClipboard(text) => {
                 let text = text.clone();
@@ -742,6 +763,167 @@ impl App {
         // Force the file tree to re-read on the next tick rather than waiting
         // out the throttle window.
         self.last_tree_scan = Instant::now() - Duration::from_secs(2);
+    }
+
+    /// Number of interactive rows in the `/settings` overlay.
+    const SETTINGS_ROWS: usize = 5;
+
+    /// Drive the `/settings` overlay: ↑↓/jk move, Enter/Space toggle, ←/→ adjust
+    /// the dock height row, Esc/q close.
+    fn settings_key(&mut self, k: crossterm::event::KeyEvent) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.settings_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_sel = self.settings_sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_sel = (self.settings_sel + 1).min(Self::SETTINGS_ROWS - 1);
+            }
+            KeyCode::Left if self.settings_sel == 3 => self.resize_term(-2),
+            KeyCode::Right if self.settings_sel == 3 => self.resize_term(2),
+            KeyCode::Enter | KeyCode::Char(' ') => match self.settings_sel {
+                0 => self.show_sessions = !self.show_sessions,
+                1 => self.show_tree = !self.show_tree,
+                2 => self.show_term = !self.show_term,
+                3 => {} // height adjusts with ←/→
+                4 => self.chat.toggle_tools_expanded(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Render the `/settings` overlay: a centered modal on the SLATE bed with
+    /// toggle rows (on/off pills), the dock-height stepper, and a read-only
+    /// info section for the live session.
+    fn draw_settings(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        let full = frame.area();
+        let width = 56u16.min(full.width.saturating_sub(4));
+        let height = 14u16.min(full.height.saturating_sub(2));
+        let x = full.x + (full.width.saturating_sub(width)) / 2;
+        let y = full.y + (full.height.saturating_sub(height)) / 2;
+        let area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} SETTINGS ", g("◆", "*")),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let pill = |on: bool| {
+            if on {
+                Span::styled(
+                    format!("{} on ", g("●", "*")),
+                    Style::default().fg(theme::GREEN),
+                )
+            } else {
+                Span::styled(
+                    format!("{} off", g("○", "o")),
+                    Style::default().fg(theme::COMMENT),
+                )
+            }
+        };
+        let rows: Vec<(String, Span)> = vec![
+            ("sessions rail".into(), pill(self.show_sessions)),
+            ("file tree".into(), pill(self.show_tree)),
+            ("terminal dock".into(), pill(self.show_term)),
+            (
+                "terminal height".into(),
+                Span::styled(
+                    format!("{} {} rows {}", g("◂", "<"), self.term_h, g("▸", ">")),
+                    Style::default().fg(theme::CYAN),
+                ),
+            ),
+            ("tool cards expanded".into(), pill(self.chat.tools_expanded())),
+        ];
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let selected = i == self.settings_sel;
+            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+            let marker = if selected { g("▎", "|") } else { " " };
+            let left = format!("{marker} {label}");
+            let pad = (inner.width as usize)
+                .saturating_sub(left.chars().count() + value.content.chars().count() + 1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(left, {
+                        let s = Style::default().fg(theme::FG);
+                        if selected {
+                            s.add_modifier(Modifier::BOLD)
+                        } else {
+                            s
+                        }
+                    }),
+                    Span::raw(" ".repeat(pad)),
+                    value.clone(),
+                ]))
+                .style(Style::default().bg(bed)),
+                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            );
+        }
+
+        // Read-only info section.
+        let model = self
+            .model_override
+            .clone()
+            .unwrap_or_else(|| "daemon default".into());
+        let session = self
+            .session_id
+            .map(|id| format!("{:.8}", id.0.to_string()))
+            .unwrap_or_else(|| "none (fresh)".into());
+        let project = std::path::Path::new(&self.workspace_root)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let info = [
+            format!("model    {model}"),
+            format!("session  {session}"),
+            format!("project  {project}"),
+        ];
+        let info_y = inner.y + rows.len() as u16 + 1;
+        for (i, line) in info.iter().enumerate() {
+            let yy = info_y + i as u16;
+            if yy >= inner.y + inner.height.saturating_sub(1) {
+                break;
+            }
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("   {line}"),
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x, yy, inner.width, 1),
+            );
+        }
+        // Footer hints on the last row.
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(
+                    " {} move · ⏎ toggle · {} height · esc close",
+                    g("↑↓", "^v"),
+                    g("◂▸", "<>")
+                ),
+                Style::default().fg(theme::COMMENT),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(
+                inner.x,
+                inner.y + inner.height.saturating_sub(1),
+                inner.width,
+                1,
+            ),
+        );
     }
 
     /// Grow (+) or shrink (−) the terminal dock by `delta` rows, clamped so the
@@ -923,6 +1105,11 @@ impl App {
 
         self.draw_title(frame, title_row);
         self.draw_status(frame, status_row);
+
+        // `/settings` modal overlay — drawn last so it floats over everything.
+        if self.settings_open {
+            self.draw_settings(frame);
+        }
     }
 
     /// CTRL's title row: project label left, status pill center, and the

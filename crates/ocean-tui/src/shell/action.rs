@@ -52,6 +52,9 @@ pub enum Action {
     CopyToClipboard(String),
     /// `/model <id>` — override the model for subsequent turns this session.
     SetModel(String),
+    /// `/settings` — open the app's settings overlay (panel toggles, dock
+    /// height, live session info).
+    OpenSettings,
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
     /// Resume a session natively in the chat: load its transcript from `path`,

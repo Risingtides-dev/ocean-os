@@ -481,6 +481,24 @@ impl ChatComponent {
         }
     }
 
+    /// Whether a turn is currently streaming (submit → TurnFinished). The app's
+    /// render loop animates at tick rate only while this (or a live PTY) is
+    /// true, instead of redrawing 60Hz forever.
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    /// Whether tool/diff cards render fully expanded (the ⌃O toggle). Exposed
+    /// for the settings overlay.
+    pub fn tools_expanded(&self) -> bool {
+        self.tools_expanded
+    }
+
+    /// Flip the ⌃O expand toggle from outside (settings overlay row).
+    pub fn toggle_tools_expanded(&mut self) {
+        self.tools_expanded = !self.tools_expanded;
+    }
+
     // ── `@` file mentions ────────────────────────────────────────────────────
 
     /// Point `@`-mentions at a project root. Invalidates the file index when the
@@ -591,6 +609,7 @@ impl ChatComponent {
             "/files" => Some(Action::Navigate(Nav::Files)),
             "/graph" => Some(Action::Navigate(Nav::Graph)),
             "/terminal" => Some(Action::Navigate(Nav::Terminal)),
+            "/settings" => Some(Action::OpenSettings),
             // Roadmap commands: present in the palette as a discoverability map,
             // but honest that the backend isn't on this branch yet.
             _ => {
@@ -614,42 +633,79 @@ impl ChatComponent {
     }
 
     /// Push `/help` output into the transcript as an assistant block — the
-    /// markdown-lite renderer styles the heading, bullets, and inline `code`.
+    /// markdown-lite renderer styles the headings, bullets, and inline `code`.
+    /// Sections follow the registry's breadcrumb groups.
     fn push_help(&mut self) {
         let mut body = String::from("# commands\n");
+        let mut last_group = "";
         for c in slash::COMMANDS {
+            if c.group != last_group {
+                body.push_str(&format!("\n## {}\n", c.group));
+                last_group = c.group;
+            }
             body.push_str(&format!("- `{}` — {}\n", c.name, c.desc));
         }
         self.turns.push(Turn::Assistant(body));
     }
 
-    /// Render the floating command palette just above the composer, listing the
-    /// ranked matches with the selection on a `BG_HL` bed. Overlaid last so it
-    /// sits on top of the transcript.
+    /// Render the floating command palette just above the composer. On the bare
+    /// `/` the registry renders as breadcrumbed group SECTIONS (session /
+    /// workspace / chat / roadmap groups) with muted headers, like the file
+    /// tree's grouping; while filtering, rows are flat ranked matches carrying a
+    /// muted `group ›` breadcrumb so you still see where a command lives. The
+    /// selection rides on a `BG_HL` bed. Overlaid last so it sits on top of the
+    /// transcript.
     fn draw_menu(&self, frame: &mut Frame, composer: Rect, matches: &[&slash::SlashCommand]) {
         if matches.is_empty() {
             return;
         }
-        // Show as many as fit in the space above the composer, capped so the
-        // roadmap is visible without the popup running off the top of the frame.
-        let cap = (composer.y as usize).saturating_sub(3).clamp(1, 20);
-        let shown = matches.len().min(cap);
-        let sel = self.menu_sel.min(shown - 1);
+        // Grouped mode on the bare `/` (matches are in registry order there).
+        let grouped = self.input == "/";
 
-        // `soon` rows carry a right-aligned " · soon" badge (7 cols). Width fits
-        // the widest ACTUAL row, capped to the composer width. Each row renders
-        // as ` {marker} ` (3) + `{:<11}` name (min 11) + ` — ` (3) + desc, plus
-        // the badge on roadmap rows — mirror that exactly or long descriptions
-        // clip mid-word against the composer cap.
+        // Build the visible row list: command rows indexed into `matches`, plus
+        // (in grouped mode) a header row at each group boundary.
+        enum Row<'a> {
+            Header(&'static str),
+            Cmd(usize, &'a slash::SlashCommand),
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        let mut last_group = "";
+        for (i, c) in matches.iter().enumerate() {
+            if grouped && c.group != last_group {
+                rows.push(Row::Header(c.group));
+                last_group = c.group;
+            }
+            rows.push(Row::Cmd(i, c));
+        }
+
+        let cap = (composer.y as usize).saturating_sub(3).clamp(1, 26);
+        let shown = rows.len().min(cap);
+        let sel = self.menu_sel.min(matches.len() - 1);
+
+        // Width fits the widest ACTUAL row, capped to the composer width. A
+        // command row renders as ` {marker} ` (3) + breadcrumb (filtered mode)
+        // + `{:<11}` name + ` — ` (3) + desc + the soon badge; mirror that
+        // exactly or long descriptions clip mid-word.
         const BADGE_W: usize = 7; // " · soon"
-        let content_w = matches
+        let crumb_w = |c: &slash::SlashCommand| {
+            if grouped {
+                0
+            } else {
+                c.group.chars().count() + 3 // "group › "
+            }
+        };
+        let content_w = rows
             .iter()
             .take(shown)
-            .map(|c| {
-                3 + c.name.chars().count().max(11)
-                    + 3
-                    + c.desc.chars().count()
-                    + if c.soon { BADGE_W } else { 0 }
+            .map(|r| match r {
+                Row::Header(gname) => 2 + gname.chars().count(),
+                Row::Cmd(_, c) => {
+                    3 + crumb_w(c)
+                        + c.name.chars().count().max(11)
+                        + 3
+                        + c.desc.chars().count()
+                        + if c.soon { BADGE_W } else { 0 }
+                }
             })
             .max()
             .unwrap_or(24);
@@ -675,49 +731,89 @@ impl ChatComponent {
             return;
         }
 
-        for (i, c) in matches.iter().take(shown).enumerate() {
-            let selected = i == sel;
-            let bed = if selected { theme::BG_HL } else { theme::SLATE };
-            // Live rows read bold in FG/CYAN; roadmap (soon) rows are muted so
-            // the working commands stay visually dominant.
-            let (name_fg, name_mod) = match (selected, c.soon) {
-                (true, false) => (theme::CYAN, Modifier::BOLD),
-                (true, true) => (theme::YELLOW, Modifier::empty()),
-                (false, false) => (theme::FG, Modifier::BOLD),
-                (false, true) => (theme::COMMENT, Modifier::empty()),
-            };
-            let marker = if selected { g("❯", ">") } else { " " };
-            let mut spans = vec![
-                Span::styled(format!(" {marker} "), Style::default().fg(theme::CYAN)),
-                Span::styled(
-                    format!("{:<11}", c.name),
-                    Style::default().fg(name_fg).add_modifier(name_mod),
-                ),
-                Span::styled(
-                    format!(" {} {}", g("—", "-"), c.desc),
-                    Style::default().fg(theme::COMMENT),
-                ),
-            ];
-            if c.soon {
-                let left_w = 3 + c.name.chars().count().max(11) + 3 + c.desc.chars().count();
-                let target = inner.width as usize;
-                if target > left_w + BADGE_W {
-                    spans.push(Span::raw(" ".repeat(target - left_w - BADGE_W)));
+        for (row_i, row) in rows.iter().take(shown).enumerate() {
+            match row {
+                Row::Header(gname) => {
+                    // Muted section header, file-tree style: `▾ group`.
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(
+                                format!(" {} ", g("▾", "v")),
+                                Style::default().fg(theme::DEEPBLUE),
+                            ),
+                            Span::styled(
+                                gname.to_string(),
+                                Style::default()
+                                    .fg(theme::BLUE)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]))
+                        .style(Style::default().bg(theme::SLATE)),
+                        Rect::new(inner.x, inner.y + row_i as u16, inner.width, 1),
+                    );
                 }
-                spans.push(Span::styled(
-                    format!(" {} soon", g("·", "-")),
-                    Style::default().fg(theme::YELLOW),
-                ));
+                Row::Cmd(i, c) => {
+                    let selected = *i == sel;
+                    let bed = if selected { theme::BG_HL } else { theme::SLATE };
+                    // Live rows read bold in FG/CYAN; roadmap (soon) rows are
+                    // muted so the working commands stay visually dominant.
+                    let (name_fg, name_mod) = match (selected, c.soon) {
+                        (true, false) => (theme::CYAN, Modifier::BOLD),
+                        (true, true) => (theme::YELLOW, Modifier::empty()),
+                        (false, false) => (theme::FG, Modifier::BOLD),
+                        (false, true) => (theme::COMMENT, Modifier::empty()),
+                    };
+                    let marker = if selected { g("❯", ">") } else { " " };
+                    let mut spans = vec![Span::styled(
+                        format!(" {marker} "),
+                        Style::default().fg(theme::CYAN),
+                    )];
+                    if !grouped {
+                        // Filtered rows carry their breadcrumb: `group › /name`.
+                        spans.push(Span::styled(
+                            format!("{} {} ", c.group, g("›", ">")),
+                            Style::default().fg(theme::DEEPBLUE),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        format!("{:<11}", c.name),
+                        Style::default().fg(name_fg).add_modifier(name_mod),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" {} {}", g("—", "-"), c.desc),
+                        Style::default().fg(theme::COMMENT),
+                    ));
+                    if c.soon {
+                        let left_w = 3
+                            + crumb_w(c)
+                            + c.name.chars().count().max(11)
+                            + 3
+                            + c.desc.chars().count();
+                        let target = inner.width as usize;
+                        if target > left_w + BADGE_W {
+                            spans.push(Span::raw(" ".repeat(target - left_w - BADGE_W)));
+                        }
+                        spans.push(Span::styled(
+                            format!(" {} soon", g("·", "-")),
+                            Style::default().fg(theme::YELLOW),
+                        ));
+                    }
+                    frame.render_widget(
+                        Paragraph::new(Line::from(spans)).style(Style::default().bg(bed)),
+                        Rect::new(inner.x, inner.y + row_i as u16, inner.width, 1),
+                    );
+                }
             }
-            frame.render_widget(
-                Paragraph::new(Line::from(spans)).style(Style::default().bg(bed)),
-                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
-            );
         }
         // Footer hint on the last inner row; note the truncation when the list
         // is longer than what fits.
-        let more = if shown < matches.len() {
-            format!(" · {shown}/{}", matches.len())
+        let shown_cmds = rows
+            .iter()
+            .take(shown)
+            .filter(|r| matches!(r, Row::Cmd(..)))
+            .count();
+        let more = if shown_cmds < matches.len() {
+            format!(" · {shown_cmds}/{}", matches.len())
         } else {
             String::new()
         };

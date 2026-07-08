@@ -17,37 +17,47 @@
 pub struct SlashCommand {
     pub name: &'static str,
     pub desc: &'static str,
+    /// Breadcrumb group — sections the bare `/` menu and prefixes filtered rows
+    /// (`session › /new`). Keep to one short lowercase word.
+    pub group: &'static str,
     pub soon: bool,
 }
 
 /// The built-in command set. One line per command — the palette, the fuzzy
 /// filter, and `/help` all read from here, so this is the single source of
 /// truth. Keep names short and lower-case; execution matches on `name`.
+/// Commands are ordered by group: the bare `/` menu renders these groups as
+/// sections (in first-appearance order), so keep each group's lines together.
 ///
 /// LIVE commands work when pressed. `soon: true` commands advertise where the
 /// harness is going (the W3–W7 slices) and say so honestly when run.
 pub const COMMANDS: &[SlashCommand] = &[
-    // ── live: wired to real behavior ──────────────────────────────────────
-    SlashCommand { name: "/new", desc: "start a fresh session", soon: false },
-    SlashCommand { name: "/model", desc: "set the model for this session (/model <id>)", soon: false },
-    SlashCommand { name: "/copy", desc: "copy the last reply to the clipboard", soon: false },
-    SlashCommand { name: "/resume", desc: "resume a past session", soon: false },
-    SlashCommand { name: "/sessions", desc: "focus the session rail", soon: false },
-    SlashCommand { name: "/files", desc: "focus the file tree", soon: false },
-    SlashCommand { name: "/graph", desc: "open the graph view", soon: false },
-    SlashCommand { name: "/terminal", desc: "focus the terminal", soon: false },
-    SlashCommand { name: "/clear", desc: "clear the chat transcript", soon: false },
-    SlashCommand { name: "/help", desc: "list all commands", soon: false },
-    SlashCommand { name: "/quit", desc: "exit ocean", soon: false },
-    // ── soon: roadmap surface (W3–W7), honest when run ────────────────────
-    SlashCommand { name: "/compact", desc: "prune + shake the context (W3)", soon: true },
-    SlashCommand { name: "/context", desc: "context-economy panel (W3)", soon: true },
-    SlashCommand { name: "/diff", desc: "review pending edits (W3)", soon: true },
-    SlashCommand { name: "/lsp", desc: "diagnostics / rename (W5)", soon: true },
-    SlashCommand { name: "/rules", desc: "manage stream rules (W6)", soon: true },
-    SlashCommand { name: "/memory", desc: "recall / retain memory — OKF (W7)", soon: true },
-    SlashCommand { name: "/goal", desc: "set the session goal (W7)", soon: true },
-    SlashCommand { name: "/handoff", desc: "write handoff.md (W7)", soon: true },
+    // ── session ────────────────────────────────────────────────────────────
+    SlashCommand { name: "/new", desc: "start a fresh session", group: "session", soon: false },
+    SlashCommand { name: "/resume", desc: "resume a past session", group: "session", soon: false },
+    SlashCommand { name: "/sessions", desc: "focus the session rail", group: "session", soon: false },
+    SlashCommand { name: "/model", desc: "set the model for this session (/model <id>)", group: "session", soon: false },
+    // ── workspace ──────────────────────────────────────────────────────────
+    SlashCommand { name: "/files", desc: "focus the file tree", group: "workspace", soon: false },
+    SlashCommand { name: "/graph", desc: "open the graph view", group: "workspace", soon: false },
+    SlashCommand { name: "/terminal", desc: "focus the terminal", group: "workspace", soon: false },
+    SlashCommand { name: "/settings", desc: "open the settings panel", group: "workspace", soon: false },
+    // ── chat ───────────────────────────────────────────────────────────────
+    SlashCommand { name: "/copy", desc: "copy the last reply to the clipboard", group: "chat", soon: false },
+    SlashCommand { name: "/clear", desc: "clear the chat transcript", group: "chat", soon: false },
+    SlashCommand { name: "/help", desc: "list all commands", group: "chat", soon: false },
+    SlashCommand { name: "/quit", desc: "exit ocean", group: "chat", soon: false },
+    // ── context (W3 roadmap) ───────────────────────────────────────────────
+    SlashCommand { name: "/compact", desc: "prune + shake the context (W3)", group: "context", soon: true },
+    SlashCommand { name: "/context", desc: "context-economy panel (W3)", group: "context", soon: true },
+    SlashCommand { name: "/diff", desc: "review pending edits (W3)", group: "context", soon: true },
+    // ── intel (W5–W6 roadmap) ──────────────────────────────────────────────
+    SlashCommand { name: "/lsp", desc: "diagnostics / rename (W5)", group: "intel", soon: true },
+    SlashCommand { name: "/rules", desc: "manage stream rules (W6)", group: "intel", soon: true },
+    // ── agent (W7 roadmap) ─────────────────────────────────────────────────
+    SlashCommand { name: "/memory", desc: "recall / retain memory — OKF (W7)", group: "agent", soon: true },
+    SlashCommand { name: "/goal", desc: "set the session goal (W7)", group: "agent", soon: true },
+    SlashCommand { name: "/handoff", desc: "write handoff.md (W7)", group: "agent", soon: true },
 ];
 
 /// Is `name` (with leading `/`) a known command? Used by the composer to decide
@@ -64,6 +74,11 @@ pub fn is_command(name: &str) -> bool {
 /// Ties break toward the shorter name, then alphabetically, so the ordering is
 /// deterministic (important for the selection cursor and for tests).
 pub fn filter(query: &str) -> Vec<(&'static SlashCommand, i32)> {
+    // Bare `/`: keep registry order so the menu renders as contiguous group
+    // sections (session / workspace / chat / roadmap groups).
+    if query.is_empty() {
+        return COMMANDS.iter().map(|c| (c, 0)).collect();
+    }
     let mut out: Vec<(&'static SlashCommand, i32)> = COMMANDS
         .iter()
         .filter_map(|c| fuzzy_score(query, c).map(|s| (c, s)))
@@ -71,7 +86,7 @@ pub fn filter(query: &str) -> Vec<(&'static SlashCommand, i32)> {
     out.sort_by(|a, b| {
         b.1.cmp(&a.1)
             // live (soon=false) sorts ahead of roadmap (soon=true) on score ties,
-            // so the bare `/` menu groups working commands above the roadmap.
+            // so ranked results keep working commands above the roadmap.
             .then_with(|| a.0.soon.cmp(&b.0.soon))
             .then_with(|| a.0.name.len().cmp(&b.0.name.len()))
             .then_with(|| a.0.name.cmp(b.0.name))
