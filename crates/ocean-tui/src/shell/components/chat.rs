@@ -1262,6 +1262,25 @@ impl Component for ChatComponent {
                     }
                     self.busy = true;
                 }
+                // Failover honesty (OCEAN-275): the daemon rerouted this turn to
+                // a different model than requested. Render it as a concern card
+                // in the transcript (the status line alone is easy to miss) and
+                // update the pill to the model actually answering.
+                AgentTurnEvent::ModelRerouted {
+                    requested,
+                    effective,
+                    reason,
+                    ..
+                } => {
+                    self.model = Some(effective.clone());
+                    self.turns.push(Turn::Advisor {
+                        note: format!(
+                            "{requested} unavailable — turn running on {effective}. {reason}"
+                        ),
+                        severity: "concern".into(),
+                        model: effective.clone(),
+                    });
+                }
                 AgentTurnEvent::AssistantTextDelta { delta, .. } => self.push_assistant(delta),
                 AgentTurnEvent::ThinkingDelta { delta, .. } => self.push_thinking(delta),
                 AgentTurnEvent::ToolCallStarted { call, .. } => {

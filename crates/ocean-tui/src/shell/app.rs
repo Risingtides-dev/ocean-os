@@ -641,21 +641,18 @@ impl App {
                         return;
                     }
                 }
-                // Honesty check: the daemon fails degraded providers over to a
-                // ready alternate at selection time. That resilience is right
-                // for unattended loops but WRONG to hide from an operator who
-                // explicitly pinned a model — surface the reroute the moment
-                // the turn starts on something else.
-                if let AgentTurnEvent::TurnStarted {
-                    model: Some(got), ..
+                // Failover honesty (OCEAN-275): the daemon announces a reroute
+                // on the stream; paint it in the status line too (the chat
+                // renders the full concern card in the transcript).
+                if let AgentTurnEvent::ModelRerouted {
+                    requested,
+                    effective,
+                    ..
                 } = evt.as_ref()
                 {
-                    if let Some(want) = &self.model_override {
-                        if got != want {
-                            self.status =
-                                format!("⚠ {want} unavailable — turn running on {got} (fallback)");
-                        }
-                    }
+                    self.status = format!(
+                        "⚠ {requested} unavailable — turn running on {effective} (fallback)"
+                    );
                 }
             }
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),

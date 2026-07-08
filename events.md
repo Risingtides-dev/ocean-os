@@ -1930,3 +1930,11 @@ area:      frontend
 
 Models: made /model actually work and honest. Diagnosed John's "login worked but switching doesn't": the daemon's failover silently rerouted turns — claude-code resolved fine but Anthropic 429'd (sub quota window) → fell over to gpt-5.4 with zero surface signal; kimi suspended (balance); anthropic/openai/glm/minimax/google have no credential visible to the daemon. Live-swept all 22 registry models with real turns to establish ground truth (honored: deepseek v4-pro/flash + all four codex gpt-5.x). Shipped: (1) ocean-providers known_models_with_readiness — per-provider credential resolve stamped on every model, GET /v1/models now returns ready+credential_source per entry (additive); (2) TUI /models picker overlay — live registry fetch, ready providers first, not-ready greyed with reason, ↑↓/⏎/esc/click/scroll, ←→ cycles per-turn thinking level (off…xhigh, default=daemon), bare /model opens it too; (3) thinking_override rides AgentTurnRequest.thinking_level on every turn; (4) fallback honesty — TurnStarted model ≠ pinned override paints "⚠ X unavailable — running on Y (fallback)" in the status line. Suites: tui 162/0, daemon 257/0, agent 128/0, providers 34/0.
 _________________________________________________________________________________
+time:      [5:05pm] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+ModelRerouted event — failover honesty end to end. The OCEAN-275 failover silently swapped models (John's claude-code 429 → gpt-5.4 with zero signal). New runtime AgentEvent::ModelRerouted emitted at BOTH failover sites (degraded-at-selection + pre-stream call failure, reason clamped to 200 chars), bridged by the daemon onto the scoped SSE as AgentTurnEvent::ModelRerouted {requested, effective, reason}, surfaced in the workbench chat as a concern card + status line, in the legacy TUI transcript, and in ACP as a visible message chunk. All exhaustive matchers updated across acp/daemon/sdk/tui. Suites: runtime 84+12, agent 128, sdk 48, daemon 258, acp 19+3, tui 162 — all green.
+_________________________________________________________________________________

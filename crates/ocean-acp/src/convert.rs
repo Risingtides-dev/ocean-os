@@ -74,6 +74,16 @@ pub fn event_to_update(event: &AgentTurnEvent) -> Option<SessionUpdate> {
             Some(SessionUpdate::AgentMessageChunk(text_chunk(delta.clone())))
         }
 
+        // Failover honesty (OCEAN-275): tell the editor the turn was rerouted
+        // to a different model than requested, as a visible message chunk.
+        AgentTurnEvent::ModelRerouted {
+            requested,
+            effective,
+            ..
+        } => Some(SessionUpdate::AgentMessageChunk(text_chunk(format!(
+            "⚠ {requested} unavailable — turn running on {effective} (fallback)\n"
+        )))),
+
         AgentTurnEvent::ThinkingDelta { delta, .. } => {
             Some(SessionUpdate::AgentThoughtChunk(text_chunk(delta.clone())))
         }

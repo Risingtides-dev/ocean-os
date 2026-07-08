@@ -3697,6 +3697,17 @@ fn daemon_apply_agent_stream_event(app: &mut DaemonApp, event: AgentTurnEvent) {
     }
 
     match event {
+        // Failover honesty (OCEAN-275): surface the daemon's model reroute in
+        // the transcript instead of silently answering from a different model.
+        AgentTurnEvent::ModelRerouted {
+            requested,
+            effective,
+            ..
+        } => {
+            app.push_transcript_if_new(format!(
+                "⚠ {requested} unavailable — turn running on {effective} (fallback)"
+            ));
+        }
         AgentTurnEvent::SessionCreated {
             session_id,
             title,
@@ -4814,6 +4825,11 @@ fn summarize_longhouse_event(event: &LonghouseEvent) -> String {
 
 fn summarize_agent_event(event: &AgentTurnEvent) -> String {
     match event {
+        AgentTurnEvent::ModelRerouted {
+            requested,
+            effective,
+            ..
+        } => format!("agent model_rerouted {requested} → {effective}"),
         AgentTurnEvent::SessionCreated {
             session_id,
             title,

@@ -619,6 +619,7 @@ impl AgentRuntime {
         // — when no alternate is ready — a clear "all providers degraded" error
         // rather than the bare single-provider preflight message. A ready primary
         // passes straight through untouched.
+        let requested_model = turn_snapshot.provider_config.selection.model.clone();
         let effective = match Self::resolve_turn_state_with_failover(turn_snapshot, &env) {
             Ok(state) => state,
             Err(stderr) => {
@@ -635,6 +636,20 @@ impl AgentRuntime {
                 };
             }
         };
+        // OCEAN-275 honesty: selection-time failover keeps the turn alive, but
+        // hiding it from an operator who pinned a model is lying — announce the
+        // reroute on the event stream BEFORE any output.
+        if effective.provider_config.selection.model != requested_model {
+            if let Some(sink) = control.event_sink.as_ref() {
+                let _ = sink.send(AgentEvent::ModelRerouted {
+                    session_id: req.session_id.map(|s| s.to_string()),
+                    requested: requested_model,
+                    effective: effective.provider_config.selection.model.clone(),
+                    reason: "provider degraded at selection (missing credential or not ready)"
+                        .into(),
+                });
+            }
+        }
 
         // Run the turn against the effective provider; on a pre-stream
         // connect-failure with a transient/availability error, fail over once to
@@ -798,6 +813,22 @@ impl AgentRuntime {
                     error = %e,
                     "provider call failed before streaming; failing over to ready alternate"
                 );
+                // OCEAN-275 honesty: announce the reroute on the event stream —
+                // this is the path a 429'd/suspended provider takes, and it used
+                // to swap models with zero operator-visible signal. The reason
+                // clamps so a provider's JSON error blob can't flood the wire.
+                if let Some(sink) = control.event_sink.as_ref() {
+                    let mut reason = format!("provider call failed: {e}");
+                    if reason.chars().count() > 200 {
+                        reason = reason.chars().take(199).chain(['…']).collect();
+                    }
+                    let _ = sink.send(AgentEvent::ModelRerouted {
+                        session_id: req.session_id.map(|s| s.to_string()),
+                        requested: state.provider_config.selection.model.clone(),
+                        effective: alt_state.provider_config.selection.model.clone(),
+                        reason,
+                    });
+                }
                 // Single bounded retry on the alternate. Whatever it returns is
                 // final (success or failure) — no further fan-out.
                 self.dispatch_turn(req, control, &alt_state)

@@ -509,6 +509,17 @@ pub enum AgentTurnEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
     },
+    /// The daemon rerouted this turn to a different model than requested — the
+    /// pinned provider was degraded at selection, or its call failed before any
+    /// output streamed (OCEAN-275 failover). Surfaces should tell the operator:
+    /// "you asked for `requested`, this turn ran on `effective`".
+    ModelRerouted {
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+        requested: String,
+        effective: String,
+        reason: String,
+    },
     /// Incremental assistant text delta.  Clients append to their output buffer.
     AssistantTextDelta {
         session_id: AgentSessionId,
@@ -680,6 +691,7 @@ impl AgentTurnEvent {
     pub fn session_id(&self) -> Option<AgentSessionId> {
         match self {
             AgentTurnEvent::TurnStarted { session_id, .. }
+            | AgentTurnEvent::ModelRerouted { session_id, .. }
             | AgentTurnEvent::AssistantTextDelta { session_id, .. }
             | AgentTurnEvent::ThinkingDelta { session_id, .. }
             | AgentTurnEvent::ToolCallStarted { session_id, .. }
@@ -1234,6 +1246,7 @@ mod tests {
             #[allow(clippy::match_same_arms)]
             match ev {
                 AgentTurnEvent::TurnStarted { .. }
+                | AgentTurnEvent::ModelRerouted { .. }
                 | AgentTurnEvent::AssistantTextDelta { .. }
                 | AgentTurnEvent::ThinkingDelta { .. }
                 | AgentTurnEvent::ToolCallStarted { .. }

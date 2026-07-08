@@ -9210,6 +9210,23 @@ async fn agent_turn(
                         delta,
                     });
                 }
+                // OCEAN-275 honesty: the failover that keeps a turn alive must
+                // also be visible — relay the reroute so surfaces can tell the
+                // operator "you asked for X, this turn ran on Y".
+                AgentEvent::ModelRerouted {
+                    requested,
+                    effective,
+                    reason,
+                    ..
+                } => {
+                    bridge_bus.emit(AgentTurnEvent::ModelRerouted {
+                        session_id: bridge_session_id,
+                        turn_id: bridge_turn_id,
+                        requested,
+                        effective,
+                        reason,
+                    });
+                }
                 AgentEvent::ThinkingDelta { delta, .. } => {
                     if delta.is_empty() {
                         continue;
@@ -11089,6 +11106,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
         AgentTurnEvent::AssistantTextDelta {
             turn_id: _, delta, ..
         } => Some(OceanEvent::AssistantDelta { text: delta }),
+        AgentTurnEvent::ModelRerouted { .. } => None,
         AgentTurnEvent::ThinkingDelta { .. } => None,
         AgentTurnEvent::ToolCallStarted {
             turn_id: _, call, ..
@@ -11144,6 +11162,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
 fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
     match event {
         AgentTurnEvent::TurnStarted { .. } => "turn_started",
+        AgentTurnEvent::ModelRerouted { .. } => "model_rerouted",
         AgentTurnEvent::AssistantTextDelta { .. } => "assistant_text_delta",
         AgentTurnEvent::ThinkingDelta { .. } => "thinking_delta",
         AgentTurnEvent::ToolCallStarted { .. } => "tool_call_started",
@@ -11383,6 +11402,7 @@ mod tests {
         match ev {
             // Relayed onto the SSE wire (see the bridge match arms).
             AgentEvent::TextDelta { .. }
+            | AgentEvent::ModelRerouted { .. }
             | AgentEvent::ThinkingDelta { .. }
             | AgentEvent::ToolExecutionStart { .. }
             | AgentEvent::ToolExecutionEnd { .. }

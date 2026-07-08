@@ -318,6 +318,17 @@ pub enum AgentEvent {
         tool_name: String,
         reason: String,
     },
+    /// The turn was rerouted to a different model than requested — the provider
+    /// was degraded at selection, or its call failed before any output streamed
+    /// (OCEAN-275 failover). Failover keeps unattended loops alive, but hiding
+    /// it from an operator who pinned a model is lying — this event lets every
+    /// surface say "you asked for X, this turn ran on Y".
+    ModelRerouted {
+        session_id: Option<String>,
+        requested: String,
+        effective: String,
+        reason: String,
+    },
     /// The agent wants the client to mount or update an interactive component.
     /// Clients maintain a component registry per session.
     Render {
@@ -372,6 +383,7 @@ impl AgentEvent {
             | AgentEvent::ToolExecutionStart { session_id, .. }
             | AgentEvent::ToolExecutionEnd { session_id, .. }
             | AgentEvent::PermissionDenied { session_id, .. }
+            | AgentEvent::ModelRerouted { session_id, .. }
             | AgentEvent::Render { session_id, .. }
             | AgentEvent::Unmount { session_id, .. }
             | AgentEvent::BrowserActivity { session_id, .. }
