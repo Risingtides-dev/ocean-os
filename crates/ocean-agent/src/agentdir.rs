@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// `agent.toml` only exists to override defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentConfig {
-    /// Gateway/provider model id, e.g. `claude-opus-4-7`. `None` =
+    /// Gateway/provider model id, e.g. `claude-opus-4-8`. `None` =
     /// inherit the daemon default.
     #[serde(default)]
     pub model: Option<String>,
@@ -530,7 +530,7 @@ mod tests {
         fs::create_dir_all(r.join("subagents")).unwrap();
         fs::write(
             r.join("agent.toml"),
-            "model = \"claude-opus-4-7\"\n\
+            "model = \"claude-opus-4-8\"\n\
              description = \"deep researcher\"\n\
              tools = [\"web_search\"]\n\
              yolo = true\n",
@@ -570,7 +570,7 @@ mod tests {
         let root = scaffold("full");
         let def = resolve(&root, "researcher").unwrap();
         assert_eq!(def.name, "researcher");
-        assert_eq!(def.config.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(def.config.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(def.config.description.as_deref(), Some("deep researcher"));
         assert_eq!(def.config.yolo, Some(true));
         assert_eq!(def.system_prompt(), Some("You are a careful researcher."));
@@ -717,7 +717,7 @@ mod tests {
         fs::create_dir_all(&agent_dir).unwrap();
         fs::write(
             agent_dir.join("agent.toml"),
-            "model = \"claude-opus-4-7\"\ndescription = \"test bot\"\ntools = [\"web_fetch\"]\n",
+            "model = \"claude-opus-4-8\"\ndescription = \"test bot\"\ntools = [\"web_fetch\"]\n",
         )
         .unwrap();
         fs::write(agent_dir.join("instructions.md"), "You are a test bot.\n").unwrap();
@@ -749,7 +749,7 @@ mod tests {
         // Only agent.toml — no instructions.md.
         fs::write(
             agent_dir.join("agent.toml"),
-            "model = \"claude-opus-4-7\"\ndescription = \"test bot\"\n",
+            "model = \"claude-opus-4-8\"\ndescription = \"test bot\"\n",
         )
         .unwrap();
 
@@ -850,7 +850,7 @@ mod tests {
         fs::create_dir_all(&agent_dir).unwrap();
         fs::write(
             agent_dir.join("agent.toml"),
-            "model = \"claude-opus-4-7\"\ndescription = \"test\"\ntools = [\"not_a_real_tool\"]\n",
+            "model = \"claude-opus-4-8\"\ndescription = \"test\"\ntools = [\"not_a_real_tool\"]\n",
         )
         .unwrap();
         fs::write(agent_dir.join("instructions.md"), "Do stuff.\n").unwrap();

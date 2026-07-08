@@ -62,7 +62,7 @@ Model selection via `OCEAN_MODEL` — there is no hardcoded default model; with 
 
 - `deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash`, `deepseek-v4-pro`
 - `gpt-4o`, `gpt-4o-mini`
-- `claude-sonnet-4-6`, `claude-opus-4-7`
+- `claude-sonnet-5`, `claude-opus-4-8`, `claude-haiku-4-5` (+ `claude-code-*` subscription variants incl. `claude-code-fable-5`)
 - `fake` (no creds — for testing)
 - any OpenAI-compatible base via `OCEAN_PROVIDER=openai-compatible` + `OCEAN_BASE_URL`
 

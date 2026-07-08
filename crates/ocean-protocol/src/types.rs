@@ -218,7 +218,72 @@ pub struct Model {
 }
 
 impl Model {
-    /// Anthropic Claude Sonnet 4.6.
+    /// Anthropic Claude Sonnet 5 — current Sonnet generation. Verified live
+    /// against api.anthropic.com (2026-07-08): the undated id is recognized on
+    /// both API-key and Claude-subscription OAuth auth.
+    pub fn anthropic_claude_sonnet_5() -> Self {
+        Self {
+            id: "claude-sonnet-5".into(),
+            name: "Claude Sonnet 5".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            reasoning: true,
+            supports_images: true,
+            context_window: 200_000,
+            max_tokens: 16_384,
+        }
+    }
+
+    /// Anthropic Claude Opus 4.8 — current Opus generation (verified 2026-07-08).
+    pub fn anthropic_claude_opus_4_8() -> Self {
+        Self {
+            id: "claude-opus-4-8".into(),
+            name: "Claude Opus 4.8".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            reasoning: true,
+            supports_images: true,
+            context_window: 200_000,
+            max_tokens: 16_384,
+        }
+    }
+
+    /// Anthropic Claude Haiku 4.5 — current Haiku generation (verified
+    /// 2026-07-08; the undated alias resolves).
+    pub fn anthropic_claude_haiku_4_5() -> Self {
+        Self {
+            id: "claude-haiku-4-5".into(),
+            name: "Claude Haiku 4.5".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            reasoning: true,
+            supports_images: true,
+            context_window: 200_000,
+            max_tokens: 16_384,
+        }
+    }
+
+    /// Anthropic Claude Fable 5 — Mythos-class tier above Opus (verified
+    /// recognized on subscription OAuth 2026-07-08).
+    pub fn anthropic_claude_fable_5() -> Self {
+        Self {
+            id: "claude-fable-5".into(),
+            name: "Claude Fable 5".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            reasoning: true,
+            supports_images: true,
+            context_window: 200_000,
+            max_tokens: 16_384,
+        }
+    }
+
+    /// Anthropic Claude Sonnet 4.6 (LEGACY — kept so sessions pinned to the
+    /// old id still resolve; not in the public model menu).
     pub fn anthropic_claude_sonnet_4_6() -> Self {
         Self {
             id: "claude-sonnet-4-6".into(),

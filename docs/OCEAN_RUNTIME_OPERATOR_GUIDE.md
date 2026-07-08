@@ -185,8 +185,8 @@ Currently mapped model IDs and their aliases (from `resolve_model_selection`; `k
 - `gpt-5.4` / `gpt-5-4` (Codex)
 - `gpt-5.4-mini` / `gpt-5-4-mini` (Codex)
 - `gpt-5.3-codex-spark` / `gpt-5-3-codex-spark` (Codex)
-- `claude-sonnet-4-6` / `claude-sonnet` / `sonnet`
-- `claude-opus-4-7` / `claude-opus` / `opus`
+- `claude-sonnet-5` / `claude-sonnet` / `sonnet`
+- `claude-opus-4-8` / `claude-opus` / `opus`
 - `minimax` / `minimax-m2` (maps to `MiniMax-M2`)
 - `minimax-m2.7` / `minimax-m2-7` (maps to `MiniMax-M2.7`)
 - `kimi` / `kimi-k2.6` / `kimi-k2-6`

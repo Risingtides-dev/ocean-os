@@ -806,7 +806,20 @@ impl ChatComponent {
             return;
         }
 
-        for (row_i, row) in rows.iter().take(shown).enumerate() {
+        // Scroll the row window to keep the SELECTED row visible — with the
+        // registry grown past the overlay cap, the cursor used to walk off the
+        // bottom (or the top groups were simply unreachable) while the window
+        // stayed pinned to the first rows.
+        let sel_row = rows
+            .iter()
+            .position(|r| matches!(r, Row::Cmd(i, _) if *i == sel))
+            .unwrap_or(0);
+        let scroll = sel_row
+            .saturating_sub(shown.saturating_sub(1))
+            .min(rows.len().saturating_sub(shown));
+
+        for (row_i, row) in rows.iter().enumerate().skip(scroll).take(shown) {
+            let row_y = (row_i - scroll) as u16;
             match row {
                 Row::Header(gname) => {
                     // Muted section header, file-tree style: `▾ group`.
@@ -824,7 +837,7 @@ impl ChatComponent {
                             ),
                         ]))
                         .style(Style::default().bg(theme::SLATE)),
-                        Rect::new(inner.x, inner.y + row_i as u16, inner.width, 1),
+                        Rect::new(inner.x, inner.y + row_y, inner.width, 1),
                     );
                 }
                 Row::Cmd(i, c) => {
@@ -875,7 +888,7 @@ impl ChatComponent {
                     }
                     frame.render_widget(
                         Paragraph::new(Line::from(spans)).style(Style::default().bg(bed)),
-                        Rect::new(inner.x, inner.y + row_i as u16, inner.width, 1),
+                        Rect::new(inner.x, inner.y + row_y, inner.width, 1),
                     );
                 }
             }

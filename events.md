@@ -1954,3 +1954,11 @@ area:      frontend
 
 Composer soft-wrap: typing past the right edge used to clip (words landed but never showed) — the input Paragraph had no wrap and the composer height counted only ⌃J lines. Now: wrapped-row-aware growth (cap 8 rows / half the pane), Wrap{trim:false} on the input, scroll keeps the cursor row visible past the cap. PTY-verified 280-char input wraps across 3 rows with first+last words visible. Also reconciled the in-TUI agent's /thinking command (it replaced SetModel with SetThinking in action.rs, breaking 4 call sites): both actions now coexist — /thinking default|off|minimal|low|medium|high|xhigh sets the same per-turn override as the picker's ←/→. Suite 164/0.
 _________________________________________________________________________________
+time:      [7:10pm] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Claude model refresh + in-TUI-agent guardrails. John's "old anthropic models don't work": probed api.anthropic.com live with his subscription token — the wire/auth is CORRECT (bare Bearer, no beta header needed; claude-haiku-4-5 returned 200 OK), the registry ids were just stale (sonnet-4-6 connection-resets at the edge now; opus-4-7 is last-gen; the 429s on big models are his sub quota window, all new ids are recognized). Registry moved to the current generation: claude-opus-4-8 / claude-sonnet-5 / claude-haiku-4-5 (anthropic) + claude-code-fable-5/opus-4-8/sonnet-5/haiku-4-5 (subscription), aliases (opus/sonnet/haiku/fable, cc-*) repointed, DEFAULT_FALLBACK_ORDER → claude-sonnet-5, old ids retired from the menu but kept routable for pinned sessions; Model constructors added in ocean-protocol, claude-code→API mapping extended in ocean-agent, example agent + docs updated. Slash palette now scrolls to keep the selection visible (bare / overflowed the overlay and stranded the cursor offscreen — John's screenshot). ocean-tui/AGENTS.md gained Hard Rules from tonight's real failures (enums additive-only + grep call sites, compile before finishing, re-read before edit in concurrent lanes, sanitize_line for any rendered output, Elm loop is the only mutation channel). Suites: providers 34, agent 128, tui 164, daemon 264 — green.
+_________________________________________________________________________________

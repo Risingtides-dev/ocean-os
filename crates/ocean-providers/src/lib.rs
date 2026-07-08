@@ -4,7 +4,11 @@
 //! provider/auth decision for Ocean callers; temporary adapters can translate the
 //! resolved config into legacy runtime structs at the edge.
 
-use std::{collections::BTreeMap, fmt, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -105,12 +109,18 @@ impl ProviderId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialSource {
-    Env { name: String },
-    OceanAuthFile { path: String },
+    Env {
+        name: String,
+    },
+    OceanAuthFile {
+        path: String,
+    },
     /// Codex CLI auth JSON (`OCEAN_CODEX_AUTH_FILE` / `$HOME/.codex/auth.json`),
     /// used as a fallback when the Ocean `openai-codex` OAuth block is absent or
     /// expired.
-    CodexCliAuthFile { path: String },
+    CodexCliAuthFile {
+        path: String,
+    },
     NotRequired,
 }
 
@@ -353,7 +363,7 @@ pub const ENV_PROVIDER_FALLBACK: &str = "OCEAN_PROVIDER_FALLBACK";
 /// to a canned echo would hide an outage rather than route around it (an operator
 /// who wants that can still list `fake` explicitly in the env override).
 pub const DEFAULT_FALLBACK_ORDER: &[&str] = &[
-    "claude-sonnet-4-6", // anthropic
+    "claude-sonnet-5",   // anthropic
     "gpt-5.4",           // openai-codex
     "deepseek-v4-pro",   // deepseek
     "gemini-2.0-flash",  // google
@@ -590,10 +600,29 @@ pub fn known_models() -> Vec<KnownModel> {
         m("gpt-5.3-codex-spark", "openai-codex", "GPT-5.3 Codex Spark"),
         m("gpt-4o", "openai", "GPT-4o"),
         m("gpt-4o-mini", "openai", "GPT-4o Mini"),
-        m("claude-opus-4-7", "anthropic", "Claude Opus 4.7"),
-        m("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6"),
-        m("claude-code-sonnet-4-6", "claude-code", "Claude Code Sonnet 4.6"),
-        m("claude-code-opus-4-7", "claude-code", "Claude Code Opus 4.7"),
+        // Current Claude generation (verified against api.anthropic.com
+        // 2026-07-08: all ids recognized on subscription OAuth; the old
+        // 4-6/4-7 ids are retired from the menu but stay routable as legacy
+        // arms so pinned sessions keep resolving).
+        m("claude-opus-4-8", "anthropic", "Claude Opus 4.8"),
+        m("claude-sonnet-5", "anthropic", "Claude Sonnet 5"),
+        m("claude-haiku-4-5", "anthropic", "Claude Haiku 4.5"),
+        m("claude-code-fable-5", "claude-code", "Claude Code Fable 5"),
+        m(
+            "claude-code-opus-4-8",
+            "claude-code",
+            "Claude Code Opus 4.8",
+        ),
+        m(
+            "claude-code-sonnet-5",
+            "claude-code",
+            "Claude Code Sonnet 5",
+        ),
+        m(
+            "claude-code-haiku-4-5",
+            "claude-code",
+            "Claude Code Haiku 4.5",
+        ),
         // MiniMax ids use the API casing the resolver returns as current.model
         // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
         // holds for every entry — ACP/Zed match the selected mode id against the
@@ -755,14 +784,39 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             400_000,
             128_000,
         )),
-        "claude-sonnet-4-6" | "claude-sonnet" | "sonnet" => Ok(model_selection(
+        // Current Claude generation (2026-07 refresh; verified live). The
+        // convenience aliases ("sonnet", "opus", "haiku") track the newest ids.
+        "claude-sonnet-5" | "claude-sonnet" | "sonnet" => Ok(model_selection(
+            ProviderId::Anthropic,
+            "claude-sonnet-5",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        "claude-opus-4-8" | "claude-opus" | "opus" => Ok(model_selection(
+            ProviderId::Anthropic,
+            "claude-opus-4-8",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        "claude-haiku-4-5" | "claude-haiku" | "haiku" => Ok(model_selection(
+            ProviderId::Anthropic,
+            "claude-haiku-4-5",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        // LEGACY Claude ids — retired from the menu, kept routable so sessions
+        // pinned before the refresh still resolve.
+        "claude-sonnet-4-6" => Ok(model_selection(
             ProviderId::Anthropic,
             "claude-sonnet-4-6",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
-        "claude-opus-4-7" | "claude-opus" | "opus" => Ok(model_selection(
+        "claude-opus-4-7" => Ok(model_selection(
             ProviderId::Anthropic,
             "claude-opus-4-7",
             ANTHROPIC_BASE_URL,
@@ -772,14 +826,45 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // Claude Code (Anthropic Messages wire protocol, OAuth bearer auth).
         // selection.model preserves the public alias id; ocean-agent maps it to
         // the real Anthropic API model id.
-        "claude-code-sonnet-4-6" | "claude-code-sonnet" | "cc-sonnet" => Ok(model_selection(
+        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" => {
+            Ok(model_selection(
+                ProviderId::ClaudeCode,
+                "claude-code-fable-5",
+                ANTHROPIC_BASE_URL,
+                200_000,
+                16_384,
+            ))
+        }
+        "claude-code-opus-4-8" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-opus-4-8",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        "claude-code-sonnet-5" | "claude-code-sonnet" | "cc-sonnet" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-sonnet-5",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        "claude-code-haiku-4-5" | "claude-code-haiku" | "cc-haiku" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-haiku-4-5",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        // LEGACY claude-code ids (see the anthropic legacy block above).
+        "claude-code-sonnet-4-6" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-sonnet-4-6",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
-        "claude-code-opus-4-7" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
+        "claude-code-opus-4-7" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-opus-4-7",
             ANTHROPIC_BASE_URL,
@@ -1089,13 +1174,18 @@ fn resolve_credential(
             .or_else(|| oauth_access_token(&json, "anthropic-oauth"));
         (token, CredentialKind::OAuthBearer)
     } else {
-        (auth_file_key(&json, provider.as_str()), CredentialKind::ApiKey)
+        (
+            auth_file_key(&json, provider.as_str()),
+            CredentialKind::ApiKey,
+        )
     };
-    Ok(secret.and_then(SecretString::new).map(|secret| ResolvedCredential {
-        secret,
-        source,
-        kind,
-    }))
+    Ok(secret
+        .and_then(SecretString::new)
+        .map(|secret| ResolvedCredential {
+            secret,
+            source,
+            kind,
+        }))
 }
 
 fn auth_file_key<'a>(json: &'a serde_json::Value, provider: &str) -> Option<&'a str> {
@@ -1122,7 +1212,10 @@ fn oauth_access_token<'a>(json: &'a serde_json::Value, block: &str) -> Option<&'
         .filter(|value| !value.is_empty())?;
     // Reject expired blocks. `expires` is milliseconds since epoch when large,
     // seconds otherwise; a missing `expires` means "accept" (no expiry known).
-    if let Some(expires) = entry.pointer("/expires").and_then(serde_json::Value::as_i64) {
+    if let Some(expires) = entry
+        .pointer("/expires")
+        .and_then(serde_json::Value::as_i64)
+    {
         let now_secs = unix_epoch_secs();
         let expires_secs = if expires >= 1_000_000_000_000 {
             expires / 1_000
@@ -1170,10 +1263,11 @@ fn default_codex_auth_file() -> Option<PathBuf> {
 /// [`ProviderConfigError::InvalidAuthFile`] so a malformed configured file is
 /// visible rather than silently dropping credentials.
 fn read_auth_json(path: &Path) -> Result<serde_json::Value, ProviderConfigError> {
-    let text = std::fs::read_to_string(path).map_err(|err| ProviderConfigError::InvalidAuthFile {
-        path: path.display().to_string(),
-        message: err.to_string(),
-    })?;
+    let text =
+        std::fs::read_to_string(path).map_err(|err| ProviderConfigError::InvalidAuthFile {
+            path: path.display().to_string(),
+            message: err.to_string(),
+        })?;
     serde_json::from_str(&text).map_err(|err| ProviderConfigError::InvalidAuthFile {
         path: path.display().to_string(),
         message: err.to_string(),
@@ -1553,10 +1647,16 @@ mod tests {
             "gpt-5.4",
             "gpt-5.4-mini",
             "gpt-5.3-codex-spark",
-            "claude-sonnet-4-6",
-            "claude-opus-4-7",
-            "claude-code-sonnet-4-6",
-            "claude-code-opus-4-7",
+            // Current Claude generation (2026-07 refresh). The retired
+            // 4-6/4-7 ids stay ROUTABLE (legacy arms, pinned sessions) but are
+            // deliberately NOT in the menu, so they're absent here too.
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "claude-code-fable-5",
+            "claude-code-opus-4-8",
+            "claude-code-sonnet-5",
+            "claude-code-haiku-4-5",
             // API-cased ids: `resolve_model_selection` returns these as
             // current.model, and known_models() advertises the same string.
             "MiniMax-M2",
@@ -1738,8 +1838,7 @@ mod tests {
 
     #[test]
     fn glm_45_flash_routes_to_glm_provider() {
-        let selection =
-            resolve_model_selection(&env(&[("OCEAN_MODEL", "glm-4.5-flash")])).unwrap();
+        let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", "glm-4.5-flash")])).unwrap();
         assert_eq!(selection.provider, ProviderId::Glm);
         assert_eq!(selection.model, "glm-4.5-flash");
         assert_eq!(selection.base_url, GLM_BASE_URL);
@@ -1749,10 +1848,8 @@ mod tests {
 
     #[test]
     fn claude_code_alias_routes_with_oauth_and_is_listed() {
-        let dir = std::env::temp_dir().join(format!(
-            "ocean-claude-code-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ocean-claude-code-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
@@ -1763,7 +1860,7 @@ mod tests {
         .unwrap();
 
         let config = resolve_provider_config(&ProviderEnv {
-            vars: BTreeMap::from([("OCEAN_MODEL".into(), "claude-code-sonnet-4-6".into())]),
+            vars: BTreeMap::from([("OCEAN_MODEL".into(), "claude-code-sonnet-5".into())]),
             auth_file: Some(path.clone()),
             codex_auth_file: None,
         })
@@ -1771,7 +1868,7 @@ mod tests {
         assert_eq!(config.selection.provider, ProviderId::ClaudeCode);
         // selection.model preserves the public alias id; ocean-agent maps it to
         // the real Anthropic API model id.
-        assert_eq!(config.selection.model, "claude-code-sonnet-4-6");
+        assert_eq!(config.selection.model, "claude-code-sonnet-5");
         assert_eq!(config.selection.base_url, ANTHROPIC_BASE_URL);
         let credential = config
             .credential
@@ -1781,21 +1878,21 @@ mod tests {
         assert_eq!(credential.kind, CredentialKind::OAuthBearer);
         assert!(config.readiness().ok);
 
-        // Both public Claude Code aliases are advertised in the model picker.
+        // The public Claude Code aliases are advertised in the model picker.
         let listed: std::collections::BTreeSet<String> =
             known_models().into_iter().map(|m| m.id).collect();
-        assert!(listed.contains("claude-code-sonnet-4-6"));
-        assert!(listed.contains("claude-code-opus-4-7"));
+        assert!(listed.contains("claude-code-sonnet-5"));
+        assert!(listed.contains("claude-code-opus-4-8"));
+        assert!(listed.contains("claude-code-haiku-4-5"));
+        assert!(listed.contains("claude-code-fable-5"));
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn claude_code_accepts_anthropic_oauth_block_synonym() {
-        let dir = std::env::temp_dir().join(format!(
-            "ocean-claude-code-syn-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ocean-claude-code-syn-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
@@ -1848,10 +1945,7 @@ mod tests {
 
     #[test]
     fn expired_codex_oauth_ignored_codex_cli_fallback_supplies_token_and_account_id() {
-        let dir = std::env::temp_dir().join(format!(
-            "ocean-codex-cli-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ocean-codex-cli-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

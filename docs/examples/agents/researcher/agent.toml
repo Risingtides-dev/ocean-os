@@ -8,7 +8,7 @@
 # this on a turn run via this agent — fail-soft: an unresolvable model falls back
 # to the global one. (eve-style gateway ids like `anthropic/claude-opus-4.8` are
 # a future mapping; today use Ocean's bare aliases.)
-model = "claude-opus-4-7"
+model = "claude-opus-4-8"
 description = "A careful researcher: gathers sources, verifies claims, cites."
 
 # Tool allowlist by built-in tool name (empty = inherit all). These match the
