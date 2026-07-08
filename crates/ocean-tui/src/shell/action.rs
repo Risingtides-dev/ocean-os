@@ -18,6 +18,16 @@ pub enum Nav {
     Terminal,
 }
 
+/// Provider login target for `/login`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginTarget {
+    /// Claude Code / Claude subscription OAuth.
+    Claude,
+    /// Codex / ChatGPT subscription OAuth.
+    Codex,
+}
+
+
 #[derive(Debug, Clone)]
 pub enum Action {
     /// Redraw requested (coalesced with the render tick).
@@ -52,6 +62,8 @@ pub enum Action {
     CopyToClipboard(String),
     /// `/model <id>` — override the model for subsequent turns this session.
     SetModel(String),
+    /// `/login [claude|codex]` — open a browser login flow for provider OAuth.
+    Login(LoginTarget),
     /// `/settings` — open the app's settings overlay (panel toggles, dock
     /// height, live session info).
     OpenSettings,

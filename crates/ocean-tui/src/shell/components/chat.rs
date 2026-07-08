@@ -18,7 +18,7 @@ use ratatui::{
 };
 
 use crate::shell::{
-    action::{Action, Nav},
+    action::{Action, LoginTarget, Nav},
     component::Component,
     diff::{self, DiffKind, DiffRow},
     history::PromptHistory,
@@ -557,6 +557,18 @@ impl ChatComponent {
         }
     }
 
+fn login_target(args: &str) -> Result<LoginTarget, String> {
+    let target = args.trim();
+    if target.is_empty() {
+        return Ok(LoginTarget::Claude);
+    }
+    match target.to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" | "anthropic" => Ok(LoginTarget::Claude),
+        "codex" | "openai-codex" | "chatgpt" | "openai" => Ok(LoginTarget::Codex),
+        _ => Err("usage: /login [claude|codex]".into()),
+    }
+}
+
     /// Execute a slash command by name, with any trailing `args` (empty for a
     /// palette pick; the tail of a typed `/name args` line otherwise). Clears
     /// the composer, then either mutates the transcript locally (`/clear`,
@@ -599,6 +611,10 @@ impl ChatComponent {
                     Some(Action::SetModel(args.to_string()))
                 }
             }
+            "/login" => match Self::login_target(args) {
+                Ok(target) => Some(Action::Login(target)),
+                Err(usage) => Some(Action::Status(usage)),
+            },
             "/copy" => match self.last_reply() {
                 Some(text) => Some(Action::CopyToClipboard(text)),
                 None => Some(Action::Status("nothing to copy yet".into())),
@@ -1572,6 +1588,7 @@ impl Component for ChatComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::action::LoginTarget;
     use serde_json::json;
 
     /// A chat with the composer pre-filled — avoids the `field_reassign_with_default`
@@ -1775,6 +1792,15 @@ mod tests {
     }
 
     #[test]
+    fn slash_login_without_args_routes_claude_login() {
+        let mut chat = ChatComponent::default();
+
+        let act = chat.run_slash("/login", "");
+
+        assert!(matches!(act, Some(Action::Login(LoginTarget::Claude))));
+    }
+
+    #[test]
     fn slash_copy_uses_last_reply() {
         let mut chat = ChatComponent::default();
         assert!(matches!(chat.run_slash("/copy", ""), Some(Action::Status(_)))); // nothing yet
@@ -1805,6 +1831,16 @@ mod tests {
         let mut chat2 = chat_with("/etc/hosts is a file");
         let act2 = chat2.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(act2, Some(Action::SubmitPrompt(_))));
+    }
+
+    #[test]
+    fn typed_login_codex_routes_login_action_not_user_turn() {
+        let mut chat = chat_with("/login codex");
+
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(act, Some(Action::Login(LoginTarget::Codex))));
+        assert!(chat.turns.is_empty(), "command line must not become a User turn");
     }
 
     #[test]

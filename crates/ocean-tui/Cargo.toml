@@ -35,3 +35,4 @@ ignore = "0.4"
 similar = "2"
 # Non-fatal warn logging for best-effort prompt-history I/O.
 tracing.workspace = true
+open = "5"

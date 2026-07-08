@@ -37,6 +37,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/resume", desc: "resume a past session", group: "session", soon: false },
     SlashCommand { name: "/sessions", desc: "focus the session rail", group: "session", soon: false },
     SlashCommand { name: "/model", desc: "set the model for this session (/model <id>)", group: "session", soon: false },
+    SlashCommand { name: "/login", desc: "open provider login in browser (/login [claude|codex])", group: "session", soon: false },
     // ── workspace ──────────────────────────────────────────────────────────
     SlashCommand { name: "/files", desc: "focus the file tree", group: "workspace", soon: false },
     SlashCommand { name: "/graph", desc: "open the graph view", group: "workspace", soon: false },
@@ -165,6 +166,24 @@ mod tests {
     fn mod_ranks_model_first() {
         let ranked = filter("mod");
         assert_eq!(ranked[0].0.name, "/model", "\"mod\" should rank /model first");
+    }
+
+    #[test]
+    fn login_is_registered_and_log_ranks_it_first() {
+        assert!(is_command("/login"), "/login should be a live slash command");
+
+        let ranked = filter("log");
+
+        assert_eq!(
+            ranked.first().map(|(cmd, _)| cmd.name),
+            Some("/login"),
+            "\"log\" should rank /login first"
+        );
+        assert_eq!(
+            ranked.first().map(|(cmd, _)| cmd.soon),
+            Some(false),
+            "/login should be live, not a roadmap placeholder"
+        );
     }
 
     #[test]

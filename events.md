@@ -1743,3 +1743,12 @@ NOT sufficient evidence a concurrent session is dead — verify with John
 before touching another lane's uncommitted state; stash-not-discard is the
 right instinct but even a stash yanks files out from under a live session.
 _________________________________________________________________________________
+
+time:      [11:40PM] [07-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+Added a live `/login` slash command to the ocean-tui shell. Registry gains `/login` in the session group; `run_slash` routes bare `/login` (and `claude|claude-code|anthropic`) to `Action::Login(LoginTarget::Claude)` and `codex|openai-codex|chatgpt|openai` to `LoginTarget::Codex`, unknown args get a usage hint; `App::dispatch` opens the provider login URL in the default browser off-thread via the new `open` dependency (same async pattern as `/copy`) and reports success/failure in the status line with a post-auth readiness hint. TUI-only slice — no daemon endpoint; credentials still land via provider CLI/auth-file flows resolved by ocean-providers. TDD: three RED tests first (`login_is_registered_and_log_ranks_it_first`, `slash_login_without_args_routes_claude_login`, `typed_login_codex_routes_login_action_not_user_turn`). Verification: `cargo test -p ocean-tui` 150 passed, `cargo build -p ocean-tui --release` OK, `cargo check --workspace` OK. Cargo.lock delta is the `open` dep only. Concurrent runtime-lane files left untouched.
+_________________________________________________________________________________

@@ -34,7 +34,7 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use super::{
-    action::{Action, Nav},
+    action::{Action, LoginTarget, Nav},
     client::DaemonClient,
     component::Component,
     components::{
@@ -61,6 +61,20 @@ fn max_term_h(center_h: u16) -> u16 {
     center_h
         .saturating_sub(2 + MIN_CENTER_H)
         .max(MIN_TERM_H)
+}
+
+fn login_url(target: LoginTarget) -> &'static str {
+    match target {
+        LoginTarget::Claude => "https://claude.ai/login",
+        LoginTarget::Codex => "https://chatgpt.com/auth/login",
+    }
+}
+
+fn login_label(target: LoginTarget) -> &'static str {
+    match target {
+        LoginTarget::Claude => "Claude",
+        LoginTarget::Codex => "Codex",
+    }
 }
 
 /// What the center surface is showing (CTRL swaps editor↔graph the same way).
@@ -654,6 +668,23 @@ impl App {
             Action::SetModel(id) => {
                 self.model_override = Some(id.clone());
                 self.status = format!("model → {id}");
+            }
+            // `/login [claude|codex]`: open provider login in the browser
+            // off-thread so the TUI never blocks on browser/OS integration.
+            Action::Login(target) => {
+                let tx = self.actions_tx.clone();
+                let target = *target;
+                tokio::spawn(async move {
+                    let label = login_label(target);
+                    let url = login_url(target);
+                    let msg = match open::that(url) {
+                        Ok(()) => format!(
+                            "opened {label} login in browser; after auth, restart daemon or reselect model if readiness still shows missing credential"
+                        ),
+                        Err(e) => format!("could not open {label} login: {e}"),
+                    };
+                    let _ = tx.send(Action::Status(msg));
+                });
             }
             // `/settings`: open the modal settings overlay.
             Action::OpenSettings => {
