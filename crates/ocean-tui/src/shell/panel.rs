@@ -43,8 +43,16 @@ pub fn draw(f: &mut Frame, area: Rect, title: &str, pill: Option<&str>, focused:
     );
 
     // ── title row: "◆ TITLE" left, pill right ────────────────────────────────
+    // An empty title drops the diamond+label but keeps the row (pill stays
+    // right-aligned, hairline stays) — used by the chat pane, where the app
+    // title bar + breadcrumb already say where you are and a third "OCEAN"
+    // was pure redundancy.
     let title_fg = if focused { theme::BLUE } else { theme::COMMENT };
-    let title_txt = format!("{} {}", g("◆", "*"), title);
+    let title_txt = if title.is_empty() {
+        String::new()
+    } else {
+        format!("{} {}", g("◆", "*"), title)
+    };
     let pill_txt = pill.unwrap_or("");
     let pill_w = if pill_txt.is_empty() {
         0

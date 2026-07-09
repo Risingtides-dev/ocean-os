@@ -1979,3 +1979,11 @@ area:      backend
 
 MiniMax onto John's intl key + GLM/Z.ai wiring completed. Pulled John's zai + minimax API keys from ~/.pi/agent/auth.json into Ocean's auth.json (glm/minimax blocks; anthropic API key deliberately NOT wired — valid but zero credit, would make the picker lie). Verified live before writing: zai key 200 OK on the Z.ai coding plan endpoint; minimax key 200 OK on api.minimax.io but 401 "invalid api key (2049)" on mainland api.minimaxi.com — Ocean's default pointed at the mainland host, so MINIMAX_BASE_URL now defaults to the international platform with an OCEAN_MINIMAX_BASE_URL override (mirrors the runtime lane's OCEAN_GLM_BASE_URL pattern from 1c39a20, which fixed GLM's identical problem: bigmodel.cn 1113 balance error vs coding-plan 200). Suites: providers 39/0.
 _________________________________________________________________________________
+time:      [9:25pm] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+De-cluttered the chat pane header per John: the pane's "◆ OCEAN" title (third OCEAN branding in a 3-row stack under the app title bar and the chat › crumb) is gone. panel::draw now treats an empty title as title-less chrome — no diamond/label, pill stays right-aligned, hairline stays — and chat passes "". Suite 165/0, PTY-verified.
+_________________________________________________________________________________

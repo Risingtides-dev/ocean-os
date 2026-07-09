@@ -1433,8 +1433,11 @@ impl Component for ChatComponent {
         }
 
         // ── transcript panel in the CTRL skin ────────────────────────────────
+        // Title-less chrome: the app title bar + crumb already identify this
+        // pane; a third "◆ OCEAN" was pure redundancy. The model pill keeps
+        // the top row.
         let pill = self.model.clone();
-        let body = panel::draw(frame, chunks[0], "OCEAN", pill.as_deref(), self.focused);
+        let body = panel::draw(frame, chunks[0], "", pill.as_deref(), self.focused);
 
         // Transcript lines (bottom-anchored via scroll offset). Split the
         // borrow: the markdown cache (`md`) is a distinct field from `turns`, so
