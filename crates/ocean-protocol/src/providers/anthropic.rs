@@ -25,6 +25,19 @@ use crate::types::{
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Beta flag REQUIRED on every OAuth-bearer request: Anthropic rejects
+/// `sk-ant-oat01` access tokens (Claude Code plan OAuth) unless the request
+/// carries `anthropic-beta: oauth-2025-04-20`. API-key requests never send it
+/// (their wire shape is unchanged). Mirrors OMP's `claudeCode*BetaDefaults`.
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// The Claude Code identity line that must OPEN the system prompt on OAuth
+/// requests — the other half of the OAuth fingerprint (Anthropic validates
+/// oat01-token requests look like Claude Code). Exact string mirrored from
+/// OMP's `claudeCodeSystemInstruction`.
+const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 enum SseEvent {
@@ -286,7 +299,34 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     // "re-bill only the new tail", and is what makes usage.cache_read non-zero
     // on Anthropic at all.
 
-    if let Some(sp) = &context.system_prompt {
+    // OAuth-bearer (Claude Code plan) requests must LOOK like Claude Code:
+    // Anthropic validates that oat01-token requests open their system prompt
+    // with the Claude Code identity line (paired with the `anthropic-beta:
+    // oauth-2025-04-20` header set in `apply_auth`) and 401s anything else.
+    // The real system prompt rides as a SECOND block, so the identity block
+    // stays byte-stable across turns and the cache breakpoint keeps sitting on
+    // the LAST block of the stable system region. API-key requests keep the
+    // pre-existing single-block shape untouched.
+    if options.auth == AuthMethod::Bearer {
+        let mut blocks = vec![json!({
+            "type": "text",
+            "text": CLAUDE_CODE_SYSTEM_INSTRUCTION,
+        })];
+        if let Some(sp) = &context.system_prompt {
+            if cache {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": sp,
+                    "cache_control": cache_control(),
+                }));
+            } else {
+                blocks.push(json!({"type": "text", "text": sp}));
+            }
+        } else if cache {
+            blocks[0]["cache_control"] = cache_control();
+        }
+        body["system"] = json!(blocks);
+    } else if let Some(sp) = &context.system_prompt {
         if cache {
             // Convert the system prompt to a single text block carrying the
             // cache breakpoint (a bare string cannot hold cache_control).
@@ -380,15 +420,23 @@ enum BlockKind {
 /// `ApiKey` (the default, and the historical Anthropic convention) sets
 /// `x-api-key: <secret>`. `Bearer` uses `reqwest`'s `bearer_auth`, which sets
 /// `authorization: Bearer <secret>` and does NOT set `x-api-key` — the OAuth
-/// path used when the credential is an access token (Claude Code plan OAuth,
-/// OpenAI Codex OAuth) rather than an API key.
+/// path used when the credential is an access token (Claude Code plan OAuth)
+/// rather than an API key. Bearer ALSO sends the mandatory
+/// `anthropic-beta: oauth-2025-04-20` flag: Anthropic rejects oat01 bearers
+/// without it, and API-key requests must not grow new headers.
 ///
 /// Extracted from the retry closure so the wire shape is directly testable
 /// without an HTTP round-trip; `AnthropicProvider::stream` delegates here.
-fn apply_auth(req: reqwest::RequestBuilder, method: AuthMethod, secret: &str) -> reqwest::RequestBuilder {
+fn apply_auth(
+    req: reqwest::RequestBuilder,
+    method: AuthMethod,
+    secret: &str,
+) -> reqwest::RequestBuilder {
     match method {
         AuthMethod::ApiKey => req.header("x-api-key", secret),
-        AuthMethod::Bearer => req.bearer_auth(secret),
+        AuthMethod::Bearer => req
+            .bearer_auth(secret)
+            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
     }
 }
 
@@ -1052,6 +1100,11 @@ mod tests {
             None,
             "ApiKey must not set an authorization header",
         );
+        assert_eq!(
+            header_str(headers, "anthropic-beta"),
+            None,
+            "ApiKey must not grow an anthropic-beta header",
+        );
     }
 
     // AuthMethod::Bearer must produce `authorization: Bearer <secret>` and
@@ -1077,6 +1130,58 @@ mod tests {
             header_str(headers, "x-api-key"),
             None,
             "Bearer must not set x-api-key",
+        );
+        assert_eq!(
+            header_str(headers, "anthropic-beta"),
+            Some(ANTHROPIC_OAUTH_BETA),
+            "Bearer must send the oauth beta — Anthropic rejects oat01 tokens without it",
+        );
+    }
+
+    // OAuth-bearer bodies must OPEN the system array with the Claude Code
+    // identity block (Anthropic rejects oat01 tokens otherwise); the real
+    // system prompt rides second and keeps the cache breakpoint as the LAST
+    // stable system block. API-key bodies keep the historical shape — proven
+    // by the cache-position test above running with default (ApiKey) options.
+    #[test]
+    fn bearer_body_opens_system_with_claude_code_identity() {
+        let options = StreamOptions {
+            auth: AuthMethod::Bearer,
+            ..Default::default()
+        };
+        let body = build_body(&anthropic_model(), &ctx_with_history(), &options);
+        let system = body["system"].as_array().expect("system array");
+        assert_eq!(system.len(), 2, "identity + real prompt: {body}");
+        assert_eq!(system[0]["text"], CLAUDE_CODE_SYSTEM_INSTRUCTION);
+        assert!(
+            system[0].get("cache_control").is_none(),
+            "breakpoint belongs on the LAST system block: {body}"
+        );
+        assert_eq!(system[1]["text"], "You are a helpful assistant.");
+        assert_eq!(
+            system[1]["cache_control"]["type"], "ephemeral",
+            "real prompt keeps the system cache breakpoint: {body}"
+        );
+    }
+
+    #[test]
+    fn bearer_body_without_system_prompt_still_sends_identity() {
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::user_text("only turn")],
+            tools: vec![],
+        };
+        let options = StreamOptions {
+            auth: AuthMethod::Bearer,
+            ..Default::default()
+        };
+        let body = build_body(&anthropic_model(), &ctx, &options);
+        let system = body["system"].as_array().expect("system array");
+        assert_eq!(system.len(), 1, "identity only: {body}");
+        assert_eq!(system[0]["text"], CLAUDE_CODE_SYSTEM_INSTRUCTION);
+        assert_eq!(
+            system[0]["cache_control"]["type"], "ephemeral",
+            "identity is the last (only) stable system block: {body}"
         );
     }
 
