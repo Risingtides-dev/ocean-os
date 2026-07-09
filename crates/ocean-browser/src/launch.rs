@@ -59,7 +59,7 @@ pub struct LaunchedChrome {
 }
 
 /// Spawn the CDP handler-polling task that keeps a Browser making progress.
-fn spawn_handler(mut handler: chromiumoxide::Handler) {
+pub(crate) fn spawn_handler(mut handler: chromiumoxide::Handler) {
     tokio::spawn(async move {
         while let Some(ev) = handler.next().await {
             if ev.is_err() {
@@ -73,7 +73,7 @@ fn spawn_handler(mut handler: chromiumoxide::Handler) {
 /// (e.g. "http://127.0.0.1:NNNN"). Chrome writes the live port to
 /// `<user-data-dir>/DevToolsActivePort` (first line). We verify it actually
 /// responds before trusting it — a stale file from a dead Chrome is common.
-async fn running_cdp_endpoint(cfg: &LaunchConfig) -> Option<String> {
+pub(crate) async fn running_cdp_endpoint(cfg: &LaunchConfig) -> Option<String> {
     let port_file = cfg.profile_dir.join("DevToolsActivePort");
     let contents = std::fs::read_to_string(&port_file).ok()?;
     let port: u16 = contents.lines().next()?.trim().parse().ok()?;
@@ -87,6 +87,33 @@ async fn running_cdp_endpoint(cfg: &LaunchConfig) -> Option<String> {
         .map(|r| r.status().is_success())
         .unwrap_or(false);
     ok.then_some(url)
+}
+
+/// Attach as a SECOND CDP client to an already-running Chrome on this profile,
+/// without owning or launching a process. Returns the connected [`Browser`]
+/// (handler task spawned), or `None` if no live Chrome is reachable on the
+/// profile's `DevToolsActivePort`.
+///
+/// This is the seam the daemon's `/v1/browser/screencast` + `/v1/browser/input`
+/// endpoints use to mirror the agent's live browser: they attach to the SAME
+/// Chrome the agent is already driving, never launch their own (a second
+/// instance would fight the profile's `SingletonLock` and wouldn't be the page
+/// the agent controls). Because [`Browser::connect`] owns no child process,
+/// dropping the returned [`Browser`] closes only the CDP websocket — it does
+/// NOT kill the agent's Chrome.
+pub async fn attach_running(cfg: &LaunchConfig) -> Option<Browser> {
+    let endpoint = running_cdp_endpoint(cfg).await?;
+    match Browser::connect(endpoint.clone()).await {
+        Ok((browser, handler)) => {
+            spawn_handler(handler);
+            tracing::info!(%endpoint, "attached to running Chrome (screencast/input)");
+            Some(browser)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %endpoint, "attach to running Chrome failed");
+            None
+        }
+    }
 }
 
 /// Connect to (attach) or launch Chrome. ATTACH-FIRST: if a Chrome is already

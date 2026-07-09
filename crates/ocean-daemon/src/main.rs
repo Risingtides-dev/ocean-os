@@ -87,6 +87,13 @@ mod harness_profile;
 /// Event buses — parallel broadcast/pub-sub for legacy `OceanEvent` and
 /// full-fidelity `AgentTurnEvent`.
 mod bus;
+/// Browser-screencast backend — streams the agent's live Chrome (JPEG frames
+/// + input forwarding) for Ocean Desktop's Browser tab over
+/// `/v1/browser/screencast` (SSE) and `/v1/browser/input`. Attaches as a SECOND
+/// CDP client to the same Chrome the agent already drives; see [`browser_stream`]
+/// for the frozen client contract.
+mod browser_stream;
+use browser_stream::{input as browser_input, screencast_stream as browser_screencast};
 
 #[derive(Clone)]
 struct AppState {
@@ -1648,6 +1655,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/fs/dirs", get(fs_dirs))
         .route("/v1/fs/file", get(fs_file))
+        .route("/v1/browser/screencast", get(browser_screencast))
+        .route("/v1/browser/input", post(browser_input))
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
         .route(
@@ -1972,6 +1981,8 @@ fn banner_routes() -> &'static [&'static str] {
         "DELETE /v1/projects/{id}",
         "GET /v1/fs/dirs",
         "GET /v1/fs/file",
+        "GET /v1/browser/screencast",
+        "POST /v1/browser/input",
         "GET /v1/model",
         "POST /v1/model",
         "GET /v1/models",
