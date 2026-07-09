@@ -2061,3 +2061,26 @@ area:      frontend
 
 Inline images via kitty graphics — the last of the 4 port items John queued. Architecture decision: hand-rolled the kitty protocol (new shell/kitty.rs, zero deps beyond the existing base64 workspace dep) rather than ratatui-image (its 11.x needs rustc>MSRV 1.80, v3 fallback is stale vs ratatui 0.29, drags in the image decode tree; and pyte can't render pixels so a dep buys little). Scope = PNG via native file transmission (t=f,f=100 — no decode needed for screenshots), full-screen VIEWER (stable rect) not inline-in-scroll (which smears — the exact bug class John already hit). markdown ![alt](path) at line-start → a 🖼 card (parse_image_ref shared with chat); /image [path] (bare = newest image in transcript via chat.latest_image) opens a full-screen viewer that emits the kitty APC into the reserved body rect AFTER ratatui paints (images float above the cell buffer); esc/click closes → CLEAR_ALL + terminal.clear() full repaint; static-takeover gate skips redraws while placed so the image is placed exactly once. Non-kitty / non-PNG → honest text note in the viewer, never a broken render. PTY-verified end to end (KITTY_WINDOW_ID faked): a=T + f=100 + c=,r= sizing emitted, title shows filename, a=d on close — pixels themselves are John's-eyes-only (pyte is text). 7 new tests (kitty ×3, markdown image ×1, + existing). Suite 178/0; workspace 0 errors. TUI-only, no daemon change. ALL 4 PORT ITEMS DONE.
 _________________________________________________________________________________
+time:      [4:40pm] [07-09-26]
+agent:     [claude] [fable-5]
+worktree:  detached @ main (shared checkout is on feat/ocean-tui-shell-rebuild)
+type:      feature-request
+area:      backend
+
+Realtime voice phases 2/3, daemon side: POST /v1/voice/realtime/client-secret
+mints an ephemeral OpenAI Realtime secret (gpt-realtime-2.1) with a compacted
+session briefing + render_component/write_handoff tool defs; the browser does
+WebRTC straight to OpenAI, key never leaves the daemon. POST
+/v1/agent/sessions/{id}/messages appends the voice agent's handoff notes into
+the session under the run path's per-session lock (404 unknown, 400 non-user
+roles). New: ocean_providers::resolve_credential_from_env (public single-
+provider credential resolve), AgentRuntime::append_session_message,
+ocean-daemon/src/voice_realtime.rs (pure mint pieces + 7 unit tests), reqwest
++ ocean-providers deps on ocean-daemon. Landed on main from a detached
+worktree because the shared checkout sits on the TUI session's branch; the
+shared tree's matching dirty hunks will dedupe on their next rebase. Live-
+verified: mint 502s clean without a key, append round-trips + shows as
+"[voice handoff] ..." in session turns. NOTE: no OpenAI platform API key is
+configured anywhere yet - realtime voice needs one (openai api_key block in
+~/.config/ocean-rs/auth.json or OPENAI_API_KEY in the daemon env).
+_________________________________________________________________________________
