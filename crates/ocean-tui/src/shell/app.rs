@@ -271,6 +271,10 @@ pub struct App {
     memory_entries: Vec<crate::shell::client::MemoryEntry>,
     memory_query: String,
     memory_sel: usize,
+    /// `/lsp` panel: detected language servers for the active workspace.
+    lsp_open: bool,
+    lsp_loading: bool,
+    lsp_servers: Vec<crate::shell::client::LspServer>,
     /// Mouse text selection. `sel_press` arms on any left-down that isn't a
     /// splitter grab; the first drag promotes it into `selection` — a linear
     /// (terminal-style) sweep in screen cells, anchor → head. Releasing the
@@ -375,6 +379,9 @@ impl App {
             memory_entries: Vec::new(),
             memory_query: String::new(),
             memory_sel: 0,
+            lsp_open: false,
+            lsp_loading: false,
+            lsp_servers: Vec::new(),
             sel_press: None,
             selection: None,
             frame_cells: Vec::new(),
@@ -501,6 +508,22 @@ impl App {
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // The `/lsp` panel is a read-only modal: any key or click closes it.
+        if self.lsp_open {
+            match evt {
+                CrosstermEvent::Key(_) => {
+                    self.lsp_open = false;
+                    return;
+                }
+                CrosstermEvent::Mouse(m)
+                    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    self.lsp_open = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The `/memory` browser is modal (typing filters, so keys route here).
         if self.memory_open {
             match evt {
@@ -1078,6 +1101,29 @@ impl App {
                 self.memory_loading = false;
                 self.memory_entries = entries.clone();
                 self.memory_sel = 0;
+            }
+            // `/lsp`: open the language-server panel and fetch the detected
+            // servers for the active workspace off-thread.
+            Action::OpenLsp => {
+                self.lsp_open = true;
+                self.lsp_loading = true;
+                let client = self.client.clone();
+                let tx = self.actions_tx.clone();
+                let cwd = self.workspace_root.clone();
+                tokio::spawn(async move {
+                    match client.lsp(&cwd).await {
+                        Ok(r) => {
+                            let _ = tx.send(Action::LspLoaded { servers: r.servers });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Action::Error(format!("lsp: {e}")));
+                        }
+                    }
+                });
+            }
+            Action::LspLoaded { servers } => {
+                self.lsp_loading = false;
+                self.lsp_servers = servers.clone();
             }
             // `/login [claude|codex]`: run the REAL OAuth flow off-thread
             // (begin → browser → token exchange → persist) so the TUI never
@@ -1741,6 +1787,90 @@ impl App {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 " type to search · ⏎ copy · esc close",
+                Style::default().fg(theme::CYAN),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+        );
+    }
+
+    /// Render the `/lsp` panel: the language servers relevant to this
+    /// workspace, each with its ready/install state. A read-only info modal —
+    /// live diagnostics are the agent's `lsp` tool (ask it in-turn).
+    fn draw_lsp(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        let full = frame.area();
+        let width = 72u16.min(full.width.saturating_sub(4));
+        let rows = self.lsp_servers.len().max(1) as u16;
+        let height = (rows + 5).min(full.height.saturating_sub(4)).max(7);
+        let x = full.x + (full.width.saturating_sub(width)) / 2;
+        let y = full.y + (full.height.saturating_sub(height)) / 2;
+        let area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} LANGUAGE SERVERS ", g("◆", "*")),
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height < 2 {
+            return;
+        }
+
+        let mut y = inner.y;
+        if self.lsp_loading {
+            frame.render_widget(
+                Paragraph::new(Span::styled("detecting…", Style::default().fg(theme::COMMENT)))
+                    .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
+            );
+            return;
+        }
+        if self.lsp_servers.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "no language servers match this project (no root marker found)",
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
+            );
+        } else {
+            for s in self.lsp_servers.iter().take(inner.height.saturating_sub(2) as usize) {
+                let (glyph, gcolor, state) = if s.ready {
+                    (g("●", "*"), theme::GREEN, "ready".to_string())
+                } else {
+                    (g("○", "o"), theme::YELLOW, format!("install {}", s.command))
+                };
+                let exts = if s.extensions.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ·{}", s.extensions.join(" ·"))
+                };
+                let name_w = 26usize;
+                let name = format!("{:<name_w$}", truncate_str(&s.name, name_w));
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(format!(" {glyph} "), Style::default().fg(gcolor)),
+                        Span::styled(name, Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("  {state}"), Style::default().fg(gcolor)),
+                        Span::styled(exts, Style::default().fg(theme::COMMENT)),
+                    ]))
+                    .style(Style::default().bg(theme::SLATE)),
+                    Rect::new(inner.x, y, inner.width, 1),
+                );
+                y += 1;
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " diagnostics: ask the agent (its lsp tool) · esc close",
                 Style::default().fg(theme::CYAN),
             ))
             .style(Style::default().bg(theme::SLATE)),
@@ -2532,6 +2662,9 @@ impl App {
         }
         if self.memory_open {
             self.draw_memory(frame);
+        }
+        if self.lsp_open {
+            self.draw_lsp(frame);
         }
         if self.providers_open {
             self.draw_providers(frame);

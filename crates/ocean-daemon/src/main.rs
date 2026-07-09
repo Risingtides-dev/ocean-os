@@ -1660,6 +1660,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
         .route("/v1/memory", get(memory_list))
+        .route("/v1/lsp", get(lsp_list))
         .route(
             "/v1/settings/yolo",
             get(yolo_setting_get).post(yolo_setting_set),
@@ -2905,6 +2906,30 @@ async fn memory_list() -> Json<serde_json::Value> {
     .await
     .unwrap_or_default();
     Json(json!({ "ok": true, "memories": memories }))
+}
+
+#[derive(serde::Deserialize)]
+struct LspQuery {
+    /// Workspace the surface is rooted at; language servers are detected
+    /// relative to it. Defaults to the daemon's cwd when omitted.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// `GET /v1/lsp?cwd=<path>` — the language servers relevant to a workspace
+/// (root marker present) plus install/ready state, for the TUI `/lsp` panel.
+/// Cheap: pure filesystem + `$PATH` checks, NO server spawn. Live diagnostics
+/// stay the agent's stateful `lsp` tool.
+async fn lsp_list(Query(q): Query<LspQuery>) -> Json<serde_json::Value> {
+    let cwd = q
+        .cwd
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let servers =
+        tokio::task::spawn_blocking(move || ocean_agent::lsp_servers(&cwd))
+            .await
+            .unwrap_or_default();
+    Json(json!({ "ok": true, "servers": servers }))
 }
 
 /// Where folder-as-agent definitions live: `$OCEAN_AGENTS_DIR`, else `agents/`

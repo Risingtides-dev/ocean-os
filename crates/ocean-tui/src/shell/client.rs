@@ -362,6 +362,43 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())
     }
+
+    /// `GET /v1/lsp?cwd=<workspace>` — language servers relevant to the
+    /// workspace + their install/ready state, for the `/lsp` panel.
+    pub async fn lsp(&self, cwd: &str) -> Result<LspResponse, String> {
+        self.http
+            .get(format!("{}/v1/lsp", self.base))
+            .query(&[("cwd", cwd)])
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json::<LspResponse>()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// One language server from `GET /v1/lsp`, for the `/lsp` panel.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LspServer {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub binary_available: bool,
+    #[serde(default)]
+    pub ready: bool,
+}
+
+/// Response shape of `GET /v1/lsp`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LspResponse {
+    #[serde(default)]
+    pub servers: Vec<LspServer>,
 }
 
 /// Pull the `id:` line out of one SSE frame (for Last-Event-ID replay).

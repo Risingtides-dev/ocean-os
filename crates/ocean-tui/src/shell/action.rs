@@ -97,6 +97,13 @@ pub enum Action {
     MemoryLoaded {
         entries: Vec<crate::shell::client::MemoryEntry>,
     },
+    /// `/lsp` — open the language-server panel for the active workspace
+    /// (detected servers + install/ready state).
+    OpenLsp,
+    /// The async `GET /v1/lsp` fetch came back.
+    LspLoaded {
+        servers: Vec<crate::shell::client::LspServer>,
+    },
     /// The async `GET /v1/models` fetch for the picker came back.
     ModelsLoaded {
         current: String,

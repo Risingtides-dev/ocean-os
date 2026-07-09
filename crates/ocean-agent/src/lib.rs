@@ -2390,6 +2390,50 @@ pub fn config_dir_from_env() -> PathBuf {
     PathBuf::from(".ocean-rs")
 }
 
+/// A language server relevant to a workspace, for the TUI `/lsp` surface: its
+/// name, the extensions it owns, whether the project has its root marker, and
+/// whether its binary is installed (`ready` = both, so a turn's `lsp` tool can
+/// actually use it). Cheap + synchronous — pure filesystem + `$PATH` checks,
+/// NO server spawn (live diagnostics stay the agent's `lsp` tool, which manages
+/// the stateful server processes).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LspServerView {
+    pub name: String,
+    pub command: String,
+    pub extensions: Vec<String>,
+    /// The detected project root for this server, if its marker was found.
+    pub root: Option<String>,
+    /// The server's binary resolves on `$PATH`.
+    pub binary_available: bool,
+    /// Root marker present AND binary installed — usable this session.
+    pub ready: bool,
+}
+
+/// List the language servers whose root markers are present in `cwd`'s tree,
+/// with their install/ready state. Only servers relevant to the project (root
+/// marker found) are returned, so `/lsp` shows "rust-analyzer: ready" or
+/// "pyright: install pyright-langserver" rather than the whole builtin table.
+pub fn lsp_servers(cwd: &std::path::Path) -> Vec<LspServerView> {
+    ocean_lsp::SERVERS
+        .iter()
+        .filter_map(|def| {
+            let root = ocean_lsp::servers::find_root(cwd, def.root_markers);
+            // Skip servers whose markers aren't in this project at all.
+            let root_str = root.as_ref().map(|p| p.display().to_string());
+            root_str.as_ref()?;
+            let binary_available = ocean_lsp::servers::binary_on_path(def.command);
+            Some(LspServerView {
+                name: def.name.to_string(),
+                command: def.command.to_string(),
+                extensions: def.extensions.iter().map(|s| s.to_string()).collect(),
+                ready: binary_available,
+                binary_available,
+                root: root_str,
+            })
+        })
+        .collect()
+}
+
 fn strip_assistant_thinking_content(messages: &mut [Message]) {
     for message in messages {
         if let Message::Assistant(assistant) = message {

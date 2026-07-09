@@ -159,9 +159,9 @@ pub const COMMANDS: &[SlashCommand] = &[
     // ── intel (W5–W6 roadmap) ──────────────────────────────────────────────
     SlashCommand {
         name: "/lsp",
-        desc: "diagnostics / rename (W5)",
+        desc: "language servers for this project (ready / install state)",
         group: "intel",
-        soon: true,
+        soon: false,
     },
     SlashCommand {
         name: "/rules",
