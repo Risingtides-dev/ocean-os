@@ -189,7 +189,29 @@ fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
             continue;
         }
 
-        if let Some(h) = heading(line) {
+        if let Some((alt, path)) = parse_image_ref(trimmed) {
+            // Image reference → a distinct card line (the pixels render via the
+            // kitty viewer; see `/image`). Always visible text, scrolls fine.
+            let label = if alt.is_empty() {
+                path.clone()
+            } else {
+                format!("{alt}  ·  {path}")
+            };
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", g("🖼", "[img]")),
+                    Style::default().fg(theme::CYAN),
+                ),
+                Span::styled(
+                    label,
+                    Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "   /image to view",
+                    Style::default().fg(theme::COMMENT),
+                ),
+            ]));
+        } else if let Some(h) = heading(line) {
             out.push(h);
         } else if is_horizontal_rule(trimmed) {
             out.push(Line::from(Span::styled(
@@ -206,6 +228,31 @@ fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
         i += 1;
     }
     out
+}
+
+/// Parse an image reference `![alt](path)` occupying (most of) a line, into
+/// `(alt, path)`. Shared by the markdown renderer (draws the card) and the chat
+/// (collects paths for the `/image` viewer) so both agree on what an image is.
+/// Only a leading `![...](...)` is recognized — inline images mid-sentence are
+/// left as prose (rare from an agent, and a card mid-line would read oddly).
+/// A `title` after the url (`](path "title")`) is tolerated and dropped.
+pub(crate) fn parse_image_ref(t: &str) -> Option<(String, String)> {
+    let rest = t.strip_prefix("![")?;
+    let alt_end = rest.find(']')?;
+    let alt = rest[..alt_end].to_string();
+    let after = rest[alt_end + 1..].strip_prefix('(')?;
+    let url_end = after.find(')')?;
+    let inner = &after[..url_end];
+    // Drop an optional `"title"` after the url.
+    let path = inner
+        .split_once(char::is_whitespace)
+        .map(|(p, _)| p)
+        .unwrap_or(inner)
+        .trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some((alt, path.to_string()))
 }
 
 /// `---` / `***` / `___` on their own line (3+ of one marker, optionally
@@ -638,6 +685,29 @@ mod tests {
         assert!(all.contains("old") && !all.contains("~~"));
         // Task list checkboxes replace the bracket triplets.
         assert!(all.contains("☑ shipped") && all.contains("☐ next"), "{all}");
+    }
+
+    #[test]
+    fn image_ref_parses_and_renders_as_card() {
+        assert_eq!(
+            parse_image_ref("![a chart](/tmp/chart.png)"),
+            Some(("a chart".into(), "/tmp/chart.png".into()))
+        );
+        // Empty alt, and a title after the url is dropped.
+        assert_eq!(
+            parse_image_ref("![](./shot.png \"caption\")"),
+            Some((String::new(), "./shot.png".into()))
+        );
+        // Not an image ref.
+        assert!(parse_image_ref("just a [link](url)").is_none());
+        assert!(parse_image_ref("plain text").is_none());
+
+        // Renders as a card, not raw markdown.
+        let mut md = Markdown::new();
+        let lines = md.render("![diagram](/tmp/d.png)");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("diagram") && text.contains("/tmp/d.png"));
+        assert!(!text.contains("!["), "raw markdown consumed");
     }
 
     #[test]

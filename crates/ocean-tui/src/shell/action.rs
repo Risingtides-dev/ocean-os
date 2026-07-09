@@ -104,6 +104,10 @@ pub enum Action {
     LspLoaded {
         servers: Vec<crate::shell::client::LspServer>,
     },
+    /// `/image [path]` — open the full-screen image viewer on `path` (bare =
+    /// the newest image referenced in the chat). The raw path is resolved
+    /// against the workspace by the app; the pixels render via kitty graphics.
+    ViewImage(String),
     /// The async `GET /v1/models` fetch for the picker came back.
     ModelsLoaded {
         current: String,

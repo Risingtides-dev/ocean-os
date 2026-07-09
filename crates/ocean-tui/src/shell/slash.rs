@@ -107,6 +107,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         soon: false,
     },
     SlashCommand {
+        name: "/image",
+        desc: "view an image inline (/image [path]; bare = newest in chat)",
+        group: "workspace",
+        soon: false,
+    },
+    SlashCommand {
         name: "/providers",
         desc: "provider logins & API keys",
         group: "workspace",

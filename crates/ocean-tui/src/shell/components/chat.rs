@@ -530,6 +530,22 @@ impl ChatComponent {
         self.model.as_deref()
     }
 
+    /// Newest image path referenced anywhere in the transcript (user or
+    /// assistant text), for the bare `/image` viewer. Scans turns newest-first,
+    /// then lines within a turn newest-first. Uses the same `![](path)` parse
+    /// as the markdown card so what shows as an image is what `/image` opens.
+    pub fn latest_image(&self) -> Option<String> {
+        self.turns.iter().rev().find_map(|t| {
+            let text = match t {
+                Turn::Assistant(s) | Turn::User(s) => s.as_str(),
+                _ => return None,
+            };
+            text.lines().rev().find_map(|l| {
+                crate::shell::markdown::parse_image_ref(l.trim_start()).map(|(_, p)| p)
+            })
+        })
+    }
+
     /// Whether tool/diff cards render fully expanded (the ⌃O toggle). Exposed
     /// for the settings overlay.
     pub fn tools_expanded(&self) -> bool {
@@ -677,6 +693,19 @@ impl ChatComponent {
             "/advisor" => Some(Action::OpenAdvisor),
             "/memory" => Some(Action::OpenMemory),
             "/lsp" => Some(Action::OpenLsp),
+            "/image" => {
+                let path = if args.trim().is_empty() {
+                    self.latest_image()
+                } else {
+                    Some(args.trim().to_string())
+                };
+                match path {
+                    Some(p) => Some(Action::ViewImage(p)),
+                    None => Some(Action::Status(
+                        "no image in this chat yet (agents show one with ![](path))".into(),
+                    )),
+                }
+            }
             "/login" => {
                 // Bare `/login` opens the provider popup (OAuth + API keys);
                 // `/login claude|codex` keeps the direct browser flow.

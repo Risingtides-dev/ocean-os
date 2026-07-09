@@ -36,5 +36,7 @@ similar = "2"
 # Non-fatal warn logging for best-effort prompt-history I/O.
 tracing.workspace = true
 open = "5"
+# Kitty graphics protocol payload encoding (inline image display).
+base64.workspace = true
 ocean-oauth.workspace = true
 ocean-providers.workspace = true

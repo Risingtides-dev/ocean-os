@@ -16,6 +16,7 @@ mod editor;
 mod event;
 mod git;
 mod graph;
+mod kitty;
 mod status;
 mod highlight;
 mod history;

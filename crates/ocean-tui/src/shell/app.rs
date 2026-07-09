@@ -44,7 +44,7 @@ use super::{
         graph::GraphComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent,
     },
     event::{Event, EventHandler},
-    git,
+    git, kitty,
     status::{self, StatusData, Tone},
     theme::{self, g},
     tui,
@@ -275,6 +275,13 @@ pub struct App {
     lsp_open: bool,
     lsp_loading: bool,
     lsp_servers: Vec<crate::shell::client::LspServer>,
+    /// `/image` full-screen viewer: `Some(abs_path)` when open. `image_body` is
+    /// the cell rect the pixels fill (set during draw); `image_placed` tracks
+    /// whether the kitty image is currently on screen (place once, clear on
+    /// close — see the post-draw emission in `run`).
+    image_view: Option<PathBuf>,
+    image_body: Rect,
+    image_placed: bool,
     /// Mouse text selection. `sel_press` arms on any left-down that isn't a
     /// splitter grab; the first drag promotes it into `selection` — a linear
     /// (terminal-style) sweep in screen cells, anchor → head. Releasing the
@@ -382,6 +389,9 @@ impl App {
             lsp_open: false,
             lsp_loading: false,
             lsp_servers: Vec::new(),
+            image_view: None,
+            image_body: Rect::default(),
+            image_placed: false,
             sel_press: None,
             selection: None,
             frame_cells: Vec::new(),
@@ -497,17 +507,69 @@ impl App {
                 self.dispatch(action);
                 dirty = true;
             }
+            // The image viewer closed (or switched images): delete the placed
+            // kitty image and force a full repaint so the workbench comes back
+            // clean underneath where the pixels were.
+            if self.image_placed && self.image_view.is_none() {
+                kitty::emit(kitty::CLEAR_ALL);
+                self.image_placed = false;
+                let _ = terminal.clear();
+                dirty = true;
+            }
+            // While the viewer is open and its pixels are already placed, it's a
+            // STATIC takeover — skip redraws (a redraw would need to re-place the
+            // image, and nothing else on screen is changing).
+            let viewer_static = self.image_view.is_some() && self.image_placed;
             // Input paints immediately; streaming/async changes coalesce onto the
             // render tick (≤ render_hz); idle frames draw nothing.
-            if immediate || (is_render && dirty) {
+            if !viewer_static && (immediate || (is_render && dirty)) {
                 terminal.draw(|f| self.draw(f))?;
                 dirty = false;
+                // Just painted the viewer frame: now lay the pixels into the
+                // reserved body rect, once (kitty images float above ratatui's
+                // cells — see `kitty`).
+                if self.image_view.is_some() && !self.image_placed {
+                    if let Some(path) = self.image_view.clone() {
+                        let b = self.image_body;
+                        if let Some(seq) =
+                            kitty::place_png_at(&path, b.x, b.y, b.width, b.height)
+                        {
+                            kitty::emit(&seq);
+                        }
+                        // Mark placed even when kitty declined (non-kitty /
+                        // non-PNG): the frame's note is the render, and this
+                        // keeps the static-takeover gate from redrawing.
+                        self.image_placed = true;
+                    }
+                }
             }
         }
         Ok(())
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // The `/image` viewer is a full-screen takeover: esc/q/enter or a click
+        // closes it; other keys are swallowed (no accidental composer input).
+        if self.image_view.is_some() {
+            match evt {
+                CrosstermEvent::Key(k) => {
+                    if matches!(
+                        k.code,
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter
+                    ) {
+                        self.image_view = None;
+                    }
+                    return;
+                }
+                CrosstermEvent::Mouse(m)
+                    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    self.image_view = None;
+                    return;
+                }
+                _ => return,
+            }
+        }
         // The `/lsp` panel is a read-only modal: any key or click closes it.
         if self.lsp_open {
             match evt {
@@ -1124,6 +1186,22 @@ impl App {
             Action::LspLoaded { servers } => {
                 self.lsp_loading = false;
                 self.lsp_servers = servers.clone();
+            }
+            // `/image [path]`: open the full-screen viewer. Resolve a relative
+            // path against the active workspace; a missing file surfaces in the
+            // status line instead of a blank viewer.
+            Action::ViewImage(raw) => {
+                let p = PathBuf::from(raw);
+                let abs = if p.is_absolute() {
+                    p
+                } else {
+                    PathBuf::from(&self.workspace_root).join(p)
+                };
+                if abs.exists() {
+                    self.image_view = Some(abs);
+                } else {
+                    self.status = format!("image not found: {}", abs.display());
+                }
             }
             // `/login [claude|codex]`: run the REAL OAuth flow off-thread
             // (begin → browser → token exchange → persist) so the TUI never
@@ -1792,6 +1870,67 @@ impl App {
             .style(Style::default().bg(theme::SLATE)),
             Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
         );
+    }
+
+    /// Render the `/image` viewer frame: a full-screen takeover with a title
+    /// bar (filename + close hint) and an empty body. The body rect is stored
+    /// in `image_body`; the actual pixels are drawn AFTER this frame paints, by
+    /// the kitty emission in `run` (ratatui doesn't model the image layer). For
+    /// a non-kitty terminal or a non-PNG file, a centered note fills the body
+    /// instead — the frame is honest about why there's no picture.
+    fn draw_image_viewer(&mut self, frame: &mut ratatui::Frame) {
+        let full = frame.area();
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme::BG_DARK)),
+            full,
+        );
+        let Some(path) = self.image_view.clone() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        // Title bar.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("  {} {name}", g("🖼", "[img]")),
+                    Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "   esc close",
+                    Style::default().fg(theme::COMMENT),
+                ),
+            ]))
+            .style(Style::default().bg(theme::BG_DARK)),
+            Rect::new(full.x, full.y, full.width, 1),
+        );
+        // Body rect (below the title, small inset) — where the pixels go.
+        let body = Rect::new(
+            full.x + 1,
+            full.y + 2,
+            full.width.saturating_sub(2),
+            full.height.saturating_sub(3),
+        );
+        self.image_body = body;
+
+        // Honest note when we can't render pixels here.
+        let note = if !kitty::supported() {
+            Some("image preview needs a kitty-graphics terminal (kitty/ghostty/wezterm)")
+        } else if !kitty::is_png(&path) {
+            Some("inline preview supports PNG today — open other formats externally")
+        } else {
+            None
+        };
+        if let Some(msg) = note {
+            let y = body.y + body.height / 2;
+            frame.render_widget(
+                Paragraph::new(Span::styled(msg, Style::default().fg(theme::YELLOW)))
+                    .style(Style::default().bg(theme::BG_DARK)),
+                Rect::new(body.x + 2, y, body.width.saturating_sub(4), 1),
+            );
+        }
     }
 
     /// Render the `/lsp` panel: the language servers relevant to this
@@ -2668,6 +2807,11 @@ impl App {
         }
         if self.providers_open {
             self.draw_providers(frame);
+        }
+        // The image viewer is a full-screen takeover — drawn last so its frame
+        // covers everything; the pixels land after this paint (see `run`).
+        if self.image_view.is_some() {
+            self.draw_image_viewer(frame);
         }
     }
 
