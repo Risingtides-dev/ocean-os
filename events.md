@@ -2078,3 +2078,11 @@ area:      backend
 
 Re-verified Claude Code OAuth end-to-end after John said "proceed". Daemon healthy on 127.0.0.1:4780 (LaunchAgent pid listening); auth.json still has claude-code oauth (sk-ant-oat01…). Fresh POST /v1/agent/turns with model_id=claude-sonnet-5 (per-turn override, no global swap) → HTTP 202 ok:true status:completed turn_id=4d5efb81… input_tokens=101 output_tokens=17 wall_ms=1730; daemon log shows provider_stream provider=anthropic model=claude-sonnet-5 api=anthropic-messages. Global /health remained deepseek/deepseek-v4-pro. Confirmed ffca90c+f9c0de9 already on origin (no push needed). /v1/models Claude rows ready:true — earlier NOT-READY was a probe field-name miss (`ready` not `ok`), not a listing bug. /tmp/ocean-daemon-clean already cleaned.
 _________________________________________________________________________________
+time:      [7:25PM] [07-09-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      backend
+
+Provider lane audit after the Claude OAuth verification. GLM/Z.AI proven live: POST /v1/agent/turns model_id=glm-4.7 -> completed (88/4 tokens, 12.8s wall — Z.AI coding plan is slow but real). Codex lane is DOWN: gpt-5.4 -> 401 token_invalidated ("authentication token has been invalidated. Please try signing in again") — OpenAI revoked the grant server-side (expiry Jul 18 irrelevant), and the codex CLI is itself logged out (`codex login status` -> Not logged in; ~/.codex/auth.json gone, only a .bad-20260624 backup), so there is no fresh token to sync. Ocean-side plumbing is complete — oauth_refresh covers openai-codex (auth.openai.com/oauth/token) but refresh cannot resurrect a revoked grant. Fix requires interactive re-auth: TUI /login -> Codex (the flow built this week). Also confirmed oauth_refresh has the claude-code block (console.anthropic.com/v1/oauth/token + tests); claude access token expires ~01:50 UTC tonight — first natural field test of turn-time refresh.
+_________________________________________________________________________________
