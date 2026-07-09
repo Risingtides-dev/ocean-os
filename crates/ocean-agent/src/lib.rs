@@ -1073,6 +1073,27 @@ impl AgentRuntime {
         session::detail(&self.config_dir, id)
     }
 
+    /// Append a client-authored message to a persisted session outside the
+    /// turn loop (the realtime voice agent's handoff notes, voice phases
+    /// 2/3). Returns `Ok(false)` when no such session exists — the caller
+    /// maps that to 404. Takes the same per-session lock as the run path so
+    /// a concurrent turn's load→run→save can never drop the appended row.
+    pub async fn append_session_message(
+        &self,
+        id: SessionId,
+        text: String,
+    ) -> anyhow::Result<bool> {
+        let lock = self.session_lock(id);
+        let _guard = lock.lock().await;
+        let Some(mut session) = session::load_resumable(&self.config_dir, id)? else {
+            return Ok(false);
+        };
+        session.messages.push(Message::user_text(text));
+        session.updated_ms = ocean_protocol::now_ms();
+        session::save(&self.config_dir, &session)?;
+        Ok(true)
+    }
+
     /// Explicitly mint a session container *before* any turn is run, per the
     /// ecosystem contract. Mirrors the implicit create-on-turn path's session
     /// setup (mint id → `bind_workspace(cwd)` → persist) but runs no agent loop
@@ -4169,6 +4190,35 @@ done
             Arc::strong_count(&lock),
             2,
             "the returned clone (1) + the map entry (1) == 2"
+        );
+    }
+
+    // Voice phases 2/3: the handoff append must persist through a real
+    // save→load round-trip and must report a missing session as `false`
+    // (the daemon maps that to 404) instead of minting a phantom file.
+    #[tokio::test]
+    async fn append_session_message_persists_and_404s_unknown_ids() {
+        let rt = lock_runtime("handoff-append");
+        let cwd = temp_config_dir("handoff-append-ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let (id, _, _) = rt
+            .create_session(cwd.to_str().unwrap(), None)
+            .expect("create session");
+
+        assert!(rt
+            .append_session_message(id, "[voice handoff] fix the header".into())
+            .await
+            .expect("append should succeed"));
+        let detail = rt.session_detail(id).expect("reload session");
+        let last = detail.transcript.last().expect("one transcript entry");
+        assert_eq!(last.role, "user");
+        assert_eq!(last.text, "[voice handoff] fix the header");
+
+        assert!(
+            !rt.append_session_message(SessionId::new_v4(), "ghost".into())
+                .await
+                .expect("unknown id is Ok(false), not an error"),
+            "an unknown session must not be created by an append"
         );
     }
 

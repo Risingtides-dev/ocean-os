@@ -93,6 +93,9 @@ mod bus;
 /// CDP client to the same Chrome the agent already drives; see [`browser_stream`]
 /// for the frozen client contract.
 mod browser_stream;
+/// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
+/// pure pieces behind `POST /v1/voice/realtime/client-secret`.
+mod voice_realtime;
 use browser_stream::{input as browser_input, screencast_stream as browser_screencast};
 
 #[derive(Clone)]
@@ -1588,6 +1591,18 @@ async fn main() -> anyhow::Result<()> {
             get(agent_sessions).post(agent_sessions_create),
         )
         .route("/v1/agent/sessions/{id}", get(agent_session))
+        // Voice phases 2/3: ephemeral Realtime client-secret mint (the
+        // browser talks WebRTC directly to OpenAI with the returned secret;
+        // the API key never leaves the daemon) and the voice agent's handoff
+        // append into a chat session.
+        .route(
+            "/v1/voice/realtime/client-secret",
+            post(voice_realtime_client_secret),
+        )
+        .route(
+            "/v1/agent/sessions/{id}/messages",
+            post(agent_session_message_append),
+        )
         .route("/v1/events", get(events))
         .route("/v1/prompt", post(prompt))
         .route("/v1/requests", get(requests).post(create_request))
@@ -1953,6 +1968,8 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/agent/sessions",
         "GET /v1/agent/sessions",
         "GET /v1/agent/sessions/{id}",
+        "POST /v1/agent/sessions/{id}/messages",
+        "POST /v1/voice/realtime/client-secret",
         "GET /v1/events",
         "POST /v1/prompt",
         "GET /v1/requests",
@@ -11298,6 +11315,125 @@ async fn agent_session(
                 error: Some("session not found".into()),
             }),
         ),
+    }
+}
+
+/// Body for `POST /v1/agent/sessions/{id}/messages` — the realtime voice
+/// agent's handoff append (voice phases 2/3).
+#[derive(Debug, serde::Deserialize)]
+struct SessionMessageAppendRequest {
+    role: String,
+    content: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// Append an out-of-turn message to a persisted session. Today this serves
+/// the voice agent's `write_handoff` tool: the note lands in the transcript
+/// so the text agent's next turn picks it up. Only `role: "user"` is
+/// accepted — transcripts store assistant/tool rows with provider metadata
+/// this route cannot honestly fabricate.
+async fn agent_session_message_append(
+    State(state): State<AppState>,
+    Path(session_id): Path<AgentSessionId>,
+    Json(req): Json<SessionMessageAppendRequest>,
+) -> (StatusCode, Json<Value>) {
+    if req.role != "user" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "only role \"user\" is supported" })),
+        );
+    }
+    let content = req.content.trim();
+    if content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "content must not be empty" })),
+        );
+    }
+    // Handoff notes are tagged inline so the next turn (and a human reading
+    // the transcript) can tell them from typed prompts.
+    let text = match req.kind.as_deref() {
+        Some("handoff") => format!("[voice handoff] {content}"),
+        _ => content.to_string(),
+    };
+    match state
+        .runtime
+        .append_session_message(core_sid(session_id), text)
+        .await
+    {
+        Ok(true) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "session not found" })),
+        ),
+        Err(err) => {
+            tracing::warn!(%session_id, error = %err, "session message append failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": err.to_string() })),
+            )
+        }
+    }
+}
+
+/// Mint an ephemeral OpenAI Realtime client secret (voice phases 2/3). The
+/// daemon resolves the OpenAI credential and briefs the voice agent on the
+/// target chat session; the browser connects to OpenAI over WebRTC with the
+/// returned short-lived secret. The API key never leaves this process.
+async fn voice_realtime_client_secret(
+    State(state): State<AppState>,
+    Json(req): Json<voice_realtime::RealtimeSecretRequest>,
+) -> (StatusCode, Json<Value>) {
+    let credential =
+        match ocean_providers::resolve_credential_from_env(&ocean_providers::ProviderId::OpenAi) {
+            Ok(Some(credential)) => credential,
+            Ok(None) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "no OpenAI credential configured (OCEAN_OPENAI_API_KEY / OPENAI_API_KEY / auth.json)"
+                    })),
+                );
+            }
+            Err(err) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": format!("credential resolution failed: {err}") })),
+                );
+            }
+        };
+
+    // Briefing: best-effort. A bad/unknown session id degrades to the
+    // header-only instructions rather than blocking the voice session.
+    let transcript: Vec<(String, String)> = req
+        .session_id
+        .as_deref()
+        .and_then(|raw| raw.parse::<SessionId>().ok())
+        .and_then(|id| state.runtime.session_detail(id).ok())
+        .map(|detail| {
+            detail
+                .transcript
+                .iter()
+                .map(|entry| (entry.role.clone(), entry.text.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let model = req
+        .model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(voice_realtime::DEFAULT_REALTIME_MODEL)
+        .to_string();
+    let instructions = voice_realtime::build_instructions(&transcript);
+    let body = voice_realtime::upstream_body(&model, &instructions);
+    match voice_realtime::mint_client_secret(credential.secret.expose(), &model, &body).await {
+        Ok(normalized) => (StatusCode::OK, Json(normalized)),
+        Err(err) => {
+            tracing::warn!(error = %err, "realtime client-secret mint failed");
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": err })))
+        }
     }
 }
 

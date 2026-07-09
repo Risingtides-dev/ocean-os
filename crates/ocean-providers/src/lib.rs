@@ -322,6 +322,18 @@ pub fn resolve_provider_config_from_env() -> Result<ProviderConfig, ProviderConf
     resolve_provider_config(&ProviderEnv::from_process())
 }
 
+/// Resolve a single provider's credential from the current process
+/// environment — env names first, then the Ocean auth file — without pulling
+/// the full model-selection config. Public entry for non-turn features that
+/// need a raw provider credential, e.g. the daemon's Realtime voice
+/// client-secret mint (voice phases 2/3): the browser never holds the key,
+/// the daemon resolves it here and mints an ephemeral upstream secret.
+pub fn resolve_credential_from_env(
+    provider: &ProviderId,
+) -> Result<Option<ResolvedCredential>, ProviderConfigError> {
+    resolve_credential(&ProviderEnv::from_process(), provider)
+}
+
 /// Resolve full provider config from a provided environment snapshot.
 pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, ProviderConfigError> {
     let selection = resolve_model_selection(env)?;
