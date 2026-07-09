@@ -524,6 +524,12 @@ impl ChatComponent {
         self.busy
     }
 
+    /// The model driving turns (the header pill), for the status bar. `None`
+    /// until the first `TurnStarted` names it.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     /// Whether tool/diff cards render fully expanded (the ⌃O toggle). Exposed
     /// for the settings overlay.
     pub fn tools_expanded(&self) -> bool {

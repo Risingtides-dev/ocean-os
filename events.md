@@ -2020,3 +2020,11 @@ area:      backend
 
 /advisor slash command — per-session second-opinion reviewer, coordinated across the daemon+TUI lanes. The post-turn advisor observer was global-config-only (ocean.toml [roles].advisor, loaded once at boot, no runtime control). Added AgentTurnRequest.advisor: Option<AdvisorControl {enabled, model}> (SDK), and resolve_advisor_alias() in the daemon giving the per-turn override precedence over the global role (enabled:false suppresses even a configured role; enabled:true runs on override model or falls back to the role; None = today's global behavior). Pure helper, 7-case unit test. TUI: /advisor opens a picker overlay (reuses the /models registry fetch) — an "off" row over the ready models, ↑↓/⏎/esc/click, the pick rides every subsequent turn as advisor_ctl. All AgentTurnRequest construction sites across sdk/daemon/acp/tui got advisor:None. Suites: tui 168, sdk 48, daemon (resolve_advisor 7-case) all green; workspace --tests 0 errors. Daemon changed → needs redeploy from main.
 _________________________________________________________________________________
+time:      [12:40am] [07-09-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+Status-line dashboard (OMP Slice 4, port item 1 of 3). Replaced the one-string status line with composable segments: focus chip · model · git (branch ±dirty ↑ahead ↓behind, green clean / yellow dirty) · tok/s · session tokens · §session · advisor state · message, keybind hint right-pinned. Pure formatting in new shell/status.rs (Tone enum → theme colors at render; 5 unit tests: empty→just-chip, absent-values-skipped, git clean/dirty tone+counts, count/rate formatting, advisor+tokens present). Git cached (shells out) — populated in App::new from frame 1, refreshed on the existing 1s tree tick + on re-root. Turn usage (tokens_per_second/output_tokens) captured from TurnFinished; session_tokens accumulates. chat.model() accessor added. PTY-verified: "chat  feat/ocean-tui-shell-rebuild ±38 · §dd192125 · connected". Suite 173/0.
+_________________________________________________________________________________

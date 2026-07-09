@@ -44,6 +44,8 @@ use super::{
         graph::GraphComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent,
     },
     event::{Event, EventHandler},
+    git,
+    status::{self, StatusData, Tone},
     theme::{self, g},
     tui,
 };
@@ -283,6 +285,14 @@ pub struct App {
     esc_armed: bool,
     /// Last time the file tree was re-read from disk (throttles the live rescan).
     last_tree_scan: Instant,
+    /// Cached git status of the active workspace for the status-line dashboard.
+    /// Refreshed on the same throttled tick as the tree (git shells out, so it
+    /// must not run per-frame) and immediately on a workspace re-root.
+    git_status: git::Status,
+    /// Output tokens/second of the last completed turn, and the running total
+    /// of output tokens this session — status-bar segments.
+    turn_tok_per_s: Option<f64>,
+    session_tokens: u64,
     /// `/settings` overlay: open flag + selected row.
     settings_open: bool,
     settings_sel: usize,
@@ -308,6 +318,9 @@ impl App {
     pub fn new(client: DaemonClient, workspace_root: String) -> Self {
         let (actions_tx, actions_rx) = mpsc::unbounded_channel();
         let root = PathBuf::from(&workspace_root);
+        // Status-bar git segment, populated from frame 1 (before `root` is
+        // moved into the components below).
+        let git_status = git::status(&root);
         let mut app = Self {
             client,
             workspace_root,
@@ -359,6 +372,11 @@ impl App {
             buttons: Vec::new(),
             esc_armed: false,
             last_tree_scan: Instant::now(),
+            // Populated above from `root`, before it was moved into components;
+            // refreshed thereafter on the 1s tick.
+            git_status,
+            turn_tok_per_s: None,
+            session_tokens: 0,
             settings_open: false,
             settings_sel: 0,
             providers_open: false,
@@ -435,6 +453,9 @@ impl App {
                     // ~1s so it's a couple of cheap read_dirs, not per-tick.
                     if self.last_tree_scan.elapsed() >= Duration::from_millis(1000) {
                         self.tree.rescan();
+                        // Refresh the status-bar git segment on the same cheap
+                        // cadence (git shells out — never per-frame).
+                        self.git_status = git::status(std::path::Path::new(&self.workspace_root));
                         self.last_tree_scan = Instant::now();
                         dirty = true;
                     }
@@ -815,6 +836,18 @@ impl App {
                     self.status = format!(
                         "⚠ {requested} unavailable — turn running on {effective} (fallback)"
                     );
+                }
+                // Capture turn usage for the status-bar rate/token segments.
+                if let AgentTurnEvent::TurnFinished {
+                    tokens_per_second,
+                    output_tokens,
+                    ..
+                } = evt.as_ref()
+                {
+                    self.turn_tok_per_s = *tokens_per_second;
+                    if let Some(out) = output_tokens {
+                        self.session_tokens = self.session_tokens.saturating_add(*out);
+                    }
                 }
             }
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
@@ -2380,7 +2413,10 @@ impl App {
     }
 
     fn draw_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        // CTRL-style status: what's happening + where focus is, not a mode menu.
+        // Composable dashboard segments (OMP Slice 4): focus · model · git ·
+        // rate · tokens · session · advisor · message. Built pure in
+        // `status::segments`; rendered here with theme colours and ` · `
+        // separators. The keybind hint pins to the right.
         let focus_name = match self.focus {
             Focus::Sessions => "sessions",
             Focus::Tree => "files",
@@ -2391,20 +2427,61 @@ impl App {
                 Center::Graph => "graph",
             },
         };
-        let spans: Vec<Span> = vec![
-            Span::styled(
-                format!(" {} ", focus_name),
-                Style::default()
-                    .fg(theme::CYAN)
-                    .bg(theme::BG_HL)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}", self.status),
-                Style::default().fg(theme::COMMENT),
-            ),
-            Span::styled("   ⇥ move · ⌃Q quit", Style::default().fg(theme::COMMENT)),
-        ];
+        let advisor = self.advisor_ctl.as_ref().map(|c| {
+            if c.enabled {
+                c.model.as_deref().unwrap_or("on")
+            } else {
+                "off"
+            }
+        });
+        let session = self.session_id.map(|id| {
+            let s = id.0.to_string();
+            s.chars().take(8).collect::<String>()
+        });
+        let data = StatusData {
+            focus: focus_name,
+            model: self.chat.model(),
+            git: Some(&self.git_status),
+            tok_per_s: self.turn_tok_per_s,
+            session_tokens: self.session_tokens,
+            session: session.as_deref(),
+            advisor,
+            message: &self.status,
+        };
+
+        let tone_color = |t: Tone| match t {
+            Tone::Focus => theme::CYAN,
+            Tone::Primary => theme::FG,
+            Tone::Muted => theme::COMMENT,
+            Tone::Ok => theme::GREEN,
+            Tone::Warn => theme::YELLOW,
+        };
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, seg) in status::segments(&data).into_iter().enumerate() {
+            if seg.tone == Tone::Focus {
+                // Focus chip: accent bed, bold.
+                spans.push(Span::styled(
+                    seg.text,
+                    Style::default()
+                        .fg(theme::CYAN)
+                        .bg(theme::BG_HL)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    if i == 1 { "  " } else { &" · "[..] },
+                    Style::default().fg(theme::EDGE),
+                ));
+                spans.push(Span::styled(seg.text, Style::default().fg(tone_color(seg.tone))));
+            }
+        }
+        let hint = " ⇥ move · ⌃Q quit ";
+        // Right-pin the hint: pad between the segments and the hint.
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let pad = (area.width as usize).saturating_sub(used + hint.chars().count());
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(hint, Style::default().fg(theme::COMMENT)));
+
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
             area,
