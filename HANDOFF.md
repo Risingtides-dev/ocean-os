@@ -1,6 +1,6 @@
 # Handoff — Ocean TUI/UX + model-provider lane
 
-**As of:** 2026-07-08 evening · main @ `08de052` · both binaries deployed from clean main
+**As of:** 2026-07-09 ~3:40am · main @ `73b4ed4` · both binaries deployed from clean main
 **Lanes:** this doc covers the TUI-UX + providers lane. A second agent lane owns runtime/browser
 (currently mid-flight: browser_stream.rs / daemon main.rs WIP with compile errors in the shared
 working tree — do not touch, do not build `--workspace` from the dirty tree).
