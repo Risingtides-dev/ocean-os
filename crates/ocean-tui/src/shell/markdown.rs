@@ -170,8 +170,32 @@ fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
             continue;
         }
 
+        // Markdown table: a `|`-delimited row whose NEXT line is the
+        // `|---|---|` separator. Rendered as padded columns with box-drawing
+        // dividers instead of raw pipe soup; inline styles inside cells
+        // (`code`, **bold**) keep working.
+        if is_table_row(trimmed)
+            && i + 1 < lines.len()
+            && is_table_separator(lines[i + 1].trim_start())
+        {
+            let mut rows: Vec<Vec<String>> = vec![table_cells(trimmed)];
+            let mut j = i + 2;
+            while j < lines.len() && is_table_row(lines[j].trim_start()) {
+                rows.push(table_cells(lines[j].trim_start()));
+                j += 1;
+            }
+            render_table(&rows, &mut out);
+            i = j;
+            continue;
+        }
+
         if let Some(h) = heading(line) {
             out.push(h);
+        } else if is_horizontal_rule(trimmed) {
+            out.push(Line::from(Span::styled(
+                g("─", "-").repeat(40),
+                Style::default().fg(theme::EDGE),
+            )));
         } else if trimmed.starts_with("> ") || trimmed == ">" {
             out.push(blockquote(line));
         } else if let Some(l) = list_item(line) {
@@ -182,6 +206,108 @@ fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
         i += 1;
     }
     out
+}
+
+/// `---` / `***` / `___` on their own line (3+ of one marker, optionally
+/// spaced) — a thematic break, rendered as a dim rule instead of raw dashes.
+fn is_horizontal_rule(t: &str) -> bool {
+    let t = t.trim_end();
+    for marker in ['-', '*', '_'] {
+        let stripped: String = t.chars().filter(|c| *c != ' ').collect();
+        if stripped.len() >= 3 && stripped.chars().all(|c| c == marker) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A table row starts and (after trailing-space trim) ends with `|` and has at
+/// least one interior cell divider.
+fn is_table_row(t: &str) -> bool {
+    let t = t.trim_end();
+    t.len() >= 2 && t.starts_with('|') && t.ends_with('|') && t.matches('|').count() >= 2
+}
+
+/// The header/body separator: a table row whose cells contain only `-`, `:`
+/// and spaces (`|---|:--:|`).
+fn is_table_separator(t: &str) -> bool {
+    is_table_row(t)
+        && t.trim_end()
+            .trim_matches('|')
+            .chars()
+            .all(|c| matches!(c, '-' | ':' | '|' | ' '))
+        && t.contains('-')
+}
+
+/// Split one `| a | b |` row into trimmed cell strings.
+fn table_cells(t: &str) -> Vec<String> {
+    let inner = t.trim_end().trim_start_matches('|').trim_end_matches('|');
+    inner.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Render parsed rows (first row = header) as padded columns joined by `│`,
+/// with a `─┼─` rule under the header. Column width = the widest cell's
+/// styled-stripped display width, capped so one long cell can't blow out the
+/// whole table; cells run through the inline styler so `code` spans render.
+fn render_table(rows: &[Vec<String>], out: &mut Vec<Line<'static>>) {
+    const CELL_CAP: usize = 48;
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return;
+    }
+    let mut w = vec![0usize; cols];
+    for row in rows {
+        for (ci, cell) in row.iter().enumerate() {
+            w[ci] = w[ci].max(inline_plain_len(cell).min(CELL_CAP));
+        }
+    }
+    for (ri, row) in rows.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+        for (ci, cw) in w.iter().enumerate() {
+            if ci > 0 {
+                spans.push(Span::styled(
+                    format!(" {} ", g("│", "|")),
+                    Style::default().fg(theme::EDGE),
+                ));
+            }
+            let cell = row.get(ci).map(String::as_str).unwrap_or("");
+            let base = if ri == 0 {
+                base_style().add_modifier(Modifier::BOLD)
+            } else {
+                base_style()
+            };
+            let len = inline_plain_len(cell);
+            spans.extend(inline_spans(cell, base));
+            if len < *cw {
+                spans.push(Span::raw(" ".repeat(cw - len)));
+            }
+        }
+        out.push(Line::from(spans));
+        if ri == 0 {
+            // Header underline: ─┼─ junctions matching the column widths.
+            let mut rule = String::from("  ");
+            for (ci, cw) in w.iter().enumerate() {
+                if ci > 0 {
+                    rule.push_str(&g("─┼─", "-+-"));
+                }
+                rule.push_str(&g("─", "-").repeat(*cw));
+            }
+            out.push(Line::from(Span::styled(
+                rule,
+                Style::default().fg(theme::EDGE),
+            )));
+        }
+    }
+}
+
+/// Display length of a cell after inline markers (`` ` ``, `**`, `*`) are
+/// consumed by the styler — used for column-width math so padding lines up
+/// with what actually renders.
+fn inline_plain_len(text: &str) -> usize {
+    inline_spans(text, base_style())
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum()
 }
 
 fn base_style() -> Style {
@@ -228,7 +354,9 @@ fn heading(line: &str) -> Option<Line<'static>> {
     let text = after.trim_start();
     Some(Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::BLUE)
+            .add_modifier(Modifier::BOLD),
     )))
 }
 
@@ -258,9 +386,36 @@ fn list_item(line: &str) -> Option<Line<'static>> {
         .or_else(|| t.strip_prefix("* "))
         .or_else(|| t.strip_prefix("+ "))
     {
+        // Task-list items: `- [x] done` / `- [ ] todo` get a checkbox glyph
+        // (green when checked) instead of the raw bracket triplet.
+        if let Some(body) = rest.strip_prefix("[x] ").or_else(|| rest.strip_prefix("[X] ")) {
+            let mut spans = vec![
+                Span::styled(indent.to_string(), base_style()),
+                Span::styled(
+                    format!("{} ", g("☑", "[x]")),
+                    Style::default().fg(theme::GREEN),
+                ),
+            ];
+            spans.extend(inline_spans(body, base_style()));
+            return Some(Line::from(spans));
+        }
+        if let Some(body) = rest.strip_prefix("[ ] ") {
+            let mut spans = vec![
+                Span::styled(indent.to_string(), base_style()),
+                Span::styled(
+                    format!("{} ", g("☐", "[ ]")),
+                    Style::default().fg(theme::COMMENT),
+                ),
+            ];
+            spans.extend(inline_spans(body, base_style()));
+            return Some(Line::from(spans));
+        }
         let mut spans = vec![
             Span::styled(indent.to_string(), base_style()),
-            Span::styled(format!("{} ", g("•", "-")), Style::default().fg(theme::CYAN)),
+            Span::styled(
+                format!("{} ", g("•", "-")),
+                Style::default().fg(theme::CYAN),
+            ),
         ];
         spans.extend(inline_spans(rest, base_style()));
         return Some(Line::from(spans));
@@ -269,7 +424,10 @@ fn list_item(line: &str) -> Option<Line<'static>> {
     let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
     if !digits.is_empty() {
         let after = &t[digits.len()..];
-        if let Some(rest) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
+        if let Some(rest) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
             let mut spans = vec![
                 Span::styled(indent.to_string(), base_style()),
                 Span::styled(format!("{digits}. "), Style::default().fg(theme::CYAN)),
@@ -297,10 +455,7 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(close) = find_char(&chars, i + 1, '`') {
                 push_buf(&mut spans, &mut buf, base);
                 let code: String = chars[i + 1..close].iter().collect();
-                spans.push(Span::styled(
-                    code,
-                    base.fg(theme::CYAN).bg(theme::BG_DARK),
-                ));
+                spans.push(Span::styled(code, base.fg(theme::CYAN).bg(theme::BG_DARK)));
                 i = close + 1;
                 continue;
             }
@@ -326,6 +481,39 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
             }
         }
 
+        // ~~strikethrough~~
+        if c == '~' && i + 1 < chars.len() && chars[i + 1] == '~' {
+            if let Some(close) = find_double(&chars, i + 2, '~') {
+                push_buf(&mut spans, &mut buf, base);
+                let inner: String = chars[i + 2..close].iter().collect();
+                spans.push(Span::styled(inner, base.add_modifier(Modifier::CROSSED_OUT)));
+                i = close + 2;
+                continue;
+            }
+        }
+
+        // [text](url) — text in cyan-underline, url as a dim trailing note so
+        // it stays copyable (terminals don't click ratatui spans).
+        if c == '[' {
+            if let Some((text_end, url_end)) = find_link(&chars, i) {
+                push_buf(&mut spans, &mut buf, base);
+                let label: String = chars[i + 1..text_end].iter().collect();
+                let url: String = chars[text_end + 2..url_end].iter().collect();
+                spans.push(Span::styled(
+                    label,
+                    base.fg(theme::CYAN).add_modifier(Modifier::UNDERLINED),
+                ));
+                if !url.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" ({url})"),
+                        base.fg(theme::COMMENT),
+                    ));
+                }
+                i = url_end + 1;
+                continue;
+            }
+        }
+
         buf.push(c);
         i += 1;
     }
@@ -344,6 +532,30 @@ fn push_buf(spans: &mut Vec<Span<'static>>, buf: &mut String, base: Style) {
 
 fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
     (from..chars.len()).find(|&k| chars[k] == target)
+}
+
+/// Find a doubled `target` (`~~`, etc.) starting at `from`; returns the index
+/// of the FIRST of the pair.
+fn find_double(chars: &[char], from: usize, target: char) -> Option<usize> {
+    let mut k = from;
+    while k + 1 < chars.len() {
+        if chars[k] == target && chars[k + 1] == target {
+            return Some(k);
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Match `[text](url)` at `open` (the `[`). Returns (index of `]`, index of
+/// the closing `)`), with `](` required to be adjacent. Single-line only.
+fn find_link(chars: &[char], open: usize) -> Option<(usize, usize)> {
+    let text_end = find_char(chars, open + 1, ']')?;
+    if text_end + 1 >= chars.len() || chars[text_end + 1] != '(' {
+        return None;
+    }
+    let url_end = find_char(chars, text_end + 2, ')')?;
+    Some((text_end, url_end))
 }
 
 fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
@@ -384,6 +596,62 @@ fn lang_ext(lang: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn plain(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn table_renders_aligned_columns_not_pipe_soup() {
+        let mut md = Markdown::new();
+        let src = "| Provider | Auth |\n|---|---|\n| Anthropic | `KEY` (API key) |\n| ClaudeCode | OAuth |";
+        let lines = md.render(src);
+        let texts: Vec<String> = lines.iter().map(plain).collect();
+        // Header + rule + 2 body rows.
+        assert_eq!(texts.len(), 4, "got: {texts:?}");
+        assert!(texts[0].contains("Provider") && texts[0].contains("│"));
+        assert!(texts[1].contains("┼"), "header rule: {:?}", texts[1]);
+        // Raw markdown pipes/dashes must be gone.
+        assert!(!texts.iter().any(|t| t.contains("|---")));
+        // Columns align: the divider sits at the same char index in every
+        // content row (header padded to the widest cell).
+        let idx: Vec<usize> = [0, 2, 3]
+            .iter()
+            .map(|i| texts[*i].find('│').unwrap())
+            .collect();
+        assert!(idx.windows(2).all(|w| w[0] == w[1]), "dividers: {idx:?}");
+        // Inline code inside a cell still styles (backticks consumed).
+        assert!(texts[2].contains("KEY") && !texts[2].contains('`'));
+    }
+
+    #[test]
+    fn links_strikethrough_and_task_lists_render() {
+        let mut md = Markdown::new();
+        let lines = md.render(
+            "see [the docs](https://x.dev) for ~~old~~ new info\n\n- [x] shipped\n- [ ] next",
+        );
+        let texts: Vec<String> = lines.iter().map(plain).collect();
+        let all = texts.join("\n");
+        // Link: label + dim (url), raw []() consumed.
+        assert!(all.contains("the docs") && all.contains("(https://x.dev)"));
+        assert!(!all.contains("[the docs]"));
+        // Strikethrough markers consumed.
+        assert!(all.contains("old") && !all.contains("~~"));
+        // Task list checkboxes replace the bracket triplets.
+        assert!(all.contains("☑ shipped") && all.contains("☐ next"), "{all}");
+    }
+
+    #[test]
+    fn horizontal_rule_renders_as_dim_line() {
+        let mut md = Markdown::new();
+        let lines = md.render("above\n\n---\n\nbelow");
+        let texts: Vec<String> = lines.iter().map(plain).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("────")),
+            "expected a rule, got {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.trim() == "---"));
+    }
+
     #[test]
     fn prefix_freeze_reuses_frozen_block() {
         let mut md = Markdown::new();
@@ -405,7 +673,7 @@ mod tests {
         let mut md = Markdown::new();
         md.render("A\n\nB"); // A frozen (miss), B is tail
         md.render("A\n\nB\n\nC"); // now B freezes too
-        // A hit again, B newly frozen (miss). Total misses: A + B = 2.
+                                  // A hit again, B newly frozen (miss). Total misses: A + B = 2.
         assert_eq!(md.stats().misses, 2);
         assert!(md.stats().hits >= 1);
     }

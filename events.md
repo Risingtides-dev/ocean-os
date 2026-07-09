@@ -1995,3 +1995,11 @@ area:      frontend
 
 Killed the tool-output screen spam John screenshotted: collapsed tool cards are now ONE line each — status glyph + name + args + a dim outcome summary (whole output inline when it's one short line, else "N lines") — instead of header + 3-row tail + "+N more" per call (~5 rows × 10 calls = a wall). Consecutive tool rows tight-pack with no blank separators. Historical "thinking (N chars)" markers are hidden when collapsed (only the LIVE tail thinking row shows while busy). Errors keep their red 3-line tail; diff cards unchanged (edits are content); ⌃O restores everything verbose. PTY-verified: a 4-tool turn = 4 tight rows, zero gutter rows, zero thinking spam. Suite 165/0.
 _________________________________________________________________________________
+time:      [10:30pm] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+Markdown renderer completeness (John: "should handle everything an agent throws at it"): tables now render as padded columns with │ dividers and a ─┼─ header rule (was raw pipe soup — his screenshot), inline styles work inside cells, one long cell can't blow out the layout (48-char cap). Also landed: horizontal rules (---/***/___ → dim line), links ([text](url) → cyan-underline label + dim copyable url), ~~strikethrough~~ (CROSSED_OUT), and task lists (- [x] → green ☑, - [ ] → dim ☐). 4 new unit tests; suite 168/0. Still open on this thread: inline images/screenshots via kitty graphics (ratatui-image + placeholder-row overlay architecture) — next block.
+_________________________________________________________________________________
