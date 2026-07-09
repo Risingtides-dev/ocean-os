@@ -1447,8 +1447,10 @@ impl Component for ChatComponent {
         // Collapsed tool-card tail lines clamp to one screen row each (gutter
         // "    │ " = 6 cols + 1 spare); ⌃O opts into full wrapped output.
         let clamp_w = (body.width as usize).saturating_sub(7);
+        let busy = self.busy;
+        let n_turns = self.turns.len();
         let mut lines: Vec<Line> = Vec::new();
-        for turn in &self.turns {
+        for (ti, turn) in self.turns.iter().enumerate() {
             match turn {
                 Turn::User(s) => {
                     lines.push(Line::from(vec![
@@ -1514,12 +1516,20 @@ impl Component for ChatComponent {
                     }
                 }
                 Turn::Thinking(s) => {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {} thinking ({} chars)", g("◌", "~"), s.len()),
-                        Style::default()
-                            .fg(theme::COMMENT)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                    // Collapsed mode shows thinking ONLY while it's the live
+                    // tail of a busy turn (feedback that the model is working).
+                    // Historical thinking markers between every tool call were
+                    // half the transcript spam; ⌃O brings them all back.
+                    if tools_expanded || (busy && ti + 1 == n_turns) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {} thinking ({} chars)", g("◌", "~"), s.len()),
+                            Style::default()
+                                .fg(theme::COMMENT)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    } else {
+                        continue; // no separator row either
+                    }
                 }
                 Turn::Tool {
                     name,
@@ -1547,6 +1557,47 @@ impl Component for ChatComponent {
                             format!("  {args}"),
                             Style::default().fg(theme::COMMENT),
                         ));
+                    }
+
+                    // Collapsed, healthy, non-diff cards are ONE line: the
+                    // header plus a dim outcome summary (inline when the whole
+                    // output is one short line, else a line count). The old
+                    // 3-line tail + "+N more" per call meant a 10-tool turn
+                    // painted ~50 rows of chrome. Errors keep their tail (red
+                    // matters); ⌃O restores full output for everything.
+                    let collapsed_plain = !tools_expanded
+                        && diff.is_none()
+                        && !matches!(status, ToolStatus::Err);
+                    if collapsed_plain {
+                        let out = output.trim();
+                        if !out.is_empty() {
+                            let total = out.lines().count();
+                            let first = one_line(out.lines().next().unwrap_or(""), 48);
+                            let summary = if total == 1 && first.chars().count() <= 48 {
+                                format!("  {} {first}", g("·", "-"))
+                            } else if total == 1 {
+                                format!("  {} 1 line", g("·", "-"))
+                            } else {
+                                format!("  {} {total} lines", g("·", "-"))
+                            };
+                            header.push(Span::styled(
+                                summary,
+                                Style::default()
+                                    .fg(theme::COMMENT)
+                                    .add_modifier(Modifier::ITALIC),
+                            ));
+                        }
+                        lines.push(Line::from(header));
+                        // Skip the separator when the next row is another tool
+                        // call — a burst of one-liners reads as one block.
+                        if matches!(
+                            self.turns.get(ti + 1),
+                            Some(Turn::Tool { .. }) | Some(Turn::Thinking(_))
+                        ) {
+                            continue;
+                        }
+                        lines.push(Line::from(""));
+                        continue;
                     }
                     lines.push(Line::from(header));
 
