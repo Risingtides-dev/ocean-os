@@ -8815,6 +8815,7 @@ async fn agent_voice(
         // Voice turns are not in-browser; they carry no client/browser context
         // (OCEAN-40). Additive field, `None` keeps the voice path unchanged.
         client_context: None,
+        advisor: None,
         // Voice turns run on the surface profile, not a named folder-as-agent.
         agent: None,
     };
@@ -8976,6 +8977,30 @@ fn advisor_user_prompt(operator_prompt: &str, assistant_response: &str) -> Strin
 /// the empty string and the sentinel "NOTHING" (case-insensitive, ignoring
 /// surrounding punctuation/whitespace) so a "nothing wrong" verdict emits no
 /// event. Returns the trimmed note when there is genuine content.
+/// Decide which model alias the post-turn advisor runs on, given the per-turn
+/// override and the global `[roles]` table. Precedence:
+///
+/// - override `enabled:false` → `None` (suppress even a configured global role)
+/// - override `enabled:true`  → the override's `model`, else the global
+///   `advisor` role; `None` when neither exists (nothing to run on)
+/// - no override → the global `advisor` role (today's behavior)
+///
+/// Pure so the precedence is unit-testable without a full turn.
+fn resolve_advisor_alias(
+    override_ctl: Option<&ocean_agent_sdk::AdvisorControl>,
+    roles: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    match override_ctl {
+        Some(ctl) if !ctl.enabled => None,
+        Some(ctl) => ctl
+            .model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .or_else(|| roles.get("advisor").cloned()),
+        None => roles.get("advisor").cloned(),
+    }
+}
+
 fn advisor_note_if_actionable(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -9072,6 +9097,7 @@ async fn agent_turn(
         decision_token,
         agent,
         client_context,
+        advisor: advisor_ctl,
     } = req;
 
     // OCEAN-304: backpressure. Take a turn permit BEFORE any work (cwd
@@ -9886,14 +9912,19 @@ async fn agent_turn(
         );
     }
     // Post-turn advisor observer (fire-and-forget). Runs at most once per
-    // operator prompt, and ONLY when an `advisor` role is configured — zero cost
-    // otherwise. It reviews the completed exchange on a FRESH advisor-model
+    // operator prompt. It reviews the completed exchange on a FRESH advisor-model
     // context (a single completion, not the agent loop) and, if it finds a real
     // concern, emits it as an `AgentTurnEvent::Extension` scoped to this session.
     // Fully detached: a slow/failed advisor never blocks or fails the operator's
     // turn — the response below is already computed and returns immediately.
+    //
+    // Model selection precedence (`resolve_advisor_alias`): a per-turn
+    // `advisor` override (from a surface's `/advisor` picker) wins over the
+    // global `[roles].advisor` config — `enabled:false` suppresses it entirely,
+    // `enabled:true` runs on the override model or falls back to the global
+    // role. `None` = today's global-only behavior. Zero cost when neither is set.
     if res.ok {
-        if let Some(advisor_alias) = state.roles.get("advisor").cloned() {
+        if let Some(advisor_alias) = resolve_advisor_alias(advisor_ctl.as_ref(), &state.roles) {
             let assistant_text = res.stdout.clone();
             if !assistant_text.trim().is_empty() {
                 let operator_prompt = prompt.clone();
@@ -11510,6 +11541,48 @@ mod tests {
     use super::*;
 
     // ── Advisor observer pure helpers ───────────────────────────────────────
+
+    #[test]
+    fn resolve_advisor_alias_precedence() {
+        use ocean_agent_sdk::AdvisorControl;
+        let mut roles = std::collections::HashMap::new();
+        roles.insert("advisor".to_string(), "claude-haiku-4-5".to_string());
+
+        // No override → global role (today's behavior).
+        assert_eq!(
+            resolve_advisor_alias(None, &roles).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        // No override + no global role → nothing.
+        assert_eq!(
+            resolve_advisor_alias(None, &std::collections::HashMap::new()),
+            None
+        );
+        // Override disabled → suppress even a configured global role.
+        let off = AdvisorControl { enabled: false, model: Some("gpt-5.4".into()) };
+        assert_eq!(resolve_advisor_alias(Some(&off), &roles), None);
+        // Override enabled with a model → that model wins over the global role.
+        let on = AdvisorControl { enabled: true, model: Some("gpt-5.4".into()) };
+        assert_eq!(resolve_advisor_alias(Some(&on), &roles).as_deref(), Some("gpt-5.4"));
+        // Override enabled, no model → falls back to the global role.
+        let on_default = AdvisorControl { enabled: true, model: None };
+        assert_eq!(
+            resolve_advisor_alias(Some(&on_default), &roles).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        // Override enabled, no model, no global role → nothing to run on.
+        let on_orphan = AdvisorControl { enabled: true, model: None };
+        assert_eq!(
+            resolve_advisor_alias(Some(&on_orphan), &std::collections::HashMap::new()),
+            None
+        );
+        // Blank model string is treated as unset → falls back to the role.
+        let on_blank = AdvisorControl { enabled: true, model: Some("  ".into()) };
+        assert_eq!(
+            resolve_advisor_alias(Some(&on_blank), &roles).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+    }
 
     #[test]
     fn advisor_suppresses_empty_and_nothing() {
@@ -15257,6 +15330,7 @@ mod tests {
             decision_token: None,
             agent: None,
             client_context: None,
+            advisor: None,
         }
     }
 

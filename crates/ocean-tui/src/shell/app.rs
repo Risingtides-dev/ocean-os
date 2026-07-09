@@ -253,6 +253,15 @@ pub struct App {
     models_sel: usize,
     models_hit: Vec<(Rect, usize)>,
     thinking_override: Option<ThinkingLevel>,
+    /// `/advisor` picker overlay — the per-session second-opinion reviewer.
+    /// Reuses `models_entries` (the same registry fetch) for its model list,
+    /// with an "off" row on top. `advisor_ctl` rides every turn as the per-turn
+    /// advisor override (None = defer to the daemon's global `[roles].advisor`).
+    /// `advisor_hit` maps drawn rows back to a pick (0 = off, i+1 = entry i).
+    advisor_open: bool,
+    advisor_sel: usize,
+    advisor_hit: Vec<(Rect, usize)>,
+    advisor_ctl: Option<ocean_agent_sdk::AdvisorControl>,
     /// Mouse text selection. `sel_press` arms on any left-down that isn't a
     /// splitter grab; the first drag promotes it into `selection` — a linear
     /// (terminal-style) sweep in screen cells, anchor → head. Releasing the
@@ -337,6 +346,10 @@ impl App {
             models_sel: 0,
             models_hit: Vec::new(),
             thinking_override: None,
+            advisor_open: false,
+            advisor_sel: 0,
+            advisor_hit: Vec::new(),
+            advisor_ctl: None,
             sel_press: None,
             selection: None,
             frame_cells: Vec::new(),
@@ -455,6 +468,20 @@ impl App {
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // The `/advisor` picker is modal, same as `/models`.
+        if self.advisor_open {
+            match evt {
+                CrosstermEvent::Key(k) => {
+                    self.advisor_key(k);
+                    return;
+                }
+                CrosstermEvent::Mouse(m) => {
+                    self.advisor_mouse(m);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The `/models` picker is modal: keys and mouse both drive it while
         // open (clicking a row selects/applies, clicking outside closes).
         if self.models_open {
@@ -935,6 +962,38 @@ impl App {
                     .iter()
                     .position(|m| m.id == active)
                     .unwrap_or(0);
+                // If the advisor picker is what triggered this fetch, seat its
+                // cursor on the model it's currently set to.
+                if self.advisor_open {
+                    self.seat_advisor_cursor();
+                }
+            }
+            // `/advisor`: open the per-session advisor picker over the live
+            // registry (reuses the models fetch). Overlay = an "off" row + the
+            // ready models; the pick rides subsequent turns as `advisor_ctl`.
+            Action::OpenAdvisor => {
+                self.advisor_open = true;
+                self.advisor_hit.clear();
+                if self.models_entries.is_empty() {
+                    self.models_loading = true;
+                    let client = self.client.clone();
+                    let tx = self.actions_tx.clone();
+                    tokio::spawn(async move {
+                        match client.models().await {
+                            Ok(r) => {
+                                let _ = tx.send(Action::ModelsLoaded {
+                                    current: r.current.model,
+                                    entries: r.models,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Action::Error(format!("models: {e}")));
+                            }
+                        }
+                    });
+                } else {
+                    self.seat_advisor_cursor();
+                }
             }
             // `/login [claude|codex]`: run the REAL OAuth flow off-thread
             // (begin → browser → token exchange → persist) so the TUI never
@@ -1224,6 +1283,212 @@ impl App {
             "model → {} · thinking {}",
             entry.id,
             thinking_label(self.thinking_override)
+        );
+    }
+
+    // ── /advisor picker ──────────────────────────────────────────────────────
+
+    /// The ready models eligible to be an advisor (only credentialed ones can
+    /// actually run the review). Row 0 of the overlay is always the "off" pick,
+    /// so a click/selection at index `i` means: 0 → off, i≥1 → this[i-1].
+    fn advisor_models(&self) -> Vec<&ModelEntry> {
+        self.models_entries.iter().filter(|m| m.ready).collect()
+    }
+
+    /// Seat the advisor cursor on the current selection: the enabled model, or
+    /// row 0 (off) when disabled/unset.
+    fn seat_advisor_cursor(&mut self) {
+        self.advisor_sel = match &self.advisor_ctl {
+            Some(c) if c.enabled => c
+                .model
+                .as_deref()
+                .and_then(|m| self.advisor_models().iter().position(|e| e.id == m))
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            _ => 0,
+        };
+    }
+
+    fn advisor_key(&mut self, k: crossterm::event::KeyEvent) {
+        let rows = self.advisor_models().len() + 1; // +1 for the "off" row
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.advisor_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.advisor_sel = self.advisor_sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.advisor_sel = (self.advisor_sel + 1).min(rows - 1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.advisor_apply(),
+            _ => {}
+        }
+    }
+
+    fn advisor_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        let pos = (m.column, m.row);
+        let rows = self.advisor_models().len() + 1;
+        match m.kind {
+            MouseEventKind::ScrollUp => self.advisor_sel = self.advisor_sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                self.advisor_sel = (self.advisor_sel + 1).min(rows - 1);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, idx)) = self
+                    .advisor_hit
+                    .iter()
+                    .find(|(r, _)| rect_has(*r, pos))
+                    .copied()
+                {
+                    if idx == self.advisor_sel {
+                        self.advisor_apply();
+                    } else {
+                        self.advisor_sel = idx;
+                    }
+                } else {
+                    self.advisor_open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply the advisor selection: row 0 turns the advisor OFF for this
+    /// session; any model row turns it ON reviewing on that model. Both send an
+    /// explicit per-turn override (`advisor_ctl`) so the choice wins over the
+    /// daemon's global config until changed.
+    fn advisor_apply(&mut self) {
+        use ocean_agent_sdk::AdvisorControl;
+        if self.advisor_sel == 0 {
+            self.advisor_ctl = Some(AdvisorControl { enabled: false, model: None });
+            self.status = "advisor off".into();
+        } else {
+            let models = self.advisor_models();
+            let Some(entry) = models.get(self.advisor_sel - 1) else {
+                return;
+            };
+            let id = entry.id.clone();
+            self.advisor_ctl = Some(AdvisorControl {
+                enabled: true,
+                model: Some(id.clone()),
+            });
+            self.status = format!("advisor → {id} (reviews after each turn)");
+        }
+        self.advisor_open = false;
+    }
+
+    /// Render the `/advisor` picker: an "off" row over the ready models, with
+    /// the current pick dotted. Mirrors the `/models` modal skin.
+    fn draw_advisor(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        let full = frame.area();
+        let width = 60u16.min(full.width.saturating_sub(4));
+        // Snapshot (label, id) so the render loop can mutate `advisor_hit`
+        // without holding an immutable borrow of `self` through the models.
+        let models: Vec<(String, String)> = self
+            .advisor_models()
+            .iter()
+            .map(|e| (e.label.clone(), e.id.clone()))
+            .collect();
+        let row_count = models.len() as u16 + 1; // off + models
+        let height = (row_count + 4).min(full.height.saturating_sub(4)).max(6);
+        let x = full.x + (full.width.saturating_sub(width)) / 2;
+        let y = full.y + (full.height.saturating_sub(height)) / 2;
+        let area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} ADVISOR ", g("◆", "*")),
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.advisor_hit.clear();
+        if inner.width == 0 || inner.height < 2 {
+            return;
+        }
+
+        if self.models_loading && models.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "loading registry…",
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1),
+            );
+            return;
+        }
+
+        let view_h = inner.height.saturating_sub(1) as usize;
+        // Rows: 0 = off, 1..=N = models. Build labels then window to fit.
+        let total = models.len() + 1;
+        let scroll = self
+            .advisor_sel
+            .saturating_sub(view_h.saturating_sub(1))
+            .min(total.saturating_sub(view_h));
+        for ri in scroll..total.min(scroll + view_h) {
+            let ry = inner.y + (ri - scroll) as u16;
+            let selected = ri == self.advisor_sel;
+            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+            let marker = if selected { g("▎", "|") } else { " " };
+            let (dot, label, id, fg) = if ri == 0 {
+                let active = matches!(&self.advisor_ctl, Some(c) if !c.enabled)
+                    || self.advisor_ctl.is_none();
+                (
+                    if matches!(&self.advisor_ctl, Some(c) if !c.enabled) {
+                        g("● ", "* ")
+                    } else {
+                        "  "
+                    },
+                    "off — no second opinion".to_string(),
+                    String::new(),
+                    if active { theme::FG } else { theme::COMMENT },
+                )
+            } else {
+                let (label, id) = &models[ri - 1];
+                let active = matches!(&self.advisor_ctl, Some(c) if c.enabled && c.model.as_deref() == Some(id.as_str()));
+                (
+                    if active { g("● ", "* ") } else { "  " },
+                    label.clone(),
+                    id.clone(),
+                    theme::FG,
+                )
+            };
+            let left = format!("{marker} {dot}{label}");
+            let pad = (inner.width as usize)
+                .saturating_sub(left.chars().count() + id.chars().count() + 1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        left,
+                        Style::default().fg(fg).add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                    ),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(id, Style::default().fg(theme::COMMENT)),
+                ]))
+                .style(Style::default().bg(bed)),
+                Rect::new(inner.x, ry, inner.width, 1),
+            );
+            self.advisor_hit
+                .push((Rect::new(inner.x, ry, inner.width, 1), ri));
+        }
+
+        let footer_y = inner.y + inner.height - 1;
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " reviews the exchange after each turn · ⏎ select · esc close",
+                Style::default().fg(theme::CYAN),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, footer_y, inner.width, 1),
         );
     }
 
@@ -1783,6 +2048,7 @@ impl App {
         let existing = self.session_id;
         let model_id = self.model_override.clone();
         let thinking = self.thinking_override;
+        let advisor = self.advisor_ctl.clone();
         // OCEAN-185: mint the per-turn permission secret; the turn's first
         // permission request claims it (see Action::OceanEvent above).
         let decision_token = ocean_core::mint_decision_token();
@@ -1840,6 +2106,7 @@ impl App {
                 images: None,
                 decision_token: Some(decision_token),
                 client_context: None,
+                advisor,
             };
             let on_retry = retry_status("turn", tx.clone());
             if let Err(e) = client.agent_turn_retrying(&req, on_retry).await {
@@ -2003,6 +2270,9 @@ impl App {
         }
         if self.models_open {
             self.draw_models(frame);
+        }
+        if self.advisor_open {
+            self.draw_advisor(frame);
         }
         if self.providers_open {
             self.draw_providers(frame);

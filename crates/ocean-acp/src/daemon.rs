@@ -262,6 +262,7 @@ impl DaemonClient {
             agent: None,
             // ACP bridge is not an in-browser surface (OCEAN-40).
             client_context: None,
+            advisor: None,
         };
 
         let url = format!("{}/v1/agent/turns", self.base_url);

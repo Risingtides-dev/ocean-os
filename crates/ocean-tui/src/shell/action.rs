@@ -85,6 +85,11 @@ pub enum Action {
     /// is fetched fresh from the daemon so it reflects the REAL registry and
     /// per-model readiness, not a hardcoded menu.
     OpenModels,
+    /// `/advisor` — open the per-session advisor picker (an "off" row + the
+    /// ready models). The pick rides subsequent turns as a per-turn advisor
+    /// override, toggling the second-opinion reviewer without editing
+    /// `ocean.toml`.
+    OpenAdvisor,
     /// The async `GET /v1/models` fetch for the picker came back.
     ModelsLoaded {
         current: String,

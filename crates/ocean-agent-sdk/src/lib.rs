@@ -345,6 +345,30 @@ pub struct AgentTurnRequest {
     /// deserialize and other `client_type`s are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_context: Option<ClientContext>,
+    /// Per-turn override for the post-turn advisor observer. When present it
+    /// wins over the daemon's global `[roles].advisor` config for THIS turn:
+    /// `enabled:false` suppresses the advisor even if a global role is set;
+    /// `enabled:true` runs it on `model` (or the global advisor role when
+    /// `model` is `None`). `None` (every existing client) leaves the global
+    /// advisor behavior untouched. Lets a surface toggle the second-opinion
+    /// reviewer per session without editing `ocean.toml` + restarting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<AdvisorControl>,
+}
+
+/// Per-turn control for the post-turn advisor observer (the fresh-context
+/// reviewer that critiques a completed exchange and emits an `advisor`
+/// extension event). Ships on [`AgentTurnRequest::advisor`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdvisorControl {
+    /// Run the advisor for this turn? `false` suppresses it even when a global
+    /// advisor role is configured.
+    pub enabled: bool,
+    /// Model alias the advisor reviews on. `None` with `enabled:true` falls
+    /// back to the global `[roles].advisor` alias; if neither exists the
+    /// advisor is skipped (nothing to run on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Response payload for `POST /v1/agent/turns`.
@@ -1320,6 +1344,7 @@ mod tests {
             decision_token: None,
             agent: None,
             client_context: None,
+            advisor: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
@@ -1352,6 +1377,7 @@ mod tests {
             decision_token: None,
             agent: None,
             client_context: None,
+            advisor: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("thinking_level"));
@@ -1420,6 +1446,7 @@ mod tests {
                     ],
                 }),
             }),
+            advisor: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"client_context\""));

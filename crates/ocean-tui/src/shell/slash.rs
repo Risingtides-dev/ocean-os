@@ -70,6 +70,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         soon: false,
     },
     SlashCommand {
+        name: "/advisor",
+        desc: "pick a post-turn advisor model (or off) — a second opinion each turn",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
         name: "/login",
         desc: "provider logins (popup) or /login [claude|codex] browser flow",
         group: "session",

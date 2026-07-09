@@ -3246,6 +3246,7 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             role: None,
             // The TUI is not an in-browser surface (OCEAN-40).
             client_context: None,
+            advisor: None,
         };
         app.streaming_agent_turn_id = None;
         app.push_activity(format!(

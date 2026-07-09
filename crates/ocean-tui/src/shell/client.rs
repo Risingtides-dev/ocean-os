@@ -79,10 +79,7 @@ impl DaemonClient {
         self.post_json_retrying(&url, &req, on_retry).await
     }
 
-    pub async fn agent_turn(
-        &self,
-        req: &AgentTurnRequest,
-    ) -> Result<AgentTurnResponse, String> {
+    pub async fn agent_turn(&self, req: &AgentTurnRequest) -> Result<AgentTurnResponse, String> {
         self.agent_turn_retrying(req, |_, _| {}).await
     }
 
@@ -426,6 +423,7 @@ mod tests {
             images: None,
             decision_token: None,
             client_context: None,
+            advisor: None,
         };
         let client2 = client.clone();
         let turn = tokio::spawn(async move { client2.agent_turn(&req).await });
