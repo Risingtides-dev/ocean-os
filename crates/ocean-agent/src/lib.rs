@@ -2281,12 +2281,12 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
             // The claude-code alias maps to the REAL Anthropic API model id on
             // the wire — "claude-code-sonnet-5" is never sent to the API.
             "claude-code-fable-5" => Model::anthropic_claude_fable_5(),
-            "claude-code-opus-4-8" => Model::anthropic_claude_opus_4_8(),
-            "claude-code-sonnet-5" => Model::anthropic_claude_sonnet_5(),
-            "claude-code-haiku-4-5" => Model::anthropic_claude_haiku_4_5(),
+            "claude-code-opus-4-8" | "claude-opus-4-8" => Model::anthropic_claude_opus_4_8(),
+            "claude-code-sonnet-5" | "claude-sonnet-5" => Model::anthropic_claude_sonnet_5(),
+            "claude-code-haiku-4-5" | "claude-haiku-4-5" => Model::anthropic_claude_haiku_4_5(),
             // Legacy ids — pinned sessions from before the 2026-07 refresh.
-            "claude-code-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
-            "claude-code-opus-4-7" => Model::anthropic_claude_opus_4_7(),
+            "claude-code-sonnet-4-6" | "claude-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
+            "claude-code-opus-4-7" | "claude-opus-4-7" => Model::anthropic_claude_opus_4_7(),
             _ => {
                 anyhow::bail!("unsupported claude-code model '{}'", selection.model);
             }
@@ -4435,21 +4435,22 @@ done
     // agent-wiring level: degraded → routed to a ready provider, not failed.
     #[test]
     fn selection_failover_routes_degraded_primary_to_ready_alternate() {
-        // Primary deepseek has no credential here (degraded), but an Anthropic key
-        // is present — the default fallback order leads with Anthropic.
+        // Primary deepseek has no credential here (degraded), but a Claude Code
+        // OAuth bearer is present — the default fallback order leads with
+        // claude-sonnet-5 (now ProviderId::ClaudeCode).
         let degraded = state_from_provider_config(provider_config(
             ProviderId::DeepSeek,
             "deepseek-v4-pro",
             false,
         ))
         .unwrap();
-        let env = provider_env(&[("ANTHROPIC_API_KEY", "sk-ant")]);
+        let env = provider_env(&[("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer")]);
         let out = AgentRuntime::resolve_turn_state_with_failover(degraded, &env)
             .expect("a ready alternate must be selected");
         assert_eq!(
             out.provider_config.selection.provider,
-            ProviderId::Anthropic,
-            "degraded primary must route to the ready anthropic alternate"
+            ProviderId::ClaudeCode,
+            "degraded primary must route to the ready claude-code alternate"
         );
         assert!(
             AgentRuntime::preflight_error_for(&out).is_none(),

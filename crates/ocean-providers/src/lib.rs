@@ -370,7 +370,7 @@ pub const ENV_PROVIDER_FALLBACK: &str = "OCEAN_PROVIDER_FALLBACK";
 /// to a canned echo would hide an outage rather than route around it (an operator
 /// who wants that can still list `fake` explicitly in the env override).
 pub const DEFAULT_FALLBACK_ORDER: &[&str] = &[
-    "claude-sonnet-5",   // anthropic
+    "claude-sonnet-5",   // claude-code oauth
     "gpt-5.4",           // openai-codex
     "deepseek-v4-pro",   // deepseek
     "gemini-2.0-flash",  // google
@@ -610,26 +610,15 @@ pub fn known_models() -> Vec<KnownModel> {
         // Current Claude generation (verified against api.anthropic.com
         // 2026-07-08: all ids recognized on subscription OAuth; the old
         // 4-6/4-7 ids are retired from the menu but stay routable as legacy
-        // arms so pinned sessions keep resolving).
-        m("claude-opus-4-8", "anthropic", "Claude Opus 4.8"),
-        m("claude-sonnet-5", "anthropic", "Claude Sonnet 5"),
-        m("claude-haiku-4-5", "anthropic", "Claude Haiku 4.5"),
+        // arms so pinned sessions keep resolving). The plain ids route through
+        // `ProviderId::ClaudeCode` — they assume the Claude Code OAuth login,
+        // not a direct Anthropic API key. `claude-code-*` aliases are dropped
+        // from the menu (they resolved to the same models); `fable` has no
+        // plain alias so it keeps its `claude-code-fable-5` id.
+        m("claude-opus-4-8", "claude-code", "Claude Opus 4.8"),
+        m("claude-sonnet-5", "claude-code", "Claude Sonnet 5"),
+        m("claude-haiku-4-5", "claude-code", "Claude Haiku 4.5"),
         m("claude-code-fable-5", "claude-code", "Claude Code Fable 5"),
-        m(
-            "claude-code-opus-4-8",
-            "claude-code",
-            "Claude Code Opus 4.8",
-        ),
-        m(
-            "claude-code-sonnet-5",
-            "claude-code",
-            "Claude Code Sonnet 5",
-        ),
-        m(
-            "claude-code-haiku-4-5",
-            "claude-code",
-            "Claude Code Haiku 4.5",
-        ),
         // MiniMax ids use the API casing the resolver returns as current.model
         // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
         // holds for every entry — ACP/Zed match the selected mode id against the
@@ -793,40 +782,46 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             400_000,
             128_000,
         )),
-        // Current Claude generation (2026-07 refresh; verified live). The
-        // convenience aliases ("sonnet", "opus", "haiku") track the newest ids.
+        // Current Claude generation (2026-07 refresh; verified live). These
+        // route through `ProviderId::ClaudeCode` — i.e. they assume the Claude
+        // Code OAuth login (CLAUDE_CODE_ACCESS_TOKEN / the auth-file
+        // `claude-code` block), NOT a direct Anthropic API key. Same Anthropic
+        // Messages wire + base URL; only the auth header differs (Bearer vs
+        // x-api-key). The convenience aliases ("sonnet", "opus", "haiku") track
+        // the newest ids. Direct-API-key auth for these ids is intentionally
+        // not wired (provision later if a custom-model API path is needed).
         "claude-sonnet-5" | "claude-sonnet" | "sonnet" => Ok(model_selection(
-            ProviderId::Anthropic,
+            ProviderId::ClaudeCode,
             "claude-sonnet-5",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
         "claude-opus-4-8" | "claude-opus" | "opus" => Ok(model_selection(
-            ProviderId::Anthropic,
+            ProviderId::ClaudeCode,
             "claude-opus-4-8",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
         "claude-haiku-4-5" | "claude-haiku" | "haiku" => Ok(model_selection(
-            ProviderId::Anthropic,
+            ProviderId::ClaudeCode,
             "claude-haiku-4-5",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
         // LEGACY Claude ids — retired from the menu, kept routable so sessions
-        // pinned before the refresh still resolve.
+        // pinned before the refresh still resolve. Also OAuth (ClaudeCode).
         "claude-sonnet-4-6" => Ok(model_selection(
-            ProviderId::Anthropic,
+            ProviderId::ClaudeCode,
             "claude-sonnet-4-6",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
         "claude-opus-4-7" => Ok(model_selection(
-            ProviderId::Anthropic,
+            ProviderId::ClaudeCode,
             "claude-opus-4-7",
             ANTHROPIC_BASE_URL,
             200_000,
@@ -1532,7 +1527,7 @@ mod tests {
         // registry base must therefore be the host root, not `/v1`.
         let selection =
             resolve_model_selection(&env(&[("OCEAN_MODEL", "claude-sonnet-4-6")])).unwrap();
-        assert_eq!(selection.provider, ProviderId::Anthropic);
+        assert_eq!(selection.provider, ProviderId::ClaudeCode);
         assert_eq!(selection.base_url, "https://api.anthropic.com");
 
         let claude_code =
@@ -1711,9 +1706,6 @@ mod tests {
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "claude-code-fable-5",
-            "claude-code-opus-4-8",
-            "claude-code-sonnet-5",
-            "claude-code-haiku-4-5",
             // API-cased ids: `resolve_model_selection` returns these as
             // current.model, and known_models() advertises the same string.
             "MiniMax-M2",
@@ -1755,16 +1747,17 @@ mod tests {
 
     #[test]
     fn fallback_picks_a_ready_alternate_when_primary_provider_is_degraded() {
-        // Primary = deepseek (its key is intentionally absent → degraded), but an
-        // Anthropic key IS present. The default order leads with Anthropic, so the
-        // first ready alternate must be Anthropic.
+        // Primary = deepseek (its key is intentionally absent → degraded), but a
+        // Claude Code OAuth bearer IS present. The default order leads with
+        // claude-sonnet-5 (now ClaudeCode), so the first ready alternate must be
+        // ClaudeCode.
         let e = env(&[
             ("OCEAN_MODEL", "deepseek-v4-pro"),
-            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
         let alt = resolve_fallback_config(&e, &ProviderId::DeepSeek)
-            .expect("a ready anthropic alternate should be found");
-        assert_eq!(alt.selection.provider, ProviderId::Anthropic);
+            .expect("a ready claude-code alternate should be found");
+        assert_eq!(alt.selection.provider, ProviderId::ClaudeCode);
         assert!(alt.readiness().ok);
         assert!(alt.credential.is_some());
     }
@@ -1785,35 +1778,35 @@ mod tests {
 
     #[test]
     fn fallback_never_routes_back_to_the_excluded_primary() {
-        // Anthropic key present; if the primary is ALSO anthropic, the anthropic
-        // entry must be excluded — failing over to the provider that just failed
-        // is pointless. With no other key set, there's no alternate at all.
+        // Claude Code bearer present; if the primary is ALSO ClaudeCode, the
+        // claude entry must be excluded — failing over to the provider that just
+        // failed is pointless. With no other key set, there's no alternate at all.
         let e = env(&[
             ("OCEAN_MODEL", "claude-opus-4-7"),
-            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
-        let alt = resolve_fallback_config(&e, &ProviderId::Anthropic);
+        let alt = resolve_fallback_config(&e, &ProviderId::ClaudeCode);
         assert!(
             alt.is_none(),
-            "anthropic is the primary; it must not be its own fallback"
+            "claude-code is the primary; it must not be its own fallback"
         );
     }
 
     #[test]
     fn fallback_dedupes_by_provider_and_honors_priority_order() {
-        // Both deepseek and anthropic keys present. Primary = google (degraded).
-        // Default order is anthropic, then codex, then deepseek… → the first ready
-        // alternate is anthropic, and the candidate list holds at most one entry
-        // per provider.
+        // Both deepseek and Claude Code bearers present. Primary = google
+        // (degraded). Default order is claude-code, then codex, then deepseek…
+        // → the first ready alternate is ClaudeCode, and the candidate list holds
+        // at most one entry per provider.
         let e = env(&[
             ("OCEAN_MODEL", "gemini-2.0-flash"),
-            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
             ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
         ]);
         let candidates = fallback_candidates(&e, &ProviderId::Google);
         assert_eq!(
             candidates.first().map(|c| c.selection.provider.clone()),
-            Some(ProviderId::Anthropic),
+            Some(ProviderId::ClaudeCode),
             "highest-priority ready alternate should be first"
         );
         // deepseek is also ready and must appear, exactly once.
@@ -1848,14 +1841,14 @@ mod tests {
     #[test]
     fn blank_env_override_falls_back_to_the_default_order() {
         // An exported-but-empty override must not silently disable failover; it
-        // falls back to the default order (anthropic-first here).
+        // falls back to the default order (claude-code-first here).
         let e = env(&[
             ("OCEAN_MODEL", "deepseek-v4-pro"),
             ("OCEAN_PROVIDER_FALLBACK", "  , ,"),
-            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
         let alt = resolve_fallback_config(&e, &ProviderId::DeepSeek).unwrap();
-        assert_eq!(alt.selection.provider, ProviderId::Anthropic);
+        assert_eq!(alt.selection.provider, ProviderId::ClaudeCode);
     }
 
     #[test]
@@ -1865,10 +1858,10 @@ mod tests {
         let e = env(&[
             ("OCEAN_MODEL", "gemini-2.0-flash"),
             ("OCEAN_PROVIDER_FALLBACK", "not-a-model, claude-opus-4-7"),
-            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
         let alt = resolve_fallback_config(&e, &ProviderId::Google).unwrap();
-        assert_eq!(alt.selection.provider, ProviderId::Anthropic);
+        assert_eq!(alt.selection.provider, ProviderId::ClaudeCode);
     }
     // ---- GLM provider (Zhipu AI) -----------------------------------------
 
@@ -2063,12 +2056,14 @@ mod tests {
         assert_eq!(credential.kind, CredentialKind::OAuthBearer);
         assert!(config.readiness().ok);
 
-        // The public Claude Code aliases are advertised in the model picker.
+        // The public Claude aliases are advertised in the model picker. The plain
+        // ids (claude-sonnet-5 etc.) are the menu entries now; claude-code-* are
+        // legacy aliases kept routable but off the menu (except fable).
         let listed: std::collections::BTreeSet<String> =
             known_models().into_iter().map(|m| m.id).collect();
-        assert!(listed.contains("claude-code-sonnet-5"));
-        assert!(listed.contains("claude-code-opus-4-8"));
-        assert!(listed.contains("claude-code-haiku-4-5"));
+        assert!(listed.contains("claude-sonnet-5"));
+        assert!(listed.contains("claude-opus-4-8"));
+        assert!(listed.contains("claude-haiku-4-5"));
         assert!(listed.contains("claude-code-fable-5"));
 
         let _ = fs::remove_dir_all(&dir);

@@ -2003,3 +2003,12 @@ area:      frontend
 
 Markdown renderer completeness (John: "should handle everything an agent throws at it"): tables now render as padded columns with │ dividers and a ─┼─ header rule (was raw pipe soup — his screenshot), inline styles work inside cells, one long cell can't blow out the layout (48-char cap). Also landed: horizontal rules (---/***/___ → dim line), links ([text](url) → cyan-underline label + dim copyable url), ~~strikethrough~~ (CROSSED_OUT), and task lists (- [x] → green ☑, - [ ] → dim ☐). 4 new unit tests; suite 168/0. Still open on this thread: inline images/screenshots via kitty graphics (ratatui-image + placeholder-row overlay architecture) — next block.
 _________________________________________________________________________________
+
+time:      [9:54PM] [07-08-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+Plain Claude model ids now assume the Claude Code OAuth login instead of a direct Anthropic API key. claude-sonnet-5/claude-opus-4-8/claude-haiku-4-5 (+ aliases sonnet/opus/haiku, legacy claude-sonnet-4-6/claude-opus-4-7) route through ProviderId::ClaudeCode: same Anthropic Messages wire + base URL, but auth is the OAuth bearer (authorization: Bearer <token> from CLAUDE_CODE_ACCESS_TOKEN or the auth-file claude-code block) instead of x-api-key. ocean-agent model_from_provider_config's ClaudeCode arm now accepts the plain ids alongside the claude-code-* aliases (merged match arms) so claude-sonnet-5 maps to Model::anthropic_claude_sonnet_5 instead of bailing. known_models() drops the now-redundant claude-code-opus/sonnet/haiku menu entries (the plain ids ARE the menu); claude-code-fable-5 stays (no plain alias). DEFAULT_FALLBACK_ORDER still leads with claude-sonnet-5 (now claude-code oauth), so failover reaches the OAuth login. Per john: assume OAuth for these ids; direct-API-key path is a later provision. Verification: cargo test -p ocean-providers 39, -p ocean-agent 128, -p ocean-tui 168, cargo build -p ocean-tui --release OK. Net effect: /model claude-sonnet-5 (or sonnet/opus/haiku) now uses the Claude Code subscription OAuth login John already provisioned via /login, no ANTHROPIC_API_KEY needed.
+_________________________________________________________________________________
