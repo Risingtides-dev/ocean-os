@@ -172,9 +172,9 @@ pub const COMMANDS: &[SlashCommand] = &[
     // ── agent (W7 roadmap) ─────────────────────────────────────────────────
     SlashCommand {
         name: "/memory",
-        desc: "recall / retain memory — OKF (W7)",
+        desc: "browse + search long-term memories (what the agent retained)",
         group: "agent",
-        soon: true,
+        soon: false,
     },
     SlashCommand {
         name: "/goal",
@@ -349,13 +349,38 @@ mod tests {
     }
 
     #[test]
-    fn live_commands_group_ahead_of_roadmap() {
-        // On the bare `/` menu, every live command sorts above every soon one.
-        let ranked = filter("");
+    fn bare_menu_keeps_groups_contiguous() {
+        // The bare `/` menu renders as group SECTIONS, so every group's
+        // commands must be contiguous in registry order (a group can't appear,
+        // yield to another, then resume — that would split a section header).
+        // NOTE: "all live before all soon" is NOT an invariant anymore — a live
+        // command (`/memory`) legitimately lives in the roadmap-tier `agent`
+        // group. The menu is grouped by topic; live-before-soon is a *ranked*
+        // property, enforced by `filter`'s sort and the ranked tests.
+        let bare = filter("");
+        let mut seen = std::collections::HashSet::new();
+        let mut last = "";
+        for (c, _) in &bare {
+            if c.group != last {
+                assert!(
+                    seen.insert(c.group),
+                    "group {:?} is not contiguous in the bare menu",
+                    c.group
+                );
+                last = c.group;
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_results_rank_live_ahead_of_soon_on_ties() {
+        // "co" matches /copy (live) and /compact + /context (soon). The working
+        // command must lead the ranked list.
+        let ranked = filter("co");
+        let first_live = ranked.iter().position(|(c, _)| !c.soon);
         let first_soon = ranked.iter().position(|(c, _)| c.soon);
-        let last_live = ranked.iter().rposition(|(c, _)| !c.soon);
-        if let (Some(fs), Some(ll)) = (first_soon, last_live) {
-            assert!(ll < fs, "a soon command sorted ahead of a live one");
+        if let (Some(fl), Some(fs)) = (first_live, first_soon) {
+            assert!(fl < fs, "a soon command outranked a live one for 'co'");
         }
     }
 

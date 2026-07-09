@@ -2028,3 +2028,11 @@ area:      frontend
 
 Status-line dashboard (OMP Slice 4, port item 1 of 3). Replaced the one-string status line with composable segments: focus chip · model · git (branch ±dirty ↑ahead ↓behind, green clean / yellow dirty) · tok/s · session tokens · §session · advisor state · message, keybind hint right-pinned. Pure formatting in new shell/status.rs (Tone enum → theme colors at render; 5 unit tests: empty→just-chip, absent-values-skipped, git clean/dirty tone+counts, count/rate formatting, advisor+tokens present). Git cached (shells out) — populated in App::new from frame 1, refreshed on the existing 1s tree tick + on re-root. Turn usage (tokens_per_second/output_tokens) captured from TurnFinished; session_tokens accumulates. chat.model() accessor added. PTY-verified: "chat  feat/ocean-tui-shell-rebuild ±38 · §dd192125 · connected". Suite 173/0.
 _________________________________________________________________________________
+time:      [1:35am] [07-09-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      backend
+
+/memory surfaced (port item 2 of 3). The retain/recall store was wired for the AGENT but had no operator-facing surface. Added ocean_agent::list_memories(path, cap) → Vec<MemoryView{id,kind,text,updated_at}> (paged read over the operator's SqliteMemoryStore, fail-soft on missing store), daemon GET /v1/memory (spawn_blocking, read-only), TUI client.memory() + MemoryEntry, and a /memory browser overlay: search box (type to filter, client-side substring), ↑↓ scroll, ⏎ copies the selected memory's text to clipboard, esc closes; kind badge per row. /memory flipped soon→live. Fixed a menu-ordering test the flip exposed: /memory is a live command in the roadmap-tier 'agent' group, so "all live before all soon on the bare menu" is obsolete — the menu is topically grouped; replaced with a group-contiguity invariant + a ranked live-before-soon test. Suites: tui 174, agent 128; workspace 0 errors. Daemon changed → redeploy.
+_________________________________________________________________________________

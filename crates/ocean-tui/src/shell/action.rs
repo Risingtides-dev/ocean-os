@@ -90,6 +90,13 @@ pub enum Action {
     /// override, toggling the second-opinion reviewer without editing
     /// `ocean.toml`.
     OpenAdvisor,
+    /// `/memory` — open the retained-memory browser (fetched from the daemon's
+    /// long-term store). Read/search view of what the agent has remembered.
+    OpenMemory,
+    /// The async `GET /v1/memory` fetch for the browser came back.
+    MemoryLoaded {
+        entries: Vec<crate::shell::client::MemoryEntry>,
+    },
     /// The async `GET /v1/models` fetch for the picker came back.
     ModelsLoaded {
         current: String,

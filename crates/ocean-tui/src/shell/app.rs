@@ -264,6 +264,13 @@ pub struct App {
     advisor_sel: usize,
     advisor_hit: Vec<(Rect, usize)>,
     advisor_ctl: Option<ocean_agent_sdk::AdvisorControl>,
+    /// `/memory` browser overlay: fetched entries, a client-side search filter
+    /// (typed into the overlay), the selection cursor, and hit-testing rects.
+    memory_open: bool,
+    memory_loading: bool,
+    memory_entries: Vec<crate::shell::client::MemoryEntry>,
+    memory_query: String,
+    memory_sel: usize,
     /// Mouse text selection. `sel_press` arms on any left-down that isn't a
     /// splitter grab; the first drag promotes it into `selection` — a linear
     /// (terminal-style) sweep in screen cells, anchor → head. Releasing the
@@ -363,6 +370,11 @@ impl App {
             advisor_sel: 0,
             advisor_hit: Vec::new(),
             advisor_ctl: None,
+            memory_open: false,
+            memory_loading: false,
+            memory_entries: Vec::new(),
+            memory_query: String::new(),
+            memory_sel: 0,
             sel_press: None,
             selection: None,
             frame_cells: Vec::new(),
@@ -489,6 +501,20 @@ impl App {
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // The `/memory` browser is modal (typing filters, so keys route here).
+        if self.memory_open {
+            match evt {
+                CrosstermEvent::Key(k) => {
+                    self.memory_key(k);
+                    return;
+                }
+                CrosstermEvent::Mouse(m) => {
+                    self.memory_mouse(m);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The `/advisor` picker is modal, same as `/models`.
         if self.advisor_open {
             match evt {
@@ -1028,6 +1054,31 @@ impl App {
                     self.seat_advisor_cursor();
                 }
             }
+            // `/memory`: open the retained-memory browser and fetch the store
+            // off-thread (read-only). Overlay shows "loading…" until it lands.
+            Action::OpenMemory => {
+                self.memory_open = true;
+                self.memory_loading = true;
+                self.memory_query.clear();
+                self.memory_sel = 0;
+                let client = self.client.clone();
+                let tx = self.actions_tx.clone();
+                tokio::spawn(async move {
+                    match client.memory().await {
+                        Ok(r) => {
+                            let _ = tx.send(Action::MemoryLoaded { entries: r.memories });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Action::Error(format!("memory: {e}")));
+                        }
+                    }
+                });
+            }
+            Action::MemoryLoaded { entries } => {
+                self.memory_loading = false;
+                self.memory_entries = entries.clone();
+                self.memory_sel = 0;
+            }
             // `/login [claude|codex]`: run the REAL OAuth flow off-thread
             // (begin → browser → token exchange → persist) so the TUI never
             // blocks on the callback server or browser/OS integration. A second
@@ -1522,6 +1573,178 @@ impl App {
             ))
             .style(Style::default().bg(theme::SLATE)),
             Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+    }
+
+    // ── /memory browser ──────────────────────────────────────────────────────
+
+    /// The memories matching the current search filter (case-insensitive
+    /// substring over the text), preserving newest-first store order.
+    fn memory_filtered(&self) -> Vec<&crate::shell::client::MemoryEntry> {
+        let q = self.memory_query.to_lowercase();
+        self.memory_entries
+            .iter()
+            .filter(|m| q.is_empty() || m.text.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    fn memory_key(&mut self, k: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        let n = self.memory_filtered().len();
+        match k.code {
+            KeyCode::Esc => self.memory_open = false,
+            KeyCode::Up => self.memory_sel = self.memory_sel.saturating_sub(1),
+            KeyCode::Down => {
+                if n > 0 {
+                    self.memory_sel = (self.memory_sel + 1).min(n - 1);
+                }
+            }
+            // Enter copies the selected memory's text to the clipboard.
+            KeyCode::Enter => {
+                if let Some(m) = self.memory_filtered().get(self.memory_sel) {
+                    let text = m.text.clone();
+                    match copy_to_clipboard(&text) {
+                        Ok(()) => self.status = format!("copied memory ({} chars)", text.chars().count()),
+                        Err(e) => self.status = format!("copy failed: {e}"),
+                    }
+                }
+                self.memory_open = false;
+            }
+            KeyCode::Backspace => {
+                self.memory_query.pop();
+                self.memory_sel = 0;
+            }
+            KeyCode::Char(c) => {
+                self.memory_query.push(c);
+                self.memory_sel = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn memory_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        let n = self.memory_filtered().len();
+        match m.kind {
+            MouseEventKind::ScrollUp => self.memory_sel = self.memory_sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                if n > 0 {
+                    self.memory_sel = (self.memory_sel + 1).min(n - 1);
+                }
+            }
+            // A click anywhere outside just closes (rows aren't individually
+            // hit-tested — this is a browse/search view, Enter copies).
+            MouseEventKind::Down(MouseButton::Left) => self.memory_open = false,
+            _ => {}
+        }
+    }
+
+    /// Render the `/memory` browser: a search box, then the retained memories
+    /// (kind badge + text, newest first), filtered by the query. Enter copies
+    /// the selected memory's text; Esc closes.
+    fn draw_memory(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        let full = frame.area();
+        let width = 76u16.min(full.width.saturating_sub(4));
+        let height = full.height.saturating_sub(4).min(30).max(8);
+        let x = full.x + (full.width.saturating_sub(width)) / 2;
+        let y = full.y + (full.height.saturating_sub(height)) / 2;
+        let area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, area);
+        let count = self.memory_entries.len();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                format!(" {} MEMORY · {count} ", g("◆", "*")),
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height < 3 {
+            return;
+        }
+
+        // Search row.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" search ", Style::default().fg(theme::COMMENT)),
+                Span::styled(
+                    format!("{}{}", self.memory_query, g("▏", "_")),
+                    Style::default().fg(theme::FG),
+                ),
+            ]))
+            .style(Style::default().bg(theme::BG_HL)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        let filtered = self.memory_filtered();
+        let list_top = inner.y + 1;
+        let view_h = inner.height.saturating_sub(2) as usize; // search row + footer
+        if self.memory_loading {
+            frame.render_widget(
+                Paragraph::new(Span::styled("loading…", Style::default().fg(theme::COMMENT)))
+                    .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x + 1, list_top, inner.width.saturating_sub(2), 1),
+            );
+            return;
+        }
+        if filtered.is_empty() {
+            let msg = if count == 0 {
+                "no memories retained yet — the agent saves durable facts here"
+            } else {
+                "no matches"
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(msg, Style::default().fg(theme::COMMENT)))
+                    .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x + 1, list_top, inner.width.saturating_sub(2), 1),
+            );
+            return;
+        }
+
+        let sel = self.memory_sel.min(filtered.len() - 1);
+        let scroll = sel.saturating_sub(view_h.saturating_sub(1)).min(
+            filtered.len().saturating_sub(view_h),
+        );
+        for (vi, m) in filtered.iter().enumerate().skip(scroll).take(view_h) {
+            let ry = list_top + (vi - scroll) as u16;
+            let selected = vi == sel;
+            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+            let marker = if selected { g("▎", "|") } else { " " };
+            let badge = format!("[{}]", short_kind(&m.kind));
+            let left = format!("{marker} {badge} ");
+            let text_w = (inner.width as usize).saturating_sub(left.chars().count());
+            let text = truncate_str(&m.text, text_w);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(marker.to_string(), Style::default().fg(theme::CYAN)),
+                    Span::styled(
+                        format!(" {badge} "),
+                        Style::default().fg(theme::BLUE),
+                    ),
+                    Span::styled(
+                        text,
+                        Style::default().fg(theme::FG).add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                    ),
+                ]))
+                .style(Style::default().bg(bed)),
+                Rect::new(inner.x, ry, inner.width, 1),
+            );
+        }
+
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " type to search · ⏎ copy · esc close",
+                Style::default().fg(theme::CYAN),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
         );
     }
 
@@ -2307,6 +2530,9 @@ impl App {
         if self.advisor_open {
             self.draw_advisor(frame);
         }
+        if self.memory_open {
+            self.draw_memory(frame);
+        }
         if self.providers_open {
             self.draw_providers(frame);
         }
@@ -2518,6 +2744,26 @@ fn splitter(frame: &mut ratatui::Frame, area: Rect, vertical: bool) {
             .style(Style::default().bg(theme::BG)),
             area,
         );
+    }
+}
+
+/// Short kind badge for the memory browser (`fact`→`fact`, keeps it compact).
+fn short_kind(kind: &str) -> &str {
+    match kind {
+        "preference" => "pref",
+        "relationship" => "rel",
+        other => other,
+    }
+}
+
+/// Truncate `s` to `max` display chars with an ellipsis (whitespace preserved).
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else {
+        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
     }
 }
 

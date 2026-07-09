@@ -36,6 +36,61 @@ const MAX_RETAIN_CHARS: usize = 4000;
 
 type SharedStore = Arc<Mutex<SqliteMemoryStore>>;
 
+/// A read-only view of one retained memory for a surface (the TUI `/memory`
+/// picker). Flattens the store's rich `Memory` down to what a browser shows:
+/// id, kind, the `text` body, and the last-mutation timestamp.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryView {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    pub updated_at: i64,
+}
+
+/// List the operator's retained memories, newest first, for a read-only
+/// surface. Opens the store at `path` (the daemon's `memory.sqlite`), pages
+/// through up to `cap` rows, and returns flattened views. A missing/unopenable
+/// store yields an empty list rather than an error — the picker shows "no
+/// memories yet", never a failure wall.
+pub fn list_memories(path: &std::path::Path, cap: usize) -> Vec<MemoryView> {
+    let Ok(store) = SqliteMemoryStore::open(path) else {
+        return Vec::new();
+    };
+    let owner = PrincipalId::new("operator");
+    let mut out = Vec::new();
+    let mut after: Option<u64> = None;
+    while out.len() < cap {
+        let page = match store.list_page(&owner, after, Some(100)) {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        if page.memories.is_empty() {
+            break;
+        }
+        for mem in &page.memories {
+            out.push(MemoryView {
+                id: mem.id.0.clone(),
+                kind: mem.kind.as_str().to_string(),
+                text: mem
+                    .body
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                updated_at: mem.updated_at,
+            });
+            if out.len() >= cap {
+                break;
+            }
+        }
+        match page.next_seq {
+            Some(seq) if page.has_more => after = Some(seq),
+            _ => break,
+        }
+    }
+    out
+}
+
 pub struct MemoryToolsProvider {
     store: SharedStore,
     owner: PrincipalId,

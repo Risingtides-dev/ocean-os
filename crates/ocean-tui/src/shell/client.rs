@@ -318,6 +318,23 @@ pub struct ModelsResponse {
     pub models: Vec<ModelEntry>,
 }
 
+/// One retained memory from `GET /v1/memory`, for the `/memory` browser.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// Response shape of `GET /v1/memory`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MemoryResponse {
+    #[serde(default)]
+    pub memories: Vec<MemoryEntry>,
+}
+
 impl DaemonClient {
     /// `GET /v1/models` — the registry with per-model readiness, for the
     /// `/models` picker overlay.
@@ -329,6 +346,19 @@ impl DaemonClient {
             .and_then(|r| r.error_for_status())
             .map_err(|e| e.to_string())?
             .json::<ModelsResponse>()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// `GET /v1/memory` — the operator's retained memories, for `/memory`.
+    pub async fn memory(&self) -> Result<MemoryResponse, String> {
+        self.http
+            .get(format!("{}/v1/memory", self.base))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json::<MemoryResponse>()
             .await
             .map_err(|e| e.to_string())
     }

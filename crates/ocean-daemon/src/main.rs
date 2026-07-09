@@ -1659,6 +1659,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/browser/input", post(browser_input))
         .route("/v1/model", get(model_get).post(model_set))
         .route("/v1/models", get(models_list))
+        .route("/v1/memory", get(memory_list))
         .route(
             "/v1/settings/yolo",
             get(yolo_setting_get).post(yolo_setting_set),
@@ -2890,6 +2891,20 @@ async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
         "current": { "provider": provider, "model": model },
         "models": models,
     }))
+}
+
+/// `GET /v1/memory` — the operator's retained long-term memories (from the
+/// `retain` tool), newest first, for the TUI `/memory` picker. Read-only;
+/// SQLite reads ride `spawn_blocking`. A missing store yields an empty list.
+async fn memory_list() -> Json<serde_json::Value> {
+    const CAP: usize = 500;
+    let memories = tokio::task::spawn_blocking(|| {
+        let path = ocean_agent::config_dir_from_env().join("memory.sqlite");
+        ocean_agent::list_memories(&path, CAP)
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!({ "ok": true, "memories": memories }))
 }
 
 /// Where folder-as-agent definitions live: `$OCEAN_AGENTS_DIR`, else `agents/`

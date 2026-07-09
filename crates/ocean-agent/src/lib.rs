@@ -41,6 +41,7 @@ pub use config::{DaemonConfig, McpSection};
 /// config as `agentdir::AgentConfig`.
 pub mod agentdir;
 mod memory_tools;
+pub use memory_tools::{list_memories, MemoryView};
 mod oauth_refresh;
 pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;

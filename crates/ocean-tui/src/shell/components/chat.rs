@@ -675,6 +675,7 @@ impl ChatComponent {
             },
             "/models" => Some(Action::OpenModels),
             "/advisor" => Some(Action::OpenAdvisor),
+            "/memory" => Some(Action::OpenMemory),
             "/login" => {
                 // Bare `/login` opens the provider popup (OAuth + API keys);
                 // `/login claude|codex` keeps the direct browser flow.
