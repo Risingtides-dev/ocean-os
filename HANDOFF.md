@@ -28,6 +28,19 @@ with `CARGO_TARGET_DIR=<repo>/target` (never from the dirty shared tree), then
   tabs/control chars (`sanitize_line`) — raw tabs desync ratatui and smear the screen.
 - The other lane added: `/providers` auth popup (bare `/login`), `/login claude|codex` OAuth (real
   PKCE, `ocean-oauth` crate), resizable dock, mid-turn daemon-blip retry.
+- `/advisor` picker: per-session second-opinion reviewer (off-row + ready models). Rides turns as
+  `AgentTurnRequest.advisor` (`AdvisorControl{enabled,model}`); daemon `resolve_advisor_alias`
+  gives the per-turn override precedence over global `[roles].advisor`.
+- Status-line dashboard (`shell/status.rs`): focus · model · git(±dirty ↑↓) · tok/s · session
+  tokens · session · advisor · message. Git cached, refreshed on the 1s tick.
+- `/memory` browser: `GET /v1/memory` (over `ocean_agent::list_memories`) + overlay with search +
+  enter-to-copy. `/lsp` panel: `GET /v1/lsp?cwd=` (over `ocean_agent::lsp_servers`, pure fs/$PATH,
+  no spawn) + ready/install list; live diagnostics stay the agent's in-turn `lsp` tool.
+- Inline images (`shell/kitty.rs`): `![alt](path)` at line-start → 🖼 card; `/image [path]` (bare =
+  newest in transcript) → full-screen kitty viewer (PNG via native file transmission, emitted after
+  ratatui paints, cleared on close). Non-kitty/non-PNG → honest note. Full-screen (not
+  inline-in-scroll) by design — avoids the smear. Markdown also now renders tables/rules/links/
+  strikethrough/task-lists; collapsed tool cards are one line each.
 
 ### Models / providers (registry current as of 2026-07-08, all verified with live turns)
 - Claude generation: `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5` (anthropic) +
@@ -57,9 +70,13 @@ with `CARGO_TARGET_DIR=<repo>/target` (never from the dirty shared tree), then
   broke; reconciled — `SetModel` and `SetThinking` coexist).
 
 ## Next steps (this lane's backlog, none started)
-- Transcript jump-navigation for long sessions; image paste into composer; richer rail previews.
-- Roadmap slash commands still `soon`: /compact /context /diff /rules /memory /goal /handoff
-  (/lsp may be wireable — ocean-lsp crate landed).
+- Roadmap slash commands STILL `soon` (need backends): /compact /context /diff /rules /goal
+  /handoff. (/memory, /lsp, /advisor, /image, /models, /thinking are now LIVE.)
+- Richer `/lsp`: human-facing on-demand diagnostics (needs the daemon to drive the stateful
+  language-server spawn + wait — deferred; today's /lsp is discovery/status only).
+- Inline images: PNG-only + full-screen viewer today. Follow-ups: non-PNG (needs decode dep),
+  clickable image cards (transcript hit-testing), truly inline-in-scroll render.
+- Transcript jump-navigation for long sessions; image PASTE into composer; richer rail previews.
 - Consider surfacing provider quota state (429 history) in the picker as a soft "limited" badge.
 
 ## Blockers / cautions
