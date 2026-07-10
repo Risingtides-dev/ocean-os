@@ -119,6 +119,22 @@ impl TermPane {
         }
     }
 
+    /// Paste into the child. When the inner app enabled bracketed paste
+    /// (DEC mode 2004 — vt100 tracks it from the child's own escape output),
+    /// wrap the text in the paste markers so the app receives one atomic
+    /// paste; otherwise fall back to classic terminal behavior where pasted
+    /// newlines arrive as carriage returns.
+    pub fn paste(&mut self, text: &str) {
+        if self.scrollback != 0 {
+            self.scrollback = 0;
+            self.parser.set_scrollback(0);
+        }
+        let bytes = paste_bytes(text, self.parser.screen().bracketed_paste());
+        if !bytes.is_empty() {
+            self.send(&bytes);
+        }
+    }
+
     pub fn scroll(&mut self, lines: isize) {
         let next = (self.scrollback as isize + lines).max(0) as usize;
         self.scrollback = next;
@@ -161,4 +177,36 @@ pub fn key_to_bytes(k: KeyEvent) -> Vec<u8> {
         _ => {}
     }
     out
+}
+
+/// The byte stream a paste produces for the child PTY. Bracketed mode wraps
+/// the text VERBATIM in ESC[200~ / ESC[201~ (the app un-brackets it itself);
+/// raw mode converts newlines to carriage returns — what a real terminal
+/// sends on paste — so line-oriented prompts see Enter, not a bare LF.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut out = Vec::with_capacity(text.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::paste_bytes;
+
+    #[test]
+    fn raw_paste_converts_newlines_to_carriage_returns() {
+        assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc".to_vec());
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_text_verbatim() {
+        let got = paste_bytes("x\ny", true);
+        assert_eq!(got, b"\x1b[200~x\ny\x1b[201~".to_vec());
+    }
 }

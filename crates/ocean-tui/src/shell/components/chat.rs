@@ -36,6 +36,12 @@ const TOOL_TAIL_ROWS: usize = 3;
 /// toggle as tool output) reveals the full hunk.
 const DIFF_TAIL_ROWS: usize = 12;
 
+/// Collapsed mode shows at most this many ok/running tool one-liners per
+/// consecutive tool run; older ones compact into one "· N earlier tools" line.
+/// Without this a 30-tool turn floods the whole transcript with cards even in
+/// the minimized mode. Errors are never hidden; ⌃O expands everything.
+const BURST_TAIL_TOOLS: usize = 3;
+
 /// Kill-ring depth (⌃U / ⌃K push, ⌃Y yanks the newest).
 const KILL_RING_CAP: usize = 10;
 
@@ -223,7 +229,18 @@ fn diff_line(row: &DiffRow) -> Line<'static> {
 /// Flatten whitespace to single spaces and truncate to `max` chars with an
 /// ellipsis.
 fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Flatten whitespace, then drop any remaining control bytes: this string
+    // lands in a ratatui `Span`, and one raw ESC/CSI sequence repaints the
+    // terminal underneath ratatui's cell math (the collapsed-card screen
+    // smear). `split_whitespace` already eats tabs/newlines/CRs; ESC is NOT
+    // whitespace and would sail through without the filter.
+    let flat: String = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     if flat.chars().count() > max {
         let head: String = flat.chars().take(max.saturating_sub(1)).collect();
         format!("{head}{}", g("…", "..."))
@@ -245,6 +262,32 @@ fn clamp_line(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Normalize a bracketed paste for the composer: CRLF/CR become plain
+/// newlines (kept — the composer is multi-line via ⌃J), tabs become four
+/// spaces, and every other control byte drops (an ESC sequence must never
+/// reach a `Span`). Pasted newlines are CONTENT, never synthetic Enter
+/// presses — the pre-bracketed-paste terminal replayed them as real key
+/// events and auto-submitted mid-paste.
+pub(crate) fn paste_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl ChatComponent {
@@ -1181,6 +1224,26 @@ impl ChatComponent {
 }
 
 impl Component for ChatComponent {
+    /// Bracketed paste into the chat surface. While the ⌃R search overlay is
+    /// open the paste feeds its single-line query; otherwise it inserts into
+    /// the composer verbatim (newlines included) and NEVER submits.
+    fn handle_paste(&mut self, text: &str) -> Option<Action> {
+        if let Some(s) = self.search.as_mut() {
+            s.query.extend(text.chars().filter(|c| !c.is_control()));
+            s.sel = 0;
+            return None;
+        }
+        let clean = paste_text(text);
+        if clean.is_empty() {
+            return None;
+        }
+        self.input.push_str(&clean);
+        self.reset_history_nav();
+        self.menu_sel = 0;
+        self.mention_sel = 0;
+        None
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         // The ⌃R history-search overlay is modal: while open, all keys drive it.
         if self.search.is_some() {
@@ -1621,6 +1684,41 @@ impl Component for ChatComponent {
                 )));
             }
         }
+        // Collapsed mode: a long consecutive tool run must not flood the
+        // screen. Hide all but the newest BURST_TAIL_TOOLS ok/running cards of
+        // each run behind one "· N earlier tools" line; errors always render.
+        let mut tool_hidden: Vec<bool> = vec![false; n_turns];
+        let mut elide_count_at: Vec<usize> = vec![0; n_turns];
+        if !tools_expanded {
+            let mut i = 0;
+            while i < n_turns {
+                if !matches!(self.turns[i], Turn::Tool { .. } | Turn::Thinking(_)) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < n_turns
+                    && matches!(self.turns[i], Turn::Tool { .. } | Turn::Thinking(_))
+                {
+                    i += 1;
+                }
+                let hideable: Vec<usize> = (start..i)
+                    .filter(|&t| {
+                        matches!(
+                            &self.turns[t],
+                            Turn::Tool { status, .. } if !matches!(status, ToolStatus::Err)
+                        )
+                    })
+                    .collect();
+                if hideable.len() > BURST_TAIL_TOOLS {
+                    let cut = hideable.len() - BURST_TAIL_TOOLS;
+                    for &t in &hideable[..cut] {
+                        tool_hidden[t] = true;
+                    }
+                    elide_count_at[hideable[0]] = cut;
+                }
+            }
+        }
         for (ti, turn) in self.turns.iter().enumerate() {
             match turn {
                 Turn::User(s) => {
@@ -1712,6 +1810,23 @@ impl Component for ChatComponent {
                     diff,
                     ..
                 } => {
+                    // Burst compaction (collapsed mode): this card is hidden
+                    // behind the run's "· N earlier tools" line.
+                    if tool_hidden[ti] {
+                        if elide_count_at[ti] > 0 {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "  {} {} earlier tools · ⌃O expand",
+                                    g("·", "-"),
+                                    elide_count_at[ti]
+                                ),
+                                Style::default()
+                                    .fg(theme::COMMENT)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
+                        }
+                        continue; // no separator — the burst reads as one block
+                    }
                     // Card header: status glyph + tool name + one-line args.
                     let (mark, color) = match status {
                         ToolStatus::Running => (g("◐", "*"), theme::YELLOW),
@@ -1732,33 +1847,51 @@ impl Component for ChatComponent {
                         ));
                     }
 
-                    // Collapsed, healthy, non-diff cards are ONE line: the
-                    // header plus a dim outcome summary (inline when the whole
-                    // output is one short line, else a line count). The old
-                    // 3-line tail + "+N more" per call meant a 10-tool turn
-                    // painted ~50 rows of chrome. Errors keep their tail (red
-                    // matters); ⌃O restores full output for everything.
+                    // Collapsed, healthy cards are ONE line: the header plus a
+                    // dim outcome summary. Diff cards join the one-line rule
+                    // except at the transcript tail — the just-finished edit
+                    // keeps its hunk visible for live feedback; ⌃O restores
+                    // full output for everything. Errors keep their tail (red
+                    // matters).
+                    let is_tail = ti + 1 == n_turns;
                     let collapsed_plain = !tools_expanded
-                        && diff.is_none()
-                        && !matches!(status, ToolStatus::Err);
+                        && !matches!(status, ToolStatus::Err)
+                        && (diff.is_none() || !is_tail);
                     if collapsed_plain {
-                        let out = output.trim();
-                        if !out.is_empty() {
-                            let total = out.lines().count();
-                            let first = one_line(out.lines().next().unwrap_or(""), 48);
-                            let summary = if total == 1 && first.chars().count() <= 48 {
-                                format!("  {} {first}", g("·", "-"))
-                            } else if total == 1 {
-                                format!("  {} 1 line", g("·", "-"))
-                            } else {
-                                format!("  {} {total} lines", g("·", "-"))
-                            };
+                        if let Some(rows) = diff {
+                            let adds = rows
+                                .iter()
+                                .filter(|r| matches!(r.kind, DiffKind::Add))
+                                .count();
+                            let dels = rows
+                                .iter()
+                                .filter(|r| matches!(r.kind, DiffKind::Del))
+                                .count();
                             header.push(Span::styled(
-                                summary,
+                                format!("  {} diff +{adds} −{dels} · ⌃O", g("·", "-")),
                                 Style::default()
                                     .fg(theme::COMMENT)
                                     .add_modifier(Modifier::ITALIC),
                             ));
+                        } else {
+                            let out = output.trim();
+                            if !out.is_empty() {
+                                let total = out.lines().count();
+                                let first = one_line(out.lines().next().unwrap_or(""), 48);
+                                let summary = if total == 1 && first.chars().count() <= 48 {
+                                    format!("  {} {first}", g("·", "-"))
+                                } else if total == 1 {
+                                    format!("  {} 1 line", g("·", "-"))
+                                } else {
+                                    format!("  {} {total} lines", g("·", "-"))
+                                };
+                                header.push(Span::styled(
+                                    summary,
+                                    Style::default()
+                                        .fg(theme::COMMENT)
+                                        .add_modifier(Modifier::ITALIC),
+                                ));
+                            }
                         }
                         lines.push(Line::from(header));
                         // Skip the separator when the next row is another tool
@@ -2798,6 +2931,141 @@ mod tests {
         assert!(got.contains("world"), "normal chars preserved");
         assert!(got.contains(" tab"), "normal chars preserved");
         assert!(got.contains("new"), "normal chars preserved");
+    }
+
+    // ── bracketed paste into the composer ─────────────────────────────────
+
+    #[test]
+    fn paste_inserts_multiline_without_submitting() {
+        let mut chat = ChatComponent::default();
+        let act = chat.handle_event(&crossterm::event::Event::Paste(
+            "one\ntwo\r\nthree".to_string(),
+        ));
+        assert!(act.is_none(), "paste must never submit");
+        assert_eq!(chat.input, "one\ntwo\nthree");
+        assert!(!chat.busy, "paste must not mark the chat busy");
+    }
+
+    #[test]
+    fn paste_strips_controls_and_expands_tabs() {
+        let mut chat = ChatComponent::default();
+        chat.handle_event(&crossterm::event::Event::Paste(
+            "a\tb\x1b[31mc\x07".to_string(),
+        ));
+        assert_eq!(chat.input, "a    b[31mc");
+    }
+
+    #[test]
+    fn paste_feeds_search_query_while_overlay_open() {
+        let mut chat = ChatComponent::default();
+        chat.handle_key(ctrl('r'));
+        assert!(chat.search.is_some(), "⌃R opens the search overlay");
+        chat.handle_event(&crossterm::event::Event::Paste("cargo test\n".to_string()));
+        assert_eq!(
+            chat.search.as_ref().map(|s| s.query.as_str()),
+            Some("cargo test"),
+            "paste feeds the query, newline dropped"
+        );
+        assert!(chat.input.is_empty(), "composer untouched while search open");
+    }
+
+    // ── collapsed tool cards: sanitized summaries + burst compaction ───────
+
+    fn ok_tool(name: &str, output: &str) -> Turn {
+        Turn::Tool {
+            id: ocean_agent_sdk::ToolCallId::new_v4(),
+            name: name.to_string(),
+            args: String::new(),
+            output: output.to_string(),
+            status: ToolStatus::Ok,
+            diff: None,
+        }
+    }
+
+    #[test]
+    fn one_line_drops_escape_bytes() {
+        let s = one_line("ok \x1b[2J\x1b[H wiped", 64);
+        assert!(!s.contains('\x1b'), "ESC must not reach a Span: {s:?}");
+        assert!(s.contains("ok"), "printable text survives");
+    }
+
+    #[test]
+    fn collapsed_summary_never_paints_control_bytes() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(ok_tool("bash", "done\x1b[2J\x07"));
+        let screen = render_chat_to_string(&mut chat, 80, 12);
+        assert!(!screen.contains('\x1b'), "collapsed summary leaked ESC");
+        assert!(!screen.contains('\x07'), "collapsed summary leaked BEL");
+        assert!(screen.contains("bash"), "card header renders");
+    }
+
+    #[test]
+    fn collapsed_burst_elides_earlier_tools() {
+        let mut chat = ChatComponent::default();
+        for i in 0..6 {
+            chat.turns.push(ok_tool(&format!("tool{i}"), "ok"));
+        }
+        let screen = render_chat_to_string(&mut chat, 90, 16);
+        assert!(
+            screen.contains("3 earlier tools"),
+            "burst must compact: {screen:?}"
+        );
+        assert!(!screen.contains("tool0"), "oldest card hidden");
+        assert!(!screen.contains("tool2"), "hidden up to the tail window");
+        assert!(screen.contains("tool3"), "tail window starts here");
+        assert!(screen.contains("tool5"), "newest card visible");
+    }
+
+    #[test]
+    fn collapsed_burst_keeps_errors_visible() {
+        let mut chat = ChatComponent::default();
+        for i in 0..5 {
+            chat.turns.push(ok_tool(&format!("tool{i}"), "ok"));
+        }
+        chat.turns.insert(
+            1,
+            Turn::Tool {
+                id: ocean_agent_sdk::ToolCallId::new_v4(),
+                name: "boom".to_string(),
+                args: String::new(),
+                output: "failed".to_string(),
+                status: ToolStatus::Err,
+                diff: None,
+            },
+        );
+        let screen = render_chat_to_string(&mut chat, 90, 20);
+        assert!(screen.contains("boom"), "error card must never hide");
+        assert!(screen.contains("earlier tools"), "ok cards still compact");
+    }
+
+    #[test]
+    fn collapsed_diff_body_renders_only_at_tail() {
+        let edit_turn = || Turn::Tool {
+            id: ocean_agent_sdk::ToolCallId::new_v4(),
+            name: "edit".to_string(),
+            args: String::new(),
+            output: String::new(),
+            status: ToolStatus::Ok,
+            diff: Some(crate::shell::diff::string_rows("old_alpha\n", "new_beta\n")),
+        };
+        // Tail edit: the hunk stays visible for live feedback.
+        let mut tail = ChatComponent::default();
+        tail.turns.push(edit_turn());
+        let screen = render_chat_to_string(&mut tail, 90, 16);
+        assert!(screen.contains("new_beta"), "tail diff shows its rows");
+        // Followed by assistant text: the card compacts to a one-line summary.
+        let mut done = ChatComponent::default();
+        done.turns.push(edit_turn());
+        done.turns.push(Turn::Assistant("done".to_string()));
+        let screen = render_chat_to_string(&mut done, 90, 16);
+        assert!(
+            !screen.contains("new_beta"),
+            "non-tail diff must compact: {screen:?}"
+        );
+        assert!(
+            screen.contains("diff +1"),
+            "compacted card summarizes the hunk: {screen:?}"
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub trait Component {
         match event {
             CrosstermEvent::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(*k),
             CrosstermEvent::Mouse(m) => self.handle_mouse(*m),
+            CrosstermEvent::Paste(text) => self.handle_paste(text),
             _ => None,
         }
     }
@@ -25,6 +26,14 @@ pub trait Component {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        None
+    }
+
+    /// Bracketed paste landed on this component (terminal paste never replays
+    /// as individual key strokes — see `tui::init`). Components with a text
+    /// sink (composer, editor, PTY) override this; the default swallows the
+    /// paste so it can NEVER fall through as synthetic keys.
+    fn handle_paste(&mut self, text: &str) -> Option<Action> {
         None
     }
 

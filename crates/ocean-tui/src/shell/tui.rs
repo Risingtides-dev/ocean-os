@@ -5,8 +5,8 @@ use std::io::{self, Stdout};
 
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -22,7 +22,11 @@ pub type Tui = Terminal<Backend>;
 pub fn init() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste: without it the terminal replays a paste as individual
+    // key strokes, so any pasted newline lands as a real Enter and SUBMITS the
+    // composer mid-paste. With it, a paste arrives as one Event::Paste that
+    // components insert verbatim.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     // Kitty keyboard protocol where supported (iTerm2, Ghostty, kitty, WezTerm):
     // without it, modifier combos like Ctrl+Opt+1 are ambiguous or dropped.
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
@@ -39,7 +43,12 @@ pub fn restore() -> io::Result<()> {
     // Pop is a no-op where enhancement was never pushed.
     let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 

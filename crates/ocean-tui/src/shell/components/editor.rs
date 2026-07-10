@@ -80,6 +80,27 @@ impl EditorComponent {
 }
 
 impl Component for EditorComponent {
+    /// Bracketed paste: insert into the buffer at the cursor, newline-aware.
+    /// Tabs are kept verbatim (file content fidelity); CRs fold into the
+    /// following newline; other control bytes drop.
+    fn handle_paste(&mut self, text: &str) -> Option<Action> {
+        if !self.focused {
+            return None;
+        }
+        let hl = &self.hl;
+        let t = self.tabs.get_mut(self.active)?;
+        for c in text.chars() {
+            match c {
+                '\n' => t.insert_newline(hl),
+                '\r' => {}
+                '\t' => t.insert_char('\t', hl),
+                c if c.is_control() => {}
+                c => t.insert_char(c, hl),
+            }
+        }
+        None
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         if !self.focused {
             return None;
