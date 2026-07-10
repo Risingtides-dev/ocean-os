@@ -96,8 +96,17 @@ Core daemon routes used by surfaces:
 POST /v1/agent/sessions
 GET  /v1/agent/events?session_id=<id>
 POST /v1/agent/turns
+POST /v1/voice/stt
+POST /v1/voice/tts
+POST /v1/voice/realtime/client-secret
 GET  /health
 ```
+
+Voice is daemon-owned as of voice phase 4 (2026-07-10): the surface proxy's
+`/api/stt` and `/api/tts` forward to the daemon's `/v1/voice/stt` and
+`/v1/voice/tts`, and the browser Realtime client mints its ephemeral secret
+via `POST /v1/voice/realtime/client-secret`. Provider keys (xAI, OpenAI)
+resolve only inside `ocean-os`.
 
 Core Bedrock routes and tools are documented in `../../ocean-bedrock/docs/API.md`,
 `../../ocean-bedrock/docs/openapi.yaml`, and `../../ocean-bedrock/docs/MCP.md`.

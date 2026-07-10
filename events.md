@@ -2248,3 +2248,17 @@ checkout deliberately LEFT (live peers; 6 real test regressions in it — see
 audit). Skill packs live-verified on the running daemon today (probe ranked #1,
 fetch round-trip ok).
 _________________________________________________________________________________
+time:      [7:34pm] [07-10-26]
+agent:     [omp] [zai/glm-5.2]
+worktree:  /tmp/ocean-map-os (origin/main detached)
+type:      [workflow]
+area:      [docs]
+
+Mirrored the daemon-owned voice routes contract (voice phase 4, 2026-07-10) into
+docs/OCEAN_PROJECT_MAP.md, which must stay byte-identical across the four Ocean
+repos. Extended the "Core daemon routes used by surfaces" block with
+POST /v1/voice/stt, POST /v1/voice/tts, and POST /v1/voice/realtime/client-secret,
+and added the paragraph noting the surface /api/stt|/api/tts forwards to the daemon
+and that provider keys (xAI, OpenAI) resolve only inside ocean-os. Map edit only;
+no code touched.
+_________________________________________________________________________________
