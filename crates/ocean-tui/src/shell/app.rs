@@ -832,9 +832,7 @@ impl App {
                 && self.chat.wants_tab()
             {
                 // Let Tab through to ChatComponent; don't cycle focus.
-            } else
-
-            if k.code == KeyCode::Tab && self.focus != Focus::Term {
+            } else if k.code == KeyCode::Tab && self.focus != Focus::Term {
                 self.cycle_focus();
                 return;
             }
@@ -1853,7 +1851,7 @@ impl App {
         use ratatui::widgets::{Block, Borders, Clear};
         let full = frame.area();
         let width = 76u16.min(full.width.saturating_sub(4));
-        let height = full.height.saturating_sub(4).min(30).max(8);
+        let height = full.height.saturating_sub(4).clamp(8, 30);
         let x = full.x + (full.width.saturating_sub(width)) / 2;
         let y = full.y + (full.height.saturating_sub(height)) / 2;
         let area = Rect::new(x, y, width, height);
@@ -2108,7 +2106,7 @@ impl App {
         use ratatui::widgets::{Block, Borders, Clear};
         let full = frame.area();
         let width = 64u16.min(full.width.saturating_sub(4));
-        let height = full.height.saturating_sub(4).min(34).max(8);
+        let height = full.height.saturating_sub(4).clamp(8, 34);
         let x = full.x + (full.width.saturating_sub(width)) / 2;
         let y = full.y + (full.height.saturating_sub(height)) / 2;
         let area = Rect::new(x, y, width, height);
@@ -2259,7 +2257,7 @@ impl App {
                 label,
                 block_key,
                 env_vars,
-                status: provider_status(*block_key, env_vars, &auth_json),
+                status: provider_status(block_key, env_vars, &auth_json),
             })
             .collect()
     }
@@ -3076,7 +3074,7 @@ impl App {
                 ));
             } else {
                 spans.push(Span::styled(
-                    if i == 1 { "  " } else { &" · "[..] },
+                    if i == 1 { "  " } else { " · " },
                     Style::default().fg(theme::EDGE),
                 ));
                 spans.push(Span::styled(chat::sanitize_line(&seg.text), Style::default().fg(tone_color(seg.tone))));

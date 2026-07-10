@@ -541,7 +541,7 @@ impl ChatComponent {
         self.input
             .rsplit(char::is_whitespace)
             .next()
-            .map_or(false, |t| t.starts_with('@'))
+            .is_some_and(|t| t.starts_with('@'))
     }
 
     /// Whether a turn is currently streaming (submit → TurnFinished). The app's
@@ -2656,8 +2656,10 @@ mod tests {
 
     #[test]
     fn turn_finished_with_error_pushes_error_notice_and_clears_busy() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
         chat.update(&turn_finished(
             ocean_agent_sdk::AgentTurnStatus::Failed,
             Some("HTTP 401 Unauthorized"),
@@ -2673,8 +2675,10 @@ mod tests {
 
     #[test]
     fn turn_finished_provider_auth_error_uses_login_recovery_notice() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
 
         chat.update(&turn_finished(
             ocean_agent_sdk::AgentTurnStatus::Failed,
@@ -2698,8 +2702,10 @@ mod tests {
 
     #[test]
     fn turn_finished_failed_no_error_renders_fallback() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
         chat.update(&turn_finished(
             ocean_agent_sdk::AgentTurnStatus::Failed,
             None,
@@ -2715,8 +2721,10 @@ mod tests {
 
     #[test]
     fn turn_finished_cancelled_pushes_error_notice() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
         chat.update(&turn_finished(
             ocean_agent_sdk::AgentTurnStatus::Cancelled,
             None,
@@ -2732,8 +2740,10 @@ mod tests {
 
     #[test]
     fn turn_finished_completed_clears_busy_without_notice() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
         chat.update(&turn_finished(
             ocean_agent_sdk::AgentTurnStatus::Completed,
             None,
@@ -2753,8 +2763,10 @@ mod tests {
 
     #[test]
     fn stream_reconnect_does_not_clear_busy() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
         chat.update(&Action::Status("stream reconnected".into()));
         assert!(chat.busy, "reconnect must not clear busy — only terminal events do");
         assert!(chat.turns.is_empty(), "reconnect must not push turns");
@@ -2762,8 +2774,10 @@ mod tests {
 
     #[test]
     fn stream_reconnecting_during_busy_does_not_clear_busy() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
         chat.update(&Action::Status("stream reconnecting…".into()));
         assert!(chat.busy, "reconnecting must not clear busy");
         assert!(chat.turns.is_empty(), "reconnecting must not push turns");

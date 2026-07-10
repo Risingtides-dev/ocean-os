@@ -246,8 +246,7 @@ mod tests {
         let err = tool
             .execute("t", json!({ "url": format!("http://{addr}/") }))
             .await
-            .err()
-            .expect("a silent server must produce a fetch error, not hang");
+            .expect_err("a silent server must produce a fetch error, not hang");
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "fetch must fail within the tool deadline, took {:?}",

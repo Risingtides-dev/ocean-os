@@ -463,6 +463,14 @@ async fn fail_all_pending(pending: &Pending) {
     pending.lock().await.clear();
 }
 
+/// Total bytes of TEXT content retained per MCP tool call. Servers are
+/// third-party processes — a rogue or verbose one can return a response of any
+/// size, and pre-cap that arrived as one unbounded `String` in daemon RAM (the
+/// transcript cap only bounds what the MODEL re-reads, not what the daemon
+/// holds or ships over SSE). Text past the cap is dropped with a loud marker;
+/// 2 MiB matches the bash/web_fetch output caps.
+const MAX_TEXT_BYTES_PER_CALL: usize = 2 * 1024 * 1024;
+
 /// Map MCP content blocks onto Ocean's [`Content`] model.
 ///
 /// - `text` → [`Content::Text`].
@@ -474,14 +482,6 @@ async fn fail_all_pending(pending: &Pending) {
 ///   unsupported by the content model today: it is logged clearly and replaced
 ///   with a text placeholder so the model knows content was elided rather than
 ///   the call having returned nothing.
-/// Total bytes of TEXT content retained per MCP tool call. Servers are
-/// third-party processes — a rogue or verbose one can return a response of any
-/// size, and pre-cap that arrived as one unbounded `String` in daemon RAM (the
-/// transcript cap only bounds what the MODEL re-reads, not what the daemon
-/// holds or ships over SSE). Text past the cap is dropped with a loud marker;
-/// 2 MiB matches the bash/web_fetch output caps.
-const MAX_TEXT_BYTES_PER_CALL: usize = 2 * 1024 * 1024;
-
 fn map_content(tool_name: &str, blocks: &[Value]) -> Vec<Content> {
     let mut out = Vec::new();
     let mut text_budget = MAX_TEXT_BYTES_PER_CALL;
