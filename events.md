@@ -2116,3 +2116,21 @@ area:      frontend
 
 TUI first-touch/resilience wave, motivated by John's daemon-restart screenshots ("this is brutal"): the workbench shell now survives daemon outages and onboards a zero-state user. New shell/daemon_boot.rs — health monitor (3s offline / 15s healthy probes) with launchd-aware autostart: kickstart (no -k) when the LaunchAgent supervises, direct spawn (cwd=$HOME, child reaped) only when unsupervised; eligibility (default 127.0.0.1:4780 only, OCEAN_TUI_AUTOSTART=0 disables, OCEAN_DAEMON_BIN overrides) checked before any process probe; all blocking work in spawn_blocking. New shell/errfmt.rs — humanizes daemon/provider errors (no raw reqwest blobs anywhere), classifies credential-shaped bodies into /login recovery hints, is_connect_shaped picks honest transcript prefixes. chat.rs: TurnFinished failures now render (they were silently ignored) as sanitized Turn::ErrorNotice, busy cleared only by terminal turn events (SSE reconnect can no longer kill a live turn), welcome empty-state with live provider readiness line (refreshes on OAuth/key saves), unknown-command feedback with near-match suggestions, /help keys section (verified bindings), palette Tab completion + footer hint. Closed all six findings from the pre-merge review (eligibility ordering, async-worker blocking, zombie children, sanitize gaps incl. user prompts/permission lines/status bar, contradictory error prefix, /ready ghost command). Verified: 265/265 cargo test -p ocean-tui, cargo check --workspace clean, release build, tmux smokes (offline humanized status, welcome block, unknown-cmd, /help keys, palette footer; zero raw reqwest lines). Built by a 3-slice rust-engineer wave + 2 integration-fix slices + Tester audit + reviewer gate.
 _________________________________________________________________________________
+time:      [11:42pm] [07-09-26]
+agent:     [claude] [fable-5]
+type:      merge
+area:      infra
+
+Merged feat/ocean-tui-shell-rebuild into main (934e90f): 8 commits that were
+sitting verified-but-unmerged - TUI daemon lifeline + honest error surfaces +
+first-run onboarding, Claude Code OAuth wire fingerprint fix, branch-wide
+clippy -D debt cleared, RUSTSEC-2026-0204. Merge was conflict-free
+(merge-tree dry run) and re-gated on the exact merged tree in an isolated
+worktree: 267/267 ocean-tui, full ocean-runtime + ocean-agent suites green
+(0 failed), cargo check --workspace clean. Verified the branch checkout's
+dirty tree first: it is rustfmt churn + already-landed voice-append content +
+a separate half-done runtime test-consolidation slice (round_retry/hashline
+deletion) that is NOT load-bearing - those tests pass on the merged tree.
+That in-progress slice stays with its owner, untouched, on the branch
+worktree.
+_________________________________________________________________________________
