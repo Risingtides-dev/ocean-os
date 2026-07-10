@@ -12,7 +12,10 @@ use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };

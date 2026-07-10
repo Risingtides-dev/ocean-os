@@ -204,7 +204,10 @@ mod tests {
 
     #[test]
     fn stt_text_trims_transcript() {
-        assert_eq!(stt_text(&json!({"text": "  hello there \n"})), "hello there");
+        assert_eq!(
+            stt_text(&json!({"text": "  hello there \n"})),
+            "hello there"
+        );
     }
 
     // --- TTS body builder ----------------------------------------------------
