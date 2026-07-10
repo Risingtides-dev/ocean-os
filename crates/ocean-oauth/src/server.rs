@@ -220,14 +220,13 @@ async fn handle_callback(stream: &mut TcpStream, query: &str, shared: &ServerSha
     let result = if let Some(err) = error.as_deref() {
         let detail = error_description.unwrap_or_else(|| err.to_string());
         CallbackResult::Err(format!("authorization failed: {detail}"))
-    } else if code.is_none() {
-        CallbackResult::Err("missing authorization code".to_string())
-    } else if state != shared.expected_state {
-        CallbackResult::Err("state mismatch - possible CSRF attack".to_string())
     } else {
-        CallbackResult::Ok {
-            code: code.unwrap(),
-            state,
+        match code {
+            None => CallbackResult::Err("missing authorization code".to_string()),
+            Some(_) if state != shared.expected_state => {
+                CallbackResult::Err("state mismatch - possible CSRF attack".to_string())
+            }
+            Some(code) => CallbackResult::Ok { code, state },
         }
     };
 
@@ -415,7 +414,9 @@ mod tests {
         assert_eq!(status, 500);
         assert!(body.contains("missing authorization code"), "body: {body}");
         match server.next_result().await.expect("result") {
-            CallbackResult::Err(msg) => assert!(msg.contains("missing authorization code"), "msg: {msg}"),
+            CallbackResult::Err(msg) => {
+                assert!(msg.contains("missing authorization code"), "msg: {msg}")
+            }
             other => panic!("expected Err, got {other:?}"),
         }
     }
