@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod config;
-pub use config::{DaemonConfig, McpSection};
+pub use config::{DaemonConfig, McpSection, OffshoreSection};
 /// Filesystem-first agent definitions (folder = agent). Module-qualified to
 /// avoid colliding with `ocean_runtime::AgentConfig`; refer to the folder-agent
 /// config as `agentdir::AgentConfig`.
@@ -1915,6 +1915,25 @@ async fn build_capability_registry(
             return CapabilityRegistry::new(providers);
         }
     };
+
+    // Offshore dispatch: agent work on the remote (tailnet) Ocean daemon inside
+    // per-job git worktrees. Registered only when `[offshore]` is present AND
+    // enabled — otherwise nothing changes. Construction is pure (the tools hold
+    // config; nothing dials out until one executes), mirroring BrowserProvider's
+    // lazy posture.
+    if let Some(offshore) = cfg.offshore.as_ref().filter(|o| o.enabled) {
+        providers.push(Arc::new(
+            ocean_runtime::tools::offshore::OffshoreProvider::new(
+                ocean_runtime::tools::offshore::OffshoreConfig {
+                    remote_url: offshore.remote_url.clone(),
+                    ssh_host: offshore.ssh_host.clone(),
+                    ssh_bin: offshore.ssh_bin().to_string(),
+                    remote_root: offshore.remote_root().to_string(),
+                    turn_timeout_secs: offshore.turn_timeout_secs(),
+                },
+            ),
+        ));
+    }
 
     // Load tools.env once. Process env takes precedence (an explicitly exported
     // var overrides the file), so the closure falls back to the file only when
@@ -3821,6 +3840,78 @@ done
         // config_dir intentionally not created.
         let providers = discover_plugin_providers(&config_dir).await;
         assert!(providers.is_empty(), "no plugins dir → no providers");
+    }
+
+    // An enabled `[offshore]` table registers the offshore provider and its ten
+    // tools alongside the built-ins.
+    #[tokio::test]
+    async fn offshore_provider_registered_when_configured() {
+        let config_dir = temp_config_dir("offshore-enabled");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("ocean.toml"),
+            r#"
+            [offshore]
+            remote_url = "http://100.90.205.60:4780"
+            ssh_host = "smathdaddy@100.90.205.60"
+            "#,
+        )
+        .unwrap();
+
+        let registry = build_capability_registry(&config_dir, None).await;
+        assert!(
+            registry.providers().iter().any(|p| p.id() == "offshore"),
+            "offshore provider registered"
+        );
+        let tools = registry.tools_for_session(&SessionContext::default()).await;
+        let offshore: Vec<_> = tools
+            .iter()
+            .filter(|t| t.name().starts_with("offshore_"))
+            .collect();
+        assert_eq!(offshore.len(), 10, "the full offshore family is offered");
+        assert!(
+            tools.iter().any(|t| t.name() == "offshore_dispatch"),
+            "dispatch present"
+        );
+        assert!(
+            tools.iter().any(|t| t.name() == "bash"),
+            "built-ins still present"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // No `[offshore]` table — or a disabled one — registers nothing: zero
+    // behavior change for unconfigured daemons.
+    #[tokio::test]
+    async fn offshore_provider_absent_without_config_or_when_disabled() {
+        let no_table = temp_config_dir("offshore-absent");
+        std::fs::create_dir_all(&no_table).unwrap();
+        let registry = build_capability_registry(&no_table, None).await;
+        assert!(
+            !registry.providers().iter().any(|p| p.id() == "offshore"),
+            "no table → no offshore provider"
+        );
+        let _ = std::fs::remove_dir_all(no_table);
+
+        let disabled = temp_config_dir("offshore-disabled");
+        std::fs::create_dir_all(&disabled).unwrap();
+        std::fs::write(
+            disabled.join("ocean.toml"),
+            r#"
+            [offshore]
+            remote_url = "http://100.90.205.60:4780"
+            ssh_host = "smathdaddy@100.90.205.60"
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        let registry = build_capability_registry(&disabled, None).await;
+        assert!(
+            !registry.providers().iter().any(|p| p.id() == "offshore"),
+            "enabled = false → no offshore provider"
+        );
+        let _ = std::fs::remove_dir_all(disabled);
     }
 
     // A plugin whose manifest can't parse is skipped, never breaking discovery

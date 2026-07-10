@@ -46,6 +46,11 @@ pub struct DaemonConfig {
     /// behavior is 100% unchanged and the advisor is off (zero cost).
     #[serde(default)]
     pub roles: HashMap<String, String>,
+    /// The `[offshore]` table: dispatch agent work to a remote Ocean daemon
+    /// (reachable over the tailnet) inside per-job git worktrees. Absent →
+    /// the offshore tool family is not registered (zero behavior change).
+    #[serde(default)]
+    pub offshore: Option<OffshoreSection>,
 }
 
 impl DaemonConfig {
@@ -68,6 +73,75 @@ impl DaemonConfig {
 pub struct McpSection {
     #[serde(default)]
     pub server: Vec<McpServerConfig>,
+}
+
+/// The `[offshore]` table: the remote Ocean daemon the offshore tool family
+/// dispatches to, and the ssh path used to provision its git worktrees.
+///
+/// ```toml
+/// [offshore]
+/// remote_url = "http://100.90.205.60:4780"
+/// ssh_host   = "smathdaddy@100.90.205.60"
+/// # ssh_bin           = "/usr/bin/ssh"   (default)
+/// # remote_root       = "offshore"       (default; dir under the remote $HOME)
+/// # turn_timeout_secs = 900              (default; dispatch is synchronous)
+/// # enabled           = true             (default)
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OffshoreSection {
+    /// Base URL of the remote daemon, e.g. `http://100.90.205.60:4780`.
+    pub remote_url: String,
+    /// ssh destination of the remote box, e.g. `smathdaddy@100.90.205.60`.
+    pub ssh_host: String,
+    /// ssh binary. `None` → `/usr/bin/ssh`.
+    #[serde(default)]
+    pub ssh_bin: Option<String>,
+    /// Directory under the remote `$HOME` holding `mirrors/` and `jobs/`.
+    /// `None` → `offshore`.
+    #[serde(default)]
+    pub remote_root: Option<String>,
+    /// Deadline (seconds) for one synchronous dispatch turn — the remote
+    /// daemon's `POST /v1/agent/turns` responds only when the turn finishes.
+    /// `None` → 900.
+    #[serde(default)]
+    pub turn_timeout_secs: Option<u64>,
+    /// Kill switch: a present-but-disabled table registers nothing.
+    #[serde(default = "default_offshore_enabled")]
+    pub enabled: bool,
+}
+
+fn default_offshore_enabled() -> bool {
+    true
+}
+
+impl OffshoreSection {
+    /// The ssh binary to run, default applied.
+    pub fn ssh_bin(&self) -> &str {
+        self.ssh_bin.as_deref().unwrap_or("/usr/bin/ssh")
+    }
+
+    /// The remote root under `$HOME`, default applied.
+    pub fn remote_root(&self) -> &str {
+        self.remote_root.as_deref().unwrap_or("offshore")
+    }
+
+    /// The synchronous-dispatch deadline in seconds, default applied.
+    pub fn turn_timeout_secs(&self) -> u64 {
+        self.turn_timeout_secs.unwrap_or(900)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if !(self.remote_url.starts_with("http://") || self.remote_url.starts_with("https://")) {
+            anyhow::bail!(
+                "[offshore] remote_url must be an http(s) URL, got `{}`",
+                self.remote_url
+            );
+        }
+        if self.ssh_host.trim().is_empty() {
+            anyhow::bail!("[offshore] ssh_host must not be empty");
+        }
+        Ok(())
+    }
 }
 
 impl DaemonConfig {
@@ -93,6 +167,7 @@ impl DaemonConfig {
             path = %path.display(),
             mcp_servers = cfg.mcp.server.len(),
             stop_hooks = cfg.hooks.count_for(ocean_hooks::HookEvent::Stop),
+            offshore = cfg.offshore.as_ref().is_some_and(|o| o.enabled),
             "loaded daemon config"
         );
         Ok(cfg)
@@ -126,6 +201,9 @@ impl DaemonConfig {
                     s.name
                 );
             }
+        }
+        if let Some(offshore) = &self.offshore {
+            offshore.validate()?;
         }
         self.hooks.validate()?;
         Ok(())
@@ -200,6 +278,99 @@ mod tests {
         let cfg = DaemonConfig::default();
         assert_eq!(cfg.role_model("fast"), None);
         assert_eq!(cfg.advisor_model(), None);
+    }
+
+    #[test]
+    fn loads_offshore_section_with_defaults_applied() {
+        let dir = std::env::temp_dir().join(format!("ocean-cfg-off-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ocean.toml"),
+            r#"
+            [offshore]
+            remote_url = "http://100.90.205.60:4780"
+            ssh_host = "smathdaddy@100.90.205.60"
+            "#,
+        )
+        .unwrap();
+        let cfg = DaemonConfig::load(&dir).unwrap();
+        let offshore = cfg.offshore.expect("offshore section present");
+        assert_eq!(offshore.remote_url, "http://100.90.205.60:4780");
+        assert_eq!(offshore.ssh_host, "smathdaddy@100.90.205.60");
+        // Defaults, applied through the accessors.
+        assert_eq!(offshore.ssh_bin(), "/usr/bin/ssh");
+        assert_eq!(offshore.remote_root(), "offshore");
+        assert_eq!(offshore.turn_timeout_secs(), 900);
+        assert!(offshore.enabled, "present table defaults to enabled");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn loads_offshore_section_with_every_field_set() {
+        let dir = std::env::temp_dir().join(format!("ocean-cfg-off2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ocean.toml"),
+            r#"
+            [offshore]
+            remote_url = "https://tide-net:4780"
+            ssh_host = "me@tide-net"
+            ssh_bin = "/opt/homebrew/bin/ssh"
+            remote_root = "jobs-root"
+            turn_timeout_secs = 1200
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        let cfg = DaemonConfig::load(&dir).unwrap();
+        let offshore = cfg.offshore.expect("offshore section present");
+        assert_eq!(offshore.ssh_bin(), "/opt/homebrew/bin/ssh");
+        assert_eq!(offshore.remote_root(), "jobs-root");
+        assert_eq!(offshore.turn_timeout_secs(), 1200);
+        assert!(!offshore.enabled);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn absent_offshore_table_is_none() {
+        let cfg = DaemonConfig::default();
+        assert!(cfg.offshore.is_none());
+    }
+
+    #[test]
+    fn offshore_with_a_non_http_url_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("ocean-cfg-off3-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ocean.toml"),
+            r#"
+            [offshore]
+            remote_url = "tide-net:4780"
+            ssh_host = "me@tide-net"
+            "#,
+        )
+        .unwrap();
+        let err = DaemonConfig::load(&dir).unwrap_err();
+        assert!(format!("{err:#}").contains("remote_url"), "{err:#}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offshore_with_an_empty_ssh_host_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("ocean-cfg-off4-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ocean.toml"),
+            r#"
+            [offshore]
+            remote_url = "http://tide-net:4780"
+            ssh_host = "  "
+            "#,
+        )
+        .unwrap();
+        let err = DaemonConfig::load(&dir).unwrap_err();
+        assert!(format!("{err:#}").contains("ssh_host"), "{err:#}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
