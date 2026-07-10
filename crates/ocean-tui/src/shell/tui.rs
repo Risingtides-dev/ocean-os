@@ -26,7 +26,12 @@ pub fn init() -> io::Result<Tui> {
     // key strokes, so any pasted newline lands as a real Enter and SUBMITS the
     // composer mid-paste. With it, a paste arrives as one Event::Paste that
     // components insert verbatim.
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     // Kitty keyboard protocol where supported (iTerm2, Ghostty, kitty, WezTerm):
     // without it, modifier combos like Ctrl+Opt+1 are ambiguous or dropped.
     if matches!(supports_keyboard_enhancement(), Ok(true)) {

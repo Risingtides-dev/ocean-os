@@ -411,7 +411,7 @@ impl ChatComponent {
             self.input.drain(c..line_end);
             self.push_kill(killed);
         }
-        if self.cursor.map_or(false, |cur| cur >= self.input.len()) {
+        if self.cursor.is_some_and(|cur| cur >= self.input.len()) {
             self.cursor = None;
         }
         self.reset_history_nav();
@@ -1511,7 +1511,7 @@ impl Component for ChatComponent {
                         let ch = self.input[c..].chars().next().unwrap();
                         let end = c + ch.len_utf8();
                         self.input.drain(c..end);
-                        if self.cursor.map_or(false, |cur| cur >= self.input.len()) {
+                        if self.cursor.is_some_and(|cur| cur >= self.input.len()) {
                             self.cursor = None;
                         }
                         self.reset_history_nav();
@@ -1712,7 +1712,7 @@ impl Component for ChatComponent {
                     let ch = self.input[c..].chars().next().unwrap();
                     let end = c + ch.len_utf8();
                     self.input.drain(c..end);
-                    if self.cursor.map_or(false, |cur| cur >= self.input.len()) {
+                    if self.cursor.is_some_and(|cur| cur >= self.input.len()) {
                         self.cursor = None;
                     }
                 }
@@ -2419,11 +2419,7 @@ impl Component for ChatComponent {
             })
             .sum();
         // Cursor's visual row within its own line (0-indexed)
-        let cursor_row_in_line = if input_w > 0 {
-            (vis_before / input_w) as u16
-        } else {
-            0
-        };
+        let cursor_row_in_line = vis_before.checked_div(input_w).unwrap_or(0) as u16;
         let cursor_vis_row = prior_rows + cursor_row_in_line;
 
         let input_para = Paragraph::new(input_render)
