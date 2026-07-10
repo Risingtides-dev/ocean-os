@@ -468,10 +468,19 @@ mod tests {
                 "kind": kind,
                 "props": {}
             });
-            let res = tool.execute("call-1", args).await.expect(&format!("{kind} must render"));
+            let res = tool
+                .execute("call-1", args)
+                .await
+                .unwrap_or_else(|_| panic!("{kind} must render"));
             let summary = res.content[0].as_text().unwrap();
-            assert!(summary.contains("rendered"), "summary missing for {kind}: {summary}");
-            assert!(!summary.contains("warning"), "unexpected warning for {kind}: {summary}");
+            assert!(
+                summary.contains("rendered"),
+                "summary missing for {kind}: {summary}"
+            );
+            assert!(
+                !summary.contains("warning"),
+                "unexpected warning for {kind}: {summary}"
+            );
 
             // Side effect must carry the Render variant.
             assert_eq!(res.side_effects.len(), 1);

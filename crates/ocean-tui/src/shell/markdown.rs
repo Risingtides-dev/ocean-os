@@ -335,7 +335,7 @@ fn render_table(rows: &[Vec<String>], out: &mut Vec<Line<'static>>) {
             let mut rule = String::from("  ");
             for (ci, cw) in w.iter().enumerate() {
                 if ci > 0 {
-                    rule.push_str(&g("─┼─", "-+-"));
+                    rule.push_str(g("─┼─", "-+-"));
                 }
                 rule.push_str(&g("─", "-").repeat(*cw));
             }

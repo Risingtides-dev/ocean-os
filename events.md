@@ -2083,4 +2083,36 @@ verified: mint 502s clean without a key, append round-trips + shows as
 "[voice handoff] ..." in session turns. NOTE: no OpenAI platform API key is
 configured anywhere yet - realtime voice needs one (openai api_key block in
 ~/.config/ocean-rs/auth.json or OPENAI_API_KEY in the daemon env).
+
+time:      [6:50PM] [07-09-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      backend
+
+John reported claude models dead after OAuth login. Root cause: ocean-protocol's Anthropic provider sent a bare Bearer token — Anthropic rejects sk-ant-oat01 (Claude Code plan) bearers that don't carry the Claude Code fingerprint. Fix (ffca90c): AuthMethod::Bearer now sends `anthropic-beta: oauth-2025-04-20` (apply_auth) and build_body opens the system array with the Claude Code identity block ("You are a Claude agent, built on Anthropic's Claude Agent SDK." — exact string from OMP's claudeCodeSystemInstruction), real system prompt as second block keeping the cache breakpoint on the last stable block; API-key wire shape byte-identical (tests assert no new headers). Deployed: clean worktree build at ffca90c (CARGO_TARGET_DIR=repo target, avoids the other session's dirty tree), binary → target/release/ocean-daemon, launchctl kickstart dev.risingtides.ocean-daemon. Live verification: POST /v1/model claude-sonnet-5 → provider claude-code; POST /v1/agent/turns one-shot completed (92 in / 10 out tokens, 1.7s wall) — real subscription OAuth turn through api.anthropic.com. /v1/models shows every claude model ready:true via the auth-file oauth block (earlier "all not-ready" was my probe reading a nonexistent readiness.ok field — the field is `ready`; no listing bug exists). Daemon default restored to deepseek-v4-pro. cargo test -p ocean-protocol 120 passed.
+_________________________________________________________________________________
+time:      [7:17PM] [07-09-26]
+agent:     [cursor] [grok]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      verification
+area:      backend
+
+Re-verified Claude Code OAuth end-to-end after John said "proceed". Daemon healthy on 127.0.0.1:4780 (LaunchAgent pid listening); auth.json still has claude-code oauth (sk-ant-oat01…). Fresh POST /v1/agent/turns with model_id=claude-sonnet-5 (per-turn override, no global swap) → HTTP 202 ok:true status:completed turn_id=4d5efb81… input_tokens=101 output_tokens=17 wall_ms=1730; daemon log shows provider_stream provider=anthropic model=claude-sonnet-5 api=anthropic-messages. Global /health remained deepseek/deepseek-v4-pro. Confirmed ffca90c+f9c0de9 already on origin (no push needed). /v1/models Claude rows ready:true — earlier NOT-READY was a probe field-name miss (`ready` not `ok`), not a listing bug. /tmp/ocean-daemon-clean already cleaned.
+_________________________________________________________________________________
+time:      [7:25PM] [07-09-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      bug-report
+area:      backend
+
+Provider lane audit after the Claude OAuth verification. GLM/Z.AI proven live: POST /v1/agent/turns model_id=glm-4.7 -> completed (88/4 tokens, 12.8s wall — Z.AI coding plan is slow but real). Codex lane is DOWN: gpt-5.4 -> 401 token_invalidated ("authentication token has been invalidated. Please try signing in again") — OpenAI revoked the grant server-side (expiry Jul 18 irrelevant), and the codex CLI is itself logged out (`codex login status` -> Not logged in; ~/.codex/auth.json gone, only a .bad-20260624 backup), so there is no fresh token to sync. Ocean-side plumbing is complete — oauth_refresh covers openai-codex (auth.openai.com/oauth/token) but refresh cannot resurrect a revoked grant. Fix requires interactive re-auth: TUI /login -> Codex (the flow built this week). Also confirmed oauth_refresh has the claude-code block (console.anthropic.com/v1/oauth/token + tests); claude access token expires ~01:50 UTC tonight — first natural field test of turn-time refresh.
+_________________________________________________________________________________
+time:      [8:09pm] [07-09-26]
+agent:     [claude] [fable 5]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+TUI first-touch/resilience wave, motivated by John's daemon-restart screenshots ("this is brutal"): the workbench shell now survives daemon outages and onboards a zero-state user. New shell/daemon_boot.rs — health monitor (3s offline / 15s healthy probes) with launchd-aware autostart: kickstart (no -k) when the LaunchAgent supervises, direct spawn (cwd=$HOME, child reaped) only when unsupervised; eligibility (default 127.0.0.1:4780 only, OCEAN_TUI_AUTOSTART=0 disables, OCEAN_DAEMON_BIN overrides) checked before any process probe; all blocking work in spawn_blocking. New shell/errfmt.rs — humanizes daemon/provider errors (no raw reqwest blobs anywhere), classifies credential-shaped bodies into /login recovery hints, is_connect_shaped picks honest transcript prefixes. chat.rs: TurnFinished failures now render (they were silently ignored) as sanitized Turn::ErrorNotice, busy cleared only by terminal turn events (SSE reconnect can no longer kill a live turn), welcome empty-state with live provider readiness line (refreshes on OAuth/key saves), unknown-command feedback with near-match suggestions, /help keys section (verified bindings), palette Tab completion + footer hint. Closed all six findings from the pre-merge review (eligibility ordering, async-worker blocking, zombie children, sanitize gaps incl. user prompts/permission lines/status bar, contradictory error prefix, /ready ghost command). Verified: 265/265 cargo test -p ocean-tui, cargo check --workspace clean, release build, tmux smokes (offline humanized status, welcome block, unknown-cmd, /help keys, palette footer; zero raw reqwest lines). Built by a 3-slice rust-engineer wave + 2 integration-fix slices + Tester audit + reviewer gate.
 _________________________________________________________________________________

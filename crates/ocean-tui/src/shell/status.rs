@@ -173,7 +173,7 @@ mod tests {
         d.session = Some("2342d9fa");
         let segs = segments(&d);
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
-        assert!(texts.iter().any(|t| *t == "claude-sonnet-5"));
+        assert!(texts.contains(&"claude-sonnet-5"));
         assert!(texts.iter().any(|t| t.contains("2342d9fa")));
         // No git / rate / tokens / advisor segments when their values are None.
         assert!(!texts.iter().any(|t| t.contains("±") || t.contains("/s") || t.contains("advisor")));

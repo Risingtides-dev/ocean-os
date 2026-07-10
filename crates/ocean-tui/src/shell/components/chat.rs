@@ -21,6 +21,7 @@ use crate::shell::{
     action::{Action, LoginTarget, Nav},
     component::Component,
     diff::{self, DiffKind, DiffRow},
+    errfmt,
     history::PromptHistory,
     markdown::Markdown,
     panel, slash,
@@ -64,6 +65,12 @@ enum Turn {
         note: String,
         severity: String,
         model: String,
+    },
+    /// A terminal-level notice about a turn that failed or was cancelled.
+    /// Rendered as a plain notice line ("✗ turn failed — …"), NOT as an advisor
+    /// card — no severity label, no model attribution.
+    ErrorNotice {
+        note: String,
     },
     /// A gated tool waiting on the operator (OCEAN-185). `resolved` is `None`
     /// while waiting, then Some(allowed).
@@ -126,6 +133,9 @@ pub struct ChatComponent {
     /// Highlighted row in the `@` mention picker.
     mention_sel: usize,
     pub focused: bool,
+    /// Optional provider-status line shown in the welcome empty-state only.
+    /// Set by the app after construction.
+    pub welcome_provider_line: Option<String>,
 }
 
 /// Collapse a tool's `args_json` into a single-line summary for the card header:
@@ -168,7 +178,7 @@ fn inline_value(v: &serde_json::Value) -> String {
 /// cell math) leaves smeared "bleed" that never clears. Other control chars
 /// (ESC sequences, `\r`) can recolor or move the cursor under ratatui's feet
 /// the same way. Tabs become 4 spaces; other control chars drop.
-fn sanitize_line(s: &str) -> String {
+pub(crate) fn sanitize_line(s: &str) -> String {
     if !s.chars().any(|c| c.is_control()) {
         return s.to_string();
     }
@@ -517,6 +527,23 @@ impl ChatComponent {
         }
     }
 
+    /// Whether Tab should route to the composer instead of cycling focus — true
+    /// when the `/` palette or `@` mention picker is open (both handle Tab for
+    /// completion, but app.rs swallows it for focus-cycling first).
+    pub fn wants_tab(&self) -> bool {
+        // `/` palette: input starts with `/`, no whitespace in query.
+        if let Some(q) = self.input.strip_prefix('/') {
+            if !q.contains(char::is_whitespace) {
+                return true;
+            }
+        }
+        // `@` mention picker: trailing token starts with `@`.
+        self.input
+            .rsplit(char::is_whitespace)
+            .next()
+            .is_some_and(|t| t.starts_with('@'))
+    }
+
     /// Whether a turn is currently streaming (submit → TurnFinished). The app's
     /// render loop animates at tick rate only while this (or a live PTY) is
     /// true, instead of redrawing 60Hz forever.
@@ -765,6 +792,34 @@ impl ChatComponent {
             }
             body.push_str(&format!("- `{}` — {}\n", c.name, c.desc));
         }
+        body.push_str("\n# keys\n");
+        body.push_str("• ⏎ — send\n");
+        body.push_str("• ⌃J — newline in composer\n");
+        body.push_str("• ⌃O — toggle tool-card expansion\n");
+        body.push_str("• ⌃R — fuzzy history search\n");
+        body.push_str("• ⌃U — kill composer line\n");
+        body.push_str("• ⌃K — kill to end of line\n");
+        body.push_str("• ⌃Y — yank / allow permission\n");
+        body.push_str("• ⌃N — deny permission\n");
+        body.push_str("• PgUp — scroll transcript up\n");
+        body.push_str("• PgDn — scroll transcript down\n");
+        body.push_str("• ↑ — history prev (when composer empty)\n");
+        body.push_str("• ↓ — history next (when composer empty)\n");
+        body.push_str("• / — command palette\n");
+        body.push_str("• ↑↓ — palette select\n");
+        body.push_str("• ⏎ — palette run\n");
+        body.push_str("• ⇥ — palette complete\n");
+        body.push_str("• esc — palette dismiss\n");
+        body.push_str("• ⌃Q — quit\n");
+        body.push_str("• Tab — cycle focus (except in palette)\n");
+        body.push_str("• ⌃⌥1 — sessions pane\n");
+        body.push_str("• ⌃⌥2 — files pane\n");
+        body.push_str("• ⌃⌥3 — chat pane\n");
+        body.push_str("• ⌃⌥4 — editor pane\n");
+        body.push_str("• ⌃⌥5 — graph pane\n");
+        body.push_str("• ⌃⌥6 — terminal pane\n");
+        body.push_str("• ⌃⌥↑↓ — resize terminal dock\n");
+        body.push_str("• esc — back to chat (from other panes)\n");
         self.turns.push(Turn::Assistant(body));
     }
 
@@ -954,7 +1009,7 @@ impl ChatComponent {
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                format!(" {} select · ⏎ run · esc dismiss{more}", g("↑↓", "^v")),
+                format!(" ⇥ complete · {} select · ⏎ run · esc dismiss{more}", g("↑↓", "^v")),
                 Style::default().fg(theme::COMMENT),
             ))
             .style(Style::default().bg(theme::SLATE)),
@@ -1287,6 +1342,23 @@ impl Component for ChatComponent {
                     if slash::is_command(name) {
                         return self.run_slash(name, args);
                     }
+                    // First token looks like a command name (lowercase letters,
+                    // digits, hyphens — no path-like slashes/dots). Treat it as
+                    // an unknown command, not a chat prompt, so the user gets
+                    // actionable feedback instead of a silent send.
+                    let looks_like_cmd = name
+                        .strip_prefix('/')
+                        .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+                        .unwrap_or(false);
+                    if looks_like_cmd {
+                        let hint = if let Some(nearest) = slash::nearest(name) {
+                            format!("unknown command {name} — did you mean {nearest}?  /help lists commands")
+                        } else {
+                            format!("unknown command {name} — /help lists commands")
+                        };
+                        self.turns.push(Turn::Assistant(hint.clone()));
+                        return Some(Action::Status(hint));
+                    }
                 }
                 self.history.push(&text); // persist for ↑/↓ + ⌃R recall
                 self.reset_history_nav();
@@ -1329,8 +1401,14 @@ impl Component for ChatComponent {
         // and put the prompt back in the composer so nothing typed is lost.
         if let Action::TurnSendFailed { prompt, err } = action {
             self.busy = false;
+            let msg = errfmt::humanize(err);
+            let prefix = if errfmt::is_connect_shaped(err) {
+                "couldn't reach the daemon"
+            } else {
+                "turn could not start"
+            };
             self.turns.push(Turn::Assistant(format!(
-                "{} couldn't reach the daemon — {err}\n\nYour prompt is back in the composer; press ⏎ to retry.",
+                "{} {prefix} — {msg}\n\nYour prompt is back in the composer; press ⏎ to retry.",
                 g("⚠", "!")
             )));
             if self.input.is_empty() {
@@ -1423,7 +1501,25 @@ impl Component for ChatComponent {
                         }
                     }
                 }
-                AgentTurnEvent::TurnFinished { .. } => self.busy = false,
+                AgentTurnEvent::TurnFinished {
+                    status, error, ..
+                } => {
+                    self.busy = false;
+                    let is_failure =
+                        matches!(status, ocean_agent_sdk::AgentTurnStatus::Failed | ocean_agent_sdk::AgentTurnStatus::Cancelled);
+                    if is_failure || error.is_some() {
+                        let note = if let Some(e) = error {
+                            format!(
+                                "{} turn failed — {}",
+                                g("✗", "X"),
+                                errfmt::humanize(e)
+                            )
+                        } else {
+                            format!("{} turn failed — no error detail", g("✗", "X"))
+                        };
+                        self.turns.push(Turn::ErrorNotice { note });
+                    }
+                }
                 AgentTurnEvent::Extension {
                     extension, payload, ..
                 } if extension == "advisor" => self.push_advisor(payload),
@@ -1488,13 +1584,50 @@ impl Component for ChatComponent {
         let busy = self.busy;
         let n_turns = self.turns.len();
         let mut lines: Vec<Line> = Vec::new();
+        // ── welcome empty-state: friendly hints until the first message ──────
+        if self.turns.is_empty() {
+            // Center vertically with some top padding.
+            let vpad = (body.height.saturating_sub(8)) / 2;
+            for _ in 0..vpad {
+                lines.push(Line::from(""));
+            }
+            // "OCEAN" title
+            lines.push(Line::from(Span::styled(
+                "  OCEAN",
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            // Provider line
+            if let Some(pline) = &self.welcome_provider_line {
+                lines.push(Line::from(Span::styled(
+                    format!("  {pline}"),
+                    Style::default().fg(theme::YELLOW),
+                )));
+                lines.push(Line::from(""));
+            }
+            // Hints
+            let hints = [
+                "⏎ send · ⌃J newline · / commands",
+                "/login — connect a provider",
+                "/models — pick a model + thinking",
+                "/help — everything else",
+            ];
+            for hint in &hints {
+                lines.push(Line::from(Span::styled(
+                    format!("  {hint}"),
+                    Style::default().fg(theme::COMMENT),
+                )));
+            }
+        }
         for (ti, turn) in self.turns.iter().enumerate() {
             match turn {
                 Turn::User(s) => {
                     lines.push(Line::from(vec![
                         Span::styled(g("❯ ", "> "), Style::default().fg(theme::CYAN)),
                         Span::styled(
-                            s.clone(),
+                            sanitize_line(s),
                             Style::default()
                                 .fg(theme::CYAN)
                                 .add_modifier(Modifier::BOLD),
@@ -1523,7 +1656,7 @@ impl Component for ChatComponent {
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
-                                    tool.clone(),
+                                    sanitize_line(tool),
                                     Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
                                 ),
                             ]));
@@ -1532,7 +1665,7 @@ impl Component for ChatComponent {
                                     format!("  {} ", g("▎", "|")),
                                     Style::default().fg(theme::YELLOW),
                                 ),
-                                Span::styled(reason.clone(), Style::default().fg(theme::FG)),
+                                Span::styled(sanitize_line(reason), Style::default().fg(theme::FG)),
                             ]));
                             lines.push(Line::from(Span::styled(
                                 "  ⌃Y allow · ⌃N deny",
@@ -1540,14 +1673,16 @@ impl Component for ChatComponent {
                             )));
                         }
                         Some(true) => {
+                            let st = sanitize_line(tool);
                             lines.push(Line::from(Span::styled(
-                                format!("  {} allowed: {tool}", g("✓", "+")),
+                                format!("  {} allowed: {st}", g("✓", "+")),
                                 Style::default().fg(theme::GREEN),
                             )));
                         }
                         Some(false) => {
+                            let st = sanitize_line(tool);
                             lines.push(Line::from(Span::styled(
-                                format!("  {} denied: {tool}", g("✗", "x")),
+                                format!("  {} denied: {st}", g("✗", "x")),
                                 Style::default().fg(theme::RED),
                             )));
                         }
@@ -1719,27 +1854,44 @@ impl Component for ChatComponent {
                         "concern" => theme::YELLOW,
                         _ => theme::COMMENT,
                     };
+                    let sev = sanitize_line(severity);
                     let mut header: Vec<Span> = vec![Span::styled(
-                        format!("  {} advisor ({severity})", g("⚑", "!")),
+                        format!("  {} advisor ({sev})", g("⚑", "!")),
                         Style::default().fg(accent).add_modifier(Modifier::BOLD),
                     )];
                     if !model.is_empty() {
+                        let san_model = sanitize_line(model);
                         header.push(Span::styled(
-                            format!("  · {model}"),
+                            format!("  · {san_model}"),
                             Style::default()
                                 .fg(theme::COMMENT)
                                 .add_modifier(Modifier::DIM),
                         ));
                     }
                     lines.push(Line::from(header));
+                    let notice_w = (body.width as usize).saturating_sub(2);
                     for l in note.lines() {
+                        let sane = sanitize_line(l);
                         lines.push(Line::from(vec![
                             Span::styled(
                                 format!("  {} ", g("▎", "|")),
                                 Style::default().fg(accent),
                             ),
-                            Span::styled(l.to_string(), Style::default().fg(theme::FG)),
+                            Span::styled(
+                                clamp_line(&sane, notice_w),
+                                Style::default().fg(theme::FG),
+                            ),
                         ]));
+                    }
+                }
+                Turn::ErrorNotice { note } => {
+                    let notice_w = (body.width as usize).saturating_sub(2);
+                    for l in note.lines() {
+                        let sane = sanitize_line(l);
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", clamp_line(&sane, notice_w)),
+                            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                        )));
                     }
                 }
             }
@@ -1841,7 +1993,9 @@ impl Component for ChatComponent {
 mod tests {
     use super::*;
     use crate::shell::action::LoginTarget;
+    use ocean_agent_sdk::{AgentSessionId, AgentTurnId, AgentTurnStatus, AgentTurnEvent};
     use serde_json::json;
+    use uuid::Uuid;
 
     /// A chat with the composer pre-filled — avoids the `field_reassign_with_default`
     /// clippy lint that fires on `let mut c = default(); c.input = …`.
@@ -1851,6 +2005,26 @@ mod tests {
             ..Default::default()
         }
     }
+    fn render_chat_to_string(chat: &mut ChatComponent, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| chat.draw(frame, frame.area()))
+            .expect("draw chat");
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
 
     fn extension(extension: &str, payload: serde_json::Value) -> Action {
         Action::AgentEvent(Box::new(AgentTurnEvent::Extension {
@@ -2342,5 +2516,363 @@ mod tests {
         ));
         chat.handle_key(ctrl('y'));
         assert_eq!(chat.input, "yankable");
+    }
+
+    // ── unknown-command feedback ────────────────────────────────────────────
+
+    #[test]
+    fn unknown_command_does_not_submit_as_prompt() {
+        let mut chat = chat_with("/notacommand");
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Must be a Status, not SubmittedPrompt.
+        assert!(
+            matches!(&act, Some(Action::Status(s)) if s.contains("unknown command /notacommand")),
+            "expected Status with 'unknown command', got {act:?}"
+        );
+        // No user turn was pushed to the transcript.
+        assert!(
+            !chat.turns.iter().any(|t| matches!(t, Turn::User(_))),
+            "unknown command must not create a user turn"
+        );
+    }
+    #[test]
+    fn unknown_command_near_match_suggests_correction() {
+        // "/provder xyz" — whitespace closes the palette, so Enter reaches the
+        // unknown-command branch instead of palette-run. The near-match path
+        // only fires for the `/cmd args` form, not single-token palette use.
+        let mut chat = chat_with("/provder xyz");
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&act, Some(Action::Status(s)) if s.contains("did you mean /providers")),
+            "fuzzy near-match should suggest /providers, got {act:?}"
+        );
+        // Also surfaced in the transcript as an Assistant block.
+        assert!(
+            chat.turns.iter().any(|t| {
+                matches!(t, Turn::Assistant(s) if s.contains("did you mean /providers"))
+            }),
+            "near-match hint should appear in transcript"
+        );
+    }
+    #[test]
+    fn path_like_slash_still_submits_as_prompt() {
+        // "/etc/passwd hi" — looks like a path (has a second slash), not a
+        // command name. Must fall through to normal chat submission.
+        let mut chat = chat_with("/etc/passwd hi");
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&act, Some(Action::SubmitPrompt(s)) if s == "/etc/passwd hi"),
+            "path-like slash input must submit as prompt, got {act:?}"
+        );
+    }
+
+    #[test]
+    fn slash_known_command_still_works() {
+        // Regression: /help must still work as before.
+        let mut chat = chat_with("/help");
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // /help pushes to transcript, returns None (not a Status or Submit).
+        assert!(
+            act.is_none(),
+            "/help should return None after pushing output, got {act:?}"
+        );
+        assert!(
+            chat.turns.iter().any(|t| matches!(t, Turn::Assistant(s) if s.contains("/quit"))),
+            "/help should list commands in transcript"
+        );
+    }
+
+    // ── wants_tab ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wants_tab_true_when_palette_open() {
+        let chat = chat_with("/mod");
+        assert!(chat.wants_tab(), "palette is open, Tab should route to chat");
+    }
+
+    #[test]
+    fn wants_tab_false_when_palette_closed() {
+        let chat = chat_with("hello");
+        assert!(!chat.wants_tab(), "no palette, Tab should cycle focus");
+    }
+
+    #[test]
+    fn wants_tab_true_when_mention_picker_open() {
+        let chat = chat_with("read @src/main.rs");
+        assert!(chat.wants_tab(), "mention picker is open, Tab should route to chat");
+    }
+
+    #[test]
+    fn wants_tab_false_when_slash_has_whitespace() {
+        // "/model gpt" — palette closed (space typed), Tab should cycle focus.
+        let chat = chat_with("/model gpt");
+        assert!(!chat.wants_tab());
+    }
+
+    #[test]
+    fn welcome_empty_state_disappears_after_first_transcript_turn() {
+        let mut chat = ChatComponent {
+            welcome_provider_line: Some("provider sentinel".into()),
+            ..Default::default()
+        };
+
+        let empty = render_chat_to_string(&mut chat, 80, 24);
+        assert!(
+            empty.contains("OCEAN"),
+            "empty transcript should render the welcome title"
+        );
+        assert!(
+            empty.contains("provider sentinel"),
+            "empty transcript should show the provider status line"
+        );
+
+        chat.turns.push(Turn::User("hello ocean".into()));
+        let filled = render_chat_to_string(&mut chat, 80, 24);
+
+        assert!(
+            filled.contains("hello ocean"),
+            "existing transcript should render the user turn"
+        );
+        assert!(
+            !filled.contains("provider sentinel"),
+            "welcome provider line must not appear once transcript is non-empty"
+        );
+    }
+    // ── turn-terminal paths ──────────────────────────────────────────────────
+
+    fn turn_finished(status: AgentTurnStatus, error: Option<&str>) -> Action {
+        Action::AgentEvent(Box::new(AgentTurnEvent::TurnFinished {
+            session_id: AgentSessionId(Uuid::nil()),
+            turn_id: AgentTurnId(Uuid::nil()),
+            status,
+            error: error.map(|s| s.to_string()),
+            wall_ms: None,
+            output_tokens: None,
+            input_tokens: None,
+            cache_read_tokens: None,
+            tokens_per_second: None,
+        }))
+    }
+
+    #[test]
+    fn turn_finished_with_error_pushes_error_notice_and_clears_busy() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&turn_finished(
+            ocean_agent_sdk::AgentTurnStatus::Failed,
+            Some("HTTP 401 Unauthorized"),
+        ));
+        assert!(!chat.busy, "busy must be cleared on TurnFinished");
+        assert!(
+            chat.turns
+                .iter()
+                .any(|t| matches!(t, Turn::ErrorNotice { note } if note.contains("turn failed"))),
+            "failed turn with error should push an ErrorNotice"
+        );
+    }
+
+    #[test]
+    fn turn_finished_provider_auth_error_uses_login_recovery_notice() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+
+        chat.update(&turn_finished(
+            ocean_agent_sdk::AgentTurnStatus::Failed,
+            Some("{\"error\":{\"message\":\"token_invalidated\"}}"),
+        ));
+
+        assert!(!chat.busy, "terminal failed event must clear busy");
+        let notice = chat.turns.iter().find_map(|t| match t {
+            Turn::ErrorNotice { note } => Some(note.as_str()),
+            _ => None,
+        });
+        assert!(
+            matches!(notice, Some(note) if note.contains("run /login to reconnect")),
+            "provider credential failures should render /login recovery guidance, got {notice:?}"
+        );
+        assert!(
+            !chat.turns.iter().any(|t| matches!(t, Turn::Advisor { .. })),
+            "turn-terminal failures should render as ErrorNotice, not advisor cards"
+        );
+    }
+
+    #[test]
+    fn turn_finished_failed_no_error_renders_fallback() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&turn_finished(
+            ocean_agent_sdk::AgentTurnStatus::Failed,
+            None,
+        ));
+        assert!(!chat.busy);
+        assert!(
+            chat.turns
+                .iter()
+                .any(|t| matches!(t, Turn::ErrorNotice { note } if note.contains("no error detail"))),
+            "failed turn without error should push ErrorNotice"
+        );
+    }
+
+    #[test]
+    fn turn_finished_cancelled_pushes_error_notice() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&turn_finished(
+            ocean_agent_sdk::AgentTurnStatus::Cancelled,
+            None,
+        ));
+        assert!(!chat.busy);
+        assert!(
+            chat.turns
+                .iter()
+                .any(|t| matches!(t, Turn::ErrorNotice { note } if note.contains("turn failed"))),
+            "cancelled turn should push an ErrorNotice"
+        );
+    }
+
+    #[test]
+    fn turn_finished_completed_clears_busy_without_notice() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&turn_finished(
+            ocean_agent_sdk::AgentTurnStatus::Completed,
+            None,
+        ));
+        assert!(!chat.busy);
+        assert!(
+            !chat
+                .turns
+                .iter()
+                .any(|t| matches!(t, Turn::Advisor { .. } | Turn::ErrorNotice { .. })),
+            "successful turns should push neither advisor nor error notice"
+        );
+    }
+
+
+    // ── SSE reconnect does not clear busy ────────────────────────────────────
+
+    #[test]
+    fn stream_reconnect_does_not_clear_busy() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&Action::Status("stream reconnected".into()));
+        assert!(chat.busy, "reconnect must not clear busy — only terminal events do");
+        assert!(chat.turns.is_empty(), "reconnect must not push turns");
+    }
+
+    #[test]
+    fn stream_reconnecting_during_busy_does_not_clear_busy() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&Action::Status("stream reconnecting…".into()));
+        assert!(chat.busy, "reconnecting must not clear busy");
+        assert!(chat.turns.is_empty(), "reconnecting must not push turns");
+    }
+
+    // ── sanitize_line at error-notice boundary ───────────────────────────────
+
+    #[test]
+    fn sanitize_line_strips_control_chars() {
+        let input = "hello\x1b[31mworld\x07\t tab\r\nnew";
+        let got = sanitize_line(input);
+        assert!(!got.contains('\x1b'), "ESC stripped");
+        assert!(!got.contains('\x07'), "BEL stripped");
+        assert!(!got.contains('\r'), "CR stripped");
+        assert!(!got.contains('\n'), "LF stripped");
+        assert!(got.contains("    "), "tab expanded to spaces");
+        assert!(got.contains("hello"), "normal chars preserved");
+        assert!(got.contains("world"), "normal chars preserved");
+        assert!(got.contains(" tab"), "normal chars preserved");
+        assert!(got.contains("new"), "normal chars preserved");
+    }
+
+    #[test]
+    fn error_notice_render_strips_terminal_control_chars() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::ErrorNotice {
+            note: "✗ turn failed — raw\tbad\x1b[31m\rline".into(),
+        });
+
+        let screen = render_chat_to_string(&mut chat, 80, 12);
+
+        assert!(!screen.contains('\t'), "rendered notice must not contain tabs");
+        assert!(!screen.contains('\x1b'), "rendered notice must not contain ESC");
+        assert!(!screen.contains('\r'), "rendered notice must not contain CR");
+        assert!(
+            screen.contains("raw    bad[31mline"),
+            "sanitized notice should preserve readable text and expand tabs, got: {screen:?}"
+        );
+    }
+
+    // ── sanitize_line on user prompt render path ─────────────────────────
+
+    #[test]
+    fn user_prompt_render_strips_control_chars() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::User("hey\x1b[31mthere\tbad\rline".into()));
+
+        let screen = render_chat_to_string(&mut chat, 80, 12);
+
+        assert!(!screen.contains('\t'), "user prompt must not contain tabs");
+        assert!(!screen.contains('\x1b'), "user prompt must not contain ESC");
+        assert!(!screen.contains('\r'), "user prompt must not contain CR");
+        assert!(
+            screen.contains("hey[31mthere    badline"),
+            "sanitized user prompt should preserve readable text, got: {screen:?}"
+        );
+    }
+
+    // ── TurnSendFailed prefix ────────────────────────────────────────────
+
+    #[test]
+    fn turn_send_failed_connect_uses_daemon_prefix() {
+        let mut chat = ChatComponent::default();
+        chat.update(&Action::TurnSendFailed {
+            prompt: "hi".into(),
+            err: "tcp connect error: Connection refused (os error 61)".into(),
+        });
+        assert_eq!(chat.turns.len(), 1, "should push one Assistant turn");
+        let Turn::Assistant(msg) = &chat.turns[0] else {
+            panic!("expected Assistant turn");
+        };
+        assert!(
+            msg.contains("couldn't reach the daemon"),
+            "connect error should use daemon prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn turn_send_failed_non_connect_uses_neutral_prefix() {
+        let mut chat = ChatComponent::default();
+        chat.update(&Action::TurnSendFailed {
+            prompt: "hi".into(),
+            err: "turn: HTTP 401 Unauthorized".into(),
+        });
+        assert_eq!(chat.turns.len(), 1, "should push one Assistant turn");
+        let Turn::Assistant(msg) = &chat.turns[0] else {
+            panic!("expected Assistant turn");
+        };
+        assert!(
+            msg.contains("turn could not start"),
+            "non-connect error should use neutral prefix, got: {msg}"
+        );
+        assert!(
+            !msg.contains("couldn't reach the daemon"),
+            "non-connect error must not use daemon prefix, got: {msg}"
+        );
     }
 }

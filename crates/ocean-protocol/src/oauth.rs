@@ -126,8 +126,7 @@ mod tests {
         let url = fake_endpoint("400 Bad Request", r#"{"error":"invalid_grant"}"#).await;
         let err = refresh_token(&url, "client-1", "old-rt")
             .await
-            .err()
-            .expect("400 must be an error");
+            .expect_err("400 must be an error");
         let msg = format!("{err}");
         assert!(msg.contains("400"), "{msg}");
         assert!(
