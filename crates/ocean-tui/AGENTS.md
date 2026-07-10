@@ -43,6 +43,13 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 ## Work Guidance
 
 - Preserve keyboard-driven workflows and terminal responsiveness.
+- Chat composer (`shell/components/chat.rs`): `cursor` is a UTF-8 byte offset
+  (`None` = end). Every input replacement/insert/delete/kill/completion path
+  must preserve that invariant. Readline keys are cursor-relative; `Ctrl+Y`
+  remains permission-first, `Ctrl+L` clears only an idle transcript, and
+  `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
+  and scroll use Unicode cell width and follow the cursor row, never the final
+  input row.
 - Prefer clear status/error presentation over hidden failures (see
   `ModelRerouted` — resilience must never silently lie to the operator).
 - Keep the launch cwd as the active surface root; auto-resume must not overwrite it with a stored session root.

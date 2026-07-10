@@ -2225,4 +2225,11 @@ type:      [feature-request]
 area:      [backend]
 
 Completed voice phase 4: the daemon now owns the xAI speech credential. Added POST /v1/voice/stt (raw audio bytes -> multipart grok-stt relay -> {text}) and POST /v1/voice/tts ({text,voice?} -> grok-tts -> audio bytes) in a new voice_speech module (pure body builders + normalizers unit-tested; shared LazyLock bounded client, connect 10s / request 60s). Credential resolves per-request via ocean-providers resolve_xai_api_key (env XAI_API_KEY -> auth.json xai block), so key rotation needs no restart; errors never carry the key. Empty transcripts stay valid empty text, mirroring the legacy proxy contract for silence utterances. Also drove the realtime upstream-body test from DEFAULT_REALTIME_MODEL instead of a stale hardcoded id. The surface proxy's /api/stt and /api/tts forward here as of the paired ocean-surface landing; the proxy no longer reads any xAI key.
+time:      [05:23am] [10-07-26]
+agent:     [omp] [openai-codex/gpt-5.6-sol]
+worktree:  feat/ocean-tui-shell-rebuild
+type:      feature-request
+area:      frontend
+
+Implemented a real readline-style Ocean TUI composer. The chat input now tracks a UTF-8-safe cursor and supports cursor-relative Backspace/Delete, Home/End, Left/Right, Ctrl+A/E/B/F/D/K/U/W/Y/L, mid-buffer typing/paste/newlines, Unicode-width caret rendering, and cursor-following wrapped scroll; Ctrl+Y remains permission-first, Ctrl+L refuses to clear a busy stream, and Up/Down keep their history/picker contract. Slash completion reseats the cursor, `/model` trims arguments, and cursor-relative @mention completion preserves suffix text and Unicode whitespace boundaries. TDD covered 18 cursor/reviewer regressions; `cargo test -p ocean-tui` passed 295 tests with 4 ignored, `cargo check --workspace` passed, release build passed, live tmux key smoke rendered `>abXcd` at the expected cursor position, and Knox returned `ACK: ready to land`.
 _________________________________________________________________________________

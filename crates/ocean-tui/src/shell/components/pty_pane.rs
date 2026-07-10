@@ -62,6 +62,18 @@ impl Component for PtyComponent {
         None
     }
 
+    /// Bracketed paste: forward to the child terminal (bracket-aware — see
+    /// `TermPane::paste`).
+    fn handle_paste(&mut self, text: &str) -> Option<Action> {
+        if !self.focused {
+            return None;
+        }
+        if let Some(t) = self.term.as_mut() {
+            t.paste(text);
+        }
+        None
+    }
+
     fn tick(&mut self) -> Option<Action> {
         if let Some(t) = self.term.as_mut() {
             if t.pump() {

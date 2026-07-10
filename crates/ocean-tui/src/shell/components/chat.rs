@@ -16,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::shell::{
     action::{Action, LoginTarget, Nav},
@@ -35,6 +36,12 @@ const TOOL_TAIL_ROWS: usize = 3;
 /// Collapsed diff cards show at most this many rows; ⌃O (the same global expand
 /// toggle as tool output) reveals the full hunk.
 const DIFF_TAIL_ROWS: usize = 12;
+
+/// Collapsed mode shows at most this many ok/running tool one-liners per
+/// consecutive tool run; older ones compact into one "· N earlier tools" line.
+/// Without this a 30-tool turn floods the whole transcript with cards even in
+/// the minimized mode. Errors are never hidden; ⌃O expands everything.
+const BURST_TAIL_TOOLS: usize = 3;
 
 /// Kill-ring depth (⌃U / ⌃K push, ⌃Y yanks the newest).
 const KILL_RING_CAP: usize = 10;
@@ -102,6 +109,10 @@ pub struct ChatComponent {
     input: String,
     model: Option<String>,
     busy: bool,
+    /// Byte-index cursor position in the composer. `None` means trailing
+    /// (at `input.len()`), which is also the Default so `chat_with` and
+    /// direct `input = …` writes all self-seat at the end.
+    cursor: Option<usize>,
     /// Scrollback offset in lines from the bottom (0 = stick to live tail).
     scroll_back: usize,
     /// Highlighted row in the `/` command palette (see `slash_matches`).
@@ -221,7 +232,18 @@ fn diff_line(row: &DiffRow) -> Line<'static> {
 /// Flatten whitespace to single spaces and truncate to `max` chars with an
 /// ellipsis.
 fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Flatten whitespace, then drop any remaining control bytes: this string
+    // lands in a ratatui `Span`, and one raw ESC/CSI sequence repaints the
+    // terminal underneath ratatui's cell math (the collapsed-card screen
+    // smear). `split_whitespace` already eats tabs/newlines/CRs; ESC is NOT
+    // whitespace and would sail through without the filter.
+    let flat: String = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     if flat.chars().count() > max {
         let head: String = flat.chars().take(max.saturating_sub(1)).collect();
         format!("{head}{}", g("…", "..."))
@@ -243,6 +265,32 @@ fn clamp_line(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Normalize a bracketed paste for the composer: CRLF/CR become plain
+/// newlines (kept — the composer is multi-line via ⌃J), tabs become four
+/// spaces, and every other control byte drops (an ESC sequence must never
+/// reach a `Span`). Pasted newlines are CONTENT, never synthetic Enter
+/// presses — the pre-bracketed-paste terminal replayed them as real key
+/// events and auto-submitted mid-paste.
+pub(crate) fn paste_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl ChatComponent {
@@ -283,6 +331,7 @@ impl ChatComponent {
         };
         self.history_idx = Some(idx);
         self.input = self.history.get(idx).unwrap_or("").to_string();
+        self.cursor = None;
         self.menu_sel = 0;
     }
 
@@ -295,8 +344,10 @@ impl ChatComponent {
         if i + 1 < self.history.len() {
             self.history_idx = Some(i + 1);
             self.input = self.history.get(i + 1).unwrap_or("").to_string();
+            self.cursor = None;
         } else {
             self.input = std::mem::take(&mut self.draft);
+            self.cursor = None;
             self.history_idx = None;
         }
         self.menu_sel = 0;
@@ -315,43 +366,185 @@ impl ChatComponent {
         }
     }
 
-    /// ⌃U — kill the whole composer (cursor is pinned to the end, so kill-to-
-    /// start is the entire line) onto the ring.
+    /// ⌃U — kill from the start of the current line to the cursor onto the ring.
     fn kill_to_start(&mut self) {
-        if !self.input.is_empty() {
-            let killed = std::mem::take(&mut self.input);
-            self.push_kill(killed);
-            self.reset_history_nav();
-            self.menu_sel = 0;
+        if self.input.is_empty() {
+            return;
         }
+        let c = self.cursor_byte();
+        let line_start = self.input[..c].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if line_start == c {
+            return;
+        }
+        let killed = self.input[line_start..c].to_string();
+        self.input.drain(line_start..c);
+        self.push_kill(killed);
+        self.cursor = (line_start < self.input.len()).then_some(line_start);
+        self.reset_history_nav();
+        self.menu_sel = 0;
     }
 
-    /// ⌃K — kill the current (last) line's content onto the ring. With the
-    /// cursor at the end, "kill-to-end" is empty, so this is adapted to trim the
-    /// final line (equals ⌃U on a single-line composer, trims just the tail line
-    /// on a multi-line one). Judgment call — the composer has no horizontal
-    /// cursor.
+    /// ⌃K — kill from the cursor to the end of the current line. At end of
+    /// buffer → no-op. At a non-final line end (cursor sits on `\n`) the
+    /// newline is killed, joining the lines. Mid-line kills through end of
+    /// line but preserves the newline.
     fn kill_to_end(&mut self) {
-        let killed = match self.input.rfind('\n') {
-            Some(nl) => self.input.split_off(nl + 1),
-            None => std::mem::take(&mut self.input),
-        };
-        if !killed.is_empty() {
-            self.push_kill(killed);
-            self.reset_history_nav();
-            self.menu_sel = 0;
+        if self.input.is_empty() {
+            return;
         }
+        let c = self.cursor_byte();
+        if c == self.input.len() {
+            return;
+        } // at buffer end → no-op
+        let line_end = self.input[c..]
+            .find('\n')
+            .map(|i| c + i)
+            .unwrap_or(self.input.len());
+        if c == line_end {
+            // Cursor sits on a newline (non-final line). Kill the newline to join lines.
+            let end = c + 1; // skip the '\n'
+            let killed = self.input[c..end].to_string();
+            self.input.drain(c..end);
+            self.push_kill(killed);
+        } else {
+            let killed = self.input[c..line_end].to_string();
+            self.input.drain(c..line_end);
+            self.push_kill(killed);
+        }
+        if self.cursor.map_or(false, |cur| cur >= self.input.len()) {
+            self.cursor = None;
+        }
+        self.reset_history_nav();
+        self.menu_sel = 0;
     }
 
-    /// ⌃Y — yank the newest kill at the cursor (end). NOTE: a pending permission
-    /// takes precedence over yank (see `handle_key`); this only runs when none
-    /// is pending.
+    /// ⌃Y — yank the newest kill at the cursor.
     fn yank(&mut self) {
         if let Some(kill) = self.kill_ring.last().cloned() {
-            self.input.push_str(&kill);
+            let c = self.cursor_byte();
+            self.input.insert_str(c, &kill);
+            let new_cursor = c + kill.len();
+            self.cursor = if new_cursor == self.input.len() {
+                None
+            } else {
+                Some(new_cursor)
+            };
             self.reset_history_nav();
             self.menu_sel = 0;
         }
+    }
+
+    // ── cursor movement / helpers ──────────────────────────────────────────
+
+    /// Effective byte offset of the cursor. `None` → input end.
+    fn cursor_byte(&self) -> usize {
+        self.cursor
+            .map_or(self.input.len(), |c| c.min(self.input.len()))
+    }
+
+    /// Move the cursor one Unicode scalar to the left.
+    fn cursor_left(&mut self) {
+        let c = self.cursor_byte();
+        if c > 0 {
+            let mut prev = c - 1;
+            while prev > 0 && !self.input.is_char_boundary(prev) {
+                prev -= 1;
+            }
+            self.cursor = Some(prev);
+        }
+    }
+
+    /// Move the cursor one Unicode scalar to the right.
+    fn cursor_right(&mut self) {
+        let c = self.cursor_byte();
+        if c < self.input.len() {
+            let mut next = c + 1;
+            while next < self.input.len() && !self.input.is_char_boundary(next) {
+                next += 1;
+            }
+            if next == self.input.len() {
+                self.cursor = None;
+            } else {
+                self.cursor = Some(next);
+            }
+        }
+    }
+
+    /// Move the cursor to the start of the current line.
+    fn cursor_line_start(&mut self) {
+        let c = self.cursor_byte();
+        let line_start = self.input[..c].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if line_start != c {
+            self.cursor = Some(line_start);
+        }
+    }
+
+    /// Move the cursor to the end of the current line.
+    fn cursor_line_end(&mut self) {
+        let c = self.cursor_byte();
+        let line_end = self.input[c..]
+            .find('\n')
+            .map(|i| c + i)
+            .unwrap_or(self.input.len());
+        if line_end == self.input.len() {
+            self.cursor = None;
+        } else {
+            self.cursor = Some(line_end);
+        }
+    }
+
+    /// Insert a `&str` at the cursor and advance past it. Leaves cursor at
+    /// `None` when the insertion reaches the end.
+    fn insert_at_cursor(&mut self, s: &str) {
+        let c = self.cursor_byte();
+        self.input.insert_str(c, s);
+        let new_cursor = c + s.len();
+        self.cursor = if new_cursor == self.input.len() {
+            None
+        } else {
+            Some(new_cursor)
+        };
+    }
+
+    // ── word-kill helper (⌃W) ──────────────────────────────────────────────
+
+    /// Kill the word before the cursor onto the ring. Two-phase: first consume
+    /// the trailing whitespace run, then the preceding non-whitespace word.
+    /// Each phase uses its own reversed iterator so no char is lost at the
+    /// phase boundary. Both phases step by whole UTF-8 scalars. The killed
+    /// region includes trailing whitespace so yank reconstructs cleanly.
+    fn kill_word_backward(&mut self) {
+        let c = self.cursor_byte();
+        if c == 0 {
+            return;
+        }
+        // Phase 1: consume trailing whitespace run.
+        let mut start = c;
+        for ch in self.input[..c].chars().rev() {
+            if ch.is_whitespace() {
+                start -= ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // Phase 2: consume the preceding non-whitespace word.
+        // Fresh iterator on the remaining prefix — no shared state with phase 1.
+        for ch in self.input[..start].chars().rev() {
+            if !ch.is_whitespace() {
+                start -= ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if start == c {
+            return;
+        }
+        let killed = self.input[start..c].to_string();
+        self.input.drain(start..c);
+        self.push_kill(killed);
+        self.cursor = (start < self.input.len()).then_some(start);
+        self.reset_history_nav();
+        self.menu_sel = 0;
     }
 
     // ── ⌃R history search ──────────────────────────────────────────────────────
@@ -385,6 +578,7 @@ impl ChatComponent {
                 if let Some(&idx) = matches.get(sel) {
                     if let Some(entry) = self.history.get(idx) {
                         self.input = entry.to_string();
+                        self.cursor = None;
                     }
                 }
                 self.search = None;
@@ -535,11 +729,8 @@ impl ChatComponent {
                 return true;
             }
         }
-        // `@` mention picker: trailing token starts with `@`.
-        self.input
-            .rsplit(char::is_whitespace)
-            .next()
-            .is_some_and(|t| t.starts_with('@'))
+        // `@` mention picker: the cursor-relative token starts with `@`.
+        self.mention_query().is_some()
     }
 
     /// Whether a turn is currently streaming (submit → TurnFinished). The app's
@@ -597,20 +788,39 @@ impl ChatComponent {
     /// starts with `@`. Returns (byte offset of the `@`, query after it).
     /// Token = everything after the last whitespace, so `fix @src/ma` matches
     /// and `email me a@b.com` does not (the `@` must LEAD the token).
-    fn mention_query(&self) -> Option<(usize, &str)> {
-        let start = self
-            .input
-            .rfind(char::is_whitespace)
-            .map(|i| i + 1)
+    /// Token = whitespace-delimited word containing the character immediately
+    /// left of the cursor (`cursor_byte()`). Cursor at 0 closes the picker
+    /// (nothing left of the caret to match). Returns `(at, end, query)` where
+    /// `at..end` is the byte range of the `@` token (exclusive end) and
+    /// `query` is the text after the `@` sigil.
+    fn mention_query(&self) -> Option<(usize, usize, &str)> {
+        let cursor = self.cursor_byte();
+        if cursor == 0 {
+            return None;
+        }
+        // Walk back from just left of cursor to find the last whitespace,
+        // then skip past it — that's where this token starts.
+        let start = self.input[..cursor]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(i, ch)| i + ch.len_utf8())
             .unwrap_or(0);
-        let token = &self.input[start..];
-        token.starts_with('@').then(|| (start, &token[1..]))
+        // Walk forward from cursor to find the next whitespace — that's
+        // where this token ends.
+        let end = self.input[cursor..]
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(i, _)| cursor + i)
+            .unwrap_or(self.input.len());
+        let token = &self.input[start..end];
+        token.starts_with('@').then(|| (start, end, &token[1..]))
     }
 
     /// Ranked file matches for the current `@` query (empty when not in mention
     /// mode). Scans the project lazily on first use.
     fn mention_matches(&mut self) -> Vec<String> {
-        let Some((_, query)) = self.mention_query() else {
+        let Some((_, _, query)) = self.mention_query() else {
             return Vec::new();
         };
         let query = query.to_string();
@@ -628,14 +838,30 @@ impl ChatComponent {
             .collect()
     }
 
-    /// Replace the active `@token` with the picked path (plus a trailing space)
-    /// so the composer reads `… @src/main.rs `.
+    /// Replace the active `@token` with the picked path, preserving any text
+    /// and whitespace that follows it. Cursor lands after the suffix's leading
+    /// whitespace so the next keystroke inserts before its content; when the
+    /// completion ends the buffer, one trailing space is appended and cursor
+    /// normalizes to `None`.
     fn insert_mention(&mut self, path: &str) {
-        if let Some((at, _)) = self.mention_query() {
+        if let Some((at, end, _)) = self.mention_query() {
+            let suffix = self.input[end..].to_string();
             self.input.truncate(at);
             self.input.push('@');
             self.input.push_str(path);
-            self.input.push(' ');
+            if suffix.is_empty() {
+                self.input.push(' ');
+                self.cursor = None;
+            } else {
+                let leading_whitespace = suffix
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                let cursor_pos = self.input.len() + leading_whitespace;
+                self.input.push_str(&suffix);
+                self.cursor = (cursor_pos < self.input.len()).then_some(cursor_pos);
+            }
             self.mention_sel = 0;
         }
     }
@@ -677,6 +903,7 @@ impl ChatComponent {
     /// [`Action::Navigate`]; chat never reaches into the app's Focus/Center.
     fn run_slash(&mut self, name: &str, args: &str) -> Option<Action> {
         self.input.clear();
+        self.cursor = None;
         self.menu_sel = 0;
         let args = args.trim();
         match name {
@@ -1182,6 +1409,26 @@ impl ChatComponent {
 }
 
 impl Component for ChatComponent {
+    /// Bracketed paste into the chat surface. While the ⌃R search overlay is
+    /// open the paste feeds its single-line query; otherwise it inserts into
+    /// the composer verbatim (newlines included) and NEVER submits.
+    fn handle_paste(&mut self, text: &str) -> Option<Action> {
+        if let Some(s) = self.search.as_mut() {
+            s.query.extend(text.chars().filter(|c| !c.is_control()));
+            s.sel = 0;
+            return None;
+        }
+        let clean = paste_text(text);
+        if clean.is_empty() {
+            return None;
+        }
+        self.insert_at_cursor(&clean);
+        self.reset_history_nav();
+        self.menu_sel = 0;
+        self.mention_sel = 0;
+        None
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         // The ⌃R history-search overlay is modal: while open, all keys drive it.
         if self.search.is_some() {
@@ -1191,8 +1438,6 @@ impl Component for ChatComponent {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('y') => {
-                    // Permission-pending takes precedence over yank; ⌃Y only
-                    // yanks the kill ring when no permission is waiting.
                     if let Some(id) = self.pending_permission() {
                         return Some(Action::PermissionDecided {
                             permission_id: id,
@@ -1211,12 +1456,12 @@ impl Component for ChatComponent {
                     }
                     return None;
                 }
-                // ⌃J: newline in the composer (legacy binding).
+                // ⌃J: newline in the composer at the cursor.
                 KeyCode::Char('j') => {
-                    self.input.push('\n');
+                    self.insert_at_cursor("\n");
                     return None;
                 }
-                // ⌃O: toggle tool-card expansion (full output/diff ↔ tail window).
+                // ⌃O: toggle tool-card expansion.
                 KeyCode::Char('o') => {
                     self.tools_expanded = !self.tools_expanded;
                     return None;
@@ -1226,14 +1471,63 @@ impl Component for ChatComponent {
                     self.search = Some(HistorySearch::default());
                     return None;
                 }
-                // ⌃U: kill the whole composer to the ring.
+                // ⌃U: kill from line start to cursor.
                 KeyCode::Char('u') => {
                     self.kill_to_start();
                     return None;
                 }
-                // ⌃K: kill the current line's tail to the ring.
+                // ⌃K: kill from cursor to line end.
                 KeyCode::Char('k') => {
                     self.kill_to_end();
+                    return None;
+                }
+                // ⌃W: kill word before cursor.
+                KeyCode::Char('w') => {
+                    self.kill_word_backward();
+                    return None;
+                }
+                // ⌃B / ⌃F: cursor left / right.
+                KeyCode::Char('b') => {
+                    self.cursor_left();
+                    return None;
+                }
+                KeyCode::Char('f') => {
+                    self.cursor_right();
+                    return None;
+                }
+                // ⌃A / ⌃E: line start / line end.
+                KeyCode::Char('a') => {
+                    self.cursor_line_start();
+                    return None;
+                }
+                KeyCode::Char('e') => {
+                    self.cursor_line_end();
+                    return None;
+                }
+                // ⌃D: delete the char at cursor (or end-of-input no-op).
+                KeyCode::Char('d') => {
+                    let c = self.cursor_byte();
+                    if c < self.input.len() {
+                        let ch = self.input[c..].chars().next().unwrap();
+                        let end = c + ch.len_utf8();
+                        self.input.drain(c..end);
+                        if self.cursor.map_or(false, |cur| cur >= self.input.len()) {
+                            self.cursor = None;
+                        }
+                        self.reset_history_nav();
+                        self.menu_sel = 0;
+                        self.mention_sel = 0;
+                    }
+                    return None;
+                }
+                // ⌃L: clear transcript when idle, no-op while busy. Preserves
+                //      composer text and cursor position.
+                KeyCode::Char('l') => {
+                    if !self.busy {
+                        self.turns.clear();
+                        self.md.clear();
+                        self.scroll_back = 0;
+                    }
                     return None;
                 }
                 _ => {}
@@ -1260,6 +1554,7 @@ impl Component for ChatComponent {
                     let sel = self.menu_sel.min(matches.len() - 1);
                     self.input = matches[sel].name.to_string();
                     self.menu_sel = 0;
+                    self.cursor = None;
                     return None;
                 }
                 KeyCode::Enter => {
@@ -1270,6 +1565,7 @@ impl Component for ChatComponent {
                 KeyCode::Esc => {
                     self.input.clear();
                     self.menu_sel = 0;
+                    self.cursor = None;
                     return None;
                 }
                 _ => {}
@@ -1298,8 +1594,14 @@ impl Component for ChatComponent {
                     return None;
                 }
                 KeyCode::Esc => {
-                    if let Some((at, _)) = self.mention_query() {
+                    if let Some((at, _, _)) = self.mention_query() {
                         self.input.remove(at); // drop the `@`, keep the text
+                                               // Shift cursor left if it was past the removed sigil.
+                        if let Some(c) = self.cursor {
+                            if c > at {
+                                self.cursor = Some(c - 1);
+                            }
+                        }
                     }
                     self.mention_sel = 0;
                     return None;
@@ -1326,15 +1628,35 @@ impl Component for ChatComponent {
                 self.history_next();
                 None
             }
+            // Left / Right: cursor movement.
+            (KeyCode::Left, _) => {
+                self.cursor_left();
+                self.history_idx = None;
+                self.menu_sel = 0;
+                self.mention_sel = 0;
+                None
+            }
+            (KeyCode::Right, _) => {
+                self.cursor_right();
+                self.history_idx = None;
+                self.menu_sel = 0;
+                self.mention_sel = 0;
+                None
+            }
+            // Home / End: line boundaries.
+            (KeyCode::Home, _) => {
+                self.cursor_line_start();
+                None
+            }
+            (KeyCode::End, _) => {
+                self.cursor_line_end();
+                None
+            }
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
                     return None;
                 }
-                // A typed `/name args…` line (the palette closes once a space is
-                // typed) is a command invocation when the first token is a known
-                // command — e.g. `/model anthropic/claude-opus-4-8`. Anything
-                // else starting with `/` (a path, say) falls through and sends.
                 if text.starts_with('/') {
                     let (name, args) = match text.split_once(char::is_whitespace) {
                         Some((n, a)) => (n, a),
@@ -1343,10 +1665,6 @@ impl Component for ChatComponent {
                     if slash::is_command(name) {
                         return self.run_slash(name, args);
                     }
-                    // First token looks like a command name (lowercase letters,
-                    // digits, hyphens — no path-like slashes/dots). Treat it as
-                    // an unknown command, not a chat prompt, so the user gets
-                    // actionable feedback instead of a silent send.
                     let looks_like_cmd = name
                         .strip_prefix('/')
                         .map(|n| {
@@ -1366,25 +1684,47 @@ impl Component for ChatComponent {
                         return Some(Action::Status(hint));
                     }
                 }
-                self.history.push(&text); // persist for ↑/↓ + ⌃R recall
+                self.history.push(&text);
                 self.reset_history_nav();
                 self.input.clear();
-                self.scroll_back = 0; // sending snaps to the live tail
+                self.cursor = None;
+                self.scroll_back = 0;
                 self.turns.push(Turn::User(text.clone()));
                 self.busy = true;
                 Some(Action::SubmitPrompt(text))
             }
             (KeyCode::Backspace, _) => {
-                self.input.pop();
-                self.history_idx = None; // editing exits history navigation
-                self.menu_sel = 0; // query narrowed → reset palette cursor
+                let c = self.cursor_byte();
+                if c > 0 {
+                    let ch = self.input[..c].chars().next_back().unwrap();
+                    let start = c - ch.len_utf8();
+                    self.input.drain(start..c);
+                    self.cursor = (start < self.input.len()).then_some(start);
+                }
+                self.history_idx = None;
+                self.menu_sel = 0;
+                self.mention_sel = 0;
+                None
+            }
+            (KeyCode::Delete, _) => {
+                let c = self.cursor_byte();
+                if c < self.input.len() {
+                    let ch = self.input[c..].chars().next().unwrap();
+                    let end = c + ch.len_utf8();
+                    self.input.drain(c..end);
+                    if self.cursor.map_or(false, |cur| cur >= self.input.len()) {
+                        self.cursor = None;
+                    }
+                }
+                self.history_idx = None;
+                self.menu_sel = 0;
                 self.mention_sel = 0;
                 None
             }
             (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
-                self.input.push(c);
-                self.history_idx = None; // editing exits history navigation
-                self.menu_sel = 0; // query changed → reset palette cursor
+                self.insert_at_cursor(c.encode_utf8(&mut [0u8; 4]));
+                self.history_idx = None;
+                self.menu_sel = 0;
                 self.mention_sel = 0;
                 None
             }
@@ -1538,16 +1878,17 @@ impl Component for ChatComponent {
         // the words kept landing but never showed). Capped so the transcript
         // keeps the room; past the cap the composer scrolls to the cursor.
         let usable = (area.width.saturating_sub(2)).max(1) as usize;
-        let logical: Vec<&str> = self.input.split('\n').collect();
-        let last = logical.len() - 1;
-        let input_rows: u16 = logical
-            .iter()
+        let c = self.cursor_byte();
+        let cursor_line_idx = self.input[..c].matches('\n').count();
+        let input_rows: u16 = self
+            .input
+            .split('\n')
             .enumerate()
             .map(|(i, l)| {
-                // The block cursor occupies one extra cell on the last line, so
+                // The block cursor occupies one extra cell on its logical line, so
                 // a line exactly at the width still wraps its cursor visibly.
-                let w = l.chars().count() + usize::from(i == last);
-                (w.max(1)).div_ceil(usable) as u16
+                let visual_w = UnicodeWidthStr::width(l) + usize::from(i == cursor_line_idx);
+                (visual_w.max(1)).div_ceil(usable) as u16
             })
             .sum::<u16>()
             .max(1);
@@ -1622,6 +1963,40 @@ impl Component for ChatComponent {
                     format!("  {hint}"),
                     Style::default().fg(theme::COMMENT),
                 )));
+            }
+        }
+        // Collapsed mode: a long consecutive tool run must not flood the
+        // screen. Hide all but the newest BURST_TAIL_TOOLS ok/running cards of
+        // each run behind one "· N earlier tools" line; errors always render.
+        let mut tool_hidden: Vec<bool> = vec![false; n_turns];
+        let mut elide_count_at: Vec<usize> = vec![0; n_turns];
+        if !tools_expanded {
+            let mut i = 0;
+            while i < n_turns {
+                if !matches!(self.turns[i], Turn::Tool { .. } | Turn::Thinking(_)) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < n_turns && matches!(self.turns[i], Turn::Tool { .. } | Turn::Thinking(_))
+                {
+                    i += 1;
+                }
+                let hideable: Vec<usize> = (start..i)
+                    .filter(|&t| {
+                        matches!(
+                            &self.turns[t],
+                            Turn::Tool { status, .. } if !matches!(status, ToolStatus::Err)
+                        )
+                    })
+                    .collect();
+                if hideable.len() > BURST_TAIL_TOOLS {
+                    let cut = hideable.len() - BURST_TAIL_TOOLS;
+                    for &t in &hideable[..cut] {
+                        tool_hidden[t] = true;
+                    }
+                    elide_count_at[hideable[0]] = cut;
+                }
             }
         }
         for (ti, turn) in self.turns.iter().enumerate() {
@@ -1715,6 +2090,23 @@ impl Component for ChatComponent {
                     diff,
                     ..
                 } => {
+                    // Burst compaction (collapsed mode): this card is hidden
+                    // behind the run's "· N earlier tools" line.
+                    if tool_hidden[ti] {
+                        if elide_count_at[ti] > 0 {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "  {} {} earlier tools · ⌃O expand",
+                                    g("·", "-"),
+                                    elide_count_at[ti]
+                                ),
+                                Style::default()
+                                    .fg(theme::COMMENT)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
+                        }
+                        continue; // no separator — the burst reads as one block
+                    }
                     // Card header: status glyph + tool name + one-line args.
                     let (mark, color) = match status {
                         ToolStatus::Running => (g("◐", "*"), theme::YELLOW),
@@ -1735,32 +2127,51 @@ impl Component for ChatComponent {
                         ));
                     }
 
-                    // Collapsed, healthy, non-diff cards are ONE line: the
-                    // header plus a dim outcome summary (inline when the whole
-                    // output is one short line, else a line count). The old
-                    // 3-line tail + "+N more" per call meant a 10-tool turn
-                    // painted ~50 rows of chrome. Errors keep their tail (red
-                    // matters); ⌃O restores full output for everything.
-                    let collapsed_plain =
-                        !tools_expanded && diff.is_none() && !matches!(status, ToolStatus::Err);
+                    // Collapsed, healthy cards are ONE line: the header plus a
+                    // dim outcome summary. Diff cards join the one-line rule
+                    // except at the transcript tail — the just-finished edit
+                    // keeps its hunk visible for live feedback; ⌃O restores
+                    // full output for everything. Errors keep their tail (red
+                    // matters).
+                    let is_tail = ti + 1 == n_turns;
+                    let collapsed_plain = !tools_expanded
+                        && !matches!(status, ToolStatus::Err)
+                        && (diff.is_none() || !is_tail);
                     if collapsed_plain {
-                        let out = output.trim();
-                        if !out.is_empty() {
-                            let total = out.lines().count();
-                            let first = one_line(out.lines().next().unwrap_or(""), 48);
-                            let summary = if total == 1 && first.chars().count() <= 48 {
-                                format!("  {} {first}", g("·", "-"))
-                            } else if total == 1 {
-                                format!("  {} 1 line", g("·", "-"))
-                            } else {
-                                format!("  {} {total} lines", g("·", "-"))
-                            };
+                        if let Some(rows) = diff {
+                            let adds = rows
+                                .iter()
+                                .filter(|r| matches!(r.kind, DiffKind::Add))
+                                .count();
+                            let dels = rows
+                                .iter()
+                                .filter(|r| matches!(r.kind, DiffKind::Del))
+                                .count();
                             header.push(Span::styled(
-                                summary,
+                                format!("  {} diff +{adds} −{dels} · ⌃O", g("·", "-")),
                                 Style::default()
                                     .fg(theme::COMMENT)
                                     .add_modifier(Modifier::ITALIC),
                             ));
+                        } else {
+                            let out = output.trim();
+                            if !out.is_empty() {
+                                let total = out.lines().count();
+                                let first = one_line(out.lines().next().unwrap_or(""), 48);
+                                let summary = if total == 1 && first.chars().count() <= 48 {
+                                    format!("  {} {first}", g("·", "-"))
+                                } else if total == 1 {
+                                    format!("  {} 1 line", g("·", "-"))
+                                } else {
+                                    format!("  {} {total} lines", g("·", "-"))
+                                };
+                                header.push(Span::styled(
+                                    summary,
+                                    Style::default()
+                                        .fg(theme::COMMENT)
+                                        .add_modifier(Modifier::ITALIC),
+                                ));
+                            }
                         }
                         lines.push(Line::from(header));
                         // Skip the separator when the next row is another tool
@@ -1948,31 +2359,85 @@ impl Component for ChatComponent {
             );
         }
         let input_fg = if self.busy { theme::COMMENT } else { theme::FG };
-        let mut input_render: Vec<Line> = self
-            .input
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(input_fg))))
-            .collect();
+        let cursor_glyph = g("▏", "_");
+        let cursor_style = Style::default().fg(theme::CYAN);
+
+        // Cursor position within input
+        let c = self.cursor_byte();
+        let cursor_line_idx = self.input[..c].matches('\n').count();
+        let line_start = self.input[..c].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let after_cursor_line_end = self.input[c..]
+            .find('\n')
+            .map(|i| c + i)
+            .unwrap_or(self.input.len());
+
+        // Build render lines: cursor line gets before+glyph+after spans
+        let mut input_render: Vec<Line> = Vec::new();
+        for (li, line_text) in self.input.split('\n').enumerate() {
+            if li == cursor_line_idx {
+                let before = &self.input[line_start..c];
+                let after = &self.input[c..after_cursor_line_end];
+                let mut spans: Vec<Span> = Vec::with_capacity(3);
+                if !before.is_empty() {
+                    spans.push(Span::styled(
+                        before.to_string(),
+                        Style::default().fg(input_fg),
+                    ));
+                }
+                spans.push(Span::styled(cursor_glyph, cursor_style));
+                if !after.is_empty() {
+                    spans.push(Span::styled(
+                        after.to_string(),
+                        Style::default().fg(input_fg),
+                    ));
+                }
+                input_render.push(Line::from(spans));
+            } else {
+                input_render.push(Line::from(Span::styled(
+                    line_text.to_string(),
+                    Style::default().fg(input_fg),
+                )));
+            }
+        }
+        // Preserve trailing empty line when input ends with '\n'
         if input_render.is_empty() || self.input.ends_with('\n') {
             input_render.push(Line::from(""));
         }
-        // Block cursor rides the last line.
-        if let Some(last) = input_render.last_mut() {
-            last.spans
-                .push(Span::styled(g("▏", "_"), Style::default().fg(theme::CYAN)));
-        }
-        // Soft-wrap long lines (typing past the right edge used to just clip)
-        // and scroll so the cursor's row stays visible once wrapped content
-        // exceeds the composer's capped height.
-        let input_w = comp.width.saturating_sub(2);
+
+        // Wrap and scroll: keep the cursor's visual row visible, not always bottom.
+        let input_w = (comp.width.saturating_sub(2)).max(1) as usize;
+        let before_cursor = &self.input[line_start..c];
+        let vis_before = UnicodeWidthStr::width(before_cursor);
+        // Visual rows occupied by lines before the cursor's logical line
+        let prior_rows: u16 = self
+            .input
+            .split('\n')
+            .take(cursor_line_idx)
+            .map(|l| {
+                let vw = UnicodeWidthStr::width(l).max(1);
+                vw.div_ceil(input_w) as u16
+            })
+            .sum();
+        // Cursor's visual row within its own line (0-indexed)
+        let cursor_row_in_line = if input_w > 0 {
+            (vis_before / input_w) as u16
+        } else {
+            0
+        };
+        let cursor_vis_row = prior_rows + cursor_row_in_line;
+
         let input_para = Paragraph::new(input_render)
             .style(Style::default().bg(theme::BG_HL))
             .wrap(Wrap { trim: false });
-        let wrapped_rows = input_para.line_count(input_w) as u16;
-        let input_scroll = wrapped_rows.saturating_sub(comp.height);
+        let wrapped_rows = input_para.line_count(input_w as u16) as u16;
+        let max_scroll = wrapped_rows.saturating_sub(comp.height);
+        // When cursor is below the visible area, scroll so it's on the last visible row
+        let input_scroll = cursor_vis_row
+            .saturating_sub(comp.height.saturating_sub(1))
+            .min(max_scroll);
         frame.render_widget(
             input_para.scroll((input_scroll, 0)),
-            Rect::new(comp.x + 2, comp.y, input_w, comp.height),
+            Rect::new(comp.x + 2, comp.y, input_w as u16, comp.height),
         );
 
         // ── `/` command palette overlay, floated just above the composer ─────
@@ -2359,6 +2824,286 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    fn type_chars(chat: &mut ChatComponent, text: &str) {
+        for c in text.chars() {
+            chat.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn press_left(chat: &mut ChatComponent, count: usize) {
+        for _ in 0..count {
+            chat.handle_key(key(KeyCode::Left));
+        }
+    }
+
+    fn composer_rows(chat: &mut ChatComponent, width: u16, height: u16) -> Vec<String> {
+        let screen = render_chat_to_string(chat, width, height);
+        let bar = g("▎", "|");
+        let mut rows: Vec<String> = screen
+            .lines()
+            .rev()
+            .take_while(|line| line.starts_with(bar))
+            .map(|line| line.chars().skip(2).collect::<String>())
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        rows.reverse();
+        rows
+    }
+
+    #[test]
+    fn review_regression_model_command_trims_extra_whitespace() {
+        let mut chat = chat_with("/model  anthropic/claude-opus-4-8");
+
+        let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match act {
+            Some(Action::SetModel(id)) => assert_eq!(id, "anthropic/claude-opus-4-8"),
+            other => panic!("expected SetModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_regression_slash_tab_completion_resets_cursor_to_command_end() {
+        let mut chat = chat_with("/mod");
+
+        press_left(&mut chat, 1);
+        chat.handle_key(key(KeyCode::Tab));
+        type_chars(&mut chat, "!");
+
+        assert_eq!(chat.input, "/model!");
+    }
+
+    #[test]
+    fn review_regression_mention_tab_completion_uses_token_at_cursor_and_preserves_suffix() {
+        let mut chat = chat_with("fix @src now");
+        chat.mention_index = Some(vec!["src/main.rs".to_string()]);
+
+        press_left(&mut chat, 4);
+        let wants_tab = chat.wants_tab();
+        chat.handle_key(key(KeyCode::Tab));
+        type_chars(&mut chat, "X");
+
+        assert_eq!(
+            (wants_tab, chat.input.as_str()),
+            (true, "fix @src/main.rs Xnow")
+        );
+    }
+
+    #[test]
+    fn review_regression_mention_after_multibyte_whitespace_is_utf8_safe() {
+        let mut chat = chat_with("fix\u{00a0}@src now");
+        chat.mention_index = Some(vec!["src/main.rs".to_string()]);
+
+        press_left(&mut chat, 4);
+        let wants_tab = chat.wants_tab();
+        chat.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(
+            (wants_tab, chat.input.as_str()),
+            (true, "fix\u{00a0}@src/main.rs now")
+        );
+    }
+
+    #[test]
+    fn review_regression_mention_preserves_multiline_suffix_whitespace() {
+        let mut chat = chat_with("fix @src\n  now");
+        chat.mention_index = Some(vec!["src/main.rs".to_string()]);
+
+        press_left(&mut chat, 6);
+        chat.handle_key(key(KeyCode::Tab));
+        type_chars(&mut chat, "X");
+
+        assert_eq!(chat.input, "fix @src/main.rs\n  Xnow");
+    }
+
+    #[test]
+    fn cursor_readline_left_right_insert_at_cursor() {
+        let mut chat = chat_with("abcd");
+
+        press_left(&mut chat, 2);
+        type_chars(&mut chat, "X");
+        chat.handle_key(key(KeyCode::Right));
+        type_chars(&mut chat, "Y");
+
+        assert_eq!(chat.input, "abXcYd");
+    }
+
+    #[test]
+    fn cursor_readline_ctrl_b_ctrl_f_move_by_character() {
+        let mut chat = chat_with("rust");
+
+        chat.handle_key(ctrl('b'));
+        chat.handle_key(ctrl('b'));
+        type_chars(&mut chat, "X");
+        chat.handle_key(ctrl('f'));
+        type_chars(&mut chat, "Y");
+
+        assert_eq!(chat.input, "ruXsYt");
+    }
+
+    #[test]
+    fn cursor_readline_backspace_delete_and_ctrl_d_edit_at_cursor() {
+        let mut chat = chat_with("abcd");
+
+        press_left(&mut chat, 2);
+        chat.handle_key(key(KeyCode::Backspace));
+        assert_eq!(chat.input, "acd", "backspace removes the char before point");
+
+        chat.handle_key(key(KeyCode::Delete));
+        assert_eq!(chat.input, "ad", "delete removes the char at point");
+
+        chat.handle_key(ctrl('d'));
+        assert_eq!(chat.input, "a", "⌃D also deletes the char at point");
+    }
+
+    #[test]
+    fn cursor_readline_home_end_and_ctrl_a_ctrl_e_render_cursor_position() {
+        let cursor = g("▏", "_");
+        let mut chat = chat_with("abc");
+
+        chat.handle_key(key(KeyCode::Home));
+        assert_eq!(composer_rows(&mut chat, 20, 8)[0], format!("{cursor}abc"));
+
+        chat.handle_key(key(KeyCode::End));
+        assert_eq!(composer_rows(&mut chat, 20, 8)[0], format!("abc{cursor}"));
+
+        chat.handle_key(ctrl('a'));
+        assert_eq!(composer_rows(&mut chat, 20, 8)[0], format!("{cursor}abc"));
+
+        chat.handle_key(ctrl('e'));
+        assert_eq!(composer_rows(&mut chat, 20, 8)[0], format!("abc{cursor}"));
+    }
+
+    #[test]
+    fn cursor_readline_multiline_home_end_are_current_line_boundaries() {
+        let mut chat = chat_with("one\ntwo three");
+
+        press_left(&mut chat, 5);
+        chat.handle_key(key(KeyCode::Home));
+        type_chars(&mut chat, ">");
+        chat.handle_key(key(KeyCode::End));
+        type_chars(&mut chat, "<");
+
+        assert_eq!(chat.input, "one\n>two three<");
+    }
+
+    #[test]
+    fn cursor_readline_ctrl_k_u_w_and_yank_use_cursor_position() {
+        let mut word_kill = chat_with("alpha beta gamma");
+        press_left(&mut word_kill, 5);
+        word_kill.handle_key(ctrl('w'));
+        assert_eq!(word_kill.input, "alpha gamma");
+        assert_eq!(
+            word_kill.kill_ring.last().map(String::as_str),
+            Some("beta ")
+        );
+
+        word_kill.handle_key(ctrl('y'));
+        assert_eq!(word_kill.input, "alpha beta gamma");
+
+        let mut prefix_kill = chat_with("alpha beta gamma");
+        press_left(&mut prefix_kill, 5);
+        prefix_kill.handle_key(ctrl('u'));
+        assert_eq!(prefix_kill.input, "gamma");
+        assert_eq!(
+            prefix_kill.kill_ring.last().map(String::as_str),
+            Some("alpha beta ")
+        );
+
+        let mut tail_kill = chat_with("alpha beta gamma");
+        press_left(&mut tail_kill, 5);
+        tail_kill.handle_key(ctrl('k'));
+        assert_eq!(tail_kill.input, "alpha beta ");
+        assert_eq!(
+            tail_kill.kill_ring.last().map(String::as_str),
+            Some("gamma")
+        );
+    }
+
+    #[test]
+    fn cursor_readline_multiline_ctrl_u_kills_only_current_line_prefix() {
+        let mut chat = chat_with("first line\nsecond part");
+
+        press_left(&mut chat, 4);
+        chat.handle_key(ctrl('u'));
+
+        assert_eq!(chat.input, "first line\npart");
+        assert_eq!(chat.kill_ring.last().map(String::as_str), Some("second "));
+    }
+
+    #[test]
+    fn cursor_readline_ctrl_l_clears_idle_transcript_preserving_composer_and_cursor() {
+        let mut chat = chat_with("abc");
+        chat.turns.push(Turn::User("old prompt".into()));
+
+        chat.handle_key(key(KeyCode::Left));
+        chat.handle_key(ctrl('l'));
+
+        assert!(chat.turns.is_empty(), "⌃L clears an idle transcript");
+        assert_eq!(chat.input, "abc", "⌃L preserves composer text");
+
+        type_chars(&mut chat, "X");
+        assert_eq!(chat.input, "abXc", "⌃L preserves cursor position");
+    }
+
+    #[test]
+    fn cursor_readline_ctrl_l_noops_while_busy() {
+        let mut chat = chat_with("abc");
+        chat.busy = true;
+        chat.turns.push(Turn::User("streaming prompt".into()));
+
+        chat.handle_key(ctrl('l'));
+
+        assert_eq!(chat.turns.len(), 1, "busy transcript is not cleared");
+        assert_eq!(chat.input, "abc", "busy ⌃L preserves composer text");
+    }
+
+    #[test]
+    fn cursor_readline_unicode_editing_treats_wide_chars_as_characters() {
+        let mut chat = chat_with("a你🙂b");
+
+        chat.handle_key(key(KeyCode::Left));
+        chat.handle_key(key(KeyCode::Backspace));
+        assert_eq!(chat.input, "a你b", "backspace removes one Unicode scalar");
+
+        chat.handle_key(key(KeyCode::Delete));
+        assert_eq!(
+            chat.input, "a你",
+            "delete removes the Unicode char at point"
+        );
+    }
+
+    #[test]
+    fn cursor_readline_render_wraps_cjk_emoji_before_cursor_by_visual_width() {
+        let cursor = g("▏", "_");
+        let mut chat = chat_with("你🙂ab");
+
+        chat.handle_key(key(KeyCode::Left));
+
+        assert_eq!(
+            composer_rows(&mut chat, 8, 8),
+            vec![format!("你 🙂 a{cursor}"), "b".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn cursor_readline_render_can_place_cursor_on_wrapped_line_before_later_input() {
+        let cursor = g("▏", "_");
+        let mut chat = chat_with("abcdefghijk\nzz");
+
+        press_left(&mut chat, 3);
+
+        assert_eq!(
+            composer_rows(&mut chat, 12, 10),
+            vec![
+                "abcdefghij".to_string(),
+                format!("k{cursor}"),
+                "zz".to_string(),
+                String::new()
+            ]
+        );
+    }
+
     /// A chat seeded with an in-memory prompt history (no disk I/O: the default
     /// `PromptHistory` has no backing file, so `push` never persists).
     fn chat_with_hist(entries: &[&str]) -> ChatComponent {
@@ -2462,11 +3207,21 @@ mod tests {
     }
 
     #[test]
-    fn kill_to_end_trims_the_last_line() {
+    fn cursor_readline_ctrl_k_at_end_is_noop_and_mid_line_kills_tail() {
         let mut chat = chat_with("line one\nline two");
+
         chat.handle_key(ctrl('k'));
-        assert_eq!(chat.input, "line one\n");
-        assert_eq!(chat.kill_ring.last().map(String::as_str), Some("line two"));
+        assert_eq!(
+            chat.input, "line one\nline two",
+            "⌃K at end has no tail to kill"
+        );
+        assert!(chat.kill_ring.is_empty(), "empty kills are not recorded");
+
+        press_left(&mut chat, 3);
+        chat.handle_key(ctrl('k'));
+
+        assert_eq!(chat.input, "line one\nline ");
+        assert_eq!(chat.kill_ring.last().map(String::as_str), Some("two"));
     }
 
     #[test]
@@ -2809,6 +3564,144 @@ mod tests {
         assert!(got.contains("world"), "normal chars preserved");
         assert!(got.contains(" tab"), "normal chars preserved");
         assert!(got.contains("new"), "normal chars preserved");
+    }
+
+    // ── bracketed paste into the composer ─────────────────────────────────
+
+    #[test]
+    fn paste_inserts_multiline_without_submitting() {
+        let mut chat = ChatComponent::default();
+        let act = chat.handle_event(&crossterm::event::Event::Paste(
+            "one\ntwo\r\nthree".to_string(),
+        ));
+        assert!(act.is_none(), "paste must never submit");
+        assert_eq!(chat.input, "one\ntwo\nthree");
+        assert!(!chat.busy, "paste must not mark the chat busy");
+    }
+
+    #[test]
+    fn paste_strips_controls_and_expands_tabs() {
+        let mut chat = ChatComponent::default();
+        chat.handle_event(&crossterm::event::Event::Paste(
+            "a\tb\x1b[31mc\x07".to_string(),
+        ));
+        assert_eq!(chat.input, "a    b[31mc");
+    }
+
+    #[test]
+    fn paste_feeds_search_query_while_overlay_open() {
+        let mut chat = ChatComponent::default();
+        chat.handle_key(ctrl('r'));
+        assert!(chat.search.is_some(), "⌃R opens the search overlay");
+        chat.handle_event(&crossterm::event::Event::Paste("cargo test\n".to_string()));
+        assert_eq!(
+            chat.search.as_ref().map(|s| s.query.as_str()),
+            Some("cargo test"),
+            "paste feeds the query, newline dropped"
+        );
+        assert!(
+            chat.input.is_empty(),
+            "composer untouched while search open"
+        );
+    }
+
+    // ── collapsed tool cards: sanitized summaries + burst compaction ───────
+
+    fn ok_tool(name: &str, output: &str) -> Turn {
+        Turn::Tool {
+            id: ocean_agent_sdk::ToolCallId::new_v4(),
+            name: name.to_string(),
+            args: String::new(),
+            output: output.to_string(),
+            status: ToolStatus::Ok,
+            diff: None,
+        }
+    }
+
+    #[test]
+    fn one_line_drops_escape_bytes() {
+        let s = one_line("ok \x1b[2J\x1b[H wiped", 64);
+        assert!(!s.contains('\x1b'), "ESC must not reach a Span: {s:?}");
+        assert!(s.contains("ok"), "printable text survives");
+    }
+
+    #[test]
+    fn collapsed_summary_never_paints_control_bytes() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(ok_tool("bash", "done\x1b[2J\x07"));
+        let screen = render_chat_to_string(&mut chat, 80, 12);
+        assert!(!screen.contains('\x1b'), "collapsed summary leaked ESC");
+        assert!(!screen.contains('\x07'), "collapsed summary leaked BEL");
+        assert!(screen.contains("bash"), "card header renders");
+    }
+
+    #[test]
+    fn collapsed_burst_elides_earlier_tools() {
+        let mut chat = ChatComponent::default();
+        for i in 0..6 {
+            chat.turns.push(ok_tool(&format!("tool{i}"), "ok"));
+        }
+        let screen = render_chat_to_string(&mut chat, 90, 16);
+        assert!(
+            screen.contains("3 earlier tools"),
+            "burst must compact: {screen:?}"
+        );
+        assert!(!screen.contains("tool0"), "oldest card hidden");
+        assert!(!screen.contains("tool2"), "hidden up to the tail window");
+        assert!(screen.contains("tool3"), "tail window starts here");
+        assert!(screen.contains("tool5"), "newest card visible");
+    }
+
+    #[test]
+    fn collapsed_burst_keeps_errors_visible() {
+        let mut chat = ChatComponent::default();
+        for i in 0..5 {
+            chat.turns.push(ok_tool(&format!("tool{i}"), "ok"));
+        }
+        chat.turns.insert(
+            1,
+            Turn::Tool {
+                id: ocean_agent_sdk::ToolCallId::new_v4(),
+                name: "boom".to_string(),
+                args: String::new(),
+                output: "failed".to_string(),
+                status: ToolStatus::Err,
+                diff: None,
+            },
+        );
+        let screen = render_chat_to_string(&mut chat, 90, 20);
+        assert!(screen.contains("boom"), "error card must never hide");
+        assert!(screen.contains("earlier tools"), "ok cards still compact");
+    }
+
+    #[test]
+    fn collapsed_diff_body_renders_only_at_tail() {
+        let edit_turn = || Turn::Tool {
+            id: ocean_agent_sdk::ToolCallId::new_v4(),
+            name: "edit".to_string(),
+            args: String::new(),
+            output: String::new(),
+            status: ToolStatus::Ok,
+            diff: Some(crate::shell::diff::string_rows("old_alpha\n", "new_beta\n")),
+        };
+        // Tail edit: the hunk stays visible for live feedback.
+        let mut tail = ChatComponent::default();
+        tail.turns.push(edit_turn());
+        let screen = render_chat_to_string(&mut tail, 90, 16);
+        assert!(screen.contains("new_beta"), "tail diff shows its rows");
+        // Followed by assistant text: the card compacts to a one-line summary.
+        let mut done = ChatComponent::default();
+        done.turns.push(edit_turn());
+        done.turns.push(Turn::Assistant("done".to_string()));
+        let screen = render_chat_to_string(&mut done, 90, 16);
+        assert!(
+            !screen.contains("new_beta"),
+            "non-tail diff must compact: {screen:?}"
+        );
+        assert!(
+            screen.contains("diff +1"),
+            "compacted card summarizes the hunk: {screen:?}"
+        );
     }
 
     #[test]

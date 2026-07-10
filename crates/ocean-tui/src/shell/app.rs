@@ -688,6 +688,9 @@ impl App {
                     self.lsp_open = false;
                     return;
                 }
+                // No text sink in this panel — swallow pastes so they can't
+                // leak into the composer beneath the overlay.
+                CrosstermEvent::Paste(_) => return,
                 _ => {}
             }
         }
@@ -702,6 +705,7 @@ impl App {
                     self.memory_mouse(m);
                     return;
                 }
+                CrosstermEvent::Paste(_) => return,
                 _ => {}
             }
         }
@@ -716,6 +720,7 @@ impl App {
                     self.advisor_mouse(m);
                     return;
                 }
+                CrosstermEvent::Paste(_) => return,
                 _ => {}
             }
         }
@@ -731,6 +736,7 @@ impl App {
                     self.models_mouse(m);
                     return;
                 }
+                CrosstermEvent::Paste(_) => return,
                 _ => {}
             }
         }
@@ -742,13 +748,31 @@ impl App {
                 self.settings_key(k);
                 return;
             }
+            // No text sink — swallow pastes beneath the overlay.
+            if matches!(evt, CrosstermEvent::Paste(_)) {
+                return;
+            }
         }
         // The `/providers` popup is modal too, and mutually exclusive with the
         // settings overlay: opening one closes the other.
         if self.providers_open {
-            if let CrosstermEvent::Key(k) = evt {
-                self.providers_key(k);
-                return;
+            match &evt {
+                CrosstermEvent::Key(k) => {
+                    let k = *k;
+                    self.providers_key(k);
+                    return;
+                }
+                // API-key entry: a bracketed paste lands in the buffer as ONE
+                // event (printable chars only). The old char-stream paste path
+                // no longer fires now that bracketed paste is enabled, so
+                // without this arm pasting a provider key would do nothing.
+                CrosstermEvent::Paste(text) => {
+                    if let ProvidersMode::KeyEntry { buffer, .. } = &mut self.providers_mode {
+                        buffer.extend(text.chars().filter(|c| !c.is_control()));
+                    }
+                    return;
+                }
+                _ => {}
             }
         }
         // Mouse: a click focuses the pane under the cursor; wheel + clicks are
@@ -3410,6 +3434,45 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&root);
         App::new(client, root.to_string_lossy().into_owned())
+    }
+
+    // ── bracketed paste routing ─────────────────────────────────────────────
+
+    #[test]
+    fn paste_routes_to_the_focused_chat_composer() {
+        let mut app = offline_app();
+        app.on_crossterm(CrosstermEvent::Paste("/mod".into()));
+        assert!(
+            app.chat.wants_tab(),
+            "pasted text must reach the composer (slash palette open)"
+        );
+    }
+
+    #[test]
+    fn open_overlay_swallows_paste_instead_of_leaking_to_composer() {
+        let mut app = offline_app();
+        app.settings_open = true;
+        app.on_crossterm(CrosstermEvent::Paste("/mod".into()));
+        assert!(
+            !app.chat.wants_tab(),
+            "paste must not leak beneath a modal overlay"
+        );
+    }
+
+    #[test]
+    fn provider_key_entry_accepts_bracketed_paste() {
+        let mut app = offline_app();
+        app.providers_open = true;
+        app.providers_mode = ProvidersMode::KeyEntry {
+            block_key: "deepseek".into(),
+            buffer: String::new(),
+        };
+        app.on_crossterm(CrosstermEvent::Paste("sk-live-123\n".into()));
+        let ProvidersMode::KeyEntry { buffer, .. } = &app.providers_mode else {
+            panic!("key-entry mode must survive a paste");
+        };
+        assert_eq!(buffer, "sk-live-123", "printable chars land, newline drops");
+        assert!(app.providers_open, "popup stays open");
     }
 
     fn render_app_to_string(app: &mut App, width: u16, height: u16) -> String {
