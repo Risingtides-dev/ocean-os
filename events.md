@@ -2174,3 +2174,22 @@ zero semantic change. Gates: cargo clippy --workspace --all-targets -D
 warnings = 0 errors on 1.97.0; ocean-tui 267/267 + ocean-agent + ocean-daemon
 suites all 0 failed.
 _________________________________________________________________________________
+time:      [12:58am] [07-10-26]
+agent:     [claude] [fable-5]
+type:      gh-actions
+area:      testing
+
+Second ubuntu CI red after the lint sweep: tools_smoke
+bash_stdin_is_closed_so_reads_terminate panicking "must not hang waiting for
+stdin". NOT a stdin bug - bash.rs nulls stdin correctly (verified: all 12
+tools_smoke tests pass on stock Linux in a rust:1.97 container). The test's
+2000ms elapsed budget conflated login-shell startup with hanging: bash -l
+sources /etc/profile.d, which is 9ms on stock Linux but multi-second on
+GitHub's runner image (nvm/sdkman et al). Reproduced empirically in Docker:
+planted a "sleep 3" profile script, test then completed in 3.01s - red under
+the old 2s budget, green under the new 8s budget, while a genuine hang pins
+at the raised 15s timeout_ms and still fails the assert. Discrimination
+retained, environment sensitivity removed. Gates: 12/12 tools_smoke on
+macOS AND stock-Linux container + slow-login-shell container, clippy -p
+ocean-runtime clean.
+_________________________________________________________________________________

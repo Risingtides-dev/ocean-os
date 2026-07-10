@@ -165,22 +165,30 @@ async fn bash_timeout_kills_the_child_no_orphan() {
 }
 
 /// stdin is closed, not inherited: a command that reads stdin terminates
-/// immediately (EOF) instead of hanging until the timeout.
+/// (EOF) instead of hanging until the timeout.
+///
+/// The elapsed budget proves "did not hang until timeout_ms", NOT "was fast":
+/// `bash -l` sources the host's profile scripts, which cost multiple seconds
+/// on GitHub's ubuntu runners (nvm/sdkman et al). A hang pins elapsed at
+/// timeout_ms, so any comfortable margin under it is decisive.
 #[tokio::test]
 async fn bash_stdin_is_closed_so_reads_terminate() {
+    const TIMEOUT_MS: u64 = 15_000;
+    const NO_HANG_BUDGET_MS: u64 = 8_000;
     let start = std::time::Instant::now();
     let res = bash::BashTool::new()
         .execute(
             "1",
-            json!({ "command": "cat; echo done-after-cat", "timeout_ms": 5000 }),
+            json!({ "command": "cat; echo done-after-cat", "timeout_ms": TIMEOUT_MS }),
         )
         .await
         .expect("cat on closed stdin returns immediately");
     let text = res.content[0].as_text().unwrap();
     assert!(text.contains("done-after-cat"));
     assert!(
-        start.elapsed() < std::time::Duration::from_millis(2000),
-        "must not hang waiting for stdin"
+        start.elapsed() < std::time::Duration::from_millis(NO_HANG_BUDGET_MS),
+        "must not hang waiting for stdin (elapsed {:?} of the {TIMEOUT_MS}ms timeout)",
+        start.elapsed()
     );
 }
 
