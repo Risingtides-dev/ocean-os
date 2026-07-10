@@ -2233,3 +2233,18 @@ area:      frontend
 
 Implemented a real readline-style Ocean TUI composer. The chat input now tracks a UTF-8-safe cursor and supports cursor-relative Backspace/Delete, Home/End, Left/Right, Ctrl+A/E/B/F/D/K/U/W/Y/L, mid-buffer typing/paste/newlines, Unicode-width caret rendering, and cursor-following wrapped scroll; Ctrl+Y remains permission-first, Ctrl+L refuses to clear a busy stream, and Up/Down keep their history/picker contract. Slash completion reseats the cursor, `/model` trims arguments, and cursor-relative @mention completion preserves suffix text and Unicode whitespace boundaries. TDD covered 18 cursor/reviewer regressions; `cargo test -p ocean-tui` passed 295 tests with 4 ignored, `cargo check --workspace` passed, release build passed, live tmux key smoke rendered `>abXcd` at the expected cursor position, and Knox returned `ACK: ready to land`.
 _________________________________________________________________________________
+time:      [03:44pm] [07-10-26]
+agent:     [claude] [fable-5]
+type:      [merge]
+area:      [infra]
+
+Landed the two rotting feat/ocean-tui-shell-rebuild commits (80ac2d04 readline
+composer, 3b1eef8a bracketed paste + tool-card compaction) onto main via
+isolated worktree merge. chat.rs collapse-rule conflict resolved to the branch
+author's newer tail-aware logic. Follow-up commit cleared 1.97 clippy/fmt drift
+the branch predated. Gates on the exact tree: workspace check clean, clippy -D
+warnings 0, fmt clean, ocean-tui 297/297. Dirty 37-file cluster in the shared
+checkout deliberately LEFT (live peers; 6 real test regressions in it — see
+audit). Skill packs live-verified on the running daemon today (probe ranked #1,
+fetch round-trip ok).
+_________________________________________________________________________________
