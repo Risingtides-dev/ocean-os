@@ -75,6 +75,15 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Serializes these tests: they share the `KITTY_WINDOW_ID` process env
+    /// marker (set/removed per test) and the pid-keyed temp fixture path, so
+    /// the default multi-threaded runner intermittently saw a sibling test
+    /// delete the file / unset the marker mid-assertion.
+    fn kitty_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn tmp_png() -> std::path::PathBuf {
         let dir = std::env::temp_dir();
         let p = dir.join(format!("ocean-kitty-test-{}.png", std::process::id()));
@@ -87,6 +96,7 @@ mod tests {
 
     #[test]
     fn is_png_matches_signature_only() {
+        let _guard = kitty_test_lock();
         let png = tmp_png();
         assert!(is_png(&png));
         let dir = std::env::temp_dir();
@@ -99,6 +109,7 @@ mod tests {
 
     #[test]
     fn place_png_builds_a_graphics_escape_when_kitty() {
+        let _guard = kitty_test_lock();
         // Force the kitty env marker for this test.
         std::env::set_var("KITTY_WINDOW_ID", "1");
         let png = tmp_png();
@@ -114,6 +125,7 @@ mod tests {
 
     #[test]
     fn place_png_none_for_non_png_or_empty_box() {
+        let _guard = kitty_test_lock();
         std::env::set_var("KITTY_WINDOW_ID", "1");
         let png = tmp_png();
         assert!(place_png_at(&png, 0, 0, 0, 20).is_none(), "empty box");

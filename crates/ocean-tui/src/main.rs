@@ -423,6 +423,12 @@ struct DaemonApp {
     /// When false (default), they show the one-line "▸ thinking… (N chars)"
     /// pill and can be expanded manually via Alt+arrow + Space.
     pm_thinking_default_expanded: bool,
+    /// Offshore mode: when true, every submitted turn carries guidance that
+    /// steers heavy / subagent-style work to remote compute via the
+    /// offshore_* tools. Mirrors the flag file `~/.config/offshore/mode`
+    /// (shared convention with the offshore CLI and the daemon provider);
+    /// toggled live with `/offshore on|off`.
+    offshore_mode: bool,
     tool_timeline: Vec<ToolTimelineEntry>,
     diff_snippets: Vec<String>,
     /// Live Longhouse council topics, parsed from `AgentTurnEvent::Extension`
@@ -470,6 +476,7 @@ impl DaemonApp {
             show_all_sessions: false,
             pending_model_swap: None,
             pm_thinking_default_expanded: false,
+            offshore_mode: read_offshore_mode(),
             tool_timeline: Vec::new(),
             diff_snippets: Vec::new(),
             longhouse_topics: Vec::new(),
@@ -3226,7 +3233,9 @@ fn daemon_send_prompt(client: &DaemonClient, state: &mut AppState) {
             session_id: app.selected_agent_session_id(),
             prompt: instruction.clone(),
             cwd: app.root.to_string_lossy().into_owned(),
-            guidance: None,
+            // Offshore mode rides as per-turn guidance so the agent steers
+            // heavy / subagent-style work to remote compute (offshore_* tools).
+            guidance: offshore_guidance(app.offshore_mode),
             room_id: Some(room_id.to_string()),
             // The TUI always sends its real cwd, so it never needs a project to
             // bind correctly — the non-empty cwd wins on the daemon side.
@@ -3396,6 +3405,41 @@ fn mirror_slash_output_to_pm(app: &mut DaemonApp, in_pm: bool, before: usize) {
         app.pm_turns.drain(0..drop);
     }
     app.pm_scroll = 0;
+}
+
+/// Guidance line injected into every submitted turn while offshore mode is ON.
+const OFFSHORE_GUIDANCE: &str = "offshore mode is ON: run heavy or subagent-style work on remote compute via the offshore_* tools (offshore_workspace → offshore_dispatch → offshore_events → offshore_ship/offshore_fetch → offshore_clean) instead of doing it inline. One session per job; dispatch prompts must instruct the remote agent to commit its work.";
+
+/// Flag file holding the offshore mode state ("on"/"off") — shared convention
+/// with the offshore CLI and the daemon provider: `~/.config/offshore/mode`.
+/// Resolved through `$HOME` on every call so tests can point it at a tempdir.
+fn offshore_mode_path() -> PathBuf {
+    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join(".config").join("offshore").join("mode")
+}
+
+/// Read the offshore mode flag. A missing file/dir — or any contents other
+/// than "on" — means off.
+fn read_offshore_mode() -> bool {
+    fs::read_to_string(offshore_mode_path())
+        .map(|contents| contents.trim().eq_ignore_ascii_case("on"))
+        .unwrap_or(false)
+}
+
+/// Persist the offshore mode flag, creating `~/.config/offshore/` as needed.
+fn write_offshore_mode(on: bool) -> io::Result<()> {
+    let path = offshore_mode_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, if on { "on" } else { "off" })
+}
+
+/// The per-turn guidance for a submit: `Some([OFFSHORE_GUIDANCE])` when
+/// offshore mode is on, `None` otherwise. Mirrors the type of
+/// `AgentTurnRequest::guidance` (`Option<Vec<String>>`).
+fn offshore_guidance(enabled: bool) -> Option<Vec<String>> {
+    enabled.then(|| vec![OFFSHORE_GUIDANCE.to_string()])
 }
 
 struct SlashCommandDef {
@@ -3571,6 +3615,70 @@ const SLASH_COMMANDS: &[SlashCommandDef] = &[
             };
             app.push_transcript(format!("Ocean: thinking render → {label}"));
             app.status = format!("thinking render: {label}");
+        },
+    },
+    SlashCommandDef {
+        names: &["/offshore"],
+        help: "Route heavy/subagent work to remote compute. /offshore on|off|status",
+        execute: |app, args| {
+            let arg = args.map(str::trim).map(str::to_ascii_lowercase);
+            match arg.as_deref() {
+                None | Some("" | "status") => {
+                    if app.offshore_mode {
+                        app.push_transcript(
+                            "Ocean: offshore mode is ON — every submitted turn carries \
+                             guidance to run heavy/subagent work on remote compute via the \
+                             offshore_* tools."
+                                .to_string(),
+                        );
+                    } else {
+                        app.push_transcript(
+                            "Ocean: offshore mode is OFF — heavy/subagent work runs inline. \
+                             `/offshore on` routes it to remote compute."
+                                .to_string(),
+                        );
+                    }
+                    app.status = format!(
+                        "offshore mode {}",
+                        if app.offshore_mode { "on" } else { "off" }
+                    );
+                }
+                Some(state @ ("on" | "off")) => {
+                    let on = state == "on";
+                    match write_offshore_mode(on) {
+                        Ok(()) => {
+                            app.offshore_mode = on;
+                            if on {
+                                app.push_transcript(
+                                    "Ocean: offshore mode → ON. Turns now steer heavy/subagent \
+                                     work to remote compute via the offshore_* tools."
+                                        .to_string(),
+                                );
+                            } else {
+                                app.push_transcript(
+                                    "Ocean: offshore mode → OFF. Turns no longer carry offshore \
+                                     guidance; heavy work runs inline."
+                                        .to_string(),
+                                );
+                            }
+                            app.status = format!("offshore mode {state}");
+                        }
+                        Err(err) => {
+                            app.push_transcript(format!(
+                                "Ocean: offshore mode unchanged — could not write {}: {err}",
+                                offshore_mode_path().display()
+                            ));
+                            app.status = "offshore mode write failed".to_string();
+                        }
+                    }
+                }
+                Some(other) => {
+                    app.push_transcript(format!(
+                        "Ocean: unknown offshore arg `{other}` — usage: /offshore [on|off|status]"
+                    ));
+                    app.status = "usage: /offshore [on|off|status]".to_string();
+                }
+            }
         },
     },
     SlashCommandDef {
@@ -7787,6 +7895,92 @@ mod tests {
         assert!(app.show_help);
     }
 
+    /// Serializes tests that swap `$HOME` (process-global state) so they
+    /// cannot race each other under the default multi-threaded test runner.
+    fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+        HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn daemon_slash_offshore_toggles_mode_and_persists_flag_file() {
+        let _env_guard = home_env_lock();
+        let unique = format!(
+            "ocean-tui-offshore-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let temp = env::temp_dir().join(unique);
+        let home = temp.join("home");
+        fs::create_dir_all(&home).expect("temp home");
+
+        let original_home = env::var_os("HOME");
+        unsafe { env::set_var("HOME", &home) };
+
+        let result = std::panic::catch_unwind(|| {
+            // Missing flag file/dir = off at construction.
+            let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+            assert!(!app.offshore_mode, "missing flag file must mean off");
+
+            // `/offshore status` is handled and reports OFF without flipping.
+            assert!(handle_slash_command(&mut app, "/offshore status"));
+            assert!(app
+                .transcript
+                .iter()
+                .any(|line| line.contains("offshore mode is OFF")));
+            assert!(!app.offshore_mode);
+
+            // `/offshore on` flips the field and writes the flag file.
+            assert!(handle_slash_command(&mut app, "/offshore on"));
+            assert!(app.offshore_mode);
+            assert!(app.status.contains("offshore mode on"));
+            let flag = fs::read_to_string(home.join(".config/offshore/mode"))
+                .expect("flag file must be written");
+            assert_eq!(flag.trim(), "on");
+
+            // A fresh app under the same HOME reads the mode back in.
+            let fresh = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
+            assert!(fresh.offshore_mode, "construction must read the flag file");
+
+            // `/offshore off` flips back and rewrites the file.
+            assert!(handle_slash_command(&mut app, "/offshore off"));
+            assert!(!app.offshore_mode);
+            let flag = fs::read_to_string(home.join(".config/offshore/mode")).expect("flag file");
+            assert_eq!(flag.trim(), "off");
+
+            // Unknown arg: still handled, usage line, mode untouched.
+            assert!(handle_slash_command(&mut app, "/offshore sideways"));
+            assert!(app
+                .transcript
+                .iter()
+                .any(|line| line.contains("usage: /offshore [on|off|status]")));
+            assert!(!app.offshore_mode);
+        });
+
+        match original_home {
+            Some(value) => unsafe { env::set_var("HOME", value) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+        fs::remove_dir_all(&temp).ok();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn offshore_guidance_rides_turn_requests_only_when_mode_is_on() {
+        assert_eq!(offshore_guidance(false), None);
+        assert_eq!(
+            offshore_guidance(true),
+            Some(vec![OFFSHORE_GUIDANCE.to_string()])
+        );
+    }
+
     #[test]
     fn selection_follows_the_session_across_a_reorder() {
         let mut app = DaemonApp::new("http://127.0.0.1:4780".to_string(), PathBuf::from("."));
@@ -8832,6 +9026,7 @@ mod tests {
 
     #[test]
     fn read_agents_falls_back_to_home_registry_when_project_live_agents_missing() {
+        let _env_guard = home_env_lock();
         let unique = format!(
             "ocean-tui-test-{}-{}",
             std::process::id(),

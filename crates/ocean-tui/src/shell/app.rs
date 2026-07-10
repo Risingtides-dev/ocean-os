@@ -2578,6 +2578,10 @@ impl App {
         // permission request claims it (see Action::OceanEvent above).
         let decision_token = ocean_core::mint_decision_token();
         self.pending_submit_token = Some(decision_token.clone());
+        // Offshore mode (flag file ~/.config/offshore/mode, shared with the
+        // offshore CLI): re-read per submit so toggles — from the legacy TUI's
+        // /offshore command or the CLI — apply to the very next turn.
+        let guidance = crate::offshore_guidance(crate::read_offshore_mode());
 
         tokio::spawn(async move {
             // Both the session mint and the turn POST ride the daemon-blip
@@ -2620,7 +2624,7 @@ impl App {
                 session_id: Some(session_id),
                 prompt: prompt.clone(),
                 cwd: workspace,
-                guidance: None,
+                guidance,
                 room_id: None,
                 project_id: None,
                 client_type: Some("tui".into()),
