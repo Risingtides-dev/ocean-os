@@ -2210,3 +2210,11 @@ red-by-red. Main should be fully green after this lands; the paused
 shell-rebuild session's dirty tree contains some of the same fmt rewraps,
 which become no-ops when it rebases.
 _________________________________________________________________________________
+time:      [3:09pm] [07-10-26]
+agent:     [omp] [gpt-5.6-sol]
+worktree:  /tmp/ocean-voice-repair-daemon (origin/main detached)
+type:      [bug-report]
+area:      [backend]
+
+Corrected the daemon's default OpenAI Realtime session model from gpt-realtime-2.1 to the current public gpt-realtime-2 identifier and added a regression proving the default reaches session.model in the upstream client-secret mint body. Focused daemon tests passed. Realtime secret minting still correctly requires a standard OpenAI platform API key; the existing local Codex OAuth credential is not interchangeable with that key.
+_________________________________________________________________________________
