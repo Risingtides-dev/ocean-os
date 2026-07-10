@@ -230,6 +230,19 @@ pub fn filter(query: &str) -> Vec<(&'static SlashCommand, i32)> {
     out
 }
 
+/// When `name` (with leading `/`) is not a known command, try to find the
+/// nearest registered command via fuzzy match. Returns `Some(name)` when the
+/// top hit passes the quality floor (start-of-name or very strong match).
+/// Returns `None` when nothing is close enough — the caller should fall back
+/// to a plain "unknown command" message.
+pub fn nearest(name: &str) -> Option<&'static str> {
+    let query = name.trim_start_matches('/');
+    filter(query)
+        .first()
+        .filter(|(_, s)| *s >= 10)
+        .map(|(c, _)| c.name)
+}
+
 /// Score `query` against one command's name (leading `/` ignored, case-folded).
 /// Subsequence match required — returns `None` if any needle char is missing in
 /// order. Score rewards start-of-name hits, contiguous runs, and a whole-query
@@ -405,5 +418,36 @@ mod tests {
             filter("e").iter().map(|(c, _)| c.name).collect::<Vec<_>>(),
             filter("e").iter().map(|(c, _)| c.name).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn nearest_typo_suggests_close_match() {
+        // Typing "/provder" (missing 'i' in /providers) should still suggest.
+        assert_eq!(nearest("/provder"), Some("/providers"));
+    }
+
+    #[test]
+    fn nearest_nonsense_returns_none() {
+        // "/notacommand" is not a subsequence of any command name, so no
+        // near-match should fire — the caller tells the user it's unknown.
+        assert_eq!(nearest("/notacommand"), None);
+    }
+
+    #[test]
+    fn nearest_partial_match_suggests_top_hit() {
+        // "/prov" — prefix of /providers, strong enough to suggest.
+        assert_eq!(nearest("/prov"), Some("/providers"));
+    }
+
+    #[test]
+    fn nearest_short_scattered_returns_none() {
+        // "/zzz" — not a subsequence of anything, filter empty → None.
+        assert_eq!(nearest("/zzz"), None);
+    }
+
+    #[test]
+    fn nearest_empty_query_strips_slash_and_returns_none() {
+        // Bare "/" — filter matches everything (score 0), below threshold → None.
+        assert_eq!(nearest("/"), None);
     }
 }

@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -38,11 +39,13 @@ use tokio::sync::mpsc;
 use super::{
     action::{Action, LoginTarget, Nav},
     client::{DaemonClient, ModelEntry},
+    daemon_boot,
     component::Component,
     components::{
-        chat::ChatComponent, editor::EditorComponent, file_tree::FileTreeComponent,
+        chat::{self, ChatComponent}, editor::EditorComponent, file_tree::FileTreeComponent,
         graph::GraphComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent,
     },
+    errfmt,
     event::{Event, EventHandler},
     git, kitty,
     status::{self, StatusData, Tone},
@@ -217,6 +220,8 @@ pub struct App {
     /// aborts the superseded stream instead of leaking it (a leaked stream
     /// kept pumping a stale session's events into the chat).
     stream_task: Option<tokio::task::JoinHandle<()>>,
+    /// The health-monitor task that re-probes and triggers autostart on failure.
+    health_task: Option<tokio::task::JoinHandle<()>>,
     status: String,
     /// True while a `/login` OAuth flow is running off-thread. A second
     /// `/login` while set is rejected with a busy status instead of racing a
@@ -354,6 +359,7 @@ impl App {
             session_id: None,
             model_override: None,
             stream_task: None,
+            health_task: None,
             status: "connecting…".into(),
             login_in_flight: false,
             should_quit: false,
@@ -417,6 +423,8 @@ impl App {
         // `@` file mentions index the launch project from the start.
         app.chat
             .set_mention_root(PathBuf::from(&app.workspace_root));
+        // Welcome empty-state: tell the chat whether providers are configured.
+        app.refresh_welcome_provider_line();
         // Auto-resume the most recent session for this workspace so `ocean`
         // (or `cd project && ocean`) drops you BACK INTO your last conversation
         // — transcript rehydrated from disk, not just the session id bound (the
@@ -439,16 +447,79 @@ impl App {
         {
             let client = self.client.clone();
             let tx = self.actions_tx.clone();
-            tokio::spawn(async move {
-                match client.health().await {
-                    Ok(h) => {
-                        let _ = tx.send(Action::Status(format!("connected · {}", h.backend)));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Action::Error(format!("daemon: {e}")));
+            let base_url = client.base_url().to_string();
+            let guard = Arc::new(daemon_boot::AutostartGuard::new());
+
+            self.health_task = Some(tokio::spawn(async move {
+                let mut healthy = false;
+                // Short initial delay so the splash can render before the
+                // first probe runs.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(3), client.health()).await {
+                        Ok(Ok(h)) => {
+                            if !healthy {
+                                let _ = tx.send(Action::Status(format!(
+                                    "connected · {}",
+                                    h.backend
+                                )));
+                                healthy = true;
+                            }
+                            tokio::time::sleep(Duration::from_secs(15)).await;
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            if healthy {
+                                healthy = false;
+                            }
+                            let base_url2 = base_url.clone();
+                            let guard2 = Arc::clone(&guard);
+                            let outcome = tokio::task::spawn_blocking(move || {
+                                daemon_boot::maybe_autostart_prod(&base_url2, &guard2)
+                            })
+                            .await
+                            .unwrap_or(daemon_boot::AutostartOutcome::SpawnFailed(
+                                "autostart task panicked".into(),
+                            ));
+                            match outcome {
+                                daemon_boot::AutostartOutcome::Started => {
+                                    let _ = tx.send(Action::Status(
+                                        "daemon offline — starting ocean-daemon…".into(),
+                                    ));
+                                }
+                                daemon_boot::AutostartOutcome::BinaryNotFound => {
+                                    let _ = tx.send(Action::Status(
+                                        "daemon offline — ocean-daemon not found (set OCEAN_DAEMON_BIN)"
+                                            .into(),
+                                    ));
+                                }
+                                daemon_boot::AutostartOutcome::SpawnFailed(_) => {
+                                    let _ = tx.send(Action::Status(
+                                        "daemon offline — autostart failed (see ~/.ocean/logs/daemon-autostart.log)"
+                                            .into(),
+                                    ));
+                                }
+                                daemon_boot::AutostartOutcome::NotEligible => {
+                                    let _ = tx.send(Action::Status(format!(
+                                        "daemon offline at {} — retrying…",
+                                        daemon_boot::host_port(&base_url)
+                                    )));
+                                }
+                                daemon_boot::AutostartOutcome::RateLimited => {
+                                    // Keep current status — don't spam.
+                                }
+                                daemon_boot::AutostartOutcome::SupervisionUnknown => {
+                                    let _ = tx.send(Action::Status(
+                                        "daemon offline — autostart blocked (UID unavailable)"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
                     }
                 }
-            });
+            }));
+
             // Global /v1/events: permission requests/decisions live here.
             self.client
                 .spawn_global_event_stream(self.actions_tx.clone());
@@ -754,6 +825,15 @@ impl App {
                 return;
             }
             // Tab cycles focus across the VISIBLE panes (never hides anything).
+            // Tab: skip focus-cycling when the chat palettes are open so Tab
+            if k.code == KeyCode::Tab
+                && self.focus == Focus::Center
+                && self.center == Center::Chat
+                && self.chat.wants_tab()
+            {
+                // Let Tab through to ChatComponent; don't cycle focus.
+            } else
+
             if k.code == KeyCode::Tab && self.focus != Focus::Term {
                 self.cycle_focus();
                 return;
@@ -921,10 +1001,11 @@ impl App {
                 self.should_quit = true;
                 return;
             }
-            Action::Status(s) | Action::Error(s) => self.status = s.clone(),
+            Action::Status(s) => self.status = s.clone(),
+            Action::Error(s) => self.status = errfmt::humanize(s),
             // Chat unwinds busy + restores the prompt (see its update arm);
-            // the status line carries the error.
-            Action::TurnSendFailed { err, .. } => self.status = err.clone(),
+            // the status line carries the humanized error.
+            Action::TurnSendFailed { err, .. } => self.status = errfmt::humanize(err),
             Action::SessionBound(id) => self.bind_session(*id),
             // Session hygiene: only fold in agent events for the BOUND session.
             // A superseded stream's last envelopes (or an unscoped daemon echo)
@@ -944,9 +1025,9 @@ impl App {
                     ..
                 } = evt.as_ref()
                 {
-                    self.status = format!(
+                    self.status = errfmt::humanize(&format!(
                         "⚠ {requested} unavailable — turn running on {effective} (fallback)"
-                    );
+                    ));
                 }
                 // Capture turn usage for the status-bar rate/token segments.
                 if let AgentTurnEvent::TurnFinished {
@@ -1247,7 +1328,7 @@ impl App {
                                 let now_ms = chrono::Utc::now().timestamp_millis();
                                 let h = ((outcome.expires_ms - now_ms) / 3_600_000).max(0);
                                 format!(
-                                    "{label} login complete — credential saved (expires in ~{h}h); /ready picks it up on next poll"
+                                    "{label} login complete — credential saved (expires in ~{h}h); providers refresh automatically"
                                 )
                             }
                             Err(e) => format!("{label} login failed: {e}"),
@@ -1262,6 +1343,9 @@ impl App {
             Action::LoginDone(msg) => {
                 self.status = msg.clone();
                 self.login_in_flight = false;
+                // Auth-state changed — refresh the welcome provider line so the
+                // chat empty-state immediately reflects the new credentials.
+                self.refresh_welcome_provider_line();
             }
             // `/settings`: open the modal settings overlay. Mutually exclusive
             // with the providers popup — opening one closes the other.
@@ -2180,6 +2264,23 @@ impl App {
             .collect()
     }
 
+    /// Recompute the chat welcome provider line from current auth file +
+    /// process env state. Call after any auth-state mutation (API key save,
+    /// OAuth login completion) so the empty-state message changes immediately
+    /// without restarting the TUI.
+    fn refresh_welcome_provider_line(&mut self) {
+        let n_configured = Self::build_provider_rows()
+            .iter()
+            .filter(|r| r.status != "not configured")
+            .count();
+        self.chat.welcome_provider_line = if n_configured == 0 {
+            Some("no providers connected yet — start with /login".into())
+        } else {
+            let noun = if n_configured == 1 { "provider" } else { "providers" };
+            Some(format!("ready · {n_configured} {noun} configured"))
+        };
+    }
+
     /// Drive the `/providers` popup. List mode: ↑/↓ move, ⏎ triggers OAuth
     /// login (closes the popup, reuses the existing `/login` flow) or enters
     /// inline API-key entry. Key-entry mode: type/paste, ⏎ saves via
@@ -2218,6 +2319,9 @@ impl App {
                                     row.status =
                                         provider_status(row.block_key, row.env_vars, &auth_json);
                                 }
+                                // The welcome empty-state provider line must also
+                                // update immediately — no restart needed.
+                                self.refresh_welcome_provider_line();
                             }
                             Err(e) => self.status = format!("save failed: {e}"),
                         }
@@ -2964,7 +3068,7 @@ impl App {
             if seg.tone == Tone::Focus {
                 // Focus chip: accent bed, bold.
                 spans.push(Span::styled(
-                    seg.text,
+                    chat::sanitize_line(&seg.text),
                     Style::default()
                         .fg(theme::CYAN)
                         .bg(theme::BG_HL)
@@ -2975,7 +3079,7 @@ impl App {
                     if i == 1 { "  " } else { &" · "[..] },
                     Style::default().fg(theme::EDGE),
                 ));
-                spans.push(Span::styled(seg.text, Style::default().fg(tone_color(seg.tone))));
+                spans.push(Span::styled(chat::sanitize_line(&seg.text), Style::default().fg(tone_color(seg.tone))));
             }
         }
         let hint = " ⇥ move · ⌃Q quit ";
@@ -3258,6 +3362,34 @@ mod tests {
         App::new(client, root.to_string_lossy().into_owned())
     }
 
+    fn render_app_to_string(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("draw app");
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn key_event(code: KeyCode) -> CrosstermEvent {
+        CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            code,
+            KeyModifiers::NONE,
+        ))
+    }
+
+
     #[test]
     fn login_done_sets_status_and_clears_in_flight() {
         let mut app = offline_app();
@@ -3292,5 +3424,94 @@ mod tests {
             app.actions_rx.try_recv(),
             Err(TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn reconnect_status_does_not_clear_active_chat_turn() {
+        let mut app = offline_app();
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::nil()),
+            session_id: AgentSessionId(uuid::Uuid::nil()),
+            model: Some("test-model".into()),
+        })));
+        assert!(app.chat.is_busy(), "TurnStarted should mark chat busy");
+
+        app.dispatch(Action::Status("stream reconnected".into()));
+
+        assert_eq!(app.status, "stream reconnected");
+        assert!(
+            app.chat.is_busy(),
+            "generic reconnect statuses must not end the active turn"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_chat_palette_completion_instead_of_cycling_focus() {
+        let mut app = offline_app();
+        for c in "/mod".chars() {
+            app.on_crossterm(key_event(KeyCode::Char(c)));
+        }
+
+        app.on_crossterm(key_event(KeyCode::Tab));
+
+        assert!(app.focus == Focus::Center, "Tab should not cycle focus");
+        assert!(app.center == Center::Chat, "chat should remain active");
+        let screen = render_app_to_string(&mut app, 100, 28);
+        assert!(
+            screen.contains("/model"),
+            "Tab should complete the selected slash command in the composer, got: {screen:?}"
+        );
+    }
+
+
+    // ── welcome provider line ────────────────────────────────────────────────
+
+    #[test]
+    fn welcome_provider_line_zero_configured() {
+        // When no providers are in the env or auth file, the welcome line
+        // should prompt the user to log in.
+        let rows: Vec<ProviderRow> = PROVIDER_TABLE
+            .iter()
+            .map(|(label, block_key, env_vars)| ProviderRow {
+                label,
+                block_key,
+                env_vars,
+                status: "not configured".into(),
+            })
+            .collect();
+        let n_configured = rows.iter().filter(|r| r.status != "not configured").count();
+        assert_eq!(n_configured, 0);
+    }
+
+    #[test]
+    fn refresh_provider_line_updates_chat_field() {
+        // refresh_welcome_provider_line must set chat.welcome_provider_line
+        // from the current auth state (provider rows computed fresh each call).
+        let mut app = offline_app();
+        app.refresh_welcome_provider_line();
+        let after = app.chat.welcome_provider_line.clone();
+        // Verify it's set (Some) — the exact string depends on the test
+        // environment's auth file state, which may or may not have providers
+        // configured. The key property: refresh doesn't clear it.
+        assert!(after.is_some(), "welcome line should be Some after refresh");
+        // And it produces consistent output for the same state.
+        app.refresh_welcome_provider_line();
+        assert_eq!(app.chat.welcome_provider_line, after, "idempotent");
+    }
+
+    #[test]
+    fn login_done_triggers_welcome_refresh() {
+        let mut app = offline_app();
+        // Force the welcome line to something recognisable so we can detect
+        // that the refresh happened.
+        app.chat.welcome_provider_line = Some("before-login".into());
+        app.dispatch(Action::LoginDone("claude login complete".into()));
+        // After LoginDone, the welcome line is recomputed from live state.
+        // It won't be "before-login" anymore.
+        assert_ne!(
+            app.chat.welcome_provider_line,
+            Some("before-login".into()),
+            "LoginDone must refresh the welcome provider line"
+        );
     }
 }

@@ -42,6 +42,11 @@ impl DaemonClient {
             base: base_url.trim_end_matches('/').to_string(),
         })
     }
+    /// The daemon's base URL (e.g. `http://127.0.0.1:4780`).
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
 
     pub async fn health(&self) -> Result<HealthResponse, String> {
         self.http

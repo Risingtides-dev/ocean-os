@@ -52,6 +52,21 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `ocean-agent`). Adding a model touches all four, and the
   `known_models_are_all_routable` / `id_equals_resolved_model` tests enforce
   the invariants — run `cargo test -p ocean-providers` after registry edits.
+- Daemon lifeline (`shell/daemon_boot.rs`): the shell runs a health monitor
+  (3s probes offline, 15s healthy) and may auto-start `ocean-daemon` — via
+  `launchctl kickstart` (no `-k`) when the LaunchAgent supervises it, direct
+  spawn (cwd=$HOME, reaped child) only when unsupervised. Eligibility gates
+  run BEFORE any process probe: default `127.0.0.1:4780` only,
+  `OCEAN_TUI_AUTOSTART=0` disables, `OCEAN_DAEMON_BIN` overrides discovery.
+  Blocking work stays in `spawn_blocking`; never on an async worker.
+- Error copy (`shell/errfmt.rs`): daemon/provider error text reaching the user
+  goes through `errfmt::humanize` (no raw reqwest blobs); credential-shaped
+  errors carry `/login` recovery hints; `is_connect_shaped` picks the
+  "couldn't reach the daemon" vs "turn could not start" transcript prefix.
+- Turn lifecycle: only `TurnFinished`/`TurnSendFailed` (or explicit
+  new/clear/history reset) may clear `busy` — never generic SSE
+  reconnect statuses; failed turns render `Turn::ErrorNotice`, not advisor
+  cards.
 
 ## Verification
 
