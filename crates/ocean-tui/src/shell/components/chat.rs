@@ -69,9 +69,7 @@ enum Turn {
     /// A terminal-level notice about a turn that failed or was cancelled.
     /// Rendered as a plain notice line ("✗ turn failed — …"), NOT as an advisor
     /// card — no severity label, no model attribution.
-    ErrorNotice {
-        note: String,
-    },
+    ErrorNotice { note: String },
     /// A gated tool waiting on the operator (OCEAN-185). `resolved` is `None`
     /// while waiting, then Some(allowed).
     Permission {
@@ -1009,7 +1007,10 @@ impl ChatComponent {
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                format!(" ⇥ complete · {} select · ⏎ run · esc dismiss{more}", g("↑↓", "^v")),
+                format!(
+                    " ⇥ complete · {} select · ⏎ run · esc dismiss{more}",
+                    g("↑↓", "^v")
+                ),
                 Style::default().fg(theme::COMMENT),
             ))
             .style(Style::default().bg(theme::SLATE)),
@@ -1348,7 +1349,12 @@ impl Component for ChatComponent {
                     // actionable feedback instead of a silent send.
                     let looks_like_cmd = name
                         .strip_prefix('/')
-                        .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+                        .map(|n| {
+                            !n.is_empty()
+                                && n.chars().all(|c| {
+                                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
+                                })
+                        })
                         .unwrap_or(false);
                     if looks_like_cmd {
                         let hint = if let Some(nearest) = slash::nearest(name) {
@@ -1501,19 +1507,16 @@ impl Component for ChatComponent {
                         }
                     }
                 }
-                AgentTurnEvent::TurnFinished {
-                    status, error, ..
-                } => {
+                AgentTurnEvent::TurnFinished { status, error, .. } => {
                     self.busy = false;
-                    let is_failure =
-                        matches!(status, ocean_agent_sdk::AgentTurnStatus::Failed | ocean_agent_sdk::AgentTurnStatus::Cancelled);
+                    let is_failure = matches!(
+                        status,
+                        ocean_agent_sdk::AgentTurnStatus::Failed
+                            | ocean_agent_sdk::AgentTurnStatus::Cancelled
+                    );
                     if is_failure || error.is_some() {
                         let note = if let Some(e) = error {
-                            format!(
-                                "{} turn failed — {}",
-                                g("✗", "X"),
-                                errfmt::humanize(e)
-                            )
+                            format!("{} turn failed — {}", g("✗", "X"), errfmt::humanize(e))
                         } else {
                             format!("{} turn failed — no error detail", g("✗", "X"))
                         };
@@ -1738,9 +1741,8 @@ impl Component for ChatComponent {
                     // 3-line tail + "+N more" per call meant a 10-tool turn
                     // painted ~50 rows of chrome. Errors keep their tail (red
                     // matters); ⌃O restores full output for everything.
-                    let collapsed_plain = !tools_expanded
-                        && diff.is_none()
-                        && !matches!(status, ToolStatus::Err);
+                    let collapsed_plain =
+                        !tools_expanded && diff.is_none() && !matches!(status, ToolStatus::Err);
                     if collapsed_plain {
                         let out = output.trim();
                         if !out.is_empty() {
@@ -1993,7 +1995,7 @@ impl Component for ChatComponent {
 mod tests {
     use super::*;
     use crate::shell::action::LoginTarget;
-    use ocean_agent_sdk::{AgentSessionId, AgentTurnId, AgentTurnStatus, AgentTurnEvent};
+    use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnId, AgentTurnStatus};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -2024,7 +2026,6 @@ mod tests {
         }
         out
     }
-
 
     fn extension(extension: &str, payload: serde_json::Value) -> Action {
         Action::AgentEvent(Box::new(AgentTurnEvent::Extension {
@@ -2577,7 +2578,9 @@ mod tests {
             "/help should return None after pushing output, got {act:?}"
         );
         assert!(
-            chat.turns.iter().any(|t| matches!(t, Turn::Assistant(s) if s.contains("/quit"))),
+            chat.turns
+                .iter()
+                .any(|t| matches!(t, Turn::Assistant(s) if s.contains("/quit"))),
             "/help should list commands in transcript"
         );
     }
@@ -2587,7 +2590,10 @@ mod tests {
     #[test]
     fn wants_tab_true_when_palette_open() {
         let chat = chat_with("/mod");
-        assert!(chat.wants_tab(), "palette is open, Tab should route to chat");
+        assert!(
+            chat.wants_tab(),
+            "palette is open, Tab should route to chat"
+        );
     }
 
     #[test]
@@ -2599,7 +2605,10 @@ mod tests {
     #[test]
     fn wants_tab_true_when_mention_picker_open() {
         let chat = chat_with("read @src/main.rs");
-        assert!(chat.wants_tab(), "mention picker is open, Tab should route to chat");
+        assert!(
+            chat.wants_tab(),
+            "mention picker is open, Tab should route to chat"
+        );
     }
 
     #[test]
@@ -2712,9 +2721,9 @@ mod tests {
         ));
         assert!(!chat.busy);
         assert!(
-            chat.turns
-                .iter()
-                .any(|t| matches!(t, Turn::ErrorNotice { note } if note.contains("no error detail"))),
+            chat.turns.iter().any(
+                |t| matches!(t, Turn::ErrorNotice { note } if note.contains("no error detail"))
+            ),
             "failed turn without error should push ErrorNotice"
         );
     }
@@ -2758,7 +2767,6 @@ mod tests {
         );
     }
 
-
     // ── SSE reconnect does not clear busy ────────────────────────────────────
 
     #[test]
@@ -2768,7 +2776,10 @@ mod tests {
             ..Default::default()
         };
         chat.update(&Action::Status("stream reconnected".into()));
-        assert!(chat.busy, "reconnect must not clear busy — only terminal events do");
+        assert!(
+            chat.busy,
+            "reconnect must not clear busy — only terminal events do"
+        );
         assert!(chat.turns.is_empty(), "reconnect must not push turns");
     }
 
@@ -2809,9 +2820,18 @@ mod tests {
 
         let screen = render_chat_to_string(&mut chat, 80, 12);
 
-        assert!(!screen.contains('\t'), "rendered notice must not contain tabs");
-        assert!(!screen.contains('\x1b'), "rendered notice must not contain ESC");
-        assert!(!screen.contains('\r'), "rendered notice must not contain CR");
+        assert!(
+            !screen.contains('\t'),
+            "rendered notice must not contain tabs"
+        );
+        assert!(
+            !screen.contains('\x1b'),
+            "rendered notice must not contain ESC"
+        );
+        assert!(
+            !screen.contains('\r'),
+            "rendered notice must not contain CR"
+        );
         assert!(
             screen.contains("raw    bad[31mline"),
             "sanitized notice should preserve readable text and expand tabs, got: {screen:?}"
@@ -2823,7 +2843,8 @@ mod tests {
     #[test]
     fn user_prompt_render_strips_control_chars() {
         let mut chat = ChatComponent::default();
-        chat.turns.push(Turn::User("hey\x1b[31mthere\tbad\rline".into()));
+        chat.turns
+            .push(Turn::User("hey\x1b[31mthere\tbad\rline".into()));
 
         let screen = render_chat_to_string(&mut chat, 80, 12);
 

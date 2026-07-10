@@ -238,7 +238,10 @@ async fn claude_full_flow_end_to_end() {
         &format!("/callback?code=AUTHCODE_FF&state={state}"),
     )
     .await;
-    assert!(resp.starts_with("HTTP/1.1 200"), "browser should get 200: {resp}");
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "browser should get 200: {resp}"
+    );
     assert!(
         body_of(&resp).contains("login complete"),
         "browser body: {}",
@@ -323,9 +326,7 @@ async fn callback_error_resolves_finish_to_authorization_failed() {
 
     let resp = raw_get(
         &format!("127.0.0.1:{port}"),
-        &format!(
-            "/callback?error=access_denied&error_description=user%20canceled&state={state}"
-        ),
+        &format!("/callback?error=access_denied&error_description=user%20canceled&state={state}"),
     )
     .await;
     assert!(

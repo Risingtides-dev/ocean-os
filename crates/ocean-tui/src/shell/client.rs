@@ -47,7 +47,6 @@ impl DaemonClient {
         &self.base
     }
 
-
     pub async fn health(&self) -> Result<HealthResponse, String> {
         self.http
             .get(format!("{}/health", self.base))

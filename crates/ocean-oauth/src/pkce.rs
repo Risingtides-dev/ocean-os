@@ -19,7 +19,10 @@ const STATE_BYTES: usize = 16;
 pub(crate) fn generate() -> Pkce {
     let verifier = random_base64url(VERIFIER_BYTES);
     let challenge = challenge(&verifier);
-    Pkce { verifier, challenge }
+    Pkce {
+        verifier,
+        challenge,
+    }
 }
 
 /// Compute the S256 challenge for an existing verifier (exposed for the known
@@ -72,7 +75,10 @@ mod tests {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
             "verifier must contain only base64url chars (no +/=): {verifier}"
         );
-        assert!(URL_SAFE_NO_PAD.decode(verifier).is_ok(), "not valid base64url");
+        assert!(
+            URL_SAFE_NO_PAD.decode(verifier).is_ok(),
+            "not valid base64url"
+        );
     }
 
     #[test]

@@ -382,12 +382,12 @@ pub const ENV_PROVIDER_FALLBACK: &str = "OCEAN_PROVIDER_FALLBACK";
 /// to a canned echo would hide an outage rather than route around it (an operator
 /// who wants that can still list `fake` explicitly in the env override).
 pub const DEFAULT_FALLBACK_ORDER: &[&str] = &[
-    "claude-sonnet-5",   // claude-code oauth
-    "gpt-5.4",           // openai-codex
-    "deepseek-v4-pro",   // deepseek
-    "gemini-2.0-flash",  // google
-    "kimi-k2.6",         // kimi
-    "minimax-m2",        // minimax
+    "claude-sonnet-5",  // claude-code oauth
+    "gpt-5.4",          // openai-codex
+    "deepseek-v4-pro",  // deepseek
+    "gemini-2.0-flash", // google
+    "kimi-k2.6",        // kimi
+    "minimax-m2",       // minimax
 ];
 
 /// Parse the configured fallback order into a list of model aliases.
@@ -640,8 +640,8 @@ pub fn known_models() -> Vec<KnownModel> {
         m("MiniMax-M2", "minimax", "MiniMax M2"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
-m("glm-5.2", "glm", "GLM 5.2"),
-m("glm-4.7", "glm", "GLM 4.7"),
+        m("glm-5.2", "glm", "GLM 5.2"),
+        m("glm-4.7", "glm", "GLM 4.7"),
         m("glm-4.6", "glm", "GLM 4.6"),
         m("glm-4.5", "glm", "GLM 4.5"),
         m("glm-4.5-flash", "glm", "GLM 4.5 Flash"),
@@ -842,15 +842,13 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // Claude Code (Anthropic Messages wire protocol, OAuth bearer auth).
         // selection.model preserves the public alias id; ocean-agent maps it to
         // the real Anthropic API model id.
-        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" => {
-            Ok(model_selection(
-                ProviderId::ClaudeCode,
-                "claude-code-fable-5",
-                ANTHROPIC_BASE_URL,
-                200_000,
-                16_384,
-            ))
-        }
+        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-fable-5",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
         "claude-code-opus-4-8" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-opus-4-8",
@@ -1925,8 +1923,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(
-            blank.base_url,
-            "https://api.z.ai/api/coding/paas/v4",
+            blank.base_url, "https://api.z.ai/api/coding/paas/v4",
             "a blank override must fall back to the default base"
         );
     }

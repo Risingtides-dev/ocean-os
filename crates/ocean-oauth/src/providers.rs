@@ -131,7 +131,9 @@ pub(crate) async fn exchange(
         OAuthProvider::Claude => {
             exchange_anthropic(&client, token_url, code, state, redirect_uri, verifier).await
         }
-        OAuthProvider::Codex => exchange_codex(&client, token_url, code, redirect_uri, verifier).await,
+        OAuthProvider::Codex => {
+            exchange_codex(&client, token_url, code, redirect_uri, verifier).await
+        }
     }
 }
 
@@ -362,7 +364,10 @@ mod tests {
             "CHA1",
             "http://localhost:54545/callback",
         );
-        assert!(url.starts_with("https://claude.ai/oauth/authorize?"), "{url}");
+        assert!(
+            url.starts_with("https://claude.ai/oauth/authorize?"),
+            "{url}"
+        );
         let q = query_of(&url);
         assert_eq!(query_get(q, "code"), Some("true".to_string()));
         assert_eq!(
@@ -375,13 +380,20 @@ mod tests {
             Some("http://localhost:54545/callback".to_string())
         );
         assert_eq!(query_get(q, "code_challenge"), Some("CHA1".to_string()));
-        assert_eq!(query_get(q, "code_challenge_method"), Some("S256".to_string()));
+        assert_eq!(
+            query_get(q, "code_challenge_method"),
+            Some("S256".to_string())
+        );
         assert_eq!(query_get(q, "state"), Some("STATER".to_string()));
 
         // The full 6-scope string, decoded back to the exact constant.
         let scope = query_get(q, "scope").expect("scope present");
         assert_eq!(scope, consts(OAuthProvider::Claude).scope);
-        assert_eq!(scope.split_whitespace().count(), 6, "expected 6 scopes: {scope}");
+        assert_eq!(
+            scope.split_whitespace().count(),
+            6,
+            "expected 6 scopes: {scope}"
+        );
 
         // Scopes are percent-encoded in the raw query (space -> %20, colon -> %3A).
         assert!(q.contains("user%3Asessions%3Aclaude_code"), "raw q: {q}");
@@ -396,7 +408,10 @@ mod tests {
             "CHA2",
             "http://localhost:1455/auth/callback",
         );
-        assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"), "{url}");
+        assert!(
+            url.starts_with("https://auth.openai.com/oauth/authorize?"),
+            "{url}"
+        );
         let q = query_of(&url);
         assert_eq!(query_get(q, "response_type"), Some("code".to_string()));
         assert_eq!(
@@ -408,10 +423,19 @@ mod tests {
             Some("http://localhost:1455/auth/callback".to_string())
         );
         assert_eq!(query_get(q, "code_challenge"), Some("CHA2".to_string()));
-        assert_eq!(query_get(q, "code_challenge_method"), Some("S256".to_string()));
+        assert_eq!(
+            query_get(q, "code_challenge_method"),
+            Some("S256".to_string())
+        );
         assert_eq!(query_get(q, "state"), Some("ST".to_string()));
-        assert_eq!(query_get(q, "id_token_add_organizations"), Some("true".to_string()));
-        assert_eq!(query_get(q, "codex_cli_simplified_flow"), Some("true".to_string()));
+        assert_eq!(
+            query_get(q, "id_token_add_organizations"),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            query_get(q, "codex_cli_simplified_flow"),
+            Some("true".to_string())
+        );
         assert_eq!(query_get(q, "originator"), Some("codex_cli_rs".to_string()));
 
         let scope = query_get(q, "scope").expect("scope present");
@@ -429,7 +453,10 @@ mod tests {
             "http://localhost:1/callback",
         );
         let q = query_of(&url);
-        let pos = |key: &str| q.find(&format!("{key}=")).unwrap_or_else(|| panic!("missing {key} in {q}"));
+        let pos = |key: &str| {
+            q.find(&format!("{key}="))
+                .unwrap_or_else(|| panic!("missing {key} in {q}"))
+        };
         assert!(pos("code") < pos("client_id"));
         assert!(pos("client_id") < pos("response_type"));
         assert!(pos("response_type") < pos("redirect_uri"));
@@ -460,9 +487,10 @@ mod tests {
     fn decode_jwt_payload_strips_trailing_base64_padding() {
         // Some issuers emit standard base64 (with '=' padding). The decoder
         // trims it before URL_SAFE_NO_PAD decoding — verify that path.
-        let payload =
-            serde_json::to_vec(&json!({"sub":"u","https://api.openai.com/auth":{"chatgpt_account_id":"a"}}))
-                .unwrap();
+        let payload = serde_json::to_vec(
+            &json!({"sub":"u","https://api.openai.com/auth":{"chatgpt_account_id":"a"}}),
+        )
+        .unwrap();
         let unpadded = URL_SAFE_NO_PAD.encode(&payload);
         // Reconstruct the correct padded form for this payload length.
         let padded = match unpadded.len() % 4 {
@@ -514,7 +542,10 @@ mod tests {
 
     #[test]
     fn codex_block_always_has_account_id() {
-        let blk = build_block(OAuthProvider::Codex, &token("a", 1_700_000_000_000i64, Some("acct_x")));
+        let blk = build_block(
+            OAuthProvider::Codex,
+            &token("a", 1_700_000_000_000i64, Some("acct_x")),
+        );
         assert_eq!(blk["type"], "oauth");
         assert_eq!(blk["access"], "a");
         assert_eq!(blk["refresh"], "rt");

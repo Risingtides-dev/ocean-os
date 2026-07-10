@@ -39,8 +39,8 @@ use chromiumoxide::cdp::browser_protocol::input::{
     InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    EventScreencastFrame, ScreencastFrameAckParams, ScreencastFrameMetadata,
-    StartScreencastFormat, StartScreencastParams, StopScreencastParams,
+    EventScreencastFrame, ScreencastFrameAckParams, ScreencastFrameMetadata, StartScreencastFormat,
+    StartScreencastParams, StopScreencastParams,
 };
 use chromiumoxide::page::Page;
 use ocean_browser::LaunchConfig;
@@ -132,7 +132,8 @@ pub async fn screencast_stream() -> Sse<ReceiverStream<Result<Event, Infallible>
 /// dispatch; `500 {"error": ".."}` on a CDP failure.
 pub async fn input(Json(req): Json<BrowserInputRequest>) -> (StatusCode, Json<Value>) {
     let page = {
-        let st = state(); let mut s = st.lock().await;
+        let st = state();
+        let mut s = st.lock().await;
         match ensure_page_locked(&mut s).await {
             Some(p) => p,
             None => return no_browser(),
@@ -140,7 +141,10 @@ pub async fn input(Json(req): Json<BrowserInputRequest>) -> (StatusCode, Json<Va
     };
     match dispatch_input(&page, &req).await {
         Ok(()) => (StatusCode::OK, Json(json!({}))),
-        Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg }))),
+        Err(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": msg })),
+        ),
     }
 }
 
@@ -398,12 +402,8 @@ async fn dispatch_input(page: &Page, req: &BrowserInputRequest) -> Result<(), St
     match req.kind.as_str() {
         "click" => {
             let (x, y) = required_xy(req)?;
-            page.execute(click_press(x, y)?)
-                .await
-                .map_err(cdpe)?;
-            page.execute(click_release(x, y)?)
-                .await
-                .map_err(cdpe)?;
+            page.execute(click_press(x, y)?).await.map_err(cdpe)?;
+            page.execute(click_release(x, y)?).await.map_err(cdpe)?;
             Ok(())
         }
         "scroll" => {
@@ -417,8 +417,7 @@ async fn dispatch_input(page: &Page, req: &BrowserInputRequest) -> Result<(), St
         }
         "key" => {
             let key = req.key.as_deref().ok_or("missing 'key'")?;
-            let def = named_key_def(key)
-                .ok_or_else(|| format!("unknown named key: {key}"))?;
+            let def = named_key_def(key).ok_or_else(|| format!("unknown named key: {key}"))?;
             page.execute(key_down(&def)).await.map_err(cdpe)?;
             page.execute(key_up(&def)).await.map_err(cdpe)?;
             Ok(())
@@ -524,14 +523,46 @@ fn key_up(def: &KeyDef) -> DispatchKeyEventParams {
 /// KeyboardEvent `code` values + Windows virtual-key codes.
 fn named_key_def(key: &str) -> Option<KeyDef> {
     Some(match key {
-        "Enter" => KeyDef { key: "Enter", code: "Enter", vk: 13 },
-        "Backspace" => KeyDef { key: "Backspace", code: "Backspace", vk: 8 },
-        "Tab" => KeyDef { key: "Tab", code: "Tab", vk: 9 },
-        "Escape" => KeyDef { key: "Escape", code: "Escape", vk: 27 },
-        "ArrowUp" => KeyDef { key: "ArrowUp", code: "ArrowUp", vk: 38 },
-        "ArrowDown" => KeyDef { key: "ArrowDown", code: "ArrowDown", vk: 40 },
-        "ArrowLeft" => KeyDef { key: "ArrowLeft", code: "ArrowLeft", vk: 37 },
-        "ArrowRight" => KeyDef { key: "ArrowRight", code: "ArrowRight", vk: 39 },
+        "Enter" => KeyDef {
+            key: "Enter",
+            code: "Enter",
+            vk: 13,
+        },
+        "Backspace" => KeyDef {
+            key: "Backspace",
+            code: "Backspace",
+            vk: 8,
+        },
+        "Tab" => KeyDef {
+            key: "Tab",
+            code: "Tab",
+            vk: 9,
+        },
+        "Escape" => KeyDef {
+            key: "Escape",
+            code: "Escape",
+            vk: 27,
+        },
+        "ArrowUp" => KeyDef {
+            key: "ArrowUp",
+            code: "ArrowUp",
+            vk: 38,
+        },
+        "ArrowDown" => KeyDef {
+            key: "ArrowDown",
+            code: "ArrowDown",
+            vk: 40,
+        },
+        "ArrowLeft" => KeyDef {
+            key: "ArrowLeft",
+            code: "ArrowLeft",
+            vk: 37,
+        },
+        "ArrowRight" => KeyDef {
+            key: "ArrowRight",
+            code: "ArrowRight",
+            vk: 39,
+        },
         _ => return None,
     })
 }
@@ -577,35 +608,67 @@ mod tests {
         // Every key the frozen contract names.
         assert_eq!(
             named_key_def("Enter"),
-            Some(KeyDef { key: "Enter", code: "Enter", vk: 13 })
+            Some(KeyDef {
+                key: "Enter",
+                code: "Enter",
+                vk: 13
+            })
         );
         assert_eq!(
             named_key_def("Backspace"),
-            Some(KeyDef { key: "Backspace", code: "Backspace", vk: 8 })
+            Some(KeyDef {
+                key: "Backspace",
+                code: "Backspace",
+                vk: 8
+            })
         );
         assert_eq!(
             named_key_def("Tab"),
-            Some(KeyDef { key: "Tab", code: "Tab", vk: 9 })
+            Some(KeyDef {
+                key: "Tab",
+                code: "Tab",
+                vk: 9
+            })
         );
         assert_eq!(
             named_key_def("Escape"),
-            Some(KeyDef { key: "Escape", code: "Escape", vk: 27 })
+            Some(KeyDef {
+                key: "Escape",
+                code: "Escape",
+                vk: 27
+            })
         );
         assert_eq!(
             named_key_def("ArrowUp"),
-            Some(KeyDef { key: "ArrowUp", code: "ArrowUp", vk: 38 })
+            Some(KeyDef {
+                key: "ArrowUp",
+                code: "ArrowUp",
+                vk: 38
+            })
         );
         assert_eq!(
             named_key_def("ArrowDown"),
-            Some(KeyDef { key: "ArrowDown", code: "ArrowDown", vk: 40 })
+            Some(KeyDef {
+                key: "ArrowDown",
+                code: "ArrowDown",
+                vk: 40
+            })
         );
         assert_eq!(
             named_key_def("ArrowLeft"),
-            Some(KeyDef { key: "ArrowLeft", code: "ArrowLeft", vk: 37 })
+            Some(KeyDef {
+                key: "ArrowLeft",
+                code: "ArrowLeft",
+                vk: 37
+            })
         );
         assert_eq!(
             named_key_def("ArrowRight"),
-            Some(KeyDef { key: "ArrowRight", code: "ArrowRight", vk: 39 })
+            Some(KeyDef {
+                key: "ArrowRight",
+                code: "ArrowRight",
+                vk: 39
+            })
         );
         // Unknown keys (printable chars, function keys, …) are rejected — the
         // caller must use the `type` kind for text.

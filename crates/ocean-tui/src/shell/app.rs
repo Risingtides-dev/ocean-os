@@ -39,13 +39,16 @@ use tokio::sync::mpsc;
 use super::{
     action::{Action, LoginTarget, Nav},
     client::{DaemonClient, ModelEntry},
-    daemon_boot,
     component::Component,
     components::{
-        chat::{self, ChatComponent}, editor::EditorComponent, file_tree::FileTreeComponent,
-        graph::GraphComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent,
+        chat::{self, ChatComponent},
+        editor::EditorComponent,
+        file_tree::FileTreeComponent,
+        graph::GraphComponent,
+        pty_pane::PtyComponent,
+        session_rail::SessionRailComponent,
     },
-    errfmt,
+    daemon_boot, errfmt,
     event::{Event, EventHandler},
     git, kitty,
     status::{self, StatusData, Tone},
@@ -109,12 +112,42 @@ impl ProviderRow {
 const PROVIDER_TABLE: &[(&str, &str, &[&str])] = &[
     ("Claude (Claude Code OAuth)", "claude-code", &[]),
     ("Codex (ChatGPT OAuth)", "openai-codex", &[]),
-    ("GLM — Z.AI coding plan", "glm", &["ZAI_API_KEY", "GLM_API_KEY", "OCEAN_GLM_API_KEY", "ZHIPUAI_API_KEY", "BIGMODEL_API_KEY"]),
-    ("DeepSeek", "deepseek", &["DEEPSEEK_API_KEY", "OCEAN_DEEPSEEK_API_KEY"]),
-    ("Kimi (Moonshot)", "kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY", "OCEAN_MOONSHOT_API_KEY"]),
-    ("MiniMax", "minimax", &["MINIMAX_API_KEY", "OCEAN_MINIMAX_API_KEY"]),
-    ("Google (Gemini)", "google", &["GEMINI_API_KEY", "GOOGLE_API_KEY", "OCEAN_GOOGLE_API_KEY"]),
-    ("OpenAI", "openai", &["OPENAI_API_KEY", "OCEAN_OPENAI_API_KEY"]),
+    (
+        "GLM — Z.AI coding plan",
+        "glm",
+        &[
+            "ZAI_API_KEY",
+            "GLM_API_KEY",
+            "OCEAN_GLM_API_KEY",
+            "ZHIPUAI_API_KEY",
+            "BIGMODEL_API_KEY",
+        ],
+    ),
+    (
+        "DeepSeek",
+        "deepseek",
+        &["DEEPSEEK_API_KEY", "OCEAN_DEEPSEEK_API_KEY"],
+    ),
+    (
+        "Kimi (Moonshot)",
+        "kimi",
+        &["MOONSHOT_API_KEY", "KIMI_API_KEY", "OCEAN_MOONSHOT_API_KEY"],
+    ),
+    (
+        "MiniMax",
+        "minimax",
+        &["MINIMAX_API_KEY", "OCEAN_MINIMAX_API_KEY"],
+    ),
+    (
+        "Google (Gemini)",
+        "google",
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY", "OCEAN_GOOGLE_API_KEY"],
+    ),
+    (
+        "OpenAI",
+        "openai",
+        &["OPENAI_API_KEY", "OCEAN_OPENAI_API_KEY"],
+    ),
 ];
 
 /// `/providers` popup mode: list navigation, or inline API-key entry for the
@@ -134,10 +167,12 @@ fn provider_status(
     env_vars: &[&str],
     auth_json: &Option<serde_json::Value>,
 ) -> String {
-    if let Some(var) = env_vars
-        .iter()
-        .find(|v| std::env::var(v).ok().filter(|x| !x.trim().is_empty()).is_some())
-    {
+    if let Some(var) = env_vars.iter().find(|v| {
+        std::env::var(v)
+            .ok()
+            .filter(|x| !x.trim().is_empty())
+            .is_some()
+    }) {
         return format!("env:{var}");
     }
     let Some(json) = auth_json else {
@@ -147,10 +182,7 @@ fn provider_status(
         return "not configured".into();
     };
     if matches!(block_key, "claude-code" | "openai-codex") {
-        let is_oauth = entry
-            .pointer("/type")
-            .and_then(serde_json::Value::as_str)
-            == Some("oauth");
+        let is_oauth = entry.pointer("/type").and_then(serde_json::Value::as_str) == Some("oauth");
         if !is_oauth {
             return "not configured".into();
         }
@@ -165,10 +197,17 @@ fn provider_status(
         // `expires` is ms since epoch when large, seconds otherwise. Treat a
         // missing `expires` as "accept" (no expiry known), matching
         // ocean-providers' oauth_access_token.
-        match entry.pointer("/expires").and_then(serde_json::Value::as_i64) {
+        match entry
+            .pointer("/expires")
+            .and_then(serde_json::Value::as_i64)
+        {
             Some(ms) => {
                 let now_ms = unix_epoch_ms();
-                let expires_ms = if ms >= 1_000_000_000_000 { ms } else { ms * 1000 };
+                let expires_ms = if ms >= 1_000_000_000_000 {
+                    ms
+                } else {
+                    ms * 1000
+                };
                 if expires_ms <= now_ms {
                     "oauth expired".into()
                 } else {
@@ -459,10 +498,8 @@ impl App {
                     match tokio::time::timeout(Duration::from_secs(3), client.health()).await {
                         Ok(Ok(h)) => {
                             if !healthy {
-                                let _ = tx.send(Action::Status(format!(
-                                    "connected · {}",
-                                    h.backend
-                                )));
+                                let _ =
+                                    tx.send(Action::Status(format!("connected · {}", h.backend)));
                                 healthy = true;
                             }
                             tokio::time::sleep(Duration::from_secs(15)).await;
@@ -477,9 +514,11 @@ impl App {
                                 daemon_boot::maybe_autostart_prod(&base_url2, &guard2)
                             })
                             .await
-                            .unwrap_or(daemon_boot::AutostartOutcome::SpawnFailed(
-                                "autostart task panicked".into(),
-                            ));
+                            .unwrap_or(
+                                daemon_boot::AutostartOutcome::SpawnFailed(
+                                    "autostart task panicked".into(),
+                                ),
+                            );
                             match outcome {
                                 daemon_boot::AutostartOutcome::Started => {
                                     let _ = tx.send(Action::Status(
@@ -602,9 +641,7 @@ impl App {
                 if self.image_view.is_some() && !self.image_placed {
                     if let Some(path) = self.image_view.clone() {
                         let b = self.image_body;
-                        if let Some(seq) =
-                            kitty::place_png_at(&path, b.x, b.y, b.width, b.height)
-                        {
+                        if let Some(seq) = kitty::place_png_at(&path, b.x, b.y, b.width, b.height) {
                             kitty::emit(&seq);
                         }
                         // Mark placed even when kitty declined (non-kitty /
@@ -624,10 +661,7 @@ impl App {
         if self.image_view.is_some() {
             match evt {
                 CrosstermEvent::Key(k) => {
-                    if matches!(
-                        k.code,
-                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter
-                    ) {
+                    if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
                         self.image_view = None;
                     }
                     return;
@@ -1230,7 +1264,9 @@ impl App {
                 tokio::spawn(async move {
                     match client.memory().await {
                         Ok(r) => {
-                            let _ = tx.send(Action::MemoryLoaded { entries: r.memories });
+                            let _ = tx.send(Action::MemoryLoaded {
+                                entries: r.memories,
+                            });
                         }
                         Err(e) => {
                             let _ = tx.send(Action::Error(format!("memory: {e}")));
@@ -1649,7 +1685,10 @@ impl App {
     fn advisor_apply(&mut self) {
         use ocean_agent_sdk::AdvisorControl;
         if self.advisor_sel == 0 {
-            self.advisor_ctl = Some(AdvisorControl { enabled: false, model: None });
+            self.advisor_ctl = Some(AdvisorControl {
+                enabled: false,
+                model: None,
+            });
             self.status = "advisor off".into();
         } else {
             let models = self.advisor_models();
@@ -1692,7 +1731,9 @@ impl App {
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
                 format!(" {} ADVISOR ", g("◆", "*")),
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1810,7 +1851,9 @@ impl App {
                 if let Some(m) = self.memory_filtered().get(self.memory_sel) {
                     let text = m.text.clone();
                     match copy_to_clipboard(&text) {
-                        Ok(()) => self.status = format!("copied memory ({} chars)", text.chars().count()),
+                        Ok(()) => {
+                            self.status = format!("copied memory ({} chars)", text.chars().count())
+                        }
                         Err(e) => self.status = format!("copy failed: {e}"),
                     }
                 }
@@ -1864,7 +1907,9 @@ impl App {
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
                 format!(" {} MEMORY · {count} ", g("◆", "*")),
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1890,8 +1935,11 @@ impl App {
         let view_h = inner.height.saturating_sub(2) as usize; // search row + footer
         if self.memory_loading {
             frame.render_widget(
-                Paragraph::new(Span::styled("loading…", Style::default().fg(theme::COMMENT)))
-                    .style(Style::default().bg(theme::SLATE)),
+                Paragraph::new(Span::styled(
+                    "loading…",
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::SLATE)),
                 Rect::new(inner.x + 1, list_top, inner.width.saturating_sub(2), 1),
             );
             return;
@@ -1911,9 +1959,9 @@ impl App {
         }
 
         let sel = self.memory_sel.min(filtered.len() - 1);
-        let scroll = sel.saturating_sub(view_h.saturating_sub(1)).min(
-            filtered.len().saturating_sub(view_h),
-        );
+        let scroll = sel
+            .saturating_sub(view_h.saturating_sub(1))
+            .min(filtered.len().saturating_sub(view_h));
         for (vi, m) in filtered.iter().enumerate().skip(scroll).take(view_h) {
             let ry = list_top + (vi - scroll) as u16;
             let selected = vi == sel;
@@ -1926,10 +1974,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(marker.to_string(), Style::default().fg(theme::CYAN)),
-                    Span::styled(
-                        format!(" {badge} "),
-                        Style::default().fg(theme::BLUE),
-                    ),
+                    Span::styled(format!(" {badge} "), Style::default().fg(theme::BLUE)),
                     Span::styled(
                         text,
                         Style::default().fg(theme::FG).add_modifier(if selected {
@@ -1978,12 +2023,11 @@ impl App {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     format!("  {} {name}", g("🖼", "[img]")),
-                    Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::CYAN)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "   esc close",
-                    Style::default().fg(theme::COMMENT),
-                ),
+                Span::styled("   esc close", Style::default().fg(theme::COMMENT)),
             ]))
             .style(Style::default().bg(theme::BG_DARK)),
             Rect::new(full.x, full.y, full.width, 1),
@@ -2035,7 +2079,9 @@ impl App {
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
                 format!(" {} LANGUAGE SERVERS ", g("◆", "*")),
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -2046,8 +2092,11 @@ impl App {
         let mut y = inner.y;
         if self.lsp_loading {
             frame.render_widget(
-                Paragraph::new(Span::styled("detecting…", Style::default().fg(theme::COMMENT)))
-                    .style(Style::default().bg(theme::SLATE)),
+                Paragraph::new(Span::styled(
+                    "detecting…",
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::SLATE)),
                 Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
             );
             return;
@@ -2062,7 +2111,11 @@ impl App {
                 Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
             );
         } else {
-            for s in self.lsp_servers.iter().take(inner.height.saturating_sub(2) as usize) {
+            for s in self
+                .lsp_servers
+                .iter()
+                .take(inner.height.saturating_sub(2) as usize)
+            {
                 let (glyph, gcolor, state) = if s.ready {
                     (g("●", "*"), theme::GREEN, "ready".to_string())
                 } else {
@@ -2078,7 +2131,10 @@ impl App {
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
                         Span::styled(format!(" {glyph} "), Style::default().fg(gcolor)),
-                        Span::styled(name, Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            name,
+                            Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(format!("  {state}"), Style::default().fg(gcolor)),
                         Span::styled(exts, Style::default().fg(theme::COMMENT)),
                     ]))
@@ -2274,7 +2330,11 @@ impl App {
         self.chat.welcome_provider_line = if n_configured == 0 {
             Some("no providers connected yet — start with /login".into())
         } else {
-            let noun = if n_configured == 1 { "provider" } else { "providers" };
+            let noun = if n_configured == 1 {
+                "provider"
+            } else {
+                "providers"
+            };
             Some(format!("ready · {n_configured} {noun} configured"))
         };
     }
@@ -2295,11 +2355,8 @@ impl App {
                         let key = buffer.clone();
                         match ocean_oauth::store_api_key(&block_key, &key, None) {
                             Ok(path) => {
-                                self.status = format!(
-                                    "{} key saved to {}",
-                                    block_key,
-                                    path.display()
-                                );
+                                self.status =
+                                    format!("{} key saved to {}", block_key, path.display());
                                 self.providers_mode = ProvidersMode::List;
                                 // Refresh only the saved row's status in place.
                                 if let Some(row) = self
@@ -2437,10 +2494,7 @@ impl App {
                 );
                 frame.render_widget(
                     Paragraph::new(Span::styled(
-                        format!(
-                            " {} save · esc cancel",
-                            g("⏎", "<enter>")
-                        ),
+                        format!(" {} save · esc cancel", g("⏎", "<enter>")),
                         Style::default().fg(theme::COMMENT),
                     ))
                     .style(Style::default().bg(theme::SLATE)),
@@ -2468,10 +2522,7 @@ impl App {
                     } else {
                         theme::COMMENT
                     };
-                    let value = Span::styled(
-                        row.status.clone(),
-                        Style::default().fg(status_fg),
-                    );
+                    let value = Span::styled(row.status.clone(), Style::default().fg(status_fg));
                     let pad = (inner.width as usize)
                         .saturating_sub(left.chars().count() + value.content.chars().count() + 1);
                     frame.render_widget(
@@ -2479,9 +2530,7 @@ impl App {
                             Span::styled(
                                 left,
                                 if selected {
-                                    Style::default()
-                                        .fg(theme::FG)
-                                        .add_modifier(Modifier::BOLD)
+                                    Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)
                                 } else {
                                     Style::default().fg(theme::FG)
                                 },
@@ -2493,16 +2542,10 @@ impl App {
                         Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
                     );
                 }
-                let footer = format!(
-                    " {} move · ⏎ login / paste key · esc close",
-                    g("↑↓", "^v")
-                );
+                let footer = format!(" {} move · ⏎ login / paste key · esc close", g("↑↓", "^v"));
                 frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        footer,
-                        Style::default().fg(theme::COMMENT),
-                    ))
-                    .style(Style::default().bg(theme::SLATE)),
+                    Paragraph::new(Span::styled(footer, Style::default().fg(theme::COMMENT)))
+                        .style(Style::default().bg(theme::SLATE)),
                     Rect::new(
                         inner.x,
                         inner.y + inner.height.saturating_sub(1),
@@ -2513,7 +2556,6 @@ impl App {
             }
         }
     }
-
 
     /// Render the `/settings` overlay: a centered modal on the SLATE bed with
     /// toggle rows (on/off pills), the dock-height stepper, and a read-only
@@ -3081,7 +3123,10 @@ impl App {
                     if i == 1 { "  " } else { " · " },
                     Style::default().fg(theme::EDGE),
                 ));
-                spans.push(Span::styled(chat::sanitize_line(&seg.text), Style::default().fg(tone_color(seg.tone))));
+                spans.push(Span::styled(
+                    chat::sanitize_line(&seg.text),
+                    Style::default().fg(tone_color(seg.tone)),
+                ));
             }
         }
         let hint = " ⇥ move · ⌃Q quit ";
@@ -3146,7 +3191,10 @@ fn truncate_str(s: &str, max: usize) -> String {
     } else if max == 0 {
         String::new()
     } else {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
@@ -3367,9 +3415,7 @@ mod tests {
     fn render_app_to_string(app: &mut App, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
-        terminal
-            .draw(|frame| app.draw(frame))
-            .expect("draw app");
+        terminal.draw(|frame| app.draw(frame)).expect("draw app");
         let buf = terminal.backend().buffer();
         let area = buf.area;
         let mut out = String::new();
@@ -3385,12 +3431,8 @@ mod tests {
     }
 
     fn key_event(code: KeyCode) -> CrosstermEvent {
-        CrosstermEvent::Key(crossterm::event::KeyEvent::new(
-            code,
-            KeyModifiers::NONE,
-        ))
+        CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
     }
-
 
     #[test]
     fn login_done_sets_status_and_clears_in_flight() {
@@ -3464,7 +3506,6 @@ mod tests {
             "Tab should complete the selected slash command in the composer, got: {screen:?}"
         );
     }
-
 
     // ── welcome provider line ────────────────────────────────────────────────
 

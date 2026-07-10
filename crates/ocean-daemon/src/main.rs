@@ -84,15 +84,15 @@ mod startup;
 /// future harness features scope per surface instead of behind a global flag.
 mod harness_profile;
 
-/// Event buses — parallel broadcast/pub-sub for legacy `OceanEvent` and
-/// full-fidelity `AgentTurnEvent`.
-mod bus;
 /// Browser-screencast backend — streams the agent's live Chrome (JPEG frames
 /// + input forwarding) for Ocean Desktop's Browser tab over
 /// `/v1/browser/screencast` (SSE) and `/v1/browser/input`. Attaches as a SECOND
 /// CDP client to the same Chrome the agent already drives; see [`browser_stream`]
 /// for the frozen client contract.
 mod browser_stream;
+/// Event buses — parallel broadcast/pub-sub for legacy `OceanEvent` and
+/// full-fidelity `AgentTurnEvent`.
+mod bus;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
 /// pure pieces behind `POST /v1/voice/realtime/client-secret`.
 mod voice_realtime;
@@ -2942,10 +2942,9 @@ async fn lsp_list(Query(q): Query<LspQuery>) -> Json<serde_json::Value> {
         .cwd
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let servers =
-        tokio::task::spawn_blocking(move || ocean_agent::lsp_servers(&cwd))
-            .await
-            .unwrap_or_default();
+    let servers = tokio::task::spawn_blocking(move || ocean_agent::lsp_servers(&cwd))
+        .await
+        .unwrap_or_default();
     Json(json!({ "ok": true, "servers": servers }))
 }
 
@@ -7439,9 +7438,7 @@ struct FsDirsQuery {
 /// INCLUDED), each `{name, path, size}`, sorted by name; `files[]` is omitted
 /// entirely when the flag is unset, so callers that never ask for it see the
 /// same body they always have.
-async fn fs_dirs(
-    Query(q): Query<FsDirsQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn fs_dirs(Query(q): Query<FsDirsQuery>) -> (StatusCode, Json<serde_json::Value>) {
     // Default the path to `$HOME`; `resolve_under_home` reports HomeUnset
     // (→ 500 "HOME not set") when `$HOME` is unset, matching the old behavior.
     let raw = match q.path {
@@ -7467,7 +7464,11 @@ async fn fs_dirs(
     } else {
         target.parent().and_then(|p| {
             let ps = p.to_string_lossy().to_string();
-            if ps.is_empty() { None } else { Some(ps) }
+            if ps.is_empty() {
+                None
+            } else {
+                Some(ps)
+            }
         })
     };
 
@@ -7512,10 +7513,16 @@ async fn fs_dirs(
     }
 
     dirs.sort_by(|a, b| {
-        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
     });
     files.sort_by(|a, b| {
-        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
     });
 
     // Build the response; only attach `files[]` when requested so the no-flag
@@ -7556,9 +7563,7 @@ const FS_FILE_BINARY_SNIFF: usize = 8 * 1024;
 /// success predicate is `error.is_none()` (the daemon does NOT send an `ok`
 /// field on this route). Errors map to 403 (outside `$HOME`) or 404
 /// (missing/unreadable).
-async fn fs_file(
-    Query(q): Query<FsFileQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn fs_file(Query(q): Query<FsFileQuery>) -> (StatusCode, Json<serde_json::Value>) {
     let raw = q.path;
     let (_home, target) = match resolve_under_home(&raw) {
         Ok(v) => v,
@@ -11385,24 +11390,25 @@ async fn voice_realtime_client_secret(
     State(state): State<AppState>,
     Json(req): Json<voice_realtime::RealtimeSecretRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let credential =
-        match ocean_providers::resolve_credential_from_env(&ocean_providers::ProviderId::OpenAi) {
-            Ok(Some(credential)) => credential,
-            Ok(None) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({
-                        "error": "no OpenAI credential configured (OCEAN_OPENAI_API_KEY / OPENAI_API_KEY / auth.json)"
-                    })),
-                );
-            }
-            Err(err) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": format!("credential resolution failed: {err}") })),
-                );
-            }
-        };
+    let credential = match ocean_providers::resolve_credential_from_env(
+        &ocean_providers::ProviderId::OpenAi,
+    ) {
+        Ok(Some(credential)) => credential,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "no OpenAI credential configured (OCEAN_OPENAI_API_KEY / OPENAI_API_KEY / auth.json)"
+                })),
+            );
+        }
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("credential resolution failed: {err}") })),
+            );
+        }
+    };
 
     // Briefing: best-effort. A bad/unknown session id degrades to the
     // header-only instructions rather than blocking the voice session.
@@ -11725,25 +11731,43 @@ mod tests {
             None
         );
         // Override disabled → suppress even a configured global role.
-        let off = AdvisorControl { enabled: false, model: Some("gpt-5.4".into()) };
+        let off = AdvisorControl {
+            enabled: false,
+            model: Some("gpt-5.4".into()),
+        };
         assert_eq!(resolve_advisor_alias(Some(&off), &roles), None);
         // Override enabled with a model → that model wins over the global role.
-        let on = AdvisorControl { enabled: true, model: Some("gpt-5.4".into()) };
-        assert_eq!(resolve_advisor_alias(Some(&on), &roles).as_deref(), Some("gpt-5.4"));
+        let on = AdvisorControl {
+            enabled: true,
+            model: Some("gpt-5.4".into()),
+        };
+        assert_eq!(
+            resolve_advisor_alias(Some(&on), &roles).as_deref(),
+            Some("gpt-5.4")
+        );
         // Override enabled, no model → falls back to the global role.
-        let on_default = AdvisorControl { enabled: true, model: None };
+        let on_default = AdvisorControl {
+            enabled: true,
+            model: None,
+        };
         assert_eq!(
             resolve_advisor_alias(Some(&on_default), &roles).as_deref(),
             Some("claude-haiku-4-5")
         );
         // Override enabled, no model, no global role → nothing to run on.
-        let on_orphan = AdvisorControl { enabled: true, model: None };
+        let on_orphan = AdvisorControl {
+            enabled: true,
+            model: None,
+        };
         assert_eq!(
             resolve_advisor_alias(Some(&on_orphan), &std::collections::HashMap::new()),
             None
         );
         // Blank model string is treated as unset → falls back to the role.
-        let on_blank = AdvisorControl { enabled: true, model: Some("  ".into()) };
+        let on_blank = AdvisorControl {
+            enabled: true,
+            model: Some("  ".into()),
+        };
         assert_eq!(
             resolve_advisor_alias(Some(&on_blank), &roles).as_deref(),
             Some("claude-haiku-4-5")
@@ -21103,8 +21127,7 @@ mod tests {
     /// sandbox admits it without touching the process environment.
     fn home_tempdir() -> tempfile::TempDir {
         let home = std::env::var("HOME").expect("HOME is set in this environment");
-        let home =
-            std::fs::canonicalize(&home).unwrap_or_else(|_| std::path::PathBuf::from(home));
+        let home = std::fs::canonicalize(&home).unwrap_or_else(|_| std::path::PathBuf::from(home));
         tempfile::TempDir::new_in(&home).expect("tempdir under $HOME")
     }
 
@@ -21138,7 +21161,10 @@ mod tests {
         let (status, Json(resp)) = fs_file(Query(FsFileQuery { path })).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(
-            resp["error"].as_str().unwrap().contains("outside home directory"),
+            resp["error"]
+                .as_str()
+                .unwrap()
+                .contains("outside home directory"),
             "unexpected error: {resp}"
         );
         assert_eq!(resp["content"].as_str().unwrap(), "");
@@ -21196,7 +21222,10 @@ mod tests {
         let (status, Json(resp)) = fs_file(Query(FsFileQuery { path })).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(
-            resp["error"].as_str().unwrap().contains("path does not exist"),
+            resp["error"]
+                .as_str()
+                .unwrap()
+                .contains("path does not exist"),
             "unexpected error: {resp}"
         );
     }
@@ -21222,11 +21251,19 @@ mod tests {
 
         let files = resp["files"].as_array().expect("files[] present");
         let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec![".envrc", "alpha.txt"], "sorted, dotfile included");
+        assert_eq!(
+            names,
+            vec![".envrc", "alpha.txt"],
+            "sorted, dotfile included"
+        );
         // Each file entry is exactly {name, path, size}.
         for f in files {
             let obj = f.as_object().unwrap();
-            assert_eq!(obj.len(), 3, "file entry must be exactly {{name, path, size}}");
+            assert_eq!(
+                obj.len(),
+                3,
+                "file entry must be exactly {{name, path, size}}"
+            );
             assert!(obj.contains_key("name"));
             assert!(obj.contains_key("path"));
             assert!(obj.contains_key("size"));
@@ -21235,18 +21272,23 @@ mod tests {
         assert_eq!(files[1]["size"].as_u64().unwrap(), 1, "alpha.txt is 1 byte");
 
         let dirs = resp["dirs"].as_array().expect("dirs[] present");
-        let dir_names: Vec<&str> =
-            dirs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        let dir_names: Vec<&str> = dirs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert_eq!(dir_names, vec!["sub"], ".hidden skipped, only sub");
         assert!(dirs[0].get("is_repo").is_some());
         assert!(dirs[0].get("git_branch").is_some());
 
         // files[] omitted entirely when the flag is absent — byte-compatible
         // with the pre-existing body.
-        let (status, Json(resp)) =
-            fs_dirs(Query(FsDirsQuery { path: Some(path), files: None })).await;
+        let (status, Json(resp)) = fs_dirs(Query(FsDirsQuery {
+            path: Some(path),
+            files: None,
+        }))
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(resp.get("files").is_none(), "files[] must be absent without files=1");
+        assert!(
+            resp.get("files").is_none(),
+            "files[] must be absent without files=1"
+        );
         assert_eq!(resp["dirs"].as_array().unwrap().len(), 1);
     }
 

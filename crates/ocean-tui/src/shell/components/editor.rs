@@ -130,10 +130,7 @@ impl Component for EditorComponent {
             return;
         }
         // Editor void bed over the slate (CTRL's editor sits on BG, not SLATE).
-        frame.render_widget(
-            Block::default().style(Style::default().bg(theme::BG)),
-            body,
-        );
+        frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), body);
         self.last_body_h = body.height as usize;
 
         let Some(t) = self.tabs.get(self.active) else {

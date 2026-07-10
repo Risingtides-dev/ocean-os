@@ -41,9 +41,7 @@ fn spawn_wait(session_id: &str, component_id: &str) -> tokio::task::JoinHandle<V
         let mut pending = COMPONENT_WAIT_REGISTRY.pending.lock().unwrap();
         pending.insert((session_id.to_string(), component_id.to_string()), tx);
     }
-    tokio::spawn(async move {
-        rx.await.expect("channel closed unexpectedly")
-    })
+    tokio::spawn(async move { rx.await.expect("channel closed unexpectedly") })
 }
 
 // ---------------------------------------------------------------------------
@@ -200,12 +198,20 @@ async fn concurrent_waits_on_different_components() {
     let h_b = spawn_wait(session_id, "comp-b");
 
     // Inject on comp-a first.
-    inject_event(session_id, "comp-a", json!({ "type": "a_clicked", "payload": {"n": 1} }));
+    inject_event(
+        session_id,
+        "comp-a",
+        json!({ "type": "a_clicked", "payload": {"n": 1} }),
+    );
     let event_a = h_a.await.expect("a resolved");
     assert_eq!(event_a["type"], "a_clicked");
 
     // comp-b should still be waiting.
-    inject_event(session_id, "comp-b", json!({ "type": "form_submit", "payload": {"q": "hello"} }));
+    inject_event(
+        session_id,
+        "comp-b",
+        json!({ "type": "form_submit", "payload": {"q": "hello"} }),
+    );
     let event_b = h_b.await.expect("b resolved");
     assert_eq!(event_b["type"], "form_submit");
     assert_eq!(event_b["payload"]["q"], "hello");
@@ -282,7 +288,10 @@ async fn real_wait_tool_resolves_on_injected_event() {
         json!({ "type": "confirm_response", "payload": {"confirmed": true} }),
     );
 
-    let result = handle.await.expect("wait task panicked").expect("wait should resolve");
+    let result = handle
+        .await
+        .expect("wait task panicked")
+        .expect("wait should resolve");
     let text = result.content[0].as_text().unwrap();
     assert!(text.contains("confirm_response"), "result text: {text}");
     assert!(text.contains("confirmed"), "result text: {text}");

@@ -211,11 +211,7 @@ impl SessionRailComponent {
                 None
             }
             Row::Branch(di, bi) => {
-                if let Some(branch) = self
-                    .groups
-                    .get_mut(di)
-                    .and_then(|d| d.branches.get_mut(bi))
-                {
+                if let Some(branch) = self.groups.get_mut(di).and_then(|d| d.branches.get_mut(bi)) {
                     branch.expanded = !branch.expanded;
                 }
                 let n = self.rows().len();
@@ -406,7 +402,11 @@ impl Component for SessionRailComponent {
                            count: usize,
                            color: ratatui::style::Color,
                            selected: bool| {
-            let caret = if expanded { g("▾ ", "v ") } else { g("▸ ", "> ") };
+            let caret = if expanded {
+                g("▾ ", "v ")
+            } else {
+                g("▸ ", "> ")
+            };
             let count = format!("({count})");
             let plus = g("＋", "+");
             let text = format!("{indent}{caret}{label}");
@@ -604,7 +604,11 @@ fn build_groups(root: &std::path::Path, sessions: Vec<Session>) -> Vec<DirGroup>
             .max()
             .unwrap_or(0)
     };
-    dirs.sort_by(|a, b| newest(b).cmp(&newest(a)).then_with(|| a.label.cmp(&b.label)));
+    dirs.sort_by(|a, b| {
+        newest(b)
+            .cmp(&newest(a))
+            .then_with(|| a.label.cmp(&b.label))
+    });
     if let Some(first) = dirs.first_mut() {
         first.expanded = true;
         if let Some(branch) = first.branches.first_mut() {

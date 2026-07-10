@@ -124,11 +124,7 @@ fn resolve_auth_path(auth_file: Option<PathBuf>) -> Result<PathBuf> {
 /// write reuses [`store::merge_and_write`] — atomic (temp + rename, 0600) and
 /// every unrelated provider block is preserved. Env vars always win over a
 /// file key at resolve time; this fn only writes the file side.
-pub fn store_api_key(
-    provider_key: &str,
-    key: &str,
-    auth_file: Option<PathBuf>,
-) -> Result<PathBuf> {
+pub fn store_api_key(provider_key: &str, key: &str, auth_file: Option<PathBuf>) -> Result<PathBuf> {
     let trimmed = key.trim();
     if trimmed.is_empty() {
         bail!("api key for {provider_key} is empty");
@@ -243,8 +239,10 @@ mod tests {
 
     fn fresh() -> (TempDir, PathBuf) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir()
-            .join(format!("ocean-oauth-store-api-key-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-oauth-store-api-key-{}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let auth = dir.join("auth.json");
@@ -274,7 +272,10 @@ mod tests {
         assert_eq!(written, auth);
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
-        assert_eq!(v["deepseek"]["api_key"], "sk-ds", "unrelated block preserved");
+        assert_eq!(
+            v["deepseek"]["api_key"], "sk-ds",
+            "unrelated block preserved"
+        );
         assert_eq!(v["glm"]["api_key"], "sk-glm-new");
         assert!(
             v["glm"].get("api_key").and_then(Value::as_str) != Some("OLD"),

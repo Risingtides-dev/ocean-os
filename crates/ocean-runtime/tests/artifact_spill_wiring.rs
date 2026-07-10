@@ -72,7 +72,11 @@ fn spill_ctx(session: &str) -> SessionContext {
     }
 }
 
-async fn tool_named(reg: &CapabilityRegistry, ctx: &SessionContext, name: &str) -> Arc<dyn AgentTool> {
+async fn tool_named(
+    reg: &CapabilityRegistry,
+    ctx: &SessionContext,
+    name: &str,
+) -> Arc<dyn AgentTool> {
     reg.tools_for_session(ctx)
         .await
         .into_iter()
@@ -86,10 +90,11 @@ async fn oversized_output_spills_and_reads_back() {
     // notice's "lines 1-N of M" is meaningful.
     let line = "the quick brown fox jumps over the lazy dog"; // 43 bytes + \n
     let total_lines = (SPILL_THRESHOLD_BYTES / (line.len() + 1)) + 200;
-    let payload: String = (0..total_lines)
-        .map(|i| format!("{i}: {line}\n"))
-        .collect();
-    assert!(payload.len() > SPILL_THRESHOLD_BYTES, "payload must exceed threshold");
+    let payload: String = (0..total_lines).map(|i| format!("{i}: {line}\n")).collect();
+    assert!(
+        payload.len() > SPILL_THRESHOLD_BYTES,
+        "payload must exceed threshold"
+    );
 
     let registry = CapabilityRegistry::new(vec![
         Arc::new(BuiltinProvider::new()),
@@ -105,7 +110,10 @@ async fn oversized_output_spills_and_reads_back() {
     let shown = body(&out);
 
     // The model sees a truncated HEAD + a notice, far smaller than the full body.
-    assert!(shown.len() < payload.len(), "output truncated for the model");
+    assert!(
+        shown.len() < payload.len(),
+        "output truncated for the model"
+    );
     assert!(
         shown.contains("[output truncated: showing lines 1-"),
         "truncation notice present, got tail: {:?}",
@@ -116,7 +124,10 @@ async fn oversized_output_spills_and_reads_back() {
         "notice carries the artifact handle"
     );
     // The HEAD is real content (the model can act on it).
-    assert!(shown.starts_with("0: the quick brown fox"), "head is the real output start");
+    assert!(
+        shown.starts_with("0: the quick brown fox"),
+        "head is the real output start"
+    );
 
     // Extract the artifact id from the notice.
     let id = shown
@@ -161,7 +172,11 @@ async fn under_threshold_output_is_untouched() {
 
     let echo = tool_named(&registry, &ctx, "echo").await;
     let out = echo.execute("1", json!({})).await.expect("echo ok");
-    assert_eq!(body(&out), payload, "under-threshold output passes through verbatim");
+    assert_eq!(
+        body(&out),
+        payload,
+        "under-threshold output passes through verbatim"
+    );
 }
 
 #[tokio::test]
@@ -185,7 +200,11 @@ async fn profile_off_is_byte_identical_and_no_artifact_scheme() {
 
     let echo = tool_named(&registry, &ctx, "echo").await;
     let out = echo.execute("1", json!({})).await.expect("echo ok");
-    assert_eq!(body(&out), payload, "off-profile output is unchanged (no truncation)");
+    assert_eq!(
+        body(&out),
+        payload,
+        "off-profile output is unchanged (no truncation)"
+    );
 
     // read of an artifact:// path with the profile off is a plain (failing) read,
     // not a store resolution.

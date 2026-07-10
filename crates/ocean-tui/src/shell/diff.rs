@@ -291,7 +291,10 @@ mod tests {
         assert!(del.segs.iter().any(|s| s.changed && s.text.contains('1')));
         assert!(add.segs.iter().any(|s| s.changed && s.text.contains('2')));
         // The shared prefix is NOT flagged changed.
-        assert!(del.segs.iter().any(|s| !s.changed && s.text.contains("let x")));
+        assert!(del
+            .segs
+            .iter()
+            .any(|s| !s.changed && s.text.contains("let x")));
     }
 
     #[test]
@@ -301,7 +304,12 @@ mod tests {
         let rows = string_rows(old, new);
         assert_eq!(
             kinds(&rows),
-            vec![DiffKind::Context, DiffKind::Del, DiffKind::Add, DiffKind::Context]
+            vec![
+                DiffKind::Context,
+                DiffKind::Del,
+                DiffKind::Add,
+                DiffKind::Context
+            ]
         );
         assert_eq!(text(&rows[0]), "a");
         assert_eq!(text(&rows[3]), "c");
@@ -328,8 +336,7 @@ mod tests {
 
     #[test]
     fn write_tool_is_all_additions() {
-        let rows =
-            edit_tool_diff("write", &json!({ "content": "line one\nline two\n" })).unwrap();
+        let rows = edit_tool_diff("write", &json!({ "content": "line one\nline two\n" })).unwrap();
         assert_eq!(kinds(&rows), vec![DiffKind::Add, DiffKind::Add]);
     }
 

@@ -204,12 +204,11 @@ fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
                 ),
                 Span::styled(
                     label,
-                    Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::CYAN)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "   /image to view",
-                    Style::default().fg(theme::COMMENT),
-                ),
+                Span::styled("   /image to view", Style::default().fg(theme::COMMENT)),
             ]));
         } else if let Some(h) = heading(line) {
             out.push(h);
@@ -435,7 +434,10 @@ fn list_item(line: &str) -> Option<Line<'static>> {
     {
         // Task-list items: `- [x] done` / `- [ ] todo` get a checkbox glyph
         // (green when checked) instead of the raw bracket triplet.
-        if let Some(body) = rest.strip_prefix("[x] ").or_else(|| rest.strip_prefix("[X] ")) {
+        if let Some(body) = rest
+            .strip_prefix("[x] ")
+            .or_else(|| rest.strip_prefix("[X] "))
+        {
             let mut spans = vec![
                 Span::styled(indent.to_string(), base_style()),
                 Span::styled(
@@ -533,7 +535,10 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(close) = find_double(&chars, i + 2, '~') {
                 push_buf(&mut spans, &mut buf, base);
                 let inner: String = chars[i + 2..close].iter().collect();
-                spans.push(Span::styled(inner, base.add_modifier(Modifier::CROSSED_OUT)));
+                spans.push(Span::styled(
+                    inner,
+                    base.add_modifier(Modifier::CROSSED_OUT),
+                ));
                 i = close + 2;
                 continue;
             }
@@ -551,10 +556,7 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
                     base.fg(theme::CYAN).add_modifier(Modifier::UNDERLINED),
                 ));
                 if !url.is_empty() {
-                    spans.push(Span::styled(
-                        format!(" ({url})"),
-                        base.fg(theme::COMMENT),
-                    ));
+                    spans.push(Span::styled(format!(" ({url})"), base.fg(theme::COMMENT)));
                 }
                 i = url_end + 1;
                 continue;

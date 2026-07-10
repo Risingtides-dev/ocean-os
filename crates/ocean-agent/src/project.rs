@@ -127,10 +127,7 @@ pub fn git_head_info(dir: &Path) -> (bool, Option<String>) {
                 let resolved = if git_dir.is_absolute() {
                     git_dir.to_path_buf()
                 } else {
-                    dot_git
-                        .parent()
-                        .unwrap_or(Path::new("."))
-                        .join(git_dir)
+                    dot_git.parent().unwrap_or(Path::new(".")).join(git_dir)
                 };
                 resolved.join("HEAD")
             }

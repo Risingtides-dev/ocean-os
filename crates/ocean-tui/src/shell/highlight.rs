@@ -45,7 +45,10 @@ impl Highlighter {
                 .into_iter()
                 .map(|(s, t)| {
                     let c = s.foreground;
-                    (Color::Rgb(c.r, c.g, c.b), t.trim_end_matches('\n').to_string())
+                    (
+                        Color::Rgb(c.r, c.g, c.b),
+                        t.trim_end_matches('\n').to_string(),
+                    )
                 })
                 .collect();
             out.push(styled);

@@ -182,7 +182,10 @@ mod tests {
         assert_eq!(h.len(), HISTORY_CAP);
         // Oldest surviving entry is #25; newest is the last pushed.
         assert_eq!(h.get(0), Some("entry 25"));
-        assert_eq!(h.get(HISTORY_CAP - 1), Some(&format!("entry {}", HISTORY_CAP + 24)[..]));
+        assert_eq!(
+            h.get(HISTORY_CAP - 1),
+            Some(&format!("entry {}", HISTORY_CAP + 24)[..])
+        );
     }
 
     #[test]

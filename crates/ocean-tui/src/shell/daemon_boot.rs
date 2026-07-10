@@ -190,7 +190,6 @@ pub fn discover_binary() -> Option<PathBuf> {
     )
 }
 
-
 /// Get the current user's UID by shelling out to `id -u` (std-only, no libc).
 /// Returns None when UID resolution is unavailable — no hardcoded fallback.
 #[cfg(target_os = "macos")]
@@ -199,7 +198,11 @@ fn current_uid() -> Option<u32> {
         .arg("-u")
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok().and_then(|s| s.trim().parse().ok()))
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
 }
 // ── launchd detection ───────────────────────────────────────────────────────────
 /// Production: invoke `launchctl print`. Returns `None` if the UID cannot be
@@ -210,10 +213,7 @@ pub fn launchd_supervises() -> Option<bool> {
     {
         let uid = current_uid()?;
         Command::new("launchctl")
-            .args([
-                "print",
-                &format!("gui/{uid}/dev.risingtides.ocean-daemon"),
-            ])
+            .args(["print", &format!("gui/{uid}/dev.risingtides.ocean-daemon")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -253,8 +253,8 @@ fn open_autostart_log() -> Result<fs::File, String> {
 /// already dead, launchd just needs to re-launch it.
 #[cfg(target_os = "macos")]
 fn launchctl_kickstart() -> Result<(), String> {
-    let uid = current_uid()
-        .ok_or_else(|| "cannot kickstart LaunchAgent: UID unavailable".to_string())?;
+    let uid =
+        current_uid().ok_or_else(|| "cannot kickstart LaunchAgent: UID unavailable".to_string())?;
     let label = format!("gui/{uid}/dev.risingtides.ocean-daemon");
     let status = Command::new("launchctl")
         .args(["kickstart", &label])
@@ -292,7 +292,9 @@ fn direct_spawn(binary: &Path) -> Result<(), String> {
         cmd.process_group(0);
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", binary.display()))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", binary.display()))?;
     // Reap on a detached thread so an exiting daemon never leaves a zombie
     // while the TUI is running.
     std::thread::spawn(move || {
@@ -400,10 +402,7 @@ mod tests {
 
     #[test]
     fn not_eligible_wrong_host() {
-        assert!(!autostart_eligible_with(
-            "http://192.168.1.1:4780",
-            None
-        ));
+        assert!(!autostart_eligible_with("http://192.168.1.1:4780", None));
         assert!(!autostart_eligible_with("http://0.0.0.0:4780", None));
     }
 
@@ -419,10 +418,7 @@ mod tests {
         assert_eq!(host_port("http://127.0.0.1:4780"), "127.0.0.1:4780");
         assert_eq!(host_port("http://localhost:4780"), "localhost:4780");
         assert_eq!(host_port("http://example.com:9999"), "example.com:9999");
-        assert_eq!(
-            host_port("http://example.com:9999/"),
-            "example.com:9999"
-        );
+        assert_eq!(host_port("http://example.com:9999/"), "example.com:9999");
     }
 
     // ── binary discovery ───────────────────────────────────────────────────
@@ -539,7 +535,7 @@ mod tests {
             "http://127.0.0.1:4780",
             &g,
             None,
-            || false,            // no launchd
+            || false, // no launchd
             || unreachable!(),
             || AutostartOutcome::Started,
         );
@@ -564,7 +560,7 @@ mod tests {
             "http://127.0.0.1:4780",
             &g,
             None,
-            || true, // probe says supervised
+            || true,   // probe says supervised
             || Ok(()), // kickstart succeeds
             || unreachable!("should not spawn when launchd supervised"),
         );

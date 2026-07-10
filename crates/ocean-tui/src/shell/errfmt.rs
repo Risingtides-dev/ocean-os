@@ -107,7 +107,9 @@ fn classify_credential(s: &str) -> Option<String> {
         || lower.contains("missing api key")
         || lower.contains("no api key")
     {
-        return Some("no credentials for this model — /login to add one, or /model to switch".into());
+        return Some(
+            "no credentials for this model — /login to add one, or /model to switch".into(),
+        );
     }
     None
 }
@@ -186,7 +188,9 @@ mod tests {
 
     #[test]
     fn json_provider_error_message() {
-        let got = humanize("turn: HTTP 500: {\"error\":{\"message\":\"rate limit exceeded\",\"code\":429}}");
+        let got = humanize(
+            "turn: HTTP 500: {\"error\":{\"message\":\"rate limit exceeded\",\"code\":429}}",
+        );
         assert_eq!(got, "rate limit exceeded");
     }
 
@@ -205,56 +209,78 @@ mod tests {
     #[test]
     fn credential_401() {
         let got = humanize("turn: HTTP 401 Unauthorized");
-        assert_eq!(got, "credentials look expired or revoked — run /login to reconnect");
+        assert_eq!(
+            got,
+            "credentials look expired or revoked — run /login to reconnect"
+        );
     }
 
     #[test]
     fn credential_token_invalidated() {
         let got = humanize("turn: token_invalidated");
-        assert_eq!(got, "credentials look expired or revoked — run /login to reconnect");
+        assert_eq!(
+            got,
+            "credentials look expired or revoked — run /login to reconnect"
+        );
     }
 
     #[test]
     fn credential_invalid_grant() {
         let got = humanize("turn: invalid_grant");
-        assert_eq!(got, "credentials look expired or revoked — run /login to reconnect");
+        assert_eq!(
+            got,
+            "credentials look expired or revoked — run /login to reconnect"
+        );
     }
 
     #[test]
     fn credential_oauth_expired() {
         let got = humanize("turn: oauth token expired");
-        assert_eq!(got, "credentials look expired or revoked — run /login to reconnect");
+        assert_eq!(
+            got,
+            "credentials look expired or revoked — run /login to reconnect"
+        );
     }
 
     #[test]
     fn credential_authentication() {
         let got = humanize("turn: authentication failed");
-        assert_eq!(got, "credentials look expired or revoked — run /login to reconnect");
+        assert_eq!(
+            got,
+            "credentials look expired or revoked — run /login to reconnect"
+        );
     }
 
     #[test]
     fn no_credential() {
         let got = humanize("turn: no credential found for provider deepseek");
-        assert_eq!(got, "no credentials for this model — /login to add one, or /model to switch");
+        assert_eq!(
+            got,
+            "no credentials for this model — /login to add one, or /model to switch"
+        );
     }
 
     #[test]
     fn not_configured() {
         let got = humanize("turn: provider not configured: glm");
-        assert_eq!(got, "no credentials for this model — /login to add one, or /model to switch");
+        assert_eq!(
+            got,
+            "no credentials for this model — /login to add one, or /model to switch"
+        );
     }
 
     #[test]
     fn missing_api_key() {
         let got = humanize("turn: missing api key for openai");
-        assert_eq!(got, "no credentials for this model — /login to add one, or /model to switch");
+        assert_eq!(
+            got,
+            "no credentials for this model — /login to add one, or /model to switch"
+        );
     }
 
     #[test]
     fn json_token_invalidated_gets_login_hint() {
-        let got = humanize(
-            "turn: {\"error\":{\"message\":\"token_invalidated\"}}",
-        );
+        let got = humanize("turn: {\"error\":{\"message\":\"token_invalidated\"}}");
         assert_eq!(
             got,
             "credentials look expired or revoked — run /login to reconnect"
@@ -263,9 +289,7 @@ mod tests {
 
     #[test]
     fn json_expired_token_gets_login_hint() {
-        let got = humanize(
-            "turn: HTTP 500: {\"error\":{\"message\":\"oauth token expired\"}}",
-        );
+        let got = humanize("turn: HTTP 500: {\"error\":{\"message\":\"oauth token expired\"}}");
         assert_eq!(
             got,
             "credentials look expired or revoked — run /login to reconnect"
@@ -274,9 +298,7 @@ mod tests {
 
     #[test]
     fn json_unauthorized_gets_login_hint() {
-        let got = humanize(
-            "turn: {\"message\":\"Unauthorized\"}",
-        );
+        let got = humanize("turn: {\"message\":\"Unauthorized\"}");
         assert_eq!(
             got,
             "credentials look expired or revoked — run /login to reconnect"
@@ -285,7 +307,10 @@ mod tests {
     #[test]
     fn turn_prefix_stripped() {
         let got = humanize("turn: HTTP 401 Unauthorized");
-        assert_eq!(got, "credentials look expired or revoked — run /login to reconnect");
+        assert_eq!(
+            got,
+            "credentials look expired or revoked — run /login to reconnect"
+        );
     }
 
     #[test]
@@ -318,7 +343,9 @@ mod tests {
 
     #[test]
     fn is_connect_shaped_connection_refused() {
-        assert!(is_connect_shaped("tcp connect error: Connection refused (os error 61)"));
+        assert!(is_connect_shaped(
+            "tcp connect error: Connection refused (os error 61)"
+        ));
     }
 
     #[test]
@@ -333,7 +360,9 @@ mod tests {
 
     #[test]
     fn is_connect_shaped_on_stripped_body() {
-        assert!(is_connect_shaped("session: Connection refused (os error 61)"));
+        assert!(is_connect_shaped(
+            "session: Connection refused (os error 61)"
+        ));
         assert!(is_connect_shaped("turn: dns error: failed to resolve"));
     }
 
@@ -341,7 +370,9 @@ mod tests {
     fn is_connect_shaped_rejects_credentials() {
         assert!(!is_connect_shaped("turn: HTTP 401 Unauthorized"));
         assert!(!is_connect_shaped("turn: token_invalidated"));
-        assert!(!is_connect_shaped("turn: no credential found for provider deepseek"));
+        assert!(!is_connect_shaped(
+            "turn: no credential found for provider deepseek"
+        ));
     }
 
     #[test]

@@ -137,14 +137,12 @@ async fn bind_loopback(spec: &BindSpec) -> Result<TcpListener> {
         Ok(listener) => Ok(listener),
         Err(err) => {
             if spec.allow_fallback {
-                let listener = TcpListener::bind(("127.0.0.1", 0))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "callback port {} unavailable and ephemeral bind failed: {err}",
-                            spec.preferred_port
-                        )
-                    })?;
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await.with_context(|| {
+                    format!(
+                        "callback port {} unavailable and ephemeral bind failed: {err}",
+                        spec.preferred_port
+                    )
+                })?;
                 let ephemeral = listener.local_addr()?.port();
                 tracing::warn!(
                     label = spec.label,
@@ -198,13 +196,15 @@ async fn handle_connection(mut stream: TcpStream, shared: Arc<ServerShared>) {
         let pending = shared.pending.lock().clone();
         match pending {
             Some(url) => write_redirect(&mut stream, &url).await,
-            None => write_response(
-                &mut stream,
-                503,
-                "text/plain; charset=utf-8",
-                "OAuth launch URL is no longer active",
-            )
-            .await,
+            None => {
+                write_response(
+                    &mut stream,
+                    503,
+                    "text/plain; charset=utf-8",
+                    "OAuth launch URL is no longer active",
+                )
+                .await
+            }
         }
     } else {
         write_response(&mut stream, 404, "text/plain; charset=utf-8", "Not Found").await;
@@ -322,11 +322,17 @@ mod tests {
             .redirect_uri
             .strip_prefix("http://localhost:")
             .expect("redirect_uri is localhost");
-        rest.split('/').next().expect("port").parse().expect("numeric")
+        rest.split('/')
+            .next()
+            .expect("port")
+            .parse()
+            .expect("numeric")
     }
 
     async fn get(port: u16, target: &str) -> String {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
         let req = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.expect("write");
         let mut buf = Vec::new();
@@ -389,8 +395,11 @@ mod tests {
             .await
             .expect("bind");
         let port = port_of(&server);
-        let resp =
-            get(port, "/callback?error=access_denied&error_description=user%20declined").await;
+        let resp = get(
+            port,
+            "/callback?error=access_denied&error_description=user%20declined",
+        )
+        .await;
         let (status, body) = status_and_body(&resp);
         assert_eq!(status, 500);
         assert!(
@@ -450,7 +459,10 @@ mod tests {
         server.set_pending_url("https://example.test/authorize?x=1".to_string());
         let port = port_of(&server);
         let resp = get(port, "/launch").await;
-        assert!(resp.starts_with("HTTP/1.1 302"), "expected 302, got: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 302"),
+            "expected 302, got: {resp}"
+        );
         assert!(
             resp.contains("Location: https://example.test/authorize?x=1"),
             "missing Location: {resp}"

@@ -500,10 +500,19 @@ mod tests {
     async fn unknown_kind_renders_with_warning() {
         let tool = ComponentRenderTool;
         let args = json!({ "id": "comp-future", "kind": "hologram", "props": {} });
-        let res = tool.execute("call-1", args).await.expect("unknown kind still renders");
+        let res = tool
+            .execute("call-1", args)
+            .await
+            .expect("unknown kind still renders");
         let summary = res.content[0].as_text().unwrap();
-        assert!(summary.contains("warning"), "unknown kind must produce warning: {summary}");
-        assert!(summary.contains("hologram"), "warning must name the kind: {summary}");
+        assert!(
+            summary.contains("warning"),
+            "unknown kind must produce warning: {summary}"
+        );
+        assert!(
+            summary.contains("hologram"),
+            "warning must name the kind: {summary}"
+        );
     }
 
     /// Missing `id` is rejected.
@@ -535,8 +544,12 @@ mod tests {
     #[tokio::test]
     async fn component_render_with_replace_flag() {
         let tool = ComponentRenderTool;
-        let args = json!({ "id": "comp-1", "kind": "progress", "props": {"label":"ok"}, "replace": true });
-        let res = tool.execute("call-1", args).await.expect("replace flag accepted");
+        let args =
+            json!({ "id": "comp-1", "kind": "progress", "props": {"label":"ok"}, "replace": true });
+        let res = tool
+            .execute("call-1", args)
+            .await
+            .expect("replace flag accepted");
         assert_eq!(res.side_effects.len(), 1);
         match &res.side_effects[0] {
             ToolSideEffect::Render { replace, .. } => assert!(replace, "replace must be true"),
@@ -551,7 +564,9 @@ mod tests {
         let args = json!({ "id": "comp-1", "kind": "progress", "props": {} });
         let res = tool.execute("call-1", args).await.expect("valid");
         match &res.side_effects[0] {
-            ToolSideEffect::Render { replace, .. } => assert!(!replace, "replace must default to false"),
+            ToolSideEffect::Render { replace, .. } => {
+                assert!(!replace, "replace must default to false")
+            }
             other => panic!("expected Render, got {other:?}"),
         }
     }
@@ -564,7 +579,9 @@ mod tests {
         let args = json!({ "id": "prog-1", "kind": "progress", "props": props });
         let res = tool.execute("call-1", args).await.expect("valid");
         match &res.side_effects[0] {
-            ToolSideEffect::Render { props: forwarded, .. } => {
+            ToolSideEffect::Render {
+                props: forwarded, ..
+            } => {
                 assert_eq!(forwarded["label"], "Building");
                 assert_eq!(forwarded["value"], 0.5);
                 assert_eq!(forwarded["max"], 1.0);
@@ -582,10 +599,17 @@ mod tests {
         // execute fn uses `args.get("props").cloned().unwrap_or(…)` and won't
         // reject a missing props key.
         let args = json!({ "id": "comp-1", "kind": "table" });
-        let res = tool.execute("call-1", args).await.expect("missing props handled");
+        let res = tool
+            .execute("call-1", args)
+            .await
+            .expect("missing props handled");
         match &res.side_effects[0] {
             ToolSideEffect::Render { props, .. } => {
-                assert_eq!(props, &json!({}), "missing props must default to empty object");
+                assert_eq!(
+                    props,
+                    &json!({}),
+                    "missing props must default to empty object"
+                );
             }
             other => panic!("expected Render, got {other:?}"),
         }

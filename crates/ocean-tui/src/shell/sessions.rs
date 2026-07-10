@@ -135,7 +135,10 @@ fn ocean_session_from_value(root: &Path, path: &Path, v: &serde_json::Value) -> 
     let workspace = json_str(v, "workspace_root").map(PathBuf::from);
     let match_path = workspace.as_ref().or(cwd.as_ref())?;
     let worktree = worktree_label(root, match_path)?;
-    let run_cwd = workspace.clone().or(cwd).unwrap_or_else(|| root.to_path_buf());
+    let run_cwd = workspace
+        .clone()
+        .or(cwd)
+        .unwrap_or_else(|| root.to_path_buf());
     let mtime = v
         .get("updated_ms")
         .and_then(|x| x.as_u64())
@@ -225,8 +228,16 @@ pub fn sort_sessions(v: &mut [Session], sort: Sort) {
     match sort {
         Sort::Date => v.sort_by_key(|s| std::cmp::Reverse(s.mtime)),
         Sort::Worktree => v.sort_by(|a, b| {
-            let ka = (a.worktree != "main", a.worktree.as_str(), std::cmp::Reverse(a.mtime));
-            let kb = (b.worktree != "main", b.worktree.as_str(), std::cmp::Reverse(b.mtime));
+            let ka = (
+                a.worktree != "main",
+                a.worktree.as_str(),
+                std::cmp::Reverse(a.mtime),
+            );
+            let kb = (
+                b.worktree != "main",
+                b.worktree.as_str(),
+                std::cmp::Reverse(b.mtime),
+            );
             ka.cmp(&kb)
         }),
     }
@@ -395,10 +406,7 @@ mod tests {
             ocean_clean_user_text("[TUI] hey there").as_deref(),
             Some("hey there")
         );
-        assert_eq!(
-            ocean_clean_user_text("[ACP] hey").as_deref(),
-            Some("hey")
-        );
+        assert_eq!(ocean_clean_user_text("[ACP] hey").as_deref(), Some("hey"));
         assert_eq!(
             ocean_clean_user_text("[?] say pong").as_deref(),
             Some("say pong")
@@ -505,7 +513,11 @@ mod tests {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/Users/risingtidesdev/dev/ocean-os"));
         let found = discover(&root, Sort::Date);
-        println!("discovered {} ocean sessions under {}", found.len(), root.display());
+        println!(
+            "discovered {} ocean sessions under {}",
+            found.len(),
+            root.display()
+        );
         for s in found.iter().take(15) {
             println!("  [{}] {} · {}", s.worktree, ago(s.mtime), s.title);
         }
@@ -521,7 +533,10 @@ mod live_transcript {
         // Newest ocean-os session on disk.
         let root = PathBuf::from("/Users/risingtidesdev/dev/ocean-os");
         let sessions = discover(&root, Sort::Date);
-        let Some(s) = sessions.first() else { println!("no sessions"); return; };
+        let Some(s) = sessions.first() else {
+            println!("no sessions");
+            return;
+        };
         let hist = load_transcript(&s.path);
         println!("session '{}' → {} messages", s.title, hist.len());
         for m in hist.iter().take(6) {

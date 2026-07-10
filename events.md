@@ -2193,3 +2193,20 @@ retained, environment sensitivity removed. Gates: 12/12 tools_smoke on
 macOS AND stock-Linux container + slow-login-shell container, clippy -p
 ocean-runtime clean.
 _________________________________________________________________________________
+time:      [01:21am] [07-10-26]
+agent:     [claude] [fable-5]
+type:      gh-actions
+area:      infra
+
+Third and final leg of the rust 1.97 toolchain-drift cleanup: the fmt axis.
+CI (dtolnay stable = 1.97 since 07-07) enforces cargo fmt --all --check as
+its LAST step, so the drift stayed hidden behind the earlier clippy/test
+aborts and surfaced one red at a time. 1.97 rustfmt rewraps lines the
+OCEAN-323 sweep (1.96) accepted: 34 files, whitespace-only resweep, zero
+semantic change. Lesson applied: this push was gated on CI's EXACT four
+steps locally (build workspace, test workspace, clippy all-targets -D
+warnings, fmt check) at 1.97 parity - all green before push, not discovered
+red-by-red. Main should be fully green after this lands; the paused
+shell-rebuild session's dirty tree contains some of the same fmt rewraps,
+which become no-ops when it rebases.
+_________________________________________________________________________________

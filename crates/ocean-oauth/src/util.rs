@@ -125,7 +125,10 @@ mod tests {
         // The two encodings that matter for OAuth scopes: space and colon.
         assert_eq!(percent_encode(" "), "%20");
         assert_eq!(percent_encode("a:b"), "a%3Ab");
-        assert_eq!(percent_encode("openid profile a:b"), "openid%20profile%20a%3Ab");
+        assert_eq!(
+            percent_encode("openid profile a:b"),
+            "openid%20profile%20a%3Ab"
+        );
         // Hex digits are uppercase.
         assert_eq!(percent_encode("/"), "%2F");
     }
@@ -141,11 +144,17 @@ mod tests {
 
     #[test]
     fn query_get_decodes_and_treats_empty_or_missing_as_none() {
-        assert_eq!(query_get("code=ab%2Dc&state=zz", "code"), Some("ab-c".to_string()));
+        assert_eq!(
+            query_get("code=ab%2Dc&state=zz", "code"),
+            Some("ab-c".to_string())
+        );
         assert_eq!(query_get("state=zz", "code"), None); // missing entirely
         assert_eq!(query_get("code=", "code"), None); // present but empty
         assert_eq!(query_get("code=&state=1", "code"), None); // empty among peers
-        assert_eq!(query_get("q=hello+world", "q"), Some("hello world".to_string()));
+        assert_eq!(
+            query_get("q=hello+world", "q"),
+            Some("hello world".to_string())
+        );
         // First occurrence wins (URLSearchParams.get semantics).
         assert_eq!(query_get("k=one&k=two", "k"), Some("one".to_string()));
     }

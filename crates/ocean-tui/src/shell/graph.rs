@@ -607,9 +607,16 @@ mod live {
     fn live_scan_dump() {
         let root = std::env::var("OCEAN_TUI_LIST_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/Users/risingtidesdev/dev/ocean-os/crates/ocean-tui"));
+            .unwrap_or_else(|_| {
+                PathBuf::from("/Users/risingtidesdev/dev/ocean-os/crates/ocean-tui")
+            });
         let g = ProjectGraph::scan(&root);
-        println!("graph: {} nodes, {} edges (truncated={})", g.nodes.len(), g.edges.len(), g.truncated);
+        println!(
+            "graph: {} nodes, {} edges (truncated={})",
+            g.nodes.len(),
+            g.edges.len(),
+            g.truncated
+        );
         println!("start node: {}", g.selected_label());
     }
 }

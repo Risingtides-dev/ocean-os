@@ -176,7 +176,9 @@ mod tests {
         assert!(texts.contains(&"claude-sonnet-5"));
         assert!(texts.iter().any(|t| t.contains("2342d9fa")));
         // No git / rate / tokens / advisor segments when their values are None.
-        assert!(!texts.iter().any(|t| t.contains("±") || t.contains("/s") || t.contains("advisor")));
+        assert!(!texts
+            .iter()
+            .any(|t| t.contains("±") || t.contains("/s") || t.contains("advisor")));
     }
 
     #[test]

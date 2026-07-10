@@ -201,7 +201,11 @@ mod tests {
         }
         assert_eq!(s.len(), 3, "count capped at 3");
         let ids: Vec<_> = s.list().iter().map(|a| a.id.clone()).collect();
-        assert_eq!(ids, vec!["a3", "a4", "a5"], "oldest two evicted, order preserved");
+        assert_eq!(
+            ids,
+            vec!["a3", "a4", "a5"],
+            "oldest two evicted, order preserved"
+        );
     }
 
     #[test]

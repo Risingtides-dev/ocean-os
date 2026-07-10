@@ -55,11 +55,7 @@ pub(crate) fn build_instructions(transcript: &[(String, String)]) -> String {
          agent picks it up for real coding work — use it whenever the user \
          asks for non-trivial code or file changes.",
     );
-    let tail: Vec<&(String, String)> = transcript
-        .iter()
-        .rev()
-        .take(BRIEFING_MAX_ENTRIES)
-        .collect();
+    let tail: Vec<&(String, String)> = transcript.iter().rev().take(BRIEFING_MAX_ENTRIES).collect();
     if tail.is_empty() {
         return out;
     }
@@ -201,7 +197,10 @@ mod tests {
             .collect();
         let out = build_instructions(&transcript);
         // Only the newest BRIEFING_MAX_ENTRIES survive…
-        assert!(!out.contains("message 9\n"), "oldest entries must be dropped");
+        assert!(
+            !out.contains("message 9\n"),
+            "oldest entries must be dropped"
+        );
         assert!(out.contains("message 10"));
         assert!(out.contains("message 39"));
         // …and order is oldest-first among the survivors.

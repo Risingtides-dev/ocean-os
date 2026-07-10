@@ -17,7 +17,12 @@ pub const CAP: usize = 6000;
 /// forward-slash paths, sorted. Directories are excluded — you mention files.
 pub fn scan(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    for dent in WalkBuilder::new(root).hidden(true).git_ignore(true).build().flatten() {
+    for dent in WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .build()
+        .flatten()
+    {
         if out.len() >= CAP {
             break;
         }
@@ -67,10 +72,15 @@ mod tests {
     use super::*;
 
     fn idx() -> Vec<String> {
-        ["src/main.rs", "src/domain/user.rs", "README.md", "docs/main-notes.md"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "src/main.rs",
+            "src/domain/user.rs",
+            "README.md",
+            "docs/main-notes.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     #[test]

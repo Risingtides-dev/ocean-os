@@ -38,7 +38,9 @@ fn read_root(path: &Path) -> Result<Value> {
             Ok(value)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
-        Err(err) => Err(err).with_context(|| format!("failed to read auth file {}", path.display())),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read auth file {}", path.display()))
+        }
     }
 }
 
@@ -97,7 +99,8 @@ mod tests {
 
     fn fresh() -> (TempDir, PathBuf) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("ocean-oauth-store-{}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ocean-oauth-store-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let auth = dir.join("auth.json");
@@ -115,7 +118,11 @@ mod tests {
     #[test]
     fn preserves_unrelated_keys_and_replaces_same_key_block() {
         let (_guard, auth) = fresh();
-        std::fs::write(&auth, r#"{"deepseek":{"k":"v"},"claude-code":{"old":true}}"#).unwrap();
+        std::fs::write(
+            &auth,
+            r#"{"deepseek":{"k":"v"},"claude-code":{"old":true}}"#,
+        )
+        .unwrap();
         merge_and_write(
             &auth,
             "claude-code",
@@ -129,7 +136,10 @@ mod tests {
         // Same-key block fully replaced — no leftover "old".
         assert_eq!(v["claude-code"]["type"], "oauth");
         assert_eq!(v["claude-code"]["access"], "a");
-        assert!(v["claude-code"].get("old").is_none(), "old block not replaced: {v}");
+        assert!(
+            v["claude-code"].get("old").is_none(),
+            "old block not replaced: {v}"
+        );
     }
 
     #[test]
@@ -151,7 +161,10 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
         assert_eq!(v["claude-code"]["expires"], 7);
         #[cfg(unix)]
-        assert!(mode_is_0600(&auth), "expected 0600 permissions on auth file");
+        assert!(
+            mode_is_0600(&auth),
+            "expected 0600 permissions on auth file"
+        );
     }
 
     #[test]
@@ -189,6 +202,9 @@ mod tests {
         )
         .unwrap();
         let contents = std::fs::read_to_string(&auth).unwrap();
-        assert!(contents.contains("\n  \"claude-code\""), "not pretty: {contents}");
+        assert!(
+            contents.contains("\n  \"claude-code\""),
+            "not pretty: {contents}"
+        );
     }
 }

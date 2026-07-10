@@ -46,7 +46,8 @@ pub fn place_png_at(path: &Path, col: u16, row: u16, cols: u16, rows: u16) -> Op
         return None;
     }
     let abs = std::fs::canonicalize(path).ok()?;
-    let payload = base64::engine::general_purpose::STANDARD.encode(abs.to_string_lossy().as_bytes());
+    let payload =
+        base64::engine::general_purpose::STANDARD.encode(abs.to_string_lossy().as_bytes());
     // Move cursor (1-based) then transmit+display: file medium (t=f), PNG
     // (f=100), sized to the cell box (c=cols, r=rows), quiet (q=2 → no ack).
     Some(format!(
