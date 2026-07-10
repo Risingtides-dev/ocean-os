@@ -469,7 +469,6 @@ impl Provider for AnthropicProvider {
             let api_key = api_key.clone();
             let body = body.clone();
             let extra_headers = extra_headers.clone();
-            let auth = auth;
             async move {
                 let mut req = client
                     .post(&url)
