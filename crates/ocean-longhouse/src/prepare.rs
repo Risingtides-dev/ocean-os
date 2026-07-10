@@ -16,7 +16,9 @@
 //! ## What this is
 //!
 //! * **Loaders** that index the documented skill sources
-//!   (`docs/LONGHOUSE.md` lines 119-122):
+//!   (`docs/LONGHOUSE.md` §"Skill Librarian"):
+//!   - `~/.config/ocean-rs/skills/**` (Ocean's native user library, either
+//!     format; `OCEAN_SKILLS_DIR` overrides),
 //!   - `~/.spawner/skills/**/skill.yaml` (spawner format),
 //!   - `~/.codex/skills/**/SKILL.md` (codex format, YAML frontmatter),
 //!   - repo-local `./skills/**` (either format).
@@ -64,8 +66,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-/// How many skill briefs `prepare` returns at most. `docs/LONGHOUSE.md` line 129
-/// calls for "3–7 compact skill briefs"; 5 sits in the middle.
+/// How many skill briefs `prepare` returns at most. `docs/LONGHOUSE.md`
+/// §"Skill Librarian" calls for "3–7 compact skill briefs"; 5 sits in the middle.
 pub const DEFAULT_TOP_N: usize = 5;
 
 /// How long a cached [`SkillIndex`] stays fresh before the next consult re-walks
@@ -113,6 +115,8 @@ impl TurnBrief {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillSource {
+    /// `~/.config/ocean-rs/skills/**` — Ocean's own user library (either format).
+    Ocean,
     /// `~/.spawner/skills/**/skill.yaml`
     Spawner,
     /// `~/.codex/skills/**/SKILL.md`
@@ -176,13 +180,16 @@ impl TurnPrep {
 }
 
 /// Configurable roots for the skill index. Defaults to the documented sources
-/// (`docs/LONGHOUSE.md` lines 119-122). Any root may be absent on disk — the
+/// (`docs/LONGHOUSE.md` §"Skill Librarian"). Any root may be absent on disk — the
 /// loader skips missing dirs silently.
 ///
 /// `Hash`/`Eq` so it can key the process-wide [`cached_index_for`] cache: two
 /// turns with the same roots share one loaded index.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SkillRoots {
+    /// `~/.config/ocean-rs/skills` — Ocean's native user skill library
+    /// (`OCEAN_SKILLS_DIR` overrides). Accepts both `skill.yaml` and `SKILL.md`.
+    pub ocean: Option<PathBuf>,
     /// `~/.spawner/skills` — spawner `skill.yaml` files.
     pub spawner: Option<PathBuf>,
     /// `~/.codex/skills` — codex `SKILL.md` files.
@@ -195,6 +202,7 @@ impl Default for SkillRoots {
     /// The documented default roots, with `~` expanded from `$HOME`.
     fn default() -> Self {
         Self {
+            ocean: ocean_root_from(std::env::var_os("OCEAN_SKILLS_DIR")),
             spawner: home_join(".spawner/skills"),
             codex: home_join(".codex/skills"),
             // Repo-local skills are cwd-relative and the daemon supplies the cwd
@@ -221,6 +229,17 @@ fn home_join(rest: &str) -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
 }
 
+/// Resolve the Ocean-native skill root: an explicit non-empty
+/// `OCEAN_SKILLS_DIR` wins; otherwise `~/.config/ocean-rs/skills`. Pure in its
+/// argument so tests can exercise both branches without touching the process
+/// environment (env mutation races parallel tests).
+fn ocean_root_from(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match env_override {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => home_join(".config/ocean-rs/skills"),
+    }
+}
+
 /// The loaded, cached skill index. Built once via [`SkillIndex::load`] /
 /// [`SkillIndex::load_from`], then queried per-turn via [`SkillIndex::prepare`]
 /// — the scan does NOT re-run on every prepare call.
@@ -230,9 +249,10 @@ pub struct SkillIndex {
 }
 
 impl SkillIndex {
-    /// Load the index from the documented default roots (`~/.spawner/skills`,
-    /// `~/.codex/skills`). Never errors: missing dirs and malformed files are
-    /// skipped (the latter logged at `warn`/`debug`).
+    /// Load the index from the documented default roots
+    /// (`~/.config/ocean-rs/skills`, `~/.spawner/skills`, `~/.codex/skills`).
+    /// Never errors: missing dirs and malformed files are skipped (the latter
+    /// logged at `warn`/`debug`).
     pub fn load() -> Self {
         Self::load_from(&SkillRoots::default())
     }
@@ -241,6 +261,11 @@ impl SkillIndex {
     pub fn load_from(roots: &SkillRoots) -> Self {
         let mut skills = Vec::new();
 
+        // Ocean's native library scans first — product-owned packs lead the
+        // index; foreign libraries (spawner/codex) follow.
+        if let Some(dir) = &roots.ocean {
+            scan_dir(dir, SkillSource::Ocean, &mut skills);
+        }
         if let Some(dir) = &roots.spawner {
             scan_dir(dir, SkillSource::Spawner, &mut skills);
         }
@@ -1082,6 +1107,7 @@ mod tests {
         );
 
         let roots = SkillRoots {
+            ocean: None,
             spawner: Some(spawner),
             codex: Some(codex),
             repo: None,
@@ -1109,6 +1135,7 @@ mod tests {
     #[test]
     fn missing_dir_yields_empty_no_error() {
         let roots = SkillRoots {
+            ocean: Some(PathBuf::from("/nonexistent/ocean/skills/xyz")),
             spawner: Some(PathBuf::from("/nonexistent/spawner/skills/xyz")),
             codex: Some(PathBuf::from("/nonexistent/codex/skills/xyz")),
             repo: Some(PathBuf::from("/nonexistent/repo/skills")),
@@ -1134,6 +1161,7 @@ mod tests {
         write(&root, "junk/skill.yaml", "\x00\x01 not yaml at all :::");
 
         let roots = SkillRoots {
+            ocean: None,
             spawner: Some(root),
             codex: None,
             repo: None,
@@ -1153,6 +1181,7 @@ mod tests {
             "---\ndescription: \"does a thing\"\n---\n\n# Thing Skill\n",
         );
         let roots = SkillRoots {
+            ocean: None,
             spawner: None,
             codex: Some(root),
             repo: None,
@@ -1179,12 +1208,72 @@ mod tests {
         let roots = SkillRoots::for_cwd(cwd);
         // Don't depend on the host's real ~/.spawner — only assert the repo ones.
         let index = SkillIndex::load_from(&SkillRoots {
+            ocean: None,
             spawner: None,
             codex: None,
             repo: roots.repo,
         });
         assert_eq!(index.len(), 2);
         assert!(index.skills().iter().all(|s| s.source == SkillSource::Repo));
+    }
+
+    #[test]
+    fn ocean_root_accepts_either_format_and_scans_first() {
+        let tmp = TempDir::new().unwrap();
+        let ocean = tmp.path().join("ocean-skills");
+        let spawner = tmp.path().join("spawner");
+        write(
+            &ocean,
+            "deploys/skill.yaml",
+            "name: Ocean Yaml\ndescription: ocean yaml pack\n",
+        );
+        write(
+            &ocean,
+            "captions/SKILL.md",
+            "---\nname: \"Ocean Md\"\ndescription: \"ocean md pack\"\n---\n\n# Ocean Md\n",
+        );
+        write(
+            &spawner,
+            "video/skill.yaml",
+            "name: Foreign\ndescription: foreign library skill\n",
+        );
+        let index = SkillIndex::load_from(&SkillRoots {
+            ocean: Some(ocean),
+            spawner: Some(spawner),
+            codex: None,
+            repo: None,
+        });
+        assert_eq!(index.len(), 3);
+        // Ocean's native library leads the index; the foreign library follows.
+        assert!(
+            index.skills()[..2]
+                .iter()
+                .all(|s| s.source == SkillSource::Ocean),
+            "ocean packs must scan first, got {:?}",
+            index.skills().iter().map(|s| s.source).collect::<Vec<_>>()
+        );
+        assert_eq!(index.skills()[2].source, SkillSource::Spawner);
+    }
+
+    #[test]
+    fn ocean_root_from_env_override_wins_and_falls_back_to_home() {
+        // Explicit non-empty override wins verbatim.
+        assert_eq!(
+            ocean_root_from(Some("/custom/packs".into())),
+            Some(PathBuf::from("/custom/packs"))
+        );
+        // Empty override falls through to the home default (suffix-checked so
+        // the assertion holds under any $HOME; None only if HOME is unset).
+        for path in [ocean_root_from(Some("".into())), ocean_root_from(None)]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                path.ends_with(".config/ocean-rs/skills"),
+                "home fallback must land on the documented dir, got {}",
+                path.display()
+            );
+        }
     }
 
     // ---- prepare / relevance tests ----
@@ -1385,6 +1474,7 @@ mod tests {
             "name: Zorptastic\ndescription: build a zorptastic widget\n",
         );
         let roots = SkillRoots {
+            ocean: None,
             spawner: None,
             codex: None,
             repo: Some(repo.join("skills")),
@@ -1435,6 +1525,7 @@ mod tests {
             "name: Alpha\ndescription: alpha skill\n",
         );
         let roots = SkillRoots {
+            ocean: None,
             spawner: None,
             codex: None,
             repo: Some(repo.join("skills")),

@@ -122,10 +122,12 @@ The smallest useful dynamic integration is a **read-only preparation step**:
 
 This creates value without allowing Longhouse to perform local side effects.
 
-## Skill Librarian future
+## Skill Librarian
 
-Longhouse should eventually index and query:
+Longhouse indexes and queries (implemented — `ocean-longhouse/src/prepare.rs`):
 
+- `~/.config/ocean-rs/skills/**` — Ocean's native user skill pack library
+  (either format below; `OCEAN_SKILLS_DIR` overrides the location)
 - `~/.spawner/skills/**/skill.yaml`
 - `~/.codex/skills/**/SKILL.md`
 - repo-local `./skills/**`

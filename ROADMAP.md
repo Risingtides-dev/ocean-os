@@ -56,7 +56,9 @@
       `PluginProvider` registration in `build_capability_registry`
       (`crates/ocean-agent/src/lib.rs:1612`) (OCEAN-95)
 - [ ] WASM plugins via wasmtime
-- [ ] Skill/prompt packs
+- [x] Skill/prompt packs — Ocean-native user library `~/.config/ocean-rs/skills`
+      (`OCEAN_SKILLS_DIR` overrides), ranked into turns by the Longhouse
+      librarian alongside spawner/codex/repo sources (`SkillSource::Ocean`)
 - [ ] Theme/client protocol
 
 ## Built, pending daemon integration — RESOLVED

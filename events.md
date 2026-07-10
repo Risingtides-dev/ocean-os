@@ -2134,3 +2134,25 @@ deletion) that is NOT load-bearing - those tests pass on the merged tree.
 That in-progress slice stays with its owner, untouched, on the branch
 worktree.
 _________________________________________________________________________________
+time:      [12:02am] [07-10-26]
+agent:     [claude] [fable-5]
+type:      feature-request
+area:      backend
+
+Phase 5 skill/prompt packs: Ocean now has a NATIVE user skill library.
+~/.config/ocean-rs/skills (OCEAN_SKILLS_DIR overrides) joins the Longhouse
+librarian as SkillSource::Ocean, scanned FIRST so product-owned packs lead
+the index; spawner/codex/repo sources unchanged. Both formats accepted
+(skill.yaml + SKILL.md) via the existing format-agnostic scan_dir. Before
+this, Ocean users had to plant packs in another product's directory
+(~/.codex or ~/.spawner) to get them ranked into turns. Discovery, ranking,
+prompt injection, subagent assembly, and the /v1/skills query-fetch flow all
+preexisted and pick the new root up through SkillRoots::default()/for_cwd.
+Gates: 113/113 ocean-longhouse (2 new tests: either-format+scan-order,
+env-override resolution), cargo check -p ocean-daemon, clippy -p
+ocean-longhouse --all-targets clean. Docs: LONGHOUSE.md Skill Librarian
+section marked implemented + new root; ROADMAP Phase 5 box checked; stale
+line-number refs replaced with section refs. Live-daemon smoke deferred with
+the daemon respawn (merged-main binary is staged; bounce deferred while the
+operator's surface session is live).
+_________________________________________________________________________________

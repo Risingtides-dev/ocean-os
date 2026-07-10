@@ -3695,7 +3695,7 @@ struct SkillQueryRequest {
 /// `cwd` is given) and returns the top-N compact briefs most relevant to the
 /// query by the deterministic keyword-overlap rank. This is `prepare`'s ranking
 /// surfaced as a standalone, queryable endpoint per `docs/LONGHOUSE.md`
-/// §"Skill Librarian future" step 1+3.
+/// §"Skill Librarian" step 1+3.
 ///
 /// Each returned brief carries an `id` (its `source_path`) the caller hands to
 /// `POST /v1/skills/fetch` to pull the full body — the query→fetch flow.
