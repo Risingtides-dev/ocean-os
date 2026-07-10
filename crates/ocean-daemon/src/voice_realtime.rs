@@ -14,9 +14,9 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// Default Realtime model — full 2.1; the surface may override per-request
-/// (e.g. the cheaper mini variant) via the request body.
-pub(crate) const DEFAULT_REALTIME_MODEL: &str = "gpt-realtime-2.1";
+/// Default Realtime model — current public id; the surface may override
+/// per-request (e.g. the cheaper mini variant) via the request body.
+pub(crate) const DEFAULT_REALTIME_MODEL: &str = "gpt-realtime-2";
 
 /// Upstream mint endpoint (GA Realtime API).
 const UPSTREAM_URL: &str = "https://api.openai.com/v1/realtime/client_secrets";
@@ -233,6 +233,14 @@ mod tests {
         let out = build_instructions(&transcript);
         assert!(out.contains("user: real"));
         assert!(!out.contains("tool:"));
+    }
+
+    #[test]
+    fn default_realtime_model_is_public_id_in_upstream_mint_body() {
+        let body = upstream_body(DEFAULT_REALTIME_MODEL, "hello");
+
+        assert_eq!(DEFAULT_REALTIME_MODEL, "gpt-realtime-2");
+        assert_eq!(body["session"]["model"], "gpt-realtime-2");
     }
 
     #[test]
