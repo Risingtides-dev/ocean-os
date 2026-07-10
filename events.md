@@ -2218,3 +2218,11 @@ area:      [backend]
 
 Corrected the daemon's default OpenAI Realtime session model from gpt-realtime-2.1 to the current public gpt-realtime-2 identifier and added a regression proving the default reaches session.model in the upstream client-secret mint body. Focused daemon tests passed. Realtime secret minting still correctly requires a standard OpenAI platform API key; the existing local Codex OAuth credential is not interchangeable with that key.
 _________________________________________________________________________________
+time:      [3:45pm] [07-10-26]
+agent:     [omp] [gpt-5.6-sol]
+worktree:  /tmp/ocean-voice-stt-daemon (origin/main detached)
+type:      [feature-request]
+area:      [backend]
+
+Completed voice phase 4: the daemon now owns the xAI speech credential. Added POST /v1/voice/stt (raw audio bytes -> multipart grok-stt relay -> {text}) and POST /v1/voice/tts ({text,voice?} -> grok-tts -> audio bytes) in a new voice_speech module (pure body builders + normalizers unit-tested; shared LazyLock bounded client, connect 10s / request 60s). Credential resolves per-request via ocean-providers resolve_xai_api_key (env XAI_API_KEY -> auth.json xai block), so key rotation needs no restart; errors never carry the key. Empty transcripts stay valid empty text, mirroring the legacy proxy contract for silence utterances. Also drove the realtime upstream-body test from DEFAULT_REALTIME_MODEL instead of a stale hardcoded id. The surface proxy's /api/stt and /api/tts forward here as of the paired ocean-surface landing; the proxy no longer reads any xAI key.
+_________________________________________________________________________________

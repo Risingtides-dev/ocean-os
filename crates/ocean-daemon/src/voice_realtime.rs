@@ -245,8 +245,8 @@ mod tests {
 
     #[test]
     fn upstream_body_carries_model_tools_and_ttl() {
-        let body = upstream_body("gpt-realtime-2.1", "hello");
-        assert_eq!(body["session"]["model"], "gpt-realtime-2.1");
+        let body = upstream_body(DEFAULT_REALTIME_MODEL, "hello");
+        assert_eq!(body["session"]["model"], DEFAULT_REALTIME_MODEL);
         assert_eq!(body["session"]["instructions"], "hello");
         assert_eq!(body["expires_after"]["seconds"], 600);
         let tools = body["session"]["tools"].as_array().unwrap();

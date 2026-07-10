@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
-    response::sse::{Event, KeepAlive, Sse},
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -96,6 +96,9 @@ mod bus;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
 /// pure pieces behind `POST /v1/voice/realtime/client-secret`.
 mod voice_realtime;
+/// xAI STT + TTS endpoints (voice phase 4) — the daemon holds the xAI key
+/// so the surface proxy never needs it.
+mod voice_speech;
 use browser_stream::{input as browser_input, screencast_stream as browser_screencast};
 
 #[derive(Clone)]
@@ -1599,6 +1602,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/voice/realtime/client-secret",
             post(voice_realtime_client_secret),
         )
+        // Voice phase 4: STT + TTS endpoints. The daemon holds the xAI key;
+        // the surface proxy forwards `/api/stt` and `/api/tts` here.
+        .route("/v1/voice/stt", post(voice_stt))
+        .route("/v1/voice/tts", post(voice_tts))
         .route(
             "/v1/agent/sessions/{id}/messages",
             post(agent_session_message_append),
@@ -1970,6 +1977,8 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/agent/sessions/{id}",
         "POST /v1/agent/sessions/{id}/messages",
         "POST /v1/voice/realtime/client-secret",
+        "POST /v1/voice/stt",
+        "POST /v1/voice/tts",
         "GET /v1/events",
         "POST /v1/prompt",
         "GET /v1/requests",
@@ -11439,6 +11448,90 @@ async fn voice_realtime_client_secret(
         Err(err) => {
             tracing::warn!(error = %err, "realtime client-secret mint failed");
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": err })))
+        }
+    }
+}
+
+/// Transcribe raw audio bytes via xAI STT (voice phase 4). The daemon holds
+/// the xAI key; the surface proxy forwards `/api/stt` here so the browser
+/// never touches the provider credential.
+async fn voice_stt(
+    State(_state): State<AppState>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    let key = match ocean_providers::resolve_xai_api_key() {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "no xAI credential configured (XAI_API_KEY / auth.json xai block)"
+                })),
+            );
+        }
+    };
+
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "empty audio body" })),
+        );
+    }
+
+    match voice_speech::transcribe(&key, &body).await {
+        Ok(text) => (StatusCode::OK, Json(json!({ "text": text }))),
+        Err(err) => {
+            tracing::warn!(error = %err, "stt upstream failed");
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": err })))
+        }
+    }
+}
+
+/// Synthesize text to speech via xAI TTS (voice phase 4). The daemon holds
+/// the xAI key; the surface proxy forwards `/api/tts` here so the browser
+/// never touches the provider credential.
+async fn voice_tts(
+    State(_state): State<AppState>,
+    Json(req): Json<voice_speech::TtsRequest>,
+) -> impl IntoResponse {
+    let key = match ocean_providers::resolve_xai_api_key() {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "no xAI credential configured (XAI_API_KEY / auth.json xai block)"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let voice = req
+        .voice
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(voice_speech::DEFAULT_VOICE);
+    let text = req.text.trim().to_string();
+
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "text required" })),
+        )
+            .into_response();
+    }
+
+    match voice_speech::synthesize(&key, &text, voice).await {
+        Ok((audio, content_type)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, content_type.as_str())],
+            audio,
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "tts upstream failed");
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": err }))).into_response()
         }
     }
 }

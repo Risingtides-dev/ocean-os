@@ -334,6 +334,28 @@ pub fn resolve_credential_from_env(
     resolve_credential(&ProviderEnv::from_process(), provider)
 }
 
+/// Resolve the xAI API key for voice STT/TTS (voice phase 4). The daemon owns
+/// the key so the surface never holds it. Resolution order: env `XAI_API_KEY`,
+/// then the Ocean auth file `xai` block (providers/xai/api_key, xai/api_key,
+/// xai/key) via the same `ProviderEnv` path the Realtime credential uses so a
+/// custom `OCEAN_AUTH_FILE` is honored. Resolved per-request so key rotation
+/// needs no daemon restart.
+pub fn resolve_xai_api_key() -> Option<String> {
+    // 1. Env var.
+    if let Ok(key) = std::env::var("XAI_API_KEY") {
+        let trimmed = key.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    // 2. Auth file xai block — reuse the same ProviderEnv path as
+    //    resolve_credential so OCEAN_AUTH_FILE overrides work.
+    let env = ProviderEnv::from_process();
+    let path = env.auth_file?;
+    let json = read_auth_json(&path).ok()?;
+    auth_file_key(&json, "xai").map(str::to_string)
+}
+
 /// Resolve full provider config from a provided environment snapshot.
 pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, ProviderConfigError> {
     let selection = resolve_model_selection(env)?;

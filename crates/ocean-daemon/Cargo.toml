@@ -49,9 +49,10 @@ ocean-runtime.workspace = true
 ocean-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# Voice phases 2/3: the Realtime client-secret mint POSTs to api.openai.com.
-# Workspace-pinned; already a transitive dep via ocean-protocol.
-reqwest.workspace = true
+# Voice phases 2-4: the Realtime client-secret mint POSTs to api.openai.com,
+# and the STT endpoint uses multipart for xAI speech-to-text. Workspace-pinned;
+# already a transitive dep via ocean-protocol.
+reqwest = { workspace = true, features = ["multipart"] }
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
