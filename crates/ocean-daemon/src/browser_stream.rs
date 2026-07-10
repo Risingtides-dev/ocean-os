@@ -618,14 +618,14 @@ mod tests {
 
     #[test]
     fn click_maps_to_left_press_then_release_clickcount_one() {
-        let press = serde_json::to_value(&click_press(10.0, 20.0).unwrap()).unwrap();
+        let press = serde_json::to_value(click_press(10.0, 20.0).unwrap()).unwrap();
         assert_eq!(press["type"], "mousePressed");
         assert_eq!(press["x"], 10.0);
         assert_eq!(press["y"], 20.0);
         assert_eq!(press["button"], "left");
         assert_eq!(press["clickCount"], 1);
 
-        let release = serde_json::to_value(&click_release(10.0, 20.0).unwrap()).unwrap();
+        let release = serde_json::to_value(click_release(10.0, 20.0).unwrap()).unwrap();
         assert_eq!(release["type"], "mouseReleased");
         assert_eq!(release["x"], 10.0);
         assert_eq!(release["y"], 20.0);
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn scroll_maps_to_mousewheel_with_delta_y() {
-        let wheel = serde_json::to_value(&scroll_wheel(5.0, 6.0, -240.0).unwrap()).unwrap();
+        let wheel = serde_json::to_value(scroll_wheel(5.0, 6.0, -240.0).unwrap()).unwrap();
         assert_eq!(wheel["type"], "mouseWheel");
         assert_eq!(wheel["x"], 5.0);
         assert_eq!(wheel["y"], 6.0);
@@ -645,14 +645,14 @@ mod tests {
     #[test]
     fn key_maps_to_rawkeydown_then_keyup_with_key_code_and_vk() {
         let def = named_key_def("ArrowUp").unwrap();
-        let down = serde_json::to_value(&key_down(&def)).unwrap();
+        let down = serde_json::to_value(key_down(&def)).unwrap();
         assert_eq!(down["type"], "rawKeyDown");
         assert_eq!(down["key"], "ArrowUp");
         assert_eq!(down["code"], "ArrowUp");
         assert_eq!(down["windowsVirtualKeyCode"], 38);
         assert_eq!(down["nativeVirtualKeyCode"], 38);
 
-        let up = serde_json::to_value(&key_up(&def)).unwrap();
+        let up = serde_json::to_value(key_up(&def)).unwrap();
         assert_eq!(up["type"], "keyUp");
         assert_eq!(up["key"], "ArrowUp");
         assert_eq!(up["code"], "ArrowUp");
@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn screencast_is_jpeg_quality_60_maxwidth_1280_every_frame() {
-        let p = serde_json::to_value(&start_screencast_params()).unwrap();
+        let p = serde_json::to_value(start_screencast_params()).unwrap();
         assert_eq!(p["format"], "jpeg");
         assert_eq!(p["quality"], 60);
         assert_eq!(p["maxWidth"], 1280);

@@ -383,8 +383,7 @@ mod tests {
         let err = retain
             .execute("1", json!({ "text": "x".repeat(MAX_RETAIN_CHARS + 1) }))
             .await
-            .err()
-            .expect("oversized retain must be rejected");
+            .expect_err("oversized retain must be rejected");
         assert!(err.contains("durable facts"), "{err}");
     }
 }

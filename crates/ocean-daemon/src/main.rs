@@ -11536,11 +11536,7 @@ fn emit_agent(
 
 fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
     match event {
-        AgentTurnEvent::TurnStarted {
-            turn_id: _,
-            session_id: _,
-            ..
-        } => None,
+        AgentTurnEvent::TurnStarted { .. } => None,
         AgentTurnEvent::AssistantTextDelta {
             turn_id: _, delta, ..
         } => Some(OceanEvent::AssistantDelta { text: delta }),
@@ -11553,13 +11549,7 @@ fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
             args: call.args_json,
         }),
         AgentTurnEvent::TurnFinished {
-            turn_id: _,
-            status,
-            error: _,
-            wall_ms,
-            output_tokens: _,
-            tokens_per_second: _,
-            ..
+            status, wall_ms, ..
         } => Some(OceanEvent::TurnFinished {
             ok: matches!(status, AgentTurnStatus::Completed),
             wall_ms: wall_ms.unwrap_or(0),

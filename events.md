@@ -2156,3 +2156,21 @@ line-number refs replaced with section refs. Live-daemon smoke deferred with
 the daemon respawn (merged-main binary is staged; bounce deferred while the
 operator's surface session is live).
 _________________________________________________________________________________
+time:      [12:30am] [07-10-26]
+agent:     [claude] [fable-5]
+type:      gh-actions
+area:      infra
+
+CI went red on 22afb62 (ubuntu check job): clippy 1.97.0 drift lints, not a
+platform break. The box's toolchain was 1.96.1 while CI runners moved to
+1.97.0 (2026-07-07); the shell-rebuild branch's "branch-wide clippy debt
+cleared" was true on 1.96 but 1.97 ships new/retuned lints. Updated the
+local toolchain to 1.97.0 for parity, reproduced CI's exact failure, then
+swept the WHOLE workspace (CI aborts at the first crate, hiding the rest):
+11 lints across 5 files - question_mark x2 (tui history/tree), err_expect,
+get-then-check, two redundant-pattern matches (daemon event mapping),
+needless borrows x6 (browser_stream/serde_json::to_value). All mechanical,
+zero semantic change. Gates: cargo clippy --workspace --all-targets -D
+warnings = 0 errors on 1.97.0; ocean-tui 267/267 + ocean-agent + ocean-daemon
+suites all 0 failed.
+_________________________________________________________________________________

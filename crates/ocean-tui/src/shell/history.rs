@@ -127,10 +127,9 @@ fn history_path() -> Option<PathBuf> {
         PathBuf::from(p)
     } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(xdg).join("ocean-rs")
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config").join("ocean-rs")
     } else {
-        return None;
+        let home = std::env::var_os("HOME")?;
+        PathBuf::from(home).join(".config").join("ocean-rs")
     };
     Some(dir.join("tui_history"))
 }

@@ -5602,7 +5602,7 @@ done
             "the claimed root maps to its project"
         );
         assert!(
-            index.get("/srv/nobody-claims-this").is_none(),
+            !index.contains_key("/srv/nobody-claims-this"),
             "an unregistered root is absent"
         );
 

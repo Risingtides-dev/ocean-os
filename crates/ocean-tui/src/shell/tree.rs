@@ -109,9 +109,9 @@ impl Tree {
 
     /// Toggle a directory; returns Some(path) if a file should be opened.
     pub fn activate(&mut self) -> Option<PathBuf> {
-        let (path, is_dir) = match self.selected_entry() {
-            Some(e) => (e.path.clone(), e.is_dir),
-            None => return None,
+        let (path, is_dir) = {
+            let e = self.selected_entry()?;
+            (e.path.clone(), e.is_dir)
         };
         if is_dir {
             if self.expanded.contains(&path) {
