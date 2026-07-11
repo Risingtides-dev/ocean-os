@@ -2336,3 +2336,12 @@ area:      [backend]
 
 Ocean memory made usable (85c27ccd, deployed): the retain/recall tools existed since the port-map win but nothing advertised them and the store was empty, so no model ever used memory. build_system_prompt_from now takes a memory_db seam (production: <config>/memory.sqlite): a "## Memory" section teaches recall-at-task-start / retain-durable-facts, and a "## What you already know" block injects the newest 10 retained facts via list_memories (200-char clip, fail-soft on missing/unopenable store). New examples/seed_memory.rs idempotently seeds the operator store; ran it live - 8 curated facts inserted (repo map, port+health path, build/deploy commands, session store location, ledger discipline, operator conventions). Gates: ocean-agent 148/0, clippy -D warnings, fmt all green. Daemon rebuilt + kickstarted at rev 85c27ccd4026; live smoke turn proved injection (model cited the system-prompt fact verbatim and answered port/health correctly with zero tool calls). Also in flight: FleetCockpitBlueprint spec for OMP-style subagents + todo + live fleet TUI.
 _________________________________________________________________________________
+
+time:      [05:25am] [11-07-26]
+agent:     [omp], [claude-fable-5]
+worktree:  main
+type:      [review]
+area:      [analysis]
+
+Harness benchmark built and run at ~/dev/harness-bench (own git repo): one graded Python bug-fix fixture (6 tests, 4 real injected bugs, tamper-gated grader), 5 runners (ocean HTTP, omp/pi/claude/codex CLIs) with normalized metrics (tokens, wall, RSS, cost, tool calls). First matrix: all 4 available stacks solved 6/6. Ocean findings vs pi on the SAME model (deepseek-v4-pro): 272.8s vs 30.0s wall, 172k vs 30k input tokens, 19 vs 11 tool calls, ~12.7 vs ~53 out-tok/s provider throughput. Two ocean leads: (1) ocean-providers deepseek routing throughput (which endpoint?), (2) agent-loop chattiness (rounds/verbosity). Ocean daemon RSS during the run peaked at 32.6MB vs 350-500MB for Node CLI harnesses. Codex row pending ChatGPT usage-window reset (CLI upgraded 0.142.5 -> 0.144.1, models now accepted).
+_________________________________________________________________________________
