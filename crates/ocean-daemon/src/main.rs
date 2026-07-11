@@ -9913,194 +9913,202 @@ async fn agent_turn(
         Some((root, caps)) => control.with_agent_capabilities(root, caps),
         None => control,
     };
-    // Run the turn inside the turn-root span (OCEAN-274): the runtime's
-    // `runtime.prompt` span (and every child — agent_loop, provider_stream,
-    // tool_exec, persist) nests under `turn`, so the full lifecycle of this turn
-    // is one followable tree in the logs, tagged with `turn_id`/`session_id`.
-    use tracing::Instrument as _;
-    // OCEAN-303: mark this turn in-flight for the whole `runtime.prompt` await.
-    // The RAII guard decrements `metrics.in_flight` on drop — including on a
-    // cancelled/panicked turn — so the `/metrics` in-flight gauge stays honest.
-    let in_flight = InFlightGuard::enter(state.metrics.clone());
-    let res = state
-        .runtime
-        .prompt(prompt_req, control)
-        .instrument(turn_span)
-        .await;
-    // Turn is done: drop the in-flight guard now (before the bridge drain and
-    // post-processing) so the gauge reflects only turns actually executing, then
-    // fold this turn's already-computed `wall_ms`/`ok` into the metrics — a
-    // couple of relaxed `fetch_add`s, the same place the "agent turn finished"
-    // log reads them (OCEAN-303).
-    drop(in_flight);
-    state.metrics.record_turn(res.wall_ms, res.ok);
-    // Wait for the bridge to drain (the sender has been dropped by now).
-    let _ = bridge.await;
-    // Prefer real provider usage; fall back to a visible-text estimate only
-    // when the provider reported no output tokens.
-    let output_tokens = if res.usage.output > 0 {
-        res.usage.output
-    } else {
-        estimate_visible_tokens(&res.stdout)
-    };
-    let input_tokens = (res.usage.input > 0).then_some(res.usage.input);
-    let cache_read_tokens = (res.usage.cache_read > 0).then_some(res.usage.cache_read);
-    let tokens_per_second = if res.wall_ms > 0 {
-        Some((output_tokens as f64) / (res.wall_ms as f64 / 1000.0))
-    } else {
-        None
-    };
-    // OCEAN-305: the agent-turn path marks its legacy completion announcements
-    // (full-stdout AssistantDelta, TurnFinished, Error/Cancelled) as agent
-    // mirrors — the same content already streamed delta-by-delta on
-    // /v1/agent/events, and a dual-rail client must not render it twice.
-    record_prompt_result(
-        &state,
-        request_id,
-        &res,
-        Some(ocean_core::EVENT_ORIGIN_AGENT),
-    )
-    .await;
-
-    tracing::info!(
-        turn_id = %turn_id,
-        request_id = %request_id,
-        session_id = %session_id,
-        ok = res.ok,
-        wall_ms = res.wall_ms,
-        input_tokens = res.usage.input,
-        output_tokens,
-        cache_read = res.usage.cache_read,
-        total_tokens = res.usage.total_tokens,
-        tokens_per_second,
-        "agent turn finished"
-    );
-
-    // NOTE: assistant text already streamed delta-by-delta through the bridge,
-    // so we do NOT re-emit res.stdout here. Just close out the turn.
-    if res.ok {
-        emit_agent(
-            &state.events,
-            &state.agent_events,
-            session_id,
-            AgentTurnEvent::TurnFinished {
-                session_id,
-                turn_id,
-                status: AgentTurnStatus::Completed,
-                error: None,
-                wall_ms: Some(res.wall_ms),
-                output_tokens: Some(output_tokens),
-                input_tokens,
-                cache_read_tokens,
-                tokens_per_second,
-            },
-        );
-    } else {
-        emit_agent(
-            &state.events,
-            &state.agent_events,
-            session_id,
-            AgentTurnEvent::TurnFinished {
-                session_id,
-                turn_id,
-                status: AgentTurnStatus::Failed,
-                error: Some(res.stderr.clone()),
-                wall_ms: Some(res.wall_ms),
-                output_tokens: Some(output_tokens),
-                input_tokens,
-                cache_read_tokens,
-                tokens_per_second,
-            },
-        );
-    }
-    // Post-turn advisor observer (fire-and-forget). Runs at most once per
-    // operator prompt. It reviews the completed exchange on a FRESH advisor-model
-    // context (a single completion, not the agent loop) and, if it finds a real
-    // concern, emits it as an `AgentTurnEvent::Extension` scoped to this session.
-    // Fully detached: a slow/failed advisor never blocks or fails the operator's
-    // turn — the response below is already computed and returns immediately.
+    // ── fire-and-ack (OCEAN-410): spawn the turn, ACK immediately ──
+    // The POST is an ACK carrying turn_id / session_id / event_id_prefix so the
+    // client correlates the SSE stream (/v1/agent/events) that delivers ALL turn
+    // output AND the terminal TurnFinished. Awaiting the full turn inline here
+    // used to hold the HTTP connection open for minutes of tool-calling, blowing
+    // client timeouts (ocean-tui's 120s reqwest ceiling) and surfacing a FALSE
+    // "couldn't reach the daemon" mid-turn — while the daemon kept running and
+    // persisted the turn fine. Both clients (ocean-tui shell, ocean-surface) were
+    // built for fire-and-ack: they read completion from the SSE TurnFinished, not
+    // the POST body; the inline await was the outlier.
     //
-    // Model selection precedence (`resolve_advisor_alias`): a per-turn
-    // `advisor` override (from a surface's `/advisor` picker) wins over the
-    // global `[roles].advisor` config — `enabled:false` suppresses it entirely,
-    // `enabled:true` runs on the override model or falls back to the global
-    // role. `None` = today's global-only behavior. Zero cost when neither is set.
-    if res.ok {
-        if let Some(advisor_alias) = resolve_advisor_alias(advisor_ctl.as_ref(), &state.roles) {
-            let assistant_text = res.stdout.clone();
-            if !assistant_text.trim().is_empty() {
-                let operator_prompt = prompt.clone();
-                let runtime = state.runtime.clone();
-                let events = state.events.clone();
-                let agent_events = state.agent_events.clone();
-                tokio::spawn(async move {
-                    let user = advisor_user_prompt(&operator_prompt, &assistant_text);
-                    match runtime
-                        .complete_once(&advisor_alias, advisor_system_prompt(), &user)
-                        .await
-                    {
-                        Ok((note, model_id)) => {
-                            if let Some(clean) = advisor_note_if_actionable(&note) {
-                                let severity = advisor_severity(&clean);
-                                tracing::info!(
-                                    %session_id,
-                                    severity,
-                                    model = %model_id,
-                                    "advisor observer note"
-                                );
-                                emit_agent(
-                                    &events,
-                                    &agent_events,
-                                    session_id,
-                                    AgentTurnEvent::Extension {
-                                        extension: "advisor".into(),
-                                        payload: serde_json::json!({
-                                            "note": clean,
-                                            "severity": severity,
-                                            "model": model_id,
-                                        }),
-                                        scope: Some(session_id),
-                                    },
-                                );
+    // The turn permit, cancel token (threaded into `control`), in-flight gauge,
+    // event bridge, metrics, record_prompt_result, and advisor all move into the
+    // detached task. Cancellation stays cooperative-token-based —
+    // register_running_request hands back a CancellationToken the runtime polls;
+    // nothing here registered a JoinHandle to abort, so spawning changes no
+    // cancellation semantics. The permit is captured explicitly below so the
+    // concurrency cap spans the whole turn, not just the ACK.
+    use tracing::Instrument as _;
+    let bg_state = state.clone();
+    tokio::spawn(async move {
+        // Hold the turn permit for the full turn duration; released when this
+        // task ends (success or panic), so OCEAN-304's cap covers running turns,
+        // not just accepted ones.
+        let _permit = _turn_permit;
+        // OCEAN-303: mark this turn in-flight for the whole runtime.prompt await.
+        // The RAII guard decrements metrics.in_flight on drop — including on a
+        // cancelled/panicked turn — so /metrics stays honest.
+        let in_flight = InFlightGuard::enter(bg_state.metrics.clone());
+        let res = bg_state
+            .runtime
+            .prompt(prompt_req, control)
+            .instrument(turn_span)
+            .await;
+        // Turn is done: drop the in-flight guard before the bridge drain and
+        // post-processing so the gauge reflects only executing turns, then fold
+        // this turn's wall_ms/ok into the metrics (OCEAN-303).
+        drop(in_flight);
+        bg_state.metrics.record_turn(res.wall_ms, res.ok);
+        // Wait for the bridge to drain (the sender has been dropped by now).
+        let _ = bridge.await;
+        // Prefer real provider usage; fall back to a visible-text estimate only
+        // when the provider reported no output tokens.
+        let output_tokens = if res.usage.output > 0 {
+            res.usage.output
+        } else {
+            estimate_visible_tokens(&res.stdout)
+        };
+        let input_tokens = (res.usage.input > 0).then_some(res.usage.input);
+        let cache_read_tokens = (res.usage.cache_read > 0).then_some(res.usage.cache_read);
+        let tokens_per_second = if res.wall_ms > 0 {
+            Some((output_tokens as f64) / (res.wall_ms as f64 / 1000.0))
+        } else {
+            None
+        };
+        // OCEAN-305: mark legacy completion announcements as agent mirrors — the
+        // same content already streamed delta-by-delta on /v1/agent/events.
+        record_prompt_result(
+            &bg_state,
+            request_id,
+            &res,
+            Some(ocean_core::EVENT_ORIGIN_AGENT),
+        )
+        .await;
+
+        tracing::info!(
+            turn_id = %turn_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            ok = res.ok,
+            wall_ms = res.wall_ms,
+            input_tokens = res.usage.input,
+            output_tokens,
+            cache_read = res.usage.cache_read,
+            total_tokens = res.usage.total_tokens,
+            tokens_per_second,
+            "agent turn finished"
+        );
+
+        // NOTE: assistant text already streamed delta-by-delta through the bridge,
+        // so we do NOT re-emit res.stdout here. This terminal TurnFinished is how
+        // fire-and-ack clients learn the turn ended (the POST already ACKed): it
+        // carries status + error + telemetry to every SSE subscriber.
+        if res.ok {
+            emit_agent(
+                &bg_state.events,
+                &bg_state.agent_events,
+                session_id,
+                AgentTurnEvent::TurnFinished {
+                    session_id,
+                    turn_id,
+                    status: AgentTurnStatus::Completed,
+                    error: None,
+                    wall_ms: Some(res.wall_ms),
+                    output_tokens: Some(output_tokens),
+                    input_tokens,
+                    cache_read_tokens,
+                    tokens_per_second,
+                },
+            );
+        } else {
+            emit_agent(
+                &bg_state.events,
+                &bg_state.agent_events,
+                session_id,
+                AgentTurnEvent::TurnFinished {
+                    session_id,
+                    turn_id,
+                    status: AgentTurnStatus::Failed,
+                    error: Some(res.stderr.clone()),
+                    wall_ms: Some(res.wall_ms),
+                    output_tokens: Some(output_tokens),
+                    input_tokens,
+                    cache_read_tokens,
+                    tokens_per_second,
+                },
+            );
+        }
+        // Post-turn advisor observer (fire-and-forget). Runs at most once per
+        // operator prompt on a FRESH advisor-model context and, if it finds a real
+        // concern, emits it as an AgentTurnEvent::Extension scoped to this
+        // session. A slow/failed advisor never blocks the operator's turn — the
+        // ACK already returned. Model selection precedence (resolve_advisor_alias):
+        // a per-turn `advisor` override wins over the global `[roles].advisor`
+        // config; `None` = today's global-only behavior. Zero cost when unset.
+        if res.ok {
+            if let Some(advisor_alias) =
+                resolve_advisor_alias(advisor_ctl.as_ref(), &bg_state.roles)
+            {
+                let assistant_text = res.stdout.clone();
+                if !assistant_text.trim().is_empty() {
+                    let operator_prompt = prompt.clone();
+                    let runtime = bg_state.runtime.clone();
+                    let events = bg_state.events.clone();
+                    let agent_events = bg_state.agent_events.clone();
+                    tokio::spawn(async move {
+                        let user = advisor_user_prompt(&operator_prompt, &assistant_text);
+                        match runtime
+                            .complete_once(&advisor_alias, advisor_system_prompt(), &user)
+                            .await
+                        {
+                            Ok((note, model_id)) => {
+                                if let Some(clean) = advisor_note_if_actionable(&note) {
+                                    let severity = advisor_severity(&clean);
+                                    tracing::info!(
+                                        %session_id,
+                                        severity,
+                                        model = %model_id,
+                                        "advisor observer note"
+                                    );
+                                    emit_agent(
+                                        &events,
+                                        &agent_events,
+                                        session_id,
+                                        AgentTurnEvent::Extension {
+                                            extension: "advisor".into(),
+                                            payload: serde_json::json!({
+                                                "note": clean,
+                                                "severity": severity,
+                                                "model": model_id,
+                                            }),
+                                            scope: Some(session_id),
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "advisor observer failed; dropping");
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "advisor observer failed; dropping");
-                        }
-                    }
-                });
+                    });
+                }
             }
         }
-    }
+    });
 
-    // A per-turn timeout (OCEAN-17) surfaces as code 408 from the runtime; map
-    // it to HTTP 408 Request Timeout so callers can distinguish a hung-provider
-    // abort from a normal failed turn. Every other outcome keeps the
-    // fire-and-acknowledge 202 envelope (the turn ran; success/failure lives in
-    // the body + streamed events).
-    let http_status = if !res.ok && res.code == Some(408) {
-        StatusCode::REQUEST_TIMEOUT
-    } else {
-        StatusCode::ACCEPTED
-    };
+    // ACK immediately: the turn runs detached. ok: true + status: Running means
+    // "accepted, in flight". Completion + telemetry arrive over /v1/agent/events
+    // as TurnFinished. The per-turn-timeout HTTP 408 this handler used to emit is
+    // dropped on purpose: with fire-and-ack there is no `res` at response time,
+    // and a timeout now surfaces as TurnFinished{status: Failed, error: …} over
+    // SSE — no client (ocean-tui / ocean-surface) branched on HTTP 408 here.
     (
-        http_status,
+        StatusCode::ACCEPTED,
         Json(AgentTurnResponse {
-            ok: res.ok,
+            ok: true,
             turn_id,
             session_id,
-            status: if res.ok {
-                AgentTurnStatus::Completed
-            } else {
-                AgentTurnStatus::Failed
-            },
+            status: AgentTurnStatus::Running,
             event_id_prefix: event_prefix,
-            error: if res.ok { None } else { Some(res.stderr) },
-            output_tokens: Some(output_tokens),
-            input_tokens,
-            cache_read_tokens,
-            tokens_per_second,
-            wall_ms: Some(res.wall_ms),
+            error: None,
+            output_tokens: None,
+            input_tokens: None,
+            cache_read_tokens: None,
+            tokens_per_second: None,
+            wall_ms: None,
         }),
     )
 }
@@ -15718,28 +15726,77 @@ mod tests {
     /// fake-ok runtime, the slot is back and a later turn is admitted (202).
     #[tokio::test]
     async fn agent_turn_releases_permit_on_success() {
+        use std::time::Duration;
         // Runs a real fake-ok turn; the assertions are on status + permit count,
         // not the yolo posture, so no process-env serialization is required (the
         // turn calls no tools, so permission gating is irrelevant here).
         let state = capped_turn_state(1);
 
         let (status, body) = agent_turn(State(state.clone()), Json(sample_agent_turn())).await;
-        // fire-and-acknowledge: a run turn returns 202 with ok:true.
+        // fire-and-acknowledge: an accepted turn returns 202 with ok:true.
         assert_eq!(status, StatusCode::ACCEPTED);
         assert!(body.ok);
-        // The single permit must be back — the RAII guard dropped at handler exit.
-        assert_eq!(
-            state.turn_limiter.available_permits(),
-            1,
-            "permit must be released after a successful turn"
+
+        // fire-and-ack (OCEAN-410): the permit moves into the detached task and is
+        // released when the turn COMPLETES, not when the handler returns. The fake-ok
+        // runtime has no network delay, so a bounded poll (2ms sleep inside a 2s cap)
+        // waits for the real release without a fixed flaky delay.
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while state.turn_limiter.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            released,
+            "first turn's permit was never released (detached-task leak?)"
         );
 
-        // And a second turn on the same cap-1 limiter is admitted, proving the
-        // slot was genuinely freed rather than leaked.
+        // A second turn on the same cap-1 limiter is admitted only once the first's
+        // slot is genuinely freed — proving the permit wasn't leaked.
         let (status2, body2) = agent_turn(State(state.clone()), Json(sample_agent_turn())).await;
         assert_eq!(status2, StatusCode::ACCEPTED);
         assert!(body2.ok);
-        assert_eq!(state.turn_limiter.available_permits(), 1);
+        let released2 = tokio::time::timeout(Duration::from_secs(2), async {
+            while state.turn_limiter.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            released2,
+            "second turn's permit was never released (detached-task leak?)"
+        );
+    }
+    /// fire-and-ack (OCEAN-410): the POST returns 202 the instant a turn is
+    /// accepted — `ok: true`, `status: Running`, and NO telemetry (wall_ms /
+    /// output_tokens are `None`) — because the turn hasn't run yet at ACK time.
+    /// Completion arrives later over the agent event stream. This is the contract
+    /// whose violation broke ocean-tui (a long turn held the POST open past the
+    /// client's 120s timeout → false "can't reach the daemon"); locking it here
+    /// catches any regression to inline-await.
+    #[tokio::test]
+    async fn agent_turn_acks_running_before_completion() {
+        let state = capped_turn_state(1);
+        let (status, body) = agent_turn(State(state.clone()), Json(sample_agent_turn())).await;
+        // Accepted immediately — the turn runs detached.
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.ok);
+        assert_eq!(
+            body.status,
+            AgentTurnStatus::Running,
+            "ACK must say Running, not a terminal status"
+        );
+        // No completion telemetry exists yet — it flows over the SSE TurnFinished
+        // once the detached turn actually finishes.
+        assert_eq!(body.wall_ms, None, "wall_ms must be None at ACK time");
+        assert_eq!(
+            body.output_tokens, None,
+            "output_tokens must be None at ACK time"
+        );
+        assert_eq!(body.error, None, "an accepted turn carries no error");
     }
 
     /// The permit releases on an EARLY-ERROR exit too: a turn that fails the

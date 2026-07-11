@@ -35,7 +35,7 @@ pub struct DaemonClient {
 impl DaemonClient {
     pub fn new(base_url: &str) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(1800))
             .build()?;
         Ok(Self {
             http,
@@ -98,15 +98,16 @@ impl DaemonClient {
     /// ~15.5s, comfortably covering the ~8s launchd respawn.
     ///
     /// Timeout note: the POST is fire-and-ack — the daemon returns an
-    /// [`AgentTurnResponse`] (`turn_id` + `event_id_prefix` to correlate with
-    /// the SSE stream) as soon as the turn is ACCEPTED, not when it finishes.
-    /// Turn output flows over the separate `/v1/agent/events` stream, which
-    /// overrides the client's 120s timeout with an effectively-infinite cap
-    /// (see [`Self::spawn_event_stream`]). So the client's global 120s timeout
-    /// can only fire if the daemon fails to ACK the POST itself (wedged /
-    /// saturated) — the correct condition to surface as a timeout, which errfmt
-    /// renders as "the turn may still be running" rather than "can't reach the
-    /// daemon". No per-request long timeout is added to the POST on purpose.
+    /// [`AgentTurnResponse`] (`turn_id` + `event_id_prefix` to correlate with the
+    /// SSE stream) as soon as the turn is ACCEPTED, not when it finishes; turn
+    /// output flows over the separate `/v1/agent/events` stream (which overrides
+    /// this timeout with an effectively-infinite cap — see
+    /// [`Self::spawn_event_stream`]). The 1800s ceiling here is a dead safety net:
+    /// it should never fire for the ACK (the daemon responds in milliseconds),
+    /// and only trips if the daemon is truly wedged/unreachable — in which case
+    /// `errfmt` renders an honest "didn't answer in time / couldn't reach the
+    /// daemon". Kept long rather than removed so a misbehaving daemon can't hold a
+    /// connection open forever.
     pub async fn agent_turn_retrying(
         &self,
         req: &AgentTurnRequest,

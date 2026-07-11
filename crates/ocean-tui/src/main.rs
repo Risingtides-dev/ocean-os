@@ -1940,7 +1940,7 @@ impl DaemonClient {
     fn new() -> anyhow::Result<Self> {
         Ok(Self {
             http: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(120))
+                .timeout(Duration::from_secs(1800))
                 .build()
                 .context("build daemon client")?,
         })
@@ -3763,13 +3763,13 @@ fn daemon_apply_agent_turn_response(app: &mut DaemonApp, response: AgentTurnResp
         short_id(response.session_id),
         response.status
     ));
-    if response.ok && response.status == ocean_agent_sdk::AgentTurnStatus::Completed {
-        app.status = format!(
-            "PM agent turn {:?}: {}",
-            response.status,
-            short_id(response.turn_id)
-        );
-    } else {
+    // fire-and-ack (OCEAN-410): the daemon ACKs with status::Running the instant
+    // a turn is accepted, not when it finishes — the terminal TurnFinished
+    // (Completed/Failed) arrives over the agent event stream and writes the
+    // transcript there. Treat Running/Completed as accepted (never an error) so a
+    // slow turn never shows a bogus failure banner; only a genuine Failed status
+    // surfaces the error text.
+    if response.status == ocean_agent_sdk::AgentTurnStatus::Failed {
         let error = response
             .error
             .as_deref()
@@ -3780,6 +3780,12 @@ fn daemon_apply_agent_turn_response(app: &mut DaemonApp, response: AgentTurnResp
             short_id(response.turn_id),
             compact_text(error, 140)
         ));
+    } else {
+        app.status = format!(
+            "PM agent turn {:?}: {}",
+            response.status,
+            short_id(response.turn_id)
+        );
     }
 }
 
