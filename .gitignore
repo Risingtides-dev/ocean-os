@@ -51,3 +51,7 @@ __pycache__/
 
 # Playwright MCP test artifacts
 .playwright-mcp/
+
+# local plugin/session scaffolding + stale CI build dir — keep provenance stamps clean
+.superpowers/
+target-ci/
