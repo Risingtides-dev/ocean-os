@@ -2300,3 +2300,12 @@ area:      [analysis]
 
 Branch-state triage after multi-agent confusion: verified feat/ocean-tui-shell-rebuild is FULLY merged into origin/main (merge 892866e8, 0 unique commits remain) and the "behind by 31" was only a stale local main — fast-forwarded local main 32 commits to 38da7e03. The stash taken on the feature tip (80ac2d04) was preserved durably as branch wip/stash-readline-era-refactor (db5d9f89) and adjudicated as a CONTAMINATED working tree, not a resumable refactor: its runtime files (agent_loop.rs, bash/grep/edit/hashline_edit.rs) are byte-identical to pre-508085d7 versions, so applying it would revert the landed round-retry + noop-guard feature; its headline additions (agent_session_message_append, voice_realtime_client_secret) already landed on main in reworked form. Possibly-unique crumbs on that branch: two tools_smoke read-window tests + small capability.rs/hashline_wiring.rs deltas. An untracked older voice_realtime.rs draft (pinned gpt-realtime-2.1; main deliberately pins gpt-realtime-2) was backed up to /tmp/voice_realtime.local-backup.rs before the ff. Awaiting operator call on salvage-vs-freeze of the wip branch.
 _________________________________________________________________________________
+
+time:      [11:40pm] [10-07-26]
+agent:     [omp], [claude-fable-5]
+worktree:  main
+type:      [workflow]
+area:      [infra]
+
+Daemon provenance cleanup + redeploy: live /health had been reporting rev 38da7e03-dirty. Root cause of the dirty flag: build.rs uses plain `git status --porcelain`, and untracked scaffolding (.superpowers/, 5.1GB stale target-ci/) polluted it. Deleted both, gitignored them, committed the stray 07-09 handoff + shell-completion spec docs (e7cb268a). Rebuilt ocean-daemon release from clean main and kickstarted dev.risingtides.ocean-daemon — /health now proves rev e7cb268afa50 with no dirty suffix. Also this session: deleted stash@{0}, wip/stash-readline-era-refactor, and feat/ocean-tui-shell-rebuild (local+remote) per operator; flagged wip/room-execution-isolation-local and origin/backup/codex-models-wip-20260710 as UNLANDED real work (room isolation spec+daemon code; codex models-cache providers feature) awaiting operator decision.
+_________________________________________________________________________________
