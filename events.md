@@ -2309,3 +2309,12 @@ area:      [infra]
 
 Daemon provenance cleanup + redeploy: live /health had been reporting rev 38da7e03-dirty. Root cause of the dirty flag: build.rs uses plain `git status --porcelain`, and untracked scaffolding (.superpowers/, 5.1GB stale target-ci/) polluted it. Deleted both, gitignored them, committed the stray 07-09 handoff + shell-completion spec docs (e7cb268a). Rebuilt ocean-daemon release from clean main and kickstarted dev.risingtides.ocean-daemon — /health now proves rev e7cb268afa50 with no dirty suffix. Also this session: deleted stash@{0}, wip/stash-readline-era-refactor, and feat/ocean-tui-shell-rebuild (local+remote) per operator; flagged wip/room-execution-isolation-local and origin/backup/codex-models-wip-20260710 as UNLANDED real work (room isolation spec+daemon code; codex models-cache providers feature) awaiting operator decision.
 _________________________________________________________________________________
+
+time:      [12:05am] [11-07-26]
+agent:     [omp], [claude-fable-5]
+worktree:  main
+type:      [workflow]
+area:      [infra]
+
+Branch graveyard purge: triaged all 83 stray refs (local + origin). 57 were fully merged or patch-equivalent to landed main content; the stale remainder (May/June PR lanes, backup-before-sync refs, abandoned rescues incl. rescue/ocean-rooms-workspace-packet, backup/stash-archive-20260701, backup/device-local-20260709, ops/prod-hardening, feat/ocean-voice, mobile-webui-base, the ocean-3xx context lanes) was deleted per operator directive — 77 remote + 6 local branches removed. Also nuked earlier at operator request: wip/room-execution-isolation-local and origin/backup/codex-models-wip-20260710 (codex models-cache WIP). Survivors: feat/slack-quality-rooms-core (dated today, possibly a live lane) and fix/immediate-provider-halt-b (checked out in ~/dev/ocean-os-halt2 with UNCOMMITTED agent_loop.rs edits — left untouched, likely a live session). gitbutler/* internals untouched.
+_________________________________________________________________________________
