@@ -3,6 +3,10 @@
 //! are already human-readable (no "humanize(humanize(x))" corruption).
 
 /// Check whether `s` matches a known transport / DNS / timeout pattern.
+/// Includes the timeout tokens because [`humanize`]'s entry guard uses this — a
+/// timeout is then split off into its own honest message inside `humanize`.
+/// [`is_connect_shaped`] / [`is_timeout_shaped`] re-split the two classes for
+/// callers that need to pick a transcript prefix.
 fn is_connect_pattern(s: &str) -> bool {
     let lower = s.to_lowercase();
     lower.contains("error sending request for url")
@@ -14,10 +18,44 @@ fn is_connect_pattern(s: &str) -> bool {
         || lower.contains("deadline has elapsed")
 }
 
-/// Classify the raw error string (before prefix stripping) as connection-shaped.
-/// Mirrors the combined checks inside `humanize` so that callers can pick the
-/// right transcript prefix for `TurnSendFailed` without duplicating the logic.
+/// Check whether `s` matches a timeout pattern — the request was in flight but
+/// no answer arrived within the deadline.
+fn is_timeout_pattern(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("deadline has elapsed")
+}
+
+/// Classify `err` (after stripping the `turn: `/`session: ` prefix app.rs
+/// prepends) as a TIMEOUT: the request reached (or was in flight to) the daemon
+/// but no answer arrived in time. Distinct from [`is_connect_shaped`] — a
+/// timeout means the turn POST may have started a still-running turn server-side
+/// (the POST is fire-and-ack; output flows over the SSE stream), so a caller
+/// must NOT offer a blind retry, which would double-submit.
+pub(crate) fn is_timeout_shaped(err: &str) -> bool {
+    if is_timeout_pattern(err) {
+        return true;
+    }
+    match err
+        .strip_prefix("turn: ")
+        .or_else(|| err.strip_prefix("session: "))
+    {
+        Some(stripped) => is_timeout_pattern(stripped),
+        None => false,
+    }
+}
+
+/// Classify the raw error string (before prefix stripping) as connection-shaped
+/// — i.e. the daemon was unreachable (refused/DNS/reset) and the request never
+/// landed, so a retry is safe. Mirrors the combined checks inside `humanize` so
+/// that callers can pick the right transcript prefix for `TurnSendFailed`
+/// without duplicating the logic. A TIMEOUT is never connect-shaped: the request
+/// may have started a turn, so retrying is not idempotent-safe.
 pub(crate) fn is_connect_shaped(err: &str) -> bool {
+    if is_timeout_shaped(err) {
+        return false;
+    }
     if is_connect_pattern(err) {
         return true;
     }
@@ -36,13 +74,13 @@ pub(crate) fn is_connect_shaped(err: &str) -> bool {
 /// transcript or status line. Already-human strings pass through unchanged.
 pub fn humanize(err: &str) -> String {
     if is_connect_pattern(err) {
-        // Distinguish timeout from other transport failures.
-        let lower = err.to_lowercase();
-        if lower.contains("timed out")
-            || lower.contains("timeout")
-            || lower.contains("deadline has elapsed")
-        {
-            return "daemon timed out — is it overloaded?".into();
+        // Distinguish timeout from other transport failures. A timeout is NOT
+        // "can't reach the daemon": the turn POST is fire-and-ack, so it may
+        // have started a still-running turn server-side (output flows over the
+        // SSE stream). Tell the operator the truth instead of implying a safe
+        // retry — see chat.rs's TurnSendFailed arm.
+        if is_timeout_pattern(err) {
+            return "daemon didn't answer in time — the turn may still be running".into();
         }
         if let Some(host) = extract_url_host(err) {
             return format!("can't reach the daemon at {host}");
@@ -171,13 +209,37 @@ mod tests {
     #[test]
     fn timeout() {
         let got = humanize("operation timed out");
-        assert_eq!(got, "daemon timed out — is it overloaded?");
+        assert_eq!(
+            got,
+            "daemon didn't answer in time — the turn may still be running"
+        );
     }
 
     #[test]
     fn deadline_elapsed() {
         let got = humanize("deadline has elapsed");
-        assert_eq!(got, "daemon timed out — is it overloaded?");
+        assert_eq!(
+            got,
+            "daemon didn't answer in time — the turn may still be running"
+        );
+    }
+
+    #[test]
+    fn timeout_with_url_is_not_unreachable() {
+        // Real reqwest shape when the client's request timeout fires mid-POST.
+        // Must NOT collapse to "can't reach the daemon at …" — the turn POST is
+        // fire-and-ack and the turn may still be running server-side.
+        let got = humanize(
+            "error sending request for url (http://127.0.0.1:4780/v1/agent/turns): operation timed out",
+        );
+        assert_eq!(
+            got,
+            "daemon didn't answer in time — the turn may still be running"
+        );
+        assert!(
+            !got.contains("can't reach the daemon"),
+            "timeout must not be classified as unreachable, got: {got}"
+        );
     }
 
     #[test]
@@ -350,7 +412,37 @@ mod tests {
 
     #[test]
     fn is_connect_shaped_timeout() {
-        assert!(is_connect_shaped("operation timed out"));
+        // A timeout is its own class — never connect-shaped. Retrying a
+        // connect failure is safe (the daemon never saw the prompt); retrying a
+        // timeout is not (the turn POST is fire-and-ack and may have started a
+        // still-running turn server-side → double-submit).
+        assert!(!is_connect_shaped("operation timed out"));
+        assert!(!is_connect_shaped(
+            "turn: error sending request for url (http://127.0.0.1:4780/v1/agent/turns): operation timed out"
+        ));
+    }
+
+    // ── is_timeout_shaped ────────────────────────────────────────────────
+
+    #[test]
+    fn is_timeout_shaped_matches_bare_and_prefixed() {
+        assert!(is_timeout_shaped("operation timed out"));
+        assert!(is_timeout_shaped("deadline has elapsed"));
+        assert!(is_timeout_shaped("request timeout"));
+        assert!(is_timeout_shaped("session: operation timed out"));
+        assert!(is_timeout_shaped(
+            "turn: error sending request for url (http://127.0.0.1:4780/v1/agent/turns): operation timed out"
+        ));
+    }
+
+    #[test]
+    fn is_timeout_shaped_rejects_connect_and_credentials() {
+        assert!(!is_timeout_shaped(
+            "tcp connect error: Connection refused (os error 61)"
+        ));
+        assert!(!is_timeout_shaped("dns error: failed to resolve"));
+        assert!(!is_timeout_shaped("turn: HTTP 401 Unauthorized"));
+        assert!(!is_timeout_shaped("turn: token_invalidated"));
     }
 
     #[test]

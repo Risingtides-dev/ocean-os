@@ -1748,6 +1748,21 @@ impl Component for ChatComponent {
         if let Action::TurnSendFailed { prompt, err } = action {
             self.busy = false;
             let msg = errfmt::humanize(err);
+            if errfmt::is_timeout_shaped(err) {
+                // The POST timed out waiting for the daemon's ACK — but the turn
+                // POST is fire-and-ack, so the turn may well still be running
+                // server-side and emitting into the event stream. Do NOT restore
+                // the prompt or offer a blind "press ⏎ to retry": that invites a
+                // double-submit while the original turn runs. The transcript
+                // catches up via the SSE stream; if it truly stalled, the
+                // operator can start a fresh turn deliberately.
+                self.turns.push(Turn::Assistant(format!(
+                    "{} {msg}\nIf it's still running server-side, output will stream in here.",
+                    g("⚠", "!")
+                )));
+                self.scroll_back = 0;
+                return None;
+            }
             let prefix = if errfmt::is_connect_shaped(err) {
                 "couldn't reach the daemon"
             } else {
@@ -3784,5 +3799,33 @@ mod tests {
             !msg.contains("couldn't reach the daemon"),
             "non-connect error must not use daemon prefix, got: {msg}"
         );
+    }
+    #[test]
+    fn turn_send_failed_timeout_does_not_offer_retry() {
+        let mut chat = ChatComponent::default();
+        chat.update(&Action::TurnSendFailed {
+            prompt: "hi".into(),
+            err: "turn: error sending request for url (http://127.0.0.1:4780/v1/agent/turns): operation timed out"
+                .into(),
+        });
+        assert_eq!(chat.turns.len(), 1, "should push one Assistant turn");
+        let Turn::Assistant(msg) = &chat.turns[0] else {
+            panic!("expected Assistant turn");
+        };
+        assert!(
+            !msg.contains("couldn't reach the daemon"),
+            "timeout must not use the daemon-unreachable prefix, got: {msg}"
+        );
+        assert!(
+            !msg.contains("press ⏎ to retry"),
+            "timeout must not offer a blind retry (double-submit trap), got: {msg}"
+        );
+        assert!(
+            msg.contains("didn't answer in time"),
+            "timeout should render the honest timeout notice, got: {msg}"
+        );
+        // Must NOT restore the prompt into the composer — that's the
+        // double-submit affordance the original bug surfaced.
+        assert_eq!(chat.input, "", "timeout must not restore the prompt");
     }
 }

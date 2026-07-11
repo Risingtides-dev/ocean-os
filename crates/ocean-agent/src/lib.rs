@@ -2603,6 +2603,7 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
 
 mod session {
     use super::*;
+    use std::io::Write;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Session {
@@ -2732,7 +2733,7 @@ mod session {
         format!("-{slug}")
     }
 
-    fn probe_git(cwd: &Path) -> (Option<String>, Option<String>) {
+    pub(crate) fn probe_git(cwd: &Path) -> (Option<String>, Option<String>) {
         let branch = std::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
@@ -2967,13 +2968,49 @@ mod session {
         std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         let path = dir.join(format!("{}.json", session.id));
         let json = serde_json::to_string_pretty(session)?;
-        // Atomic write: a crash mid-write must never corrupt an existing good
-        // transcript. Write to a temp sibling, then rename over the target.
+        // Atomic + durable write: a crash mid-write must never corrupt an
+        // existing good transcript. Write to a temp sibling, fsync it, then
+        // rename over the target.
         let tmp = dir.join(format!(".{}.json.tmp", session.id));
-        std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+        {
+            let mut file =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            file.write_all(json.as_bytes())
+                .with_context(|| format!("write {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("fsync {}", tmp.display()))?;
+        }
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+
+        // Split-brain invariant (one id == one file): a prior
+        // `bind_workspace` rebind may have left this session's `<id>.json` in
+        // another bucket. Remove every other copy so the loader can never
+        // resolve a stale empty stub over this canonical file. Best-effort —
+        // a failed unlink is warned, not fatal.
+        purge_duplicate_session_files(config_dir, session.id, &path);
+
         Ok(path)
+    }
+
+    /// Remove every `<id>.json` for `id` except `keep`. Best-effort: failed
+    /// unlinks are warned, never fatal. Enforces the one-id-one-file invariant
+    /// both on save (clearing the pre-rebind orphan) and as the loader's
+    /// self-heal (collapsing duplicates it just resolved).
+    fn purge_duplicate_session_files(config_dir: &Path, id: SessionId, keep: &Path) {
+        let target = format!("{id}.json");
+        for candidate in candidate_session_paths(config_dir, &target) {
+            if candidate.as_path() == keep || !candidate.exists() {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_file(&candidate) {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    error = %e,
+                    "session: failed to remove orphaned duplicate session file"
+                );
+            }
+        }
     }
 
     pub fn load(config_dir: &Path, id: SessionId) -> anyhow::Result<Session> {
@@ -2989,17 +3026,68 @@ mod session {
     /// or the entire prior transcript is silently discarded mid-chat).
     pub fn load_resumable(config_dir: &Path, id: SessionId) -> anyhow::Result<Option<Session>> {
         let target = format!("{id}.json");
-        // Search all workspace buckets + legacy/ + top-level (for forward-compat).
-        for candidate in candidate_session_paths(config_dir, &target) {
-            if candidate.exists() {
-                let text = std::fs::read_to_string(&candidate)
-                    .with_context(|| format!("read {}", candidate.display()))?;
-                let session = serde_json::from_str(&text)
-                    .with_context(|| format!("parse {}", candidate.display()))?;
-                return Ok(Some(session));
+        // Gather every existing copy across all workspace buckets + top-level.
+        let existing: Vec<PathBuf> = candidate_session_paths(config_dir, &target)
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+        if existing.is_empty() {
+            return Ok(None);
+        }
+
+        // Parse each copy, partitioning successes from errors so we can both
+        // pick a deterministic winner (split-brain: a rebind left >1 file) and
+        // still honor the corrupt→Err contract below.
+        let mut parsed: Vec<(PathBuf, Session)> = Vec::new();
+        let mut errors: Vec<(PathBuf, anyhow::Error)> = Vec::new();
+        for p in &existing {
+            match std::fs::read_to_string(p)
+                .with_context(|| format!("read {}", p.display()))
+                .and_then(|text| {
+                    serde_json::from_str::<Session>(&text)
+                        .with_context(|| format!("parse {}", p.display()))
+                }) {
+                Ok(s) => parsed.push((p.clone(), s)),
+                Err(e) => errors.push((p.clone(), e)),
             }
         }
-        Ok(None)
+
+        if parsed.is_empty() {
+            // At least one file existed but none parsed — propagate the first
+            // error so the daemon resume path never treats a corrupt-on-disk
+            // transcript as a fresh session.
+            let (_, e) = errors
+                .into_iter()
+                .next()
+                .expect("existing non-empty with no parsed copies implies an error");
+            return Err(e);
+        }
+
+        // Deterministic winner: newest updated_ms, then most messages, then
+        // lexicographically largest path — a stable, FS-order-independent
+        // tiebreak so even two truly-identical copies resolve to one.
+        parsed.sort_by(|(pa, a), (pb, b)| {
+            b.updated_ms
+                .cmp(&a.updated_ms)
+                .then_with(|| b.messages.len().cmp(&a.messages.len()))
+                .then_with(|| pb.cmp(pa))
+        });
+        let (winner_path, winner) = parsed.into_iter().next().expect("parsed non-empty");
+
+        // Self-heal: delete every other copy so the next load is deterministic
+        // even without a follow-up save. The winner supersedes stale valid
+        // copies and any corrupt ones alike.
+        let had_duplicates = existing.len() > 1;
+        purge_duplicate_session_files(config_dir, id, &winner_path);
+        if had_duplicates {
+            tracing::warn!(
+                session_id = %id,
+                winner = %winner_path.display(),
+                "session: multiple files found for one id; loaded the newest and removed the rest"
+            );
+        }
+
+        Ok(Some(winner))
     }
 
     fn candidate_session_paths(config_dir: &Path, filename: &str) -> Vec<PathBuf> {
@@ -4453,6 +4541,231 @@ done
 
         let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
         assert!(loaded.client_type.is_none());
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// Test helper: every on-disk `<id>.json` across all workspace buckets
+    /// plus the top-level sessions dir. Mirrors the loader's candidate walk so
+    /// tests can assert the "one id == one file" invariant directly.
+    fn session_files_for(config_dir: &Path, id: SessionId) -> Vec<PathBuf> {
+        let name = format!("{id}.json");
+        let root = session::sessions_dir(config_dir);
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for e in entries.flatten() {
+                let p = e.path().join(&name);
+                if p.exists() {
+                    out.push(p);
+                }
+            }
+        }
+        let top = root.join(&name);
+        if top.exists() {
+            out.push(top);
+        }
+        out
+    }
+
+    /// Split-brain repro: one session id persisted as two files in different
+    /// workspace buckets (an empty older stub + the real newer transcript).
+    /// Loading by id must deterministically return the message-bearing copy
+    /// and self-heal down to a single file. Under the old loader this was
+    /// nondeterministic — `read_dir` order decided whether the empty stub or
+    /// the real history won, flapping between "fresh session" and the truth
+    /// mid-conversation with no daemon restart.
+    #[test]
+    fn load_resumable_resolves_split_brain_to_the_newest_message_bearing_file() {
+        let config_dir = temp_config_dir("split-brain-load");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let id = SessionId::new_v4();
+
+        // Empty stub in bucket A — older.
+        let bucket_a = session::sessions_dir(&config_dir)
+            .join(session::workspace_slug(Path::new("/fake/ws-split-a")));
+        std::fs::create_dir_all(&bucket_a).unwrap();
+        let mut stub = session::Session::new_with_id(id, &model);
+        stub.workspace_root = Some("/fake/ws-split-a".into());
+        stub.updated_ms = 1000;
+        std::fs::write(
+            bucket_a.join(format!("{id}.json")),
+            serde_json::to_string(&stub).unwrap(),
+        )
+        .unwrap();
+
+        // Real transcript in bucket B — newer, one message.
+        let bucket_b = session::sessions_dir(&config_dir)
+            .join(session::workspace_slug(Path::new("/fake/ws-split-b")));
+        std::fs::create_dir_all(&bucket_b).unwrap();
+        let mut real = session::Session::new_with_id(id, &model);
+        real.workspace_root = Some("/fake/ws-split-b".into());
+        real.replace_messages(vec![Message::user_text("the real first turn")]);
+        real.updated_ms = 5000;
+        std::fs::write(
+            bucket_b.join(format!("{id}.json")),
+            serde_json::to_string(&real).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_files_for(&config_dir, id).len(),
+            2,
+            "test setup: two files for one id must exist"
+        );
+
+        let loaded = session::load_resumable(&config_dir, id)
+            .expect("load must not error")
+            .expect("session must be found");
+        assert_eq!(
+            loaded.messages.len(),
+            1,
+            "split-brain load must return the message-bearing copy, not the empty stub"
+        );
+        assert_eq!(loaded.updated_ms, 5000);
+
+        // Self-heal: the loser must be gone so the next load is deterministic.
+        let remaining = session_files_for(&config_dir, id);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "self-heal must collapse duplicate files to one; got {remaining:?}"
+        );
+        assert_eq!(
+            remaining[0],
+            bucket_b.join(format!("{id}.json")),
+            "the newest, message-bearing copy must be the survivor"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// save() must write the canonical bucket AND purge any stale `<id>.json`
+    /// left in another bucket — the orphan from a pre-fix rebind. One id must
+    /// resolve to exactly one loadable file after every save.
+    #[test]
+    fn save_removes_orphaned_duplicate_session_files_across_buckets() {
+        let config_dir = temp_config_dir("split-brain-save-collapses");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let id = SessionId::new_v4();
+
+        // Seed an orphan in bucket A (as a prior rebind would have left).
+        let bucket_a = session::sessions_dir(&config_dir)
+            .join(session::workspace_slug(Path::new("/fake/ws-save-a")));
+        let bucket_b = session::sessions_dir(&config_dir)
+            .join(session::workspace_slug(Path::new("/fake/ws-save-b")));
+        std::fs::create_dir_all(&bucket_a).unwrap();
+        std::fs::create_dir_all(&bucket_b).unwrap();
+        let mut stale = session::Session::new_with_id(id, &model);
+        stale.workspace_root = Some("/fake/ws-save-a".into());
+        stale.updated_ms = 1000;
+        std::fs::write(
+            bucket_a.join(format!("{id}.json")),
+            serde_json::to_string(&stale).unwrap(),
+        )
+        .unwrap();
+
+        // Save the canonical session bound to bucket B.
+        let mut canonical = session::Session::new_with_id(id, &model);
+        canonical.workspace_root = Some("/fake/ws-save-b".into());
+        canonical.replace_messages(vec![Message::user_text("canonical history")]);
+        let written = session::save(&config_dir, &canonical).unwrap();
+        assert_eq!(written, bucket_b.join(format!("{id}.json")));
+
+        let remaining = session_files_for(&config_dir, id);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "save must leave exactly one file for the id; got {remaining:?}"
+        );
+
+        let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
+        assert_eq!(
+            loaded.messages.len(),
+            1,
+            "the surviving file must be the canonical one"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// The original split-brain mechanism: `bind_workspace` rebinds to a new
+    /// workspace_root, then save() wrote the new bucket but left the OLD
+    /// bucket's file behind. Verify rebind + save moves the file: old bucket
+    /// empty, new bucket holds it, full history intact.
+    #[test]
+    fn bind_workspace_rebind_moves_session_file_without_leaving_orphan() {
+        let config_dir = temp_config_dir("rebind-moves-file");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let id = SessionId::new_v4();
+
+        // First bind + save in workspace A.
+        let mut s = session::Session::new_with_id(id, &model);
+        s.workspace_root = Some("/fake/ws-rebind-a".into());
+        s.replace_messages(vec![Message::user_text("turn one")]);
+        session::save(&config_dir, &s).unwrap();
+        let bucket_a = session::sessions_dir(&config_dir)
+            .join(session::workspace_slug(Path::new("/fake/ws-rebind-a")));
+        assert!(
+            bucket_a.join(format!("{id}.json")).exists(),
+            "pre-rebind file must exist in bucket A"
+        );
+
+        // Rebind to workspace B (mimics `cd /project-b && ocean --resume <id>`).
+        s.workspace_root = Some("/fake/ws-rebind-b".into());
+        let mut msgs = s.messages.clone();
+        msgs.push(Message::user_text("turn two"));
+        s.replace_messages(msgs);
+        session::save(&config_dir, &s).unwrap();
+
+        assert!(
+            !bucket_a.join(format!("{id}.json")).exists(),
+            "rebind must not leave an orphan in the old bucket"
+        );
+
+        let remaining = session_files_for(&config_dir, id);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly one file after rebind; got {remaining:?}"
+        );
+
+        let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
+        assert_eq!(
+            loaded.messages.len(),
+            2,
+            "history must survive the rebind move intact"
+        );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// Happy path untouched: repeated saves to the same workspace keep exactly
+    /// one file and load the latest content. Guards against the cleanup logic
+    /// accidentally nuking the in-bucket file on a normal save.
+    #[test]
+    fn save_in_a_single_bucket_is_idempotent_and_leaves_one_file() {
+        let config_dir = temp_config_dir("single-bucket-untouched");
+        let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
+        let id = SessionId::new_v4();
+
+        let mut s = session::Session::new_with_id(id, &model);
+        s.workspace_root = Some("/fake/ws-single".into());
+        s.replace_messages(vec![Message::user_text("first")]);
+        session::save(&config_dir, &s).unwrap();
+        assert_eq!(session_files_for(&config_dir, id).len(), 1);
+
+        let mut msgs = s.messages.clone();
+        msgs.push(Message::user_text("second"));
+        s.replace_messages(msgs);
+        session::save(&config_dir, &s).unwrap();
+        assert_eq!(
+            session_files_for(&config_dir, id).len(),
+            1,
+            "same-bucket re-save must not create a duplicate"
+        );
+
+        let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
@@ -5944,26 +6257,72 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
         client_type: Option<&str>,
         assistants_root: Option<&Path>,
     ) -> String {
-        let cwd = cwd
-            .and_then(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(s))
-                }
-            })
+        // The explicit, non-empty cwd the caller named — captured BEFORE the
+        // current-dir fallback below. The Environment block is grounded on
+        // THIS only, never on the process cwd we fall back to for
+        // project-instruction loading. So a `None`/empty cwd still loads
+        // project instructions from wherever the process happens to run
+        // (unchanged behavior) but produces NO Environment block — it never
+        // invents a workspace the caller didn't name. Production always passes
+        // `Some(req.cwd)`, so the block is present on every real turn.
+        let explicit_cwd = cwd.and_then(|s| (!s.is_empty()).then(|| PathBuf::from(s)));
+
+        let resolved_cwd = explicit_cwd
+            .clone()
             .or_else(|| std::env::current_dir().ok());
-        let project = cwd
+        let project = resolved_cwd
             .as_ref()
             .map(|p| load_project_prompt(p))
             .unwrap_or_default();
-        if project.is_empty() {
-            append_client_type_from(BASE_SYSTEM_PROMPT, client_type, assistants_root)
-        } else {
-            let prompt =
-                format!("{BASE_SYSTEM_PROMPT}\n----- project instructions -----\n{project}");
-            append_client_type_from(&prompt, client_type, assistants_root)
+
+        let mut prompt = String::from(BASE_SYSTEM_PROMPT);
+        if let Some(dir) = &explicit_cwd {
+            prompt.push('\n');
+            prompt.push_str(&environment_block(dir));
         }
+        if !project.is_empty() {
+            prompt.push_str("\n----- project instructions -----\n");
+            prompt.push_str(&project);
+        }
+        append_client_type_from(&prompt, client_type, assistants_root)
+    }
+
+    /// Build the compact grounded-environment block for `cwd`: the working
+    /// directory, the workspace root (`git rev-parse --show-toplevel`, or the
+    /// cwd itself when not in a repo / git is absent), and — only when git
+    /// actually reports them — the branch and short commit. Closes with one
+    /// directive: treat this directory as ground truth, never fabricate paths
+    /// outside it. This is what stops the model from inventing paths like
+    /// `/home/ubuntu/agent-0` in a session whose real cwd is elsewhere.
+    ///
+    /// Reuses `session::workspace_root` / `session::probe_git` so the
+    /// git-probing logic lives in exactly one place — the same helpers
+    /// `Session::bind_workspace` uses to tag the session. The git line is
+    /// gated on having a branch or commit value (not on `root != cwd`) so a
+    /// session started at the repo toplevel still surfaces its branch.
+    fn environment_block(cwd: &Path) -> String {
+        let root = crate::session::workspace_root(cwd);
+        let (branch, commit) = crate::session::probe_git(cwd);
+        let mut block = String::from("## Environment\n");
+        block.push_str(&format!("- Working directory: {}\n", cwd.display()));
+        block.push_str(&format!("- Workspace root: {}\n", root.display()));
+        match (branch.as_deref(), commit.as_deref()) {
+            (Some(branch), Some(commit)) => {
+                block.push_str(&format!("- Git branch: {branch} @ {commit}\n"));
+            }
+            (Some(branch), None) => {
+                block.push_str(&format!("- Git branch: {branch}\n"));
+            }
+            (None, Some(commit)) => {
+                block.push_str(&format!("- Git commit: {commit} (detached HEAD)\n"));
+            }
+            (None, None) => {}
+        }
+        block.push_str(
+            "- Treat the working directory above as ground truth; never guess or \
+             fabricate absolute paths outside it.\n",
+        );
+        block
     }
 
     const WEB_SURFACE_COMPONENT_PROMPT: &str = r#"
@@ -6653,6 +7012,175 @@ is the user's real, signed-in browser session.\n\n\
             assert!(prompt.contains("terminal-native"));
             assert!(prompt.contains("Do not use `component_render`"));
             assert!(!prompt.contains("Leptos components from `component_render` events"));
+        }
+        // --- Grounded environment block ---------------------------------------
+        //
+        // The daemon's system prompt historically never stated the session's
+        // working directory, so models hallucinated paths (observed live: a
+        // provider ran `cd /home/ubuntu/agent-0 && ...` in a session whose
+        // real cwd was elsewhere). `build_system_prompt_from` now appends a
+        // grounded Environment block whenever the caller passes an explicit,
+        // non-empty cwd. These four tests pin that contract.
+
+        /// (a) With an explicit cwd and no project instructions, the prompt
+        /// MUST contain the exact cwd path. Against the pre-fix prompt — a
+        /// static `BASE_SYSTEM_PROMPT` with no cwd baked in and no instruction
+        /// files to load — this assertion fails, which is the bug.
+        #[test]
+        fn environment_block_states_explicit_cwd() {
+            let root = empty_assistants_root();
+            // No AGENTS.md / CLAUDE.md here, so `load_project_prompt`
+            // contributes nothing — the only way cwd can appear is the
+            // Environment block.
+            let project = TempDir::new().expect("project tempdir");
+            let cwd_str = project.path().to_string_lossy().into_owned();
+
+            let prompt = build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()));
+
+            assert!(
+                prompt.contains(&cwd_str),
+                "prompt must state the working directory; got a prompt without `{cwd_str}`"
+            );
+            assert!(prompt.contains("## Environment"));
+            assert!(prompt.contains("Working directory:"));
+        }
+
+        /// (b) Inside a git repo the workspace-root label and the real branch
+        /// name appear. The branch is queried from git (not hardcoded main /
+        /// master — git's default differs by config and version), and the
+        /// workspace-root path is never compared to the tempdir: `git
+        /// rev-parse --show-toplevel` canonicalizes through symlinks
+        /// (`/var` -> `/private/var` on macOS), so a path-equality check
+        /// flakes locally while passing on Linux CI.
+        #[test]
+        fn environment_block_reports_git_branch_in_repo() {
+            if std::process::Command::new("git")
+                .arg("--version")
+                .status()
+                .map(|status| !status.success())
+                .unwrap_or(true)
+            {
+                // No git on this box (some CI images) — not a regression.
+                return;
+            }
+
+            let repo = TempDir::new().expect("repo tempdir");
+            let repo_path = repo.path();
+            let ok = |cmd: &mut std::process::Command, label: &str| {
+                let status = cmd.status().expect(label);
+                assert!(status.success(), "{label} failed with status {status}");
+            };
+
+            ok(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(repo_path),
+                "git init",
+            );
+            // Pin the unborn branch up front so the first commit lands on a
+            // known name regardless of `init.defaultBranch`.
+            ok(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo_path)
+                    .args(["symbolic-ref", "HEAD", "refs/heads/ocean-env-test"]),
+                "git symbolic-ref HEAD",
+            );
+            std::fs::write(repo_path.join("README.md"), "ocean\n").expect("write seed file");
+            ok(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo_path)
+                    .args(["add", "README.md"]),
+                "git add",
+            );
+            ok(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo_path)
+                    .args([
+                        "-c",
+                        "user.name=Ocean Test",
+                        "-c",
+                        "user.email=ocean-test@example.invalid",
+                        "commit",
+                        "-q",
+                        "-m",
+                        "initial",
+                    ]),
+                "git commit",
+            );
+
+            // Read the branch git actually reports (not the one we requested)
+            // so the assertion is robust to any local git quirk.
+            let branch = String::from_utf8(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo_path)
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .expect("git rev-parse HEAD")
+                    .stdout,
+            )
+            .expect("branch utf8")
+            .trim()
+            .to_string();
+
+            let root = empty_assistants_root();
+            let cwd_str = repo_path.to_string_lossy().into_owned();
+            let prompt = build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()));
+
+            assert!(!branch.is_empty(), "test setup must produce a branch");
+            assert!(
+                prompt.contains(&format!("Git branch: {branch}")),
+                "prompt must name the git branch ({branch})"
+            );
+            assert!(
+                prompt.contains("Workspace root:"),
+                "workspace-root line must be present inside a repo"
+            );
+            // Branch + short commit render as `branch @ <short>`.
+            assert!(prompt.contains(" @ "));
+        }
+
+        /// (c) Outside any git repo, no git line appears — but the working
+        /// directory line still does. (`tempfile` places the dir under the
+        /// system temp root, never inside a repo.)
+        #[test]
+        fn environment_block_omits_git_lines_outside_repo() {
+            let root = empty_assistants_root();
+            let outside = TempDir::new().expect("non-repo tempdir");
+            let cwd_str = outside.path().to_string_lossy().into_owned();
+
+            let prompt = build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()));
+
+            assert!(prompt.contains("Working directory:"));
+            assert!(
+                !prompt.contains("Git branch:"),
+                "no git branch line outside a repo"
+            );
+            assert!(
+                !prompt.contains("Git commit:"),
+                "no git commit line outside a repo"
+            );
+        }
+
+        /// (d) With no cwd at all there is NO Environment block — we never
+        /// invent a workspace by falling back to the process cwd. Deterministic
+        /// regardless of where the test process happens to run.
+        #[test]
+        fn environment_block_absent_when_no_cwd() {
+            let root = empty_assistants_root();
+            let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()));
+
+            assert!(
+                !prompt.contains("## Environment"),
+                "no Environment block when cwd is None"
+            );
+            assert!(
+                !prompt.contains("Working directory:"),
+                "no working-directory line when cwd is None"
+            );
         }
     }
 }

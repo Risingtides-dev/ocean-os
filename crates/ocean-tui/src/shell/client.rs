@@ -96,6 +96,17 @@ impl DaemonClient {
     /// idempotent-safe). `on_retry(attempt, total)` fires before each backoff
     /// sleep so the caller can show "retrying…" progress. The schedule spans
     /// ~15.5s, comfortably covering the ~8s launchd respawn.
+    ///
+    /// Timeout note: the POST is fire-and-ack — the daemon returns an
+    /// [`AgentTurnResponse`] (`turn_id` + `event_id_prefix` to correlate with
+    /// the SSE stream) as soon as the turn is ACCEPTED, not when it finishes.
+    /// Turn output flows over the separate `/v1/agent/events` stream, which
+    /// overrides the client's 120s timeout with an effectively-infinite cap
+    /// (see [`Self::spawn_event_stream`]). So the client's global 120s timeout
+    /// can only fire if the daemon fails to ACK the POST itself (wedged /
+    /// saturated) — the correct condition to surface as a timeout, which errfmt
+    /// renders as "the turn may still be running" rather than "can't reach the
+    /// daemon". No per-request long timeout is added to the POST on purpose.
     pub async fn agent_turn_retrying(
         &self,
         req: &AgentTurnRequest,
