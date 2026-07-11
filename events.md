@@ -2283,3 +2283,11 @@ accepted_provider_error_emits_failed_turn_finished_and_clears_running does not
 exist on main (stale reference); nearest live coverage above. No timeout values,
 providers, daemon, or surface code changed.
 _________________________________________________________________________________
+time:      [08:35pm] [07-10-26]
+agent:     [omp] [fable-5]
+worktree:  /tmp/ocean-daemon-mainline (origin/main detached)
+type:      [feature-request]
+area:      [backend]
+
+Added compile-time provenance to ocean-daemon: build.rs embeds the 12-character git HEAD, appends -dirty for uncommitted worktrees, and falls back to unknown when git cannot verify the checkout. GET /health and GET /ready now surface that value as rev while preserving the existing health wire shape, and the focused handler test asserts rev is present and non-empty. The release was rebuilt from the pushed clean main commit into the launchd-managed target path, the ocean TUI binary was refreshed from the same tree, and dev.risingtides.ocean-daemon was restarted so the live health endpoint proves the exact deployed revision.
+_________________________________________________________________________________
