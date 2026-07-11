@@ -6239,10 +6239,16 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
 
     /// Build the system prompt, optionally scoped to `cwd` and `client_type`.
     pub fn build_system_prompt(cwd: Option<&str>, client_type: Option<&str>) -> String {
-        // Production resolves the surface profile against the real assistants
-        // root (`OCEAN_ASSISTANTS_DIR`, else the Ocean config dir). Tests call
-        // [`build_system_prompt_from`] with an explicit temp root for isolation.
-        build_system_prompt_from(cwd, client_type, assistants_root().as_deref())
+        // Production resolves file-backed prompt inputs against the real
+        // config roots. Tests call [`build_system_prompt_from`] with explicit
+        // temp roots (or `None`) for isolation.
+        let memory_db = config_dir_from_env().join("memory.sqlite");
+        build_system_prompt_from(
+            cwd,
+            client_type,
+            assistants_root().as_deref(),
+            Some(&memory_db),
+        )
     }
 
     /// Inner form of [`build_system_prompt`] that resolves any file-loaded
@@ -6256,6 +6262,7 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
         cwd: Option<&str>,
         client_type: Option<&str>,
         assistants_root: Option<&Path>,
+        memory_db: Option<&Path>,
     ) -> String {
         // The explicit, non-empty cwd the caller named — captured BEFORE the
         // current-dir fallback below. The Environment block is grounded on
@@ -6280,11 +6287,66 @@ You operate from the user's project directory (passed per turn). Look for AGENTS
             prompt.push('\n');
             prompt.push_str(&environment_block(dir));
         }
+        if let Some(path) = memory_db {
+            append_memory_context(&mut prompt, path);
+        }
         if !project.is_empty() {
             prompt.push_str("\n----- project instructions -----\n");
             prompt.push_str(&project);
         }
         append_client_type_from(&prompt, client_type, assistants_root)
+    }
+
+    fn append_memory_context(prompt: &mut String, memory_db: &Path) {
+        prompt.push_str(
+            "\n## Memory\n\
+             Persistent long-term memory survives across sessions through two tools:\n\
+             - `recall {query?, limit?}` searches it. Use it at the START of substantive tasks and before answering questions about prior work or preferences.\n\
+             - `retain {text, kind?}` saves durable facts: decisions, conventions, and operator preferences. Keep each fact specific and self-contained; never save ephemeral task state.\n",
+        );
+
+        if !memory_db.exists() {
+            return;
+        }
+        let memories = crate::list_memories(memory_db, 10);
+        if memories.is_empty() {
+            return;
+        }
+
+        prompt.push_str("\n## What you already know\n");
+        for memory in memories {
+            prompt.push_str("- [");
+            prompt.push_str(&memory.kind);
+            prompt.push_str("] ");
+            prompt.push_str(&compact_memory_text(&memory.text));
+            prompt.push('\n');
+        }
+    }
+
+    fn compact_memory_text(text: &str) -> String {
+        const MAX_CHARS: usize = 200;
+
+        let mut compact = String::with_capacity(text.len().min(MAX_CHARS + 3));
+        let mut previous_was_space = false;
+        let mut char_count = 0;
+        let mut clipped = false;
+        for ch in text.chars() {
+            let ch = if ch.is_whitespace() { ' ' } else { ch };
+            if ch == ' ' && (previous_was_space || compact.is_empty()) {
+                continue;
+            }
+            if char_count == MAX_CHARS {
+                clipped = true;
+                break;
+            }
+            compact.push(ch);
+            char_count += 1;
+            previous_was_space = ch == ' ';
+        }
+        if clipped {
+            compact.push('…');
+        }
+        compact
     }
 
     /// Build the compact grounded-environment block for `cwd`: the working
@@ -6704,6 +6766,10 @@ is the user's real, signed-in browser session.\n\n\
         use super::{
             build_system_prompt_from, load_surface_profile_from, surface_dir, surface_flag,
         };
+        use ocean_context::{ClaimStatus, Provenance};
+        use ocean_memory::{
+            Memory, MemoryId, MemoryKind, MemoryScope, MemoryStore, PrincipalId, SqliteMemoryStore,
+        };
         use std::path::Path;
         use tempfile::TempDir;
 
@@ -6790,7 +6856,8 @@ is the user's real, signed-in browser session.\n\n\
             assert!(load_surface_profile_from(root.path(), Some("tui")).is_none());
 
             // And the loaded file actually wins inside the full prompt build.
-            let prompt = build_system_prompt_from(None, Some("surface-slack"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(None, Some("surface-slack"), Some(root.path()), None);
             assert!(prompt.contains("CUSTOM SLACK PROFILE FROM FILE"));
         }
 
@@ -6833,7 +6900,7 @@ is the user's real, signed-in browser session.\n\n\
             // (OCEAN-285) — never the operator's real ~/.config profiles.
             let root = empty_assistants_root();
             for ct in ["surface-slack", "surface-canvas", "surface-mobile"] {
-                let prompt = build_system_prompt_from(None, Some(ct), Some(root.path()));
+                let prompt = build_system_prompt_from(None, Some(ct), Some(root.path()), None);
                 assert!(
                     !prompt.contains("unknown client"),
                     "{ct} must have a real surface arm, not the fallthrough"
@@ -6860,7 +6927,8 @@ is the user's real, signed-in browser session.\n\n\
             // process env is touched (no save/restore race with sibling tests).
             let root = empty_assistants_root();
 
-            let slack = build_system_prompt_from(None, Some("surface-slack"), Some(root.path()));
+            let slack =
+                build_system_prompt_from(None, Some("surface-slack"), Some(root.path()), None);
             // Slack-native: thread-aware, concise, mrkdwn-not-Markdown, canvas-aware.
             assert!(slack.contains("Slack surface UX"));
             assert!(slack.contains("thread"));
@@ -6871,13 +6939,15 @@ is the user's real, signed-in browser session.\n\n\
             // Not the old stub one-liner, and not a web/HTML surface.
             assert!(!slack.contains("Responses render as HTML"));
 
-            let canvas = build_system_prompt_from(None, Some("surface-canvas"), Some(root.path()));
+            let canvas =
+                build_system_prompt_from(None, Some("surface-canvas"), Some(root.path()), None);
             assert!(canvas.contains("canvas surface UX"));
             assert!(canvas.contains("artifact"));
             assert!(canvas.contains("append over overwrite"));
             assert!(canvas.contains("pair the canvas with a message"));
 
-            let mobile = build_system_prompt_from(None, Some("surface-mobile"), Some(root.path()));
+            let mobile =
+                build_system_prompt_from(None, Some("surface-mobile"), Some(root.path()), None);
             assert!(mobile.contains("mobile surface UX"));
             assert!(mobile.contains("phone"));
             assert!(mobile.contains("answer-first"));
@@ -6903,7 +6973,8 @@ is the user's real, signed-in browser session.\n\n\
             // Const fallback under test — pin an empty temp assistants root so a
             // real WEB profile on the box can't shadow it (OCEAN-285).
             let root = empty_assistants_root();
-            let prompt = build_system_prompt_from(None, Some("surface-web"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(None, Some("surface-web"), Some(root.path()), None);
 
             assert!(prompt.contains("Leptos components"));
             assert!(prompt.contains("component_render"));
@@ -6934,7 +7005,8 @@ is the user's real, signed-in browser session.\n\n\
         #[test]
         fn gpui_surface_avoids_web_component_guidance() {
             let root = empty_assistants_root();
-            let prompt = build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()), None);
 
             assert!(prompt.contains("Ocean GUI"));
             assert!(prompt.contains("GPUI"));
@@ -6954,7 +7026,8 @@ is the user's real, signed-in browser session.\n\n\
         #[test]
         fn gpui_surface_guides_to_surface_patch_not_ascii() {
             let root = empty_assistants_root();
-            let prompt = build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()), None);
 
             // The keystone: the model is told the canvas tool exists and how to
             // use it.
@@ -6972,7 +7045,8 @@ is the user's real, signed-in browser session.\n\n\
         #[test]
         fn legacy_native_surface_is_not_treated_as_webview() {
             let root = empty_assistants_root();
-            let prompt = build_system_prompt_from(None, Some("surface-native"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(None, Some("surface-native"), Some(root.path()), None);
 
             assert!(prompt.contains("Ocean native surface"));
             assert!(prompt.contains("surface_patch"));
@@ -6997,6 +7071,7 @@ is the user's real, signed-in browser session.\n\n\
                 Some(nested.to_str().expect("nested path utf8")),
                 Some("tui"),
                 Some(assistants.path()),
+                None,
             );
 
             assert!(prompt.contains(".ocean/AGENTS.md"));
@@ -7006,7 +7081,7 @@ is the user's real, signed-in browser session.\n\n\
         #[test]
         fn tui_surface_avoids_web_component_guidance() {
             let root = empty_assistants_root();
-            let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()));
+            let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
 
             assert!(prompt.contains("Ocean TUI"));
             assert!(prompt.contains("terminal-native"));
@@ -7035,7 +7110,8 @@ is the user's real, signed-in browser session.\n\n\
             let project = TempDir::new().expect("project tempdir");
             let cwd_str = project.path().to_string_lossy().into_owned();
 
-            let prompt = build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()), None);
 
             assert!(
                 prompt.contains(&cwd_str),
@@ -7128,7 +7204,8 @@ is the user's real, signed-in browser session.\n\n\
 
             let root = empty_assistants_root();
             let cwd_str = repo_path.to_string_lossy().into_owned();
-            let prompt = build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()), None);
 
             assert!(!branch.is_empty(), "test setup must produce a branch");
             assert!(
@@ -7152,7 +7229,8 @@ is the user's real, signed-in browser session.\n\n\
             let outside = TempDir::new().expect("non-repo tempdir");
             let cwd_str = outside.path().to_string_lossy().into_owned();
 
-            let prompt = build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()));
+            let prompt =
+                build_system_prompt_from(Some(&cwd_str), Some("tui"), Some(root.path()), None);
 
             assert!(prompt.contains("Working directory:"));
             assert!(
@@ -7171,7 +7249,7 @@ is the user's real, signed-in browser session.\n\n\
         #[test]
         fn environment_block_absent_when_no_cwd() {
             let root = empty_assistants_root();
-            let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()));
+            let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
 
             assert!(
                 !prompt.contains("## Environment"),
@@ -7181,6 +7259,96 @@ is the user's real, signed-in browser session.\n\n\
                 !prompt.contains("Working directory:"),
                 "no working-directory line when cwd is None"
             );
+        }
+        fn seed_memory(path: &Path, text: &str, kind: MemoryKind) {
+            let mut store = SqliteMemoryStore::open(path).expect("open temp memory db");
+            store
+                .put(Memory {
+                    id: MemoryId::new(),
+                    scope: MemoryScope::Operator,
+                    owner: PrincipalId::new("operator"),
+                    kind,
+                    body: serde_json::json!({ "text": text }),
+                    provenance: Provenance {
+                        anchors: Vec::new(),
+                        tickets: Vec::new(),
+                        commit_sha: String::new(),
+                    },
+                    trust: ClaimStatus::Asserted,
+                    seq: 0,
+                    written_at: 1,
+                    updated_at: 1,
+                    history: Vec::new(),
+                })
+                .expect("seed temp memory");
+        }
+
+        #[test]
+        fn memory_prompt_describes_tools_and_auto_recalls_existing_facts() {
+            let root = empty_assistants_root();
+            let memory_dir = TempDir::new().expect("memory tempdir");
+            let memory_db = memory_dir.path().join("memory.sqlite");
+            seed_memory(
+                &memory_db,
+                "John prefers verified work landed to main.",
+                MemoryKind::Preference,
+            );
+            seed_memory(
+                &memory_db,
+                "Ocean daemon health is GET /health.",
+                MemoryKind::Fact,
+            );
+
+            let prompt =
+                build_system_prompt_from(None, Some("tui"), Some(root.path()), Some(&memory_db));
+
+            assert!(prompt.contains("## Memory"));
+            assert!(prompt.contains("recall"));
+            assert!(prompt.contains("retain"));
+            assert!(prompt.contains("## What you already know"));
+            assert!(prompt.contains("John prefers verified work landed to main."));
+            assert!(prompt.contains("Ocean daemon health is GET /health."));
+        }
+
+        #[test]
+        fn memory_prompt_omits_auto_recall_for_missing_database() {
+            let root = empty_assistants_root();
+            let memory_dir = TempDir::new().expect("memory tempdir");
+            let missing = memory_dir.path().join("missing.sqlite");
+
+            let prompt =
+                build_system_prompt_from(None, Some("tui"), Some(root.path()), Some(&missing));
+
+            assert!(prompt.contains("## Memory"));
+            assert!(!prompt.contains("## What you already know"));
+            assert!(
+                !missing.exists(),
+                "prompt build must not create a missing db"
+            );
+        }
+
+        #[test]
+        fn memory_prompt_is_absent_without_database_configuration() {
+            let root = empty_assistants_root();
+            let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
+
+            assert!(!prompt.contains("## Memory"));
+            assert!(!prompt.contains("## What you already know"));
+        }
+
+        #[test]
+        fn auto_recalled_memory_is_truncated_at_two_hundred_characters() {
+            let root = empty_assistants_root();
+            let memory_dir = TempDir::new().expect("memory tempdir");
+            let memory_db = memory_dir.path().join("memory.sqlite");
+            let long_fact = "x".repeat(201);
+            seed_memory(&memory_db, &long_fact, MemoryKind::Fact);
+
+            let prompt =
+                build_system_prompt_from(None, Some("tui"), Some(root.path()), Some(&memory_db));
+
+            assert!(prompt.contains(&format!("{}…", "x".repeat(200))));
+            assert!(!prompt.contains(&long_fact));
         }
     }
 }
