@@ -2051,23 +2051,46 @@ async fn root() -> Json<serde_json::Value> {
     }))
 }
 
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
-        service: "ocean-daemon".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        backend: state.runtime.backend_name().to_string(),
-        // Surface dropped-transcript-write count (OCEAN-255): best-effort call
-        // persistence never stalls the rail, so this is how a sustained store
-        // failure that's silently losing transcripts becomes visible. `0` healthy.
-        persist_failures_total: state
-            .persist_failures
-            .load(std::sync::atomic::Ordering::Relaxed),
-        // Surface failed-GC-sweep count (OCEAN-371): the GC loop catches a panicked
-        // sweep as a `JoinError` and keeps going, so without this a self-perpetuating
-        // poisoned-mutex GC loop leaking the registries would only live in the logs.
-        // `0` healthy; a climbing value means GC is failing and memory is leaking.
-        gc_failures_total: state.gc_failures.load(std::sync::atomic::Ordering::Relaxed),
+/// `GET /health` wire payload: the shared [`HealthResponse`] flattened together
+/// with a build-provenance `rev` — the short git revision the running daemon was
+/// compiled from, embedded at build time via the `OCEAN_BUILD_REV` build-script
+/// env (`-dirty` suffix when the worktree had uncommitted changes; `unknown`
+/// when git was unavailable). `flatten` keeps the wire shape stable: existing
+/// clients that deserialize into [`HealthResponse`] still parse (it carries no
+/// `deny_unknown_fields`), and the extra field makes the *deployed* commit
+/// directly verifiable from the wire — the supervised binary's freshness and
+/// provenance are observable without inspecting the process or build dir.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HealthEnvelope {
+    #[serde(flatten)]
+    health: HealthResponse,
+    rev: String,
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
+    Json(HealthEnvelope {
+        health: HealthResponse {
+            ok: true,
+            service: "ocean-daemon".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            backend: state.runtime.backend_name().to_string(),
+            // Surface dropped-transcript-write count (OCEAN-255): best-effort call
+            // persistence never stalls the rail, so this is how a sustained store
+            // failure that's silently losing transcripts becomes visible. `0` healthy.
+            persist_failures_total: state
+                .persist_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            // Surface failed-GC-sweep count (OCEAN-371): the GC loop catches a panicked
+            // sweep as a `JoinError` and keeps going, so without this a self-perpetuating
+            // poisoned-mutex GC loop leaking the registries would only live in the logs.
+            // `0` healthy; a climbing value means GC is failing and memory is leaking.
+            gc_failures_total: state.gc_failures.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        // Build provenance: the commit the running binary was compiled from, set by
+        // build.rs (`-dirty` suffix on uncommitted worktrees; `unknown` when git
+        // could not be run). Lets an operator confirm the supervised daemon is
+        // actually running the main commit they expect.
+        rev: env!("OCEAN_BUILD_REV").into(),
     })
 }
 
@@ -2138,6 +2161,11 @@ async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
             "fallback_providers".into(),
             json!(state.runtime.fallback_providers()),
         );
+        // Build provenance: the same `rev` `/health` reports, so a readiness probe
+        // also tells the operator which commit the supervised daemon was built from.
+        // Object-only (mirrors the failover list above) so the serialize-error
+        // fallback shape stays untouched.
+        obj.insert("rev".into(), json!(env!("OCEAN_BUILD_REV")));
     }
     Json(body)
 }
@@ -20909,6 +20937,19 @@ mod tests {
         assert_eq!(
             health.gc_failures_total, 3,
             "gc_failures must be read off AppState and surfaced on /health"
+        );
+        // Build provenance: `/health` must surface the embedded build revision
+        // (non-empty; only `unknown` when git itself was unavailable at build
+        // time). Reuses the same body bytes — the HealthResponse parse above
+        // borrows them, it doesn't consume them.
+        let health_json: Value = serde_json::from_slice(&bytes).expect("health body is JSON");
+        let rev = health_json
+            .get("rev")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !rev.is_empty(),
+            "/health must surface a non-empty build `rev` (got: {health_json})"
         );
     }
 
