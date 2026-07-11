@@ -761,6 +761,141 @@ async fn cancel_during_long_tool_aborts_promptly_without_awaiting_completion() {
     );
 }
 
+// ===========================================================================
+// Scenario 5b — Halt DURING a silent (never-yielding) provider stream.
+//
+// The defect (spec §1): the stream-read boundary at `agent_loop.rs:205` checks
+// the cancel token *post-yield* — `if is_cancelled(config)` runs only after
+// `stream.next().await` resolves. A provider that accepts the connection and
+// then goes silent (no Done, no error, no bytes — the "accepts then stalls"
+// hang) leaves `stream.next().await` blocked forever, so a user Halt landing on
+// that silent socket is ignored until the 120s byte-idle read_timeout or the
+// 300s round deadline fires — NOT immediate.
+//
+// This test reproduces the silent socket with a provider whose stream is
+// `futures::stream::pending()` (next() is Pending forever), trips the
+// CancellationToken from a second task ~50ms in, and asserts the post-fix
+// contract: the run unwinds with `Err(AgentError::Cancelled)` inside a
+// sub-second outer budget — far below 120s/300s — proving a cancel-race at the
+// read boundary (not a wall-clock bound) broke the blocking read.
+//
+// ASSERTION DIRECTION (load-bearing): the outer-budget-elapsed branch is a
+// TEST FAILURE (panic), never an expected pass. Pre-fix the run stays blocked
+// in `stream.next().await` past the 750ms budget and the test MUST fail here;
+// post-fix the biased `select!` resolves the cancel arm promptly and it passes.
+// Real time only — `start_paused` would auto-fire the 300s round deadline and
+// invalidate the proof.
+// ===========================================================================
+#[tokio::test]
+async fn halt_during_silent_provider_stream_cancels_promptly() {
+    use std::time::{Duration, Instant};
+
+    // Trip the token this long after the run starts — long enough for round 1
+    // to have entered `stream_work` and be blocked on `stream.next().await`,
+    // short enough to land well inside the outer budget.
+    const CANCEL_AFTER: Duration = Duration::from_millis(50);
+    // Sub-second outer budget. Far below the 120s read_timeout and the 300s
+    // round deadline — if the run is still live at this point, Halt did NOT
+    // break the silent read, i.e. the pre-fix bug. Elapsing here is a failure.
+    const OUTER_BUDGET: Duration = Duration::from_millis(750);
+
+    let token = CancellationToken::new();
+
+    // A provider whose stream NEVER resolves — its `next()` is `Pending`
+    // forever (no Done, no Error, no items). This is the silent socket: the
+    // existing MockProvider can't express "never yields" (it pops scripted
+    // turns), so we reuse the same `Provider` impl pattern locally and return
+    // `futures::stream::pending()` boxed as the protocol's event stream.
+    struct SilentProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for SilentProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> ocean_protocol::Result<AssistantMessageEventStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // `pending::<T>()` is a stream of `T` that never yields anything —
+            // `StreamExt::next()` on it is Pending forever, exactly the silent
+            // socket. `Box::pin` coerces the concrete stream to `BoxStream`.
+            Ok(Box::pin(stream::pending::<
+                ocean_protocol::Result<AssistantMessageEvent>,
+            >()))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    // `with_provider` takes `Arc<dyn Provider>`, so build the config directly
+    // (mirroring `base_config`) rather than through the `Arc<MockProvider>`
+    // helper.
+    let provider: Arc<dyn Provider> = Arc::new(SilentProvider {
+        calls: calls.clone(),
+    });
+    let mut cfg = AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test system")
+        .with_session_id("e2e")
+        .with_provider(provider);
+    cfg.stream_options.cancel = Some(token.clone());
+
+    // Trip the token from a second task a fixed interval after the run begins,
+    // while the loop is blocked mid-stream-read. (Not at run start: the
+    // start-of-round `is_cancelled` guard would bail before calling the
+    // provider, which is a different path and wouldn't exercise the boundary.)
+    let canceller = {
+        let token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CANCEL_AFTER).await;
+            token.cancel();
+        })
+    };
+
+    let start = Instant::now();
+    let outcome = tokio::time::timeout(
+        OUTER_BUDGET,
+        ocean_runtime::run_agent(&cfg, user("anything — provider is silent"), None),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    let _ = canceller.await;
+
+    // SELF-VALIDATION (deliberately BEFORE the budget panic below): the provider
+    // stream MUST have been entered — call_count == 1 proves the run got past
+    // the start-of-round `is_cancelled` guard and was genuinely blocked on the
+    // never-yielding read (`stream.next().await`), not stalled earlier in setup.
+    // This is what makes the budget-elapse failure proof of the read-boundary
+    // defect rather than a generic hang that never reached the provider.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "round 1 must have entered stream_work and blocked on the silent stream"
+    );
+
+    // The load-bearing assertion: the run MUST resolve inside the budget.
+    // Elapsing means the silent-stream read was not broken by Halt — the
+    // post-fix cancel-race at the read boundary is missing (the pre-fix bug).
+    let result = outcome.unwrap_or_else(|_elapsed| {
+        panic!(
+            "run did NOT unwind on Halt within {OUTER_BUDGET:?} (elapsed {elapsed:?}); \
+             the silent provider stream blocked `stream.next().await` past the \
+             budget, so Halt was ignored until the 120s/300s wall-clock bound — \
+             the read-boundary cancel-race (spec §6) is absent"
+        );
+    });
+
+    match result {
+        Err(ocean_runtime::AgentError::Cancelled) => {}
+        other => panic!(
+            "expected Err(AgentError::Cancelled) within {OUTER_BUDGET:?}; got {}",
+            match other {
+                Err(e) => format!("Err({e:?})"),
+                Ok(_) => "Ok(AgentRun)".to_string(),
+            }
+        ),
+    }
+}
+
 // Pre-cancelled before any round: must bail before touching the provider at all.
 #[tokio::test]
 async fn pre_cancelled_run_never_calls_provider() {

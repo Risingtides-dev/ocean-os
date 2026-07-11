@@ -202,15 +202,21 @@ pub async fn run_agent_with_history(
                     Some(provider) => provider.stream(&config.model, &ctx, &options).await?,
                     None => stream_simple(&config.model, &ctx, &options).await?,
                 };
-                while let Some(ev) = stream.next().await {
-                    // A cancel can land mid-stream (client hit halt while the
-                    // assistant was still typing). The provider also yields
-                    // `Error::Cancelled` on its own, but checking here breaks out
-                    // immediately and surfaces a clean `AgentError::Cancelled`
-                    // rather than waiting on the next chunk.
-                    if is_cancelled(config) {
-                        return Err(AgentError::Cancelled);
-                    }
+                loop {
+                    // Race the blocking read against the cancel token.
+                    // `cancelled()` is `pending()` when no token is wired
+                    // (ad-hoc/embedded runs), so this select! reduces to a
+                    // plain `stream.next().await` on the no-cancel path. With
+                    // a token, cancel is polled first each iteration (biased),
+                    // so a Halt that lands on a silent socket breaks out
+                    // immediately rather than waiting on any transport or
+                    // deadline bound.
+                    let next = tokio::select! {
+                        biased;
+                        () = cancelled(config) => return Err(AgentError::Cancelled),
+                        ev = stream.next() => ev,
+                    };
+                    let Some(ev) = next else { break };
                     let ev = match ev {
                         Ok(ev) => ev,
                         // The provider maps a cancel-token trip to `Error::Cancelled`;

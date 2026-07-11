@@ -19,6 +19,7 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - Runtime events must remain compatible with `ocean-core` event contracts and daemon SSE streaming.
 - Keep provider concerns outside runtime unless mediated through the protocol/provider layers.
 - A tool-call batch runs through the concurrency scheduler (`agent_loop.rs`): consecutive `Concurrency::Shared` (read-only) tools run in one concurrent segment; a `Concurrency::Exclusive` tool (the default) is a full barrier. A new tool defaults to `Exclusive` — only override `concurrency()` to `Shared` when the tool is genuinely side-effect-free. The persisted transcript MUST stay in original batch order regardless of finish order (provider tool_use/tool_result pairing depends on it).
+- Blocking await boundaries in the agent loop (provider stream read, tool execution, retry backoff) must race the cancel token pre-yield via a biased `tokio::select!` on `cancelled(config)` — never a post-yield `is_cancelled` poll, which ignores user Halt on a silent socket until a wall-clock bound fires. Regression: `halt_during_silent_provider_stream_cancels_promptly` in `tests/agent_loop_e2e.rs`.
 
 ## Work Guidance
 

@@ -2261,4 +2261,25 @@ POST /v1/voice/stt, POST /v1/voice/tts, and POST /v1/voice/realtime/client-secre
 and added the paragraph noting the surface /api/stt|/api/tts forwards to the daemon
 and that provider keys (xAI, OpenAI) resolve only inside ocean-os. Map edit only;
 no code touched.
+time:      [08:25pm] [07-10-26]
+agent:     [claude] [fable-5]
+worktree:  fix/immediate-provider-halt
+type:      [bug-report]
+area:      [backend]
+
+Fixed immediate provider Halt cancellation per approved spec
+docs/superpowers/specs/2026-07-10-immediate-provider-halt-design.md (a0eef51c).
+The stream-consumption loop in ocean-runtime agent_loop.rs checked the cancel
+token only post-yield, so a user Halt on a silent socket waited out the 120s
+read-timeout or 300s round deadline. Replaced only that read boundary with a
+biased tokio::select! racing cancelled(config) against stream.next(), mirroring
+the in-tree tool-exec race; no-token path reduces to a plain read. TDD: new
+regression halt_during_silent_provider_stream_cancels_promptly (never-yielding
+mock stream, Halt from a second task, Err(AgentError::Cancelled) within a 750ms
+budget) failed pre-fix on the budget path and passes post-fix in 0.06s. Gates:
+agent_loop_e2e 13/13, round_retry 4/4, ocean-runtime package green, daemon
+finish_/cancel terminalization family 4/4. Note: the handoff-named daemon test
+accepted_provider_error_emits_failed_turn_finished_and_clears_running does not
+exist on main (stale reference); nearest live coverage above. No timeout values,
+providers, daemon, or surface code changed.
 _________________________________________________________________________________
