@@ -2291,3 +2291,12 @@ area:      [backend]
 
 Added compile-time provenance to ocean-daemon: build.rs embeds the 12-character git HEAD, appends -dirty for uncommitted worktrees, and falls back to unknown when git cannot verify the checkout. GET /health and GET /ready now surface that value as rev while preserving the existing health wire shape, and the focused handler test asserts rev is present and non-empty. The release was rebuilt from the pushed clean main commit into the launchd-managed target path, the ocean TUI binary was refreshed from the same tree, and dev.risingtides.ocean-daemon was restarted so the live health endpoint proves the exact deployed revision.
 _________________________________________________________________________________
+
+time:      [11:15pm] [10-07-26]
+agent:     [omp], [claude-fable-5]
+worktree:  main
+type:      [workflow]
+area:      [analysis]
+
+Branch-state triage after multi-agent confusion: verified feat/ocean-tui-shell-rebuild is FULLY merged into origin/main (merge 892866e8, 0 unique commits remain) and the "behind by 31" was only a stale local main — fast-forwarded local main 32 commits to 38da7e03. The stash taken on the feature tip (80ac2d04) was preserved durably as branch wip/stash-readline-era-refactor (db5d9f89) and adjudicated as a CONTAMINATED working tree, not a resumable refactor: its runtime files (agent_loop.rs, bash/grep/edit/hashline_edit.rs) are byte-identical to pre-508085d7 versions, so applying it would revert the landed round-retry + noop-guard feature; its headline additions (agent_session_message_append, voice_realtime_client_secret) already landed on main in reworked form. Possibly-unique crumbs on that branch: two tools_smoke read-window tests + small capability.rs/hashline_wiring.rs deltas. An untracked older voice_realtime.rs draft (pinned gpt-realtime-2.1; main deliberately pins gpt-realtime-2) was backed up to /tmp/voice_realtime.local-backup.rs before the ff. Awaiting operator call on salvage-vs-freeze of the wip branch.
+_________________________________________________________________________________
