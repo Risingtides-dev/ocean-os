@@ -198,10 +198,7 @@ fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
                 format!("{alt}  ·  {path}")
             };
             out.push(Line::from(vec![
-                Span::styled(
-                    format!("  {} ", g("🖼", "[img]")),
-                    Style::default().fg(theme::CYAN),
-                ),
+                Span::styled("  [img] ", Style::default().fg(theme::CYAN)),
                 Span::styled(
                     label,
                     Style::default()

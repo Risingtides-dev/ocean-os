@@ -27,6 +27,17 @@ pub enum LoginTarget {
     Codex,
 }
 
+/// A typed health source — the daemon liveness probe and the SSE transport
+/// are tracked independently so a recovery clears only its own source
+/// (`status::Health`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthSource {
+    /// The periodic `GET /health` probe (plus autostart outcomes).
+    Daemon,
+    /// The scoped `/v1/agent/events` SSE stream.
+    Sse,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     /// Redraw requested (coalesced with the render tick).
@@ -46,8 +57,24 @@ pub enum Action {
     /// retry window. The chat unwinds its busy state, surfaces the error in the
     /// transcript, and restores `prompt` to the composer so nothing typed is lost.
     TurnSendFailed { prompt: String, err: String },
-    /// Transient status message (connection state, etc.).
+    /// The turn POST was connected but its final response was lost/invalid.
+    /// The daemon may already be executing it, so do NOT restore the prompt or
+    /// offer an automatic retry that could duplicate side effects.
+    TurnOutcomeUnknown { err: String },
+    /// Transient status message. COMPATIBILITY PATH for slash-command and
+    /// notice producers — health transitions use the typed
+    /// [`Action::HealthDegraded`]/[`Action::HealthRecovered`] variants instead
+    /// so recovery/failure/acknowledgement can no longer overwrite one another.
     Status(String),
+    /// A health source became degraded with a terse condition. Persists until
+    /// the SAME source recovers; unrelated notices never clear it.
+    HealthDegraded {
+        source: HealthSource,
+        condition: String,
+    },
+    /// A health source recovered. Clears only that source; success is never
+    /// rendered as text.
+    HealthRecovered(HealthSource),
     /// Open a discovered session in the PTY: run `line` in a shell rooted at `cwd`.
     OpenSession { line: String, cwd: PathBuf },
     /// Move keyboard focus to the next pane.

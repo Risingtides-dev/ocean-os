@@ -6,6 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::shell::spatial::{Camera, Vec3};
+
 const MAX_NODES: usize = 320;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -16,6 +18,13 @@ pub enum NodeKind {
     Other,
 }
 
+/// Axis-aligned 3D bounding box of the laid-out graph (min/max corners).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bounds3d {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
 #[derive(Clone, Debug)]
 pub struct GraphNode {
     pub path: PathBuf,
@@ -24,6 +33,7 @@ pub struct GraphNode {
     pub kind: NodeKind,
     pub x: f32,
     pub y: f32,
+    pub z: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -31,12 +41,10 @@ pub struct ProjectGraph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<(usize, usize)>,
     pub selected: usize,
-    /// Screen-space pan in terminal cells.
-    pub pan_x: f32,
-    /// Screen-space pan in terminal cells.
-    pub pan_y: f32,
-    /// User zoom multiplier; rendering computes an auto-fit base scale first.
-    pub zoom: f32,
+    /// Orbit camera (yaw/pitch/distance) around the origin-centered,
+    /// unit-radius normalized node cloud; the default pose frames the whole
+    /// cloud with margin.
+    pub camera: Camera,
     pub truncated: bool,
 }
 
@@ -130,6 +138,7 @@ impl ProjectGraph {
                 kind: d.kind,
                 x: 0.0,
                 y: 0.0,
+                z: 0.0,
             })
             .collect();
 
@@ -169,9 +178,7 @@ impl ProjectGraph {
             nodes,
             edges,
             selected,
-            pan_x: 0.0,
-            pan_y: 0.0,
-            zoom: 1.0,
+            camera: Camera::new(),
             truncated,
         }
     }
@@ -207,31 +214,32 @@ impl ProjectGraph {
         self.selected = s as usize;
     }
 
-    pub fn zoom_by(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(0.25, 4.0);
-    }
-
-    pub fn pan(&mut self, dx: f32, dy: f32) {
-        self.pan_x += dx;
-        self.pan_y += dy;
-    }
-
     pub fn reset_view(&mut self) {
-        self.pan_x = 0.0;
-        self.pan_y = 0.0;
-        self.zoom = 1.0;
+        self.camera.reset();
     }
 
-    pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
+    /// Axis-aligned 3D bounds of the laid-out (normalized) node cloud.
+    pub fn bounds3d(&self) -> Option<Bounds3d> {
         let first = self.nodes.first()?;
-        let (mut min_x, mut max_x, mut min_y, mut max_y) = (first.x, first.x, first.y, first.y);
+        let mut b = Bounds3d {
+            min: [first.x, first.y, first.z],
+            max: [first.x, first.y, first.z],
+        };
         for n in &self.nodes {
-            min_x = min_x.min(n.x);
-            max_x = max_x.max(n.x);
-            min_y = min_y.min(n.y);
-            max_y = max_y.max(n.y);
+            let p = [n.x, n.y, n.z];
+            for axis in 0..3 {
+                b.min[axis] = b.min[axis].min(p[axis]);
+                b.max[axis] = b.max[axis].max(p[axis]);
+            }
         }
-        Some((min_x, max_x, min_y, max_y))
+        Some(b)
+    }
+
+    /// World-space position of node `i` for the camera/projection pipeline.
+    pub fn node_world(&self, i: usize) -> Option<Vec3> {
+        self.nodes
+            .get(i)
+            .map(|n| Vec3::new(n.x as f64, n.y as f64, n.z as f64))
     }
 
     pub fn neighbors_of_selected(&self) -> HashSet<usize> {
@@ -503,17 +511,23 @@ fn layout(nodes: &mut [GraphNode], edges: &[(usize, usize)]) {
     if n == 1 {
         nodes[0].x = 0.0;
         nodes[0].y = 0.0;
+        nodes[0].z = 0.0;
         return;
     }
 
-    // Deterministic seed positions on a golden-angle spiral. This gives stable
-    // snapshots and avoids needing rand.
+    // Deterministic 3D seed: golden-angle (Fibonacci-sphere) directions pushed
+    // outward on a growing spiral radius — the 3D analogue of the previous 2D
+    // golden-angle spiral. Stable snapshots, no rand dependency.
     let golden = 2.3999632_f32;
     for (i, node) in nodes.iter_mut().enumerate() {
         let r = 2.0 + (i as f32).sqrt() * 2.4;
+        let t = (i as f32 + 0.5) / n as f32;
+        let y = 1.0 - 2.0 * t;
+        let ring = (1.0 - y * y).max(0.0).sqrt();
         let a = i as f32 * golden;
-        node.x = a.cos() * r;
-        node.y = a.sin() * r * 0.62;
+        node.x = a.cos() * ring * r;
+        node.y = y * r;
+        node.z = a.sin() * ring * r;
     }
 
     if !edges.is_empty() && n <= 220 {
@@ -521,59 +535,79 @@ fn layout(nodes: &mut [GraphNode], edges: &[(usize, usize)]) {
         let area = (n as f32).sqrt() * 18.0;
         let k = (area * area / n as f32).sqrt().max(3.0);
         for _ in 0..iters {
-            let mut disp = vec![(0.0f32, 0.0f32); n];
+            let mut disp = vec![[0.0f32; 3]; n];
             for i in 0..n {
                 for j in i + 1..n {
                     let dx = nodes[i].x - nodes[j].x;
                     let dy = nodes[i].y - nodes[j].y;
-                    let dist = (dx * dx + dy * dy).sqrt().max(0.05);
+                    let dz = nodes[i].z - nodes[j].z;
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.05);
                     let force = (k * k / dist).min(8.0);
                     let fx = dx / dist * force;
                     let fy = dy / dist * force;
-                    disp[i].0 += fx;
-                    disp[i].1 += fy;
-                    disp[j].0 -= fx;
-                    disp[j].1 -= fy;
+                    let fz = dz / dist * force;
+                    disp[i][0] += fx;
+                    disp[i][1] += fy;
+                    disp[i][2] += fz;
+                    disp[j][0] -= fx;
+                    disp[j][1] -= fy;
+                    disp[j][2] -= fz;
                 }
             }
             for &(a, b) in edges {
                 let dx = nodes[a].x - nodes[b].x;
                 let dy = nodes[a].y - nodes[b].y;
-                let dist = (dx * dx + dy * dy).sqrt().max(0.05);
+                let dz = nodes[a].z - nodes[b].z;
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.05);
                 let force = (dist * dist / k * 0.035).min(6.0);
                 let fx = dx / dist * force;
                 let fy = dy / dist * force;
-                disp[a].0 -= fx;
-                disp[a].1 -= fy;
-                disp[b].0 += fx;
-                disp[b].1 += fy;
+                let fz = dz / dist * force;
+                disp[a][0] -= fx;
+                disp[a][1] -= fy;
+                disp[a][2] -= fz;
+                disp[b][0] += fx;
+                disp[b][1] += fy;
+                disp[b][2] += fz;
             }
             let temp = 0.18;
             for i in 0..n {
-                nodes[i].x += disp[i].0.clamp(-10.0, 10.0) * temp;
-                nodes[i].y += disp[i].1.clamp(-10.0, 10.0) * temp;
+                nodes[i].x += disp[i][0].clamp(-10.0, 10.0) * temp;
+                nodes[i].y += disp[i][1].clamp(-10.0, 10.0) * temp;
+                nodes[i].z += disp[i][2].clamp(-10.0, 10.0) * temp;
             }
         }
     }
 
-    // Center and scale to a predictable logical canvas. The renderer does the
-    // final fit to the current pane size.
-    let (mut min_x, mut max_x, mut min_y, mut max_y) =
-        (nodes[0].x, nodes[0].x, nodes[0].y, nodes[0].y);
+    // Center all three axes, then normalize the greatest EUCLIDEAN radius to a
+    // unit sphere (not a unit cube): the camera's default framing distance
+    // assumes max |position| == 1.
+    let mut min = [nodes[0].x, nodes[0].y, nodes[0].z];
+    let mut max = min;
     for node in nodes.iter() {
-        min_x = min_x.min(node.x);
-        max_x = max_x.max(node.x);
-        min_y = min_y.min(node.y);
-        max_y = max_y.max(node.y);
+        let p = [node.x, node.y, node.z];
+        for axis in 0..3 {
+            min[axis] = min[axis].min(p[axis]);
+            max[axis] = max[axis].max(p[axis]);
+        }
     }
-    let cx = (min_x + max_x) / 2.0;
-    let cy = (min_y + max_y) / 2.0;
-    let span = (max_x - min_x).max((max_y - min_y) * 1.8).max(1.0);
-    let target = (n as f32).sqrt() * 8.0 + 12.0;
-    let scale = target / span;
+    let c = [
+        (min[0] + max[0]) / 2.0,
+        (min[1] + max[1]) / 2.0,
+        (min[2] + max[2]) / 2.0,
+    ];
+    let mut max_r2 = 0.0f32;
     for node in nodes.iter_mut() {
-        node.x = (node.x - cx) * scale;
-        node.y = (node.y - cy) * scale * 0.68;
+        node.x -= c[0];
+        node.y -= c[1];
+        node.z -= c[2];
+        max_r2 = max_r2.max(node.x * node.x + node.y * node.y + node.z * node.z);
+    }
+    let scale = 1.0 / max_r2.sqrt().max(1e-6);
+    for node in nodes.iter_mut() {
+        node.x *= scale;
+        node.y *= scale;
+        node.z *= scale;
     }
 }
 
@@ -594,6 +628,65 @@ mod tests {
         assert_eq!(rust_mod_name("mod graph;"), Some("graph".into()));
         assert_eq!(rust_mod_name("pub mod app;"), Some("app".into()));
         assert_eq!(rust_mod_name("mod inline {"), None);
+    }
+
+    fn make_nodes(n: usize) -> Vec<GraphNode> {
+        (0..n)
+            .map(|i| GraphNode {
+                path: PathBuf::from(format!("n{i}.md")),
+                rel: format!("n{i}.md"),
+                title: format!("n{i}"),
+                kind: NodeKind::Other,
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            })
+            .collect()
+    }
+
+    /// The default camera pose (spatial.rs `Camera::new`, distance 4.5) frames
+    /// the cloud assuming layout() normalizes to max EUCLIDEAN radius == 1.0
+    /// around the origin. Per-axis (unit-cube) scaling would push corner nodes
+    /// out to radius ~sqrt(3) and break framing; this test pins the sphere
+    /// contract on both layout paths (with and without the FR relaxation).
+    fn assert_unit_sphere(nodes: &[GraphNode]) {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        let mut max_r = 0.0f32;
+        for node in nodes {
+            let p = [node.x, node.y, node.z];
+            for axis in 0..3 {
+                assert!(p[axis].is_finite(), "non-finite coordinate {p:?}");
+                min[axis] = min[axis].min(p[axis]);
+                max[axis] = max[axis].max(p[axis]);
+            }
+            max_r = max_r.max((p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt());
+        }
+        assert!(
+            (max_r - 1.0).abs() <= 1e-3,
+            "max Euclidean radius {max_r} not within 1e-3 of 1.0"
+        );
+        for axis in 0..3 {
+            let mid = (min[axis] + max[axis]) / 2.0;
+            assert!(
+                mid.abs() <= 1e-3,
+                "bounds midpoint {mid} on axis {axis} not at origin"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_normalizes_to_unit_radius() {
+        // FR path: edges present and n <= 220.
+        let mut nodes = make_nodes(20);
+        let edges: Vec<(usize, usize)> = vec![(0, 1), (1, 2), (2, 3), (0, 5), (4, 9), (10, 17)];
+        layout(&mut nodes, &edges);
+        assert_unit_sphere(&nodes);
+
+        // No-FR path: small N, no edges — seed spiral only, then normalize.
+        let mut small = make_nodes(3);
+        layout(&mut small, &[]);
+        assert_unit_sphere(&small);
     }
 }
 

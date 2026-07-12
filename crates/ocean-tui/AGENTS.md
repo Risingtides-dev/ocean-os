@@ -13,6 +13,14 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 ## Local Contracts
 
 - After any TUI change, build the release binary: `cargo build -p ocean-tui --release`.
+- Installing a fresh build over `~/.cargo/bin/ocean-tui` MUST use remove+copy
+  (`rm dest && cp src dest`) or a temp-file + atomic rename — NEVER an
+  in-place overwrite of the existing Mach-O: on this host the next `ocean`
+  exec dies with an instant SIGKILL (observed 2026-07-11; stale kernel
+  code-signature cache is the leading explanation). After installing, verify
+  with `codesign --verify --deep --strict` AND a real PTY launch that stays
+  alive several seconds — `--help` exits before terminal setup and proves
+  nothing.
 - Keep TUI behavior aligned with daemon API contracts; clients do not own sessions.
 - Do not introduce agent/session logic into the TUI; session state lives in the daemon via `ocean-agent`.
 
@@ -43,6 +51,33 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 ## Work Guidance
 
 - Preserve keyboard-driven workflows and terminal responsiveness.
+- Chrome contract (2026-07-11, owner-directed): the TITLE row is identity only
+  — `workspace › surface`, no branding, no controls. The BOTTOM row is the
+  control + info bar: six nav buttons on the LEFT (mouse-first, closest to the
+  prompt — `≡` sessions, `◒` chat (the owner's ocean mark, U+25D2), `✎` editor,
+  `⟠` graph, `⊟` terminal,
+  `◨` files; toggle semantics via `App::press`, hit rects filled by
+  `draw_status` using DISPLAY width, never `chars().count()`), then the status
+  segments from `shell/status.rs`: model · branch · health · error · activity
+  · tok/s. Layout order and survival are SEPARATE: on overflow, segments drop
+  by rank (tok/s, then activity, then branch; health/error outlive extras; the
+  model never drops). Do not resurrect key legends, counters, or branding.
+- Mouse text selection is pane-scoped (2026-07-11, owner-directed): Down arms
+  only inside a content pane (sessions/tree/center/terminal — never title,
+  status, breadcrumb, or splitters); the drag head clamps into that pane; the
+  reverse-video highlight and the copied text share one bounded-span geometry
+  (`bounded_span`, app.rs) so highlight == copy and a selection never crosses
+  into a sibling lane.
+- Metrics are truthful or absent: tok/s renders only as the daemon reported it
+  for the LAST finished turn (cleared on `TurnStarted`); the model row falls
+  back to the startup `/v1/models` fetch before the first turn; there is NO
+  context-window display until the daemon exposes real occupancy
+  (`ModelSelection.context_window` + usage provenance are the pending daemon
+  follow-ups — never estimate from cumulative turn usage).
+- Tool drawers (`shell/components/chat.rs`): one per call, independently
+  expandable (`▸`/`▾` via `g()`), collapsed header never wraps; consecutive
+  VISIBLE tool turns render single-spaced — a suppressed Thinking turn between
+  tool calls must not reintroduce the blank row.
 - Chat composer (`shell/components/chat.rs`): `cursor` is a UTF-8 byte offset
   (`None` = end). Every input replacement/insert/delete/kill/completion path
   must preserve that invariant. Readline keys are cursor-relative; `Ctrl+Y`
@@ -70,8 +105,16 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   goes through `errfmt::humanize` (no raw reqwest blobs); credential-shaped
   errors carry `/login` recovery hints; `is_connect_shaped` picks the
   "couldn't reach the daemon" vs "turn could not start" transcript prefix.
-- Turn lifecycle: only `TurnFinished`/`TurnSendFailed` (or explicit
-  new/clear/history reset) may clear `busy` — never generic SSE
+  A request timeout or generic post-connect transport failure is outcome-unknown,
+  never proof that the daemon was unavailable.
+- Turn submission uses its dedicated no-whole-request-timeout HTTP client;
+  provider rounds own their runtime timeout. Retry/restore only definitely-unsent
+  connect failures or pre-execution 4xx rejection. HTTP 408 is a known executed
+  runtime failure in Ocean and must decode its normal response. On
+  `TurnOutcomeUnknown`, unwind
+  `busy` but never restore or replay the prompt because tools may have run.
+- Turn lifecycle: only `TurnFinished`/`TurnSendFailed`/`TurnOutcomeUnknown` (or
+  explicit new/clear/history reset) may clear `busy` — never generic SSE
   reconnect statuses; failed turns render `Turn::ErrorNotice`, not advisor
   cards.
 

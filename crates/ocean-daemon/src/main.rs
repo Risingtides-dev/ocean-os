@@ -9843,10 +9843,13 @@ async fn agent_turn(
                 //     turn close), so re-emitting the whole message would double it.
                 //   - UserMessage: the prompt the client just submitted on this
                 //     turn — echoing it back over SSE tells the client nothing new.
+                //   - TurnCheckpoint: internal session-durability deltas. They are
+                //     consumed and persisted by ocean-agent, never exposed on SSE.
                 AgentEvent::AgentStart { .. }
                 | AgentEvent::AgentEnd { .. }
                 | AgentEvent::TurnStart { .. }
                 | AgentEvent::TurnEnd { .. }
+                | AgentEvent::TurnCheckpoint { .. }
                 | AgentEvent::AssistantMessage { .. }
                 | AgentEvent::UserMessage { .. } => {}
             }
@@ -12056,6 +12059,7 @@ mod tests {
             | AgentEvent::AgentEnd { .. }
             | AgentEvent::TurnStart { .. }
             | AgentEvent::TurnEnd { .. }
+            | AgentEvent::TurnCheckpoint { .. }
             | AgentEvent::AssistantMessage { .. }
             | AgentEvent::UserMessage { .. } => RelayClass::Filtered,
         }
@@ -12066,7 +12070,7 @@ mod tests {
         use ocean_protocol::Message;
 
         // Every currently-filtered variant must classify as Filtered. These are
-        // the six structural / message variants the bridge documents-and-drops.
+        // the structural/message/durability variants the bridge documents-and-drops.
         let filtered = [
             AgentEvent::AgentStart { session_id: None },
             AgentEvent::AgentEnd {
@@ -12075,6 +12079,10 @@ mod tests {
             },
             AgentEvent::TurnStart { session_id: None },
             AgentEvent::TurnEnd { session_id: None },
+            AgentEvent::TurnCheckpoint {
+                session_id: None,
+                messages: vec![],
+            },
             AgentEvent::AssistantMessage {
                 session_id: None,
                 message: Message::user_text("x"),

@@ -23,6 +23,7 @@ use ocean_protocol::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Content, Context,
     Message, Model, Provider, StopReason, StreamOptions, Usage,
 };
+use ocean_runtime::types::AgentEvent;
 use ocean_runtime::types::{AgentConfig, AgentTool, AgentToolResult, Concurrency};
 use serde_json::Value;
 
@@ -435,5 +436,100 @@ async fn default_tools_do_not_parallelize() {
         1,
         "tools at the default (Exclusive) concurrency must never overlap — peak was {}",
         tracker.peak.load(Ordering::SeqCst)
+    );
+}
+
+// ===========================================================================
+// 5 — LIVE End emission: a Shared batch member's ToolExecutionEnd must be
+// emitted the moment IT completes, not after the whole segment drains. The
+// slow member is gated on a Notify (no timing race): the fast member's End
+// must arrive while the slow one is still gated; releasing the gate then
+// completes the run with the transcript in ORIGINAL call order.
+// ===========================================================================
+
+struct GatedTool {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl AgentTool for GatedTool {
+    fn name(&self) -> &str {
+        "gated"
+    }
+    fn description(&self) -> &str {
+        "fast returns immediately; slow waits on the test's gate"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn requires_permission(&self) -> bool {
+        false
+    }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Shared
+    }
+    async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
+        let tag = args
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        if tag == "slow" {
+            self.release.notified().await;
+        }
+        Ok(AgentToolResult::text(format!("result-{tag}")))
+    }
+}
+
+#[tokio::test]
+async fn shared_batch_emits_each_end_as_it_completes() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![
+                tool_call("c0", "gated", serde_json::json!({ "tag": "slow" })),
+                tool_call("c1", "gated", serde_json::json!({ "tag": "fast" })),
+            ],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("done")], StopReason::Stop)],
+    ]));
+    let cfg = base_config(provider).with_tools(vec![Arc::new(GatedTool {
+        release: release.clone(),
+    })]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle =
+        tokio::spawn(async move { ocean_runtime::run_agent(&cfg, user("go"), Some(tx)).await });
+
+    // The fast member's End must arrive while the slow member is still gated.
+    let mut saw_fast_end = false;
+    let waited = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::ToolExecutionEnd { tool_call_id, .. } = &ev {
+                assert_ne!(
+                    tool_call_id, "c0",
+                    "slow (gated) member must not End before its gate releases"
+                );
+                if tool_call_id == "c1" {
+                    saw_fast_end = true;
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok() && saw_fast_end,
+        "fast member's ToolExecutionEnd must be emitted while the slow member is still running \
+         (a join_all barrier holds every End hostage to the slowest tool in the batch)"
+    );
+
+    release.notify_one();
+    let run = handle.await.expect("join").expect("run completes");
+    // Transcript stays in ORIGINAL call order regardless of finish order.
+    assert_eq!(
+        result_texts(&run.messages),
+        vec!["result-slow", "result-fast"]
     );
 }

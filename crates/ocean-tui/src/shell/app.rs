@@ -37,16 +37,12 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use super::{
-    action::{Action, LoginTarget, Nav},
-    client::{DaemonClient, ModelEntry},
+    action::{Action, HealthSource, LoginTarget, Nav},
+    client::{DaemonClient, ModelEntry, TurnSubmitError},
     component::Component,
     components::{
-        chat::{self, ChatComponent},
-        editor::EditorComponent,
-        file_tree::FileTreeComponent,
-        graph::GraphComponent,
-        pty_pane::PtyComponent,
-        session_rail::SessionRailComponent,
+        chat::ChatComponent, editor::EditorComponent, file_tree::FileTreeComponent,
+        graph::GraphComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent,
     },
     daemon_boot, errfmt,
     event::{Event, EventHandler},
@@ -60,6 +56,9 @@ const SESS_W: u16 = 30;
 const TREE_W: u16 = 30;
 /// Default terminal-dock height; resizable at runtime (drag the splitter / ⌃⌥↑↓).
 const TERM_H: u16 = 14;
+/// How long an ephemeral notice occupies the bottom status row before the
+/// tick path clears it — the idle row returns to its minimal, model-only set.
+const STATUS_TTL: Duration = Duration::from_secs(8);
 /// Floor for the dock and the main surface so neither can be squeezed to nothing.
 const MIN_TERM_H: u16 = 3;
 const MIN_CENTER_H: u16 = 5;
@@ -261,7 +260,16 @@ pub struct App {
     stream_task: Option<tokio::task::JoinHandle<()>>,
     /// The health-monitor task that re-probes and triggers autostart on failure.
     health_task: Option<tokio::task::JoinHandle<()>>,
+    /// Ephemeral notice/error message (unresolved error/notice bucket). Typed
+    /// health lives in `health`; this never carries connection state. Written
+    /// via `set_notice` and expired back to empty on the tick path
+    /// (`STATUS_TTL`) so a stale acknowledgement can't squat on the idle row.
     status: String,
+    /// When `status` was last written — drives `expire_status`.
+    status_at: Instant,
+    /// Typed per-source health (daemon probe · SSE transport) — degraded
+    /// conditions render in the bottom row; recovery renders nothing.
+    health: status::Health,
     /// True while a `/login` OAuth flow is running off-thread. A second
     /// `/login` while set is rejected with a busy status instead of racing a
     /// second callback server / browser launch.
@@ -326,11 +334,13 @@ pub struct App {
     image_view: Option<PathBuf>,
     image_body: Rect,
     image_placed: bool,
-    /// Mouse text selection. `sel_press` arms on any left-down that isn't a
-    /// splitter grab; the first drag promotes it into `selection` — a linear
-    /// (terminal-style) sweep in screen cells, anchor → head. Releasing the
-    /// button auto-copies the swept text to the system clipboard.
+    /// Mouse text selection. `sel_press` arms on any left-down that lands in a
+    /// content pane; the first drag promotes it into `selection` — a linear
+    /// (terminal-style) sweep in screen cells, anchor → head, but BOUND to the
+    /// pane (`sel_rect`) where the drag began so a sweep never crosses into a
+    /// sibling lane. Releasing the button auto-copies the swept text.
     sel_press: Option<(u16, u16)>,
+    sel_rect: Option<Rect>,
     selection: Option<((u16, u16), (u16, u16))>,
     /// Cell symbols of the last drawn frame (row-major), captured only while a
     /// selection is live, so release-time copy reads exactly what was shown.
@@ -339,7 +349,8 @@ pub struct App {
     show_sessions: bool,
     show_tree: bool,
     show_term: bool,
-    /// Clickable title-bar buttons (CTRL's upper model): (rect, action).
+    /// Title-bar buttons: (hit rect, button), rebuilt on every title draw —
+    /// mouse-first navigation, restored per operator request.
     buttons: Vec<(Rect, Btn)>,
     /// Double-Esc latch for the terminal dock: a single Esc belongs to the
     /// shell, so leaving the dock by keyboard takes two. Armed on the first Esc
@@ -351,10 +362,6 @@ pub struct App {
     /// Refreshed on the same throttled tick as the tree (git shells out, so it
     /// must not run per-frame) and immediately on a workspace re-root.
     git_status: git::Status,
-    /// Output tokens/second of the last completed turn, and the running total
-    /// of output tokens this session — status-bar segments.
-    turn_tok_per_s: Option<f64>,
-    session_tokens: u64,
     /// `/settings` overlay: open flag + selected row.
     settings_open: bool,
     settings_sel: usize,
@@ -365,7 +372,9 @@ pub struct App {
     providers_mode: ProvidersMode,
 }
 
-/// A title-bar button — CTRL's icon toggles, extended with the center surfaces.
+/// A title-bar button — the clickable icon toggles on the right of the title
+/// row. Buttons TOGGLE (rails/terminal) or select the center surface; keys
+/// and `/` commands mirror them but always-show instead of toggling.
 #[derive(Clone, Copy, PartialEq)]
 enum Btn {
     Sessions,
@@ -399,7 +408,9 @@ impl App {
             model_override: None,
             stream_task: None,
             health_task: None,
-            status: "connecting…".into(),
+            status: String::new(),
+            status_at: Instant::now(),
+            health: status::Health::default(),
             login_in_flight: false,
             should_quit: false,
             actions_tx,
@@ -438,6 +449,7 @@ impl App {
             image_body: Rect::default(),
             image_placed: false,
             sel_press: None,
+            sel_rect: None,
             selection: None,
             frame_cells: Vec::new(),
             show_sessions: true,
@@ -449,8 +461,6 @@ impl App {
             // Populated above from `root`, before it was moved into components;
             // refreshed thereafter on the 1s tick.
             git_status,
-            turn_tok_per_s: None,
-            session_tokens: 0,
             settings_open: false,
             settings_sel: 0,
             providers_open: false,
@@ -475,12 +485,27 @@ impl App {
                 .load_history(crate::shell::sessions::load_transcript(&path));
             app.bind_session_with(id, false); // transcript came from disk
             app.rail.live_id = Some(id.0.to_string());
-            app.status = format!("resumed {:.8}", id.0.to_string());
         }
         app
     }
 
     pub async fn run(mut self, terminal: &mut tui::Tui) -> anyhow::Result<()> {
+        // One-shot startup fetch of the model registry so the status row can
+        // show the daemon's current model BEFORE the first turn (chat.model()
+        // is None until TurnStarted; the picker fetch only runs on `/models`).
+        // Lives here, not App::new: construction stays pure and runtime-free.
+        {
+            let client = self.client.clone();
+            let tx = self.actions_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(r) = client.models().await {
+                    let _ = tx.send(Action::ModelsLoaded {
+                        current: r.current.model,
+                        entries: r.models,
+                    });
+                }
+            });
+        }
         let mut events = EventHandler::new(30.0, 60.0);
 
         {
@@ -496,10 +521,11 @@ impl App {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 loop {
                     match tokio::time::timeout(Duration::from_secs(3), client.health()).await {
-                        Ok(Ok(h)) => {
+                        Ok(Ok(_)) => {
                             if !healthy {
-                                let _ =
-                                    tx.send(Action::Status(format!("connected · {}", h.backend)));
+                                // Typed recovery: clears ONLY the daemon source;
+                                // no connected success text is rendered.
+                                let _ = tx.send(Action::HealthRecovered(HealthSource::Daemon));
                                 healthy = true;
                             }
                             tokio::time::sleep(Duration::from_secs(15)).await;
@@ -519,39 +545,34 @@ impl App {
                                     "autostart task panicked".into(),
                                 ),
                             );
-                            match outcome {
+                            // Typed degradation: the condition persists on the
+                            // daemon source until ITS probe recovers — notices
+                            // and SSE transitions can no longer overwrite it.
+                            let condition = match outcome {
                                 daemon_boot::AutostartOutcome::Started => {
-                                    let _ = tx.send(Action::Status(
-                                        "daemon offline — starting ocean-daemon…".into(),
-                                    ));
+                                    Some("daemon starting".to_string())
                                 }
                                 daemon_boot::AutostartOutcome::BinaryNotFound => {
-                                    let _ = tx.send(Action::Status(
-                                        "daemon offline — ocean-daemon not found (set OCEAN_DAEMON_BIN)"
-                                            .into(),
-                                    ));
+                                    Some("daemon binary not found".to_string())
                                 }
                                 daemon_boot::AutostartOutcome::SpawnFailed(_) => {
-                                    let _ = tx.send(Action::Status(
-                                        "daemon offline — autostart failed (see ~/.ocean/logs/daemon-autostart.log)"
-                                            .into(),
-                                    ));
+                                    Some("daemon autostart failed".to_string())
                                 }
-                                daemon_boot::AutostartOutcome::NotEligible => {
-                                    let _ = tx.send(Action::Status(format!(
-                                        "daemon offline at {} — retrying…",
-                                        daemon_boot::host_port(&base_url)
-                                    )));
-                                }
-                                daemon_boot::AutostartOutcome::RateLimited => {
-                                    // Keep current status — don't spam.
-                                }
+                                daemon_boot::AutostartOutcome::NotEligible => Some(format!(
+                                    "daemon offline at {}",
+                                    daemon_boot::host_port(&base_url)
+                                )),
+                                // Don't spam a fresh condition on every probe.
+                                daemon_boot::AutostartOutcome::RateLimited => None,
                                 daemon_boot::AutostartOutcome::SupervisionUnknown => {
-                                    let _ = tx.send(Action::Status(
-                                        "daemon offline — autostart blocked (UID unavailable)"
-                                            .into(),
-                                    ));
+                                    Some("daemon autostart blocked".to_string())
                                 }
+                            };
+                            if let Some(condition) = condition {
+                                let _ = tx.send(Action::HealthDegraded {
+                                    source: HealthSource::Daemon,
+                                    condition,
+                                });
                             }
                             tokio::time::sleep(Duration::from_secs(3)).await;
                         }
@@ -585,6 +606,11 @@ impl App {
                     }
                     if let Some(a) = self.editor.tick() {
                         self.dispatch(a);
+                        dirty = true;
+                    }
+                    // Notices are transient: past STATUS_TTL the bottom row
+                    // returns to its minimal (model-only) idle set.
+                    if self.expire_status(Instant::now()) {
                         dirty = true;
                     }
                     // Live-reflect files the agent (or the terminal) creates in
@@ -801,41 +827,9 @@ impl App {
                 }
                 _ => {}
             }
-            // Mouse text selection: holding the left button and dragging sweeps
-            // a linear (terminal-style) selection across the whole frame;
-            // releasing auto-copies it to the system clipboard. A plain click
-            // (down + up, no drag) falls through to the panes untouched.
-            match m.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    self.sel_press = Some(pos);
-                    self.selection = None;
-                }
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    if let Some(anchor) = self.sel_press {
-                        self.selection = Some((anchor, pos));
-                        return; // selection owns the drag; panes don't see it
-                    }
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    self.sel_press = None;
-                    if let Some((a, b)) = self.selection.take() {
-                        let text = selection_text(&self.frame_cells, a, b);
-                        if !text.is_empty() {
-                            let msg = match copy_to_clipboard(&text) {
-                                Ok(()) => {
-                                    format!("copied {} chars", text.chars().count())
-                                }
-                                Err(e) => format!("copy failed: {e}"),
-                            };
-                            self.dispatch(Action::Status(msg));
-                        }
-                        return; // this Up ends a selection, not a click
-                    }
-                }
-                _ => {}
-            }
-            // Title-bar buttons win over pane routing (CTRL's upper model).
-            if matches!(m.kind, MouseEventKind::Down(_)) {
+            // Title-bar buttons: a left click on a button fires it and stops —
+            // it must never arm a text selection or fall through to panes.
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                 if let Some(btn) = self
                     .buttons
                     .iter()
@@ -845,6 +839,57 @@ impl App {
                     self.press(btn);
                     return;
                 }
+            }
+            // Mouse text selection: holding the left button and dragging sweeps
+            // a linear (terminal-style) selection, but BOUND to the content
+            // pane where the Down landed — a sweep never crosses into a sibling
+            // lane. Releasing auto-copies the swept text. A plain click (down +
+            // up, no drag) falls through to the panes untouched.
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Arm only inside a content pane; a Down on a title/status/
+                    // breadcrumb row or a splitter arms nothing AND clears any
+                    // stale arm so an interrupted mouse sequence can't leak.
+                    self.selection = None;
+                    match self.pane_rect_at(pos) {
+                        Some(rect) => {
+                            self.sel_press = Some(pos);
+                            self.sel_rect = Some(rect);
+                        }
+                        None => {
+                            self.sel_press = None;
+                            self.sel_rect = None;
+                        }
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(anchor) = self.sel_press {
+                        if let Some(rect) = self.sel_rect {
+                            // Clamp the head INTO the pane so sweeping past a
+                            // border saturates at the lane edge.
+                            self.selection = Some((anchor, clamp_pos(pos, rect)));
+                        }
+                        return; // selection owns the drag; panes don't see it
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let sel = self.selection.take();
+                    let rect = self.sel_rect;
+                    self.sel_press = None;
+                    self.sel_rect = None;
+                    if let (Some((a, b)), Some(rect)) = (sel, rect) {
+                        let text = selection_text(&self.frame_cells, a, b, rect);
+                        // A selection of pure padding copies nothing (and must
+                        // not clobber the clipboard). Success is silent.
+                        if !text.is_empty() {
+                            if let Err(e) = copy_to_clipboard(&text) {
+                                self.dispatch(Action::Error(format!("copy failed: {e}")));
+                            }
+                        }
+                        return; // this Up ends a selection, not a click
+                    }
+                }
+                _ => {}
             }
             let target = if rect_has(self.r_sessions, pos) {
                 Some(Focus::Sessions)
@@ -925,10 +970,13 @@ impl App {
                         return self.focus_to(Focus::Center);
                     }
                     KeyCode::Char('6') => {
-                        if self.pty.is_active() {
-                            return self.focus_to(Focus::Term);
+                        // Create if needed and ALWAYS unhide — focusing an
+                        // invisible dock strands the keyboard.
+                        if !self.pty.is_active() {
+                            self.pty.open(&PathBuf::from(&self.workspace_root), "");
                         }
-                        return;
+                        self.show_term = true;
+                        return self.focus_to(Focus::Term);
                     }
                     // ⌃⌥↑ / ⌃⌥↓ — stretch / shrink the terminal dock.
                     KeyCode::Up => return self.resize_term(2),
@@ -980,8 +1028,66 @@ impl App {
         }
     }
 
+    fn cycle_focus(&mut self) {
+        let next = match self.focus {
+            Focus::Sessions => Focus::Center,
+            Focus::Center => {
+                if self.pty.is_active() {
+                    Focus::Term
+                } else {
+                    Focus::Tree
+                }
+            }
+            Focus::Term => Focus::Tree,
+            Focus::Tree => Focus::Sessions,
+        };
+        self.focus_to(next);
+    }
+
+    /// Record an ephemeral status notice and stamp it for expiry. Every writer
+    /// of `status` goes through here so the TTL clock always restarts.
+    fn set_notice(&mut self, s: String) {
+        self.status = s;
+        self.status_at = Instant::now();
+    }
+
+    /// Clear a notice older than [`STATUS_TTL`] as of `now`. Returns true when
+    /// the row changed and needs a repaint. Parametric in `now` so tests can
+    /// prove expiry without sleeping.
+    fn expire_status(&mut self, now: Instant) -> bool {
+        if !self.status.is_empty() && now.duration_since(self.status_at) >= STATUS_TTL {
+            self.status.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Snapshot the bottom row's inputs. The displayed model prefers the
+    /// operator's explicit selection (`/model <id>`, the `/models` picker) so
+    /// a pick shows instantly; the chat's turn-derived model is the fallback
+    /// until the next `TurnStarted` confirms it.
+    fn status_data(&self) -> StatusData<'_> {
+        StatusData {
+            model: self
+                .model_override
+                .as_deref()
+                .or(self.chat.model())
+                .or_else(|| {
+                    (!self.models_current.is_empty()).then_some(self.models_current.as_str())
+                }),
+            health: self.health.effective(),
+            error: Some(self.status.as_str()),
+            activity: self.chat.activity(),
+            git: Some(&self.git_status),
+            tok_per_s: self.chat.tok_per_s(),
+        }
+    }
+
     /// A title-bar button press: rails and the terminal TOGGLE visibility;
-    /// chat/editor/graph select the center surface (CTRL's editor↔graph swap).
+    /// chat/editor/graph select the center surface. Toggle semantics are the
+    /// buttons' contract — `Action::Navigate` (keys, `/` commands) always
+    /// SHOWS; the buttons flip.
     fn press(&mut self, btn: Btn) {
         match btn {
             Btn::Sessions => {
@@ -998,8 +1104,6 @@ impl App {
             }
             Btn::Term => {
                 if !self.pty.is_active() {
-                    // Like CTRL's ensure_terminal: first press opens a plain
-                    // shell at the project root.
                     self.pty.open(&PathBuf::from(&self.workspace_root), "");
                     self.show_term = true;
                     self.focus_to(Focus::Term);
@@ -1035,33 +1139,25 @@ impl App {
         }
     }
 
-    fn cycle_focus(&mut self) {
-        let next = match self.focus {
-            Focus::Sessions => Focus::Center,
-            Focus::Center => {
-                if self.pty.is_active() {
-                    Focus::Term
-                } else {
-                    Focus::Tree
-                }
-            }
-            Focus::Term => Focus::Tree,
-            Focus::Tree => Focus::Sessions,
-        };
-        self.focus_to(next);
-    }
-
     fn dispatch(&mut self, action: Action) {
         match &action {
             Action::Quit => {
                 self.should_quit = true;
                 return;
             }
-            Action::Status(s) => self.status = s.clone(),
-            Action::Error(s) => self.status = errfmt::humanize(s),
+            Action::Status(s) => self.set_notice(s.clone()),
+            Action::Error(s) => self.set_notice(errfmt::humanize(s)),
+            // Typed health: each source clears independently; the effective
+            // degraded condition renders in the bottom row while ANY source
+            // remains degraded. Recovery renders nothing.
+            Action::HealthDegraded { source, condition } => {
+                self.health.degrade(*source, condition.clone())
+            }
+            Action::HealthRecovered(source) => self.health.recover(*source),
             // Chat unwinds busy + restores the prompt (see its update arm);
             // the status line carries the humanized error.
-            Action::TurnSendFailed { err, .. } => self.status = errfmt::humanize(err),
+            Action::TurnSendFailed { err, .. } => self.set_notice(errfmt::humanize(err)),
+            Action::TurnOutcomeUnknown { err } => self.set_notice(errfmt::humanize(err)),
             Action::SessionBound(id) => self.bind_session(*id),
             // Session hygiene: only fold in agent events for the BOUND session.
             // A superseded stream's last envelopes (or an unscoped daemon echo)
@@ -1081,21 +1177,10 @@ impl App {
                     ..
                 } = evt.as_ref()
                 {
-                    self.status = errfmt::humanize(&format!(
-                        "⚠ {requested} unavailable — turn running on {effective} (fallback)"
+                    let msg = errfmt::humanize(&format!(
+                        "{requested} unavailable - running on {effective}"
                     ));
-                }
-                // Capture turn usage for the status-bar rate/token segments.
-                if let AgentTurnEvent::TurnFinished {
-                    tokens_per_second,
-                    output_tokens,
-                    ..
-                } = evt.as_ref()
-                {
-                    self.turn_tok_per_s = *tokens_per_second;
-                    if let Some(out) = output_tokens {
-                        self.session_tokens = self.session_tokens.saturating_add(*out);
-                    }
+                    self.set_notice(msg);
                 }
             }
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
@@ -1103,6 +1188,7 @@ impl App {
                 // Hydrate into the terminal DOCK (appears at the bottom of the
                 // center column, CTRL-style) and focus it.
                 self.pty.open(cwd, line);
+                self.show_term = true;
                 self.focus_to(Focus::Term);
             }
             Action::OpenFile(path) => {
@@ -1118,7 +1204,6 @@ impl App {
                 // Re-root the workbench to the dir this session ran in, so the
                 // file tree, graph, and future turns follow the session.
                 self.set_active_project(cwd.clone());
-                self.status = format!("resumed session {:.8}", id.0.to_string());
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
             }
@@ -1127,21 +1212,17 @@ impl App {
                 if let Some(task) = self.stream_task.take() {
                     task.abort();
                 }
+                // Intentional unbind: no stream will reconnect, so a stale
+                // degraded SSE reading must not persist forever.
+                self.health.recover(HealthSource::Sse);
                 self.session_id = None;
                 self.chat.load_history(Vec::new()); // clear the transcript
                 self.rail.live_id = None;
                 self.set_active_project(cwd.clone());
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
-                let leaf = cwd
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-                self.status = format!("new session · {leaf}");
             }
             Action::CycleFocus => self.cycle_focus(),
-            // `/` palette navigation — reuse the exact patterns from `press()`
-            // and the ⌃⌥ handler so keyboard and palette stay consistent.
             Action::Navigate(nav) => match *nav {
                 Nav::Sessions => {
                     self.show_sessions = true;
@@ -1177,8 +1258,10 @@ impl App {
                 Nav::Terminal => {
                     if !self.pty.is_active() {
                         self.pty.open(&PathBuf::from(&self.workspace_root), "");
-                        self.show_term = true;
                     }
+                    // ALWAYS unhide: `/terminal` after the dock was hidden in
+                    // settings must not focus an invisible pane.
+                    self.show_term = true;
                     self.focus_to(Focus::Term);
                 }
             },
@@ -1188,22 +1271,20 @@ impl App {
                 if let Some(task) = self.stream_task.take() {
                     task.abort();
                 }
+                // Intentional unbind: no stream will reconnect, so a stale
+                // degraded SSE reading must not persist forever.
+                self.health.recover(HealthSource::Sse);
                 self.session_id = None;
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
-                self.status = "new session".into();
             }
             // `/model <id>`: remember the override for subsequent turns.
-            Action::SetModel(id) => {
-                self.model_override = Some(id.clone());
-                self.status = format!("model → {id}");
-            }
+            Action::SetModel(id) => self.model_override = Some(id.clone()),
             // `/thinking <level>`: remember the override for subsequent turns.
             // `default` clears the per-turn override so the daemon's global
             // setting is in force again.
             Action::SetThinking(level) => {
                 self.thinking_override = *level;
-                self.status = format!("thinking → {}", thinking_label(self.thinking_override));
             }
             // `/models`: open the picker and fetch the live registry (with
             // readiness) off-thread — the overlay shows "loading…" until
@@ -1339,7 +1420,7 @@ impl App {
                 if abs.exists() {
                     self.image_view = Some(abs);
                 } else {
-                    self.status = format!("image not found: {}", abs.display());
+                    self.set_notice(format!("image not found: {}", abs.display()));
                 }
             }
             // `/login [claude|codex]`: run the REAL OAuth flow off-thread
@@ -1349,7 +1430,7 @@ impl App {
             // status instead of racing a second callback server.
             Action::Login(target) => {
                 if self.login_in_flight {
-                    self.status = "login already in progress".into();
+                    self.set_notice("login already in progress".into());
                 } else {
                     self.login_in_flight = true;
                     let tx = self.actions_tx.clone();
@@ -1399,7 +1480,7 @@ impl App {
             // `LoginDone` carrying the final message. Lands it in the status
             // line and clears the `login_in_flight` guard for the next attempt.
             Action::LoginDone(msg) => {
-                self.status = msg.clone();
+                self.set_notice(msg.clone());
                 self.login_in_flight = false;
                 // Auth-state changed — refresh the welcome provider line so the
                 // chat empty-state immediately reflects the new credentials.
@@ -1496,6 +1577,9 @@ impl App {
         if let Some(task) = self.stream_task.take() {
             task.abort();
         }
+        // The superseded stream's degraded state doesn't describe the fresh
+        // subscription below — start it from a neutral SSE source.
+        self.health.recover(HealthSource::Sse);
         self.session_id = Some(id);
         self.stream_task = Some(self.client.spawn_event_stream(
             id,
@@ -1621,19 +1705,14 @@ impl App {
             return;
         };
         if !entry.ready {
-            self.status = format!(
-                "{} has no credential — configure {} (env key or /login)",
+            self.set_notice(format!(
+                "{} has no credential ({})",
                 entry.id, entry.provider
-            );
+            ));
             return;
         }
         self.model_override = Some(entry.id.clone());
         self.models_open = false;
-        self.status = format!(
-            "model → {} · thinking {}",
-            entry.id,
-            thinking_label(self.thinking_override)
-        );
     }
 
     // ── /advisor picker ──────────────────────────────────────────────────────
@@ -1713,7 +1792,6 @@ impl App {
                 enabled: false,
                 model: None,
             });
-            self.status = "advisor off".into();
         } else {
             let models = self.advisor_models();
             let Some(entry) = models.get(self.advisor_sel - 1) else {
@@ -1724,7 +1802,6 @@ impl App {
                 enabled: true,
                 model: Some(id.clone()),
             });
-            self.status = format!("advisor → {id} (reviews after each turn)");
         }
         self.advisor_open = false;
     }
@@ -1754,7 +1831,7 @@ impl App {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} ADVISOR ", g("◆", "*")),
+                " ADVISOR ",
                 Style::default()
                     .fg(theme::CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -1799,7 +1876,7 @@ impl App {
                     } else {
                         "  "
                     },
-                    "off — no second opinion".to_string(),
+                    "off".to_string(),
                     String::new(),
                     if active { theme::FG } else { theme::COMMENT },
                 )
@@ -1835,16 +1912,6 @@ impl App {
             self.advisor_hit
                 .push((Rect::new(inner.x, ry, inner.width, 1), ri));
         }
-
-        let footer_y = inner.y + inner.height - 1;
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " reviews the exchange after each turn · ⏎ select · esc close",
-                Style::default().fg(theme::CYAN),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
-            Rect::new(inner.x, footer_y, inner.width, 1),
-        );
     }
 
     // ── /memory browser ──────────────────────────────────────────────────────
@@ -1874,11 +1941,8 @@ impl App {
             KeyCode::Enter => {
                 if let Some(m) = self.memory_filtered().get(self.memory_sel) {
                     let text = m.text.clone();
-                    match copy_to_clipboard(&text) {
-                        Ok(()) => {
-                            self.status = format!("copied memory ({} chars)", text.chars().count())
-                        }
-                        Err(e) => self.status = format!("copy failed: {e}"),
+                    if let Err(e) = copy_to_clipboard(&text) {
+                        self.set_notice(format!("copy failed: {e}"));
                     }
                 }
                 self.memory_open = false;
@@ -1930,7 +1994,7 @@ impl App {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} MEMORY · {count} ", g("◆", "*")),
+                format!(" MEMORY {count} "),
                 Style::default()
                     .fg(theme::CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -1970,7 +2034,7 @@ impl App {
         }
         if filtered.is_empty() {
             let msg = if count == 0 {
-                "no memories retained yet — the agent saves durable facts here"
+                "no memories retained yet"
             } else {
                 "no matches"
             };
@@ -2012,19 +2076,10 @@ impl App {
                 Rect::new(inner.x, ry, inner.width, 1),
             );
         }
-
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " type to search · ⏎ copy · esc close",
-                Style::default().fg(theme::CYAN),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
-            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
-        );
     }
 
     /// Render the `/image` viewer frame: a full-screen takeover with a title
-    /// bar (filename + close hint) and an empty body. The body rect is stored
+    /// bar (filename only) and an empty body. The body rect is stored
     /// in `image_body`; the actual pixels are drawn AFTER this frame paints, by
     /// the kitty emission in `run` (ratatui doesn't model the image layer). For
     /// a non-kitty terminal or a non-PNG file, a centered note fills the body
@@ -2044,15 +2099,12 @@ impl App {
             .unwrap_or_else(|| path.display().to_string());
         // Title bar.
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("  {} {name}", g("🖼", "[img]")),
-                    Style::default()
-                        .fg(theme::CYAN)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("   esc close", Style::default().fg(theme::COMMENT)),
-            ]))
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("  {name}"),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            )]))
             .style(Style::default().bg(theme::BG_DARK)),
             Rect::new(full.x, full.y, full.width, 1),
         );
@@ -2069,7 +2121,7 @@ impl App {
         let note = if !kitty::supported() {
             Some("image preview needs a kitty-graphics terminal (kitty/ghostty/wezterm)")
         } else if !kitty::is_png(&path) {
-            Some("inline preview supports PNG today — open other formats externally")
+            Some("inline preview supports PNG only")
         } else {
             None
         };
@@ -2102,7 +2154,7 @@ impl App {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} LANGUAGE SERVERS ", g("◆", "*")),
+                " LANGUAGE SERVERS ",
                 Style::default()
                     .fg(theme::CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -2148,7 +2200,7 @@ impl App {
                 let exts = if s.extensions.is_empty() {
                     String::new()
                 } else {
-                    format!("  ·{}", s.extensions.join(" ·"))
+                    format!("  {}", s.extensions.join(" "))
                 };
                 let name_w = 26usize;
                 let name = format!("{:<name_w$}", truncate_str(&s.name, name_w));
@@ -2168,15 +2220,6 @@ impl App {
                 y += 1;
             }
         }
-
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " diagnostics: ask the agent (its lsp tool) · esc close",
-                Style::default().fg(theme::CYAN),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
-            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
-        );
     }
 
     /// Render the `/models` picker: a centered modal listing the daemon's live
@@ -2197,7 +2240,7 @@ impl App {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} MODELS ", g("◆", "*")),
+                " MODELS ",
                 Style::default()
                     .fg(theme::CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -2264,7 +2307,7 @@ impl App {
                     } else {
                         Style::default().fg(theme::COMMENT)
                     };
-                    let tag = if ready { "" } else { " · no credential" };
+                    let tag = if ready { "" } else { " (no credential)" };
                     frame.render_widget(
                         Paragraph::new(Span::styled(format!("{prov}{tag}"), style))
                             .style(Style::default().bg(theme::SLATE)),
@@ -2306,14 +2349,10 @@ impl App {
             }
         }
 
-        // Footer: the thinking-level control + key hints.
+        // Footer: the thinking-level state — functional context only, no
+        // printed key hints.
         let footer_y = inner.y + inner.height - 1;
-        let footer = format!(
-            " {} thinking: {} {}  ·  ⏎ select · esc close",
-            g("◂", "<"),
-            thinking_label(self.thinking_override),
-            g("▸", ">"),
-        );
+        let footer = format!(" thinking: {}", thinking_label(self.thinking_override));
         frame.render_widget(
             Paragraph::new(Span::styled(footer, Style::default().fg(theme::CYAN)))
                 .style(Style::default().bg(theme::SLATE)),
@@ -2351,15 +2390,13 @@ impl App {
             .iter()
             .filter(|r| r.status != "not configured")
             .count();
+        // Terse configuration condition ONLY when nothing is configured.
+        // Configured credentials are never claimed as runtime readiness
+        // (`ready · N providers` was a false health signal).
         self.chat.welcome_provider_line = if n_configured == 0 {
-            Some("no providers connected yet — start with /login".into())
+            Some("provider configuration required".into())
         } else {
-            let noun = if n_configured == 1 {
-                "provider"
-            } else {
-                "providers"
-            };
-            Some(format!("ready · {n_configured} {noun} configured"))
+            None
         };
     }
 
@@ -2379,8 +2416,11 @@ impl App {
                         let key = buffer.clone();
                         match ocean_oauth::store_api_key(&block_key, &key, None) {
                             Ok(path) => {
-                                self.status =
-                                    format!("{} key saved to {}", block_key, path.display());
+                                self.set_notice(format!(
+                                    "{} key saved to {}",
+                                    block_key,
+                                    path.display()
+                                ));
                                 self.providers_mode = ProvidersMode::List;
                                 // Refresh only the saved row's status in place.
                                 if let Some(row) = self
@@ -2402,7 +2442,7 @@ impl App {
                                 // update immediately — no restart needed.
                                 self.refresh_welcome_provider_line();
                             }
-                            Err(e) => self.status = format!("save failed: {e}"),
+                            Err(e) => self.set_notice(format!("save failed: {e}")),
                         }
                     }
                     KeyCode::Backspace => {
@@ -2479,7 +2519,7 @@ impl App {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} PROVIDERS ", g("◆", "*")),
+                " PROVIDERS ",
                 Style::default()
                     .fg(theme::CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -2515,19 +2555,6 @@ impl App {
                     ))
                     .style(Style::default().bg(theme::BG_HL)),
                     Rect::new(inner.x, inner.y + 2, inner.width, 1),
-                );
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        format!(" {} save · esc cancel", g("⏎", "<enter>")),
-                        Style::default().fg(theme::COMMENT),
-                    ))
-                    .style(Style::default().bg(theme::SLATE)),
-                    Rect::new(
-                        inner.x,
-                        inner.y + inner.height.saturating_sub(1),
-                        inner.width,
-                        1,
-                    ),
                 );
             }
             ProvidersMode::List => {
@@ -2566,17 +2593,6 @@ impl App {
                         Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
                     );
                 }
-                let footer = format!(" {} move · ⏎ login / paste key · esc close", g("↑↓", "^v"));
-                frame.render_widget(
-                    Paragraph::new(Span::styled(footer, Style::default().fg(theme::COMMENT)))
-                        .style(Style::default().bg(theme::SLATE)),
-                    Rect::new(
-                        inner.x,
-                        inner.y + inner.height.saturating_sub(1),
-                        inner.width,
-                        1,
-                    ),
-                );
             }
         }
     }
@@ -2599,7 +2615,7 @@ impl App {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} SETTINGS ", g("◆", "*")),
+                " SETTINGS ",
                 Style::default()
                     .fg(theme::CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -2630,7 +2646,7 @@ impl App {
             (
                 "terminal height".into(),
                 Span::styled(
-                    format!("{} {} rows {}", g("◂", "<"), self.term_h, g("▸", ">")),
+                    format!("{} rows", self.term_h),
                     Style::default().fg(theme::CYAN),
                 ),
             ),
@@ -2697,24 +2713,6 @@ impl App {
                 Rect::new(inner.x, yy, inner.width, 1),
             );
         }
-        // Footer hints on the last row.
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!(
-                    " {} move · ⏎ toggle · {} height · esc close",
-                    g("↑↓", "^v"),
-                    g("◂▸", "<>")
-                ),
-                Style::default().fg(theme::COMMENT),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
-            Rect::new(
-                inner.x,
-                inner.y + inner.height.saturating_sub(1),
-                inner.width,
-                1,
-            ),
-        );
     }
 
     /// Grow (+) or shrink (−) the terminal dock by `delta` rows, clamped so the
@@ -2722,6 +2720,21 @@ impl App {
     fn resize_term(&mut self, delta: i16) {
         let max = max_term_h(self.r_center_col.height) as i16;
         self.term_h = (self.term_h as i16 + delta).clamp(MIN_TERM_H as i16, max) as u16;
+    }
+
+    /// Innermost content-pane rect containing `pos`, or `None` when the point
+    /// is on a title/status/breadcrumb row, a splitter, or outside every pane.
+    /// Used to arm pane-scoped text selection: a `Down` outside any content
+    /// pane arms nothing (and lets the click fall through to buttons/splitter
+    /// grabs). The four content rects are pairwise disjoint, so order is only
+    /// by routing precedence.
+    fn pane_rect_at(&self, pos: (u16, u16)) -> Option<Rect> {
+        for r in [self.r_sessions, self.r_tree, self.r_term, self.r_center] {
+            if rect_has(r, pos) {
+                return Some(r);
+            }
+        }
+        None
     }
 
     fn apply_focus(&mut self) {
@@ -2753,14 +2766,13 @@ impl App {
 
         tokio::spawn(async move {
             // Both the session mint and the turn POST ride the daemon-blip
-            // retry (connect-class failures only — a restart mid-prompt used to
-            // surface a hard "error sending request" wall and eat the prompt).
-            // Each retry narrates in the status line; final failure unwinds the
-            // chat's busy state and RESTORES the prompt via TurnSendFailed.
+            // retry for definitely-unsent connect failures. Turn submission has
+            // no whole-request timeout; after connection, an interrupted result
+            // is outcome-unknown and MUST NOT restore/replay the prompt.
             let retry_status = |what: &'static str, tx: mpsc::UnboundedSender<Action>| {
                 move |attempt: usize, total: usize| {
                     let _ = tx.send(Action::Status(format!(
-                        "daemon unreachable — retrying {what} ({attempt}/{total})…"
+                        "daemon unreachable - retrying {what} {attempt}/{total}"
                     )));
                 }
             };
@@ -2806,11 +2818,15 @@ impl App {
                 advisor,
             };
             let on_retry = retry_status("turn", tx.clone());
-            if let Err(e) = client.agent_turn_retrying(&req, on_retry).await {
-                let _ = tx.send(Action::TurnSendFailed {
-                    prompt,
-                    err: format!("turn: {e}"),
-                });
+            if let Err(error) = client.agent_turn_retrying(&req, on_retry).await {
+                let err = format!("turn: {error}");
+                let action = match error {
+                    TurnSubmitError::DefinitelyUnsent(_) | TurnSubmitError::Rejected(_) => {
+                        Action::TurnSendFailed { prompt, err }
+                    }
+                    TurnSubmitError::OutcomeUnknown(_) => Action::TurnOutcomeUnknown { err },
+                };
+                let _ = tx.send(action);
             }
         });
     }
@@ -2821,7 +2837,7 @@ impl App {
         let full = frame.area();
         if full.width < 40 || full.height < 8 {
             frame.render_widget(
-                Paragraph::new("ocean: window too small — enlarge the terminal")
+                Paragraph::new("window too small")
                     .style(Style::default().fg(theme::YELLOW).bg(theme::BG_DARK)),
                 full,
             );
@@ -2889,14 +2905,15 @@ impl App {
         // deep chrome first
         frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), full);
 
-        // breadcrumb: where the center surface is pointed (CTRL's crumb row).
+        // breadcrumb: ONLY detail beyond the title — the editor's full path or
+        // the bound chat session id. Otherwise the reserved row stays blank.
         let crumb = match self.center {
-            Center::Chat => match &self.session_id {
-                Some(id) => format!(" chat {} {:.8}", g("›", ">"), id.0.to_string()),
-                None => " chat › new session".to_string(),
-            },
-            Center::Editor => format!(" editor {} {}", g("›", ">"), self.editor.crumb()),
-            Center::Graph => " graph › project constellation".to_string(),
+            Center::Chat => self
+                .session_id
+                .map(|id| format!(" {:.8}", id.0.to_string()))
+                .unwrap_or_default(),
+            Center::Editor => format!(" {}", self.editor.crumb()),
+            Center::Graph => String::new(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(crumb, Style::default().fg(theme::COMMENT)))
@@ -2930,31 +2947,33 @@ impl App {
         // the frame's cell text so releasing the button copies exactly what's
         // on screen. Drawn over everything — a selection is a selection.
         if let Some((a, b)) = self.selection {
-            let buf = frame.buffer_mut();
-            let area = buf.area;
-            self.frame_cells = (area.top()..area.bottom())
-                .map(|y| {
-                    (area.left()..area.right())
-                        .map(|x| {
-                            buf.cell((x, y))
-                                .map(|c| c.symbol().to_string())
-                                .unwrap_or_default()
-                        })
-                        .collect()
-                })
-                .collect();
-            let (s, e) = order_cells(a, b);
-            for y in s.1..=e.1.min(area.bottom().saturating_sub(1)) {
-                let x0 = if y == s.1 { s.0 } else { area.left() };
-                let x1 = if y == e.1 {
-                    e.0.min(area.right().saturating_sub(1))
-                } else {
-                    area.right().saturating_sub(1)
-                };
-                for x in x0..=x1 {
-                    if let Some(cell) = buf.cell_mut((x, y)) {
-                        let style = cell.style().add_modifier(Modifier::REVERSED);
-                        cell.set_style(style);
+            if let Some(rect) = self.sel_rect {
+                let buf = frame.buffer_mut();
+                let area = buf.area;
+                self.frame_cells = (area.top()..area.bottom())
+                    .map(|y| {
+                        (area.left()..area.right())
+                            .map(|x| {
+                                buf.cell((x, y))
+                                    .map(|c| c.symbol().to_string())
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    })
+                    .collect();
+                // Highlight is bounded to the pane's columns/rows: middle rows
+                // span the rect width (never the whole frame), endpoints clamp
+                // to the rect edges — identical span to `selection_text`.
+                if let Some(sp) = bounded_span(a, b, rect) {
+                    for y in sp.y0..=sp.y1 {
+                        let x0 = if y == sp.y0 { sp.first_x0 } else { sp.left };
+                        let x1 = if y == sp.y1 { sp.last_x1 } else { sp.right };
+                        for x in x0..=x1 {
+                            if let Some(cell) = buf.cell_mut((x, y)) {
+                                let style = cell.style().add_modifier(Modifier::REVERSED);
+                                cell.set_style(style);
+                            }
+                        }
                     }
                 }
             }
@@ -2987,60 +3006,65 @@ impl App {
         }
     }
 
-    /// CTRL's title row: project label left, status pill center, and the
-    /// clickable icon toggles right — each lit in its color when its panel is
-    /// on. This IS the primary way to drive the app; hotkeys are secondary.
-    fn draw_title(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.buttons.clear();
+    /// Title row: project identity — workspace basename › current surface.
+    /// Controls live on the BOTTOM row (buttons render in `draw_status`),
+    /// keeping the mouse near the prompt box.
+    fn draw_title(&self, frame: &mut ratatui::Frame, area: Rect) {
         frame.render_widget(
             Block::default().style(Style::default().bg(theme::BG_DARK)),
             area,
         );
-
-        // project label, CTRL-style (blue bold + chevron)
         let name = std::path::Path::new(&self.workspace_root)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "ocean".into());
-        let proj = format!("  {} OCEAN · {} ", g("◇", "*"), name);
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                proj.clone(),
+        let surface = match self.center {
+            Center::Chat => "chat",
+            Center::Editor => "editor",
+            Center::Graph => "graph",
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!("  {name}"),
                 Style::default()
-                    .fg(theme::BLUE)
+                    .fg(theme::FG)
                     .bg(theme::BG_DARK)
                     .add_modifier(Modifier::BOLD),
-            )),
-            Rect::new(
-                area.x,
-                area.y,
-                (proj.chars().count() as u16).min(area.width),
-                1,
             ),
-        );
+            Span::styled(
+                format!(" {} ", g("›", ">")),
+                Style::default().fg(theme::EDGE).bg(theme::BG_DARK),
+            ),
+            Span::styled(
+                surface,
+                Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
 
-        // centered status pill
-        let pill = format!(" {} ", self.status);
-        let pillw = (pill.chars().count() as u16).min(area.width / 2);
-        let px = area.x + (area.width.saturating_sub(pillw)) / 2;
+    /// Bottom row — the control + info bar (mouse-first: closest to the
+    /// prompt). Left: the six nav buttons, lit while active. Right of them:
+    /// model · branch · health/error · activity · tok/s, built pure and
+    /// width-aware in `status::segments` (survival ranks live there). The
+    /// buttons fill `self.buttons` for click routing; geometry uses DISPLAY
+    /// width, never scalar counts, so hit rects match painted glyphs.
+    fn draw_status(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        use unicode_width::UnicodeWidthStr as UW;
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                pill,
-                Style::default().fg(theme::CYAN).bg(theme::BG_HL),
-            )),
-            Rect::new(px, area.y, pillw, 1),
+            Block::default().style(Style::default().bg(theme::BG_DARK)),
+            area,
         );
-
-        // right: icon buttons — CTRL's ⊞/⟠/⊟/◨ plus the center surfaces.
+        self.buttons.clear();
         let items: Vec<(&str, Btn, bool, ratatui::style::Color)> = vec![
             (
-                g("⊞", "[S]"),
+                g("≡", "[S]"),
                 Btn::Sessions,
                 self.show_sessions,
                 theme::BLUE,
             ),
             (
-                g("❯", "[C]"),
+                g("◒", "[C]"),
                 Btn::Chat,
                 self.center == Center::Chat,
                 theme::CYAN,
@@ -3065,14 +3089,13 @@ impl App {
             ),
             (g("◨", "[E]"), Btn::Tree, self.show_tree, theme::CYAN),
         ];
-        let total: u16 = items
-            .iter()
-            .map(|(s, ..)| s.chars().count() as u16 + 2)
-            .sum::<u16>()
-            + 2;
-        let mut x = area.x + area.width.saturating_sub(total);
+        let right = area.x + area.width;
+        let mut x = area.x + 1;
         for (icon, btn, on, color) in items {
-            let w = icon.chars().count() as u16;
+            let w = (UW::width(icon).max(1)) as u16;
+            if x + w > right {
+                break; // pathological width: never paint past the row
+            }
             let fg = if on { color } else { theme::COMMENT };
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -3081,89 +3104,37 @@ impl App {
                 )),
                 Rect::new(x, area.y, w, 1),
             );
-            // generous hit target: icon + trailing gap
+            // Generous hit target: icon + trailing gap.
             self.buttons.push((Rect::new(x, area.y, w + 2, 1), btn));
             x += w + 2;
         }
-    }
+        let strip_w = (x + 1).saturating_sub(area.x); // gap before the info run
 
-    fn draw_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        // Composable dashboard segments (OMP Slice 4): focus · model · git ·
-        // rate · tokens · session · advisor · message. Built pure in
-        // `status::segments`; rendered here with theme colours and ` · `
-        // separators. The keybind hint pins to the right.
-        let focus_name = match self.focus {
-            Focus::Sessions => "sessions",
-            Focus::Tree => "files",
-            Focus::Term => "terminal",
-            Focus::Center => match self.center {
-                Center::Chat => "chat",
-                Center::Editor => "editor",
-                Center::Graph => "graph",
-            },
-        };
-        let advisor = self.advisor_ctl.as_ref().map(|c| {
-            if c.enabled {
-                c.model.as_deref().unwrap_or("on")
-            } else {
-                "off"
-            }
-        });
-        let session = self.session_id.map(|id| {
-            let s = id.0.to_string();
-            s.chars().take(8).collect::<String>()
-        });
-        let data = StatusData {
-            focus: focus_name,
-            model: self.chat.model(),
-            git: Some(&self.git_status),
-            tok_per_s: self.turn_tok_per_s,
-            session_tokens: self.session_tokens,
-            session: session.as_deref(),
-            advisor,
-            message: &self.status,
-        };
-
+        let data = self.status_data();
         let tone_color = |t: Tone| match t {
-            Tone::Focus => theme::CYAN,
             Tone::Primary => theme::FG,
             Tone::Muted => theme::COMMENT,
-            Tone::Ok => theme::GREEN,
             Tone::Warn => theme::YELLOW,
         };
+        let seg_budget = area.width.saturating_sub(strip_w) as usize;
         let mut spans: Vec<Span> = Vec::new();
-        for (i, seg) in status::segments(&data).into_iter().enumerate() {
-            if seg.tone == Tone::Focus {
-                // Focus chip: accent bed, bold.
-                spans.push(Span::styled(
-                    chat::sanitize_line(&seg.text),
-                    Style::default()
-                        .fg(theme::CYAN)
-                        .bg(theme::BG_HL)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    if i == 1 { "  " } else { " · " },
-                    Style::default().fg(theme::EDGE),
-                ));
-                spans.push(Span::styled(
-                    chat::sanitize_line(&seg.text),
-                    Style::default().fg(tone_color(seg.tone)),
-                ));
-            }
+        let segs = status::segments(&data, seg_budget);
+        for (i, seg) in segs.into_iter().enumerate() {
+            spans.push(Span::styled(
+                if i == 0 { " " } else { "  " },
+                Style::default().fg(theme::EDGE),
+            ));
+            spans.push(Span::styled(
+                seg.text,
+                Style::default().fg(tone_color(seg.tone)),
+            ));
         }
-        let hint = " ⇥ move · ⌃Q quit ";
-        // Right-pin the hint: pad between the segments and the hint.
-        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let pad = (area.width as usize).saturating_sub(used + hint.chars().count());
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(hint, Style::default().fg(theme::COMMENT)));
-
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
-            area,
-        );
+        if area.width > strip_w {
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_DARK)),
+                Rect::new(area.x + strip_w, area.y, area.width - strip_w, 1),
+            );
+        }
     }
 }
 
@@ -3272,15 +3243,81 @@ fn order_cells(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
     }
 }
 
-/// Extract the text of a linear (terminal-style) selection from a frame's cell
-/// snapshot: first row from the anchor column, middle rows whole, last row up
-/// to the head column. Rows are right-trimmed (panel padding isn't content);
-/// a selection of pure padding yields the empty string so releasing on a blank
-/// area copies nothing.
-fn selection_text(cells: &[Vec<String>], a: (u16, u16), b: (u16, u16)) -> String {
+/// Inclusive row/column span of a pane-bound selection. The ordered endpoints
+/// are clamped into `rect`'s row range, and every row's columns are restricted
+/// to `rect`. The first row's start column comes from the (rect-clamped) anchor
+/// only when the anchor row is inside the rect; otherwise that boundary row
+/// reads as a full-width continuation (anchor sat above the pane). Symmetric
+/// for the head/last row. Shared by the overlay painter and `selection_text`
+/// so the highlighted region and the copied text always agree.
+struct SelSpan {
+    /// First included row (inclusive).
+    y0: u16,
+    /// Last included row (inclusive).
+    y1: u16,
+    /// Start column on the first included row.
+    first_x0: u16,
+    /// End column on the last included row.
+    last_x1: u16,
+    /// Rect left column (start of middle/last rows).
+    left: u16,
+    /// Rect right column, inclusive (end of first/middle rows).
+    right: u16,
+}
+
+/// Derive the bounded span of a selection inside `rect`. Returns `None` for a
+/// zero-area rect or when the ordered endpoints don't overlap it vertically.
+fn bounded_span(a: (u16, u16), b: (u16, u16), rect: Rect) -> Option<SelSpan> {
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
     let (s, e) = order_cells(a, b);
+    let top = rect.y;
+    let bottom = rect.bottom().saturating_sub(1);
+    let left = rect.x;
+    let right = rect.right().saturating_sub(1);
+    let y0 = s.1.clamp(top, bottom);
+    let y1 = e.1.clamp(top, bottom);
+    if y0 > y1 {
+        return None;
+    }
+    let anchor_in = (s.1 >= top) && (s.1 <= bottom);
+    let head_in = (e.1 >= top) && (e.1 <= bottom);
+    let first_x0 = if anchor_in { s.0.max(left) } else { left };
+    let last_x1 = if head_in { e.0.min(right) } else { right };
+    Some(SelSpan {
+        y0,
+        y1,
+        first_x0,
+        last_x1,
+        left,
+        right,
+    })
+}
+
+/// Clamp a screen position into `rect`'s inclusive bounds — a drag head swept
+/// past a pane border saturates at the lane edge.
+fn clamp_pos(pos: (u16, u16), rect: Rect) -> (u16, u16) {
+    let x = pos.0.clamp(rect.x, rect.right().saturating_sub(1));
+    let y = pos.1.clamp(rect.y, rect.bottom().saturating_sub(1));
+    (x, y)
+}
+
+/// Extract the text of a linear (terminal-style) selection from a frame's cell
+/// snapshot, BOUND to `rect`: first row from the anchor column to the rect's
+/// right edge, middle rows spanning the rect's full width, last row from the
+/// rect's left edge to the head column. Cells outside the rect's columns are
+/// never read, so a sweep inside one lane can't copy a sibling lane's text.
+/// Rows are right-trimmed (panel padding isn't content); a selection of pure
+/// padding yields the empty string so releasing on a blank area copies nothing.
+fn selection_text(cells: &[Vec<String>], a: (u16, u16), b: (u16, u16), rect: Rect) -> String {
+    let Some(sp) = bounded_span(a, b, rect) else {
+        return String::new();
+    };
     let mut out: Vec<String> = Vec::new();
-    for y in s.1..=e.1 {
+    for y in sp.y0..=sp.y1 {
+        let x0 = (if y == sp.y0 { sp.first_x0 } else { sp.left }) as usize;
+        let x_end = (if y == sp.y1 { sp.last_x1 } else { sp.right }) as usize;
         let Some(row) = cells.get(y as usize) else {
             continue;
         };
@@ -3288,12 +3325,7 @@ fn selection_text(cells: &[Vec<String>], a: (u16, u16), b: (u16, u16)) -> String
             out.push(String::new());
             continue;
         }
-        let x0 = if y == s.1 { s.0 as usize } else { 0 };
-        let x1 = if y == e.1 {
-            (e.0 as usize).min(row.len() - 1)
-        } else {
-            row.len() - 1
-        };
+        let x1 = x_end.min(row.len().saturating_sub(1));
         if x0 > x1 || x0 >= row.len() {
             out.push(String::new());
             continue;
@@ -3350,23 +3382,143 @@ mod tests {
     #[test]
     fn selection_text_is_linear_like_a_terminal() {
         let cells = grid(&["hello world", "second line", "tail row   "]);
-        // Mid-first-row through mid-last-row: first row from anchor, middle
-        // whole, last row up to the head. Trailing padding trimmed.
-        let text = selection_text(&cells, (6, 0), (3, 2));
+        // Full-frame rect keeps the legacy terminal-style semantics: mid-first
+        // row through mid-last row, first row from anchor, middle whole, last
+        // row up to the head. Trailing padding trimmed.
+        let full = Rect::new(0, 0, 11, 3);
+        let text = selection_text(&cells, (6, 0), (3, 2), full);
         assert_eq!(text, "world\nsecond line\ntail");
         // Same-row span.
-        assert_eq!(selection_text(&cells, (0, 1), (5, 1)), "second");
+        assert_eq!(selection_text(&cells, (0, 1), (5, 1), full), "second");
         // Reverse drag selects the same text.
         assert_eq!(
-            selection_text(&cells, (3, 2), (6, 0)),
-            selection_text(&cells, (6, 0), (3, 2)),
+            selection_text(&cells, (3, 2), (6, 0), full),
+            selection_text(&cells, (6, 0), (3, 2), full),
         );
     }
 
     #[test]
     fn selection_of_pure_padding_copies_nothing() {
         let cells = grid(&["          ", "          "]);
-        assert_eq!(selection_text(&cells, (1, 0), (8, 1)), "");
+        let full = Rect::new(0, 0, 10, 2);
+        assert_eq!(selection_text(&cells, (1, 0), (8, 1), full), "");
+    }
+
+    #[test]
+    fn selection_text_never_crosses_into_a_sibling_lane() {
+        // Left rail sentinel "L", pane content, right rail sentinel "R". With
+        // the OLD whole-width selection_text the middle row would copy the full
+        // frame ("LLLworldRRR"); the pane-bounded rect must yield only the
+        // middle band across all three rows.
+        let cells = grid(&["LLLhelloRRR", "LLLworldRRR", "LLLthereRRR"]);
+        // Pane occupies columns 3..=7 (x=3, width=5), all three rows.
+        let pane = Rect::new(3, 0, 5, 3);
+        assert_eq!(
+            selection_text(&cells, (3, 0), (7, 2), pane),
+            "hello\nworld\nthere",
+        );
+        // Reverse drag over the same grid selects identical text.
+        assert_eq!(
+            selection_text(&cells, (7, 2), (3, 0), pane),
+            selection_text(&cells, (3, 0), (7, 2), pane),
+        );
+    }
+
+    #[test]
+    fn selection_text_clamps_a_head_dragged_past_the_pane_edge() {
+        let cells = grid(&["LLLhelloRRR", "LLLworldRRR", "LLLthereRRR"]);
+        let pane = Rect::new(3, 0, 5, 3);
+        // Head far past the pane's bottom-right corner saturates at the edges.
+        assert_eq!(
+            selection_text(&cells, (4, 0), (50, 50), pane),
+            "ello\nworld\nthere",
+        );
+        // An endpoint dragged to a column left of the pane saturates at the
+        // left edge — the rail sentinel at column 0 never leaks into the copy.
+        assert_eq!(
+            selection_text(&cells, (0, 0), (6, 2), pane),
+            "hello\nworld\nther",
+        );
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> CrosstermEvent {
+        CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn drag_past_a_pane_edge_clamps_the_head_into_the_rect() {
+        let mut app = offline_app();
+        render_app_to_string(&mut app, 100, 28);
+        let center = app.r_center;
+        assert!(
+            center.width > 4 && center.height > 4,
+            "chat pane must render with room"
+        );
+        let anchor = (center.x + 2, center.y + 1);
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            anchor.0,
+            anchor.1,
+        ));
+        assert_eq!(app.sel_rect, Some(center), "Down arms the chat pane rect");
+        // Drag far past the pane's bottom-right corner, into the tree lane.
+        app.on_crossterm(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            center.right() + 20,
+            center.bottom() + 20,
+        ));
+        let (a, h) = app
+            .selection
+            .expect("drag promoted the arm to a live selection");
+        assert_eq!(a, anchor, "anchor preserved across the drag");
+        assert_eq!(
+            h,
+            (center.right() - 1, center.bottom() - 1),
+            "head saturates at the pane edges, never crossing into a sibling lane"
+        );
+    }
+
+    #[test]
+    fn down_on_title_or_splitter_arms_no_selection() {
+        let mut app = offline_app();
+        render_app_to_string(&mut app, 100, 28);
+        let center = app.r_center;
+        // Arm a selection inside the chat first…
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            center.x + 2,
+            center.y + 1,
+        ));
+        assert!(
+            app.sel_press.is_some() && app.sel_rect.is_some(),
+            "chat Down arms a selection"
+        );
+        // …then a Down on the title row (row 0, button-free at column 0) must
+        // clear the stale arm and arm nothing, so the click falls through.
+        app.on_crossterm(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        assert!(
+            app.sel_press.is_none() && app.sel_rect.is_none(),
+            "title-row Down arms nothing and clears any prior arm"
+        );
+        // The dock splitter isn't drawn (pty inactive), so synthesize one: a
+        // Down there must grab the splitter (dragging_term) and arm nothing.
+        app.r_split_term = Rect::new(center.x, center.bottom(), center.width, 1);
+        let sp = app.r_split_term;
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            sp.x + 1,
+            sp.y,
+        ));
+        assert!(app.dragging_term, "splitter grab preserved");
+        assert!(
+            app.sel_press.is_none() && app.sel_rect.is_none(),
+            "splitter Down arms no selection"
+        );
     }
 
     fn entry(id: &str, provider: &str, ready: bool) -> ModelEntry {
@@ -3473,6 +3625,63 @@ mod tests {
         };
         assert_eq!(buffer, "sk-live-123", "printable chars land, newline drops");
         assert!(app.providers_open, "popup stays open");
+    }
+
+    #[test]
+    fn bottom_bar_composes_buttons_plus_model_and_clicks_route() {
+        for width in [40u16, 80, 120] {
+            let mut app = offline_app();
+            app.models_current = "claude-x".into();
+            let screen = render_app_to_string(&mut app, width, 12);
+            let status_row = screen.lines().last().expect("status row");
+            assert!(
+                status_row.contains("claude-x"),
+                "model survives the composed bar at {width} cols: {status_row:?}"
+            );
+            assert_eq!(
+                app.buttons.len(),
+                6,
+                "all six buttons hit-testable at {width} cols"
+            );
+            assert!(
+                app.buttons
+                    .iter()
+                    .all(|(r, _)| r.y == 11 && r.x + r.width <= width),
+                "button hit rects stay inside the bottom row at {width} cols"
+            );
+            // The user's acceptance criterion is the MOUSE: click the first
+            // (sessions) and last (files) buttons at their rect centers and
+            // prove the toggles fire through the real event path.
+            let click = |app: &mut App, r: Rect| {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    app.on_crossterm(CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+                        kind,
+                        column: r.x + r.width / 2,
+                        row: r.y,
+                        modifiers: crossterm::event::KeyModifiers::NONE,
+                    }));
+                }
+            };
+            let first = app.buttons.first().expect("sessions button").0;
+            let last = app.buttons.last().expect("files button").0;
+            assert!(
+                app.show_sessions && app.show_tree,
+                "fresh app shows both rails"
+            );
+            click(&mut app, first);
+            assert!(
+                !app.show_sessions,
+                "clicking the sessions button hides the rail at {width} cols"
+            );
+            click(&mut app, last);
+            assert!(
+                !app.show_tree,
+                "clicking the files button hides the tree at {width} cols"
+            );
+        }
     }
 
     fn render_app_to_string(app: &mut App, width: u16, height: u16) -> String {
@@ -3590,19 +3799,89 @@ mod tests {
     }
 
     #[test]
-    fn refresh_provider_line_updates_chat_field() {
-        // refresh_welcome_provider_line must set chat.welcome_provider_line
-        // from the current auth state (provider rows computed fresh each call).
+    fn refresh_provider_line_is_condition_only_never_ready_count() {
+        // The welcome line is a terse configuration condition ONLY when zero
+        // providers are configured — configured credentials must never be
+        // rendered as a `ready · N providers` runtime-health claim.
         let mut app = offline_app();
         app.refresh_welcome_provider_line();
         let after = app.chat.welcome_provider_line.clone();
-        // Verify it's set (Some) — the exact string depends on the test
-        // environment's auth file state, which may or may not have providers
-        // configured. The key property: refresh doesn't clear it.
-        assert!(after.is_some(), "welcome line should be Some after refresh");
+        match &after {
+            None => {} // providers configured in this environment: no line
+            Some(line) => assert_eq!(line, "provider configuration required"),
+        }
         // And it produces consistent output for the same state.
         app.refresh_welcome_provider_line();
         assert_eq!(app.chat.welcome_provider_line, after, "idempotent");
+    }
+
+    // ── typed health ────────────────────────────────────────────────────────
+
+    #[test]
+    fn health_sources_clear_independently_through_dispatch() {
+        let mut app = offline_app();
+        app.dispatch(Action::HealthDegraded {
+            source: HealthSource::Daemon,
+            condition: "daemon offline".into(),
+        });
+        app.dispatch(Action::HealthDegraded {
+            source: HealthSource::Sse,
+            condition: "stream reconnecting".into(),
+        });
+        // An unrelated notice must not clear typed health.
+        app.dispatch(Action::Status("copied".into()));
+        assert_eq!(app.health.effective(), Some("daemon offline"));
+        // Daemon recovery clears ONLY its source — the stream stays degraded.
+        app.dispatch(Action::HealthRecovered(HealthSource::Daemon));
+        assert_eq!(app.health.effective(), Some("stream reconnecting"));
+        app.dispatch(Action::HealthRecovered(HealthSource::Sse));
+        assert_eq!(app.health.effective(), None, "all sources healthy");
+    }
+
+    // ── transient notices + instant model selection ──────────────────────────
+
+    #[test]
+    fn status_notice_expires_back_to_model_only() {
+        let mut app = offline_app();
+        app.dispatch(Action::SetModel("kimi-k3".into()));
+        app.dispatch(Action::Status("api key saved".into()));
+        let segs = status::segments(&app.status_data(), 120);
+        assert!(
+            segs.iter().any(|s| s.text == "api key saved"),
+            "a fresh notice renders on the row"
+        );
+        // One instant short of the TTL the notice survives …
+        assert!(!app.expire_status(app.status_at + STATUS_TTL - Duration::from_millis(1)));
+        // … at the TTL it clears and the idle row is model-only again.
+        assert!(app.expire_status(app.status_at + STATUS_TTL));
+        let segs = status::segments(&app.status_data(), 120);
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["kimi-k3"], "idle row returns to model-only");
+    }
+
+    #[test]
+    fn model_selection_updates_status_row_immediately() {
+        let mut app = offline_app();
+        // `/model <id>` — before any TurnStarted names a model.
+        app.dispatch(Action::SetModel("glm-5".into()));
+        assert_eq!(app.status_data().model, Some("glm-5"));
+        // The `/models` picker apply path must show just as instantly.
+        app.models_entries = vec![entry("deepseek-v4-pro", "deepseek", true)];
+        app.models_sel = 0;
+        app.models_apply();
+        assert_eq!(app.status_data().model, Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn terminal_navigation_creates_and_unhides_the_dock() {
+        // With the title button gone, `/terminal` (Nav::Terminal) is the
+        // pointer-free path: it must create the PTY when absent and ALWAYS
+        // unhide the dock — focusing an invisible pane strands the keyboard.
+        let mut app = offline_app();
+        app.show_term = false;
+        app.dispatch(Action::Navigate(Nav::Terminal));
+        assert!(app.show_term, "navigate must unhide the dock");
+        assert!(app.focus == Focus::Term, "focus lands in the terminal");
     }
 
     #[test]

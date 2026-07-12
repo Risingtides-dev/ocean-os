@@ -145,8 +145,8 @@ impl Component for EditorComponent {
             Some(t) => (t.name().to_uppercase(), t.dirty),
             None => ("EDITOR".to_string(), false),
         };
-        let pill = dirty.then(|| format!("{} unsaved", g("●", "*")));
-        let body = panel::draw(frame, area, &title, pill.as_deref(), self.focused);
+        let state = dirty.then_some("unsaved");
+        let body = panel::draw(frame, area, &title, state, self.focused);
         if body.width == 0 {
             return;
         }
@@ -155,14 +155,6 @@ impl Component for EditorComponent {
         self.last_body_h = body.height as usize;
 
         let Some(t) = self.tabs.get(self.active) else {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    " open a file: ⌃⌥2 files, Enter on a file",
-                    Style::default().fg(theme::COMMENT),
-                ))
-                .style(Style::default().bg(theme::BG)),
-                body,
-            );
             panel::footer(frame, area, " no file open");
             return;
         };
@@ -214,7 +206,7 @@ impl Component for EditorComponent {
         panel::footer(
             frame,
             area,
-            &format!(" {}:{}  ·  ⌃S save", t.cursor_row + 1, t.cursor_col + 1),
+            &format!(" {}:{}", t.cursor_row + 1, t.cursor_col + 1),
         );
         let _ = Modifier::BOLD;
     }

@@ -1,9 +1,11 @@
 //! CTRL's panel chrome, extracted as a reusable frame so every pane in the
-//! shell wears the same skin: a slate bed, a left light-edge column, a right
-//! faux drop-shadow column, a `◆ TITLE` row (with an optional right-aligned
-//! pill), and a hairline underline. Returns the inner body rect.
+//! shell wears the same skin: a slate bed, a plain TITLE row (with optional
+//! right-aligned plain state text, e.g. the editor's `unsaved`), and a
+//! hairline underline. Returns the inner body rect.
 //!
-//! This is the depth-fill framing from CTRL's panel_sessions.rs, generalized.
+//! This is the depth-fill framing from CTRL's panel_sessions.rs, generalized —
+//! minus the decorative title glyph and pill styling (house rules: no
+//! decorative icons, plain undecorated labels).
 
 use ratatui::{
     layout::Rect,
@@ -13,13 +15,13 @@ use ratatui::{
     Frame,
 };
 
-use super::theme::{self, g};
+use super::theme;
 
 /// Draw the chrome for one panel and return the inner body area (below the
-/// title + hairline, inside the edge columns). `focused` lights the title and
-/// accent; `pill` renders right-aligned on the title row (e.g. a sort mode or
-/// model tag).
-pub fn draw(f: &mut Frame, area: Rect, title: &str, pill: Option<&str>, focused: bool) -> Rect {
+/// title + hairline, inside the edge columns). `focused` lights the title;
+/// `state` renders right-aligned on the title row as plain contextual text
+/// (exceptional state only, e.g. the editor's `unsaved`).
+pub fn draw(f: &mut Frame, area: Rect, title: &str, state: Option<&str>, focused: bool) -> Rect {
     if area.width < 6 || area.height < 4 {
         return Rect::new(area.x, area.y, 0, 0);
     }
@@ -42,33 +44,24 @@ pub fn draw(f: &mut Frame, area: Rect, title: &str, pill: Option<&str>, focused:
         area.height,
     );
 
-    // ── title row: "◆ TITLE" left, pill right ────────────────────────────────
-    // An empty title drops the diamond+label but keeps the row (pill stays
+    // ── title row: plain "TITLE" left, plain state text right ────────────────
+    // An empty title drops the label but keeps the row (state stays
     // right-aligned, hairline stays) — used by the chat pane, where the app
     // title bar + breadcrumb already say where you are and a third "OCEAN"
     // was pure redundancy.
     let title_fg = if focused { theme::BLUE } else { theme::COMMENT };
-    let title_txt = if title.is_empty() {
-        String::new()
-    } else {
-        format!("{} {}", g("◆", "*"), title)
-    };
-    let pill_txt = pill.unwrap_or("");
-    let pill_w = if pill_txt.is_empty() {
-        0
-    } else {
-        pill_txt.chars().count() + 2
-    };
-    let pad = (inner.width as usize).saturating_sub(title_txt.chars().count() + 1 + pill_w);
+    let state_txt = state.unwrap_or("");
+    let state_w = state_txt.chars().count();
+    let pad = (inner.width as usize).saturating_sub(title.chars().count() + 1 + state_w);
     let mut spans = vec![Span::styled(
-        format!(" {title_txt}"),
+        format!(" {title}"),
         Style::default().fg(title_fg).add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::raw(" ".repeat(pad)));
-    if !pill_txt.is_empty() {
+    if !state_txt.is_empty() {
         spans.push(Span::styled(
-            format!(" {pill_txt} "),
-            Style::default().fg(theme::CYAN).bg(theme::BG_HL),
+            state_txt.to_string(),
+            Style::default().fg(theme::COMMENT),
         ));
     }
     f.render_widget(

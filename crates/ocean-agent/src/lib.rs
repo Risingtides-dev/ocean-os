@@ -782,14 +782,32 @@ impl AgentRuntime {
     /// candidate list.
     async fn run_turn_with_failover(
         &self,
-        req: PromptRequest,
+        mut req: PromptRequest,
         control: PromptControl,
         state: RuntimeState,
         env: &ProviderEnv,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
+        // Pin an implicit new session once for the whole primary+fallback
+        // attempt. Otherwise each dispatch mints independently, orphaning the
+        // primary's durable accepted-user checkpoint on pre-stream failover.
+        if req.session_id.is_none() {
+            req.session_id = Some(SessionId::new_v4());
+            req.create_if_missing = true;
+        }
+
+        let session_id = req
+            .session_id
+            .expect("run_turn_with_failover pins a session id");
+        // One serialization guard owns the entire primary → optional fallback
+        // transaction. Releasing it between attempts would let another turn
+        // append after the primary's accepted-user checkpoint, so the fallback
+        // could reuse the wrong row or fail its invariant check.
+        let lock = self.session_lock(session_id);
+        let _turn_guard = lock.lock().await;
+
         let failed_provider = state.provider_config.selection.provider.clone();
         match self
-            .dispatch_turn(req.clone(), control.clone(), &state)
+            .dispatch_turn(req.clone(), control.clone(), &state, false)
             .await
         {
             Ok(ok) => Ok(ok),
@@ -832,7 +850,9 @@ impl AgentRuntime {
                 }
                 // Single bounded retry on the alternate. Whatever it returns is
                 // final (success or failure) — no further fan-out.
-                self.dispatch_turn(req, control, &alt_state)
+                // The primary already persisted the accepted user row. Reuse
+                // it rather than appending the same prompt a second time.
+                self.dispatch_turn(req, control, &alt_state, true)
                     .await
                     .map_err(unwrap_turn_failure)
             }
@@ -843,11 +863,14 @@ impl AgentRuntime {
     /// exactly as the pre-failover `prompt` did. Factored out so
     /// [`Self::run_turn_with_failover`] can invoke it for both the primary and
     /// the fallback provider without duplicating the fake-vs-real branching.
+    /// Dispatch one provider attempt. The caller holds the session's turn lock
+    /// across the complete primary/fallback transaction.
     async fn dispatch_turn(
         &self,
         req: PromptRequest,
         control: PromptControl,
         snapshot: &RuntimeState,
+        reuse_accepted_user: bool,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         // Fake provider dispatch. The default `fake-ok` is a text-only echo that
         // never touches the runtime loop (`run_fake_prompt`). The OCEAN-130
@@ -863,9 +886,11 @@ impl AgentRuntime {
             && (snapshot.model.id == ocean_runtime::FAKE_TOOL_MODEL
                 || snapshot.model.id == ocean_runtime::FAKE_SURFACE_MODEL);
         if is_fake && !is_fake_real_loop {
-            self.run_fake_prompt(req, control, snapshot).await
+            self.run_fake_prompt(req, control, snapshot, reuse_accepted_user)
+                .await
         } else {
-            self.run_prompt(req, control, snapshot).await
+            self.run_prompt(req, control, snapshot, reuse_accepted_user)
+                .await
         }
     }
 
@@ -1156,12 +1181,11 @@ impl AgentRuntime {
         req: PromptRequest,
         control: PromptControl,
         snapshot: &RuntimeState,
+        reuse_accepted_user: bool,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
         let session_id = req.session_id.unwrap_or_else(SessionId::new_v4);
-        let lock = self.session_lock(session_id);
-        let _turn_guard = lock.lock().await;
 
         let supplied = req.session_id.is_some();
         let mut session = match session::load_resumable(&self.config_dir, session_id)? {
@@ -1195,7 +1219,14 @@ impl AgentRuntime {
         }
 
         let mut messages = session.messages.clone();
-        messages.push(Message::user_text(req.prompt));
+        if reuse_accepted_user {
+            anyhow::ensure!(
+                matches!(messages.last(), Some(Message::User { .. })),
+                "fallback session is missing its accepted user turn"
+            );
+        } else {
+            messages.push(Message::user_text(req.prompt));
+        }
         messages.push(Message::Assistant(AssistantMessage {
             content: vec![Content::text(stdout.trim_end())],
             api: snapshot.model.api.clone(),
@@ -1226,6 +1257,7 @@ impl AgentRuntime {
         req: PromptRequest,
         control: PromptControl,
         snapshot: &RuntimeState,
+        reuse_accepted_user: bool,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
 
@@ -1245,11 +1277,9 @@ impl AgentRuntime {
         // even under concurrent turns (OCEAN-274).
         tracing::Span::current().record("session_id", tracing::field::display(session_id));
 
-        // Hold the per-session lock across load → run → save. Without it, two
-        // turns on the same session both load the same history and the last to
-        // save wins, silently dropping the other's messages.
-        let lock = self.session_lock(session_id);
-        let _turn_guard = lock.lock().await;
+        // The outer primary/fallback transaction holds the per-session lock
+        // across load → run → save. Without it, two turns on the same session
+        // could load the same history and the last save would silently win.
 
         // Strict resume-vs-create. A supplied-but-unknown session id is an error
         // by default (so a stale client id surfaces instead of silently forking
@@ -1336,7 +1366,26 @@ impl AgentRuntime {
         // First user message of the turn: prompt text plus any attached images
         // as `Content::Image` blocks (OCEAN-115). No images → plain-text message,
         // identical to the prior `Message::user_text` path.
-        history.push(build_user_message(user_text, req.images.as_deref()));
+        if reuse_accepted_user {
+            anyhow::ensure!(
+                matches!(history.last(), Some(Message::User { .. })),
+                "fallback session is missing its accepted user turn"
+            );
+        } else {
+            history.push(build_user_message(user_text, req.images.as_deref()));
+        }
+
+        // Acceptance is itself a durable boundary. Save the user turn before
+        // any provider call or side-effecting tool can run, so interruption in
+        // the first long browser round cannot erase what was submitted.
+        {
+            let accepted = cap_session_history(history.clone());
+            let accept_span =
+                tracing::info_span!("checkpoint", kind = "accepted", messages = accepted.len());
+            let _accept = accept_span.enter();
+            session.replace_messages(accepted);
+            session::save(&self.config_dir, &session)?;
+        }
 
         let PromptControl {
             permission,
@@ -1449,16 +1498,24 @@ impl AgentRuntime {
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel();
+        // Parent-side durable transcript. The runtime sends only completed-round
+        // deltas; keeping the valid prefix here avoids cloning the full history
+        // on every browser/tool round.
+        let mut checkpoint_messages = history.clone();
         let cfg_cloned = cfg.clone();
         // The agent loop runs on its own task, so the turn's span context does NOT
         // propagate automatically — a freshly spawned task starts with no parent
         // span. Re-attach the current `runtime.prompt` span (OCEAN-274) so the
         // `agent_loop` span (and its `round`/`provider_stream`/`tool_exec`
         // children) nest under this turn instead of detaching into a rootless tree.
-        let handle = tokio::spawn(
+        // Abort the loop if this parent future is dropped (for example when a
+        // synchronous HTTP client disconnects). A bare JoinHandle detaches on
+        // drop, allowing ghost tools to keep running after the session lock and
+        // persistence owner disappear.
+        let handle = AbortOnDropJoinHandle::new(tokio::spawn(
             async move { run_agent_with_history(&cfg_cloned, history, Some(tx)).await }
                 .instrument(tracing::Span::current()),
-        );
+        ));
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -1518,11 +1575,25 @@ impl AgentRuntime {
                     streamed_output = true;
                     stderr.push_str(&format!("✗ permission denied for {tool_name}: {reason}\n"));
                 }
+                AgentEvent::TurnCheckpoint { messages, .. } => {
+                    // A checkpoint is emitted only after the runtime has paired
+                    // assistant tool calls with all results in provider-valid
+                    // order. Persist that valid prefix immediately, matching
+                    // stock Pi's message-end durability without ever saving an
+                    // orphan tool call.
+                    checkpoint_messages.extend(messages);
+                    let persisted = cap_session_history(checkpoint_messages.clone());
+                    let checkpoint_span =
+                        tracing::info_span!("checkpoint", messages = persisted.len());
+                    let _checkpoint = checkpoint_span.enter();
+                    session.replace_messages(persisted);
+                    session::save(&self.config_dir, &session)?;
+                }
                 _ => {}
             }
         }
 
-        let run = match handle.await.context("agent task join failed")? {
+        let run = match handle.join().await.context("agent task join failed")? {
             Ok(run) => run,
             // The agent loop failed. Carry the `streamed_output` flag out so the
             // caller can decide whether failover is safe (only when nothing
@@ -1590,6 +1661,37 @@ impl AgentRuntime {
 /// against a second provider. `Display`/`source` delegate to the inner error, so
 /// the user-facing message and `downcast_ref::<AgentError>()` (the existing 408
 /// timeout mapping) keep working unchanged.
+/// Tokio detaches a spawned task when its `JoinHandle` is dropped. Agent turns
+/// cannot use that default: the parent owns the session lock and persistence,
+/// so a detached child could keep executing side-effecting tools with no owner
+/// left to save or finalize it. This wrapper aborts unless explicitly joined.
+struct AbortOnDropJoinHandle<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        self.handle
+            .take()
+            .expect("abort-on-drop handle joined at most once")
+            .await
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TurnFailure {
     streamed_output: bool,
@@ -3593,6 +3695,33 @@ done
         assert_eq!(assistant.content, vec![Content::text("visible answer")]);
     }
 
+    #[tokio::test]
+    async fn dropping_parent_owner_aborts_spawned_agent_task() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let owner = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("child reached its running state");
+
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted child dropped promptly")
+            .expect("drop signal delivered");
+    }
+
     #[test]
     fn room_guidance_matches_track0_rooms() {
         assert!(room_guidance(RoomId::Pm).contains("PM room"));
@@ -4379,6 +4508,56 @@ done
             .await;
         assert!(res.ok, "fake provider should run without credentials");
         assert!(res.stdout.contains("OCEAN_FAKE_OK"));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn fallback_dispatch_reuses_durable_accepted_user_without_duplication() {
+        let config_dir = temp_config_dir("fallback-accepted-user");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let snapshot = runtime.state.read().unwrap().clone();
+        let session_id = SessionId::new_v4();
+        let mut stored = session::Session::new_with_id(session_id, &snapshot.model);
+        stored.bind_workspace(Path::new("."));
+        stored.replace_messages(vec![Message::user_text("hello")]);
+        session::save(&config_dir, &stored).expect("save accepted user checkpoint");
+
+        runtime
+            .run_fake_prompt(
+                PromptRequest {
+                    prompt: "hello".into(),
+                    images: None,
+                    request_id: None,
+                    session_id: Some(session_id),
+                    create_if_missing: false,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                    decision_token: None,
+                },
+                PromptControl::yolo(false),
+                &snapshot,
+                true,
+            )
+            .await
+            .expect("fallback dispatch succeeds");
+
+        let detail = runtime.session_detail(session_id).expect("session detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(
+            detail
+                .transcript
+                .iter()
+                .filter(|entry| entry.role == "user")
+                .count(),
+            1,
+            "fallback must not append the accepted prompt twice"
+        );
         let _ = std::fs::remove_dir_all(config_dir);
     }
 

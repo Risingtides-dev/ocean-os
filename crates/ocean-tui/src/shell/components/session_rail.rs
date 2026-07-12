@@ -3,7 +3,7 @@
 //! DIRECTORY nodes (the main checkout or a worktree dir beneath it) contain
 //! BRANCH nodes (the git branch stamped on each session record at creation)
 //! which contain the sessions. Wears CTRL's SESSIONS-panel skin: slate bed,
-//! `◆ SESSIONS` title, dir headers in blue and branch headers in cyan with
+//! plain SESSIONS title, dir headers in blue and branch headers in cyan with
 //! ▸/▾ carets + a session count, sessions indented beneath with their title +
 //! relative age, a cyan accent bar on the selected row, and a live `●` dot on
 //! the session currently open in the chat/PTY.
@@ -261,10 +261,6 @@ impl SessionRailComponent {
         })
     }
 
-    fn total_sessions(&self) -> usize {
-        self.groups.iter().map(|d| d.session_count()).sum()
-    }
-
     /// The most-recently-active session for this project that can be resumed
     /// natively (its id parses as a session UUID). Used by the shell at launch
     /// so `ocean` / `cd project && ocean` drops back into the last conversation.
@@ -384,7 +380,7 @@ impl Component for SessionRailComponent {
                     .style(Style::default().bg(theme::SLATE)),
                 Rect::new(x.min(body.x + body.width), y, msg.len() as u16, 1),
             );
-            panel::footer(frame, area, " ocean 0");
+            panel::footer(frame, area, "");
             return;
         }
 
@@ -513,7 +509,7 @@ impl Component for SessionRailComponent {
             );
         }
 
-        panel::footer(frame, area, &format!(" ocean {}", self.total_sessions()));
+        panel::footer(frame, area, "");
     }
 }
 

@@ -1,30 +1,66 @@
-//! Status-line segments — the workbench's always-on dashboard, ported from
-//! oh-my-pi's composable status bar (OMP Slice 4). The bottom row is built from
-//! a small set of independent segments (focus · model · git · rate · session ·
-//! advisor · message) rather than one flat string, so each reads at a glance
-//! and adding one is a single entry.
+//! Typed status/health state + the bottom row's pure segment selection.
 //!
-//! The *formatting* lives here as pure functions so it's unit-testable without
-//! a terminal; `app::draw_status` composes the returned segments with theme
-//! colours. A segment whose value is absent (no model bound, not a git repo,
-//! no turn run yet) is simply skipped — the bar never shows empty slots.
+//! Health is tracked per SOURCE (daemon probe, SSE transport) so a recovery
+//! clears only its own source — the effective indication stays degraded while
+//! ANY source remains degraded. Healthy/recovered success text is never
+//! rendered; the segment simply disappears.
+//!
+//! The bottom row selects, in priority order: model, effective degraded
+//! health, unresolved error/notice, live activity, exceptional Git. Selection
+//! is width-aware — lowest-priority context clips first, whole segments at a
+//! time, and the model is never dropped. Formatting lives here as pure
+//! functions so it's unit-testable without a terminal; `app::draw_status`
+//! composes the returned segments with theme colours.
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use super::action::HealthSource;
 use super::git;
+
+/// Independently-clearable degraded state per health source. `Some(condition)`
+/// = degraded with that terse condition; `None` = healthy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Health {
+    daemon: Option<String>,
+    sse: Option<String>,
+}
+
+impl Health {
+    /// Mark `source` degraded with `condition` (replaces the source's prior
+    /// condition; never touches the other source).
+    pub fn degrade(&mut self, source: HealthSource, condition: String) {
+        match source {
+            HealthSource::Daemon => self.daemon = Some(condition),
+            HealthSource::Sse => self.sse = Some(condition),
+        }
+    }
+
+    /// Mark `source` healthy. Clears ONLY that source — a daemon recovery must
+    /// not mask a still-degraded stream, and vice versa.
+    pub fn recover(&mut self, source: HealthSource) {
+        match source {
+            HealthSource::Daemon => self.daemon = None,
+            HealthSource::Sse => self.sse = None,
+        }
+    }
+
+    /// The effective degraded condition, if any. The daemon probe outranks the
+    /// SSE transport: a dead daemon explains a dead stream, so it reads first.
+    pub fn effective(&self) -> Option<&str> {
+        self.daemon.as_deref().or(self.sse.as_deref())
+    }
+}
 
 /// A colour role for a segment, mapped to a concrete `theme::` colour by the
 /// renderer. Kept as a small enum (not a ratatui `Color`) so this module stays
 /// terminal-agnostic and testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
-    /// The focused-pane chip (accent bed).
-    Focus,
-    /// Primary info (model, session) — foreground.
+    /// Primary info (the bound model) — foreground.
     Primary,
-    /// Muted secondary info — comment grey.
+    /// Muted contextual info (activity) — comment grey.
     Muted,
-    /// Positive/clean (no dirty files, ahead).
-    Ok,
-    /// Attention (dirty working tree, behind).
+    /// Attention (degraded health, unresolved error, exceptional Git).
     Warn,
 }
 
@@ -38,107 +74,143 @@ pub struct Segment {
 impl Segment {
     fn new(text: impl Into<String>, tone: Tone) -> Self {
         Self {
-            text: text.into(),
+            text: sanitize(&text.into()),
             tone,
         }
     }
 }
 
-/// Everything the status bar draws from, snapshotted once per frame.
-pub struct StatusData<'a> {
-    /// Focused pane label (`chat`, `files`, …).
-    pub focus: &'a str,
-    /// Model driving turns (the chat pill), if bound.
-    pub model: Option<&'a str>,
-    /// Cached git status of the active workspace (skipped when not a repo).
-    pub git: Option<&'a git::Status>,
-    /// Output tokens/second of the last completed turn.
-    pub tok_per_s: Option<f64>,
-    /// Accumulated output tokens this session.
-    pub session_tokens: u64,
-    /// Short session id (first 8 chars), if a session is bound.
-    pub session: Option<&'a str>,
-    /// Advisor state: `Some(model)` when enabled, `Some("off")` when explicitly
-    /// disabled, `None` when deferring to the daemon default.
-    pub advisor: Option<&'a str>,
-    /// The transient status/error message.
-    pub message: &'a str,
+/// Layout-safe text: newlines/tabs become spaces, remaining control chars are
+/// stripped. Daemon-fed strings (model ids, error bodies) are untrusted for
+/// layout and must never wrap or corrupt the single status row.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
-/// Build the ordered segment list. The focus chip and message always render;
-/// the middle segments appear only when they have a value.
-pub fn segments(d: &StatusData) -> Vec<Segment> {
-    let mut out = vec![Segment::new(format!(" {} ", d.focus), Tone::Focus)];
+/// Everything the bottom row draws from, snapshotted once per frame.
+pub struct StatusData<'a> {
+    /// Model driving turns, if bound. Highest priority — never clipped.
+    pub model: Option<&'a str>,
+    /// Effective degraded health condition ([`Health::effective`]).
+    pub health: Option<&'a str>,
+    /// Unresolved error/notice message (empty/whitespace = nothing to show).
+    pub error: Option<&'a str>,
+    /// Live turn/tool activity, derived from chat state (`working` or the
+    /// current tool name). `None` when idle — never a stale copy.
+    pub activity: Option<&'a str>,
+    /// Cached git status; the branch renders whenever the workspace is a
+    /// repo, the counts (and Warn tone) only when nonzero.
+    pub git: Option<&'a git::Status>,
+    /// Last finished turn's tokens/sec, as the daemon reported it (provider
+    /// usage when available, daemon estimate otherwise). `None` = no reading.
+    pub tok_per_s: Option<f64>,
+}
 
+/// Width of the two-space separator between rendered segments (plain ASCII —
+/// no decorative interpuncts on UI surfaces).
+const SEP_W: usize = 2;
+
+/// Build the ordered segment list, clipping to `max_width` display columns.
+/// LAYOUT order: model · branch · health · error · activity · tok/s.
+/// SURVIVAL is separate: on overflow whole segments drop by rank — tok/s
+/// first, then activity, then branch, then health/error; the model (identity,
+/// rank 0) never drops. Whatever survives alone is width-clamped so a single
+/// long name can't overflow the row.
+pub fn segments(d: &StatusData, max_width: usize) -> Vec<Segment> {
+    // (segment, drop_rank) — higher rank drops first; ties drop rightmost.
+    let mut ranked: Vec<(Segment, u8)> = Vec::new();
     if let Some(m) = d.model {
-        out.push(Segment::new(m.to_string(), Tone::Primary));
+        ranked.push((Segment::new(m.to_string(), Tone::Primary), 0));
     }
     if let Some(g) = d.git {
-        if g.is_repo {
-            out.push(git_segment(g));
+        if let Some(seg) = git_segment(g) {
+            ranked.push((seg, 2));
         }
     }
-    if let Some(rate) = d.tok_per_s {
-        out.push(Segment::new(fmt_rate(rate), Tone::Muted));
+    if let Some(h) = d.health {
+        ranked.push((Segment::new(h.to_string(), Tone::Warn), 1));
     }
-    if d.session_tokens > 0 {
-        out.push(Segment::new(
-            format!("{} tok", fmt_count(d.session_tokens)),
-            Tone::Muted,
-        ));
+    if let Some(e) = d.error.filter(|e| !e.trim().is_empty()) {
+        ranked.push((Segment::new(e.to_string(), Tone::Warn), 1));
     }
-    if let Some(s) = d.session {
-        out.push(Segment::new(format!("§{s}"), Tone::Muted));
+    if let Some(a) = d.activity {
+        ranked.push((Segment::new(a.to_string(), Tone::Muted), 3));
     }
-    if let Some(a) = d.advisor {
-        out.push(Segment::new(format!("advisor:{a}"), Tone::Muted));
+    if let Some(t) = d.tok_per_s {
+        ranked.push((Segment::new(format!("{t:.0} tok/s"), Tone::Muted), 4));
     }
-    if !d.message.trim().is_empty() {
-        out.push(Segment::new(d.message.to_string(), Tone::Muted));
+    while ranked.len() > 1 && ranked_row_width(&ranked) > max_width {
+        let idx = ranked
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, (_, rank))| (*rank, *i))
+            .map(|(i, _)| i)
+            .expect("non-empty");
+        ranked.remove(idx);
+    }
+    let mut out: Vec<Segment> = ranked.into_iter().map(|(s, _)| s).collect();
+    if let [only] = out.as_mut_slice() {
+        let budget = max_width.saturating_sub(1); // leading pad space
+        if only.text.width() > budget {
+            only.text = truncate_cells(&only.text, budget);
+        }
     }
     out
 }
 
-/// Git segment: `branch ±dirty ↑ahead ↓behind`. Clean tree → `Ok` tone (no
-/// dirty count); dirty tree → `Warn`. Ahead/behind counts append only when
-/// non-zero.
-fn git_segment(g: &git::Status) -> Segment {
+/// [`row_width`] over the ranked working list.
+fn ranked_row_width(segs: &[(Segment, u8)]) -> usize {
+    let text: usize = segs.iter().map(|(s, _)| s.text.width()).sum();
+    text + segs.len().saturating_sub(1) * SEP_W + 1
+}
+
+/// Hard-clip `s` to at most `max` display cells (no ellipsis — plain clip).
+fn truncate_cells(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// Total display cells of `segs` rendered with two-space separators and the
+/// leading pad space.
+fn row_width(segs: &[Segment]) -> usize {
+    let text: usize = segs.iter().map(|s| s.text.width()).sum();
+    text + segs.len().saturating_sub(1) * SEP_W + 1
+}
+
+/// Git: `branch [~dirty +ahead -behind]` (plain ASCII). The branch is
+/// identity and renders whenever the workspace is a repo; the counts stay
+/// exceptional — appended (and the tone warns) only when nonzero.
+fn git_segment(g: &git::Status) -> Option<Segment> {
+    if !g.is_repo || g.branch.is_empty() {
+        return None;
+    }
     let mut text = g.branch.clone();
-    let tone = if g.dirty > 0 {
-        text.push_str(&format!(" ±{}", g.dirty));
-        Tone::Warn
-    } else {
-        Tone::Ok
-    };
+    if g.dirty > 0 {
+        text.push_str(&format!(" ~{}", g.dirty));
+    }
     if g.ahead > 0 {
-        text.push_str(&format!(" ↑{}", g.ahead));
+        text.push_str(&format!(" +{}", g.ahead));
     }
     if g.behind > 0 {
-        text.push_str(&format!(" ↓{}", g.behind));
+        text.push_str(&format!(" -{}", g.behind));
     }
-    Segment::new(text, tone)
-}
-
-/// `1.2k/s` / `840/s` — output tokens per second, compact.
-fn fmt_rate(rate: f64) -> String {
-    format!("{}/s", fmt_count(rate.max(0.0).round() as u64))
-}
-
-/// Compact count: `840`, `1.2k`, `12k`, `1.4M`.
-fn fmt_count(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        let k = n as f64 / 1_000.0;
-        if k < 10.0 {
-            format!("{k:.1}k")
-        } else {
-            format!("{}k", k.round() as u64)
-        }
-    } else {
-        let m = n as f64 / 1_000_000.0;
-        format!("{m:.1}M")
-    }
+    let exceptional = g.dirty > 0 || g.ahead > 0 || g.behind > 0;
+    Some(Segment::new(
+        text,
+        if exceptional { Tone::Warn } else { Tone::Muted },
+    ))
 }
 
 #[cfg(test)]
@@ -147,42 +219,54 @@ mod tests {
 
     fn base() -> StatusData<'static> {
         StatusData {
-            focus: "chat",
             model: None,
-            git: None,
+            health: None,
+            error: None,
+            activity: None,
             tok_per_s: None,
-            session_tokens: 0,
-            session: None,
-            advisor: None,
-            message: "",
+            git: None,
         }
     }
 
     #[test]
-    fn empty_state_is_just_the_focus_chip() {
-        let segs = segments(&base());
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].tone, Tone::Focus);
-        assert_eq!(segs[0].text.trim(), "chat");
-    }
-
-    #[test]
-    fn absent_values_are_skipped_no_empty_slots() {
+    fn idle_healthy_state_shows_model_only() {
         let mut d = base();
         d.model = Some("claude-sonnet-5");
-        d.session = Some("2342d9fa");
-        let segs = segments(&d);
-        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
-        assert!(texts.contains(&"claude-sonnet-5"));
-        assert!(texts.iter().any(|t| t.contains("2342d9fa")));
-        // No git / rate / tokens / advisor segments when their values are None.
-        assert!(!texts
-            .iter()
-            .any(|t| t.contains("±") || t.contains("/s") || t.contains("advisor")));
+        let segs = segments(&d, 120);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "claude-sonnet-5");
+        assert_eq!(segs[0].tone, Tone::Primary);
     }
 
     #[test]
-    fn git_clean_vs_dirty_tone_and_counts() {
+    fn empty_state_renders_nothing() {
+        assert!(segments(&base(), 120).is_empty());
+    }
+
+    #[test]
+    fn health_daemon_outranks_sse_and_recovery_clears_own_source_only() {
+        let mut h = Health::default();
+        h.degrade(HealthSource::Sse, "stream reconnecting".into());
+        h.degrade(HealthSource::Daemon, "daemon offline".into());
+        assert_eq!(h.effective(), Some("daemon offline"));
+        // Daemon recovers — the still-degraded stream must NOT be masked.
+        h.recover(HealthSource::Daemon);
+        assert_eq!(h.effective(), Some("stream reconnecting"));
+        // Stream recovers — all healthy, nothing rendered.
+        h.recover(HealthSource::Sse);
+        assert_eq!(h.effective(), None);
+    }
+
+    #[test]
+    fn recovery_of_one_source_never_touches_the_other() {
+        let mut h = Health::default();
+        h.degrade(HealthSource::Daemon, "daemon offline".into());
+        h.recover(HealthSource::Sse); // unrelated recovery
+        assert_eq!(h.effective(), Some("daemon offline"));
+    }
+
+    #[test]
+    fn git_branch_always_renders_counts_stay_exceptional() {
         let clean = git::Status {
             is_repo: true,
             branch: "main".into(),
@@ -190,9 +274,13 @@ mod tests {
             ahead: 0,
             behind: 0,
         };
-        let seg = git_segment(&clean);
-        assert_eq!(seg.text, "main");
-        assert_eq!(seg.tone, Tone::Ok);
+        let seg = git_segment(&clean).expect("branch is identity — always renders in a repo");
+        assert_eq!(seg.text, "main", "clean tree shows the bare branch");
+        assert_eq!(
+            seg.tone,
+            Tone::Muted,
+            "clean branch is muted, not a warning"
+        );
 
         let dirty = git::Status {
             is_repo: true,
@@ -201,30 +289,72 @@ mod tests {
             ahead: 2,
             behind: 1,
         };
-        let seg = git_segment(&dirty);
-        assert_eq!(seg.text, "feat/x ±3 ↑2 ↓1");
+        let seg = git_segment(&dirty).expect("exceptional git renders");
+        assert_eq!(seg.text, "feat/x ~3 +2 -1");
         assert_eq!(seg.tone, Tone::Warn);
+
+        let not_repo = git::Status {
+            is_repo: false,
+            branch: String::new(),
+            dirty: 0,
+            ahead: 0,
+            behind: 0,
+        };
+        assert!(git_segment(&not_repo).is_none(), "no repo, no segment");
     }
 
     #[test]
-    fn count_and_rate_formatting() {
-        assert_eq!(fmt_count(840), "840");
-        assert_eq!(fmt_count(1_200), "1.2k");
-        assert_eq!(fmt_count(12_000), "12k");
-        assert_eq!(fmt_count(1_400_000), "1.4M");
-        assert_eq!(fmt_rate(1234.0), "1.2k/s");
-        assert_eq!(fmt_rate(840.4), "840/s");
-    }
-
-    #[test]
-    fn advisor_and_tokens_segments_present_when_set() {
+    fn width_matrix_drops_by_rank_health_outlives_extras_model_survives() {
+        let git = git::Status {
+            is_repo: true,
+            branch: "feat/x".into(),
+            dirty: 3,
+            ahead: 0,
+            behind: 0,
+        };
         let mut d = base();
-        d.advisor = Some("claude-haiku-4-5");
-        d.session_tokens = 15_400;
-        d.tok_per_s = Some(1180.0);
-        let texts: Vec<String> = segments(&d).iter().map(|s| s.text.clone()).collect();
-        assert!(texts.iter().any(|t| t == "advisor:claude-haiku-4-5"));
-        assert!(texts.iter().any(|t| t == "15k tok"));
-        assert!(texts.iter().any(|t| t == "1.2k/s"));
+        d.model = Some("claude-sonnet-5");
+        d.health = Some("daemon offline");
+        d.activity = Some("working");
+        d.tok_per_s = Some(42.0);
+        d.git = Some(&git);
+        let texts =
+            |w: usize| -> Vec<String> { segments(&d, w).iter().map(|s| s.text.clone()).collect() };
+        // Wide: everything fits, LAYOUT order (branch beside the model).
+        assert_eq!(
+            texts(200),
+            vec![
+                "claude-sonnet-5",
+                "feat/x ~3",
+                "daemon offline",
+                "working",
+                "42 tok/s"
+            ]
+        );
+        // Shrinking drops by RANK, not position: tok/s first…
+        assert_eq!(
+            texts(55),
+            vec!["claude-sonnet-5", "feat/x ~3", "daemon offline", "working"]
+        );
+        // …then activity…
+        assert_eq!(
+            texts(45),
+            vec!["claude-sonnet-5", "feat/x ~3", "daemon offline"]
+        );
+        // …then the branch — HEALTH outlives every optional segment even
+        // though it renders to the branch's right.
+        assert_eq!(texts(40), vec!["claude-sonnet-5", "daemon offline"]);
+        // …then health, leaving identity…
+        assert_eq!(texts(20), vec!["claude-sonnet-5"]);
+        // …which survives alone, hard-clipped to the row.
+        assert_eq!(texts(10), vec!["claude-so"]);
+    }
+
+    #[test]
+    fn blank_error_is_not_a_segment() {
+        let mut d = base();
+        d.model = Some("m");
+        d.error = Some("   ");
+        assert_eq!(segments(&d, 120).len(), 1);
     }
 }

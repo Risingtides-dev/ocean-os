@@ -92,6 +92,10 @@ pub async fn run_agent_with_history(
     let mut turn: u32 = 0;
     let mut stopped_at_turn_limit = false;
     let mut total_usage = ocean_protocol::Usage::default();
+    // Completed-round durability cursor. Checkpoints carry only the transcript
+    // delta since the previous valid boundary, avoiding a full-history clone on
+    // every browser/tool round while preserving provider ordering.
+    let mut checkpointed_messages = messages.len();
 
     'outer: while turn < config.max_turns {
         // Honor a cancellation request before starting another round. The daemon
@@ -381,6 +385,7 @@ pub async fn run_agent_with_history(
                     session_id: sid.clone(),
                 },
             );
+            emit_turn_checkpoint(&events, &sid, &messages, &mut checkpointed_messages);
             break 'outer;
         }
 
@@ -486,9 +491,11 @@ pub async fn run_agent_with_history(
 
             // Emit Start for every member (in order), then run the whole segment
             // concurrently, racing it against cancellation (OCEAN-116). If cancel
-            // wins we drop the in-flight futures (they stop being polled — no
-            // leak) and unwind with `Cancelled`; the emitted Starts have no End,
-            // but the whole turn is being torn down and the caller discards it.
+            // wins we drop the in-flight futures, synthesize error results for
+            // every unfinished/not-yet-started call in this assistant batch, and
+            // checkpoint the full provider-valid batch before unwinding. A tool
+            // may have crossed its side-effect boundary just before cancellation;
+            // discarding its call/result row would make a later replay unsafe.
             let mut futs = Vec::with_capacity(segment.len());
             for g in segment {
                 let Gated::Run {
@@ -518,21 +525,99 @@ pub async fn run_agent_with_history(
                     &round_span,
                 ));
             }
-            let outcomes = tokio::select! {
-                biased;
-                () = cancelled(config) => return Err(AgentError::Cancelled),
-                outcomes = futures::future::join_all(futs) => outcomes,
-            };
+            // Run the segment with LIVE completion events: each member's End
+            // (and its side-effect events) is emitted the moment that member
+            // finishes, so a batch's drawers update one by one instead of all
+            // flipping when the slowest tool completes. Outcomes are buffered
+            // by index and the transcript below is assembled in ORIGINAL call
+            // order (provider-valid), independent of finish order. Cancellation
+            // races every completion (biased) and drops in-flight futures,
+            // exactly like the old join_all path.
+            let mut in_flight = futures::stream::FuturesUnordered::new();
+            for (k, fut) in futs.into_iter().enumerate() {
+                in_flight.push(async move { (k, fut.await) });
+            }
+            let mut outcomes: Vec<Option<Outcome>> = Vec::new();
+            outcomes.resize_with(segment.len(), || None);
+            let mut segment_cancelled = false;
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    () = cancelled(config) => {
+                        segment_cancelled = true;
+                        break;
+                    },
+                    next = futures::StreamExt::next(&mut in_flight) => next,
+                };
+                let Some((k, outcome)) = next else { break };
+                let Gated::Run { id, name, .. } = &segment[k] else {
+                    unreachable!("segment holds only Run entries");
+                };
+                emit_outcome_events(&events, &sid, id, name, &outcome);
+                outcomes[k] = Some(outcome);
+            }
+            drop(in_flight);
 
-            // Assemble in index order: emit End + side effects and push the
-            // capped tool result for each member, deterministically.
+            if segment_cancelled {
+                // Close every emitted Start and make the current segment
+                // transcript-complete. Some futures may have crossed an external
+                // side-effect boundary before being dropped, so conservatively
+                // record them as consumed rather than permitting replay.
+                for (k, outcome) in outcomes.iter_mut().enumerate() {
+                    if outcome.is_none() {
+                        let Gated::Run { id, name, .. } = &segment[k] else {
+                            unreachable!("segment holds only Run entries");
+                        };
+                        let cancelled = cancelled_tool_outcome("cancelled before completion");
+                        emit_outcome_events(&events, &sid, id, name, &cancelled);
+                        *outcome = Some(cancelled);
+                    }
+                }
+            }
+
+            // Assemble the transcript in index order, deterministically.
             for (g, outcome) in segment.iter().zip(outcomes) {
                 let Gated::Run { id, name, .. } = g else {
                     unreachable!("segment holds only Run entries");
                 };
-                if apply_outcome(&events, &sid, &mut messages, id, name, outcome) {
+                let outcome = outcome.expect("every segment member completed");
+                if finalize_outcome(&mut messages, id, name, outcome) {
                     any_terminate = true;
                 }
+            }
+
+            if segment_cancelled {
+                // Complete calls in later barrier segments that never started.
+                // The assistant message already contains those tool calls, so
+                // omitting their results would persist an invalid orphan batch.
+                for pending in &gated[i..] {
+                    match pending {
+                        Gated::Denied { id, name, reason } => {
+                            messages.push(Message::ToolResult(ToolResultMessage {
+                                tool_call_id: id.clone(),
+                                tool_name: name.clone(),
+                                content: vec![Content::text(format!(
+                                    "permission denied: {reason}"
+                                ))],
+                                is_error: true,
+                                timestamp: ocean_protocol::now_ms(),
+                            }));
+                        }
+                        Gated::Run { id, name, .. } => {
+                            let cancelled =
+                                cancelled_tool_outcome("cancelled before tool execution started");
+                            let _ = finalize_outcome(&mut messages, id, name, cancelled);
+                        }
+                    }
+                }
+                emit(
+                    &events,
+                    AgentEvent::TurnEnd {
+                        session_id: sid.clone(),
+                    },
+                );
+                emit_turn_checkpoint(&events, &sid, &messages, &mut checkpointed_messages);
+                return Err(AgentError::Cancelled);
             }
         }
         emit(
@@ -541,6 +626,7 @@ pub async fn run_agent_with_history(
                 session_id: sid.clone(),
             },
         );
+        emit_turn_checkpoint(&events, &sid, &messages, &mut checkpointed_messages);
         if any_terminate {
             break;
         }
@@ -566,6 +652,7 @@ pub async fn run_agent_with_history(
             error_message: None,
             timestamp: ocean_protocol::now_ms(),
         }));
+        emit_turn_checkpoint(&events, &sid, &messages, &mut checkpointed_messages);
     }
 
     emit(
@@ -645,6 +732,16 @@ struct Outcome {
     details: Value,
 }
 
+fn cancelled_tool_outcome(message: &str) -> Outcome {
+    Outcome {
+        content: vec![Content::text(message)],
+        is_error: true,
+        terminate: false,
+        side_effects: Vec::new(),
+        details: serde_json::json!({ "cancelled": true }),
+    }
+}
+
 /// Execute a single tool call, producing its [`Outcome`]. Owns everything it
 /// touches (cloned id/name/args/tool and a child span) so a batch of these can
 /// be polled concurrently by `join_all` with no borrow of the loop's state.
@@ -698,27 +795,23 @@ async fn run_one(
     }
 }
 
-/// Assemble one tool [`Outcome`] into the transcript: emit `ToolExecutionEnd`
-/// (with the FULL output, for the live SSE display) and any side-effect events
-/// the tool requested, then push a `ToolResult` whose content is *capped* —
-/// because that copy is resent on every subsequent round of the turn AND
-/// reloaded on every future turn of the session, so an uncapped dump would be
-/// paid for in input tokens indefinitely. Returns whether the tool asked to
-/// terminate the run.
-fn apply_outcome(
+/// Completion-time half of outcome handling: emit `ToolExecutionEnd` (with the
+/// FULL output, for the live SSE display) and any side-effect events the tool
+/// requested. Runs the MOMENT a segment member finishes — completion order —
+/// while the transcript half ([`finalize_outcome`]) runs later in call order.
+fn emit_outcome_events(
     events: &Option<mpsc::UnboundedSender<AgentEvent>>,
     sid: &Option<String>,
-    messages: &mut Vec<Message>,
     id: &str,
     name: &str,
-    outcome: Outcome,
-) -> bool {
+    outcome: &Outcome,
+) {
     let Outcome {
         content,
         is_error,
-        terminate,
         side_effects,
         details,
+        ..
     } = outcome;
     emit(
         events,
@@ -726,12 +819,12 @@ fn apply_outcome(
             session_id: sid.clone(),
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
-            is_error,
+            is_error: *is_error,
             content: content.clone(),
-            details,
+            details: details.clone(),
         },
     );
-    for effect in &side_effects {
+    for effect in side_effects {
         match effect {
             ToolSideEffect::Render {
                 id,
@@ -796,6 +889,22 @@ fn apply_outcome(
             }
         }
     }
+}
+
+/// Transcript half of outcome handling, run in ORIGINAL call order after the
+/// whole segment completes: push a `ToolResult` whose content is *capped* —
+/// that copy is resent on every subsequent round of the turn AND reloaded on
+/// every future turn of the session, so an uncapped dump would be paid for in
+/// input tokens indefinitely. Returns whether the tool asked to terminate the
+/// run. The live `ToolExecutionEnd` was already emitted (completion order) by
+/// [`emit_outcome_events`].
+fn finalize_outcome(messages: &mut Vec<Message>, id: &str, name: &str, outcome: Outcome) -> bool {
+    let Outcome {
+        content,
+        is_error,
+        terminate,
+        ..
+    } = outcome;
     let tr = ToolResultMessage {
         tool_call_id: id.to_string(),
         tool_name: name.to_string(),
@@ -1090,6 +1199,29 @@ fn anchor_including_call_for_last(messages: &[Message]) -> usize {
     last
 }
 
+/// Emit newly completed transcript rows at a provider-valid round boundary.
+/// The cursor advances even when no receiver is attached; checkpointing is an
+/// observer concern and must never change loop semantics.
+fn emit_turn_checkpoint(
+    sink: &Option<mpsc::UnboundedSender<AgentEvent>>,
+    session_id: &Option<String>,
+    messages: &[Message],
+    checkpointed_messages: &mut usize,
+) {
+    if *checkpointed_messages >= messages.len() {
+        return;
+    }
+    let delta = messages[*checkpointed_messages..].to_vec();
+    *checkpointed_messages = messages.len();
+    emit(
+        sink,
+        AgentEvent::TurnCheckpoint {
+            session_id: session_id.clone(),
+            messages: delta,
+        },
+    );
+}
+
 fn emit(sink: &Option<mpsc::UnboundedSender<AgentEvent>>, ev: AgentEvent) {
     if let Some(s) = sink {
         let _ = s.send(ev);
@@ -1211,9 +1343,12 @@ mod tests {
             if a.content.iter().any(|c| c.as_text() == Some("final answer after tool result"))));
 
         let mut deltas = Vec::new();
+        let mut checkpoints = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::TextDelta { delta, .. } = ev {
-                deltas.push(delta);
+            match ev {
+                AgentEvent::TextDelta { delta, .. } => deltas.push(delta),
+                AgentEvent::TurnCheckpoint { messages, .. } => checkpoints.push(messages),
+                _ => {}
             }
         }
         assert!(
@@ -1221,6 +1356,19 @@ mod tests {
                 .iter()
                 .any(|delta| delta == "final answer after tool result"),
             "terminal assistant text must be surfaced as TextDelta for SSE clients; got {deltas:?}"
+        );
+        assert_eq!(checkpoints.len(), 2, "one checkpoint per completed round");
+        assert_eq!(
+            checkpoints[0].len(),
+            2,
+            "tool round checkpoint must pair assistant call + result"
+        );
+        assert!(matches!(checkpoints[0][0], Message::Assistant(_)));
+        assert!(matches!(checkpoints[0][1], Message::ToolResult(_)));
+        assert_eq!(
+            checkpoints[1].len(),
+            1,
+            "final text round is one assistant checkpoint"
         );
     }
 

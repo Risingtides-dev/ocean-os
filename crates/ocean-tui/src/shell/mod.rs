@@ -27,6 +27,7 @@ mod panel;
 mod pty;
 mod sessions;
 mod slash;
+mod spatial;
 mod status;
 mod theme;
 mod tree;

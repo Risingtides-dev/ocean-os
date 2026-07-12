@@ -1,5 +1,5 @@
 //! FileTreeComponent — the project explorer wearing CTRL's panel skin: slate
-//! bed, `◆ FILES` title, hairline, accent bar on the selected row, dirs in
+//! bed, plain FILES title, hairline, accent bar on the selected row, dirs in
 //! blue with ▸/▾ carets. Enter expands a dir or opens a file in the editor.
 
 use std::path::PathBuf;
@@ -174,10 +174,7 @@ impl Component for FileTreeComponent {
             );
         }
 
-        panel::footer(
-            frame,
-            area,
-            &format!(" {} entries", self.tree.entries.len()),
-        );
+        // Reserved footer row stays for stable panel geometry; nothing to say.
+        panel::footer(frame, area, "");
     }
 }

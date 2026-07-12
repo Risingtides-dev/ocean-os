@@ -6,7 +6,7 @@
 //! inline `code`/**bold**/*italic*), tool cards with ⌃O collapse/expand,
 //! multi-line input (⌃J newline), and wheel/PageUp scrollback.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ocean_agent_sdk::{AgentTurnEvent, ThinkingLevel, ToolCallId};
 use ocean_core::{OceanEvent, PermissionId};
 use ratatui::{
@@ -16,7 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::shell::{
     action::{Action, LoginTarget, Nav},
@@ -29,19 +29,11 @@ use crate::shell::{
     theme::{self, g},
 };
 
-/// Collapsed tool cards show at most this many trailing output lines; ⌃O
-/// expands to the full output.
-const TOOL_TAIL_ROWS: usize = 3;
-
-/// Collapsed diff cards show at most this many rows; ⌃O (the same global expand
-/// toggle as tool output) reveals the full hunk.
-const DIFF_TAIL_ROWS: usize = 12;
-
-/// Collapsed mode shows at most this many ok/running tool one-liners per
-/// consecutive tool run; older ones compact into one "· N earlier tools" line.
-/// Without this a 30-tool turn floods the whole transcript with cards even in
-/// the minimized mode. Errors are never hidden; ⌃O expands everything.
-const BURST_TAIL_TOOLS: usize = 3;
+/// An open tool drawer shows at most this many logical body rows (newest
+/// first); older rows collapse behind a "… N earlier lines" marker. Bounds
+/// live-streamed output so one huge result never floods the transcript. This
+/// is a per-drawer tail; ⌃O remains the global open-all override.
+const DRAWER_BODY_ROWS: usize = 40;
 
 /// Kill-ring depth (⌃U / ⌃K push, ⌃Y yanks the newest).
 const KILL_RING_CAP: usize = 10;
@@ -54,17 +46,21 @@ enum Turn {
     Assistant(String),
     /// Extended-thinking text (accumulates deltas).
     Thinking(String),
-    /// A tool call: keyed by call id, with name + a one-line args summary +
-    /// streamed output + status. Rendered as a card (⌃O toggles collapse). When
-    /// the tool is an edit tool, `diff` carries the pre-computed diff-card rows
-    /// and the card renders those instead of raw output.
+    /// A tool call: keyed by call id, with name + lossless raw args + streamed
+    /// output + status. Each call is an independent drawer — `expanded` is the
+    /// per-call open state (⌃O / settings still globally open every drawer via
+    /// `tools_expanded`; a body is open when either is true). When the tool is
+    /// an edit tool, `diff` carries pre-computed diff-card rows and the open
+    /// drawer renders those instead of raw output. Raw `args_json` is retained
+    /// so the expanded body can show lossless arguments.
     Tool {
         id: ToolCallId,
         name: String,
-        args: String,
+        args_json: serde_json::Value,
         output: String,
         status: ToolStatus,
         diff: Option<Vec<DiffRow>>,
+        expanded: bool,
     },
     /// An advisor aside — a note from the observer/advisor extension. Rendered as
     /// a set-off amber card, clearly not the agent's own output.
@@ -94,6 +90,17 @@ enum ToolStatus {
     Err,
 }
 
+/// One visible tool-drawer header row on screen, built per frame for mouse
+/// hit-testing. Coordinates are absolute terminal cells (after wrapping and
+/// scroll), so a click maps to exactly the drawer whose header painted there.
+#[derive(Debug)]
+struct DrawerHit {
+    id: ToolCallId,
+    row: u16,
+    col_start: u16,
+    col_end: u16,
+}
+
 /// The ⌃R fuzzy history-search overlay state (present only while open).
 #[derive(Default)]
 struct HistorySearch {
@@ -105,6 +112,10 @@ struct HistorySearch {
 
 #[derive(Default)]
 pub struct ChatComponent {
+    /// Throughput of the LAST finished turn, exactly as the daemon reported
+    /// it (provider usage when available, its estimate otherwise). Cleared on
+    /// `TurnStarted` — never a stale rate dressed up as current.
+    last_tok_per_s: Option<f64>,
     turns: Vec<Turn>,
     input: String,
     model: Option<String>,
@@ -121,6 +132,16 @@ pub struct ChatComponent {
     md: Markdown,
     /// When true, tool cards render their full output instead of a tail window.
     tools_expanded: bool,
+    /// Focused tool drawer (Alt-↑/↓ traverse in transcript order with wrapping;
+    /// Alt-Space / Alt-Enter toggles). `None` when no drawer is focused.
+    focused_drawer: Option<ToolCallId>,
+    /// Per-frame map of visible drawer-header screen rows → tool id, rebuilt
+    /// on every draw for mouse hit-testing. Consumed by `handle_mouse`.
+    drawer_hits: Vec<DrawerHit>,
+    /// Drawer header armed by a left-button Down, committed on Up. A Drag in
+    /// between disarms it — so the app-level drag-to-select-text sweep across
+    /// a header never toggles the drawer.
+    pending_drawer_click: Option<ToolCallId>,
     /// Persisted prompt history (↑/↓ recall, ⌃R search). Loaded at startup.
     history: PromptHistory,
     /// Cursor into `history` while navigating with ↑/↓; `None` when editing a
@@ -147,38 +168,116 @@ pub struct ChatComponent {
     pub welcome_provider_line: Option<String>,
 }
 
-/// Collapse a tool's `args_json` into a single-line summary for the card header:
-/// prefer a well-known primary key, else compact-serialize the whole object;
-/// newlines flattened and truncated so the header never wraps.
-fn summarize_args(v: &serde_json::Value) -> String {
-    use serde_json::Value;
-    const KEYS: &[&str] = &[
-        "command",
-        "cmd",
-        "path",
-        "file_path",
-        "pattern",
-        "query",
-        "url",
-        "content",
-    ];
-    let raw = match v {
-        Value::Object(map) => KEYS
-            .iter()
-            .find_map(|k| map.get(*k))
-            .map(inline_value)
-            .unwrap_or_else(|| v.to_string()),
-        Value::Null => String::new(),
-        other => inline_value(other),
+/// Tool-aware salient preview for a drawer header: command for bash, pattern +
+/// path for grep/glob, path for file tools, url for fetch/nav, and a readable
+/// scalar `key: value` fallback for unknown/MCP tools. `write`/`edit` are
+/// PATH-FOCUSED here — the full payload lives in the expanded args body and the
+/// approval card is a separate surface; do NOT echo file content into the
+/// collapsed header. Returns a single clean line (whitespace flattened, control
+/// bytes stripped); the caller truncates by terminal-cell width at render time.
+fn humanize_preview(name: &str, args: &serde_json::Value) -> String {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let joined = |parts: Vec<&str>| {
+        parts
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     };
-    one_line(&raw, 72)
+    let summary = match name {
+        "bash" => s("command").to_string(),
+        "glob" | "grep" => joined(vec![s("pattern"), s("path")]),
+        "read" | "ls" => s("path").to_string(),
+        // Mutating file tools: path only in the collapsed preview. Content and
+        // old→new land in the expanded args body; the approval card is a
+        // separate surface that shows the payload.
+        // Path ONLY, unconditionally: even when "path" is empty/missing this
+        // must NEVER fall through to the scalar fallback below, which would
+        // echo `content: <file payload>` into the collapsed header.
+        "write" | "edit" => return flatten_oneline(s("path")),
+        "web_fetch" | "browser_navigate" => s("url").to_string(),
+        _ => String::new(),
+    };
+    let summary = if summary.is_empty() {
+        // Fallback for unknown/MCP tools and known tools whose salient arg came
+        // through empty: render scalar args as `key: value` pairs.
+        args.as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(key, value)| match value {
+                        serde_json::Value::String(st) if !st.is_empty() => {
+                            Some(format!("{key}: {st}"))
+                        }
+                        serde_json::Value::Number(n) => Some(format!("{key}: {n}")),
+                        serde_json::Value::Bool(b) => Some(format!("{key}: {b}")),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default()
+    } else {
+        summary
+    };
+    flatten_oneline(&summary)
 }
 
-fn inline_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+/// Flatten whitespace to single spaces and drop control bytes WITHOUT
+/// truncating. Used for the drawer preview before width-based truncation.
+fn flatten_oneline(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// Truncate `s` to at most `max_width` terminal cells, appending a disclosure
+/// ellipsis (`…` / `...`) when something is dropped. Unlike [`clamp_line`]
+/// (char-based) this budgets by display width via `UnicodeWidthStr`, so CJK or
+/// emoji arguments cannot wrap the one-row drawer header or blow the width
+/// budget. The result is guaranteed to fit in `max_width` cells: if the
+/// ellipsis itself is wider than `max_width`, a hard cell cut is used instead.
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    // Zero budget first: returning the whole string here would defeat the
+    // one-row width guarantee (the early `|| max_width == 0` returned `s`
+    // verbatim — a CJK/emoji argument would then wrap the header).
+    if max_width == 0 {
+        return String::new();
     }
+    let total = UnicodeWidthStr::width(s);
+    if total <= max_width {
+        return s.to_string();
+    }
+    let ell = g("…", "...");
+    let ell_w = UnicodeWidthStr::width(ell);
+    let mut out = String::new();
+    if max_width >= ell_w {
+        let budget = max_width - ell_w;
+        let mut w = 0usize;
+        for c in s.chars() {
+            let cw = c.width().unwrap_or(0);
+            if w + cw > budget {
+                break;
+            }
+            out.push(c);
+            w += cw;
+        }
+        out.push_str(ell);
+    } else {
+        // Absurdly narrow: hard cell cut, no ellipsis room.
+        let mut w = 0usize;
+        for c in s.chars() {
+            let cw = c.width().unwrap_or(0);
+            if w + cw > max_width {
+                break;
+            }
+            out.push(c);
+            w += cw;
+        }
+    }
+    out
 }
 
 /// Make a line of tool/diff output terminal-safe. ratatui does NOT expand
@@ -205,26 +304,78 @@ pub(crate) fn sanitize_line(s: &str) -> String {
 /// Render one diff-card row: a coloured gutter sigil + the (possibly word-diffed)
 /// body on the dark bed. Changed word runs carry `Modifier::REVERSED` (SGR
 /// inverse), matching OMP's intra-line diff highlight.
-fn diff_line(row: &DiffRow) -> Line<'static> {
+fn diff_line(row: &DiffRow, body_width: usize) -> Line<'static> {
     let (gutter, gutter_fg, body_fg, dim) = match row.kind {
         DiffKind::Del => (g("-", "-"), theme::RED, theme::RED, false),
         DiffKind::Add => (g("+", "+"), theme::GREEN, theme::GREEN, false),
         DiffKind::Context => (" ", theme::EDGE, theme::COMMENT, false),
         DiffKind::Header => (g("┆", ":"), theme::COMMENT, theme::COMMENT, true),
     };
-    let mut spans = vec![Span::styled(
-        format!("    {gutter} "),
-        Style::default().fg(gutter_fg),
-    )];
-    for seg in &row.segs {
+    let prefix = format!("    {gutter} ");
+    let prefix_w = UnicodeWidthStr::width(prefix.as_str());
+    let budget = body_width.saturating_sub(prefix_w);
+    let mut spans: Vec<Span> = vec![Span::styled(prefix, Style::default().fg(gutter_fg))];
+    let seg_style = |changed: bool| {
         let mut style = Style::default().fg(body_fg).bg(theme::BG_DARK);
         if dim {
             style = style.add_modifier(Modifier::DIM);
         }
-        if seg.changed {
+        if changed {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        spans.push(Span::styled(sanitize_line(&seg.text), style));
+        style
+    };
+    // Fast path: the whole row fits within the budget — keep per-segment
+    // styling verbatim (no ellipsis).
+    let total_body: usize = row
+        .segs
+        .iter()
+        .map(|seg| UnicodeWidthStr::width(sanitize_line(&seg.text).as_str()))
+        .sum();
+    if total_body <= budget {
+        for seg in &row.segs {
+            spans.push(Span::styled(
+                sanitize_line(&seg.text),
+                seg_style(seg.changed),
+            ));
+        }
+        return Line::from(spans);
+    }
+    // Truncation path: walk segments cell-by-cell; reserve an ellipsis (or hard
+    // cut when even the ellipsis won't fit) and stop once the budget is
+    // exhausted. Colouring is preserved on the kept prefix.
+    let ell = g("…", "...");
+    let ell_w = UnicodeWidthStr::width(ell);
+    let (limit, use_ellipsis) = if budget >= ell_w {
+        (budget - ell_w, true)
+    } else {
+        (budget, false)
+    };
+    let mut used = 0usize;
+    'outer: for seg in &row.segs {
+        let style = seg_style(seg.changed);
+        let clean = sanitize_line(&seg.text);
+        let mut buf = String::new();
+        for c in clean.chars() {
+            let cw = c.width().unwrap_or(0);
+            if used + cw > limit {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(buf, style));
+                }
+                if use_ellipsis {
+                    spans.push(Span::styled(
+                        ell.to_string(),
+                        Style::default().fg(body_fg).bg(theme::BG_DARK),
+                    ));
+                }
+                break 'outer;
+            }
+            buf.push(c);
+            used += cw;
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, style));
+        }
     }
     Line::from(spans)
 }
@@ -653,6 +804,78 @@ impl ChatComponent {
             .find(|t| matches!(t, Turn::Tool { id: tid, .. } if tid == id))
     }
 
+    /// All tool-call ids in transcript order — the Alt-↑/↓ traversal sequence.
+    fn drawer_ids(&self) -> Vec<ToolCallId> {
+        self.turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Tool { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Alt-↓ — focus the next tool drawer in transcript order, wrapping from
+    /// the last back to the first. With no current focus, start at the first.
+    fn drawer_focus_next(&mut self) {
+        let ids = self.drawer_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let next = match &self.focused_drawer {
+            None => 0,
+            Some(cur) => ids
+                .iter()
+                .position(|i| i == cur)
+                .map(|p| (p + 1) % ids.len())
+                .unwrap_or(0),
+        };
+        self.focused_drawer = Some(ids[next].clone());
+    }
+
+    /// Alt-↑ — focus the previous tool drawer in transcript order, wrapping
+    /// from the first back to the last. With no current focus, start at the
+    /// last (so the first press from nothing lands on the newest tool).
+    fn drawer_focus_prev(&mut self) {
+        let ids = self.drawer_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let prev = match &self.focused_drawer {
+            None => ids.len() - 1,
+            Some(cur) => ids
+                .iter()
+                .position(|i| i == cur)
+                .map(|p| (p + ids.len() - 1) % ids.len())
+                .unwrap_or(ids.len() - 1),
+        };
+        self.focused_drawer = Some(ids[prev].clone());
+    }
+
+    /// Alt-Space / Alt-Enter — flip the focused drawer's local open state.
+    /// No-op when nothing is focused (global ⌃O is a separate control).
+    fn toggle_focused_drawer(&mut self) {
+        if let Some(id) = self.focused_drawer.clone() {
+            self.toggle_drawer(&id);
+        }
+    }
+
+    /// Flip one drawer's local `expanded` state by call id.
+    fn toggle_drawer(&mut self, id: &ToolCallId) {
+        if let Some(Turn::Tool { expanded, .. }) = self.tool_by_id(id) {
+            *expanded = !*expanded;
+        }
+    }
+
+    /// Whether any composer overlay — the ⌃R history search, the `/` command
+    /// palette, or the `@` mention picker — is currently painted over the
+    /// transcript. Mouse drawer hit-handling is suppressed while one is up:
+    /// overlay rows cover transcript rows, and a click there must not fall
+    /// through to the hidden drawer header underneath.
+    fn overlay_active(&self) -> bool {
+        self.search.is_some() || !self.slash_matches().is_empty() || self.mention_query().is_some()
+    }
+
     /// Fold an `advisor` extension event into an [`Turn::Advisor`]. Tolerates
     /// missing fields (sensible defaults), skips empty notes, and never panics
     /// on a malformed payload.
@@ -738,6 +961,35 @@ impl ChatComponent {
     /// true, instead of redrawing 60Hz forever.
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+    /// Live activity for the bottom status row, derived from transcript state
+    /// (never an action-driven copy, so it cannot go stale): the newest
+    /// running tool's name while one runs, `working` for a busy turn between
+    /// tools, `None` when idle. Gated on `busy` — `TurnFinished` clears the
+    /// flag without rewriting every `ToolStatus::Running`, so an unguarded
+    /// transcript scan could leak a dead tool as live activity.
+    pub fn activity(&self) -> Option<&str> {
+        if !self.busy {
+            return None;
+        }
+        self.turns
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                Turn::Tool {
+                    name,
+                    status: ToolStatus::Running,
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .or(Some("working"))
+    }
+
+    /// Last finished turn's tokens/sec for the status row. `None` until a
+    /// turn completes or when the daemon reported no rate.
+    pub fn tok_per_s(&self) -> Option<f64> {
+        self.last_tok_per_s
     }
 
     /// The model driving turns (the header pill), for the status bar. `None`
@@ -1006,7 +1258,8 @@ impl ChatComponent {
 
     /// Push `/help` output into the transcript as an assistant block — the
     /// markdown-lite renderer styles the headings, bullets, and inline `code`.
-    /// Sections follow the registry's breadcrumb groups.
+    /// Sections follow the registry's breadcrumb groups. Commands only: no
+    /// shortcut list is printed anywhere, per the no-instructions house rule.
     fn push_help(&mut self) {
         let mut body = String::from("# commands\n");
         let mut last_group = "";
@@ -1017,34 +1270,6 @@ impl ChatComponent {
             }
             body.push_str(&format!("- `{}` — {}\n", c.name, c.desc));
         }
-        body.push_str("\n# keys\n");
-        body.push_str("• ⏎ — send\n");
-        body.push_str("• ⌃J — newline in composer\n");
-        body.push_str("• ⌃O — toggle tool-card expansion\n");
-        body.push_str("• ⌃R — fuzzy history search\n");
-        body.push_str("• ⌃U — kill composer line\n");
-        body.push_str("• ⌃K — kill to end of line\n");
-        body.push_str("• ⌃Y — yank / allow permission\n");
-        body.push_str("• ⌃N — deny permission\n");
-        body.push_str("• PgUp — scroll transcript up\n");
-        body.push_str("• PgDn — scroll transcript down\n");
-        body.push_str("• ↑ — history prev (when composer empty)\n");
-        body.push_str("• ↓ — history next (when composer empty)\n");
-        body.push_str("• / — command palette\n");
-        body.push_str("• ↑↓ — palette select\n");
-        body.push_str("• ⏎ — palette run\n");
-        body.push_str("• ⇥ — palette complete\n");
-        body.push_str("• esc — palette dismiss\n");
-        body.push_str("• ⌃Q — quit\n");
-        body.push_str("• Tab — cycle focus (except in palette)\n");
-        body.push_str("• ⌃⌥1 — sessions pane\n");
-        body.push_str("• ⌃⌥2 — files pane\n");
-        body.push_str("• ⌃⌥3 — chat pane\n");
-        body.push_str("• ⌃⌥4 — editor pane\n");
-        body.push_str("• ⌃⌥5 — graph pane\n");
-        body.push_str("• ⌃⌥6 — terminal pane\n");
-        body.push_str("• ⌃⌥↑↓ — resize terminal dock\n");
-        body.push_str("• esc — back to chat (from other panes)\n");
         self.turns.push(Turn::Assistant(body));
     }
 
@@ -1112,7 +1337,7 @@ impl ChatComponent {
         let width = ((content_w as u16) + 2/* borders */)
             .min(composer.width)
             .max(24);
-        let height = shown as u16 + 3; // top+bottom border + footer row
+        let height = shown as u16 + 2; // top+bottom border
         let y = composer.y.saturating_sub(height);
         let area = Rect::new(composer.x, y, width, height);
 
@@ -1122,7 +1347,7 @@ impl ChatComponent {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} commands ", g("◆", "*")),
+                " commands ",
                 Style::default()
                     .fg(theme::BLUE)
                     .add_modifier(Modifier::BOLD),
@@ -1220,29 +1445,8 @@ impl ChatComponent {
                 }
             }
         }
-        // Footer hint on the last inner row; note the truncation when the list
-        // is longer than what fits.
-        let shown_cmds = rows
-            .iter()
-            .take(shown)
-            .filter(|r| matches!(r, Row::Cmd(..)))
-            .count();
-        let more = if shown_cmds < matches.len() {
-            format!(" · {shown_cmds}/{}", matches.len())
-        } else {
-            String::new()
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!(
-                    " ⇥ complete · {} select · ⏎ run · esc dismiss{more}",
-                    g("↑↓", "^v")
-                ),
-                Style::default().fg(theme::COMMENT),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
-            Rect::new(inner.x, inner.y + shown as u16, inner.width, 1),
-        );
+        // No footer legend: overlays carry no printed instructions, and the
+        // selection window already scrolls to keep the cursor visible.
     }
 
     /// Render the `@` file-mention picker just above the composer: ranked file
@@ -1263,7 +1467,7 @@ impl ChatComponent {
             .max()
             .unwrap_or(24);
         let width = ((content_w as u16) + 2).min(composer.width).max(24);
-        let height = shown as u16 + 3;
+        let height = shown as u16 + 2;
         let y = composer.y.saturating_sub(height);
         let area = Rect::new(composer.x, y, width, height);
 
@@ -1273,7 +1477,7 @@ impl ChatComponent {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                format!(" {} files ", g("◆", "*")),
+                " files ",
                 Style::default()
                     .fg(theme::BLUE)
                     .add_modifier(Modifier::BOLD),
@@ -1309,19 +1513,6 @@ impl ChatComponent {
                 Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
             );
         }
-        let more = if shown < matches.len() {
-            format!(" · {shown}/{}", matches.len())
-        } else {
-            String::new()
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!(" {} select · ⏎ insert · esc dismiss{more}", g("↑↓", "^v")),
-                Style::default().fg(theme::COMMENT),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
-            Rect::new(inner.x, inner.y + shown as u16, inner.width, 1),
-        );
     }
 
     /// Render the ⌃R history-search overlay above the composer: a title row
@@ -1345,7 +1536,7 @@ impl ChatComponent {
             .unwrap_or(24)
             .max(query.chars().count() + 4);
         let width = ((content_w as u16) + 6).min(composer.width).max(24);
-        let height = shown.max(1) as u16 + 3; // top+bottom border + footer row
+        let height = shown.max(1) as u16 + 2; // top+bottom border
         let y = composer.y.saturating_sub(height);
         let area = Rect::new(composer.x, y, width, height);
 
@@ -1396,15 +1587,6 @@ impl ChatComponent {
                 Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
             );
         }
-        // Footer hint on the last inner row.
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!(" {} select · ⏎ insert · esc dismiss", g("↑↓", "^v")),
-                Style::default().fg(theme::COMMENT),
-            ))
-            .style(Style::default().bg(theme::SLATE)),
-            Rect::new(inner.x, inner.y + shown.max(1) as u16, inner.width, 1),
-        );
     }
 }
 
@@ -1528,6 +1710,28 @@ impl Component for ChatComponent {
                         self.md.clear();
                         self.scroll_back = 0;
                     }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        // ── Alt drawer navigation: traverse tool drawers in transcript order ─
+        // Alt-↓/↑ move focus across tool drawers (wrapping end-to-end); Alt-Space
+        // or Alt-Enter flips the focused drawer's open state. These NEVER touch
+        // the composer: plain ↓/↑ recall history and plain Space/Enter edit/send,
+        // so the disclosure controls stay out of the typing path.
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Down => {
+                    self.drawer_focus_next();
+                    return None;
+                }
+                KeyCode::Up => {
+                    self.drawer_focus_prev();
+                    return None;
+                }
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    self.toggle_focused_drawer();
                     return None;
                 }
                 _ => {}
@@ -1736,6 +1940,46 @@ impl Component for ChatComponent {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_back += 3,
             MouseEventKind::ScrollDown => self.scroll_back = self.scroll_back.saturating_sub(3),
+            // Left click on a rendered drawer header focuses and toggles that
+            // one call. `drawer_hits` is rebuilt every draw from the exact
+            // wrapped + scroll-adjusted geometry, so the hit routes to the
+            // header actually painted under the cursor — correct even after a
+            // preceding turn wraps, after scrolling, or after a resize. Wheel
+            // scrolling is untouched. The toggle commits on a CLEAN click
+            // only: the hit is armed on Down
+            // and committed on Up, and any Drag in between disarms it (the
+            // app-level drag-to-select-text gesture starts on the same Down,
+            // so a selection sweep across a header must not toggle it). While
+            // a composer overlay (⌃R search, `/` palette, `@` mentions) is up,
+            // drawer hit-handling is skipped entirely: overlay rows paint OVER
+            // transcript rows, and a click there must not fall through to the
+            // hidden header underneath.
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pending_drawer_click = if self.overlay_active() {
+                    None
+                } else {
+                    self.drawer_hits
+                        .iter()
+                        .find(|h| {
+                            h.row == mouse.row
+                                && mouse.column >= h.col_start
+                                && mouse.column < h.col_end
+                        })
+                        .map(|h| h.id.clone())
+                };
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Text selection, not a click — disarm the pending toggle.
+                self.pending_drawer_click = None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(id) = self.pending_drawer_click.take() {
+                    if !self.overlay_active() {
+                        self.focused_drawer = Some(id.clone());
+                        self.toggle_drawer(&id);
+                    }
+                }
+            }
             _ => {}
         }
         None
@@ -1748,33 +1992,31 @@ impl Component for ChatComponent {
         if let Action::TurnSendFailed { prompt, err } = action {
             self.busy = false;
             let msg = errfmt::humanize(err);
-            if errfmt::is_timeout_shaped(err) {
-                // The POST timed out waiting for the daemon's ACK — but the turn
-                // POST is fire-and-ack, so the turn may well still be running
-                // server-side and emitting into the event stream. Do NOT restore
-                // the prompt or offer a blind "press ⏎ to retry": that invites a
-                // double-submit while the original turn runs. The transcript
-                // catches up via the SSE stream; if it truly stalled, the
-                // operator can start a fresh turn deliberately.
-                self.turns.push(Turn::Assistant(format!(
-                    "{} {msg}\nIf it's still running server-side, output will stream in here.",
-                    g("⚠", "!")
-                )));
-                self.scroll_back = 0;
-                return None;
-            }
             let prefix = if errfmt::is_connect_shaped(err) {
                 "couldn't reach the daemon"
             } else {
                 "turn could not start"
             };
             self.turns.push(Turn::Assistant(format!(
-                "{} {prefix} — {msg}\n\nYour prompt is back in the composer; press ⏎ to retry.",
+                "{} {prefix} — {msg}\n\nYour prompt is back in the composer.",
                 g("⚠", "!")
             )));
             if self.input.is_empty() {
                 self.input = prompt.clone();
             }
+            self.scroll_back = 0;
+            return None;
+        }
+        // The request connected, but the final HTTP outcome was lost. The
+        // daemon may already have accepted/executed it, so restoring the prompt
+        // would invite a duplicate browser action, write, or purchase.
+        if let Action::TurnOutcomeUnknown { err } = action {
+            self.busy = false;
+            self.turns.push(Turn::Assistant(format!(
+                "{} turn connection ended before confirmation — {}\n\nThe prompt was not restored because the turn may already be running. Watch the session stream before resubmitting.",
+                g("⚠", "!"),
+                errfmt::humanize(err)
+            )));
             self.scroll_back = 0;
             return None;
         }
@@ -1804,6 +2046,8 @@ impl Component for ChatComponent {
         if let Action::AgentEvent(evt) = action {
             match evt.as_ref() {
                 AgentTurnEvent::TurnStarted { model, .. } => {
+                    // A fresh turn invalidates the previous throughput reading.
+                    self.last_tok_per_s = None;
                     if let Some(m) = model {
                         self.model = Some(m.clone());
                     }
@@ -1840,10 +2084,11 @@ impl Component for ChatComponent {
                     self.turns.push(Turn::Tool {
                         id: call.id.clone(),
                         name,
-                        args: summarize_args(&call.args_json),
+                        args_json: call.args_json.clone(),
                         output: String::new(),
                         status: ToolStatus::Running,
                         diff,
+                        expanded: false,
                     });
                 }
                 AgentTurnEvent::ToolCallChunk { call_id, chunk, .. } => {
@@ -1862,8 +2107,14 @@ impl Component for ChatComponent {
                         }
                     }
                 }
-                AgentTurnEvent::TurnFinished { status, error, .. } => {
+                AgentTurnEvent::TurnFinished {
+                    status,
+                    error,
+                    tokens_per_second,
+                    ..
+                } => {
                     self.busy = false;
+                    self.last_tok_per_s = *tokens_per_second;
                     let is_failure = matches!(
                         status,
                         ocean_agent_sdk::AgentTurnStatus::Failed
@@ -1926,92 +2177,35 @@ impl Component for ChatComponent {
         }
 
         // ── transcript panel in the CTRL skin ────────────────────────────────
-        // Title-less chrome: the app title bar + crumb already identify this
-        // pane; a third "◆ OCEAN" was pure redundancy. The model pill keeps
-        // the top row.
-        let pill = self.model.clone();
-        let body = panel::draw(frame, chunks[0], "", pill.as_deref(), self.focused);
+        // Title-less, pill-less chrome: the app title bar + breadcrumb already
+        // identify this pane, and the bound model lives on the bottom status
+        // row — a panel pill duplicated it.
+        let body = panel::draw(frame, chunks[0], "", None, self.focused);
 
         // Transcript lines (bottom-anchored via scroll offset). Split the
         // borrow: the markdown cache (`md`) is a distinct field from `turns`, so
         // the loop can read turns while `md.render` mutates its cache.
         let md = &mut self.md;
         let tools_expanded = self.tools_expanded;
-        // Collapsed tool-card tail lines clamp to one screen row each (gutter
-        // "    │ " = 6 cols + 1 spare); ⌃O opts into full wrapped output.
-        let clamp_w = (body.width as usize).saturating_sub(7);
         let busy = self.busy;
         let n_turns = self.turns.len();
         let mut lines: Vec<Line> = Vec::new();
-        // ── welcome empty-state: friendly hints until the first message ──────
+        // Per-frame record of each drawer header's logical-line index, used
+        // after wrapping + scroll to build the mouse hit map (`self.drawer_hits`).
+        let mut drawer_header_lines: Vec<(ToolCallId, usize)> = Vec::new();
+        // ── welcome empty-state: blank except a terse configuration condition
+        // (set by the app only when no provider is configured). No branding,
+        // no printed instructions — the `/` palette and /help carry discovery.
         if self.turns.is_empty() {
-            // Center vertically with some top padding.
-            let vpad = (body.height.saturating_sub(8)) / 2;
-            for _ in 0..vpad {
-                lines.push(Line::from(""));
-            }
-            // "OCEAN" title
-            lines.push(Line::from(Span::styled(
-                "  OCEAN",
-                Style::default()
-                    .fg(theme::CYAN)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-            // Provider line
             if let Some(pline) = &self.welcome_provider_line {
+                let vpad = (body.height.saturating_sub(1)) / 2;
+                for _ in 0..vpad {
+                    lines.push(Line::from(""));
+                }
                 lines.push(Line::from(Span::styled(
                     format!("  {pline}"),
                     Style::default().fg(theme::YELLOW),
                 )));
-                lines.push(Line::from(""));
-            }
-            // Hints
-            let hints = [
-                "⏎ send · ⌃J newline · / commands",
-                "/login — connect a provider",
-                "/models — pick a model + thinking",
-                "/help — everything else",
-            ];
-            for hint in &hints {
-                lines.push(Line::from(Span::styled(
-                    format!("  {hint}"),
-                    Style::default().fg(theme::COMMENT),
-                )));
-            }
-        }
-        // Collapsed mode: a long consecutive tool run must not flood the
-        // screen. Hide all but the newest BURST_TAIL_TOOLS ok/running cards of
-        // each run behind one "· N earlier tools" line; errors always render.
-        let mut tool_hidden: Vec<bool> = vec![false; n_turns];
-        let mut elide_count_at: Vec<usize> = vec![0; n_turns];
-        if !tools_expanded {
-            let mut i = 0;
-            while i < n_turns {
-                if !matches!(self.turns[i], Turn::Tool { .. } | Turn::Thinking(_)) {
-                    i += 1;
-                    continue;
-                }
-                let start = i;
-                while i < n_turns && matches!(self.turns[i], Turn::Tool { .. } | Turn::Thinking(_))
-                {
-                    i += 1;
-                }
-                let hideable: Vec<usize> = (start..i)
-                    .filter(|&t| {
-                        matches!(
-                            &self.turns[t],
-                            Turn::Tool { status, .. } if !matches!(status, ToolStatus::Err)
-                        )
-                    })
-                    .collect();
-                if hideable.len() > BURST_TAIL_TOOLS {
-                    let cut = hideable.len() - BURST_TAIL_TOOLS;
-                    for &t in &hideable[..cut] {
-                        tool_hidden[t] = true;
-                    }
-                    elide_count_at[hideable[0]] = cut;
-                }
             }
         }
         for (ti, turn) in self.turns.iter().enumerate() {
@@ -2060,10 +2254,6 @@ impl Component for ChatComponent {
                                 ),
                                 Span::styled(sanitize_line(reason), Style::default().fg(theme::FG)),
                             ]));
-                            lines.push(Line::from(Span::styled(
-                                "  ⌃Y allow · ⌃N deny",
-                                Style::default().fg(theme::YELLOW),
-                            )));
                         }
                         Some(true) => {
                             let st = sanitize_line(tool);
@@ -2081,14 +2271,14 @@ impl Component for ChatComponent {
                         }
                     }
                 }
-                Turn::Thinking(s) => {
+                Turn::Thinking(_) => {
                     // Collapsed mode shows thinking ONLY while it's the live
                     // tail of a busy turn (feedback that the model is working).
                     // Historical thinking markers between every tool call were
                     // half the transcript spam; ⌃O brings them all back.
                     if tools_expanded || (busy && ti + 1 == n_turns) {
                         lines.push(Line::from(Span::styled(
-                            format!("  {} thinking ({} chars)", g("◌", "~"), s.len()),
+                            format!("  {} thinking", g("◌", "~")),
                             Style::default()
                                 .fg(theme::COMMENT)
                                 .add_modifier(Modifier::ITALIC),
@@ -2098,173 +2288,174 @@ impl Component for ChatComponent {
                     }
                 }
                 Turn::Tool {
+                    id,
                     name,
-                    args,
+                    args_json,
                     output,
                     status,
                     diff,
-                    ..
+                    expanded,
                 } => {
-                    // Burst compaction (collapsed mode): this card is hidden
-                    // behind the run's "· N earlier tools" line.
-                    if tool_hidden[ti] {
-                        if elide_count_at[ti] > 0 {
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    "  {} {} earlier tools · ⌃O expand",
-                                    g("·", "-"),
-                                    elide_count_at[ti]
-                                ),
-                                Style::default()
-                                    .fg(theme::COMMENT)
-                                    .add_modifier(Modifier::ITALIC),
-                            )));
-                        }
-                        continue; // no separator — the burst reads as one block
-                    }
-                    // Card header: status glyph + tool name + one-line args.
-                    let (mark, color) = match status {
-                        ToolStatus::Running => (g("◐", "*"), theme::YELLOW),
-                        ToolStatus::Ok => (g("✓", "+"), theme::GREEN),
-                        ToolStatus::Err => (g("✗", "x"), theme::RED),
+                    // Each tool call is an independent drawer. A body is open
+                    // when the per-call `expanded` OR the global ⌃O override is
+                    // on; toggling one drawer never touches another.
+                    let open = tools_expanded || *expanded;
+                    let disc = if open { g("▾", "v") } else { g("▸", ">") };
+                    let (status_word, status_color) = match status {
+                        ToolStatus::Running => ("running", theme::YELLOW),
+                        ToolStatus::Ok => ("done", theme::GREEN),
+                        ToolStatus::Err => ("error", theme::RED),
                     };
-                    let mut header = vec![
-                        Span::styled(format!("  {mark} "), Style::default().fg(color)),
-                        Span::styled(
-                            name.clone(),
-                            Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    if !args.is_empty() {
+                    // One NON-wrapping header row:
+                    //   "  {disc} {name}[ · {preview}][ · {status}]"
+                    // Reserve disclosure / name / status by terminal-cell width
+                    // first, then let ONLY the preview truncate — so CJK/emoji
+                    // args can never wrap the header (a wrap would invalidate
+                    // the click hit map and break the one-row guarantee).
+                    let width = body.width as usize;
+                    let prefix = format!("  {disc} ");
+                    let prefix_w = UnicodeWidthStr::width(prefix.as_str());
+                    let sep = " · ";
+                    let sep_w = UnicodeWidthStr::width(sep);
+                    let status_w = UnicodeWidthStr::width(status_word);
+                    let name_budget = width.saturating_sub(prefix_w + sep_w + status_w);
+                    let name_disp = truncate_to_width(name, name_budget);
+                    let name_w = UnicodeWidthStr::width(name_disp.as_str());
+                    let reserved = prefix_w + name_w + sep_w + status_w + sep_w;
+                    let preview_budget = width.saturating_sub(reserved);
+                    let ell = g("…", "...");
+                    let ell_w = UnicodeWidthStr::width(ell);
+                    let preview_raw = humanize_preview(name, args_json);
+                    let show_preview = !preview_raw.is_empty() && preview_budget >= ell_w;
+                    let preview_disp = if show_preview {
+                        truncate_to_width(&preview_raw, preview_budget)
+                    } else {
+                        String::new()
+                    };
+                    let mut header: Vec<Span> = Vec::new();
+                    header.push(Span::styled(prefix, Style::default().fg(theme::EDGE)));
+                    header.push(Span::styled(
+                        name_disp,
+                        Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
+                    ));
+                    if show_preview {
                         header.push(Span::styled(
-                            format!("  {args}"),
+                            format!("{sep}{preview_disp}"),
                             Style::default().fg(theme::COMMENT),
                         ));
                     }
-
-                    // Collapsed, healthy cards are ONE line: the header plus a
-                    // dim outcome summary. Diff cards join the one-line rule
-                    // except at the transcript tail — the just-finished edit
-                    // keeps its hunk visible for live feedback; ⌃O restores
-                    // full output for everything. Errors keep their tail (red
-                    // matters).
-                    let is_tail = ti + 1 == n_turns;
-                    let collapsed_plain = !tools_expanded
-                        && !matches!(status, ToolStatus::Err)
-                        && (diff.is_none() || !is_tail);
-                    if collapsed_plain {
-                        if let Some(rows) = diff {
-                            let adds = rows
-                                .iter()
-                                .filter(|r| matches!(r.kind, DiffKind::Add))
-                                .count();
-                            let dels = rows
-                                .iter()
-                                .filter(|r| matches!(r.kind, DiffKind::Del))
-                                .count();
-                            header.push(Span::styled(
-                                format!("  {} diff +{adds} −{dels} · ⌃O", g("·", "-")),
-                                Style::default()
-                                    .fg(theme::COMMENT)
-                                    .add_modifier(Modifier::ITALIC),
-                            ));
+                    header.push(Span::styled(
+                        format!("{sep}{status_word}"),
+                        Style::default().fg(status_color),
+                    ));
+                    // Hard width clamp: on very narrow panes the fixed parts
+                    // (prefix + separators + status) can alone exceed the body
+                    // width, and the status span is appended after budgeting —
+                    // truncate the assembled spans by cell budget so the header
+                    // can NEVER wrap to a second row (a wrap would invalidate
+                    // the click hit map and break the one-row guarantee).
+                    let mut cells_left = width;
+                    for sp in header.iter_mut() {
+                        let w = UnicodeWidthStr::width(sp.content.as_ref());
+                        if w <= cells_left {
+                            cells_left -= w;
                         } else {
-                            let out = output.trim();
-                            if !out.is_empty() {
-                                let total = out.lines().count();
-                                let first = one_line(out.lines().next().unwrap_or(""), 48);
-                                let summary = if total == 1 && first.chars().count() <= 48 {
-                                    format!("  {} {first}", g("·", "-"))
-                                } else if total == 1 {
-                                    format!("  {} 1 line", g("·", "-"))
-                                } else {
-                                    format!("  {} {total} lines", g("·", "-"))
-                                };
-                                header.push(Span::styled(
-                                    summary,
-                                    Style::default()
-                                        .fg(theme::COMMENT)
-                                        .add_modifier(Modifier::ITALIC),
-                                ));
-                            }
+                            sp.content = truncate_to_width(sp.content.as_ref(), cells_left).into();
+                            cells_left = 0;
                         }
-                        lines.push(Line::from(header));
-                        // Skip the separator when the next row is another tool
-                        // call — a burst of one-liners reads as one block.
-                        if matches!(
-                            self.turns.get(ti + 1),
-                            Some(Turn::Tool { .. }) | Some(Turn::Thinking(_))
-                        ) {
-                            continue;
-                        }
-                        lines.push(Line::from(""));
-                        continue;
                     }
+                    header.retain(|sp| !sp.content.is_empty());
+                    // Focus highlight: reverse the complete header row.
+                    if self.focused_drawer.as_ref() == Some(id) {
+                        for sp in header.iter_mut() {
+                            sp.style = sp.style.add_modifier(Modifier::REVERSED);
+                        }
+                    }
+                    // Record the header's logical-line index for the mouse hit
+                    // map BEFORE pushing, so the index points at the header row.
+                    drawer_header_lines.push((id.clone(), lines.len()));
                     lines.push(Line::from(header));
 
-                    match diff {
-                        // Edit tools render a diff card: removed/added gutters in
-                        // theme colours, word-level intra-line changes reversed,
-                        // truncated to DIFF_TAIL_ROWS unless expanded (⌃O).
-                        Some(rows) => {
-                            let total = rows.len();
-                            let shown = if tools_expanded {
-                                total
-                            } else {
-                                total.min(DIFF_TAIL_ROWS)
-                            };
-                            for row in &rows[..shown] {
-                                lines.push(diff_line(row));
-                            }
-                            if shown < total {
-                                lines.push(Line::from(Span::styled(
-                                    format!(
-                                        "    {} +{} more · ⌃O expand",
-                                        g("┄", ".."),
-                                        total - shown
+                    if open {
+                        // Lossless, terminal-sanitized args section. Lines may
+                        // wrap; the exact per-line hit map accounts for those
+                        // wrapped rows. Skip null / empty-object payloads.
+                        let has_args = !args_json.is_null()
+                            && !(matches!(args_json, serde_json::Value::Object(o) if o.is_empty()));
+                        if has_args {
+                            let pretty = serde_json::to_string_pretty(args_json)
+                                .unwrap_or_else(|_| args_json.to_string());
+                            for l in pretty.lines() {
+                                lines.push(Line::from(vec![
+                                    Span::styled(
+                                        "    ".to_string(),
+                                        Style::default().fg(theme::EDGE),
                                     ),
-                                    Style::default().fg(theme::COMMENT),
-                                )));
+                                    Span::styled(
+                                        sanitize_line(l),
+                                        Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
+                                    ),
+                                ]));
                             }
                         }
-                        // Plain card: full output when expanded (⌃O), else a tail
-                        // window with a "+N more" hint on the rail.
-                        None => {
-                            let body: Vec<&str> = output.lines().collect();
-                            if !body.is_empty() {
-                                let hidden = if tools_expanded {
-                                    0
-                                } else {
-                                    body.len().saturating_sub(TOOL_TAIL_ROWS)
-                                };
-                                for l in &body[hidden..] {
-                                    // Terminal-safe first (tabs/controls smear
-                                    // cells — see `sanitize_line`), then when
-                                    // collapsed: one screen row per line, hard
-                                    // stop — a single giant line (JSON blobs)
-                                    // must not wrap into a wall. ⌃O shows all.
-                                    let l = sanitize_line(l);
-                                    let text = if tools_expanded {
-                                        l
-                                    } else {
-                                        clamp_line(&l, clamp_w)
-                                    };
-                                    lines.push(Line::from(vec![
-                                        Span::styled(
-                                            format!("    {} ", g("│", "|")),
-                                            Style::default().fg(theme::EDGE),
-                                        ),
-                                        Span::styled(
-                                            text,
-                                            Style::default().fg(theme::COMMENT).bg(theme::BG_DARK),
-                                        ),
-                                    ]));
-                                }
+                        // Body rail bounded to the newest DRAWER_BODY_ROWS rows
+                        // (diff for edit tools, streamed output otherwise), each
+                        // clamped to one screen row. The earlier-rows marker
+                        // paints ABOVE the tail — the omitted rows are
+                        // chronologically older than every visible one.
+                        match diff {
+                            Some(rows) => {
+                                let total = rows.len();
+                                let hidden = total.saturating_sub(DRAWER_BODY_ROWS);
                                 if hidden > 0 {
                                     lines.push(Line::from(Span::styled(
-                                        format!("    {} +{hidden} more · ⌃O expand", g("┄", "..")),
+                                        format!("    {} {} earlier lines", g("┄", ".."), hidden),
                                         Style::default().fg(theme::COMMENT),
                                     )));
+                                }
+                                for row in &rows[hidden..] {
+                                    lines.push(diff_line(row, width));
+                                }
+                            }
+                            None => {
+                                let body_rows: Vec<&str> = output.lines().collect();
+                                if body_rows.is_empty() {
+                                    if matches!(status, ToolStatus::Running) {
+                                        lines.push(Line::from(Span::styled(
+                                            "    (no output yet)".to_string(),
+                                            Style::default().fg(theme::COMMENT),
+                                        )));
+                                    }
+                                } else {
+                                    let hidden = body_rows.len().saturating_sub(DRAWER_BODY_ROWS);
+                                    // "    │ " gutter = 6 cells; clamp each line
+                                    // to the rest so it costs exactly one row.
+                                    let rail_w = width.saturating_sub(6);
+                                    if hidden > 0 {
+                                        lines.push(Line::from(Span::styled(
+                                            format!(
+                                                "    {} {} earlier lines",
+                                                g("┄", ".."),
+                                                hidden
+                                            ),
+                                            Style::default().fg(theme::COMMENT),
+                                        )));
+                                    }
+                                    for l in &body_rows[hidden..] {
+                                        let text = truncate_to_width(&sanitize_line(l), rail_w);
+                                        lines.push(Line::from(vec![
+                                            Span::styled(
+                                                format!("    {} ", g("│", "|")),
+                                                Style::default().fg(theme::EDGE),
+                                            ),
+                                            Span::styled(
+                                                text,
+                                                Style::default()
+                                                    .fg(theme::COMMENT)
+                                                    .bg(theme::BG_DARK),
+                                            ),
+                                        ]));
+                                    }
                                 }
                             }
                         }
@@ -2323,13 +2514,64 @@ impl Component for ChatComponent {
                     }
                 }
             }
-            lines.push(Line::from(""));
+            // Single-space tool runs: a suppressed Thinking turn between tool
+            // calls emits nothing (its arm `continue`s), so the NEXT VISIBLE
+            // turn decides the gap — Tool -> hidden Thinking -> Tool stays
+            // tight. Every other visible boundary keeps its blank separator.
+            let next_visible_is_tool = self.turns[ti + 1..]
+                .iter()
+                .enumerate()
+                .find_map(|(off, t)| match t {
+                    Turn::Thinking(_) if !(tools_expanded || (busy && ti + 2 + off == n_turns)) => {
+                        None
+                    }
+                    Turn::Tool { .. } => Some(true),
+                    _ => Some(false),
+                })
+                .unwrap_or(false);
+            if !(matches!(turn, Turn::Tool { .. }) && next_visible_is_tool) {
+                lines.push(Line::from(""));
+            }
         }
         // Bottom-anchor on the WRAPPED row count, not the raw line count — long
         // streamed lines reflow into multiple rows, and Paragraph's scroll
         // offset is in wrapped rows. Counting unwrapped lines made the live
         // tail jitter/scroll off as text arrived. `line_count` uses the exact
         // same wrap algorithm the render will.
+        // Per-line wrapped-row counts (ratatui's exact algorithm) and the
+        // cumulative wrapped-row offset where each drawer header first paints.
+        // Computed before `lines` moves into the Paragraph; the scroll window
+        // is applied once it is known. A header at logical line i lands on
+        // wrapped row Σ(rows[0..i)), so a long assistant turn that wraps above
+        // shifts the header down on screen — the hit map MUST follow that shift
+        // or a click toggles the wrong drawer (the logical-index-as-row bug).
+        let drawer_wrapped: Vec<(ToolCallId, u16, u16)> = if drawer_header_lines.is_empty() {
+            Vec::new()
+        } else {
+            let per_line: Vec<u16> = lines
+                .iter()
+                .map(|l| {
+                    Paragraph::new(vec![l.clone()])
+                        .wrap(Wrap { trim: false })
+                        .line_count(body.width) as u16
+                })
+                .collect();
+            let mut mapped: Vec<(ToolCallId, u16, u16)> = Vec::new();
+            let mut cum: u16 = 0;
+            // `drawer_header_lines` is in ascending logical-index order (headers
+            // are pushed while walking turns top-to-bottom), so one advancing
+            // cursor matches every header in O(lines + drawers) instead of the
+            // O(lines × drawers) a per-line rescan would cost.
+            let mut headers = drawer_header_lines.iter().peekable();
+            for (i, &rows) in per_line.iter().enumerate() {
+                if headers.peek().is_some_and(|(_, li)| *li == i) {
+                    let (id, _) = headers.next().unwrap();
+                    mapped.push((id.clone(), cum, cum.saturating_add(rows)));
+                }
+                cum = cum.saturating_add(rows);
+            }
+            mapped
+        };
         let para = Paragraph::new(lines)
             .style(Style::default().bg(theme::SLATE))
             .wrap(Wrap { trim: false });
@@ -2339,19 +2581,29 @@ impl Component for ChatComponent {
         let scroll = wrapped
             .saturating_sub(body.height)
             .saturating_sub(self.scroll_back as u16);
+        // Apply the scroll window and body origin to the wrapped header rows,
+        // yielding absolute screen rows for the mouse hit map. Only headers
+        // inside the visible wrapped-row window are clickable; the vec is
+        // always reassigned so stale entries from a prior frame never linger.
+        let vis_lo = scroll;
+        let vis_hi = scroll.saturating_add(body.height);
+        self.drawer_hits = drawer_wrapped
+            .iter()
+            .filter_map(|(id, start, end)| {
+                let row = (*start..*end).find(|r| *r >= vis_lo && *r < vis_hi)?;
+                Some(DrawerHit {
+                    id: id.clone(),
+                    row: body.y + (row - vis_lo),
+                    col_start: body.x,
+                    col_end: body.x + body.width,
+                })
+            })
+            .collect();
         frame.render_widget(para.scroll((scroll, 0)), body);
-        let footer_hint = if self.search.is_some() {
-            " history search · ⏎ insert · esc dismiss".to_string()
-        } else if !menu.is_empty() {
-            " command palette · esc to dismiss".to_string()
-        } else if self.scroll_back > 0 {
-            format!(" ↑{} lines back · PgDn to tail", self.scroll_back)
-        } else if self.busy {
-            " streaming…".to_string()
-        } else {
-            " ⏎ send · ⌃J newline · ⌃O tools · ⌃R history · / commands".to_string()
-        };
-        panel::footer(frame, chunks[0], &footer_hint);
+        // Footer: always blank. No key legends, no counters; activity lives on
+        // the bottom status row (derived from this component's state), never
+        // duplicated here. The reserved row stays so panel geometry is stable.
+        panel::footer(frame, chunks[0], "");
 
         // ── composer: highlight bed, accent bar, multi-line, block cursor ────
         let comp = chunks[1];
@@ -2641,13 +2893,38 @@ mod tests {
     }
 
     #[test]
-    fn summarize_args_is_single_line_and_prefers_primary_key() {
-        let s = summarize_args(&json!({ "command": "echo hi\nrm x", "cwd": "/tmp" }));
-        assert!(!s.contains('\n'), "args summary must be one line");
-        assert!(s.contains("echo hi"));
-        // No recognised key → compact-serialize the whole object.
-        let s2 = summarize_args(&json!({ "foo": 1 }));
-        assert!(s2.contains("foo"));
+    fn humanize_preview_picks_salient_arg_and_flattens_to_one_line() {
+        // bash → the command, whitespace flattened so it can't wrap a header.
+        let bash = humanize_preview(
+            "bash",
+            &json!({ "command": "echo hi\nrm x", "cwd": "/tmp" }),
+        );
+        assert!(!bash.contains('\n'), "preview must be one line");
+        assert!(bash.contains("echo hi"));
+        assert!(bash.contains("rm x"));
+        // grep → pattern + path joined; write → path only, NEVER content.
+        assert_eq!(
+            humanize_preview("grep", &json!({ "pattern": "TODO", "path": "/src" })),
+            "TODO /src"
+        );
+        let write = humanize_preview("write", &json!({ "path": "/a.txt", "content": "secret" }));
+        assert_eq!(write, "/a.txt");
+        assert!(
+            !write.contains("secret"),
+            "header must not echo file content"
+        );
+        // Pathless write/edit: NEVER fall through to the scalar fallback —
+        // that would print `content: <payload>` into the collapsed header.
+        let pathless = humanize_preview("write", &json!({ "content": "secret" }));
+        assert!(
+            !pathless.contains("secret"),
+            "pathless write must not echo content: {pathless}"
+        );
+        assert!(pathless.is_empty(), "pathless write previews as empty");
+        // Unknown/MCP tool with scalar args → readable `key: value` fallback.
+        let unk = humanize_preview("mcp_foo", &json!({ "foo": 1, "bar": "baz" }));
+        assert!(unk.contains("foo: 1"), "scalar fallback: {unk}");
+        assert!(unk.contains("bar: baz"), "string fallback: {unk}");
     }
 
     #[test]
@@ -3393,8 +3670,12 @@ mod tests {
 
         let empty = render_chat_to_string(&mut chat, 80, 24);
         assert!(
-            empty.contains("OCEAN"),
-            "empty transcript should render the welcome title"
+            !empty.contains("OCEAN"),
+            "welcome must not render product branding"
+        );
+        assert!(
+            !empty.contains('⏎') && !empty.contains('⌃') && !empty.contains("/login"),
+            "welcome must not print instruction hints, got: {empty:?}"
         );
         assert!(
             empty.contains("provider sentinel"),
@@ -3412,6 +3693,127 @@ mod tests {
             !filled.contains("provider sentinel"),
             "welcome provider line must not appear once transcript is non-empty"
         );
+    }
+
+    #[test]
+    fn welcome_without_condition_renders_nothing() {
+        let mut chat = ChatComponent::default();
+        let empty = render_chat_to_string(&mut chat, 80, 24);
+        assert!(
+            !empty.contains("OCEAN") && !empty.contains('⏎') && !empty.contains("/help"),
+            "a bare empty chat renders no branding or hints, got: {empty:?}"
+        );
+    }
+
+    #[test]
+    fn pending_permission_card_prints_no_key_instructions() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::Permission {
+            permission_id: PermissionId::new_v4(),
+            tool: "bash".into(),
+            reason: "wants to run a command".into(),
+            resolved: None,
+        });
+        let screen = render_chat_to_string(&mut chat, 80, 24);
+        assert!(
+            screen.contains("approval needed"),
+            "pending card still renders its condition"
+        );
+        assert!(
+            screen.contains("wants to run a command"),
+            "pending card still renders the reason"
+        );
+        assert!(
+            !screen.contains('⌃') && !screen.contains("allow · "),
+            "no allow/deny key instructions on the card, got: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn live_thinking_marker_has_no_char_count() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.turns.push(Turn::Thinking("abcdef".into()));
+        let screen = render_chat_to_string(&mut chat, 80, 12);
+        assert!(
+            screen.contains("thinking"),
+            "live-tail thinking marker renders"
+        );
+        assert!(!screen.contains("chars"), "no character counters");
+    }
+
+    #[test]
+    fn footer_is_blank_when_idle_streaming_or_scrolled() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::User("hi".into()));
+        let idle = render_chat_to_string(&mut chat, 80, 12);
+        assert!(
+            !idle.contains('⏎') && !idle.contains("commands"),
+            "idle footer carries no key legend, got: {idle:?}"
+        );
+        chat.busy = true;
+        let busy = render_chat_to_string(&mut chat, 80, 12);
+        assert!(
+            !busy.contains("streaming"),
+            "activity belongs to the bottom status row, not the chat footer"
+        );
+        // Detached from the live tail: still blank — no scroll counter either.
+        for i in 0..30 {
+            chat.turns.push(Turn::User(format!("turn {i}")));
+        }
+        chat.scroll_back = 5;
+        let scrolled = render_chat_to_string(&mut chat, 80, 12);
+        assert!(
+            chat.scroll_back > 0,
+            "test premise: the view really is scrolled back"
+        );
+        assert!(
+            !scrolled.contains("lines back") && !scrolled.contains("PgDn"),
+            "scrolled footer prints no counter or key hint, got: {scrolled:?}"
+        );
+    }
+
+    // ── activity accessor: busy/tool-derived, never stale ──────────────────
+
+    #[test]
+    fn activity_is_none_when_idle_even_with_stale_running_marker() {
+        let mut chat = ChatComponent::default();
+        assert_eq!(chat.activity(), None);
+        // A Running marker left behind by an aborted turn must not leak once
+        // busy clears (TurnFinished does not rewrite tool statuses).
+        let id = add_tool(&mut chat, "bash", "");
+        if let Some(Turn::Tool { status, .. }) = chat.tool_by_id(&id) {
+            *status = ToolStatus::Running;
+        }
+        chat.busy = false;
+        assert_eq!(chat.activity(), None, "idle chat reports no activity");
+    }
+
+    #[test]
+    fn activity_names_newest_running_tool_then_falls_back_to_working() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        assert_eq!(chat.activity(), Some("working"), "busy with no tool yet");
+        chat.turns.push(ok_tool("read", ""));
+        let id = add_tool(&mut chat, "bash", "");
+        if let Some(Turn::Tool { status, .. }) = chat.tool_by_id(&id) {
+            *status = ToolStatus::Running;
+        }
+        assert_eq!(chat.activity(), Some("bash"), "newest running tool wins");
+        if let Some(Turn::Tool { status, .. }) = chat.tool_by_id(&id) {
+            *status = ToolStatus::Ok;
+        }
+        assert_eq!(
+            chat.activity(),
+            Some("working"),
+            "finished tool falls back to working while the turn streams"
+        );
+        chat.update(&turn_finished(AgentTurnStatus::Completed, None));
+        assert_eq!(chat.activity(), None, "turn completion clears activity");
     }
     // ── turn-terminal paths ──────────────────────────────────────────────────
 
@@ -3616,17 +4018,65 @@ mod tests {
         );
     }
 
-    // ── collapsed tool cards: sanitized summaries + burst compaction ───────
+    // ── tool drawers: per-call expansion, sanitized bodies, hit testing ────
 
     fn ok_tool(name: &str, output: &str) -> Turn {
         Turn::Tool {
             id: ocean_agent_sdk::ToolCallId::new_v4(),
             name: name.to_string(),
-            args: String::new(),
+            args_json: serde_json::Value::Null,
             output: output.to_string(),
             status: ToolStatus::Ok,
             diff: None,
+            expanded: false,
         }
+    }
+
+    /// Push a closed ok-status tool drawer and return its call id, so tests can
+    /// track per-call expansion independently.
+    fn add_tool(chat: &mut ChatComponent, name: &str, output: &str) -> ToolCallId {
+        let id = ocean_agent_sdk::ToolCallId::new_v4();
+        chat.turns.push(Turn::Tool {
+            id: id.clone(),
+            name: name.to_string(),
+            args_json: serde_json::Value::Null,
+            output: output.to_string(),
+            status: ToolStatus::Ok,
+            diff: None,
+            expanded: false,
+        });
+        id
+    }
+
+    /// Read one drawer's local `expanded` flag by call id.
+    fn expanded_of(chat: &ChatComponent, id: &ToolCallId) -> bool {
+        chat.turns
+            .iter()
+            .find_map(|t| match t {
+                Turn::Tool {
+                    id: tid, expanded, ..
+                } if tid == id => Some(*expanded),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build a left-button mouse event at an absolute screen row (crossterm
+    /// 0.28 has no `MouseEvent::new`; use a struct literal).
+    fn mouse_at(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// Simulate a full left-click (Down then Up, no Drag) at a screen row —
+    /// the toggle commits on Up, so Down alone is not a click.
+    fn click_row(chat: &mut ChatComponent, row: u16) {
+        chat.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row));
+        chat.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), row));
     }
 
     #[test]
@@ -3647,71 +4097,165 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_burst_elides_earlier_tools() {
+    fn every_drawer_header_stays_visible_no_burst_hiding() {
+        // Burst compaction was removed: every tool drawer paints its own header
+        // no matter how many run consecutively. A tall viewport shows them all;
+        // there is no "earlier tools" compaction row.
         let mut chat = ChatComponent::default();
         for i in 0..6 {
             chat.turns.push(ok_tool(&format!("tool{i}"), "ok"));
         }
-        let screen = render_chat_to_string(&mut chat, 90, 16);
-        assert!(
-            screen.contains("3 earlier tools"),
-            "burst must compact: {screen:?}"
-        );
-        assert!(!screen.contains("tool0"), "oldest card hidden");
-        assert!(!screen.contains("tool2"), "hidden up to the tail window");
-        assert!(screen.contains("tool3"), "tail window starts here");
-        assert!(screen.contains("tool5"), "newest card visible");
-    }
-
-    #[test]
-    fn collapsed_burst_keeps_errors_visible() {
-        let mut chat = ChatComponent::default();
-        for i in 0..5 {
-            chat.turns.push(ok_tool(&format!("tool{i}"), "ok"));
+        let screen = render_chat_to_string(&mut chat, 90, 24);
+        for i in 0..6 {
+            assert!(
+                screen.contains(&format!("tool{i}")),
+                "drawer {i} header must stay visible: {screen:?}"
+            );
         }
-        chat.turns.insert(
-            1,
-            Turn::Tool {
-                id: ocean_agent_sdk::ToolCallId::new_v4(),
-                name: "boom".to_string(),
-                args: String::new(),
-                output: "failed".to_string(),
-                status: ToolStatus::Err,
-                diff: None,
-            },
+        assert!(
+            !screen.contains("earlier tools"),
+            "burst hiding was removed"
         );
-        let screen = render_chat_to_string(&mut chat, 90, 20);
-        assert!(screen.contains("boom"), "error card must never hide");
-        assert!(screen.contains("earlier tools"), "ok cards still compact");
     }
 
     #[test]
-    fn collapsed_diff_body_renders_only_at_tail() {
-        let edit_turn = || Turn::Tool {
+    fn alt_keys_focus_and_toggle_only_the_targeted_drawer() {
+        let mut chat = ChatComponent::default();
+        let alpha = add_tool(&mut chat, "alpha", "x");
+        let beta = add_tool(&mut chat, "beta", "y");
+
+        // First Alt-Down from no focus lands on the first drawer.
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(chat.focused_drawer, Some(alpha.clone()));
+
+        // Alt-Space toggles ONLY the focused drawer (alpha); beta stays closed.
+        chat.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::ALT));
+        assert!(expanded_of(&chat, &alpha), "focused drawer opened");
+        assert!(!expanded_of(&chat, &beta), "untargeted drawer untouched");
+
+        // Alt-Enter toggles it back closed.
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(!expanded_of(&chat, &alpha), "Alt-Enter toggles back");
+
+        // Traversal wraps end-to-end: alpha -> beta -> alpha (last wraps to
+        // first), and Alt-Up from the first wraps back to the last.
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)); // alpha -> beta
+        assert_eq!(chat.focused_drawer, Some(beta.clone()));
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)); // beta -> alpha
+        assert_eq!(chat.focused_drawer, Some(alpha.clone()));
+        chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)); // alpha -> beta
+        assert_eq!(chat.focused_drawer, Some(beta.clone()));
+
+        // Plain Space and Enter never toggle a drawer — the composer owns them.
+        let beta_was = expanded_of(&chat, &beta);
+        chat.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            expanded_of(&chat, &beta),
+            beta_was,
+            "plain keys don't toggle"
+        );
+        assert_eq!(
+            chat.focused_drawer,
+            Some(beta.clone()),
+            "focus unchanged by plain keys"
+        );
+    }
+
+    #[test]
+    fn collapsed_edit_drawer_hides_body_until_opened() {
+        let edit_turn = |open| Turn::Tool {
             id: ocean_agent_sdk::ToolCallId::new_v4(),
             name: "edit".to_string(),
-            args: String::new(),
+            args_json: serde_json::Value::Null,
             output: String::new(),
             status: ToolStatus::Ok,
             diff: Some(crate::shell::diff::string_rows("old_alpha\n", "new_beta\n")),
+            expanded: open,
         };
-        // Tail edit: the hunk stays visible for live feedback.
-        let mut tail = ChatComponent::default();
-        tail.turns.push(edit_turn());
-        let screen = render_chat_to_string(&mut tail, 90, 16);
-        assert!(screen.contains("new_beta"), "tail diff shows its rows");
-        // Followed by assistant text: the card compacts to a one-line summary.
-        let mut done = ChatComponent::default();
-        done.turns.push(edit_turn());
-        done.turns.push(Turn::Assistant("done".to_string()));
-        let screen = render_chat_to_string(&mut done, 90, 16);
+        // Collapsed: just the header — no diff body leaks into the transcript.
+        let mut closed = ChatComponent::default();
+        closed.turns.push(edit_turn(false));
+        let screen = render_chat_to_string(&mut closed, 90, 16);
         assert!(
             !screen.contains("new_beta"),
-            "non-tail diff must compact: {screen:?}"
+            "collapsed drawer hides diff body: {screen:?}"
+        );
+        assert!(screen.contains("edit"), "header still renders");
+        // Per-call open: the bounded diff body paints.
+        let mut open = ChatComponent::default();
+        open.turns.push(edit_turn(true));
+        let screen = render_chat_to_string(&mut open, 90, 16);
+        assert!(
+            screen.contains("new_beta"),
+            "open drawer shows its diff rows"
+        );
+    }
+
+    #[test]
+    fn mouse_click_toggles_the_drawn_header_after_wrap_and_scroll() {
+        // A long assistant line that WRAPS at this narrow width sits above two
+        // tool drawers, pushing their headers down by many wrapped rows; the
+        // tall content also forces nonzero scroll. The click must still hit the
+        // drawer whose header is actually painted under the cursor — the exact
+        // logical-line-vs-wrapped-row trap. We do NOT trust the hit map to find
+        // a header: we scan the RENDERED SCREEN for the tool name, require the
+        // per-frame hit map to land on that same painted row, then click.
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::Assistant("word ".repeat(200)));
+        let beta = add_tool(&mut chat, "beta", "out b");
+        let alpha = add_tool(&mut chat, "alpha", "out a");
+
+        let screen = render_chat_to_string(&mut chat, 40, 24);
+        let row_of = |needle: &str| -> u16 {
+            screen
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} header painted: {screen:?}")) as u16
+        };
+        let alpha_row = row_of("alpha");
+        let beta_row = row_of("beta");
+        assert_ne!(alpha_row, beta_row, "two distinct header rows");
+        // If the hit map mapped logical line index -> row directly, the wrapping
+        // assistant text plus the scroll would put its entry on the WRONG row
+        // and these assertions fail.
+        assert!(
+            chat.drawer_hits.iter().any(|h| h.row == alpha_row),
+            "hit map covers painted alpha row {alpha_row}: {:?}",
+            chat.drawer_hits
         );
         assert!(
-            screen.contains("diff +1"),
-            "compacted card summarizes the hunk: {screen:?}"
+            chat.drawer_hits.iter().any(|h| h.row == beta_row),
+            "hit map covers painted beta row {beta_row}: {:?}",
+            chat.drawer_hits
+        );
+
+        // Click alpha's painted row: only alpha opens.
+        click_row(&mut chat, alpha_row);
+        assert!(expanded_of(&chat, &alpha), "click opened alpha");
+        assert!(
+            !expanded_of(&chat, &beta),
+            "beta untouched by alpha's click"
+        );
+
+        // Re-render: alpha (the bottom-pinned last turn) grew a body, so beta's
+        // header shifts UP. Re-derive beta's row from the NEW screen and click
+        // it — the shifted geometry still routes to beta, and alpha stays open.
+        let screen2 = render_chat_to_string(&mut chat, 40, 24);
+        let beta_row2 = screen2
+            .lines()
+            .position(|l| l.contains("beta"))
+            .unwrap_or_else(|| panic!("beta header painted after alpha opened: {screen2:?}"))
+            as u16;
+        assert_ne!(beta_row2, beta_row, "opening alpha shifted beta up");
+        click_row(&mut chat, beta_row2);
+        assert!(
+            expanded_of(&chat, &beta),
+            "click opened beta at its shifted row"
+        );
+        assert!(
+            expanded_of(&chat, &alpha),
+            "alpha stayed open — drawers are independent"
         );
     }
 
@@ -3800,32 +4344,274 @@ mod tests {
             "non-connect error must not use daemon prefix, got: {msg}"
         );
     }
+
+
     #[test]
-    fn turn_send_failed_timeout_does_not_offer_retry() {
-        let mut chat = ChatComponent::default();
-        chat.update(&Action::TurnSendFailed {
-            prompt: "hi".into(),
-            err: "turn: error sending request for url (http://127.0.0.1:4780/v1/agent/turns): operation timed out"
-                .into(),
-        });
-        assert_eq!(chat.turns.len(), 1, "should push one Assistant turn");
-        let Turn::Assistant(msg) = &chat.turns[0] else {
-            panic!("expected Assistant turn");
+    fn unknown_turn_outcome_never_restores_prompt() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..ChatComponent::default()
         };
+        chat.update(&Action::TurnOutcomeUnknown {
+            err: "turn: operation timed out".into(),
+        });
+
+        assert!(!chat.busy, "unknown response must unwind the spinner");
         assert!(
-            !msg.contains("couldn't reach the daemon"),
-            "timeout must not use the daemon-unreachable prefix, got: {msg}"
+            chat.input.is_empty(),
+            "unknown outcome must not restore a potentially side-effecting prompt"
+        );
+        let Turn::Assistant(msg) = &chat.turns[0] else {
+            panic!("expected warning assistant turn");
+        };
+        assert!(msg.contains("may already be running"));
+        assert!(msg.contains("not restored"));
+    }
+
+    // ── spec step 6: drawer body window, streaming invariance, mouse arming ──
+
+    #[test]
+    fn tool_runs_single_space_across_hidden_thinking() {
+        // Tool -> suppressed Thinking -> Tool must render ADJACENT headers:
+        // the hidden thinking emits nothing, so it must not break the run.
+        // A non-tool boundary (user turn above) keeps its blank separator.
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::User("go".into()));
+        let _a = add_tool(&mut chat, "alpha", "out a");
+        chat.turns.push(Turn::Thinking("hidden reasoning".into()));
+        let _b = add_tool(&mut chat, "beta", "out b");
+        let screen = render_chat_to_string(&mut chat, 80, 20);
+        let rows: Vec<&str> = screen.lines().collect();
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not painted: {screen:?}"))
+        };
+        let (user_row, a_row, b_row) = (row_of("go"), row_of("alpha"), row_of("beta"));
+        assert_eq!(
+            b_row,
+            a_row + 1,
+            "hidden thinking must not double-space a tool run"
         );
         assert!(
-            !msg.contains("press ⏎ to retry"),
-            "timeout must not offer a blind retry (double-submit trap), got: {msg}"
+            a_row > user_row + 1,
+            "user -> tool boundary keeps its blank separator"
+        );
+    }
+
+    #[test]
+    fn open_drawer_marker_paints_above_the_tail_and_oldest_rows_are_hidden() {
+        // 45 output lines in an open drawer: exactly the newest 40 paint, the
+        // "5 earlier lines" omission marker sits ABOVE the tail (the omitted
+        // rows are chronologically older than every visible one), and the
+        // oldest line's text is gone from the screen entirely.
+        let mut chat = ChatComponent::default();
+        let out: String = (1..=45).map(|i| format!("row-{i:03}\n")).collect();
+        let id = add_tool(&mut chat, "bash", &out);
+        chat.toggle_drawer(&id);
+        let screen = render_chat_to_string(&mut chat, 80, 55);
+
+        let body_rows = screen.lines().filter(|l| l.contains("row-0")).count();
+        assert_eq!(body_rows, 40, "exactly DRAWER_BODY_ROWS tail rows paint");
+        assert!(
+            !screen.contains("row-001"),
+            "oldest hidden line never paints"
+        );
+        let marker_idx = screen
+            .lines()
+            .position(|l| l.contains("5 earlier lines"))
+            .expect("omission marker painted");
+        let first_tail_idx = screen
+            .lines()
+            .position(|l| l.contains("row-006"))
+            .expect("oldest visible tail row painted");
+        assert!(
+            marker_idx < first_tail_idx,
+            "marker (row {marker_idx}) must paint ABOVE the tail (first tail row {first_tail_idx})"
+        );
+    }
+
+    #[test]
+    fn open_running_tool_with_empty_output_shows_placeholder() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(Turn::Tool {
+            id: ocean_agent_sdk::ToolCallId::new_v4(),
+            name: "bash".to_string(),
+            args_json: serde_json::Value::Null,
+            output: String::new(),
+            status: ToolStatus::Running,
+            diff: None,
+            expanded: true,
+        });
+        let screen = render_chat_to_string(&mut chat, 80, 12);
+        assert!(
+            screen.contains("(no output yet)"),
+            "open Running drawer with no output shows the placeholder: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_events_never_flip_a_calls_local_expanded() {
+        use ocean_agent_sdk::{ToolCall, ToolResult};
+        let sid = AgentSessionId::new_v4();
+        let tid = AgentTurnId::new_v4();
+        let cid = ocean_agent_sdk::ToolCallId::new_v4();
+        let started = |id: &ToolCallId| {
+            Action::AgentEvent(Box::new(AgentTurnEvent::ToolCallStarted {
+                session_id: sid,
+                turn_id: tid,
+                call: ToolCall {
+                    id: id.clone(),
+                    name: "bash".to_string(),
+                    args_json: serde_json::Value::Null,
+                },
+            }))
+        };
+        let chunk = |id: &ToolCallId| {
+            Action::AgentEvent(Box::new(AgentTurnEvent::ToolCallChunk {
+                session_id: sid,
+                turn_id: tid,
+                call_id: id.clone(),
+                chunk: "streamed\n".to_string(),
+            }))
+        };
+        let finished = |id: &ToolCallId| {
+            Action::AgentEvent(Box::new(AgentTurnEvent::ToolCallFinished {
+                session_id: sid,
+                turn_id: tid,
+                call_id: id.clone(),
+                result: ToolResult {
+                    ok: true,
+                    output: "done".to_string(),
+                    metadata_json: None,
+                },
+            }))
+        };
+
+        let mut chat = ChatComponent::default();
+        chat.update(&started(&cid));
+        assert!(!expanded_of(&chat, &cid), "a Running tool starts closed");
+
+        // Opened locally: chunks and completion must not flip it back.
+        chat.toggle_drawer(&cid);
+        chat.update(&chunk(&cid));
+        assert!(
+            expanded_of(&chat, &cid),
+            "ToolCallChunk must not flip expanded"
+        );
+        chat.update(&finished(&cid));
+        assert!(
+            expanded_of(&chat, &cid),
+            "ToolCallFinished must not flip expanded"
+        );
+
+        // Left closed: streaming must not open it either.
+        let cid2 = ocean_agent_sdk::ToolCallId::new_v4();
+        chat.update(&started(&cid2));
+        chat.update(&chunk(&cid2));
+        chat.update(&finished(&cid2));
+        assert!(
+            !expanded_of(&chat, &cid2),
+            "streaming must never open a closed drawer"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_override_opens_bodies_while_local_state_stays_independent() {
+        let mut chat = ChatComponent::default();
+        let alpha = add_tool(&mut chat, "alpha", "alpha-body-text");
+        let beta = add_tool(&mut chat, "beta", "beta-body-text");
+
+        // Global ⌃O: both bodies paint even though every local flag is closed.
+        chat.handle_key(ctrl('o'));
+        let screen = render_chat_to_string(&mut chat, 80, 24);
+        assert!(screen.contains("alpha-body-text"), "⌃O opens alpha's body");
+        assert!(screen.contains("beta-body-text"), "⌃O opens beta's body");
+        assert!(
+            !expanded_of(&chat, &alpha) && !expanded_of(&chat, &beta),
+            "the global override never rewrites per-call local flags"
+        );
+
+        // Override off: local state is still independent afterward.
+        chat.handle_key(ctrl('o'));
+        chat.toggle_drawer(&alpha);
+        let screen = render_chat_to_string(&mut chat, 80, 24);
+        assert!(screen.contains("alpha-body-text"), "local open survives ⌃O");
+        assert!(
+            !screen.contains("beta-body-text"),
+            "beta stays closed — locals are independent"
+        );
+    }
+
+    #[test]
+    fn click_during_active_overlay_does_not_toggle_drawer() {
+        let mut chat = ChatComponent::default();
+        let id = add_tool(&mut chat, "alpha", "x");
+        let screen = render_chat_to_string(&mut chat, 80, 16);
+        let row = screen
+            .lines()
+            .position(|l| l.contains("alpha"))
+            .expect("header painted") as u16;
+
+        // ⌃R search overlay up: its rows paint OVER the transcript, so a click
+        // on the header row must not fall through to the drawer underneath.
+        chat.search = Some(HistorySearch::default());
+        click_row(&mut chat, row);
+        assert!(
+            !expanded_of(&chat, &id),
+            "search-overlay click fell through"
+        );
+
+        // `/` palette up: same guard.
+        chat.search = None;
+        chat.input = "/mod".into();
+        click_row(&mut chat, row);
+        assert!(
+            !expanded_of(&chat, &id),
+            "palette-overlay click fell through"
+        );
+
+        // Overlays dismissed: the very same click toggles again.
+        chat.input.clear();
+        click_row(&mut chat, row);
+        assert!(expanded_of(&chat, &id), "plain click still toggles");
+    }
+
+    #[test]
+    fn down_drag_up_sweep_does_not_toggle_drawer() {
+        // A drag-to-select-text gesture arms on the same Down as a click; the
+        // Drag in between must disarm the pending toggle so sweeping a text
+        // selection across a header never flips it.
+        let mut chat = ChatComponent::default();
+        let id = add_tool(&mut chat, "alpha", "x");
+        let screen = render_chat_to_string(&mut chat, 80, 16);
+        let row = screen
+            .lines()
+            .position(|l| l.contains("alpha"))
+            .expect("header painted") as u16;
+
+        chat.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row));
+        chat.handle_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), row));
+        chat.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), row));
+        assert!(
+            !expanded_of(&chat, &id),
+            "a selection sweep is not a click — no toggle"
+        );
+        assert!(chat.focused_drawer.is_none(), "sweep must not steal focus");
+    }
+
+    #[test]
+    fn palette_render_contains_no_diamond_glyph() {
+        let mut chat = chat_with("/");
+        let screen = render_chat_to_string(&mut chat, 80, 24);
+        assert!(
+            screen.contains("commands"),
+            "palette popup painted: {screen:?}"
         );
         assert!(
-            msg.contains("didn't answer in time"),
-            "timeout should render the honest timeout notice, got: {msg}"
+            !screen.contains('◆'),
+            "no decorative diamond anywhere on the palette screen"
         );
-        // Must NOT restore the prompt into the composer — that's the
-        // double-submit affordance the original bug surfaced.
-        assert_eq!(chat.input, "", "timeout must not restore the prompt");
+
     }
 }

@@ -277,6 +277,14 @@ pub enum AgentEvent {
     TurnEnd {
         session_id: Option<String>,
     },
+    /// A provider round reached a transcript-valid boundary. `messages` contains
+    /// only the newly completed assistant/tool-result rows since the previous
+    /// checkpoint, in provider-valid order. The session layer persists these
+    /// deltas so a later interruption cannot erase an entire long tool chain.
+    TurnCheckpoint {
+        session_id: Option<String>,
+        messages: Vec<Message>,
+    },
     AssistantMessage {
         session_id: Option<String>,
         message: Message,
@@ -376,6 +384,7 @@ impl AgentEvent {
             | AgentEvent::AgentEnd { session_id, .. }
             | AgentEvent::TurnStart { session_id }
             | AgentEvent::TurnEnd { session_id }
+            | AgentEvent::TurnCheckpoint { session_id, .. }
             | AgentEvent::AssistantMessage { session_id, .. }
             | AgentEvent::UserMessage { session_id, .. }
             | AgentEvent::TextDelta { session_id, .. }

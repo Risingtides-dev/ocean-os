@@ -6,13 +6,7 @@
 use std::path::Path;
 
 use crossterm::event::KeyEvent;
-use ratatui::{
-    layout::Rect,
-    style::Style,
-    text::Span,
-    widgets::{Block, Paragraph},
-    Frame,
-};
+use ratatui::{layout::Rect, style::Style, widgets::Block, Frame};
 use tui_term::widget::PseudoTerminal;
 
 use crate::shell::{action::Action, component::Component, panel, pty::TermPane, theme};
@@ -95,23 +89,11 @@ impl Component for PtyComponent {
             body,
         );
 
-        match self.term.as_mut() {
-            Some(t) => {
-                t.resize(body.height.max(2), body.width.max(8));
-                frame.render_widget(PseudoTerminal::new(t.parser.screen()), body);
-                panel::footer(frame, area, " live shell · keys pass through");
-            }
-            None => {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        " ⌃⌥1 sessions, then t to hydrate one here",
-                        Style::default().fg(theme::COMMENT),
-                    ))
-                    .style(Style::default().bg(theme::BG_DARK)),
-                    body,
-                );
-                panel::footer(frame, area, " no shell yet");
-            }
+        if let Some(t) = self.term.as_mut() {
+            t.resize(body.height.max(2), body.width.max(8));
+            frame.render_widget(PseudoTerminal::new(t.parser.screen()), body);
         }
+        // Reserved footer row stays for stable panel geometry; nothing to say.
+        panel::footer(frame, area, "");
     }
 }

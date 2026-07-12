@@ -584,12 +584,14 @@ async fn multi_round_tool_loop_runs_tool_then_completes() {
 // Scenario 4 — Cancellation mid-loop.
 // The loop checks the cancel token between rounds and mid-stream. We cancel
 // after round 1's tool call, so round 2 must never run and the loop unwinds with
-// `Cancelled` — without leaving an orphan tool_use (the tool result for round 1
-// was already appended).
+// `Cancelled` — without leaving an orphan tool_use. Cancellation becomes ready
+// at the exact tool-completion boundary, so the runtime must checkpoint a
+// conservative consumed/error result before returning.
 // ===========================================================================
 #[tokio::test]
 async fn cancel_after_tool_round_unwinds_clean_no_orphan() {
     let ran = Arc::new(AtomicUsize::new(0));
+    let later_ran = Arc::new(AtomicUsize::new(0));
     let token = CancellationToken::new();
 
     // A tool whose execution cancels the run — simulating a halt arriving while
@@ -617,10 +619,34 @@ async fn cancel_after_tool_round_unwinds_clean_no_orphan() {
         }
     }
 
+    // A later exclusive barrier that must never execute after the first tool
+    // cancels, but whose assistant tool call still needs a synthetic result in
+    // the durable checkpoint.
+    struct NeverTool(Arc<AtomicUsize>);
+    #[async_trait]
+    impl AgentTool for NeverTool {
+        fn name(&self) -> &str {
+            "later"
+        }
+        fn description(&self) -> &str {
+            "must not run after cancellation"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(AgentToolResult::text("unexpected"))
+        }
+    }
+
     let provider = Arc::new(MockProvider::new(vec![
-        // Round 1: a tool call.
+        // Round 1: cancelling tool followed by a later exclusive barrier.
         vec![done(
-            vec![tool_call("call-1", "echo", serde_json::json!({}))],
+            vec![
+                tool_call("call-1", "echo", serde_json::json!({})),
+                tool_call("call-2", "later", serde_json::json!({})),
+            ],
             StopReason::ToolUse,
         )],
         // Round 2 should NEVER be requested — the cancel check fires first. If
@@ -632,13 +658,17 @@ async fn cancel_after_tool_round_unwinds_clean_no_orphan() {
         )],
     ]));
 
-    let mut cfg = base_config(provider.clone()).with_tools(vec![Arc::new(CancellingTool {
-        ran: ran.clone(),
-        token: token.clone(),
-    })]);
+    let mut cfg = base_config(provider.clone()).with_tools(vec![
+        Arc::new(CancellingTool {
+            ran: ran.clone(),
+            token: token.clone(),
+        }),
+        Arc::new(NeverTool(later_ran.clone())),
+    ]);
     cfg.stream_options.cancel = Some(token);
 
-    let err = ocean_runtime::run_agent(&cfg, user("use the tool then we halt"), None)
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let err = ocean_runtime::run_agent(&cfg, user("use the tool then we halt"), Some(tx))
         .await
         .err()
         .expect("a cancel after the tool round must unwind with Err(Cancelled)");
@@ -651,10 +681,38 @@ async fn cancel_after_tool_round_unwinds_clean_no_orphan() {
     // provider — the between-rounds cancel check stopped the loop.
     assert_eq!(ran.load(Ordering::SeqCst), 1);
     assert_eq!(
+        later_ran.load(Ordering::SeqCst),
+        0,
+        "later execution barrier must not start after cancellation"
+    );
+    assert_eq!(
         provider.call_count(),
         1,
         "round 2 must not have been requested after cancel"
     );
+
+    let mut checkpoint = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentEvent::TurnCheckpoint { messages, .. } = event {
+            checkpoint = Some(messages);
+        }
+    }
+    let checkpoint = checkpoint.expect("cancelled tool batch must be checkpointed");
+    assert_eq!(
+        checkpoint.len(),
+        3,
+        "assistant batch + both ordered results stay paired"
+    );
+    assert!(matches!(checkpoint[0], Message::Assistant(_)));
+    assert!(matches!(
+        &checkpoint[1],
+        Message::ToolResult(result) if result.tool_call_id == "call-1"
+    ));
+    assert!(matches!(
+        &checkpoint[2],
+        Message::ToolResult(result)
+            if result.is_error && result.tool_call_id == "call-2"
+    ));
 }
 
 // ===========================================================================

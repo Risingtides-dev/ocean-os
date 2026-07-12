@@ -24,21 +24,52 @@ use ocean_core::{
 };
 use tokio::sync::mpsc;
 
-use super::action::Action;
+use super::action::{Action, HealthSource};
+
+/// Submission certainty matters because a turn may contain side-effecting
+/// tools. Only `DefinitelyUnsent` is safe to retry/restore automatically;
+/// `OutcomeUnknown` means the daemon may already be executing the prompt.
+#[derive(Debug)]
+pub enum TurnSubmitError {
+    DefinitelyUnsent(String),
+    Rejected(String),
+    OutcomeUnknown(String),
+}
+
+impl std::fmt::Display for TurnSubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefinitelyUnsent(message)
+            | Self::Rejected(message)
+            | Self::OutcomeUnknown(message) => f.write_str(message),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DaemonClient {
+    /// Short-lived health/control/session requests.
     http: reqwest::Client,
+    /// Fire-and-ack turn submission. This client has a long deadman timeout for
+    /// a wedged daemon, but normal turns return as soon as they are accepted and
+    /// continue over SSE.
+    turn_http: reqwest::Client,
     base: String,
 }
 
 impl DaemonClient {
     pub fn new(base_url: &str) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
+            .build()?;
+        let turn_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(1800))
             .build()?;
         Ok(Self {
             http,
+            turn_http,
             base: base_url.trim_end_matches('/').to_string(),
         })
     }
@@ -83,43 +114,77 @@ impl DaemonClient {
         self.post_json_retrying(&url, &req, on_retry).await
     }
 
-    pub async fn agent_turn(&self, req: &AgentTurnRequest) -> Result<AgentTurnResponse, String> {
+    pub async fn agent_turn(
+        &self,
+        req: &AgentTurnRequest,
+    ) -> Result<AgentTurnResponse, TurnSubmitError> {
         self.agent_turn_retrying(req, |_, _| {}).await
     }
 
-    /// Submit a turn, riding out a daemon blip (restart/redeploy) instead of
-    /// failing the operator's prompt with a hard error. Retries ONLY
-    /// connect-class failures — connection refused/reset means the request
-    /// never reached a daemon, so a retry can't double-submit a turn. HTTP
-    /// status errors, timeouts, and decode errors surface immediately (the
-    /// daemon spoke, or may have started processing — retrying those is not
-    /// idempotent-safe). `on_retry(attempt, total)` fires before each backoff
-    /// sleep so the caller can show "retrying…" progress. The schedule spans
-    /// ~15.5s, comfortably covering the ~8s launchd respawn.
-    ///
-    /// Timeout note: the POST is fire-and-ack — the daemon returns an
-    /// [`AgentTurnResponse`] (`turn_id` + `event_id_prefix` to correlate with the
-    /// SSE stream) as soon as the turn is ACCEPTED, not when it finishes; turn
-    /// output flows over the separate `/v1/agent/events` stream (which overrides
-    /// this timeout with an effectively-infinite cap — see
-    /// [`Self::spawn_event_stream`]). The 1800s ceiling here is a dead safety net:
-    /// it should never fire for the ACK (the daemon responds in milliseconds),
-    /// and only trips if the daemon is truly wedged/unreachable — in which case
-    /// `errfmt` renders an honest "didn't answer in time / couldn't reach the
-    /// daemon". Kept long rather than removed so a misbehaving daemon can't hold a
-    /// connection open forever.
+    /// Submit a fire-and-ack turn, riding out a daemon restart without risking
+    /// duplicate side effects. Only connect failures are retried; they prove no
+    /// HTTP connection existed. Once connected, any timeout, transport, decode,
+    /// or 5xx failure has an unknown outcome and must not be replayed. The daemon
+    /// normally returns an [`AgentTurnResponse`] immediately after acceptance,
+    /// while output continues over `/v1/agent/events`; the 1800-second timeout is
+    /// only a deadman for a wedged acknowledgement path.
     pub async fn agent_turn_retrying(
         &self,
         req: &AgentTurnRequest,
-        on_retry: impl FnMut(usize, usize),
-    ) -> Result<AgentTurnResponse, String> {
+        mut on_retry: impl FnMut(usize, usize),
+    ) -> Result<AgentTurnResponse, TurnSubmitError> {
+        const RETRY_DELAYS_MS: &[u64] = &[500, 1000, 2000, 3000, 4000, 5000];
+        let total = RETRY_DELAYS_MS.len() + 1;
         let url = format!("{}/v1/agent/turns", self.base);
-        self.post_json_retrying(&url, req, on_retry).await
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let response = match self.turn_http.post(&url).json(req).send().await {
+                Ok(response) => response,
+                Err(error) if error.is_connect() && attempt < total => {
+                    on_retry(attempt, total);
+                    tokio::time::sleep(Duration::from_millis(RETRY_DELAYS_MS[attempt - 1])).await;
+                    continue;
+                }
+                Err(error) if error.is_connect() => {
+                    return Err(TurnSubmitError::DefinitelyUnsent(format!(
+                        "daemon unreachable after {attempt} attempts: {error}"
+                    )));
+                }
+                Err(error) => {
+                    return Err(TurnSubmitError::OutcomeUnknown(error.to_string()));
+                }
+            };
+
+            let status = response.status();
+            // Ocean uses HTTP 408 only after the runtime has actually executed
+            // and emitted a failed TurnFinished. Its JSON body is therefore a
+            // normal known terminal response, not an admission rejection.
+            if status_proves_turn_rejection(status) {
+                return Err(TurnSubmitError::Rejected(
+                    response
+                        .error_for_status()
+                        .expect_err("4xx response must be an error")
+                        .to_string(),
+                ));
+            }
+            if status.is_server_error() {
+                return Err(TurnSubmitError::OutcomeUnknown(
+                    response
+                        .error_for_status()
+                        .expect_err("5xx response must be an error")
+                        .to_string(),
+                ));
+            }
+            return response
+                .json::<AgentTurnResponse>()
+                .await
+                .map_err(|error| TurnSubmitError::OutcomeUnknown(error.to_string()));
+        }
     }
 
     /// POST `body` as JSON and decode a JSON response, retrying connect-class
-    /// transport failures on [`RETRY_DELAYS_MS`] backoff. Shared engine for the
-    /// turn + session-mint paths.
+    /// transport failures on [`RETRY_DELAYS_MS`] backoff. Used for session mint.
     async fn post_json_retrying<B: serde::Serialize, T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -135,8 +200,8 @@ impl DaemonClient {
             let sent = self.http.post(url).json(body).send().await;
             match sent.and_then(|r| r.error_for_status()) {
                 Ok(resp) => return resp.json::<T>().await.map_err(|e| e.to_string()),
-                // Connection refused/reset: the daemon is down or mid-restart
-                // and the request never landed — safe to retry.
+                // No connection was established: the daemon is down or
+                // mid-restart and the request never landed — safe to retry.
                 Err(e) if e.is_connect() && attempt < total => {
                     on_retry(attempt, total);
                     tokio::time::sleep(Duration::from_millis(RETRY_DELAYS_MS[attempt - 1])).await;
@@ -180,7 +245,6 @@ impl DaemonClient {
         );
         tokio::spawn(async move {
             let mut last_event_id: Option<String> = None;
-            let mut first = true;
             loop {
                 // The client's default 120s TOTAL timeout would kill a live
                 // SSE body after 2 minutes (the original silent-stream-death
@@ -193,12 +257,9 @@ impl DaemonClient {
                 }
                 match req.send().await.and_then(|r| r.error_for_status()) {
                     Ok(resp) => {
-                        let _ = actions.send(Action::Status(if first {
-                            "stream connected".into()
-                        } else {
-                            "stream reconnected".into()
-                        }));
-                        first = false;
+                        // Typed recovery: clears ONLY the SSE source — no
+                        // connected/reconnected success text is rendered.
+                        let _ = actions.send(Action::HealthRecovered(HealthSource::Sse));
                         let mut stream = resp.bytes_stream();
                         let mut buf = String::new();
                         while let Some(chunk) = stream.next().await {
@@ -216,16 +277,16 @@ impl DaemonClient {
                             }
                         }
                     }
-                    Err(e) => {
-                        if first {
-                            let _ = actions.send(Action::Error(format!("stream: {e}")));
-                            first = false;
-                        }
-                    }
+                    Err(_) => {}
                 }
-                // Dropped (or failed to connect): brief backoff, then resubscribe
-                // with the last seen id so the daemon replays what we missed.
-                let _ = actions.send(Action::Status("stream reconnecting…".into()));
+                // Dropped (or failed to connect): mark the SSE source degraded,
+                // brief backoff, then resubscribe with the last seen id so the
+                // daemon replays what we missed. The typed transition persists
+                // until THIS source reconnects — unrelated notices can't clear it.
+                let _ = actions.send(Action::HealthDegraded {
+                    source: HealthSource::Sse,
+                    condition: "stream reconnecting".into(),
+                });
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         })
@@ -442,6 +503,10 @@ fn parse_sse_data<T: serde::de::DeserializeOwned>(frame: &str) -> Option<T> {
 
 /// Pull the `data:` payload(s) out of one SSE frame and decode the JSON
 /// `AgentTurnEvent`. Ignores `id:`/`event:`/comment lines.
+fn status_proves_turn_rejection(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
 fn parse_sse_frame(frame: &str) -> Option<AgentTurnEvent> {
     let mut data = String::new();
     for line in frame.lines() {
@@ -458,6 +523,23 @@ fn parse_sse_frame(frame: &str) -> Option<AgentTurnEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pre_execution_4xx_statuses_are_rejections() {
+        assert!(status_proves_turn_rejection(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(status_proves_turn_rejection(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(
+            !status_proves_turn_rejection(reqwest::StatusCode::REQUEST_TIMEOUT),
+            "Ocean 408 is emitted only after turn execution"
+        );
+        assert!(!status_proves_turn_rejection(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
 
     #[test]
     fn parses_data_frame_ignoring_id_and_comments() {
