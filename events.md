@@ -2377,4 +2377,12 @@ area:      [backend]
 
 Fixed Ocean's GPT-5.6 Codex prompt-cache identity after an exact Luna/high benchmark showed Ocean at 83,159 fresh input tokens and only 15,360 cache-read tokens versus Codex CLI at 28,566 fresh and 173,312 cached. The runtime now threads its stable `AgentConfig::session_id` into every provider round; the Codex provider sends that id as both `prompt_cache_key` and the HTTP `session_id`, retaining a random UUID only for ad-hoc calls. Focused protocol/runtime regressions cover request serialization and runtime propagation. The exact rerun stayed 6/6 and improved Ocean to 17,926 fresh input with 118,272 cached (86.8% hit rate), beating Codex CLI's 24,763 fresh input and estimated API-equivalent cost while retaining a 63.8MB versus 381.7MB marginal-memory advantage. Ocean remained slower on this sample (87.662s versus 55.958s). Verification: 283 protocol/runtime tests, `cargo check --workspace`, and `cargo fmt --check`.
 _________________________________________________________________________________
+time:      [07:39pm] [12-07-26]
+agent:     [omp], [gpt-5.6-sol]
+worktree:  main
+type:      [refactor]
+area:      [backend]
+
+Removed the competing legacy `edit` tool from hashline-enabled Ocean sessions while preserving it for plain Web/Voice and unbound profiles; `write` remains universal. TUI, CLI/default, and future ACP sessions now receive one coherent surgical editor, `hashline_edit`, so the model cannot stochastically downgrade to repeated single-replacement edits instead of a batched multi-file patch. Added red/green capability tests for both profile contracts and retained the existing read-to-hashline integration coverage. Verification: 162 ocean-runtime tests, three hashline wiring tests, `cargo check --workspace`, and `cargo fmt --check`.
+_________________________________________________________________________________
 

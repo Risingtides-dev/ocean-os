@@ -206,6 +206,12 @@ impl CapabilityProvider for BuiltinProvider {
         //   session the daemon stored the fetched content under, so a `read`
         //   surfaces real content instead of `pending_bridge`.
         if let Some(session_id) = &ctx.session_id {
+            // A hashline session gets one surgical editor, not a weaker
+            // competing fallback. Plain profiles retain `edit`; unbound
+            // contexts cannot support snapshot-scoped hashline edits.
+            if ctx.hashline {
+                tools.retain(|tool| tool.name() != "edit");
+            }
             for tool in tools.iter_mut() {
                 match tool.name() {
                     "component_wait" => {
@@ -532,6 +538,29 @@ mod tests {
         let got = provider.tools(&ctx()).await;
         let expected = default_tools();
         assert_eq!(names(&got), names(&expected));
+    }
+
+    #[tokio::test]
+    async fn hashline_profile_offers_one_surgical_editor() {
+        let provider = BuiltinProvider::new();
+        let mut context = ctx();
+        context.hashline = true;
+
+        let got = names(&provider.tools(&context).await);
+
+        assert!(got.contains(&"hashline_edit".to_string()));
+        assert!(!got.contains(&"edit".to_string()));
+        assert!(got.contains(&"write".to_string()));
+    }
+
+    #[tokio::test]
+    async fn plain_profile_keeps_legacy_editor() {
+        let provider = BuiltinProvider::new();
+        let got = names(&provider.tools(&ctx()).await);
+
+        assert!(got.contains(&"edit".to_string()));
+        assert!(!got.contains(&"hashline_edit".to_string()));
+        assert!(got.contains(&"write".to_string()));
     }
 
     #[tokio::test]
