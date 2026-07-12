@@ -228,6 +228,16 @@ fn incomplete_is_length_cap(reason: Option<&str>) -> bool {
     reason == Some("max_output_tokens")
 }
 
+fn stable_session_id(options: &StreamOptions) -> Option<&str> {
+    options.session_id.as_deref().filter(|id| !id.is_empty())
+}
+
+fn request_session_id(options: &StreamOptions) -> String {
+    stable_session_id(options)
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     // OCEAN-165: do NOT set `parallel_tool_calls`. The Codex backend speaks the
     // OpenAI Responses API, which accepts this param and defaults it to `true`
@@ -244,6 +254,9 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         "store": false,
         "stream": true,
     });
+    if let Some(session_id) = stable_session_id(options) {
+        body["prompt_cache_key"] = json!(session_id);
+    }
     if let Some(sp) = &context.system_prompt {
         body["instructions"] = json!(sp);
     }
@@ -555,6 +568,9 @@ impl Provider for CodexProvider {
         let url = format!("{}/responses", base_url.trim_end_matches('/'));
         let body = build_body(model, context, options);
         let cancel = options.cancel.clone();
+        // Keep the same request identity across retries. Agent sessions provide
+        // a stable id across every model round; ad-hoc calls get one random id.
+        let session_id = request_session_id(options);
 
         let resp = with_retry(retry_config(), cancel.as_ref(), |_| {
             let client = self.client.clone();
@@ -562,8 +578,8 @@ impl Provider for CodexProvider {
             let access = access.clone();
             let account_id = account_id.clone();
             let body = body.clone();
+            let session_id = session_id.clone();
             async move {
-                let session_id = uuid::Uuid::new_v4().to_string();
                 let req = apply_request_headers(
                     client.post(&url),
                     &access,
@@ -1103,6 +1119,22 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
+    }
+    #[test]
+    fn build_body_uses_stable_session_as_prompt_cache_key() {
+        let options = StreamOptions {
+            session_id: Some("session-stable-123".into()),
+            ..StreamOptions::default()
+        };
+
+        let body = build_body(&codex_model(), &Context::default(), &options);
+
+        assert_eq!(body["prompt_cache_key"], "session-stable-123");
+        assert_eq!(
+            request_session_id(&options),
+            "session-stable-123",
+            "the HTTP session header must use the same stable identity"
+        );
     }
 
     // OCEAN-176: Codex (OpenAI Responses API) must emit the operator's output cap

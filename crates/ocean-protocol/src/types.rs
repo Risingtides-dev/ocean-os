@@ -185,6 +185,10 @@ pub struct StreamOptions {
     pub max_tokens: Option<u32>,
     pub api_key: Option<String>,
     pub reasoning: Option<ThinkingLevel>,
+    /// Stable identity for one agent session. Providers may use this for prompt
+    /// cache routing and request correlation across multiple model rounds.
+    pub session_id: Option<String>,
+
     /// Cancellation token honored by the provider HTTP client and SSE loop.
     pub cancel: Option<tokio_util::sync::CancellationToken>,
     /// Override base URL (used by OpenAI-compatible passthrough providers).

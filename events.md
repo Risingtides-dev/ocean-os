@@ -2369,4 +2369,12 @@ area:      [backend]
 
 Fixed two provider-wire failures exposed by the harness benchmark. Codex OAuth requests now send the current Codex CLI `version` header; the ChatGPT backend had returned a misleading 404 “Model not found” for GPT-5.6 Luna when that header was absent. Anthropic extended thinking now clamps `budget_tokens` below the request's `max_tokens` cap; Haiku 4.5 high effort had sent 16384 for both fields and received a 400. Added focused serialization/header regression tests, ran all 122 ocean-protocol tests, `cargo check --workspace`, and `cargo fmt --check`; rebuilt and restarted the supervised daemon. Live high-effort benchmark reruns completed 6/6 for GPT-5.6 Luna (46.224s) and Claude Haiku 4.5 (53.698s).
 _________________________________________________________________________________
+time:      [06:05pm] [12-07-26]
+agent:     [omp], [gpt-5.6-sol]
+worktree:  main
+type:      [bug-report]
+area:      [backend]
+
+Fixed Ocean's GPT-5.6 Codex prompt-cache identity after an exact Luna/high benchmark showed Ocean at 83,159 fresh input tokens and only 15,360 cache-read tokens versus Codex CLI at 28,566 fresh and 173,312 cached. The runtime now threads its stable `AgentConfig::session_id` into every provider round; the Codex provider sends that id as both `prompt_cache_key` and the HTTP `session_id`, retaining a random UUID only for ad-hoc calls. Focused protocol/runtime regressions cover request serialization and runtime propagation. The exact rerun stayed 6/6 and improved Ocean to 17,926 fresh input with 118,272 cached (86.8% hit rate), beating Codex CLI's 24,763 fresh input and estimated API-equivalent cost while retaining a 63.8MB versus 381.7MB marginal-memory advantage. Ocean remained slower on this sample (87.662s versus 55.958s). Verification: 283 protocol/runtime tests, `cargo check --workspace`, and `cargo fmt --check`.
+_________________________________________________________________________________
 

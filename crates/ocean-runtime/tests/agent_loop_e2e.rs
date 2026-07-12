@@ -14,7 +14,7 @@
 //! - Multi-round tool loop: tool_use → tool runs → final text → clean completion.
 //! - Cancellation: a cancel mid-loop unwinds with `Cancelled`, no orphan call.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -46,6 +46,7 @@ type Turn = Vec<AssistantMessageEvent>;
 struct MockProvider {
     turns: std::sync::Mutex<std::collections::VecDeque<Turn>>,
     calls: AtomicUsize,
+    saw_bound_session_id: AtomicBool,
 }
 
 impl MockProvider {
@@ -53,11 +54,16 @@ impl MockProvider {
         Self {
             turns: std::sync::Mutex::new(turns.into()),
             calls: AtomicUsize::new(0),
+            saw_bound_session_id: AtomicBool::new(false),
         }
     }
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn saw_bound_session_id(&self) -> bool {
+        self.saw_bound_session_id.load(Ordering::SeqCst)
     }
 }
 
@@ -67,8 +73,12 @@ impl Provider for MockProvider {
         &self,
         _model: &Model,
         _context: &Context,
-        _options: &StreamOptions,
+        options: &StreamOptions,
     ) -> ocean_protocol::Result<AssistantMessageEventStream> {
+        self.saw_bound_session_id.store(
+            options.session_id.as_deref() == Some("e2e"),
+            Ordering::SeqCst,
+        );
         self.calls.fetch_add(1, Ordering::SeqCst);
         let turn = self.turns.lock().unwrap().pop_front().expect(
             "MockProvider ran out of scripted turns — loop requested more rounds than scripted",
@@ -255,6 +265,24 @@ fn base_config(provider: Arc<MockProvider>) -> AgentConfig {
     AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test system")
         .with_session_id("e2e")
         .with_provider(provider)
+}
+
+#[tokio::test]
+async fn session_identity_reaches_every_provider_round() {
+    let provider = Arc::new(MockProvider::new(vec![vec![done(
+        vec![Content::text("done")],
+        StopReason::Stop,
+    )]]));
+    let cfg = base_config(provider.clone());
+
+    ocean_runtime::run_agent(&cfg, user("finish"), None)
+        .await
+        .expect("agent run succeeds");
+
+    assert!(
+        provider.saw_bound_session_id(),
+        "AgentConfig.session_id must reach StreamOptions for provider cache identity"
+    );
 }
 
 // ===========================================================================

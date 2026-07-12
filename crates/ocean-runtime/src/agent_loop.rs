@@ -151,6 +151,9 @@ pub async fn run_agent_with_history(
         };
 
         let mut options = config.stream_options.clone();
+        if config.session_id.is_some() {
+            options.session_id.clone_from(&config.session_id);
+        }
         if options.reasoning.is_none()
             && config.thinking_level != ocean_protocol::ThinkingLevel::Off
         {

@@ -20,6 +20,10 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Anthropic extended-thinking requests must keep `budget_tokens` at least 1024
   and strictly below `max_tokens`; preserve explicit output caps by clamping the
   thinking budget rather than raising the cap.
+- Codex OAuth turns with a bound Ocean session must use that stable session id
+  for both `prompt_cache_key` and the HTTP `session_id`; a fresh UUID is only
+  valid for ad-hoc provider calls with no session.
+
 
 
 ## Work Guidance
