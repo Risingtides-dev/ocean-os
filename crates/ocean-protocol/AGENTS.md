@@ -15,6 +15,12 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Keep provider-specific behavior isolated behind protocol abstractions.
 - Do not leak provider quirks into shared `ocean-core` types unless the shared contract intentionally changes.
 - Treat streaming event shape changes as compatibility-sensitive.
+- Codex OAuth requests using the `codex_cli_rs` originator must carry a current
+  `version` header; ChatGPT version-gates newly released Codex models.
+- Anthropic extended-thinking requests must keep `budget_tokens` at least 1024
+  and strictly below `max_tokens`; preserve explicit output caps by clamping the
+  thinking budget rather than raising the cap.
+
 
 ## Work Guidance
 

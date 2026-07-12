@@ -27,6 +27,30 @@ use crate::types::{
 
 const ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_BETA: &str = "responses=experimental";
+// ChatGPT's Codex backend version-gates newly released models. Keep this aligned
+// with the current open-source Codex CLI wire version.
+const CODEX_VERSION: &str = "0.144.1";
+
+fn apply_request_headers(
+    request: reqwest::RequestBuilder,
+    access: &str,
+    session_id: &str,
+    account_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = request
+        .bearer_auth(access)
+        .header("accept", "text/event-stream")
+        .header("content-type", "application/json")
+        .header("originator", ORIGINATOR)
+        .header("openai-beta", OPENAI_BETA)
+        .header("version", CODEX_VERSION)
+        .header("session_id", session_id);
+
+    match account_id {
+        Some(account_id) => request.header("chatgpt-account-id", account_id),
+        None => request,
+    }
+}
 
 pub struct CodexProvider {
     client: reqwest::Client,
@@ -540,17 +564,12 @@ impl Provider for CodexProvider {
             let body = body.clone();
             async move {
                 let session_id = uuid::Uuid::new_v4().to_string();
-                let mut req = client
-                    .post(&url)
-                    .bearer_auth(&access)
-                    .header("accept", "text/event-stream")
-                    .header("content-type", "application/json")
-                    .header("originator", ORIGINATOR)
-                    .header("openai-beta", OPENAI_BETA)
-                    .header("session_id", session_id);
-                if let Some(acct) = &account_id {
-                    req = req.header("chatgpt-account-id", acct);
-                }
+                let req = apply_request_headers(
+                    client.post(&url),
+                    &access,
+                    &session_id,
+                    account_id.as_deref(),
+                );
                 let r = match req.json(&body).send().await {
                     Ok(r) => r,
                     Err(e) => {
@@ -872,6 +891,23 @@ impl Provider for CodexProvider {
 mod tests {
     use super::*;
     use crate::types::{now_ms, ToolResultMessage};
+    #[test]
+    fn codex_request_includes_client_version_header() {
+        let built = apply_request_headers(
+            reqwest::Client::new().post("https://example.test/codex/responses"),
+            "oauth-token",
+            "session-123",
+            Some("account-456"),
+        )
+        .build()
+        .expect("request builds");
+
+        assert_eq!(
+            built.headers().get("version").and_then(|v| v.to_str().ok()),
+            Some(CODEX_VERSION),
+            "new Codex models are version-gated by this header"
+        );
+    }
 
     // OCEAN-99: vision parity for the OpenAI Responses API. A user image must
     // serialize as an input_image content part (data-URL), not be dropped.

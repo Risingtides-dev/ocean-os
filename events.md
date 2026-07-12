@@ -2361,3 +2361,12 @@ area:      [backend]
 
 Added the current Codex GPT-5.6 Sol, Terra, and Luna aliases to the Ocean provider catalog and public model picker. All three resolve through the existing ChatGPT/Codex OAuth backend with the established 272k context and 128k output limits; round-trip and inverse catalog tests cover the aliases. Rebuilt and restarted the supervised daemon, confirmed all three are ready in GET /v1/models, and completed live low-effort turns on each model. The separate harness benchmark then completed an actual gpt-5.6-terra high-effort fixture run at 6/6 with explicit thinking_level provenance. Verification: targeted ocean-providers catalog tests, cargo fmt --check, and cargo check --workspace.
 _________________________________________________________________________________
+time:      [05:11pm] [12-07-26]
+agent:     [omp], [gpt-5.6-sol]
+worktree:  main
+type:      [bug-report]
+area:      [backend]
+
+Fixed two provider-wire failures exposed by the harness benchmark. Codex OAuth requests now send the current Codex CLI `version` header; the ChatGPT backend had returned a misleading 404 “Model not found” for GPT-5.6 Luna when that header was absent. Anthropic extended thinking now clamps `budget_tokens` below the request's `max_tokens` cap; Haiku 4.5 high effort had sent 16384 for both fields and received a 400. Added focused serialization/header regression tests, ran all 122 ocean-protocol tests, `cargo check --workspace`, and `cargo fmt --check`; rebuilt and restarted the supervised daemon. Live high-effort benchmark reruns completed 6/6 for GPT-5.6 Luna (46.224s) and Claude Haiku 4.5 (53.698s).
+_________________________________________________________________________________
+

@@ -276,10 +276,11 @@ fn cache_control() -> Value {
 
 fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let cache = is_anthropic_family(model);
+    let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
 
     let mut body = json!({
         "model": model.id,
-        "max_tokens": options.max_tokens.unwrap_or(model.max_tokens),
+        "max_tokens": max_tokens,
         "messages": convert_messages(&context.messages),
         "stream": true,
     });
@@ -344,7 +345,13 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     }
     if let Some(level) = options.reasoning {
         if let Some(budget) = thinking_budget(level) {
-            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            // Anthropic requires budget_tokens >= 1024 and strictly below
+            // max_tokens. Preserve the caller's output cap by shrinking the
+            // thinking budget rather than raising max_tokens past that cap.
+            if max_tokens > 1024 {
+                let budget = budget.min(max_tokens - 1);
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            }
         }
     }
     if !context.tools.is_empty() {
@@ -745,6 +752,27 @@ mod tests {
 
     fn anthropic_model() -> Model {
         Model::anthropic_claude_sonnet_4_6()
+    }
+    #[test]
+    fn haiku_high_thinking_budget_stays_below_max_tokens() {
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let body = build_body(
+            &Model::anthropic_claude_haiku_4_5(),
+            &Context::default(),
+            &options,
+        );
+
+        let max_tokens = body["max_tokens"].as_u64().expect("max_tokens");
+        let budget = body["thinking"]["budget_tokens"]
+            .as_u64()
+            .expect("thinking budget");
+        assert!(
+            budget < max_tokens,
+            "Anthropic requires thinking.budget_tokens < max_tokens: {body}"
+        );
     }
 
     // A non-Anthropic model routed through this provider's build_body — used to
