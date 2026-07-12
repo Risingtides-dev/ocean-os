@@ -22,6 +22,7 @@ This child doc governs the `crates/` workspace directory. It indexes Ocean OS Ru
 - Prefer small, explicit crate boundaries.
 - Run crate-local checks when possible, then workspace checks before merge.
 - Session/history changes usually cross `ocean-agent`, `ocean-core`, and `ocean-daemon`; coordinate those edits explicitly.
+- Public picker models are owned by `ocean-providers::known_models`; every advertised id must round-trip through `resolve_model_selection`, and every routable production alias must be listed.
 
 ## Verification
 
