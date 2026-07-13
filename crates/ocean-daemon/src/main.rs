@@ -2067,7 +2067,7 @@ async fn create_request(
         let res = task_state.runtime.prompt(req, control).await;
         record_prompt_result(&task_state, request_id, &res, None).await;
     });
-    attach_request_handle(&state, request_id, handle).await;
+    attach_request_handle(&state.requests, request_id, handle).await;
 
     Json(RequestCreateResponse {
         ok: true,
@@ -7511,8 +7511,12 @@ async fn register_running_request(
     (request_id, cancel)
 }
 
-async fn attach_request_handle(state: &AppState, request_id: RequestId, handle: JoinHandle<()>) {
-    let mut requests = state.requests.write().await;
+async fn attach_request_handle(
+    requests: &RequestRegistry,
+    request_id: RequestId,
+    handle: JoinHandle<()>,
+) {
+    let mut requests = requests.write().await;
     if let Some(control) = requests.get_mut(&request_id) {
         control.handle = Some(handle);
     }
@@ -8790,14 +8794,15 @@ async fn agent_turn(
     //
     // The turn permit, cancel token (threaded into `control`), in-flight gauge,
     // event bridge, metrics, record_prompt_result, and advisor all move into the
-    // detached task. Cancellation stays cooperative-token-based —
-    // register_running_request hands back a CancellationToken the runtime polls;
-    // nothing here registered a JoinHandle to abort, so spawning changes no
-    // cancellation semantics. The permit is captured explicitly below so the
-    // concurrency cap spans the whole turn, not just the ACK.
+    // background task. Cancellation stays cooperative-token-based —
+    // register_running_request hands back a CancellationToken the runtime polls.
+    // The JoinHandle is registered before ACK so graceful shutdown can drain an
+    // accepted turn instead of dropping it with the Tokio runtime. The permit is
+    // captured explicitly below so the concurrency cap spans the whole turn,
+    // not just the ACK.
     use tracing::Instrument as _;
     let bg_state = state.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         // Hold the turn permit for the full turn duration; released when this
         // task ends (success or panic), so OCEAN-304's cap covers running turns,
         // not just accepted ones.
@@ -8952,8 +8957,9 @@ async fn agent_turn(
             }
         }
     });
+    attach_request_handle(&state.requests, request_id, handle).await;
 
-    // ACK immediately: the turn runs detached. ok: true + status: Running means
+    // ACK immediately: the daemon owns the registered background task. ok: true + status: Running means
     // "accepted, in flight". Completion + telemetry arrive over /v1/agent/events
     // as TurnFinished. The per-turn-timeout HTTP 408 this handler used to emit is
     // dropped on purpose: with fire-and-ack there is no `res` at response time,
@@ -12483,6 +12489,29 @@ mod tests {
         let mut ctl = status(id, RequestState::Running);
         ctl.handle = Some(handle);
         ctl
+    }
+
+    #[tokio::test]
+    async fn attached_request_handle_is_visible_to_graceful_shutdown_drain() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let request_id = RequestId::new_v4();
+        requests
+            .write()
+            .await
+            .insert(request_id, status(request_id, RequestState::Running));
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_w = done.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            done_w.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        attach_request_handle(&requests, request_id, handle).await;
+        assert!(requests.read().await[&request_id].handle.is_some());
+
+        drain_request_tasks(&requests, std::time::Duration::from_secs(2)).await;
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(requests.read().await[&request_id].handle.is_none());
     }
 
     #[tokio::test]

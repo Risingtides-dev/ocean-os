@@ -1562,7 +1562,7 @@ mod tests {
     }
 
     /// Characterize the live-event seam with finite deterministic pressure.
-    /// `apply_outcome` intentionally emits the full tool result while retaining
+    /// Outcome handling intentionally emits the full tool result while retaining
     /// only a capped transcript copy. Because the event sink is unbounded, all
     /// eight 1 MiB payloads remain queued until the bridge drains them.
     #[test]
@@ -1578,23 +1578,19 @@ mod tests {
         let mut messages = Vec::new();
 
         for index in 0..EVENT_COUNT {
-            let terminate = apply_outcome(
-                &events,
-                &sid,
-                &mut messages,
-                &format!("call-{index}"),
-                "stress_tool",
-                Outcome {
-                    content: vec![Content::text("x".repeat(TEXT_BYTES))],
-                    is_error: false,
-                    terminate: false,
-                    side_effects: Vec::new(),
-                    details: serde_json::json!({
-                        "index": index,
-                        "blob": details_blob,
-                    }),
-                },
-            );
+            let call_id = format!("call-{index}");
+            let outcome = Outcome {
+                content: vec![Content::text("x".repeat(TEXT_BYTES))],
+                is_error: false,
+                terminate: false,
+                side_effects: Vec::new(),
+                details: serde_json::json!({
+                    "index": index,
+                    "blob": details_blob,
+                }),
+            };
+            emit_outcome_events(&events, &sid, &call_id, "stress_tool", &outcome);
+            let terminate = finalize_outcome(&mut messages, &call_id, "stress_tool", outcome);
             assert!(!terminate);
         }
 
@@ -1606,7 +1602,7 @@ mod tests {
         assert_eq!(messages.len(), EVENT_COUNT);
         for message in &messages {
             let Message::ToolResult(result) = message else {
-                panic!("apply_outcome must append a tool result");
+                panic!("finalize_outcome must append a tool result");
             };
             let retained = result.content[0]
                 .as_text()
