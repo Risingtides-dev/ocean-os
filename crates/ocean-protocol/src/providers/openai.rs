@@ -399,24 +399,42 @@ fn deepseek_reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
 /// Param names diverge per backend, so we gate by `model.provider` rather than
 /// blasting one param everywhere (an unknown field 400s on stricter gateways):
 ///   - OpenAI o-series      → top-level `reasoning_effort` (minimal|low|medium|high)
-///   - DeepSeek (v4/reasoner) → `reasoning_effort` (high|max) + `thinking:{type:enabled}`
+///   - DeepSeek (V4)        → `thinking: {type, reasoning_effort}` (see below)
 ///   - other openai-compatible backends → left untouched (no agreed param)
+///
+/// DeepSeek's shape (verified live against api.deepseek.com 2026-07-12):
+///
+///   - The effort nests INSIDE the thinking object —
+///     `thinking: {"type": "enabled", "reasoning_effort": "high"}`. A top-level
+///     `reasoning_effort` is not part of DeepSeek's contract, and DeepSeek
+///     silently DROPS unknown top-level fields rather than 400ing (probed with a
+///     junk param: HTTP 200), so the old top-level form could not be trusted to
+///     do anything. Send the documented shape.
+///
+///   - Thinking is ON BY DEFAULT. A request with no `thinking` object still
+///     burns reasoning tokens (probed: ~1.8k–3.1k on a plain math prompt). So
+///     `ThinkingLevel::Off` MUST send an explicit `{"type": "disabled"}` — an
+///     early return leaves the reasoner running and the user pays for thinking
+///     they turned off. This is why the fn no longer bails on Off.
 fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
-    if level == ThinkingLevel::Off {
-        return;
-    }
     match model.provider.as_str() {
         "openai" => {
+            if level == ThinkingLevel::Off {
+                return;
+            }
             if let Some(effort) = openai_reasoning_effort(level) {
                 body["reasoning_effort"] = json!(effort);
             }
         }
-        "deepseek" => {
-            if let Some(effort) = deepseek_reasoning_effort(level) {
-                body["reasoning_effort"] = json!(effort);
-                body["thinking"] = json!({"type": "enabled"});
+        "deepseek" => match deepseek_reasoning_effort(level) {
+            Some(effort) => {
+                body["thinking"] = json!({"type": "enabled", "reasoning_effort": effort});
             }
-        }
+            // Off — must be explicit; see the note above.
+            None => {
+                body["thinking"] = json!({"type": "disabled"});
+            }
+        },
         // MiniMax, Kimi, OpenRouter passthrough, and arbitrary `openai_compat`
         // backends have no common reasoning-effort param — sending one risks a
         // 400. They already stream reasoning by default, so we leave the body
@@ -485,6 +503,34 @@ struct PartialToolCall {
     args: String,
 }
 
+/// Picks the bearer token for an openai-completions turn.
+///
+/// The `OPENAI_API_KEY` env fallback is gated on the routed backend ACTUALLY being
+/// OpenAI. Every openai-compatible vendor (DeepSeek, MiniMax, Kimi, GLM, and any
+/// custom `base_url`) shares this adapter, so an ungated fallback would bearer-auth
+/// the user's OpenAI secret to THAT vendor's host whenever its own key was missing —
+/// a cross-provider credential leak, not merely a confusing error. It also used to
+/// report `MissingApiKey("openai")` on a DeepSeek turn; the error now names the
+/// provider that is actually missing a key.
+///
+/// `openai_env` is passed in rather than read here so this stays pure and testable
+/// without racing on process env in a parallel test run.
+fn resolve_api_key(
+    provider: &str,
+    explicit: Option<&str>,
+    openai_env: Option<String>,
+) -> Result<String> {
+    if let Some(key) = explicit {
+        return Ok(key.to_string());
+    }
+    if provider == "openai" {
+        if let Some(key) = openai_env {
+            return Ok(key);
+        }
+    }
+    Err(Error::MissingApiKey(provider.to_string()))
+}
+
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn stream(
@@ -493,11 +539,11 @@ impl Provider for OpenAiProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> Result<AssistantMessageEventStream> {
-        let api_key = options
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .ok_or_else(|| Error::MissingApiKey("openai".into()))?;
+        let api_key = resolve_api_key(
+            &model.provider,
+            options.api_key.as_deref(),
+            std::env::var("OPENAI_API_KEY").ok(),
+        )?;
         let base_url = options
             .base_url
             .clone()
@@ -1269,22 +1315,29 @@ mod tests {
         }
     }
 
+    // DeepSeek nests the effort inside the thinking object. A top-level
+    // `reasoning_effort` is NOT part of its contract, and DeepSeek silently drops
+    // unknown top-level fields (verified live: a junk param returns HTTP 200), so
+    // the old shape failed open — no error, no guarantee the effort was read.
     #[test]
-    fn build_body_emits_deepseek_reasoning_and_thinking_toggle() {
+    fn build_body_nests_deepseek_reasoning_effort_inside_thinking() {
         let opts = StreamOptions {
             reasoning: Some(ThinkingLevel::Low),
             ..Default::default()
         };
         let body = build_body(&deepseek_model(), &Context::default(), &opts);
-        // DeepSeek maps low/medium/high all up to "high".
-        assert_eq!(
-            body["reasoning_effort"], "high",
-            "DeepSeek must map low up to high: {body}"
-        );
-        // DeepSeek needs the thinking toggle to engage the reasoner.
         assert_eq!(
             body["thinking"]["type"], "enabled",
             "DeepSeek must enable the thinking toggle: {body}"
+        );
+        // DeepSeek maps low/medium/high all up to "high".
+        assert_eq!(
+            body["thinking"]["reasoning_effort"], "high",
+            "DeepSeek effort must nest inside `thinking`: {body}"
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "DeepSeek must not receive a top-level reasoning_effort: {body}"
         );
     }
 
@@ -1296,8 +1349,72 @@ mod tests {
         };
         let body = build_body(&deepseek_model(), &Context::default(), &opts);
         assert_eq!(
-            body["reasoning_effort"], "max",
+            body["thinking"]["reasoning_effort"], "max",
             "DeepSeek xhigh must map to max: {body}"
+        );
+    }
+
+    // Thinking is ON BY DEFAULT at DeepSeek — a request carrying no `thinking`
+    // object still burns reasoning tokens (probed live: ~1.8k-3.1k on a plain
+    // math prompt). So `Off` has to say so out loud, or the user pays for
+    // reasoning they explicitly turned off. Regression guard for that silent cost.
+    #[test]
+    fn build_body_explicitly_disables_deepseek_thinking_when_off() {
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        assert_eq!(
+            body["thinking"]["type"], "disabled",
+            "DeepSeek thinking-off must be explicit, not an omitted param: {body}"
+        );
+        assert!(
+            body["thinking"].get("reasoning_effort").is_none(),
+            "disabled thinking must not carry an effort: {body}"
+        );
+    }
+
+    // The leak: a keyless DeepSeek turn with OPENAI_API_KEY set in the environment
+    // used to bearer-auth the OpenAI secret straight to api.deepseek.com. The env
+    // fallback must be reachable ONLY when the routed backend is really OpenAI.
+    #[test]
+    fn openai_env_key_never_leaks_to_a_compat_backend() {
+        for provider in ["deepseek", "minimax", "kimi", "glm", "openai-compatible"] {
+            let err = resolve_api_key(provider, None, Some("sk-openai-secret".into()))
+                .expect_err("keyless compat backend must not fall back to OPENAI_API_KEY");
+            match err {
+                Error::MissingApiKey(p) => assert_eq!(
+                    p, provider,
+                    "error must name the provider actually missing a key"
+                ),
+                other => panic!("expected MissingApiKey, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn openai_env_key_still_serves_a_real_openai_turn() {
+        let key = resolve_api_key("openai", None, Some("sk-openai-secret".into()))
+            .expect("openai must still accept the env fallback");
+        assert_eq!(key, "sk-openai-secret");
+        // An explicitly resolved key always wins, whatever the backend.
+        let key = resolve_api_key("deepseek", Some("sk-deepseek"), Some("sk-openai".into()))
+            .expect("explicit key must be used");
+        assert_eq!(key, "sk-deepseek");
+    }
+
+    // OpenAI has no thinking toggle — Off there stays an omission.
+    #[test]
+    fn build_body_omits_reasoning_for_openai_when_off() {
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let body = build_body(&openai_model(), &Context::default(), &opts);
+        assert!(
+            body.get("reasoning_effort").is_none() && body.get("thinking").is_none(),
+            "OpenAI must receive no reasoning params when off: {body}"
         );
     }
 

@@ -35,7 +35,7 @@ pub struct DaemonConfig {
     ///
     /// ```toml
     /// [roles]
-    /// fast    = "deepseek/deepseek-chat"
+    /// fast    = "deepseek/deepseek-v4-flash"
     /// deep    = "anthropic/claude-opus-4"
     /// advisor = "anthropic/claude-sonnet-4"
     /// ```

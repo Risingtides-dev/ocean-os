@@ -13,6 +13,19 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
+// DeepSeek V4 capacity. Both V4 models carry a 1M context window; the output cap
+// is the API's own hard ceiling, reported verbatim in its 400 on an over-large
+// request (verified live 2026-07-12: "the valid range of max_tokens is
+// [1, 393216]"). These replaced a hardcoded 64k/8k, which was V3-era and made
+// `compact_history` start eliding at 6% of the real window — throwing away
+// context, and paying to re-summarize it, for no reason.
+//
+// `max_output_tokens` doubles as the headroom `trim_to_context_window` reserves
+// for the reply, so it is deliberately NOT the 393,216 ceiling — reserving 38% of
+// the window for an output that never comes would defeat the point. 64k is a
+// generous reply budget that leaves ~936k for context.
+const DEEPSEEK_CONTEXT_WINDOW: u32 = 1_000_000;
+const DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 65_536;
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -631,10 +644,14 @@ pub fn known_models() -> Vec<KnownModel> {
         label: label.to_string(),
     };
     vec![
+        // The live DeepSeek API serves exactly these two (verified against
+        // GET /models 2026-07-12). `deepseek-chat` / `deepseek-reasoner` were
+        // advertised here until DeepSeek scheduled them for hard retirement on
+        // 2026-07-24 — they stay routable as forward aliases onto v4-flash in
+        // `resolve_model_selection`, but the picker must stop offering models that
+        // are about to stop existing.
         m("deepseek-v4-pro", "deepseek", "DeepSeek V4 Pro"),
         m("deepseek-v4-flash", "deepseek", "DeepSeek V4 Flash"),
-        m("deepseek-reasoner", "deepseek", "DeepSeek Reasoner"),
-        m("deepseek-chat", "deepseek", "DeepSeek Chat"),
         m("gpt-5.6-sol", "openai-codex", "GPT-5.6 Sol (Codex)"),
         m("gpt-5.6-terra", "openai-codex", "GPT-5.6 Terra (Codex)"),
         m("gpt-5.6-luna", "openai-codex", "GPT-5.6 Luna (Codex)"),
@@ -749,34 +766,33 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
     }
 
     match model.as_str() {
-        "deepseek" | "deepseek-chat" => Ok(model_selection(
-            ProviderId::DeepSeek,
-            "deepseek-chat",
-            DEEPSEEK_BASE_URL,
-            64_000,
-            8_192,
-        )),
-        "deepseek-reasoner" | "deepseek-r1" => Ok(model_selection(
-            ProviderId::DeepSeek,
-            "deepseek-reasoner",
-            DEEPSEEK_BASE_URL,
-            64_000,
-            8_192,
-        )),
-        "deepseek-v4-flash" => Ok(model_selection(
-            ProviderId::DeepSeek,
-            "deepseek-v4-flash",
-            DEEPSEEK_BASE_URL,
-            64_000,
-            8_192,
-        )),
-        "deepseek-v4-pro" | "deepseek-v4" | "deepseek-pro" | "v4-pro" => Ok(model_selection(
-            ProviderId::DeepSeek,
-            "deepseek-v4-pro",
-            DEEPSEEK_BASE_URL,
-            64_000,
-            8_192,
-        )),
+        // `deepseek-chat` / `deepseek-reasoner` are RETIRED by DeepSeek after
+        // 2026-07-24 15:59 UTC — after that they stop resolving at the API and any
+        // session pinned to them dies. They are already only aliases for V4 Flash
+        // (non-thinking / thinking), and `GET /models` no longer lists them at all
+        // (verified live 2026-07-12: the API serves exactly deepseek-v4-pro and
+        // deepseek-v4-flash). So they survive here purely as legacy aliases that
+        // resolve FORWARD onto v4-flash, keeping pinned sessions alive across the
+        // cutover — the same pattern the retired Claude 4-6/4-7 ids use. They are
+        // dropped from `known_models()` so the picker stops advertising them.
+        "deepseek-chat" | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v4-flash" => {
+            Ok(model_selection(
+                ProviderId::DeepSeek,
+                "deepseek-v4-flash",
+                DEEPSEEK_BASE_URL,
+                DEEPSEEK_CONTEXT_WINDOW,
+                DEEPSEEK_MAX_OUTPUT_TOKENS,
+            ))
+        }
+        "deepseek" | "deepseek-v4-pro" | "deepseek-v4" | "deepseek-pro" | "v4-pro" => {
+            Ok(model_selection(
+                ProviderId::DeepSeek,
+                "deepseek-v4-pro",
+                DEEPSEEK_BASE_URL,
+                DEEPSEEK_CONTEXT_WINDOW,
+                DEEPSEEK_MAX_OUTPUT_TOKENS,
+            ))
+        }
         "gpt-4o" => Ok(model_selection(
             ProviderId::OpenAi,
             "gpt-4o",
@@ -1117,8 +1133,8 @@ fn model_for_explicit_provider(
             ProviderId::DeepSeek,
             model,
             DEEPSEEK_BASE_URL,
-            64_000,
-            8_192,
+            DEEPSEEK_CONTEXT_WINDOW,
+            DEEPSEEK_MAX_OUTPUT_TOKENS,
         )),
         "openai" => Ok(model_selection(
             ProviderId::OpenAi,
@@ -1427,6 +1443,38 @@ mod tests {
         assert_eq!(selection.provider, ProviderId::DeepSeek);
         assert_eq!(selection.model, "deepseek-v4-flash");
         assert_eq!(selection.base_url, DEEPSEEK_BASE_URL);
+    }
+
+    // DeepSeek hard-retires `deepseek-chat` / `deepseek-reasoner` on 2026-07-24;
+    // after that the API stops resolving them and any session still pinned to one
+    // dies mid-conversation. They must therefore resolve FORWARD onto the model
+    // that actually exists, not pass through as themselves.
+    #[test]
+    fn retiring_deepseek_aliases_resolve_forward_onto_v4_flash() {
+        for legacy in ["deepseek-chat", "deepseek-reasoner", "deepseek-r1"] {
+            let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", legacy)])).unwrap();
+            assert_eq!(
+                selection.model, "deepseek-v4-flash",
+                "{legacy:?} must forward onto a model that still exists after 2026-07-24"
+            );
+            assert_eq!(selection.provider, ProviderId::DeepSeek);
+        }
+    }
+
+    // The registry's capacity numbers feed `compact_history` / `trim_to_context_window`.
+    // They were 64k/8k (V3-era) against a model that holds 1M and emits up to 393,216
+    // tokens — so history was being elided at 6% of the real window.
+    #[test]
+    fn deepseek_advertises_v4_capacity_not_v3() {
+        let selection =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "deepseek-v4-pro")])).unwrap();
+        assert_eq!(selection.context_window, 1_000_000);
+        // Reply headroom, deliberately well under the API's 393,216 hard ceiling.
+        assert_eq!(selection.max_output_tokens, 65_536);
+        assert!(
+            selection.max_output_tokens < 393_216,
+            "max_output_tokens is reserved headroom, not the API ceiling"
+        );
     }
 
     #[test]
@@ -1745,8 +1793,10 @@ mod tests {
         // arm is added to resolve_model_selection, add it here AND to
         // known_models() — this test is the tripwire that forces that.
         let routable_production_ids = [
-            "deepseek-chat",
-            "deepseek-reasoner",
+            // `deepseek-chat` / `deepseek-reasoner` are absent for the same reason
+            // the retired Claude 4-6/4-7 ids are: DeepSeek retires them 2026-07-24,
+            // so they stay ROUTABLE as forward aliases onto v4-flash (pinned
+            // sessions survive the cutover) but must not be in the menu.
             "deepseek-v4-flash",
             "deepseek-v4-pro",
             "gpt-4o",
