@@ -40,6 +40,8 @@ fi
 #   OCEAN_YOLO=1            -> operator default: tools run without per-call gating.
 #   OCEAN_BIND (optional)   -> defaults to 127.0.0.1:4780 inside the binary.
 #   OCEAN_ASSISTANTS_DIR    -> optional; defaults to ~/.config/ocean-rs/assistants.
+#   OCEAN_PROMPT_CAPTURE_DIR -> optional owner-only local JSON request captures;
+#                               includes private prompt/transcript/tool content.
 export OCEAN_YOLO="${OCEAN_YOLO:-1}"
 
 # Run from a NEUTRAL cwd so the startup guard's repo-cwd check passes and the

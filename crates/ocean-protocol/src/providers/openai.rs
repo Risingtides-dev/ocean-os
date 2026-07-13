@@ -550,6 +550,7 @@ impl Provider for OpenAiProvider {
             .unwrap_or_else(|| model.base_url.clone());
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let body = build_body(model, context, options);
+        crate::prompt_capture::capture_request_body(&model.api, &model.provider, &model.id, &body);
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
 

@@ -2789,3 +2789,17 @@ Corrected an invalid council staffing attempt that used invented aliases instead
 Verification:
 - `cargo fmt --check`
 - `cargo test -p ocean-daemon convene_rejects_aliases_missing_from_live_ready_registry -- --nocapture`
+_________________________________________________________________________________
+
+time:      [03:03pm] [13-07-26]
+agent:     [ocean], [deepseek-v4-pro]
+worktree:  [main]
+type:      [feature-request]: local full provider-request prompt capture
+area:      [backend]: provider wire diagnostics
+
+Added an opt-in `OCEAN_PROMPT_CAPTURE_DIR` diagnostic that writes the exact JSON body passed to every supported provider after Ocean has built its system instruction, trimmed transcript, and tool schemas. Captures are disabled by default, contain no headers or endpoint URL, are owner-only (`0700` directory / `0600` files on Unix), and fail open so capture I/O cannot block a turn. Added the protocol regression test, documented the privacy boundary in the protocol contract, and added commented LaunchAgent configuration guidance.
+
+Verification:
+- `cargo fmt --check`
+- `cargo test -p ocean-protocol prompt_capture -- --nocapture`
+- `cargo check --workspace`

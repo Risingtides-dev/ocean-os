@@ -70,6 +70,15 @@
          without per-call permission prompts. Set OCEAN_YOLO=0 to gate. -->
     <key>OCEAN_YOLO</key>
     <string>1</string>
+    <!-- Opt-in local diagnostic: captures complete provider JSON bodies (system
+         instruction, trimmed transcript, and tool schemas) under this directory.
+         Bodies include private conversation content; the protocol layer writes
+         owner-only files and never captures headers or endpoint URLs. Disabled
+         unless uncommented for an inspection run. -->
+    <!--
+    <key>OCEAN_PROMPT_CAPTURE_DIR</key>
+    <string>/private/tmp/ocean-prompt-captures</string>
+    -->
     <!-- launchd starts with a minimal PATH; give the launcher + daemon a sane
          one (the daemon shells out to git/ripgrep/etc for tool calls). -->
     <key>PATH</key>

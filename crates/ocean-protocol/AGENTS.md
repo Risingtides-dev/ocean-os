@@ -23,6 +23,10 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Codex OAuth turns with a bound Ocean session must use that stable session id
   for both `prompt_cache_key` and the HTTP `session_id`; a fresh UUID is only
   valid for ad-hoc provider calls with no session.
+- `OCEAN_PROMPT_CAPTURE_DIR` is an opt-in local diagnostics path: capture the
+  complete serialized JSON body only (never request headers or endpoint URLs),
+  warn-and-continue on capture failures, and retain owner-only permissions
+  because request bodies contain private instructions, transcript, and tool data.
 
 
 

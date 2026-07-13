@@ -567,6 +567,7 @@ impl Provider for CodexProvider {
             .unwrap_or_else(|| model.base_url.clone());
         let url = format!("{}/responses", base_url.trim_end_matches('/'));
         let body = build_body(model, context, options);
+        crate::prompt_capture::capture_request_body(&model.api, &model.provider, &model.id, &body);
         let cancel = options.cancel.clone();
         // Keep the same request identity across retries. Agent sessions provide
         // a stable id across every model round; ad-hoc calls get one random id.

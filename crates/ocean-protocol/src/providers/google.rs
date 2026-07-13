@@ -391,6 +391,7 @@ impl Provider for GoogleProvider {
             api_key,
         );
         let body = build_body(context, options);
+        crate::prompt_capture::capture_request_body(&model.api, &model.provider, &model.id, &body);
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
 

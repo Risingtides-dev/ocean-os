@@ -466,6 +466,7 @@ impl Provider for AnthropicProvider {
             .unwrap_or_else(|| model.base_url.clone());
         let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
         let body = build_body(model, context, options);
+        crate::prompt_capture::capture_request_body(&model.api, &model.provider, &model.id, &body);
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
         let auth = options.auth;
