@@ -2976,8 +2976,10 @@ struct LonghouseConveneRequest {
     /// commons. Defaults to `commons` if omitted or unrecognized.
     #[serde(default)]
     federation: Option<String>,
-    /// Optional model alias override; one worker per alias. Defaults to a mixed
-    /// deepseek + kimi council so it's genuinely multi-model.
+    /// Optional model alias override; one worker per alias. Every supplied alias
+    /// is validated against the daemon's live ready-model registry before the
+    /// council starts; unknown or unready aliases are rejected (never silently
+    /// resolved as a fallback).
     #[serde(default)]
     models: Option<Vec<String>>,
 }
@@ -3021,6 +3023,26 @@ async fn longhouse_convene(
     let mut convene_req = ocean_longhouse::ConveneRequest::new(req.question.clone(), federation);
     if let Some(models) = req.models {
         if !models.is_empty() {
+            let ready: std::collections::HashSet<_> = ocean_providers::known_models_with_readiness(
+                &ocean_providers::ProviderEnv::from_process(),
+            )
+            .into_iter()
+            .filter(|model| model.ready)
+            .map(|model| model.model.id)
+            .collect();
+            let invalid: Vec<_> = models
+                .iter()
+                .filter(|model| !ready.contains(model.as_str()))
+                .cloned()
+                .collect();
+            if !invalid.is_empty() {
+                return Json(json!({
+                    "ok": false,
+                    "error": "longhouse council requires ready model ids from GET /v1/models",
+                    "invalid_models": invalid,
+                    "ready_models": ready,
+                }));
+            }
             convene_req.models = models;
         }
     }
@@ -15412,6 +15434,41 @@ mod tests {
         );
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// Unknown and unready requested aliases must be rejected before a council
+    /// worker is spawned. A council roster is an audit record, so silent provider
+    /// fallback is prohibited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn convene_rejects_aliases_missing_from_live_ready_registry() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let app = longhouse_routes().with_state(fake_convene_state(&tmp));
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/longhouse/convene")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "question": "audit the roster",
+                    "models": ["totally-invented-model"]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], json!(false), "body: {body}");
+        assert_eq!(
+            body["invalid_models"],
+            json!(["totally-invented-model"]),
+            "body: {body}"
+        );
     }
 
     // ---- Council convene alias (OCEAN-227) ---------------------------------

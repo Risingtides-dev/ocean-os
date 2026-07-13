@@ -2776,3 +2776,16 @@ area:  [testing]: Hosted Unix process-cleanup regression reliability
 
 Main CI run 29235174509 first failed on Ubuntu because both Shell Halt smoke fixtures could not write their PID markers inside the nominal two-second startup probe while the runner was saturated; the same job passed unchanged on rerun. I bounded marker discovery with a hard five-second timeout while leaving the stricter two-second post-Halt process-termination deadline and all survivor assertions unchanged. Ten parallel focused repetitions, the focused/full runtime suites, strict runtime Clippy, workspace check, formatting, and diff checks pass. Independent read-only review confirmed the change is finite, cleanup-safe, test-only, and does not weaken the descendant-kill contract.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [06:06am] [13-07-26]
+agent:     [ocean], [deepseek-v4-pro]
+worktree:  [main]
+type:      [bug report]: enforce live ready-model validation for Longhouse councils
+area:      [backend]: Longhouse model roster integrity
+
+Corrected an invalid council staffing attempt that used invented aliases instead of checking the daemon registry first. `POST /v1/longhouse/convene` now validates every requested model ID against the daemon's current ready-model registry (`GET /v1/models`) before spawning workers, rejects the full request with `invalid_models` rather than silently falling back, documents the operator convention in `docs/LONGHOUSE.md`, and adds a route regression test for an invented alias.
+
+Verification:
+- `cargo fmt --check`
+- `cargo test -p ocean-daemon convene_rejects_aliases_missing_from_live_ready_registry -- --nocapture`

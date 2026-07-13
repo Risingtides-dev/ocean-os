@@ -168,6 +168,17 @@ Subagents can be orchestrated by Longhouse, but local side effects still return 
 
 `ocean-daemon` currently embeds Longhouse routes for demo and convene flows. The next step is to let `ocean-longhouse` also run as a local service on `127.0.0.1:4781`, then teach the daemon to consult it dynamically in read-only preparation mode.
 
+### Council model-selection convention
+
+Before convening a model-staffed council, the caller **must fetch the daemon's
+live `GET /v1/models` registry** and choose only IDs whose `ready` field is
+`true`. Model labels, provider marketing names, remembered aliases, and model
+names invented in conversation are not valid worker IDs. The convene route
+re-validates every requested ID against the same ready registry and rejects the
+whole request with `invalid_models` rather than silently substituting a model or
+starting a partial council. This keeps the recorded council roster truthful and
+makes model choice reproducible from the active daemon configuration.
+
 ## Built vs unbuilt — quorum steps 1–5 are real, steps 6+ are not
 
 Per the build order in `docs/LONGHOUSE_ORCHESTRATION.md` § 8, the `QuorumEngine`
