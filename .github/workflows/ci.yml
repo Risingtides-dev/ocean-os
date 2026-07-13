@@ -46,24 +46,12 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
-      # Rule A: build the WHOLE workspace, not just the daemon — a daemon-only
-      # build misses cross-crate breaks.
-      - name: Build (workspace)
-        run: cargo build --workspace
-
-      - name: Test (workspace)
-        run: cargo test --workspace
-
-      # OCEAN-309: the tree is warning-clean — `-D warnings` keeps it that way.
-      # Any new clippy warning (style or correctness, any target incl. tests)
-      # fails the build instead of eroding the baseline.
-      - name: Clippy (workspace, all targets, deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # OCEAN-191 follow-up: the one-time fmt sweep landed in OCEAN-323.
-      # The tree is now formatted — enforce it in CI.
-      - name: Format check
-        run: cargo fmt --all -- --check
+      # The dependency-free xtask manifest is the canonical local/CI gate:
+      # docs/index integrity, whole-workspace build + tests, warning-clean
+      # all-target Clippy, and formatting. cargo-deny stays in its Ubuntu-only
+      # job below, so this matrix invocation explicitly omits that final step.
+      - name: Repository gate
+        run: cargo xtask ci --skip-deny
 
   # ── supply-chain audit ───────────────────────────────────────────────────
   deny:

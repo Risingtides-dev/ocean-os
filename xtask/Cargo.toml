@@ -9,9 +9,9 @@ publish = false
 
 # Ocean OS dev-task runner (the cargo-xtask pattern: a plain workspace binary,
 # invoked via `cargo xtask <cmd>` — see /.cargo/config.toml alias). NOT part of
-# the runtime; it ships nothing. Today it owns `clear-webrtc-cache`, which un-
-# poisons the libwebrtc download-cache (OCEAN-252). Deliberately ZERO third-party
-# deps so `cargo build --workspace` never pays for it and it can't break a build.
+# the runtime; it ships nothing. It owns docs/index integrity, the executable
+# CI command manifest, and libwebrtc cache recovery (OCEAN-252). Deliberately
+# ZERO third-party deps so it stays cheap and cannot destabilize workspace builds.
 
 [[bin]]
 name = "xtask"

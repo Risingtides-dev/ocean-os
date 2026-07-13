@@ -1,56 +1,57 @@
-# Contributing to Ocean-OS
+# Contributing to Ocean OS
 
-Ocean-OS is a squad project. Each Claude/operator on the team should claim one or more ingestion workers and own them end to end. This file explains how.
+Ocean OS is a Rust workspace with daemon-owned runtime authority. Start with the contracts, choose the correct owner, keep changes narrow, and run the owning validation before the workspace gate.
 
-## Claiming a worker
+## Before editing
 
-Open a PR adding your name + handle to the table below. One worker per row. If you're claiming, you're committing to:
+1. Read root [`AGENTS.md`](../AGENTS.md).
+2. Route the request through [`docs/OCEAN_PROJECT_MAP.md`](../docs/OCEAN_PROJECT_MAP.md) when it may belong to another Ocean repo.
+3. Find the package owner, entry point, exclusion boundary, and narrow test in [`crates/AGENTS.md`](../crates/AGENTS.md).
+4. Read the target package's local `AGENTS.md` when one is linked.
+5. Check `git status`; preserve unrelated work and stage only files you own.
 
-1. Building the ingestion worker (webhook intake or polling, your choice).
-2. Writing rows to that source's schema in `schema/000_init.sql`. If your source needs new tables, propose them in the same PR.
-3. Wiring at least one MCP tool in `mcp/src/index.ts` that returns real data from your source (replacing the stub).
-4. Documenting the env vars and deploy steps in a `README.md` inside your worker's directory.
+## Architecture rules
 
-## Source ownership
+- `ocean-daemon` owns HTTP/SSE execution authority.
+- `ocean-agent` owns local session/history behavior.
+- `ocean-runtime` owns the permission-gated agent/tool loop.
+- `ocean-protocol` owns provider wire encoding; `ocean-providers` owns model/auth routing.
+- Clients such as TUI, CLI, ACP, and ocean-surface steer the daemon; they do not invent session or permission authority.
+- Do not bypass caller cwd resolution or runtime permission gates.
+- Shared enum and serialized protocol changes are additive unless a migration is explicitly approved.
 
-| Source | Owner | Status | Notes |
-|---|---|---|---|
-| `github` | _unclaimed_ | scaffolded | proof of concept exists, needs deploy + secret |
-| `slack` | _unclaimed_ | not started | already have Slack tokens via the bridges |
-| `cobrand` | _unclaimed_ | not started | API access via Campaign Hub |
-| `campaign-hub` | _unclaimed_ | not started | Postgres on Railway, can replicate or poll API |
-| `content-lab` | _unclaimed_ | not started | FastAPI on Railway, expose internal events endpoint |
-| `telegram` | _unclaimed_ | not started | tap into existing bot or poll the bridge logs |
-| `railway` | _unclaimed_ | not started | poll Railway API |
-| `cloudflare` | _unclaimed_ | not started | poll Cloudflare API for Workers/DNS/R2/email rules |
-| `notion` | _unclaimed_ | not started | webhook + polling hybrid |
+See the cross-crate change-impact matrix in `crates/AGENTS.md` before changing events, sessions, tools, models, routes, or persisted schemas.
 
-## Worker conventions
+## Change shape
 
-- One service per source. Independent deploy.
-- TypeScript or Python — pick whatever you ship faster in. Prefer TypeScript for consistency with the MCP.
-- Idempotent on the source's native event id. Re-processing a delivery is a no-op.
-- Write raw payloads to `<source>.events`. Materialized views are populated by separate functions/jobs, never inline in the webhook handler.
-- Health endpoint at `GET /health`.
-- Log JSON lines.
+- Prefer one bounded concern per change.
+- Behavior-neutral extraction must have an extraction manifest and must not bundle redesign, renames, or opportunistic fixes.
+- Add focused regression tests for behavior changes.
+- Keep public errors and operator-visible fallback behavior honest.
+- Update owning docs and append `events.md` after meaningful work.
 
-## MCP tool conventions
+## Validation
 
-- Tool name is `ocean.<verb>_<noun>` — verb maps to operator intent.
-- Args are flat objects. Document required and optional fields in the JSON schema.
-- Return shape-correct data even when the source is empty (e.g. `[]`, never `null`).
-- Every meaningful agent action should call `ocean.log_agent_action` afterward to keep the feedback log alive.
+### Fast loop
 
-## Schema migrations
+Run the narrow command from `crates/AGENTS.md` or the target package contract.
 
-For now, single file: `schema/000_init.sql`. When we need real migrations, we'll move to numbered files and pick a tool. PRs that add tables: edit `000_init.sql` until further notice.
+### Workspace completion
 
-## Deploy targets
+```bash
+cargo check --workspace
+```
 
-Pending squad decision. Default leaning:
+Use `cargo check --workspace --tests` when shared enums/events affect test-only matches.
 
-- Postgres + workers on Railway
-- Webhook intake on Cloudflare Workers
-- R2 for blob caching
+### Merge / PR gate
 
-Final choice will be tracked in `docs/architecture.md`.
+```bash
+cargo xtask ci
+```
+
+This canonical manifest runs docs/index integrity, workspace build/test, all-target Clippy with denied warnings, format, and `cargo deny check`. Use `cargo xtask ci --dry-run` to print the portable command manifest and CI-only lanes. CI consumes the same manifest on macOS and Ubuntu and keeps `cargo-deny` in its separate Ubuntu job. Feature-gated areas may require additional commands from their local contract.
+
+## Review
+
+Feature, logic, protocol, security, and architecture changes require a fresh independent reviewer. Report changed files, commands and outcomes, remaining risks, and any verification that could not run.

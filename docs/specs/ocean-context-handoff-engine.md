@@ -181,8 +181,10 @@ crates/ocean-context/
 
 ### Layer A acceptance (when v1 is done)
 
-1. `extract.rs` pulls the 51 known anchored claims out of the two real root HANDOFF.md docs
-   (`ocean-os/HANDOFF.md`, `claude-monorepo/docs/PHASE2_HANDOFF.md`) — deterministic, regression-tested.
+> Historical corpus note (2026-07-12): `ocean-os/HANDOFF.md` is now an evergreen pointer, not the old snapshot. The exact validation corpus remains in `crates/ocean-context/tests/fixtures/ocean-os-HANDOFF.md` and opt-in archive history; acceptance must use the fixture, not current root handoff prose.
+
+1. `extract.rs` pulls the 51 known anchored claims out of the two preserved historical HANDOFF fixtures
+   (`crates/ocean-context/tests/fixtures/ocean-os-HANDOFF.md` and the corresponding Claude-monorepo snapshot) — deterministic, regression-tested.
 2. `write_handoff` round-trips a `Handoff` → markdown+frontmatter → `Handoff` losslessly.
 3. `read_freshest(repo, branch)` returns the most recent handoff, claims sorted by the stub TrustModel.
 4. The replay binary walks ocean-os history from a claim's anchor commit and prints, per claim, the
@@ -230,8 +232,9 @@ are the same code. You tune the replay; the thing you tuned is the engine.
 ## A real-workflow case the design must handle (found during brainstorm)
 
 Fanning a handoff into N parallel agent worktrees produces N byte-identical context copies that
-immediately diverge as each agent commits — and nothing tracks the divergence. (Observed live: 80
-worktree HANDOFF.md files, all one md5.) This is exactly the epistemic similarity graph: N worlds
+immediately diverge as each agent commits — and nothing tracks the divergence. (Historical observation:
+80 worktree HANDOFF.md files shared one md5; the snapshot now lives in the regression fixture/archive.)
+This is exactly the epistemic similarity graph: N worlds
 that start indistinguishable (`E(s,t) = all abilities`) and split as commits land. B6 must model this
 as a first-class case, not a quirk.
 

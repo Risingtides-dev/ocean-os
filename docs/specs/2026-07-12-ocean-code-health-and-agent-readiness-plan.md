@@ -1,0 +1,386 @@
+# Ocean OS Code Health and Agent Readiness Plan
+
+**Date:** 2026-07-12
+**Status:** Approved by operator — Phase 0A and 1A complete; first Phase 2A extraction next
+**Owner:** Smaths / Ocean OS
+**Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
+
+## 1. North-star goal
+
+A cold agent should be able to enter Ocean OS, identify the correct owner and entry point, understand the critical invariants, make one bounded change, and run the right validation without rediscovering the architecture from scratch.
+
+The codebase should remain the same product while becoming:
+
+- easier to route work into;
+- easier to review in small units;
+- harder to change across an unsafe boundary accidentally;
+- better protected by compiler, test, documentation, and performance gates;
+- measurably easier for a fresh agent to use.
+
+## 2. Principles
+
+1. **Preserve behavior before improving design.** Mechanical moves and architectural redesign never share a change set.
+2. **Map before moving.** Each extraction starts with ownership, callers, invariants, tests, and rollback points.
+3. **Tests before fixes for suspected bugs.** A risk becomes a behavior change only after a focused regression or benchmark proves it.
+4. **Profile before optimizing.** Clone counts and file sizes identify places to inspect, not defects by themselves.
+5. **Stable contracts beat elegant rewrites.** HTTP/SSE shapes, session files, permission gates, cwd binding, public Rust imports, and TUI event semantics remain stable during extraction.
+6. **One writer, independent reviewers.** Read-only analysis can fan out; each active worktree has one implementation writer.
+7. **Prefer durable indexes over doc sprawl.** Add local `AGENTS.md` files only where a real boundary has unique rules.
+8. **Every wave is independently shippable and reversible.** Small reviewable commits, narrow tests first, full gates at wave close.
+
+## 3. Evidence baseline
+
+The baseline was collected on `main` at commit `b5d564169f3f7034c2794007ed9795be3e6bb498` on 2026-07-12 with `rustc 1.97.0` and `cargo 1.97.0`. The worktree contained pre-existing non-source changes (`events.md`, `.pi-subagents/`, and `target3/`), which were not used as source evidence. Cold-agent routing evidence is recorded in `docs/specs/2026-07-12-ocean-agent-readiness-baseline.md`.
+
+### 3.1 What is already strong
+
+- Approximately 136k lines of Rust across 25 workspace packages: 24 product crates plus `xtask`.
+- Normal `cargo clippy --workspace --all-targets` emitted no warnings; CI runs all-target Clippy with `-D warnings`.
+- CI builds and tests the workspace on macOS and Linux, runs all-target Clippy, checks formatting, and runs `cargo deny`.
+- The strict default-feature inventory used compiler-selected library, binary, and example targets while excluding test targets:
+
+  ```bash
+  cargo clippy --workspace --lib --bins --examples --message-format=short -- \
+    -W clippy::unwrap_used \
+    -W clippy::expect_used \
+    -W clippy::panic \
+    -W clippy::unreachable \
+    -W clippy::await_holding_lock
+  ```
+
+  It found 17 `unwrap()` warnings, 48 `expect()` warnings, 4 `unreachable!()` warnings, 0 `panic!()` warnings, and 0 `await_holding_lock` warnings. Store the raw output and counting rules when this baseline is automated; it does not cover test targets, non-default feature combinations, or expanded macro internals.
+- Those counts are an invariant inventory, not a bug count. Many sites are locally proven conditions such as piped child stdio or map entries inserted immediately above.
+- The reviewed compiler-selected production paths contain one direct `unsafe` block: a documented `RawWaker` construction in the daemon persistence helper.
+- Permission, cwd, cancellation, session-compatibility, event-ordering, and TUI mutation invariants are unusually well documented in the crate contracts that exist.
+
+### 3.2 Structural pressure
+
+| File | Total lines | Primary issue |
+|---|---:|---|
+| `crates/ocean-daemon/src/main.rs` | 21,636 | About 11.8k production lines plus a large inline test module; many route and domain responsibilities share one compilation unit. |
+| `crates/ocean-tui/src/main.rs` | 9,304 | Binary routing, active mesh support, and retained legacy UI coexist; the current `shell/` is already modular and should not be rebuilt. |
+| `crates/ocean-agent/src/lib.rs` | 7,354 | Runtime facade, turn pipeline, session store, compatibility logic, prompt shaping, and large tests share one root. |
+
+File size is a navigation and review signal. It is not evidence of runtime slowness by itself.
+
+### 3.3 Pre-Phase-0A agent-readiness gaps
+
+- `crates/AGENTS.md` indexes only 8 of the 24 product crates represented in the workspace.
+- Root and bootstrap crate maps are incomplete relative to `Cargo.toml`.
+- `OCEAN.md` describes a two-repo system while `docs/OCEAN_PROJECT_MAP.md` defines the active four-repo system.
+- Root `HANDOFF.md` is transient lane/deployment state from 2026-07-09 but appears as evergreen onboarding material.
+- The root verification contract names `cargo check --workspace`, while CI enforces a broader merge gate.
+- Active docs contain references into `docs/.agentarchive`, despite that archive being opt-in and excluded from normal agent context.
+- `docs/OCEAN_PROJECT_MAP.md` references an untracked/missing `docs/OCEAN_PROJECT_MAP_ART.html` artifact.
+- There is no single local command for CI parity or documentation/index integrity.
+
+### 3.4 Reliability and performance risks to characterize
+
+#### Runtime-to-daemon event payloads
+
+`agent_turn` uses an unbounded runtime event channel, while `ToolExecutionEnd` carries cloned full `content` and structured `details` before the transcript copy is capped. Several native tools already cap output, but external/plugin/MCP/browser capabilities may not share one global byte ceiling. The risk is unbounded retained bytes, not merely message count.
+
+This needs a checked event-policy table, payload inventory, and stress tests before choosing among:
+
+- capping display-event content at the runtime boundary;
+- spilling large content to artifacts and sending references;
+- bounded async backpressure;
+- a byte-aware bridge.
+
+#### Shell cancellation
+
+Direct verification rejected a review false positive: `BashTool` already sets `kill_on_drop(true)`, and `tools_smoke.rs` covers a direct child on timeout. It does not yet prove Halt cancellation or descendant-tree termination. Add OS-specific Halt tests for both a direct child and a descendant tree before changing process-group handling.
+
+#### Lazy browser startup
+
+`LazyBrowser::get` at `crates/ocean-runtime/src/tools/browser/mod.rs:56-72` intentionally holds a Tokio mutex while probing and launching Chrome. This provides single-flight behavior but can serialize all browser tools behind slow external I/O. Characterize healthy, dead, stalled, and cancelled launch cases through injected/fake probe and launch seams with explicit deadlines before redesigning the state machine.
+
+#### Repeated transcript work
+
+The agent loop serializes messages to estimate size and clones retained messages each provider round. The current harness benchmark already shows turn-cost and latency sensitivity. Add allocation/time benchmarks before changing ownership or caching.
+
+#### CI coverage
+
+CI does not currently compile the release profile or verify the declared Rust 1.80 MSRV. Add those only after confirming dependency compatibility and acceptable CI cost.
+
+## 4. Success criteria
+
+### 4.1 Agent navigation
+
+- All 25 workspace packages appear in one canonical workspace index; root/bootstrap maps become generated views or concise pointers rather than competing inventories.
+- A fixed ten-case cold-agent benchmark covers session persistence, provider wire format, runtime tools, TUI event mutation, daemon cwd/routes, calls, Longhouse, MCP/plugins, context/hashline, and workspace membership. Each fresh-context run starts at the repo root without prior search/session context and returns owner repo/crate, entry point, invariant, narrow command, and elapsed time. Record a baseline and repeat after Phase 1A; target at least 9/10 correct within five minutes, with the task corpus and raw outputs retained.
+- Active docs contain no contradictory system-boundary statements, broken local links, or required links into `.agentarchive`.
+- CI and the documented merge gate stay mechanically aligned through one command manifest.
+- A new crate or workspace-member change fails automation if the canonical index is not updated.
+
+### 4.2 Reliability
+
+- Every `AgentEvent` cross-layer payload has a checked policy covering ownership/cloning, maximum inline bytes, retention lifetime, overflow behavior, and durable-evidence behavior, even when characterization concludes no code change is needed.
+- Halt/cancellation behavior is tested for direct shell children and descendant process trees on each explicitly supported platform.
+- Browser launch has tested single-flight, timeout, cancellation, and retry behavior.
+- No new permission, cwd, session, event-ordering, or persistence regressions.
+
+### 4.3 Structure
+
+Navigation targets, not hard stylistic limits:
+
+- `ocean-daemon/src/main.rs` becomes composition-only and preferably under 500 lines.
+- `ocean-tui/src/main.rs` becomes parse-and-route only and preferably under 300 lines.
+- `ocean-agent/src/lib.rs` becomes a facade/re-export root and preferably under 500 lines.
+- Production modules should generally stay under 1,500 lines unless cohesion and invariants justify otherwise.
+- Existing public import paths, route method/path sets, middleware order, serialized data, session layout, and SSE semantics remain unchanged during mechanical extraction.
+
+### 4.4 Performance
+
+- Agent-loop/context improvements require before/after benchmark evidence.
+- Benchmarks report wall time, allocations/bytes where practical, peak RSS, provider rounds, and token/cache behavior.
+- No optimization is accepted solely because it reduces `.clone()` count.
+
+## 5. Program sequence
+
+### Phase 0 — Ground truth and characterization
+
+**Purpose:** Make the next edits safer before moving code.
+
+#### 0A. Canonical navigation contract — docs-only
+
+1. Make `crates/AGENTS.md` the canonical checked workspace index for all 25 packages. Root `AGENTS.md`, README, and `OCEAN.md` become concise curated maps or pointers rather than separately maintained competing inventories.
+2. Make the four-repo project map canonical and reconcile `OCEAN.md` and README system-boundary language.
+3. Move transient root `HANDOFF.md` into the archive or replace it with a short pointer to current contracts and `events.md`.
+4. Align root verification guidance with CI, explicitly separating:
+   - fast edit-loop checks;
+   - crate-local completion checks;
+   - portable local merge gates;
+   - host-specific and CI-only gates.
+5. Give every canonical workspace-index row:
+   - owns;
+   - does not own;
+   - primary entry point;
+   - local contract when one exists;
+   - narrow test command;
+   - non-default-member rationale when applicable.
+6. Add a compact cross-crate change-impact matrix for events, sessions, tools, models, provider wire changes, routes, and persistence.
+7. Remove broken or required active-doc links into `.agentarchive`; fix or remove the missing project-map artifact link.
+8. Run and retain the fixed cold-agent routing benchmark before and after the navigation changes.
+9. Do not create 16 boilerplate crate contracts. Add a crate-local `AGENTS.md` only when the crate has unique invariants or a meaningful safe-edit boundary.
+
+**Gate:** docs link/index review, Cargo metadata parity, benchmark artifacts, no source changes, independent reviewer acknowledgement.
+
+**Completion (2026-07-12): PASS.** `crates/AGENTS.md` now indexes all 25 packages; competing bootstrap maps point to it; the four-repo boundary, current handoff, contributor guide, CI-aligned gates, archive policy, non-default-member rationale, and active links are reconciled. The before/after cold-agent benchmark improved from 28/30 to 30/30 and eliminated the repeated legacy-TUI routing miss; see `docs/specs/2026-07-12-ocean-agent-readiness-baseline.md`.
+
+#### 0B. Independent characterization checkpoints
+
+These are separate changes with separate owners and artifacts. Browser and performance characterization do not block unrelated docs or intact module moves unless they expose a blocker in the files being moved.
+
+##### 0B-1. Event payload policy and stress
+
+1. Produce a checked table for every `AgentEvent` variant: payload fields, ownership/cloning points, maximum inline bytes, queue/replay retention lifetime, overflow behavior, and durable-evidence behavior.
+2. Inventory maximum `content` and `details` payloads from built-in, MCP, plugin, and browser tools.
+3. Run oversized-output stress in an isolated child process with a hard timeout/RSS ceiling, finite deterministic payload/concurrency limits, a slow or disconnected consumer, and assertions for drain/replay behavior.
+
+##### 0B-2. Shell Halt behavior
+
+1. Keep the existing direct-child timeout test.
+2. Add PID-based Halt characterization for a direct child and a descendant tree on macOS and Linux, with cleanup that still runs when assertions fail.
+3. Record unsupported-platform behavior explicitly.
+
+##### 0B-3. Browser single-flight behavior
+
+1. Introduce test seams for liveness probe and launcher operations without changing production semantics.
+2. Characterize healthy, dead, stalled, and cancelled cases under explicit deadlines.
+3. Assert concurrent callers observe exactly one launch and cancellation leaves the state retryable without an orphan browser process.
+
+##### 0B-4. Agent-loop history cost
+
+1. Add a reproducible benchmark for 10/100/1,000-message histories across 1/5/20 rounds.
+2. Record command, toolchain, machine metadata, warm-up/sample policy, allocations/bytes where practical, wall time, and threshold for meaningful regression.
+
+##### 0B-5. Strict lint inventory
+
+Store the exact command from §3.1, toolchain, raw output, feature/target exclusions, and machine-readable counts without enabling blanket `unwrap_used`/`expect_used` denial.
+
+**Gate:** each checkpoint records observed pass/failure honestly. A red regression proving a bug lands with its corresponding fix in the same safety PR; no ignored or nondeterministic test lands without an explicit tracked disposition.
+
+### Phase 1 — Automated guardrails and proven safety fixes
+
+#### 1A. Agent-facing automation
+
+Define one machine-readable repository command manifest, then make both `xtask` and CI consume it for repository-owned commands. GitHub Actions remains responsible for runner/tool installation and the OS matrix.
+
+Add discoverable `xtask` commands:
+
+- `cargo xtask docs-check`
+  - workspace/index parity;
+  - indexed contract paths exist;
+  - active local Markdown file targets resolve for inline and reference-style links;
+  - active docs do not depend on `.agentarchive` unless explicitly allowlisted;
+  - every non-default workspace member has a rationale and explicit check.
+- `cargo xtask ci --dry-run`
+  - prints the portable commands applicable to the current host;
+  - separately lists omitted host-specific and CI-only matrix/setup lanes.
+- `cargo xtask ci`
+  - runs the portable local merge gate from the shared manifest;
+  - reports platform-dependent omissions rather than claiming full CI equivalence.
+
+Add `docs-check` to CI after its own tests pass. Add parity tests so the workflow and command manifest cannot silently diverge.
+
+**Completion (2026-07-12): PASS.** Dependency-free `xtask` modules now validate the 25-package canonical index, non-default rationale, active repo-local Markdown file targets (inline and reference-style), and archive boundaries; heading fragments remain an explicit manual check. `cargo xtask ci` owns the executable gate manifest and reports CI-only setup/matrix lanes. GitHub Actions consumes that manifest on macOS and Ubuntu, with `cargo-deny` retained as a separate Ubuntu job. `cargo test -p xtask` and the full `cargo xtask ci` gate pass.
+
+#### 1B. Safety fixes proven by Phase 0B
+
+Implement only findings demonstrated by tests:
+
+1. The event byte/lifetime policy is mandatory documentation from 0B-1. If stress proves a product risk, implement the smallest approved inline cap, overflow signal, or backpressure fix. Artifact-backed large results remain a separately approved Phase 3 design.
+2. Add process-group/tree termination only if direct-child or descendant Halt characterization fails.
+3. Replace the browser startup lock pattern only if characterization shows unacceptable blocking or broken cancellation. Preserve exactly-one-launch behavior.
+4. Inventory supported feature combinations, then add a release-profile lane and an MSRV lane (`cargo +1.80 check --workspace --all-targets`) only if dependency compatibility and CI cost are acceptable. For daemon call paths, the supported compile matrix is default, `--features livekit-tap`, and `--features deepgram-stt` (which already implies `livekit-tap`).
+
+**Gate:** focused regressions; `cargo test -p ocean-runtime`; `cargo test -p ocean-daemon`; `cargo check --workspace --tests`; supported feature checks; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo fmt --all -- --check`; and a fresh security-focused review of process/payload behavior.
+
+### Phase 2 — Behavior-neutral structural extraction
+
+Every item below is a separate, reviewable move. No feature changes or opportunistic fixes.
+
+Before each move, write a short extraction manifest naming exact symbols/files, inbound and outbound dependencies, expected visibility changes (normally none), relevant route/middleware or public-path snapshots, focused tests, explicit exclusions, rollback commit, and the reviewer. If the manifest exposes a required design decision, stop and move that work to Phase 3.
+
+#### 2A. `ocean-agent` intact module moves
+
+1. Move the embedded `system_prompt` module to `src/system_prompt.rs` intact.
+2. Move the embedded session module to `src/session/mod.rs` intact.
+3. Preserve all `ocean_agent::...` public paths through re-exports.
+4. Stop after the intact moves. Splitting session internals changes the internal dependency/privacy graph and requires separate Phase 3 approval.
+
+**Critical invariants:** session serde compatibility, atomic save order, deterministic duplicate healing, strict resume/create behavior, workspace rebinding, same-session lock scope spanning load→run→save, raw message/image retention.
+
+**Gate:** `cargo test -p ocean-agent`, targeted session/project-prompt tests, workspace check, fmt.
+
+#### 2B. `ocean-tui` legacy and mesh isolation
+
+1. Leave the active `src/shell/` component/Elm architecture unchanged.
+2. Move the retained legacy daemon surface as one unit under `src/legacy/`.
+3. Move mesh command/state/ingestion/rendering under `src/mesh/`.
+4. Reduce `main.rs` to CLI parsing, project-root resolution, and dispatch.
+5. Stop after whole-surface isolation. Fine-grained legacy reducer/stream/render splits require separate Phase 3 approval.
+
+**Critical invariants:** enum variants are additive, default route remains `shell::run`, Elm dispatch remains the active shell's only mutation path, legacy SSE replay remains exactly once, agent mirrors do not double-render, cursor remains a UTF-8 byte offset, all rendered external text remains terminal-safe.
+
+**Gate:** `cargo test -p ocean-tui`; `cargo build -p ocean-tui --release`; workspace check/tests when shared enums are touched; fmt. Before the move starts, the extraction manifest must name or add a checked PTY/script harness for default, legacy, and mesh dispatch with explicit expected exit/frame conditions—“manual smoke” alone is not a completion gate.
+
+#### 2C. `ocean-daemon` composition and leaf extraction
+
+1. Establish a reusable internal router seam while preserving method/path sets, nesting/fallback behavior, and middleware layering. Preserve registration order only where an Axum match or fallback test proves it behaviorally relevant.
+2. Move leaf concerns first:
+   - metrics;
+   - CORS policy;
+   - workspace/cwd policy;
+   - core↔SDK event adapters;
+   - voice wrappers;
+   - catalog/settings;
+   - projects/filesystem;
+   - canvas routes.
+3. Move state registries/control plane, room projection, persistent rooms, Longhouse, and calls one domain at a time.
+4. Move the main agent-turn/SSE orchestration last.
+5. Keep the crate binary-only initially. Do not introduce service traits, substates, or a public library merely to move code.
+
+**Critical invariants:** route/method/middleware parity, health path, caller cwd, permission gates, session ownership, bounded replay semantics, event IDs/order, persistence paths, title tokens, room mention behavior, call feature gates.
+
+**Gate:** before extraction, add a checked method/path plus nesting/fallback/middleware snapshot and a route/banner parity command. Then run targeted route tests, `cargo test -p ocean-daemon`, default/`livekit-tap`/`deepgram-stt` compile checks, `cargo check --workspace`, fmt, and independent review.
+
+### Phase 3 — Architectural improvements after extraction
+
+Requires a new explicit approval because these are design changes rather than mechanical moves.
+
+Candidates:
+
+- split the intact `ocean-agent` session module into model, paths, store, list/detail, and GC modules;
+- migrate `ocean-cli` and any remaining clients from the legacy API/event/session rail, add deprecation telemetry, then remove the legacy routes and event bus as one compatibility migration;
+- retire the TUI `--legacy`/`OCEAN_TUI_LEGACY` path only after explicit feature-parity and usage/deprecation evidence; then remove the crate-wide dead-code allowance;
+- split isolated TUI legacy reducers, streams, rendering, and formatting into narrower modules only if retirement is not yet approved;
+- define one canonical room identity/projection contract before attempting to unify durable rooms, Track-0 snapshots, and mutable canvas projections;
+- split the universal system prompt into a compact base identity plus capability/surface profiles, with benchmark evidence and prompt-contract tests;
+- split `AppState` into domain substates;
+- unify duplicate legacy/product turn paths;
+- move sync SQLite work behind a dedicated executor;
+- generate route metadata instead of duplicating route/banner declarations;
+- create a daemon library for external HTTP contract tests;
+- redesign browser launch state;
+- establish artifact-backed large tool results;
+- introduce selective workspace lints after the current inventory is reviewed.
+
+No candidate is automatically approved by this plan.
+
+### Phase 4 — Measured performance work
+
+Use the existing harness benchmark plus focused microbenchmarks.
+
+Priority questions:
+
+1. How much time/allocation is spent serializing and trimming history per provider round?
+2. Which clones in `agent_loop.rs` and provider encoders are large enough to matter?
+3. What is the memory/latency effect of large tool outputs and slow clients?
+4. Does release-profile compilation expose different failures or meaningful binary/runtime changes?
+5. Can context caching or retained-size metadata reduce repeated work without weakening correctness?
+
+Every performance change includes before/after results and rollback criteria.
+
+## 6. Change-impact verification matrix
+
+| Change area | Read first | Required validation |
+|---|---|---|
+| Shared request/event/session serde | `ocean-core`, SDK, daemon, TUI/ACP contracts | Owning tests plus `cargo check --workspace --tests` |
+| Agent session persistence | `ocean-agent`, daemon contract | `cargo test -p ocean-agent`, daemon tests, workspace gate |
+| Tools/permissions/cwd/cancellation | runtime, agent, daemon contracts | Runtime E2E, permission/cancellation tests, daemon tests, workspace gate |
+| Model catalog/routing | providers, protocol, agent, TUI guidance | `cargo test -p ocean-providers`, protocol tests, workspace tests |
+| Provider wire/streaming | provider module and retry contract | Focused fixtures, `cargo test -p ocean-protocol` |
+| HTTP/SSE routes | daemon plus SDK/core clients | Narrow route tests, daemon tests, client compile/tests |
+| TUI enums/render/event flow | TUI contract and shared event owner | TUI tests/release build; workspace tests for shared enums |
+| Persistence schema | owning store/memory/context/Longhouse contract | Migration/backward-compat and restart persistence tests |
+
+## 7. Stop conditions
+
+Stop the current wave and request a decision if:
+
+- the required extraction manifest is missing, incomplete, or reveals a design decision;
+- a mechanical move requires a wire, serde, session-layout, error-contract, route, permission, or cwd semantic change;
+- visibility must become public outside the crate merely to resolve a move;
+- a new trait, crate dependency, daemon library, or state architecture is required;
+- tests reveal current behavior conflicts with documentation;
+- the baseline for touched behavior is already red and cannot be proven pre-existing;
+- route order, middleware, event order, lock lifetime, cancellation semantics, or persistence ordering changes unexpectedly;
+- a performance change lacks a reproducible baseline;
+- concurrent work overlaps the target files;
+- reviewer findings remain unresolved.
+
+## 8. Review and commit policy
+
+- One concern per commit; one domain per extraction.
+- Prefer move-heavy diffs and inspect with moved-code highlighting.
+- Avoid unrelated formatting or renaming during extraction.
+- Stage only owned files; never `git add -A`.
+- Re-read the applicable `AGENTS.md` chain and target files immediately before editing.
+- A fresh reviewer checks correctness, tests, and simplicity before each wave closes.
+- Update the nearest devlog contracts and append `events.md` after every meaningful change.
+
+## 9. First implementation checkpoints
+
+After this plan is approved, start with independently reviewable changes:
+
+1. **Ground-truth docs PR — complete:** repo boundaries, handoff, gates, canonical crate index, active links, and before/after cold-agent benchmark are reconciled.
+2. **Docs automation PR — complete:** `cargo xtask docs-check`, one executable CI manifest, manifest unit coverage, and GitHub Actions consumption are implemented and passing.
+3. **First intact source extraction — next:** move `ocean-agent::system_prompt` as one private module with prompt behavior/tests preserved.
+4. **Event-policy characterization PR:** produce the checked event table and isolated payload/RSS stress evidence.
+5. **Shell Halt characterization PR:** direct-child and descendant-tree tests by supported OS.
+6. **Browser characterization PR:** injected single-flight/deadline/cancellation tests.
+7. **Agent-loop benchmark PR:** reproducible history-cost benchmark and baseline artifact.
+
+Ground-truth docs and automation are complete. The first intact move is next and does not touch event, shell, browser, or history-cost paths. Further event/daemon/runtime moves remain blocked on their applicable characterization and safety disposition.
+
+## 10. Decisions requested
+
+Approval of this plan means:
+
+- preserve behavior and public contracts during structural work;
+- prioritize agent ground truth and proven safety risks before module aesthetics;
+- begin with the independent checkpoints above, allowing unrelated read-only/characterization lanes to proceed without bundling them;
+- require an extraction manifest before every mechanical move;
+- defer session-internal/TUI-legacy fine splits, `AppState` redesign, service traits, new public libraries, artifact-backed large-result design, and performance rewrites to separately approved phases.

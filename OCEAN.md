@@ -1,61 +1,57 @@
-# Ocean OS — read this first
+# Ocean OS — bootstrap context
 
-**Devlog source of truth:** read `AGENTS.md` first. The AGENTS.md hierarchy is the cross-harness work contract for Claude, Codex, Pi, ocean-native agents, and any other runtime. This file is Claude/bootstrap context only and does not override AGENTS.md.
+**Read `AGENTS.md` first.** The `AGENTS.md` hierarchy is the cross-harness work contract for Claude, Codex, Pi, ocean-native agents, and every other runtime. This file is only a compact bootstrap pointer and never overrides that contract.
 
-**Longhouse note:** Ocean Longhouse is the hive — the local-first agentic operations hub where agents go before they act. It centralizes SOPs, routines/workflows, tools/MCP discovery, skills, memory/knowledge, subagent specs, and quorum/council workflows. `ocean-daemon` remains the local runtime/body and execution authority; Longhouse coordinates/recommends and must not bypass daemon permission gates. Canonical doc: `docs/LONGHOUSE.md`.
+## System boundary
 
-**This repo is one half of a two-repo system. The other half is `ocean-surface`.**
+Ocean is a connected four-repo system. The canonical routing and ownership map is [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md):
 
-| Repo | What it is | Where |
-|---|---|---|
-| **ocean-os** (you are here) | The **runtime + daemon + TUI**. Owns the agent loop, tools, provider calls, **sessions**, permissions, events. This is the brain. | `../ocean-os` |
-| **ocean-surface** | The **client face** (browser PWA + voice, later Tauri native). A thin steering shell — holds **no** agent logic, **no** sessions. | `../ocean-surface` (also cloned locally) |
+- runtime, daemon, tools, permissions, providers, sessions, TUI, ACP, MCP client → `ocean-os`;
+- GUI/web/PWA/browser/editor/voice/canvas surfaces → `ocean-surface`;
+- assistant packages, profiles, SOPs, couriers → `ocean-agents`;
+- shared files, context, handoffs, ledger, graph/search, Bedrock APIs → `ocean-bedrock`.
 
-If someone mentions "ocean-surface", "the web surface", "the voice client", or "Leo" — **it is not a foreign country.** It is the sibling repo at `../ocean-surface`, already cloned on this machine. Go read it before saying you don't know what it is.
+Do not maintain another repo inventory here. Read the target repo's `AGENTS.md` before editing it.
 
-## How the two talk
+## Runtime authority
 
-Both clients (the TUI in this repo, and ocean-surface) steer the **same daemon** over one HTTP+SSE API:
+`ocean-daemon` is the local runtime/body. It owns provider calls, the agent loop, permission-gated tools, local sessions, and SSE events. Clients carry a `session_id` and steer the same daemon; they do not own independent session state.
 
+```text
+POST /v1/agent/turns    { prompt, cwd, session_id?, ... }
+GET  /v1/agent/events   session-scoped SSE
+GET  /health            daemon liveness
 ```
-POST /v1/agent/turns    { prompt, cwd, session_id?, guidance?, room_id? }
-GET  /v1/agent/events   (SSE stream of AgentTurnEvent)
+
+Session persistence lives in `crates/ocean-agent`. A load/save/rebind bug there affects TUI and ocean-surface together.
+
+Longhouse is the local-first coordination hive for SOPs, routines/workflows, tool/skill discovery, memory/knowledge, subagent specs, and councils. It coordinates and recommends; it never bypasses daemon execution or permission authority. Canonical reference: [`docs/LONGHOUSE.md`](docs/LONGHOUSE.md).
+
+## Workspace navigation
+
+The canonical index for all 25 workspace packages is [`crates/AGENTS.md`](crates/AGENTS.md). It records ownership, exclusions, entry points, local contracts, narrow tests, non-default-member rationale, and cross-crate fanout.
+
+Core flow:
+
+```text
+clients -> ocean-daemon -> ocean-agent -> ocean-runtime -> ocean-protocol/providers
 ```
 
-The daemon listens on `127.0.0.1:4780` by default (`OCEAN_BIND` to override).
-
-**Sessions live HERE, in the daemon, only.** Clients just carry a `session_id` string and replay it on each turn. So any "lost session / restarted mid-chat" bug is almost always a daemon-side session bug in this repo (`crates/ocean-agent` session load/save), and it breaks **both** clients at once — because they both depend on the daemon remembering the transcript by id.
-
-## Crate map
-
-| Crate | Role |
-|---|---|
-| `ocean-core` | Shared protocol types: requests, responses, events, sessions |
-| `ocean-protocol` | Multi-provider LLM wire protocol (Anthropic, OpenAI, Gemini, OpenAI-compatible) |
-| `ocean-runtime` | Agent loop + permission-gated tool execution |
-| `ocean-providers` | Provider registry: model routing, credentials, readiness |
-| `ocean-agent` | **Session/history layer** wrapping the runtime — session load/save lives here |
-| `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
-| `ocean-daemon` | Long-running HTTP service on `:4780`. Owns runtime authority |
-| `ocean-cli` (`ocean-rs`) | CLI client |
-| `ocean-tui` (`ocean`) | Terminal steering cockpit |
-
-## Build / run
+## Build and run
 
 ```bash
 cargo build --workspace --release
-./target/release/ocean-daemon              # the daemon
-./target/release/ocean-tui                 # or: ocean (symlinked release binary)
+./target/release/ocean-daemon
+curl -fsS http://127.0.0.1:4780/health
+./target/release/ocean-tui   # or: ocean
 ```
 
-The `ocean` binary is a symlink to the release build — after any TUI change, run `cargo build -p ocean-tui --release`.
+The supervised daemon runs from a neutral cwd, not the repo. After TUI changes, rebuild `cargo build -p ocean-tui --release` because the global `ocean` command points at that artifact.
 
-## Daemon restarts
+## Current work
 
-Standing authorization (set 2026-06-13): the factory loop may restart/redeploy the daemon from main without asking. A restart drops whatever session is in flight, so prefer a quiet moment (no agent turn mid-render), but that's a judgment call, not a hard stop — keep the project moving. Always build/deploy from up-to-date `main`. Use a specific-PID kill, not blind `pkill` sweeps.
-
-## More context
-
-- Architecture: `docs/ARCHITECTURE.md`
-- Repo routing / Linear rules: `docs/linear-teams-routing.md`, `docs/AGENTS.md`
-- Operator guide: `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`
+- Active code-health/agent-readiness program: [`docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md`](docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md)
+- Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Operator guide: [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md)
+- Cross-repo routing: [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md)
+- Historical chronology: `events.md`

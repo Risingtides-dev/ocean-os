@@ -7,32 +7,24 @@ Ocean OS is an agentic operating system written in Rust. A long-running daemon o
 
 ## What's in this repo
 
-| Crate | Role |
-|---|---|
-| `ocean-core` | Shared protocol types: requests, responses, events, sessions |
-| `ocean-protocol` | Unified multi-provider LLM wire protocol (Anthropic, OpenAI, Google Gemini, OpenAI-compatible). SSE streaming, retry, cancellation |
-| `ocean-runtime` | Agent loop with permission-gated tool execution. Built-in tools: read, write, edit, bash, ls, grep, glob, web_fetch, todo |
-| `ocean-mcp` | Ocean as an MCP **client**: connects to external Model Context Protocol servers and exposes their tools to the agent through the runtime |
-| `ocean-acp` | ACP (Agent Client Protocol) bridge — exposes the daemon to Zed and other ACP editors over stdio |
-| `ocean-providers` | Ocean-owned provider registry: model routing, credential resolution, readiness checks |
-| `ocean-longhouse` | Quorum engine + convening flow behind the longhouse deck (multi-agent council) |
-| `ocean-heartbeat` | Scheduleable Ocean routines: prompt-injection scheduler hooks for daemon routines (`ocean-heartbeat` binary) |
-| `ocean-agent` | Ocean session/history layer wrapping `ocean-runtime` |
-| `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
-| `ocean-daemon` | Long-running HTTP service on `:4780`. Owns runtime authority |
-| `ocean-cli` (`ocean-rs` binary) | CLI client: health, prompt, sessions |
-| `ocean-tui` (`ocean` binary) | Terminal Agent surface |
-| `ocean-browser` | Typed async handle to a Chrome instance driven over the DevTools Protocol |
-| `ocean-call` | Ocean Call Intelligence: daemon-side PSTN call agent (Twilio SIP → LiveKit room) that Ocean joins as a server-side participant |
+The canonical ownership/entry/test index for all 25 workspace packages is [`crates/AGENTS.md`](crates/AGENTS.md). It is checked against Cargo metadata; this README does not duplicate the package inventory.
 
-## Quick start
+Core execution path:
+
+```text
+clients -> ocean-daemon -> ocean-agent -> ocean-runtime -> ocean-protocol/providers
+```
+
+Cross-repo work routes through [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md), which covers `ocean-os`, `ocean-surface`, `ocean-agents`, and `ocean-bedrock`.
 
 ## Product framing
 
 - `ocean-rs` is the canonical Rust-native coding-agent harness/runtime.
 - `ocean-daemon` owns runtime authority: provider calls, agent loops, tools, sessions, permissions, and events.
-- `ocean-tui` is the Agent terminal coding surface
-- Ocean GUI and service layers remain thin clients until the daemon protocol is stable. see risingtides-dev/ocean-surface repo
+- `ocean-tui` is the agent terminal coding surface.
+- Ocean GUI and service layers remain thin clients; see the sibling `ocean-surface` repo.
+
+## Quick start
 
 Run the daemon:
 

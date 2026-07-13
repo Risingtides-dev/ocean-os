@@ -1,6 +1,6 @@
 # Ocean-OS — Agent Guidance
 
-> Agentic knowledge layer for Rising Tides. See [README.md](README.md) for full product/architecture context.
+> Agentic knowledge layer for Rising Tides. See [README.md](../README.md) for full product/architecture context.
 
 ## Team & Repo Routing
 

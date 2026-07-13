@@ -18,6 +18,8 @@ This child doc governs the `docs/` subtree: architecture notes, operator guides,
 - `ocean-daemon` owns local sessions, streaming, filesystem/tools, permission gates, and execution authority.
 - `ocean-longhouse` owns SOPs, routines/workflows, tools/MCP discovery, skills, memory/knowledge, subagent specs, and quorum/council coordination.
 - Do not port Pi TypeScript line-by-line; document idiomatic Rust concepts and boundaries.
+- Active docs must not require material from `.agentarchive` to explain current behavior. Historical evidence may be retained there as opt-in operator context, but current contracts point to active sources.
+- Active code-health/agent-readiness plan: `specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md`.
 
 ## Work Guidance
 
@@ -28,7 +30,7 @@ This child doc governs the `docs/` subtree: architecture notes, operator guides,
 
 ## Verification
 
-- For docs-only edits, manually verify links and commands named in the edited doc.
+- For docs-only edits, run `cargo xtask docs-check`; it validates repo-local Markdown file targets, not heading fragments. Manually verify headings, commands, and code-behavior claims that static checks cannot prove.
 - If documentation changes describe code behavior, run the relevant crate or workspace verification from the root contract.
 
 ## Child devlog Index

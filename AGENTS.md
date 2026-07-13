@@ -8,51 +8,68 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 
 - **Repo:** `risingtides-dev/ocean-os`
 - **Runtime:** Rust workspace, daemon on `:4780`, TUI binary `ocean`
-- **Sibling repo:** `../ocean-surface` (browser PWA client, no agent logic)
+- **Connected Ocean repos:** route cross-repo work through `docs/OCEAN_PROJECT_MAP.md`; do not infer ownership from proximity.
 
 ## Local Contracts
 
 - Read this file before editing anything in this repo.
-- Walk from repo root to your target path and read every AGENTS.md along the route.
-- Use the nearest AGENTS.md as the local contract; parent docs set repo-wide rules.
+- Walk from repo root to each target path and read every `AGENTS.md` along the route.
+- Use the nearest `AGENTS.md` as the local contract; parent docs set repo-wide rules.
 - No child doc may weaken this root contract.
 - Cross-repo routing map: `docs/OCEAN_PROJECT_MAP.md`.
-- After any meaningful change, do a devlog pass: update the nearest owning AGENTS.md, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`.
+- Canonical workspace package/entry/test index: `crates/AGENTS.md`. Do not maintain a second crate inventory here.
+- After any meaningful change, do a devlog pass: update the nearest owning `AGENTS.md`, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`.
 
-## Crate Map
+## Workspace Routing
 
-| Crate | Role |
-|---|---|
-| `ocean-core` | Shared protocol types: requests, responses, events, sessions |
-| `ocean-protocol` | Multi-provider LLM wire protocol (Anthropic, OpenAI, Gemini) |
-| `ocean-runtime` | Agent loop + permission-gated tool execution |
-| `ocean-providers` | Provider registry: model routing, credentials, readiness |
-| `ocean-agent` | Session/history layer — session load/save lives here |
-| `ocean-agent-sdk` | SDK surface for embedding the agent in other Rust code |
-| `ocean-lsp` | Code intelligence: the `lsp` tool over auto-detected workspace language servers |
-| `ocean-memory` | Typed SQLite memory store and ingest helpers |
-| `ocean-oauth` | Browser OAuth + PKCE login flows (Claude/Codex); writes Ocean auth-file blocks |
-| `ocean-daemon` | Long-running HTTP service on `:4780` |
-| `ocean-cli` | CLI client |
-| `ocean-tui` | Terminal steering cockpit (`ocean` binary) |
+Core execution flow:
+
+```text
+clients (TUI / CLI / ACP / surface)
+  -> ocean-daemon (HTTP/SSE authority)
+  -> ocean-agent (sessions, prompts, capability assembly)
+  -> ocean-runtime (agent loop, permissions, tools)
+  -> ocean-protocol + ocean-providers (wire encoding + model/auth routing)
+```
+
+Use `crates/AGENTS.md` for all 25 workspace packages, ownership exclusions, entry points, local contracts, and narrow validation commands.
 
 ## Work Guidance
 
-- Build: `cargo build --workspace --release`
-- TUI change: `cargo build -p ocean-tui --release`
-- Daemon restarts: standing authorization to restart from `main`; use specific-PID kill, not blind pkill
-- Daemon health: `GET /health` (not `/v1/health`)
-- Supervised daemon (`dev.risingtides.ocean-daemon` LaunchAgent): install/reinstall via `ops/install-ocean-daemon.sh` (builds from `main`, copies plist, bootstraps launchd, `keepalive|runatload` so it survives reboot). Ship new code: rebuild from `main`, then `launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon`. The daemon must run from a NEUTRAL cwd (`$HOME`), NOT the repo — its startup guard refuses to boot inside a git repo so unbound fallback turns don't bind to ocean-os; do NOT paper over this with `OCEAN_ALLOW_REPO_CWD=1`.
-- Sessions live in the daemon only — session bugs break both TUI and ocean-surface simultaneously
+- Active improvement program: `docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md`.
+- Optimize for cold-agent discoverability: ownership, entry point, critical invariant, and narrow validation must remain findable from the root plus `crates/AGENTS.md`.
+- Behavior-neutral extraction requires a written extraction manifest and must not bundle redesign, protocol changes, renames, or opportunistic fixes.
+- Build: `cargo build --workspace --release`.
+- TUI change: `cargo build -p ocean-tui --release`.
+- Daemon restarts: standing authorization to restart from `main`; use specific-PID kill, not blind `pkill`.
+- Daemon health: `GET /health` (not `/v1/health`).
+- Supervised daemon (`dev.risingtides.ocean-daemon` LaunchAgent): install/reinstall via `ops/install-ocean-daemon.sh`, which refuses non-`main`, builds release, installs the plist, and bootstraps launchd. Ship new code by rebuilding from updated `main`, then `launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon`.
+- The daemon must run from a neutral cwd (`$HOME` by default), never the repo. Its startup guard rejects repository cwd so unbound fallback turns cannot bind to ocean-os; do not bypass this with `OCEAN_ALLOW_REPO_CWD=1`.
+- Sessions live under daemon authority via `ocean-agent`; session bugs break TUI and ocean-surface together.
 
 ## Verification
 
-- `cargo check --workspace` must pass before any commit
-- `cargo fmt --check` is gated in CI
-- Knox (review gate) must ack before merge on feature/logic PRs
+### Fast edit loop
+
+- Run the nearest owning crate's narrow command from `crates/AGENTS.md` or its local contract.
+- For docs-only changes, run `cargo xtask docs-check`; it validates active repo-local Markdown file targets (not heading fragments), archive boundaries, canonical workspace-index parity, and non-default-member rationale.
+
+### Workspace completion gate
+
+- `cargo check --workspace`
+- Relevant crate tests; use `cargo check --workspace --tests` when shared enums/events fan out across crates.
+- Feature-specific checks named by the owning crate contract.
+
+### Merge / PR gate (mirrors CI)
+
+- `cargo xtask ci` is the canonical local gate: docs/index integrity, workspace build/test, all-target Clippy with denied warnings, format, and `cargo deny check`.
+- `cargo xtask ci --dry-run` prints the portable command manifest plus omitted CI-only matrix/setup lanes without executing them.
+- Fresh reviewer acknowledgement is required for feature, logic, security, protocol, or architecture changes.
+
+CI consumes the same xtask manifest on macOS and Ubuntu with `--skip-deny`; `cargo-deny` remains a separate Ubuntu job. A local single-host run does not replace that matrix.
 
 ## Child devlog Index
 
 - `.ocean/` — Ocean runtime artifacts, config, and session data → `.ocean/AGENTS.md`
-- `crates/` — Rust workspace crates and crate-specific contracts → `crates/AGENTS.md`
-- `docs/` — Architecture and operator documentation → `docs/AGENTS.md`
+- `crates/` — canonical Rust workspace ownership/entry/test index and crate contracts → `crates/AGENTS.md`
+- `docs/` — architecture, operator documentation, active plans, and historical archive policy → `docs/AGENTS.md`

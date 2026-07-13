@@ -15,6 +15,8 @@ written_at: 1780980000
 
 # Handoff — ocean-context (the handoff/context engine itself)
 
+> **Historical beta artifact (2026-07-12):** this document and the test fixture preserve the old root-handoff corpus. Current `HANDOFF.md` is an evergreen routing pointer, so claims below about “root HANDOFF.md docs” describe the historical validation run, not current onboarding state.
+
 > **For the agent picking this up.** We just spent a long brainstorm designing a context engine
 > where the handoff is a *primitive*. The full design is committed at
 > `docs/specs/ocean-context-handoff-engine.md`. **Read that spec first — it is the source of truth.**

@@ -17,6 +17,28 @@ cargo xtask help
 
 ---
 
+## `docs-check`
+
+Validate repository documentation and workspace routing without loading opt-in historical context:
+
+```bash
+cargo xtask docs-check
+```
+
+The check fails on missing active repo-local Markdown file targets (inline and reference-style), active links into `docs/.agentarchive/`, mismatch between Cargo workspace packages and the canonical `crates/AGENTS.md` index, missing root routing to that index, or undocumented non-default workspace members. Heading-fragment validity is not checked. Transient worktrees, the append-only event ledger, and historical archive folders are intentionally excluded.
+
+## `ci`
+
+Run the single executable manifest shared by local development and CI:
+
+```bash
+cargo xtask ci                 # docs, build, test, Clippy, format, cargo-deny
+cargo xtask ci --dry-run       # print the command manifest + CI-only lanes
+cargo xtask ci --skip-deny     # CI matrix; cargo-deny runs in its own job
+```
+
+The command fails fast. GitHub Actions calls this manifest on macOS and Ubuntu instead of duplicating individual Rust commands in YAML.
+
 ## `clear-webrtc-cache`
 
 Un-poisons the **libwebrtc download-cache** so the next build re-fetches

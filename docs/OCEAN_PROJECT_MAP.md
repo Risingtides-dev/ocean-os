@@ -7,8 +7,6 @@ repo and still route the user's words to the right source of truth. It does not
 replace the local `AGENTS.md` chain. Read the target repo's `AGENTS.md` before
 editing.
 
-Animated cartography artifact: `../../ocean-os/docs/OCEAN_PROJECT_MAP_ART.html`.
-
 ## First Routing Rule
 
 | If the user says | Start here | Why |

@@ -80,8 +80,8 @@ Shared event names are snake_case on the wire (`tool_started`, `permission_reque
 
 The main TUI context should promote the live Tides Mesh floor, not bury it in side notes. The current Rust-native MeshFloor target is documented in:
 
-- [`docs/.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md) — archived tmux floor blueprint and pane geometry (superseded reference).
-- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md) — no-feature-drop parity contract.
+- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md) — active no-feature-drop parity contract.
+- [`docs/OCEAN_TUI_MOCKUPS.md`](OCEAN_TUI_MOCKUPS.md) — active cockpit layout and interaction reference.
 
 MeshFloor summary:
 

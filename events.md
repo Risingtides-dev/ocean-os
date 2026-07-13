@@ -2369,6 +2369,16 @@ area:      [backend]
 
 Fixed two provider-wire failures exposed by the harness benchmark. Codex OAuth requests now send the current Codex CLI `version` header; the ChatGPT backend had returned a misleading 404 “Model not found” for GPT-5.6 Luna when that header was absent. Anthropic extended thinking now clamps `budget_tokens` below the request's `max_tokens` cap; Haiku 4.5 high effort had sent 16384 for both fields and received a 400. Added focused serialization/header regression tests, ran all 122 ocean-protocol tests, `cargo check --workspace`, and `cargo fmt --check`; rebuilt and restarted the supervised daemon. Live high-effort benchmark reruns completed 6/6 for GPT-5.6 Luna (46.224s) and Claude Haiku 4.5 (53.698s).
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [05:35pm] [12-07-26]
+agent:     [pi]
+worktree:  [main]
+type:      [bug report]
+area:      [testing]
+
+Restored the globally available `ocean` TUI command after the release artifact disappeared. The daemon and LaunchAgent were healthy; `~/.local/bin/ocean` was still correctly symlinked to `target/release/ocean-tui`, but that target no longer existed, leaving a dangling command. Rebuilt with `cargo build -p ocean-tui --release`; `command -v ocean`, the arm64 release artifact, `ocean --help`, and `GET /health` now verify successfully. No source or contract files changed; AGENTS.md files were intentionally left unchanged.
+_________________________________________________________________________________
 time:      [06:05pm] [12-07-26]
 agent:     [omp], [gpt-5.6-sol]
 worktree:  main
@@ -2377,6 +2387,7 @@ area:      [backend]
 
 Fixed Ocean's GPT-5.6 Codex prompt-cache identity after an exact Luna/high benchmark showed Ocean at 83,159 fresh input tokens and only 15,360 cache-read tokens versus Codex CLI at 28,566 fresh and 173,312 cached. The runtime now threads its stable `AgentConfig::session_id` into every provider round; the Codex provider sends that id as both `prompt_cache_key` and the HTTP `session_id`, retaining a random UUID only for ad-hoc calls. Focused protocol/runtime regressions cover request serialization and runtime propagation. The exact rerun stayed 6/6 and improved Ocean to 17,926 fresh input with 118,272 cached (86.8% hit rate), beating Codex CLI's 24,763 fresh input and estimated API-equivalent cost while retaining a 63.8MB versus 381.7MB marginal-memory advantage. Ocean remained slower on this sample (87.662s versus 55.958s). Verification: 283 protocol/runtime tests, `cargo check --workspace`, and `cargo fmt --check`.
 _________________________________________________________________________________
+
 time:      [07:39pm] [12-07-26]
 agent:     [omp], [gpt-5.6-sol]
 worktree:  main
@@ -2403,3 +2414,36 @@ area:      [backend]
 
 Tightened Ocean's production system prompt after benchmark traces showed unnecessary provider rounds. Replaced the 7.2KB hardcoded repo/tool/browser catalog with a 1.5KB tool-agnostic operating contract that tells models to batch independent calls, avoid repeated investigation, and trust runtime tool schemas. Changed memory guidance from recalling at the start of every substantive task to recall only when prior conversations, preferences, or decisions are actually required and not already injected. Removed the local Stitchpad MCP server and Stop hook from Ocean configuration. Focused ocean-agent prompt tests pass.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [08:09pm] [12-07-26]
+agent:     [pi]
+worktree:  [main]
+type:      [plan]
+area:      [analysis]
+
+Created the approval-gated Ocean OS code-health and agent-readiness roadmap at docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md. The north star is a behavior-preserving codebase that cold agents can route, navigate, modify, and verify without rediscovering architecture. Four read-only lanes mapped daemon decomposition, TUI/agent boundaries, onboarding/documentation gaps, and Rust risks; two adversarial plan reviews then found and resolved sequencing/validation blockers, and the final reviewer returned PASS with no blockers. The plan prioritizes canonical agent ground truth, checked event-payload/cancellation/browser/performance characterization, platform-aware automation, then intact module moves for ocean-agent, ocean-tui legacy/mesh, and ocean-daemon. Direct source verification rejected a false shell-orphan finding because BashTool already uses kill_on_drop(true); the remaining process-tree Halt question is explicitly characterization-first. No source refactor or product behavior changed. AGENTS.md files were intentionally left unchanged because this is a proposed plan, not an approved current contract.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [09:06pm] [12-07-26]
+agent:     [pi]
+worktree:  [main]
+type:      [workflow]
+area:      [automations]
+
+Applied the bounded Ocean cleanup surfaced by the harness-bench debt audit without starting the large migrations: root-anchored ignores now cover local `.pi-subagents/` state and the alternate `/target3/` build tree; the inactive 1.2 GB target3 directory was removed after confirming no process held it. Corrected ops/README.md to match the production launcher’s neutral `$HOME`/`OCEAN_DAEMON_CWD` working directory and persisted-session behavior. Closed a pre-existing deployment contract gap by making ops/install-ocean-daemon.sh fail with exit 64 before build/deploy when the checkout is not on main, instead of warning and continuing. Added the audit’s legacy API/TUI retirement, room-authority, and system-prompt profiling ideas only as separately approved Phase 3 candidates in the proposed code-health plan. Verification: bash syntax and shellcheck (when available), static guard-order assertion, ignore-scope checks, target3 absence, diff checks, and fresh independent review PASS. AGENTS.md files were intentionally unchanged because the root contract already required main-built deployment and neutral cwd; this cleanup made implementation/docs conform to that existing contract.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [09:50pm] [12-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [workflow]
+area:      [agent-building]
+
+Completed the approved Phase 0A ground-truth/navigation pass and Phase 1A automation. `crates/AGENTS.md` is now the canonical checked index for all 25 workspace packages; root/bootstrap/contributor/handoff docs point to it and the four-repo project map instead of maintaining competing inventories. Reconciled active/archive context, non-default-member rationale, CI-aligned gates, ownership exclusions, and cross-crate fanout guidance. The fixed three-agent cold-routing benchmark improved from 28/30 to 30/30 and eliminated the repeated legacy-TUI `Action` routing miss.
+
+Added dependency-free `cargo xtask docs-check` and `cargo xtask ci`. The docs check validates Cargo/index parity, non-default rationale, inline/reference-style repo-local Markdown file targets, and archive boundaries; GitHub Actions now consumes the xtask gate manifest on macOS and Ubuntu while retaining cargo-deny as a separate Ubuntu job. Final `cargo xtask ci` passed: docs-check reported 25 packages / 92 active Markdown files / 56 local links; workspace build/tests, strict all-target Clippy, format, and cargo-deny all passed. Fresh automation review found one reference-link gap, which was fixed and re-reviewed PASS.
+_________________________________________________________________________________
+

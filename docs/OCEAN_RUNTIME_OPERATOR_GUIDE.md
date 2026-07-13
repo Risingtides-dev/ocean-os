@@ -477,8 +477,8 @@ Mesh view also honors:
 
 Main MeshFloor references:
 
-- [`docs/.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md`](.agentarchive/OCEAN_TUI_TMUX_LAYOUT_MAP.md) (archived)
-- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md)
+- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md) — active parity contract
+- [`docs/OCEAN_TUI_MOCKUPS.md`](OCEAN_TUI_MOCKUPS.md) — active cockpit reference
 
 ## HTTP API quick reference
 

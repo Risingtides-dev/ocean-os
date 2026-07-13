@@ -5,6 +5,8 @@
 //! `cargo run -p xtask -- <cmd>`.
 //!
 //! Commands:
+//!   docs-check                       Validate active docs and workspace index.
+//!   ci [--dry-run] [--skip-deny]     Run the repository quality-gate manifest.
 //!   check-webrtc-cache [--fix]       Detect a poisoned/partial libwebrtc cache.
 //!   clear-webrtc-cache [--rebuild]   Remove poisoned libwebrtc build artifacts.
 //!   help                             Print usage.
@@ -12,6 +14,8 @@
 use std::process::ExitCode;
 
 mod check_webrtc_cache;
+mod ci;
+mod docs_check;
 mod paths;
 mod webrtc_cache;
 
@@ -22,6 +26,8 @@ fn main() -> ExitCode {
     let rest: Vec<String> = args.collect();
 
     match cmd.as_deref() {
+        Some("docs-check") => docs_check::run(&rest),
+        Some("ci") => ci::run(&rest),
         Some("check-webrtc-cache") => check_webrtc_cache::run(&rest),
         Some("clear-webrtc-cache") => webrtc_cache::run(&rest),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -46,6 +52,21 @@ USAGE:
     cargo run -p xtask -- <COMMAND> [ARGS]
 
 COMMANDS:
+    docs-check
+        Validate active repository-local Markdown file targets (inline and
+        reference-style; not heading fragments), prohibit active links into
+        the opt-in docs archive, compare the canonical crates/AGENTS.md
+        package index with Cargo.toml, and require rationale for non-default
+        workspace members.
+
+    ci [--dry-run] [--skip-deny]
+        Run docs-check and the repository's required Rust quality-gate manifest
+        in order: build, test, Clippy, format, and cargo-deny. Fails fast.
+
+        Flags:
+            --dry-run    Print the command manifest and CI-only lanes without running them.
+            --skip-deny  Omit cargo-deny when it is run as a separate CI job.
+
     check-webrtc-cache [--fix]
         Detect a poisoned/partial libwebrtc download-cache *before* the build
         fails with the cryptic \"could not find native static library `webrtc`\".
