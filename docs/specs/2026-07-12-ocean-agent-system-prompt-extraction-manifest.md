@@ -2,7 +2,8 @@
 
 **Date:** 2026-07-12
 **Type:** behavior-neutral structural extraction
-**Status:** Rebased implementation validated; independent re-review pending
+**Status:** Complete — independently re-reviewed after upstream sync
+**Rollback commit:** `fa1eab27`
 
 ## Source
 
@@ -45,9 +46,10 @@
 
 - Pre-format module body copied intact: **59,425 bytes**, SHA-256 `c8d1aa6e35c3bdb160ce010e6675b33dc640fade3314f1fd8572ca8a6e6d66bd` before and after extraction.
 - Upstream commit `eba86f04` tightened prompt wording before this extraction was replayed; the move preserves that upstream body and introduces no additional wording change.
+- Rustfmt-normalized rollback body equals `src/system_prompt.rs` exactly: SHA-256 `f929c269239707d5d3666195fd1e5a4d0705ea0f662050ae5116390b6c1a92c0`.
 - `cargo test -p ocean-agent system_prompt`: **22 passed**.
 - `cargo test -p ocean-agent`: **149 passed**.
 - `cargo check --workspace`: passed.
 - `cargo xtask docs-check`: passed with 25 indexed packages and 92 active Markdown files.
 - `cargo fmt --all` and `git diff --check`: passed.
-- Fresh re-review against the upstream-adjusted embedded source is pending.
+- Fresh reviewer compared the rebased target with `fa1eab27`, reran all 22 focused tests, verified upstream compactness/recall guidance, and returned **PASS** with no blockers.

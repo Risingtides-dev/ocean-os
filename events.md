@@ -2466,9 +2466,9 @@ worktree:  [main]
 type:      [refactor]
 area:      [backend]
 
-Completed the second and final approved intact `ocean-agent` Phase 2A move. Extracted the private 30,078-byte embedded `session` module from `src/lib.rs` into `src/session/mod.rs` while leaving every root caller and root test in place. Preserved symbol visibility, persisted serde fields/defaults, atomic write/sync/rename/purge order, deterministic duplicate healing, strict corrupt/unknown resume behavior, workspace binding/bucketing, TTL/GC, pagination, transcript/image projection, raw messages, and the outer load→run→save lock scope. Rustfmt-normalized rollback source (`644dbc8d`) equals the final 27,322-byte module exactly (SHA-256 `13c3769527041ccdf357f258cfca8fce89c07c35e46e40c0afdc447e78f98d59`); `lib.rs` is now 5,416 lines.
+Completed the second and final approved intact `ocean-agent` Phase 2A move. Extracted the private 30,078-byte embedded `session` module from `src/lib.rs` into `src/session/mod.rs` while leaving every root caller and root test in place. Preserved symbol visibility, persisted serde fields/defaults, atomic write/sync/rename/purge order, deterministic duplicate healing, strict corrupt/unknown resume behavior, workspace binding/bucketing, TTL/GC, pagination, transcript/image projection, raw messages, and the outer load→run→save lock scope. Rustfmt-normalized rebased rollback source (`5be4cf6d`) equals the final 27,322-byte module exactly (SHA-256 `13c3769527041ccdf357f258cfca8fce89c07c35e46e40c0afdc447e78f98d59`); `lib.rs` is now 5,416 lines.
 
-Verification: 24 focused session tests, all 148 ocean-agent tests, workspace check, docs-check (25 packages / 93 active Markdown files / 56 links), and the full `cargo xtask ci` gate passed, including strict all-target Clippy, format, and cargo-deny. The first reviewer run found only a leading blank line rejected by rustfmt; it was removed, the full gate reran cleanly, and reviewer follow-up returned PASS with no remaining blockers. Manifest: `docs/specs/2026-07-12-ocean-agent-session-extraction-manifest.md`.
+Verification after upstream reconciliation: 24 focused session tests and all 149 ocean-agent tests pass; workspace/docs/full-gate validation and fresh normalized-source re-review are recorded at rebase closeout. The original review found only a leading blank line rejected by rustfmt; it was removed before commit. Manifest: `docs/specs/2026-07-12-ocean-agent-session-extraction-manifest.md`.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
@@ -2483,4 +2483,16 @@ Completed Phase 0B-1 event-payload characterization and the smallest test-proven
 Added a 32-MiB serialized-event-payload ceiling alongside the existing 2,048-event replay limit. Oldest envelopes evict under one mutex until both limits hold; a single oversized event remains full-fidelity live but is not replay-retained. Byte counting uses a non-allocating serializer writer. Deque + aggregate share one poison-recovering state; a regression intentionally poisons after a stale aggregate mutation and proves recomputation/eviction. Tests also cover cloned bus handles, exact byte counting, slow lag, disconnect, replay, and oversized live-only delivery. Post-fix isolated RSS fell to 17.2 MiB for the same replay case. Public `AgentTurnEvent`/SSE shapes, live delivery, transcript persistence, and replay/live subscription ordering are unchanged.
 
 Verification: runtime 113 tests, daemon 294 tests, workspace test check, strict affected-crate Clippy, fmt/diff/docs checks, full repository gate, and fresh security review PASS after the poison-safety correction. The per-turn runtime MPSC queue and generic live-event sizes remain honestly documented residual risks. Report: `docs/specs/2026-07-12-ocean-event-payload-characterization.md`.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [11:18pm] [12-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [workflow]
+area:      [review]
+
+Reconciled the five local code-health commits onto fetched `origin/main` at `7726613e` without overwriting three concurrent upstream changes. Preserved `afc1a88f` dual-editor runtime behavior and AGENTS rationale, `eba86f04` compact/tool-agnostic system prompt plus conditional recall guidance and new compactness test, and `7726613e` README heading. The system-prompt extraction was replayed from the upstream-adjusted body (59,425 raw bytes, SHA-256 `c8d1aa6e35c3bdb160ce010e6675b33dc640fade3314f1fd8572ca8a6e6d66bd`; normalized `f929c269...`); the session body remained exact (30,078 raw / `087908...`; normalized `13c376...`).
+
+Post-rebase validation: 22 prompt tests, 24 session tests, 149 full ocean-agent tests, 294 daemon tests, 113 runtime tests, dual-editor regressions, docs/index checks, workspace build/tests, strict all-target Clippy, format, cargo-deny, and the full `cargo xtask ci` gate passed. A fresh preservation reviewer compared both extracted modules to their new rebased parents, verified the replay-byte/poison-safety fix, and returned PASS with no blockers. Backup ref `backup/pi-code-health-pre-rebase-20260712` retains the pre-rebase commit chain; main is clean and ahead of origin with no remaining divergence.
 _________________________________________________________________________________

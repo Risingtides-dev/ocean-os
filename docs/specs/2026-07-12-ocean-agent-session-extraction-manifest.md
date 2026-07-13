@@ -2,8 +2,8 @@
 
 **Date:** 2026-07-12
 **Type:** behavior-neutral structural extraction
-**Status:** Complete — independently reviewed
-**Rollback commit:** `644dbc8d`
+**Status:** Complete — independently re-reviewed after upstream sync
+**Rollback commit:** `5be4cf6d`
 
 ## Source
 
@@ -48,16 +48,16 @@
 5. `cargo test -p ocean-agent`
 6. `cargo check --workspace`
 7. `cargo xtask docs-check`
-8. Fresh independent review against rollback commit `644dbc8d`.
+8. Fresh independent review against rollback commit `5be4cf6d`.
 
 ## Validation result
 
 - Pre-format module body copied intact: **30,078 bytes**, SHA-256 `08790831a70c9b77f2bef3c97d4e76d75bc9e4601d27dd2a905c2e2ebedac3b9` before and after extraction.
 - Rustfmt-normalized rollback-commit body equals `src/session/mod.rs` exactly: **27,322 bytes**, SHA-256 `13c3769527041ccdf357f258cfca8fce89c07c35e46e40c0afdc447e78f98d59`.
 - `cargo test -p ocean-agent session`: **24 passed**.
-- `cargo test -p ocean-agent`: **148 passed**.
+- `cargo test -p ocean-agent`: **149 passed**.
 - `cargo check --workspace`: passed.
 - `cargo xtask docs-check`: passed with 25 indexed packages and 93 active Markdown files.
 - `cargo fmt --all` and `git diff --check`: passed.
 - Full `cargo xtask ci`: passed (docs/index, workspace build/tests, strict all-target Clippy, format, and cargo-deny).
-- Fresh reviewer compared the extracted module and root callers/tests against rollback commit `644dbc8d`, reran formatting and all 24 focused tests, and returned **PASS** with no remaining blockers.
+- Fresh reviewer compared the rebased target and root callers/tests with `5be4cf6d`, reran all 24 focused tests, and returned **PASS** with no blockers.

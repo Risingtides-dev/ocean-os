@@ -1,7 +1,7 @@
 # Ocean Event Payload and Retention Characterization
 
 **Date:** 2026-07-12
-**Baseline commit:** `003aa3bd18ff62b0d066200a8f0b19731d8f0dab`
+**Baseline commit:** `4cf87475` (rebased parent before the event-retention fix)
 **Plan checkpoint:** Phase 0B-1 / Phase 1B-1
 **Status:** Complete — risk reproduced, minimal replay-byte fix independently reviewed
 
