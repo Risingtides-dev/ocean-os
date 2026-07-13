@@ -2725,11 +2725,22 @@ GitHub Actions validated the strict production lint inventory artifacts on ubunt
 _________________________________________________________________________________
 _________________________________________________________________________________
 
-time:  [03:07am] [07-13-26]
+time:  [03:07] [13-07-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [pi/build-compat-20260713]
 type:  [workflow]: Establish truthful Rust and supported build compatibility lanes
 area:  [testing]: Feature matrix, release profile, and MSRV enforcement
 
 Characterization proved the declared Rust 1.80 floor was already impossible: Cargo 1.80 could not parse the Edition-2024 ACP dependency, and the resolved graph contains multiple Rust-1.88 dependencies. In an isolated worktree (to avoid concurrent TUI startup work on main), I raised the truthful workspace floor to 1.88, made one behavior-equivalent session path comparison compatible, and added xtask-owned stable compatibility and pinned-MSRV manifests consumed by CI. Stable strict feature checks cover daemon livekit-tap/deepgram-stt; release all-target and Rust-1.88 default/feature checks pass. Fresh-target lanes each completed in about 4m19s, the full local repository gate passed, and independent implementation review found no blocker. Hosted macOS/Ubuntu compatibility and Ubuntu MSRV timings remain.
+_________________________________________________________________________________
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [03:53] [13-07-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [pi/build-compat-20260713]
+type:  [gh actions]: Close truthful build compatibility checkpoint
+area:  [testing]: Hosted feature, release, MSRV, and policy validation
+
+Corrected GitHub Actions run 29231934039 passed macOS stable, Ubuntu stable, pinned Rust 1.88, and cargo-deny after the workflow made Ubuntu's required libglib2.0-dev prerequisite explicit. The stable jobs verified strict supported-feature Clippy and release all-target compilation; the MSRV job verified default and supported-feature compilation at the enforced floor. The slowest hosted job completed in 8m51s, within the retained 40-minute ceiling. The characterization and approved code-health/agent-readiness foundation plan now record this checkpoint complete.
 _________________________________________________________________________________

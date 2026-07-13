@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — build compatibility lanes pass locally/reviewed; hosted matrix pending
+**Status:** Approved program complete through build compatibility — all planned foundation, characterization, extraction, and compatibility checkpoints passed local, independent-review, and hosted gates
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -243,7 +243,7 @@ Implement only findings demonstrated by tests:
 1. **Complete:** the checked event byte/lifetime policy proved replay retention risk, so the daemon now enforces both 2,048-event and 32-MiB serialized-payload replay ceilings while preserving full live delivery. Focused/full gates and security review passed. Runtime-channel/live-payload redesign and artifact-backed large results remain deferred.
 2. **Complete:** descendant Halt failed while direct-child Halt passed, so Unix Bash commands now run in a child-owned process group killed by an RAII guard on cancellation/timeout; macOS and Ubuntu gates pass.
 3. **Complete:** characterization preserved the correct mutex single-flight pattern and cancellation semantics, but proved missing stall bounds; lock wait, liveness, and launch now have explicit deadlines without weakening exactly-one-launch behavior, and macOS/Ubuntu gates pass.
-4. **Build compatibility (2026-07-13): implemented/reviewed; local pass, hosted matrix pending.** The exact Rust 1.80 check failed before Ocean compilation because current ACP and other resolved dependencies require newer Cargo/Rust; downgrading that graph was broader risk than correcting the false contract. The workspace now declares/enforces Rust 1.88, with one behavior-equivalent session path comparison fix. Dependency-free xtask lanes cover strict stable Clippy for daemon `livekit-tap` and `deepgram-stt`, release-profile workspace all-target compilation, and default plus supported-feature compilation under pinned Rust 1.88. Fresh-target local runs completed in about 4m19s per lane, within the retained 40-minute CI ceiling. See `docs/specs/2026-07-13-ocean-build-compatibility-characterization.md`.
+4. **Build compatibility (2026-07-13): complete.** The exact Rust 1.80 check failed before Ocean compilation because current ACP and other resolved dependencies require newer Cargo/Rust; downgrading that graph was broader risk than correcting the false contract. The workspace now declares/enforces Rust 1.88, with one behavior-equivalent session path comparison fix. Dependency-free xtask lanes cover strict stable Clippy for daemon `livekit-tap` and `deepgram-stt`, release-profile workspace all-target compilation, and default plus supported-feature compilation under pinned Rust 1.88. Fresh-target local runs completed in about 4m19s per lane; corrected hosted run `29231934039` passed macOS, Ubuntu, pinned Rust 1.88, and `cargo-deny`, with the slowest job under nine minutes. See `docs/specs/2026-07-13-ocean-build-compatibility-characterization.md`.
 
 **Gate:** focused regressions; `cargo test -p ocean-runtime`; `cargo test -p ocean-daemon`; `cargo check --workspace --tests`; supported feature checks; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo fmt --all -- --check`; and a fresh security-focused review of process/payload behavior.
 
@@ -383,8 +383,9 @@ After this plan is approved, start with independently reviewable changes:
 6. **Browser characterization/fix — complete:** injected healthy/dead/stalled/cancelled single-flight tests, bounded phases, and real launch-cancellation PID coverage pass on macOS and Ubuntu.
 7. **Agent-loop benchmark — complete:** clean 30-sample baseline, independent methodology review, and macOS/Ubuntu repository gates passed.
 8. **Strict lint inventory — complete:** exact raw diagnostics and machine-readable 79-site inventory retained without blanket denial; independent reproduction and macOS/Ubuntu gates passed.
+9. **Build compatibility — complete:** Rust 1.88 is the truthful enforced floor; supported daemon features, release all-target compilation, and pinned-MSRV compilation pass locally and in the hosted matrix.
 
-Ground-truth docs and automation are complete. The first intact move does not touch event, shell, browser, or history-cost paths. Further event/daemon/runtime moves remain blocked on their applicable characterization and safety disposition.
+The approved foundation program is complete through build compatibility. Ground-truth docs, executable automation, intact extractions, targeted reliability fixes, retained performance/lint evidence, and truthful supported-build lanes are all closed with independent and hosted validation. Further event/daemon/runtime moves remain blocked on their applicable characterization and safety disposition rather than being implied by this plan's completion.
 
 ## 10. Decisions requested
 

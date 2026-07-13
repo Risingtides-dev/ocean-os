@@ -3,7 +3,7 @@
 **Date:** 2026-07-13
 **Plan checkpoint:** Phase 1B-4
 **Baseline revision:** `d1e06109`
-**Status:** Truthful MSRV and compatibility lanes implemented/reviewed; local gates passed, hosted timings pending
+**Status:** Complete — truthful MSRV and compatibility lanes passed local, independent-review, macOS, Ubuntu, and pinned-Rust gates
 
 ## Question
 
@@ -67,7 +67,18 @@ cargo +1.88.0 xtask ci --msrv
 
 `cargo xtask ci --dry-run` reports every command and CI-only lane. Exact-command tests pin each static manifest, and a workflow-consumption test requires GitHub Actions to invoke all three lanes and pinned Rust 1.88.
 
-The stable compatibility commands run after the existing repository gate in the same macOS/Ubuntu jobs to reuse their caches. MSRV runs separately on Ubuntu. In an isolated worktree with a fresh target directory, stable compatibility completed in 4m15s and the Rust 1.88 default/feature lane in 4m19s. The first hosted attempt proved that Ubuntu's feature build additionally needs `libglib2.0-dev`; both Ubuntu jobs now install that explicit native prerequisite. The existing 40-minute job ceilings are retained pending the corrected hosted timings.
+The stable compatibility commands run after the existing repository gate in the same macOS/Ubuntu jobs to reuse their caches. MSRV runs separately on Ubuntu. In an isolated worktree with a fresh target directory, stable compatibility completed in 4m15s and the Rust 1.88 default/feature lane in 4m19s. The first hosted attempt proved that Ubuntu's feature build additionally needs `libglib2.0-dev`; both Ubuntu jobs now install that explicit native prerequisite.
+
+Corrected GitHub Actions run [`29231934039`](https://github.com/Risingtides-dev/ocean-os/actions/runs/29231934039) passed all four jobs:
+
+| Hosted job | Total job time | Compatibility step |
+|---|---:|---:|
+| macOS stable | 5m34s | 1m06s |
+| Ubuntu stable | 8m51s | 5m07s |
+| Ubuntu Rust 1.88 | 4m36s | 3m46s |
+| `cargo-deny` | 10s | 6s |
+
+These are cache-influenced hosted timings, not clean-build benchmarks. The slowest corrected job completed in under nine minutes, so the existing 40-minute ceilings retain ample margin.
 
 ## Local verification
 
@@ -79,4 +90,4 @@ The stable compatibility commands run after the existing repository gate in the 
 - `cargo xtask ci`, `cargo check --workspace --tests`, formatting, docs integrity, and diff checks passed in the isolated worktree.
 - Independent implementation review passed with no blocker after verifying all 25 package declarations, behavior-equivalent source rewrites, lane/workflow parity, raw evidence, and timing scope.
 
-Hosted macOS/Ubuntu compatibility and Ubuntu MSRV timings remain the completion gate.
+Hosted macOS/Ubuntu compatibility, Ubuntu MSRV, and `cargo-deny` all passed. Phase 1B-4 is complete.
