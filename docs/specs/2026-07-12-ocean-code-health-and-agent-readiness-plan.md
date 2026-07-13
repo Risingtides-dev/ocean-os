@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — Phase 0A/1A/2A intact moves and event-retention checkpoint complete
+**Status:** Approved by operator — prior checkpoints complete; Shell Halt fix validated/reviewed locally and pending Linux CI
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -186,6 +186,8 @@ These are separate changes with separate owners and artifacts. Browser and perfo
 2. Add PID-based Halt characterization for a direct child and a descendant tree on macOS and Linux, with cleanup that still runs when assertions fail.
 3. Record unsupported-platform behavior explicitly.
 
+**Result (2026-07-12): RED baseline; smallest Unix fix validated on macOS.** PID tests proved direct-child Halt passed while a signal-resistant background descendant survived. `BashTool` now owns a Unix process group and kills it on future drop/timeout, retaining direct-child `kill_on_drop`; both direct and descendant tests, the full local gate, and independent security review pass. Non-Unix tree termination and deliberately re-sessioned descendants are explicitly outside this contract. Linux completion awaits the Ubuntu CI lane. See `docs/specs/2026-07-12-ocean-shell-halt-characterization.md`.
+
 ##### 0B-3. Browser single-flight behavior
 
 1. Introduce test seams for liveness probe and launcher operations without changing production semantics.
@@ -233,7 +235,7 @@ Add `docs-check` to CI after its own tests pass. Add parity tests so the workflo
 Implement only findings demonstrated by tests:
 
 1. **Complete:** the checked event byte/lifetime policy proved replay retention risk, so the daemon now enforces both 2,048-event and 32-MiB serialized-payload replay ceilings while preserving full live delivery. Focused/full gates and security review passed. Runtime-channel/live-payload redesign and artifact-backed large results remain deferred.
-2. Add process-group/tree termination only if direct-child or descendant Halt characterization fails.
+2. **macOS validated/reviewed; Linux CI pending:** descendant Halt failed while direct-child Halt passed, so Unix Bash commands now run in a child-owned process group killed by an RAII guard on cancellation/timeout.
 3. Replace the browser startup lock pattern only if characterization shows unacceptable blocking or broken cancellation. Preserve exactly-one-launch behavior.
 4. Inventory supported feature combinations, then add a release-profile lane and an MSRV lane (`cargo +1.80 check --workspace --all-targets`) only if dependency compatibility and CI cost are acceptable. For daemon call paths, the supported compile matrix is default, `--features livekit-tap`, and `--features deepgram-stt` (which already implies `livekit-tap`).
 
@@ -371,7 +373,7 @@ After this plan is approved, start with independently reviewable changes:
 2. **Docs automation PR — complete:** `cargo xtask docs-check`, one executable CI manifest, manifest unit coverage, and GitHub Actions consumption are implemented and passing.
 3. **Intact `ocean-agent` extraction wave — complete:** both private modules moved with behavior/tests preserved and independent review passed.
 4. **Event-policy characterization/fix — complete:** checked event table, isolated payload/RSS stress, smallest replay-byte retention fix, full gate, and security review passed.
-5. **Shell Halt characterization PR:** direct-child and descendant-tree tests by supported OS.
+5. **Shell Halt characterization/fix — macOS validated/reviewed, Linux CI pending:** direct/descendant PID tests and Unix process-group cleanup implemented.
 6. **Browser characterization PR:** injected single-flight/deadline/cancellation tests.
 7. **Agent-loop benchmark PR:** reproducible history-cost benchmark and baseline artifact.
 

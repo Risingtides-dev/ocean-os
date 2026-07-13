@@ -22,6 +22,114 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
+struct AbortTaskOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+#[cfg(unix)]
+impl<T> AbortTaskOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        self.handle
+            .take()
+            .expect("test task handle can only be joined once")
+            .await
+    }
+}
+
+#[cfg(unix)]
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(unix)]
+struct PidCleanup {
+    process_group: i32,
+    pids: Vec<i32>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl PidCleanup {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PidCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: kill only receives positive PIDs read from this test's own
+        // marker files and their negated process-group id. ESRCH is harmless.
+        unsafe {
+            libc::kill(-self.process_group, libc::SIGKILL);
+            for pid in &self.pids {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_pid(path: &std::path::Path) -> i32 {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                return pid;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("PID marker was not written: {}", path.display());
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: i32) -> bool {
+    // SAFETY: signal 0 performs existence/permission probing only.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => !String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('Z'),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+async fn wait_until_not_running(pid: i32) -> bool {
+    for _ in 0..100 {
+        if !process_is_running(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
 #[tokio::test]
 async fn write_then_read_roundtrips() {
     let dir = scratch_dir();
@@ -162,6 +270,82 @@ async fn bash_timeout_kills_the_child_no_orphan() {
         !marker.exists(),
         "the timed-out child kept running and touched the marker — orphan process leak"
     );
+}
+
+/// Dropping the BashTool future is the runtime's Halt boundary. The direct
+/// command process must die promptly rather than outliving its cancelled turn.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_halt_kills_direct_child_by_pid() {
+    let dir = scratch_dir();
+    let pid_file = dir.join("direct.pid");
+    let command = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+    let mut task = AbortTaskOnDrop::new(tokio::spawn(async move {
+        bash::BashTool::for_cwd(dir)
+            .execute("halt-direct", json!({"command": command}))
+            .await
+    }));
+    let pid = wait_for_pid(&pid_file).await;
+    let mut cleanup = PidCleanup {
+        process_group: pid,
+        pids: vec![pid],
+        armed: true,
+    };
+
+    task.abort();
+    let join = task
+        .join()
+        .await
+        .expect_err("aborted tool future must not complete");
+    assert!(join.is_cancelled());
+    assert!(
+        wait_until_not_running(pid).await,
+        "direct bash child {pid} survived Halt cancellation"
+    );
+    cleanup.disarm();
+}
+
+/// A shell may launch grandchildren that survive a PID-only kill. Halt must
+/// terminate the complete command process group on supported Unix platforms.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_halt_kills_descendant_process_tree_by_pid() {
+    let dir = scratch_dir();
+    let parent_file = dir.join("parent.pid");
+    let child_file = dir.join("child.pid");
+    let command = format!(
+        "echo $$ > '{}'; (trap '' HUP TERM; sleep 30) & child=$!; echo $child > '{}'; wait $child",
+        parent_file.display(),
+        child_file.display()
+    );
+    let mut task = AbortTaskOnDrop::new(tokio::spawn(async move {
+        bash::BashTool::for_cwd(dir)
+            .execute("halt-tree", json!({"command": command}))
+            .await
+    }));
+    let parent_pid = wait_for_pid(&parent_file).await;
+    let child_pid = wait_for_pid(&child_file).await;
+    let mut cleanup = PidCleanup {
+        process_group: parent_pid,
+        pids: vec![parent_pid, child_pid],
+        armed: true,
+    };
+
+    task.abort();
+    let join = task
+        .join()
+        .await
+        .expect_err("aborted tool future must not complete");
+    assert!(join.is_cancelled());
+    assert!(
+        wait_until_not_running(parent_pid).await,
+        "bash parent {parent_pid} survived Halt cancellation"
+    );
+    assert!(
+        wait_until_not_running(child_pid).await,
+        "bash descendant {child_pid} survived Halt cancellation"
+    );
+    cleanup.disarm();
 }
 
 /// stdin is closed, not inherited: a command that reads stdin terminates

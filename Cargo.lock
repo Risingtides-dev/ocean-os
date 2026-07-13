@@ -3366,6 +3366,7 @@ dependencies = [
  "futures",
  "glob",
  "ignore",
+ "libc",
  "ocean-agent-sdk",
  "ocean-browser",
  "ocean-hashline",

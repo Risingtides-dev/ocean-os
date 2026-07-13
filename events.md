@@ -2623,3 +2623,13 @@ area:  [testing]: Remove retired dead surfaces and apply behavior-neutral Clippy
 
 The post-retirement main baseline passed tests but failed the repository's strict all-target Clippy gate on twelve ocean-tui findings. I removed unused graph/session/PTY/status surfaces, test-gated test-only helpers, and applied equivalent iterator/if-let forms. `cargo clippy -p ocean-tui --all-targets -- -D warnings`, 272 TUI tests (4 ignored), and the release build pass.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [12:54am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [bug report]: Shell Halt leaked descendant process trees
+area:  [testing]: PID characterization and Unix process-group termination
+
+Phase 0B-2 proved the existing direct-child `kill_on_drop` path passed but a signal-resistant background descendant survived Halt (baseline PID 20796). BashTool now launches a child-owned Unix process group and uses an RAII SIGKILL guard on cancellation/timeout, draining inherited pipes before reaping to prevent PGID reuse. Direct/descendant PID regressions pass; immediate abort-on-drop test cleanup covers marker failures. The full `cargo xtask ci` gate, supported daemon feature checks, workspace test check, and two independent process/test reviews pass on macOS. Linux CI remains the completion gate.
+_________________________________________________________________________________
