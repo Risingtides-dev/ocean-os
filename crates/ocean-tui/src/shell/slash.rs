@@ -132,6 +132,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         soon: false,
     },
     SlashCommand {
+        name: "/pinned",
+        desc: "show or hide the pinned component (/pinned show|hide)",
+        group: "chat",
+        soon: false,
+    },
+    SlashCommand {
         name: "/help",
         desc: "list all commands",
         group: "chat",

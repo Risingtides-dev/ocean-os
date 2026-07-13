@@ -11,7 +11,7 @@ use ocean_agent_sdk::{AgentTurnEvent, ThinkingLevel, ToolCallId};
 use ocean_core::{OceanEvent, PermissionId};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
@@ -79,6 +79,17 @@ enum Turn {
         permission_id: PermissionId,
         tool: String,
         reason: String,
+        resolved: Option<bool>,
+    },
+    /// A surface-neutral `component_render` artifact projected into terminal
+    /// cells. The payload remains canonical JSON; this client supplies only the
+    /// btop-style visual interpretation.
+    Component {
+        id: String,
+        kind: String,
+        props: serde_json::Value,
+        /// For `confirm` components: None while waiting, Some(true/false) after
+        /// the operator answers. Non-confirm components leave this None.
         resolved: Option<bool>,
     },
 }
@@ -166,6 +177,13 @@ pub struct ChatComponent {
     /// Optional provider-status line shown in the welcome empty-state only.
     /// Set by the app after construction.
     pub welcome_provider_line: Option<String>,
+    /// Optional pinned component rendered in a fixed footer row above the
+    /// composer. Set by `component_render` with `pinned: true`; cleared by
+    /// `component_unmount` targeting the pinned id. Only one slot is supported.
+    pinned: Option<Turn>,
+    /// Operator-controlled visibility. `/pinned hide` preserves the artifact so
+    /// `/pinned show` can restore it without asking the agent to re-render.
+    pinned_visible: bool,
 }
 
 /// Tool-aware salient preview for a drawer header: command for bash, pattern +
@@ -299,6 +317,345 @@ pub(crate) fn sanitize_line(s: &str) -> String {
         }
     }
     out
+}
+
+/// Project the portable `component_render` contract into a compact terminal
+/// artifact. This is intentionally a pure local projection: the JSON is not
+/// added to model context and no terminal layout data crosses the daemon.
+fn component_lines(kind: &str, props: &serde_json::Value, width: usize) -> Vec<Line<'static>> {
+    let title = props
+        .get("title")
+        .or_else(|| props.get("label"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(kind);
+    let inner = width.saturating_sub(6).clamp(8, 48);
+    let rule = "─".repeat(inner);
+    let header = format!(
+        "  ╭─ {} {}",
+        truncate_to_width(&sanitize_line(title), inner / 2),
+        rule
+    );
+    let mut lines = vec![Line::from(Span::styled(
+        header,
+        Style::default().fg(theme::EDGE),
+    ))];
+    let row = |text: String, color| {
+        Line::from(vec![
+            Span::styled("  │ ", Style::default().fg(theme::EDGE)),
+            Span::styled(text, Style::default().fg(color)),
+        ])
+    };
+    match kind {
+        "progress" => {
+            let value = props.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let max = props
+                .get("max")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0)
+                .max(f64::EPSILON);
+            let ratio = (value / max).clamp(0.0, 1.0);
+            let bar_w = inner.saturating_sub(9).max(4);
+            let filled = (ratio * bar_w as f64).round() as usize;
+            lines.push(row(
+                format!(
+                    "{} {} {:>3}%",
+                    "█".repeat(filled),
+                    "░".repeat(bar_w - filled),
+                    (ratio * 100.0).round()
+                ),
+                theme::CYAN,
+            ));
+        }
+        "stat" => {
+            for stat in props
+                .get("stats")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .take(4)
+            {
+                let label = stat
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("metric");
+                let value = stat
+                    .get("value")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "—".into())
+                    .trim_matches('"')
+                    .to_string();
+                let delta = stat.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                lines.push(row(format!("{label:<14} {value:>10}  {delta}"), theme::FG));
+            }
+        }
+        "chart" => {
+            let series = props
+                .get("series")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let values: Vec<f64> = series
+                .iter()
+                .filter_map(|point| point.get("value").and_then(|v| v.as_f64()))
+                .collect();
+            if values.is_empty() {
+                lines.push(row("(no data)".into(), theme::COMMENT));
+            } else {
+                let max = values
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max)
+                    .max(f64::EPSILON);
+                let glyphs = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+                let start = values.len().saturating_sub(inner);
+                let graph: String = values[start..]
+                    .iter()
+                    .map(|v| glyphs[((v / max * 7.0).round() as usize).min(7)])
+                    .collect();
+                let last = values.last().copied().unwrap_or_default();
+                lines.push(row(format!("{graph}  {last:.2}"), theme::CYAN));
+            }
+        }
+        "timeline" => {
+            for step in props
+                .get("steps")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .take(6)
+            {
+                let label = step.get("label").and_then(|v| v.as_str()).unwrap_or("step");
+                let status = step
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pending");
+                let (mark, color) = match status {
+                    "done" => ("●", theme::GREEN),
+                    "active" => ("◉", theme::CYAN),
+                    "error" => ("✗", theme::RED),
+                    _ => ("○", theme::COMMENT),
+                };
+                lines.push(row(format!("{mark} {label}  {status}"), color));
+            }
+        }
+        "callout" => {
+            let body = props.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            let color = match props.get("variant").and_then(|v| v.as_str()) {
+                Some("success") => theme::GREEN,
+                Some("warn") => theme::YELLOW,
+                Some("error") => theme::RED,
+                _ => theme::CYAN,
+            };
+            for text in body.lines().take(3) {
+                lines.push(row(truncate_to_width(&sanitize_line(text), inner), color));
+            }
+        }
+        "confirm" => {
+            let body = props.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            let variant = props.get("variant").and_then(|v| v.as_str());
+            let color = match variant {
+                Some("error") => theme::RED,
+                _ => theme::YELLOW,
+            };
+            for text in body.lines().take(2) {
+                lines.push(row(truncate_to_width(&sanitize_line(text), inner), color));
+            }
+            if let Some(confirm_label) = props.get("confirm_label").and_then(|v| v.as_str()) {
+                let cancel_label = props
+                    .get("cancel_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("n");
+                lines.push(row(
+                    format!("[Y] {confirm_label}  [N] {cancel_label}"),
+                    theme::FG,
+                ));
+            } else {
+                lines.push(row("[Y] confirm  [N] cancel".into(), theme::FG));
+            }
+        }
+        "table" => {
+            let columns = props
+                .get("columns")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let rows = props
+                .get("rows")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_array()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if columns.is_empty() || rows.is_empty() {
+                lines.push(row("(empty table)".into(), theme::COMMENT));
+            } else {
+                let col_w = (inner.saturating_sub(columns.len() * 2)) / columns.len().max(1);
+                let fit = |s: &str| truncate_to_width(s, col_w);
+                // Header row
+                let hdr: String = columns
+                    .iter()
+                    .map(|c| format!("{: <col_w$}", fit(c)))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                lines.push(Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(theme::EDGE)),
+                    Span::styled(
+                        hdr,
+                        Style::default()
+                            .fg(theme::CYAN)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                // Separator
+                let sep: String = columns
+                    .iter()
+                    .map(|_| "─".repeat(col_w))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                lines.push(Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(theme::EDGE)),
+                    Span::styled(sep, Style::default().fg(theme::EDGE)),
+                ]));
+                // Data rows
+                for row_data in rows.iter().take(8) {
+                    let r: String = columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| {
+                            let cell = row_data.get(i).and_then(|v| v.as_str()).unwrap_or("");
+                            format!("{: <col_w$}", fit(cell))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(theme::EDGE)),
+                        Span::styled(r, Style::default().fg(theme::FG)),
+                    ]));
+                }
+            }
+        }
+        "code" => {
+            let code = props
+                .get("code")
+                .or_else(|| props.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let lang = props.get("language").and_then(|v| v.as_str()).unwrap_or("");
+            if !lang.is_empty() {
+                lines.push(row(format!("language: {lang}"), theme::COMMENT));
+            }
+            for text in code.lines().take(12) {
+                lines.push(row(
+                    truncate_to_width(&sanitize_line(text), inner),
+                    theme::FG,
+                ));
+            }
+            if code.lines().count() > 12 {
+                lines.push(row(
+                    format!("… {} more lines", code.lines().count() - 12),
+                    theme::COMMENT,
+                ));
+            }
+        }
+        "diff" => {
+            let unified = props
+                .get("unified")
+                .or_else(|| props.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let filename = props.get("filename").and_then(|v| v.as_str());
+            if let Some(f) = filename {
+                lines.push(row(format!("file: {f}"), theme::COMMENT));
+            }
+            for text in unified.lines().take(16) {
+                let (color, prefix) = if text.starts_with('+') {
+                    (theme::GREEN, text)
+                } else if text.starts_with('-') {
+                    (theme::RED, text)
+                } else if text.starts_with("@@") {
+                    (theme::CYAN, text)
+                } else {
+                    (theme::COMMENT, text)
+                };
+                lines.push(row(truncate_to_width(&sanitize_line(prefix), inner), color));
+            }
+        }
+        "file_tree" => {
+            let entries = props
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            fn walk_tree(
+                entries: &[serde_json::Value],
+                prefix: &str,
+                out: &mut Vec<(String, Color)>,
+            ) {
+                for (i, entry) in entries.iter().enumerate() {
+                    let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let is_dir = entry.get("type").and_then(|v| v.as_str()) == Some("dir");
+                    let last = i + 1 == entries.len();
+                    let (conn, child_prefix) = if last {
+                        ("└── ", "    ")
+                    } else {
+                        ("├── ", "│   ")
+                    };
+                    let display =
+                        format!("{prefix}{conn}{}{}", name, if is_dir { "/" } else { "" });
+                    out.push((display, if is_dir { theme::CYAN } else { theme::FG }));
+                    if is_dir {
+                        if let Some(children) = entry.get("children").and_then(|v| v.as_array()) {
+                            walk_tree(children, &format!("{prefix}{child_prefix}"), out);
+                        }
+                    }
+                }
+            }
+            let mut tree_lines: Vec<(String, Color)> = Vec::new();
+            walk_tree(&entries, "", &mut tree_lines);
+            for (text, color) in tree_lines.iter().take(14) {
+                lines.push(row(truncate_to_width(&sanitize_line(text), inner), *color));
+            }
+            if tree_lines.len() > 14 {
+                lines.push(row(
+                    format!("… {} more entries", tree_lines.len() - 14),
+                    theme::COMMENT,
+                ));
+            }
+        }
+        "gallery" => {
+            let images = props
+                .get("images")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if images.is_empty() {
+                lines.push(row("(no images)".into(), theme::COMMENT));
+            } else {
+                for img in images.iter().take(4) {
+                    let caption = img
+                        .get("caption")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("image");
+                    let src = img.get("src").and_then(|v| v.as_str()).unwrap_or("");
+                    let local = src.strip_prefix("file://").unwrap_or(src);
+                    lines.push(row(format!("🖼 {caption}  {local}"), theme::CYAN));
+                }
+                if images.len() > 4 {
+                    lines.push(row(
+                        format!("… {} more images", images.len() - 4),
+                        theme::COMMENT,
+                    ));
+                }
+            }
+        }
+        _ => lines.push(row(
+            format!("{kind} component (web-only projection)"),
+            theme::COMMENT,
+        )),
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  ╰{}", "─".repeat(inner + 3)),
+        Style::default().fg(theme::EDGE),
+    )));
+    lines
 }
 
 /// Render one diff-card row: a coloured gutter sigil + the (possibly word-diffed)
@@ -449,10 +806,182 @@ impl ChatComponent {
     /// ↑/↓ recall and ⌃R search). `Default` leaves history empty — used in
     /// tests that don't touch disk.
     pub fn new() -> Self {
-        Self {
+        let chat = Self {
             history: PromptHistory::load(),
+            pinned_visible: true,
             ..Default::default()
+        };
+        chat
+    }
+
+    /// Inject visual-harness components when `OCEAN_TUI_COMPONENT_DEMO` is set.
+    /// Call this AFTER session resume so `load_history` doesn't wipe them.
+    /// Each component is contextualized to the ocean-os project — real file
+    /// names, real PR history, real build metrics.
+    pub fn maybe_inject_demo(&mut self) {
+        if std::env::var_os("OCEAN_TUI_COMPONENT_DEMO").is_none() {
+            return;
         }
+        self.turns.extend([
+            // ── callout: what this is ──────────────────────────────────────
+            Turn::Component {
+                id: "demo-intro".into(),
+                kind: "callout".into(),
+                props: serde_json::json!({
+                    "title": "Component projection demo",
+                    "variant": "info",
+                    "body": "ocean-os · main · 31 MB daemon · 274+10 TUI tests\n\
+                             11 of 17 render-protocol kinds projected into the terminal.\n\
+                             All data below is live project state — real files, real PRs."
+                }),
+                resolved: None,
+            },
+            // ── stat: build metrics ───────────────────────────────────────
+            Turn::Component {
+                id: "demo-stats".into(),
+                kind: "stat".into(),
+                props: serde_json::json!({
+                    "title": "ocean-os build · main",
+                    "stats": [
+                        {"label": "daemon",    "value": "31 MB",   "delta": "release"},
+                        {"label": "ocean-tui",  "value": "11 MB",   "delta": "release"},
+                        {"label": "tests",      "value": "284",     "delta": "▲ 10"},
+                        {"label": "open PRs",   "value": "0",       "delta": "clean"}
+                    ]
+                }),
+                resolved: None,
+            },
+            // ── timeline: recent PR merges ────────────────────────────────
+            Turn::Component {
+                id: "demo-pr-timeline".into(),
+                kind: "timeline".into(),
+                props: serde_json::json!({
+                    "title": "Recent PR merges → main",
+                    "steps": [
+                        {"label": "#277 shell halt CI window",       "status": "done"},
+                        {"label": "#276 TUI launch chooser",         "status": "done"},
+                        {"label": "#275 build compat enforcement",   "status": "done"},
+                        {"label": "readline composer follow-ups",    "status": "done"},
+                        {"label": "TUI shell rebuild + lifeline",    "status": "done"},
+                        {"label": "component-projection spike",     "status": "active"}
+                    ]
+                }),
+                resolved: None,
+            },
+            // ── table: TUI crate file map ────────────────────────────────
+            Turn::Component {
+                id: "demo-table".into(),
+                kind: "table".into(),
+                props: serde_json::json!({
+                    "title": "crates/ocean-tui/src/shell/ layout",
+                    "columns": ["file", "lines", "role"],
+                    "rows": [
+                        ["app.rs",        "3895",  "Elm loop + dispatch"],
+                        ["chat.rs",       "5271",  "transcript + composer + components"],
+                        ["session_rail.rs","~340", "session browser sidebar"],
+                        ["file_tree.rs",  "~220", "project file browser"],
+                        ["editor.rs",     "~190", "text editor pane"],
+                        ["graph.rs",      "~700", "agent graph viewer"],
+                        ["slash.rs",      "~110", "/command dispatch"]
+                    ]
+                }),
+                resolved: None,
+            },
+            // ── code: component renderer entry point ─────────────────────
+            Turn::Component {
+                id: "demo-code".into(),
+                kind: "code".into(),
+                props: serde_json::json!({
+                    "title": "ComponentRender handler in chat.rs",
+                    "language": "rust",
+                    "code": "AgentTurnEvent::ComponentRender {\n    component_id, kind, props, replace, ..\n} => {\n    let pinned = props.get(\"pinned\")\n        .and_then(|v| v.as_bool()).unwrap_or(false);\n    if pinned { self.pinned = Some(/* ... */); }\n    if *replace { self.turns.retain(/* ... */); }\n    self.turns.push(Turn::Component { id, kind, props });\n}"
+                }),
+                resolved: None,
+            },
+            // ── diff: hook change we just made ───────────────────────────
+            Turn::Component {
+                id: "demo-diff".into(),
+                kind: "diff".into(),
+                props: serde_json::json!({
+                    "title": "Fix: demo inject after session resume (app.rs)",
+                    "unified": "@@ -483,6 +483,9 @@\n             app.bind_session_with(id, false);\n             app.rail.live_id = Some(id.0.to_string());\n         }\n+        // Inject visual-harness components AFTER session resume\n+        // so load_history doesn't overwrite them.\n+        app.chat.maybe_inject_demo();\n         app"
+                }),
+                resolved: None,
+            },
+            // ── file_tree: TUI crate structure ───────────────────────────
+            Turn::Component {
+                id: "demo-ftree".into(),
+                kind: "file_tree".into(),
+                props: serde_json::json!({
+                    "title": "crates/ocean-tui/",
+                    "entries": [
+                        {"name": "src/", "type": "dir", "children": [
+                            {"name": "main.rs", "type": "file"},
+                            {"name": "splash.rs", "type": "file"},
+                            {"name": "shell/", "type": "dir", "children": [
+                                {"name": "mod.rs", "type": "file"},
+                                {"name": "app.rs", "type": "file"},
+                                {"name": "action.rs", "type": "file"},
+                                {"name": "components/", "type": "dir", "children": [
+                                    {"name": "chat.rs", "type": "file"},
+                                    {"name": "editor.rs", "type": "file"},
+                                    {"name": "file_tree.rs", "type": "file"},
+                                    {"name": "graph.rs", "type": "file"},
+                                    {"name": "pty_pane.rs", "type": "file"},
+                                    {"name": "session_rail.rs", "type": "file"}
+                                ]},
+                                {"name": "client.rs", "type": "file"},
+                                {"name": "daemon_boot.rs", "type": "file"},
+                                {"name": "sessions.rs", "type": "file"},
+                                {"name": "slash.rs", "type": "file"}
+                            ]}
+                        ]}
+                    ]
+                }),
+                resolved: None,
+            },
+            // ── chart: keep provider latency ─────────────────────────────
+            Turn::Component {
+                id: "demo-chart".into(),
+                kind: "chart".into(),
+                props: serde_json::json!({
+                    "title": "Provider latency (ms)",
+                    "type": "line",
+                    "series": [
+                        {"label":"-9","value":12},{"label":"-8","value":18},
+                        {"label":"-7","value":15},{"label":"-6","value":28},
+                        {"label":"-5","value":34},{"label":"-4","value":21},
+                        {"label":"-3","value":39},{"label":"-2","value":31},
+                        {"label":"-1","value":48},{"label":"now","value":42}
+                    ]
+                }),
+                resolved: None,
+            },
+            // ── progress: component projection coverage ──────────────────
+            Turn::Component {
+                id: "demo-progress".into(),
+                kind: "progress".into(),
+                props: serde_json::json!({
+                    "label": "Component projection coverage",
+                    "value": 11,
+                    "max": 17
+                }),
+                resolved: None,
+            },
+            // ── confirm: interactive test ────────────────────────────────
+            Turn::Component {
+                id: "demo-confirm".into(),
+                kind: "confirm".into(),
+                props: serde_json::json!({
+                    "title": "Land this branch?",
+                    "body": "11 of 17 kinds projected.\n\
+                             All 284 tests pass. Ready to rebase onto main.",
+                    "confirm_label": "land it",
+                    "cancel_label": "more work"
+                }),
+                resolved: None,
+            },
+        ]);
     }
 
     // ── prompt history: ↑/↓ recall ───────────────────────────────────────────
@@ -1167,6 +1696,32 @@ impl ChatComponent {
                 self.busy = false;
                 None
             }
+            "/pinned" => match args {
+                "hide" | "off" | "clear" => {
+                    self.pinned_visible = false;
+                    Some(Action::Status(
+                        "pinned component hidden; /pinned show restores it".into(),
+                    ))
+                }
+                "show" | "on" => {
+                    if self.pinned.is_some() {
+                        self.pinned_visible = true;
+                        Some(Action::Status("pinned component shown".into()))
+                    } else {
+                        Some(Action::Status("no pinned component to show".into()))
+                    }
+                }
+                "" => {
+                    self.pinned_visible = !self.pinned_visible;
+                    let state = if self.pinned_visible {
+                        "shown"
+                    } else {
+                        "hidden"
+                    };
+                    Some(Action::Status(format!("pinned component {state}")))
+                }
+                _ => Some(Action::Status("usage: /pinned [show|hide]".into())),
+            },
             "/help" => {
                 self.push_help();
                 self.scroll_back = 0;
@@ -1615,6 +2170,28 @@ impl Component for ChatComponent {
         // The ⌃R history-search overlay is modal: while open, all keys drive it.
         if self.search.is_some() {
             return self.handle_search_key(key);
+        }
+        // Confirm component resolution: a pending confirm in the transcript
+        // intercepts Y/N before they reach the composer. Find the most-recent
+        // unresolved confirm and resolve it.
+        if let Some(code) = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+            KeyCode::Char('n') | KeyCode::Char('N') => Some(false),
+            _ => None,
+        } {
+            // Without modifiers: don't hijack Ctrl-Y (permission) or Ctrl-N.
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                for turn in self.turns.iter_mut().rev() {
+                    if let Turn::Component { kind, resolved, .. } = turn {
+                        if kind == "confirm" && resolved.is_none() {
+                            *resolved = Some(code);
+                            self.scroll_back = 0;
+                            // In a future phase, POST to /v1/component/event here.
+                            return None;
+                        }
+                    }
+                }
+            }
         }
         // Permission decisions work even mid-stream (legacy ⌃Y/⌃N bindings).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2107,6 +2684,56 @@ impl Component for ChatComponent {
                         }
                     }
                 }
+                AgentTurnEvent::ComponentRender {
+                    component_id,
+                    kind,
+                    props,
+                    replace,
+                    ..
+                } => {
+                    let pinned = props
+                        .get("pinned")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if pinned {
+                        if *replace {
+                            self.pinned = None;
+                        }
+                        self.pinned = Some(Turn::Component {
+                            id: component_id.clone(),
+                            kind: kind.clone(),
+                            props: props.clone(),
+                            resolved: None,
+                        });
+                        // A fresh agent pin is intentional; reveal it even if a
+                        // previous pinned artifact was hidden by the operator.
+                        self.pinned_visible = true;
+                    } else {
+                        if *replace {
+                            self.turns.retain(|turn| {
+                                !matches!(turn, Turn::Component { id, .. } if id == component_id)
+                            });
+                        }
+                        self.turns.push(Turn::Component {
+                            id: component_id.clone(),
+                            kind: kind.clone(),
+                            props: props.clone(),
+                            resolved: None,
+                        });
+                    }
+                    self.scroll_back = 0;
+                }
+                AgentTurnEvent::ComponentUnmount { component_id, .. } => {
+                    if self.pinned.as_ref().map_or(
+                        false,
+                        |p| matches!(p, Turn::Component { id, .. } if id == component_id),
+                    ) {
+                        self.pinned = None;
+                    }
+                    self.turns.retain(
+                        |turn| !matches!(turn, Turn::Component { id, .. } if id == component_id),
+                    );
+                }
                 AgentTurnEvent::TurnFinished {
                     status,
                     error,
@@ -2159,10 +2786,38 @@ impl Component for ChatComponent {
             .sum::<u16>()
             .max(1);
         let input_lines = input_rows.min(8).min((area.height / 2).max(1));
+        let pinned_lines: u16 = if self.pinned.is_some() && self.pinned_visible {
+            // A pinned component gets 3-5 rows depending on kind
+            match self.pinned.as_ref() {
+                Some(Turn::Component { kind, .. }) => match kind.as_str() {
+                    "timeline" => 6u16.min(area.height / 4),
+                    "table" | "file_tree" => 8u16.min(area.height / 3),
+                    "chart" | "stat" => 5u16.min(area.height / 4),
+                    _ => 3u16.min(area.height / 5),
+                },
+                _ => 3u16.min(area.height / 5),
+            }
+        } else {
+            0
+        };
+        let constraints: Vec<Constraint> = if pinned_lines > 0 {
+            vec![
+                Constraint::Min(3),
+                Constraint::Length(pinned_lines),
+                Constraint::Length(input_lines + 1),
+            ]
+        } else {
+            vec![Constraint::Min(3), Constraint::Length(input_lines + 1)]
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(input_lines + 1)])
+            .constraints(constraints)
             .split(area);
+        let (transcript_area, composer_area) = if pinned_lines > 0 {
+            (chunks[0], chunks[2])
+        } else {
+            (chunks[0], chunks[1])
+        };
 
         // Command palette state for this frame (empty unless in `/`-mode, and
         // suppressed while the ⌃R search overlay owns the screen). Clamp the
@@ -2180,7 +2835,31 @@ impl Component for ChatComponent {
         // Title-less, pill-less chrome: the app title bar + breadcrumb already
         // identify this pane, and the bound model lives on the bottom status
         // row — a panel pill duplicated it.
-        let body = panel::draw(frame, chunks[0], "", None, self.focused);
+        let body = panel::draw(frame, transcript_area, "", None, self.focused);
+
+        // ── pinned component (between transcript and composer) ───────────────
+        if let Some(Turn::Component { kind, props, .. }) = &self.pinned {
+            if pinned_lines > 0 {
+                let pinned_area = chunks[1];
+                let pinned_rows = component_lines(kind, props, pinned_area.width as usize);
+                let max_rows = (pinned_lines as usize).saturating_sub(1).max(1);
+                let trimmed: Vec<Line> = if pinned_rows.len() > max_rows {
+                    let mut t = pinned_rows[..max_rows].to_vec();
+                    t.push(Line::from(Span::styled(
+                        format!("  {} pinned, scroll for more", g("┄", "..")),
+                        Style::default().fg(theme::COMMENT),
+                    )));
+                    t
+                } else {
+                    pinned_rows
+                };
+                frame.render_widget(
+                    Paragraph::new(trimmed)
+                        .block(Block::default().style(Style::default().bg(theme::BG_DARK))),
+                    pinned_area,
+                );
+            }
+        }
 
         // Transcript lines (bottom-anchored via scroll offset). Split the
         // borrow: the markdown cache (`md`) is a distinct field from `turns`, so
@@ -2225,6 +2904,52 @@ impl Component for ChatComponent {
                     // Streaming markdown with prefix-freeze: frozen head blocks
                     // are served from cache, only the growing tail re-renders.
                     lines.extend(md.render(s));
+                }
+                Turn::Component {
+                    kind,
+                    props,
+                    resolved,
+                    ..
+                } => {
+                    if kind == "confirm" && resolved.is_some() {
+                        let confirmed = resolved.unwrap_or(false);
+                        let (mark, color) = if confirmed {
+                            (g("✓", "+"), theme::GREEN)
+                        } else {
+                            (g("✗", "x"), theme::RED)
+                        };
+                        let text = props
+                            .get("body")
+                            .or_else(|| props.get("title"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let inner = (body.width as usize).saturating_sub(6).clamp(8, 48);
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "  ╭─ {} {}",
+                                truncate_to_width(&sanitize_line(text), inner / 2),
+                                "─".repeat(inner)
+                            ),
+                            Style::default().fg(theme::EDGE),
+                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(theme::EDGE)),
+                            Span::styled(
+                                format!(
+                                    "{mark} {} — {}",
+                                    if confirmed { "confirmed" } else { "cancelled" },
+                                    sanitize_line(text)
+                                ),
+                                Style::default().fg(color),
+                            ),
+                        ]));
+                        lines.push(Line::from(Span::styled(
+                            format!("  ╰{}", "─".repeat(inner + 3)),
+                            Style::default().fg(theme::EDGE),
+                        )));
+                    } else {
+                        lines.extend(component_lines(kind, props, body.width as usize));
+                    }
                 }
                 Turn::Permission {
                     tool,
@@ -2603,10 +3328,10 @@ impl Component for ChatComponent {
         // Footer: always blank. No key legends, no counters; activity lives on
         // the bottom status row (derived from this component's state), never
         // duplicated here. The reserved row stays so panel geometry is stable.
-        panel::footer(frame, chunks[0], "");
+        panel::footer(frame, transcript_area, "");
 
         // ── composer: highlight bed, accent bar, multi-line, block cursor ────
-        let comp = chunks[1];
+        let comp = composer_area;
         frame.render_widget(
             Block::default().style(Style::default().bg(theme::BG_HL)),
             comp,
@@ -2761,6 +3486,59 @@ mod tests {
             payload,
             scope: None,
         }))
+    }
+
+    #[test]
+    fn component_render_replaces_and_unmounts_by_id() {
+        let mut chat = ChatComponent::default();
+        let sid = AgentSessionId(Uuid::new_v4());
+        chat.update(&Action::AgentEvent(Box::new(
+            AgentTurnEvent::ComponentRender {
+                session_id: sid,
+                component_id: "health".into(),
+                kind: "progress".into(),
+                props: json!({ "label": "build", "value": 0.25, "max": 1.0 }),
+                replace: false,
+            },
+        )));
+        chat.update(&Action::AgentEvent(Box::new(
+            AgentTurnEvent::ComponentRender {
+                session_id: sid,
+                component_id: "health".into(),
+                kind: "progress".into(),
+                props: json!({ "label": "build", "value": 1.0, "max": 1.0 }),
+                replace: true,
+            },
+        )));
+        assert_eq!(
+            chat.turns
+                .iter()
+                .filter(|t| matches!(t, Turn::Component { .. }))
+                .count(),
+            1
+        );
+        chat.update(&Action::AgentEvent(Box::new(
+            AgentTurnEvent::ComponentUnmount {
+                session_id: sid,
+                component_id: "health".into(),
+            },
+        )));
+        assert!(!chat
+            .turns
+            .iter()
+            .any(|t| matches!(t, Turn::Component { .. })));
+    }
+
+    #[test]
+    fn chart_projection_is_compact_and_terminal_safe() {
+        let lines = component_lines(
+            "chart",
+            &json!({ "title": "load\ttrend", "series": [{"value": 1}, {"value": 4}] }),
+            40,
+        );
+        assert!(lines.len() >= 3);
+        assert!(lines.iter().any(|line| line.to_string().contains('█')));
+        assert!(!lines.iter().any(|line| line.to_string().contains('\t')));
     }
 
     #[test]

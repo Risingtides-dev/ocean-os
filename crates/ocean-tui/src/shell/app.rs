@@ -499,6 +499,8 @@ impl App {
         app.refresh_welcome_provider_line();
         // A normal launch starts clean. Explicit `--session` remains a direct
         // opt-in handled by `resume_initial_session`.
+        // Inject visual-harness components when OCEAN_TUI_COMPONENT_DEMO is set.
+        app.chat.maybe_inject_demo();
         app
     }
 
