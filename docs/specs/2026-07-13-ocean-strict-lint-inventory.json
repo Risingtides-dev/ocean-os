@@ -1,0 +1,802 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-13T06:15:46.776945+00:00",
+  "revision": "546287bd6ab5ed1aca5e5ce891bdc0f9aec258cd",
+  "git_status": "",
+  "repository_state_note": "Working tree verified clean immediately before the inventory command; artifact files were written afterward.",
+  "command": "LC_ALL=C cargo clippy --workspace --lib --bins --examples --message-format=short -- -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic -W clippy::unreachable -W clippy::await_holding_lock",
+  "exit_code": 0,
+  "scope": {
+    "workspace": true,
+    "features": "default features only",
+    "included_targets": [
+      "library",
+      "binary",
+      "example"
+    ],
+    "excluded_targets": [
+      "tests",
+      "benches"
+    ],
+    "expanded_macro_internals": false
+  },
+  "counting_rule": "Count source-located compiler diagnostic lines matching '<path>:<line>:<column>: warning: <message>'; do not count per-target summary lines.",
+  "classification_rule": {
+    "unwrap_used": "message contains 'used `unwrap()`'",
+    "expect_used": "message contains 'used `expect' (includes expect_err)",
+    "panic": "message identifies the panic lint/macro",
+    "unreachable": "message contains '`unreachable!`'",
+    "await_holding_lock": "message identifies an await while holding a lock"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: aarch64-apple-darwin\nrelease: 1.97.0\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)"
+  },
+  "machine": {
+    "os": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "uname": "Darwin Risings-Mac-mini.local 25.3.0 Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:55 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T8132 arm64 arm",
+    "cpu": "Apple M4",
+    "memory_bytes": 34359738368
+  },
+  "raw_output": {
+    "path": "docs/specs/2026-07-13-ocean-strict-lint-inventory.raw.txt",
+    "sha256": "56e2e4a1b7767deb879a5a3b77ad9e4e58b7b5a0d9177dd15a4fa3213e4aa0c4",
+    "bytes": 10259
+  },
+  "counts": {
+    "unwrap_used": 16,
+    "expect_used": 57,
+    "panic": 0,
+    "unreachable": 6,
+    "await_holding_lock": 0,
+    "total": 79
+  },
+  "counts_by_package": {
+    "ocean-acp": {
+      "unwrap_used": 1,
+      "expect_used": 9,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 10
+    },
+    "ocean-agent": {
+      "unwrap_used": 0,
+      "expect_used": 10,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 10
+    },
+    "ocean-context": {
+      "unwrap_used": 0,
+      "expect_used": 8,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 8
+    },
+    "ocean-daemon": {
+      "unwrap_used": 1,
+      "expect_used": 5,
+      "panic": 0,
+      "unreachable": 2,
+      "await_holding_lock": 0,
+      "total": 8
+    },
+    "ocean-hashline": {
+      "unwrap_used": 5,
+      "expect_used": 0,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 5
+    },
+    "ocean-longhouse": {
+      "unwrap_used": 0,
+      "expect_used": 2,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 2
+    },
+    "ocean-mcp": {
+      "unwrap_used": 2,
+      "expect_used": 0,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 2
+    },
+    "ocean-memory": {
+      "unwrap_used": 0,
+      "expect_used": 3,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 3
+    },
+    "ocean-oauth": {
+      "unwrap_used": 0,
+      "expect_used": 2,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 2
+    },
+    "ocean-protocol": {
+      "unwrap_used": 3,
+      "expect_used": 1,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 4
+    },
+    "ocean-providers": {
+      "unwrap_used": 0,
+      "expect_used": 1,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 1
+    },
+    "ocean-runtime": {
+      "unwrap_used": 0,
+      "expect_used": 9,
+      "panic": 0,
+      "unreachable": 4,
+      "await_holding_lock": 0,
+      "total": 13
+    },
+    "ocean-store": {
+      "unwrap_used": 0,
+      "expect_used": 4,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 4
+    },
+    "ocean-tui": {
+      "unwrap_used": 4,
+      "expect_used": 3,
+      "panic": 0,
+      "unreachable": 0,
+      "await_holding_lock": 0,
+      "total": 7
+    }
+  },
+  "warnings": [
+    {
+      "category": "unwrap_used",
+      "package": "ocean-hashline",
+      "path": "crates/ocean-hashline/src/patcher.rs",
+      "line": 306,
+      "column": 26,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-hashline",
+      "path": "crates/ocean-hashline/src/recovery.rs",
+      "line": 116,
+      "column": 25,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-hashline",
+      "path": "crates/ocean-hashline/src/recovery.rs",
+      "line": 117,
+      "column": 23,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-hashline",
+      "path": "crates/ocean-hashline/src/recovery.rs",
+      "line": 118,
+      "column": 25,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-hashline",
+      "path": "crates/ocean-hashline/src/recovery.rs",
+      "line": 119,
+      "column": 23,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-providers",
+      "path": "crates/ocean-providers/src/lib.rs",
+      "line": 1256,
+      "column": 21,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/extract.rs",
+      "line": 20,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/extract.rs",
+      "line": 29,
+      "column": 23,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/extract.rs",
+      "line": 35,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/extract.rs",
+      "line": 42,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/extract.rs",
+      "line": 80,
+      "column": 25,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/extract.rs",
+      "line": 151,
+      "column": 21,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/treesitter.rs",
+      "line": 441,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-context",
+      "path": "crates/ocean-context/src/treesitter.rs",
+      "line": 657,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-oauth",
+      "path": "crates/ocean-oauth/src/pkce.rs",
+      "line": 56,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-oauth",
+      "path": "crates/ocean-oauth/src/providers.rs",
+      "line": 327,
+      "column": 22,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-memory",
+      "path": "crates/ocean-memory/src/ingest.rs",
+      "line": 174,
+      "column": 22,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-memory",
+      "path": "crates/ocean-memory/src/ingest.rs",
+      "line": 177,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-memory",
+      "path": "crates/ocean-memory/src/ingest.rs",
+      "line": 181,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-protocol",
+      "path": "crates/ocean-protocol/src/http.rs",
+      "line": 69,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-protocol",
+      "path": "crates/ocean-protocol/src/providers/codex.rs",
+      "line": 474,
+      "column": 21,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-protocol",
+      "path": "crates/ocean-protocol/src/providers/codex.rs",
+      "line": 495,
+      "column": 21,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-protocol",
+      "path": "crates/ocean-protocol/src/providers/codex.rs",
+      "line": 519,
+      "column": 21,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-store",
+      "path": "crates/ocean-store/src/lib.rs",
+      "line": 725,
+      "column": 12,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-store",
+      "path": "crates/ocean-store/src/lib.rs",
+      "line": 846,
+      "column": 12,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-store",
+      "path": "crates/ocean-store/src/lib.rs",
+      "line": 913,
+      "column": 12,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-store",
+      "path": "crates/ocean-store/src/lib.rs",
+      "line": 962,
+      "column": 12,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 117,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 129,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 138,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 155,
+      "column": 23,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 173,
+      "column": 30,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 185,
+      "column": 30,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 197,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 208,
+      "column": 15,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 224,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-acp",
+      "path": "crates/ocean-acp/src/main.rs",
+      "line": 832,
+      "column": 30,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-tui",
+      "path": "crates/ocean-tui/src/shell/client.rs",
+      "line": 149,
+      "column": 21,
+      "message": "used `expect_err()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-tui",
+      "path": "crates/ocean-tui/src/shell/client.rs",
+      "line": 157,
+      "column": 21,
+      "message": "used `expect_err()` on a `Result` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-tui",
+      "path": "crates/ocean-tui/src/shell/components/chat.rs",
+      "line": 1693,
+      "column": 34,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-tui",
+      "path": "crates/ocean-tui/src/shell/components/chat.rs",
+      "line": 1903,
+      "column": 30,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-tui",
+      "path": "crates/ocean-tui/src/shell/components/chat.rs",
+      "line": 1916,
+      "column": 30,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-tui",
+      "path": "crates/ocean-tui/src/shell/components/chat.rs",
+      "line": 2568,
+      "column": 35,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-tui",
+      "path": "crates/ocean-tui/src/shell/status.rs",
+      "line": 146,
+      "column": 19,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "unreachable",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/agent_loop.rs",
+      "line": 509,
+      "column": 21,
+      "message": "usage of the `unreachable!` macro"
+    },
+    {
+      "category": "unreachable",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/agent_loop.rs",
+      "line": 554,
+      "column": 21,
+      "message": "usage of the `unreachable!` macro"
+    },
+    {
+      "category": "unreachable",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/agent_loop.rs",
+      "line": 569,
+      "column": 29,
+      "message": "usage of the `unreachable!` macro"
+    },
+    {
+      "category": "unreachable",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/agent_loop.rs",
+      "line": 581,
+      "column": 21,
+      "message": "usage of the `unreachable!` macro"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/agent_loop.rs",
+      "line": 583,
+      "column": 31,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/capability.rs",
+      "line": 146,
+      "column": 23,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/capability.rs",
+      "line": 159,
+      "column": 23,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/capability.rs",
+      "line": 167,
+      "column": 23,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/tools/bash.rs",
+      "line": 157,
+      "column": 27,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/src/tools/bash.rs",
+      "line": 158,
+      "column": 27,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/examples/history_cost_bench.rs",
+      "line": 152,
+      "column": 20,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/examples/history_cost_bench.rs",
+      "line": 156,
+      "column": 13,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-runtime",
+      "path": "crates/ocean-runtime/examples/history_cost_bench.rs",
+      "line": 158,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-mcp",
+      "path": "crates/ocean-mcp/src/provider.rs",
+      "line": 303,
+      "column": 34,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-longhouse",
+      "path": "crates/ocean-longhouse/src/quorum.rs",
+      "line": 222,
+      "column": 21,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-longhouse",
+      "path": "crates/ocean-longhouse/src/quorum.rs",
+      "line": 284,
+      "column": 21,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-mcp",
+      "path": "crates/ocean-mcp/src/bin/fake_server.rs",
+      "line": 52,
+      "column": 18,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/oauth_refresh.rs",
+      "line": 120,
+      "column": 29,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/rooms.rs",
+      "line": 179,
+      "column": 26,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/rooms.rs",
+      "line": 192,
+      "column": 12,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/rooms.rs",
+      "line": 232,
+      "column": 12,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/lib.rs",
+      "line": 339,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/lib.rs",
+      "line": 419,
+      "column": 10,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/lib.rs",
+      "line": 780,
+      "column": 26,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/lib.rs",
+      "line": 1662,
+      "column": 9,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/session/mod.rs",
+      "line": 455,
+      "column": 22,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-agent",
+      "path": "crates/ocean-agent/src/session/mod.rs",
+      "line": 471,
+      "column": 33,
+      "message": "used `expect()` on an `Option` value"
+    },
+    {
+      "category": "unwrap_used",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/browser_stream.rs",
+      "line": 264,
+      "column": 10,
+      "message": "used `unwrap()` on an `Option` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/browser_stream.rs",
+      "line": 501,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/browser_stream.rs",
+      "line": 512,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/voice_speech.rs",
+      "line": 34,
+      "column": 5,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/main.rs",
+      "line": 1535,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "expect_used",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/main.rs",
+      "line": 1542,
+      "column": 9,
+      "message": "used `expect()` on a `Result` value"
+    },
+    {
+      "category": "unreachable",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/main.rs",
+      "line": 4808,
+      "column": 22,
+      "message": "usage of the `unreachable!` macro"
+    },
+    {
+      "category": "unreachable",
+      "package": "ocean-daemon",
+      "path": "crates/ocean-daemon/src/main.rs",
+      "line": 4826,
+      "column": 22,
+      "message": "usage of the `unreachable!` macro"
+    }
+  ]
+}

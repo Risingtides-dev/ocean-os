@@ -2703,3 +2703,13 @@ area:  [backend]: Hosted validation and supervised daemon restart
 
 GitHub Actions run 29228061344 passed the full repository gate on macOS and Ubuntu plus cargo-deny for the clean history-cost baseline checkpoint. From clean synchronized main at 6459b7907c60, I reconfirmed zero turns in flight, built the release workspace, and restarted only `dev.risingtides.ocean-daemon`. Health reports revision 6459b7907c60 with zero persistence/GC failures; PID changed from 96905 to 44616, cwd remains neutral at `/Users/risingtidesdev`, and the post-restart in-flight gauge is zero. The browser single-flight fix is now live and Phase 0B-4 is complete.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [02:22am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [plan]: Capture Phase 0B-5 strict production lint inventory
+area:  [testing]: Raw diagnostics, machine-readable sites, and bounded interpretation
+
+Ran the exact warning-level production lint command from the approved plan on clean revision 546287bd across workspace library, binary, and example targets with default features. It exited 0 and recorded 16 unwrap, 57 expect, 0 panic, 6 unreachable, and 0 await-holding-lock diagnostics (79 total). The report, JSON, and 10,259-byte raw output retain scope/exclusions, toolchain/machine metadata, all source sites, counting rules, and SHA-256. Independent rerun reproduced the exact set and passed review; artifact invariants, full local CI, workspace test check, docs integrity, and diff checks pass. These remain invariant sites rather than defects, and no blanket denial was enabled; hosted validation remains.
+_________________________________________________________________________________

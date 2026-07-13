@@ -1,0 +1,121 @@
+    Checking ocean-core v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-core)
+    Checking ocean-protocol v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-protocol)
+    Checking ocean-hashline v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-hashline)
+    Checking ocean-browser v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-browser)
+    Checking ocean-providers v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-providers)
+    Checking ocean-context v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-context)
+    Checking ocean-hooks v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-hooks)
+   Compiling ocean-daemon v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-daemon)
+    Checking ocean-ast v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-ast)
+    Checking ocean-heartbeat v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-heartbeat)
+    Checking xtask v0.1.0 (/Users/risingtidesdev/dev/ocean-os/xtask)
+crates/ocean-hashline/src/patcher.rs:306:26: warning: used `unwrap()` on an `Option` value
+crates/ocean-hashline/src/recovery.rs:116:25: warning: used `unwrap()` on an `Option` value
+crates/ocean-hashline/src/recovery.rs:117:23: warning: used `unwrap()` on an `Option` value
+crates/ocean-hashline/src/recovery.rs:118:25: warning: used `unwrap()` on an `Option` value
+crates/ocean-hashline/src/recovery.rs:119:23: warning: used `unwrap()` on an `Option` value
+warning: `ocean-hashline` (lib) generated 5 warnings
+crates/ocean-providers/src/lib.rs:1256:21: warning: used `expect()` on an `Option` value
+warning: `ocean-providers` (lib) generated 1 warning
+    Checking ocean-oauth v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-oauth)
+crates/ocean-context/src/extract.rs:20:9: warning: used `expect()` on a `Result` value
+crates/ocean-context/src/extract.rs:29:23: warning: used `expect()` on a `Result` value
+crates/ocean-context/src/extract.rs:35:9: warning: used `expect()` on a `Result` value
+crates/ocean-context/src/extract.rs:42:9: warning: used `expect()` on a `Result` value
+crates/ocean-context/src/extract.rs:80:25: warning: used `expect()` on an `Option` value
+crates/ocean-context/src/extract.rs:151:21: warning: used `expect()` on an `Option` value
+crates/ocean-context/src/treesitter.rs:441:5: warning: used `expect()` on a `Result` value
+crates/ocean-context/src/treesitter.rs:657:5: warning: used `expect()` on a `Result` value
+warning: `ocean-context` (lib) generated 8 warnings
+    Checking ocean-memory v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-memory)
+crates/ocean-oauth/src/pkce.rs:56:5: warning: used `expect()` on a `Result` value
+crates/ocean-oauth/src/providers.rs:327:22: warning: used `expect()` on an `Option` value
+warning: `ocean-oauth` (lib) generated 2 warnings
+crates/ocean-memory/src/ingest.rs:174:22: warning: used `expect()` on a `Result` value
+crates/ocean-memory/src/ingest.rs:177:5: warning: used `expect()` on a `Result` value
+crates/ocean-memory/src/ingest.rs:181:5: warning: used `expect()` on a `Result` value
+    Checking ocean-call v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-call)
+    Checking ocean-store v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-store)
+warning: `ocean-memory` (lib) generated 3 warnings
+crates/ocean-protocol/src/http.rs:69:5: warning: used `expect()` on a `Result` value
+crates/ocean-protocol/src/providers/codex.rs:474:21: warning: used `unwrap()` on an `Option` value
+crates/ocean-protocol/src/providers/codex.rs:495:21: warning: used `unwrap()` on an `Option` value
+crates/ocean-protocol/src/providers/codex.rs:519:21: warning: used `unwrap()` on an `Option` value
+crates/ocean-store/src/lib.rs:725:12: warning: used `expect()` on an `Option` value
+crates/ocean-store/src/lib.rs:846:12: warning: used `expect()` on an `Option` value
+crates/ocean-store/src/lib.rs:913:12: warning: used `expect()` on an `Option` value
+crates/ocean-store/src/lib.rs:962:12: warning: used `expect()` on an `Option` value
+warning: `ocean-store` (lib) generated 4 warnings
+warning: `ocean-protocol` (lib) generated 4 warnings
+    Checking ocean-agent-sdk v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-agent-sdk)
+    Checking ocean-runtime v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-runtime)
+    Checking ocean-acp v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-acp)
+    Checking ocean-tui v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-tui)
+crates/ocean-acp/src/main.rs:117:9: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:129:9: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:138:9: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:155:23: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:173:30: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:185:30: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:197:9: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:208:15: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:224:9: warning: used `expect()` on a `Result` value
+crates/ocean-acp/src/main.rs:832:30: warning: used `unwrap()` on an `Option` value
+warning: `ocean-acp` (bin "ocean-acp") generated 10 warnings
+crates/ocean-tui/src/shell/client.rs:149:21: warning: used `expect_err()` on a `Result` value
+crates/ocean-tui/src/shell/client.rs:157:21: warning: used `expect_err()` on a `Result` value
+crates/ocean-tui/src/shell/components/chat.rs:1693:34: warning: used `unwrap()` on an `Option` value
+crates/ocean-tui/src/shell/components/chat.rs:1903:30: warning: used `unwrap()` on an `Option` value
+crates/ocean-tui/src/shell/components/chat.rs:1916:30: warning: used `unwrap()` on an `Option` value
+crates/ocean-tui/src/shell/components/chat.rs:2568:35: warning: used `unwrap()` on an `Option` value
+crates/ocean-tui/src/shell/status.rs:146:19: warning: used `expect()` on an `Option` value
+warning: `ocean-tui` (bin "ocean-tui") generated 7 warnings
+crates/ocean-runtime/src/agent_loop.rs:509:21: warning: usage of the `unreachable!` macro
+crates/ocean-runtime/src/agent_loop.rs:554:21: warning: usage of the `unreachable!` macro
+crates/ocean-runtime/src/agent_loop.rs:569:29: warning: usage of the `unreachable!` macro
+crates/ocean-runtime/src/agent_loop.rs:581:21: warning: usage of the `unreachable!` macro
+crates/ocean-runtime/src/agent_loop.rs:583:31: warning: used `expect()` on an `Option` value
+crates/ocean-runtime/src/capability.rs:146:23: warning: used `expect()` on a `Result` value
+crates/ocean-runtime/src/capability.rs:159:23: warning: used `expect()` on a `Result` value
+crates/ocean-runtime/src/capability.rs:167:23: warning: used `expect()` on a `Result` value
+crates/ocean-runtime/src/tools/bash.rs:157:27: warning: used `expect()` on an `Option` value
+crates/ocean-runtime/src/tools/bash.rs:158:27: warning: used `expect()` on an `Option` value
+warning: `ocean-runtime` (lib) generated 10 warnings
+    Checking ocean-plugin v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-plugin)
+    Checking ocean-longhouse v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-longhouse)
+    Checking ocean-mcp v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-mcp)
+    Checking ocean-lsp v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-lsp)
+crates/ocean-runtime/examples/history_cost_bench.rs:152:20: warning: used `expect()` on a `Result` value
+crates/ocean-runtime/examples/history_cost_bench.rs:156:13: warning: used `expect()` on a `Result` value
+crates/ocean-runtime/examples/history_cost_bench.rs:158:9: warning: used `expect()` on a `Result` value
+warning: `ocean-runtime` (example "history_cost_bench") generated 3 warnings
+crates/ocean-mcp/src/provider.rs:303:34: warning: used `unwrap()` on an `Option` value
+warning: `ocean-mcp` (lib) generated 1 warning
+crates/ocean-longhouse/src/quorum.rs:222:21: warning: used `expect()` on an `Option` value
+crates/ocean-longhouse/src/quorum.rs:284:21: warning: used `expect()` on an `Option` value
+warning: `ocean-longhouse` (lib) generated 2 warnings
+    Checking ocean-agent v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-agent)
+crates/ocean-mcp/src/bin/fake_server.rs:52:18: warning: used `unwrap()` on an `Option` value
+warning: `ocean-mcp` (bin "fake_server") generated 1 warning
+crates/ocean-agent/src/oauth_refresh.rs:120:29: warning: used `expect()` on an `Option` value
+crates/ocean-agent/src/rooms.rs:179:26: warning: used `expect()` on an `Option` value
+crates/ocean-agent/src/rooms.rs:192:12: warning: used `expect()` on an `Option` value
+crates/ocean-agent/src/rooms.rs:232:12: warning: used `expect()` on an `Option` value
+crates/ocean-agent/src/lib.rs:339:9: warning: used `expect()` on a `Result` value
+crates/ocean-agent/src/lib.rs:419:10: warning: used `expect()` on a `Result` value
+crates/ocean-agent/src/lib.rs:780:26: warning: used `expect()` on an `Option` value
+crates/ocean-agent/src/lib.rs:1662:9: warning: used `expect()` on an `Option` value
+crates/ocean-agent/src/session/mod.rs:455:22: warning: used `expect()` on an `Option` value
+crates/ocean-agent/src/session/mod.rs:471:33: warning: used `expect()` on an `Option` value
+warning: `ocean-agent` (lib) generated 10 warnings
+    Checking ocean-cli v0.1.0 (/Users/risingtidesdev/dev/ocean-os/crates/ocean-cli)
+crates/ocean-daemon/src/browser_stream.rs:264:10: warning: used `unwrap()` on an `Option` value
+crates/ocean-daemon/src/browser_stream.rs:501:5: warning: used `expect()` on a `Result` value
+crates/ocean-daemon/src/browser_stream.rs:512:5: warning: used `expect()` on a `Result` value
+crates/ocean-daemon/src/voice_speech.rs:34:5: warning: used `expect()` on a `Result` value
+crates/ocean-daemon/src/main.rs:1535:9: warning: used `expect()` on a `Result` value
+crates/ocean-daemon/src/main.rs:1542:9: warning: used `expect()` on a `Result` value
+crates/ocean-daemon/src/main.rs:4808:22: warning: usage of the `unreachable!` macro
+crates/ocean-daemon/src/main.rs:4826:22: warning: usage of the `unreachable!` macro
+warning: `ocean-daemon` (bin "ocean-daemon") generated 8 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.30s
