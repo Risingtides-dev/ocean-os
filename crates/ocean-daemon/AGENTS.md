@@ -18,6 +18,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - Do not bypass runtime permission gates from daemon route code.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
 - Agent SSE replay is globally bounded by both 2,048 events and 32 MiB of serialized event payload. Oldest envelopes evict until both limits hold; an individually oversized event remains live but is not replay-retained. Preserve full live delivery and the existing explicit subscriber-lag signal.
+- Build provenance must follow normal branch commits and linked worktrees: `build.rs` watches Git `HEAD`, its resolved symbolic branch ref, and `packed-refs`; `/health` and `/ready` must report the exact main-built revision after deployment.
 
 ## Work Guidance
 

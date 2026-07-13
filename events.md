@@ -2506,3 +2506,15 @@ area:      [automations]
 
 Deployed the reviewed code-health/event-retention wave through the supervised main-built daemon. Preflight found one active turn, so restart was deferred rather than interrupted; after the turn drained to zero, built `cargo build -p ocean-daemon --release` and confirmed the artifact embedded rev `3827524ab188`. Restarted only the LaunchAgent-managed PID via `launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon` (PID 88117 → 43445). Post-restart `/health` returned ok at the expected revision, process cwd remained the neutral `/Users/risingtidesdev` rather than a repo, and `ocean_turns_in_flight` was zero.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [11:25pm] [12-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [bug report]
+area:      [automations]
+
+Fixed stale daemon build provenance discovered during deployment closeout. `crates/ocean-daemon/build.rs` watched only `.git/HEAD`; on a normal branch that file stays `ref: refs/heads/main`, so docs-only commits advanced main without rerunning the build script and repeated release builds kept the old `OCEAN_BUILD_REV`. The build script now asks Git for absolute paths and watches the worktree HEAD, resolved symbolic branch ref, and packed-refs, with a compatibility fallback. Detached HEAD safely omits the symbolic ref; linked worktrees resolve their worktree HEAD plus common ref storage. Revision/dirty/unknown stamping semantics are unchanged.
+
+Verification: emitted Cargo directives named the real `.git/HEAD`, `.git/refs/heads/main`, and `.git/packed-refs`; dirty pre-commit output reported `e3c181219352-dirty` honestly. `cargo check -p ocean-daemon`, strict daemon Clippy, all 294 daemon tests, format/diff checks, main/branch-linked/detached path inspection, and fresh independent review passed. The supervised binary is rebuilt from the committed fix after this ledger entry so `/health` can again track exact main.
+_________________________________________________________________________________

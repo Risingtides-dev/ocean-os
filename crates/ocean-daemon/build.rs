@@ -10,13 +10,47 @@
 //!   so a deployed binary can never claim a precise commit it cannot prove.
 
 fn main() {
-    // Rebuild whenever the checked-out HEAD moves so the embedded rev tracks the
-    // actually-deployed commit rather than a stale build. In a linked git
-    // worktree `.git` is a gitdir pointer rather than a directory, so this path
-    // may not resolve there — cargo treats an unresolvable hint as a no-op, and
-    // the value is still captured at that build.
-    println!("cargo::rerun-if-changed=../../.git/HEAD");
+    // `.git/HEAD` usually contains only `ref: refs/heads/main`, so its bytes do
+    // not change as normal commits advance the branch. Watch HEAD, the resolved
+    // symbolic ref, and packed-refs using git-aware absolute paths. This also
+    // works in linked worktrees where `.git` is a pointer file and branch refs
+    // live in the common git directory.
+    for path in git_rerun_paths() {
+        println!("cargo::rerun-if-changed={path}");
+    }
     println!("cargo::rustc-env=OCEAN_BUILD_REV={}", build_rev());
+}
+
+fn git_rerun_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = git_path("HEAD") {
+        paths.push(path);
+    }
+    if let Some(reference) = git_stdout(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git_path(&reference) {
+            paths.push(path);
+        }
+    }
+    if let Some(path) = git_path("packed-refs") {
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn git_path(logical: &str) -> Option<String> {
+    git_stdout(&["rev-parse", "--path-format=absolute", "--git-path", logical])
+        .or_else(|| git_stdout(&["rev-parse", "--git-path", logical]))
+}
+
+fn git_stdout(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 /// The short, dirtiness-annotated build revision, or `"unknown"` when git is
