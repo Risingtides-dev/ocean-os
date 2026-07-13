@@ -8,7 +8,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 
 - **Scope:** `crates/ocean-agent/`
 - **Parent contracts:** `../../AGENTS.md` and `../AGENTS.md`
-- **Primary responsibilities:** session persistence and history shaping in `src/lib.rs`; system/surface prompt assembly, project instruction discovery, and prompt-memory context in `src/system_prompt.rs`
+- **Primary responsibilities:** session persistence, workspace binding, GC, and transcript projection in `src/session/mod.rs`; runtime/history shaping in `src/lib.rs`; system/surface prompt assembly, project instruction discovery, and prompt-memory context in `src/system_prompt.rs`
 
 ## Local Contracts
 
@@ -20,6 +20,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 
 - Keep prompt-loading behavior deterministic and easy for cold agents to reason about.
 - `src/system_prompt.rs` is one intact cohesion boundary. Prompt wording and literal bytes are behavior; do not mix wording changes with structural extraction.
+- `src/session/mod.rs` is the intact persistence boundary. Do not split it or change schema, atomic-save order, duplicate healing, or resume behavior without a separately approved design and compatibility tests.
 - Avoid client-specific assumptions; daemon, TUI, and surface clients share this session layer.
 - Refresh the recorded `cwd` on every bind; update `workspace_root` and git metadata when the caller moves into a different workspace.
 - When changing prompt text, include tests for client-type differences when relevant.
@@ -29,6 +30,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 ## Verification
 
 - `cargo test -p ocean-agent system_prompt`
+- `cargo test -p ocean-agent session`
 - `cargo test -p ocean-agent project_prompt_loads_ocean_agents_md_from_ancestor`
 - `cargo test -p ocean-agent`
 - `cargo check --workspace`

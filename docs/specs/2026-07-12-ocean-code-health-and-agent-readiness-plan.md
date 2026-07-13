@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — Phase 0A, 1A, and first Phase 2A extraction complete
+**Status:** Approved by operator — Phase 0A, 1A, and both intact Phase 2A moves complete
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -246,7 +246,7 @@ Before each move, write a short extraction manifest naming exact symbols/files, 
 #### 2A. `ocean-agent` intact module moves
 
 1. **Complete:** moved the embedded `system_prompt` module to `src/system_prompt.rs` intact; focused/full tests and independent review passed. Manifest: `docs/specs/2026-07-12-ocean-agent-system-prompt-extraction-manifest.md`.
-2. Move the embedded session module to `src/session/mod.rs` intact.
+2. **Complete:** moved the embedded session module to `src/session/mod.rs` intact; focused/full tests, the full repository gate, and independent review passed. Manifest: `docs/specs/2026-07-12-ocean-agent-session-extraction-manifest.md`.
 3. Preserve all `ocean_agent::...` public paths through re-exports.
 4. Stop after the intact moves. Splitting session internals changes the internal dependency/privacy graph and requires separate Phase 3 approval.
 
@@ -367,7 +367,7 @@ After this plan is approved, start with independently reviewable changes:
 
 1. **Ground-truth docs PR — complete:** repo boundaries, handoff, gates, canonical crate index, active links, and before/after cold-agent benchmark are reconciled.
 2. **Docs automation PR — complete:** `cargo xtask docs-check`, one executable CI manifest, manifest unit coverage, and GitHub Actions consumption are implemented and passing.
-3. **First intact source extraction — complete:** `ocean-agent::system_prompt` moved as one private module with prompt behavior/tests preserved and independent review passed.
+3. **Intact `ocean-agent` extraction wave — complete:** both private modules moved with behavior/tests preserved and independent review passed.
 4. **Event-policy characterization PR:** produce the checked event table and isolated payload/RSS stress evidence.
 5. **Shell Halt characterization PR:** direct-child and descendant-tree tests by supported OS.
 6. **Browser characterization PR:** injected single-flight/deadline/cancellation tests.

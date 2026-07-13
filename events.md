@@ -2458,3 +2458,15 @@ Completed the first behavior-neutral Phase 2A source extraction. Moved the priva
 
 Verification after upstream reconciliation: 22 focused system-prompt tests and all 149 ocean-agent tests passed, along with format/diff checks. Workspace/docs/full-gate revalidation and a fresh comparison review are recorded at rebase closeout. The extraction manifest is `docs/specs/2026-07-12-ocean-agent-system-prompt-extraction-manifest.md`; the move preserves upstream prompt commit `eba86f04` without additional wording or public-behavior changes.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [10:43pm] [12-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [refactor]
+area:      [backend]
+
+Completed the second and final approved intact `ocean-agent` Phase 2A move. Extracted the private 30,078-byte embedded `session` module from `src/lib.rs` into `src/session/mod.rs` while leaving every root caller and root test in place. Preserved symbol visibility, persisted serde fields/defaults, atomic write/sync/rename/purge order, deterministic duplicate healing, strict corrupt/unknown resume behavior, workspace binding/bucketing, TTL/GC, pagination, transcript/image projection, raw messages, and the outer load→run→save lock scope. Rustfmt-normalized rollback source (`644dbc8d`) equals the final 27,322-byte module exactly (SHA-256 `13c3769527041ccdf357f258cfca8fce89c07c35e46e40c0afdc447e78f98d59`); `lib.rs` is now 5,416 lines.
+
+Verification: 24 focused session tests, all 148 ocean-agent tests, workspace check, docs-check (25 packages / 93 active Markdown files / 56 links), and the full `cargo xtask ci` gate passed, including strict all-target Clippy, format, and cargo-deny. The first reviewer run found only a leading blank line rejected by rustfmt; it was removed, the full gate reran cleanly, and reviewer follow-up returned PASS with no remaining blockers. Manifest: `docs/specs/2026-07-12-ocean-agent-session-extraction-manifest.md`.
+_________________________________________________________________________________
