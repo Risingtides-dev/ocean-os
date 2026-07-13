@@ -2803,3 +2803,19 @@ Verification:
 - `cargo fmt --check`
 - `cargo test -p ocean-protocol prompt_capture -- --nocapture`
 - `cargo check --workspace`
+_________________________________________________________________________________
+
+time:      [06:58pm] [13-07-26]
+agent:     [pi], [gpt-5.2-pro]
+worktree:  [main]
+type:      [feature-request]: land terminal-native chat component projections
+area:      [frontend]: TUI component lifecycle and terminal safety
+
+Landed the experiment/tui-component-projection work onto current main, adding compact terminal projections for callout, progress, stat, chart, timeline, table, code, diff, file tree, gallery, and confirmation components plus a pinned footer slot. Fresh review found cross-slot replacement duplication, pinned state leaking across sessions, unsafe agent-controlled terminal text, and over-wide headers; all were corrected with lifecycle resets, cross-registry replacement, control sanitization, Unicode cell-aware sizing, bounded rows, and regression tests.
+
+Verification:
+- `cargo test -p ocean-tui` (284 passed, 4 ignored)
+- `cargo clippy -p ocean-tui --all-targets -- -D warnings`
+- `cargo build -p ocean-tui --release`
+- `cargo fmt --all -- --check`
+_________________________________________________________________________________

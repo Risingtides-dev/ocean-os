@@ -298,6 +298,15 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
     out
 }
 
+/// Pad terminal-safe text to an exact display-cell width. Unlike format width,
+/// this treats CJK and emoji as multi-cell glyphs.
+fn pad_to_width(s: &str, width: usize) -> String {
+    let safe = sanitize_line(s);
+    let clipped = truncate_to_width(&safe, width);
+    let used = UnicodeWidthStr::width(clipped.as_str());
+    format!("{clipped}{}", " ".repeat(width.saturating_sub(used)))
+}
+
 /// Make a line of tool/diff output terminal-safe. ratatui does NOT expand
 /// tabs: a raw `\t` makes the terminal jump to its own tab stop, every cell
 /// after it paints misaligned, and ratatui's diffing (which believes its own
@@ -329,20 +338,20 @@ fn component_lines(kind: &str, props: &serde_json::Value, width: usize) -> Vec<L
         .and_then(|v| v.as_str())
         .unwrap_or(kind);
     let inner = width.saturating_sub(6).clamp(8, 48);
-    let rule = "─".repeat(inner);
-    let header = format!(
-        "  ╭─ {} {}",
-        truncate_to_width(&sanitize_line(title), inner / 2),
-        rule
-    );
+    let title = truncate_to_width(&sanitize_line(title), inner.saturating_sub(2));
+    let title_width = UnicodeWidthStr::width(title.as_str());
+    let rule = "─".repeat(inner.saturating_sub(title_width + 1));
+    let header = format!("  ╭─{title} {rule}");
     let mut lines = vec![Line::from(Span::styled(
         header,
         Style::default().fg(theme::EDGE),
     ))];
     let row = |text: String, color| {
+        let safe = sanitize_line(&text);
+        let clipped = truncate_to_width(&safe, inner);
         Line::from(vec![
             Span::styled("  │ ", Style::default().fg(theme::EDGE)),
-            Span::styled(text, Style::default().fg(color)),
+            Span::styled(clipped, Style::default().fg(color)),
         ])
     };
     match kind {
@@ -488,11 +497,11 @@ fn component_lines(kind: &str, props: &serde_json::Value, width: usize) -> Vec<L
                 lines.push(row("(empty table)".into(), theme::COMMENT));
             } else {
                 let col_w = (inner.saturating_sub(columns.len() * 2)) / columns.len().max(1);
-                let fit = |s: &str| truncate_to_width(s, col_w);
+                let fit = |s: &str| pad_to_width(s, col_w);
                 // Header row
                 let hdr: String = columns
                     .iter()
-                    .map(|c| format!("{: <col_w$}", fit(c)))
+                    .map(|c| fit(c))
                     .collect::<Vec<_>>()
                     .join("  ");
                 lines.push(Line::from(vec![
@@ -521,7 +530,7 @@ fn component_lines(kind: &str, props: &serde_json::Value, width: usize) -> Vec<L
                         .enumerate()
                         .map(|(i, _)| {
                             let cell = row_data.get(i).and_then(|v| v.as_str()).unwrap_or("");
-                            format!("{: <col_w$}", fit(cell))
+                            fit(cell)
                         })
                         .collect::<Vec<_>>()
                         .join("  ");
@@ -806,12 +815,11 @@ impl ChatComponent {
     /// ↑/↓ recall and ⌃R search). `Default` leaves history empty — used in
     /// tests that don't touch disk.
     pub fn new() -> Self {
-        let chat = Self {
+        Self {
             history: PromptHistory::load(),
             pinned_visible: true,
             ..Default::default()
-        };
-        chat
+        }
     }
 
     /// Inject visual-harness components when `OCEAN_TUI_COMPONENT_DEMO` is set.
@@ -1307,6 +1315,8 @@ impl ChatComponent {
             })
             .collect();
         self.md.clear();
+        self.pinned = None;
+        self.pinned_visible = true;
         self.busy = false;
     }
 
@@ -1732,6 +1742,8 @@ impl ChatComponent {
                 // unbind so the next turn mints a new session id.
                 self.turns.clear();
                 self.md.clear();
+                self.pinned = None;
+                self.pinned_visible = true;
                 self.scroll_back = 0;
                 self.busy = false;
                 Some(Action::NewSession)
@@ -2695,10 +2707,17 @@ impl Component for ChatComponent {
                         .get("pinned")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    if pinned {
-                        if *replace {
+                    if *replace {
+                        if self.pinned.as_ref().is_some_and(
+                            |turn| matches!(turn, Turn::Component { id, .. } if id == component_id),
+                        ) {
                             self.pinned = None;
                         }
+                        self.turns.retain(|turn| {
+                            !matches!(turn, Turn::Component { id, .. } if id == component_id)
+                        });
+                    }
+                    if pinned {
                         self.pinned = Some(Turn::Component {
                             id: component_id.clone(),
                             kind: kind.clone(),
@@ -2709,11 +2728,6 @@ impl Component for ChatComponent {
                         // previous pinned artifact was hidden by the operator.
                         self.pinned_visible = true;
                     } else {
-                        if *replace {
-                            self.turns.retain(|turn| {
-                                !matches!(turn, Turn::Component { id, .. } if id == component_id)
-                            });
-                        }
                         self.turns.push(Turn::Component {
                             id: component_id.clone(),
                             kind: kind.clone(),
@@ -2724,8 +2738,7 @@ impl Component for ChatComponent {
                     self.scroll_back = 0;
                 }
                 AgentTurnEvent::ComponentUnmount { component_id, .. } => {
-                    if self.pinned.as_ref().map_or(
-                        false,
+                    if self.pinned.as_ref().is_some_and(
                         |p| matches!(p, Turn::Component { id, .. } if id == component_id),
                     ) {
                         self.pinned = None;
@@ -3530,6 +3543,63 @@ mod tests {
     }
 
     #[test]
+    fn component_replace_moves_id_between_inline_and_pinned_without_duplicates() {
+        let mut chat = ChatComponent::default();
+        let sid = AgentSessionId(Uuid::new_v4());
+        let render = |pinned| {
+            Action::AgentEvent(Box::new(AgentTurnEvent::ComponentRender {
+                session_id: sid,
+                component_id: "health".into(),
+                kind: "stat".into(),
+                props: json!({ "title": "health", "pinned": pinned }),
+                replace: true,
+            }))
+        };
+
+        chat.update(&render(false));
+        chat.update(&render(true));
+        assert!(chat.pinned.is_some());
+        assert!(!chat
+            .turns
+            .iter()
+            .any(|turn| matches!(turn, Turn::Component { id, .. } if id == "health")));
+
+        chat.update(&render(false));
+        assert!(chat.pinned.is_none());
+        assert_eq!(
+            chat.turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::Component { id, .. } if id == "health"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn new_session_and_history_load_clear_pinned_components() {
+        let mut chat = ChatComponent {
+            pinned: Some(Turn::Component {
+                id: "pin".into(),
+                kind: "stat".into(),
+                props: json!({}),
+                resolved: None,
+            }),
+            ..Default::default()
+        };
+        chat.run_slash("/new", "");
+        assert!(chat.pinned.is_none());
+
+        chat.pinned = Some(Turn::Component {
+            id: "pin".into(),
+            kind: "stat".into(),
+            props: json!({}),
+            resolved: None,
+        });
+        chat.load_history(Vec::new());
+        assert!(chat.pinned.is_none());
+    }
+
+    #[test]
     fn chart_projection_is_compact_and_terminal_safe() {
         let lines = component_lines(
             "chart",
@@ -3539,6 +3609,16 @@ mod tests {
         assert!(lines.len() >= 3);
         assert!(lines.iter().any(|line| line.to_string().contains('█')));
         assert!(!lines.iter().any(|line| line.to_string().contains('\t')));
+
+        let hostile = component_lines(
+            "gallery",
+            &json!({ "title": "x\u{1b}[31m", "images": [{"caption": "a\tb", "src": "x\r.png"}] }),
+            30,
+        );
+        assert!(hostile.iter().all(|line| {
+            let text = line.to_string();
+            !text.contains('\u{1b}') && !text.contains('\t') && !text.contains('\r')
+        }));
     }
 
     #[test]

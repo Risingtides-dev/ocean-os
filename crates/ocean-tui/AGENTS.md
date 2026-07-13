@@ -118,6 +118,11 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   explicit new/clear/history reset) may clear `busy` — never generic SSE
   reconnect statuses; failed turns render `Turn::ErrorNotice`, not advisor
   cards.
+- Render-protocol components project into terminal-native chat cards. Component
+  IDs are unique across inline and pinned slots when `replace` is set; unmount,
+  history load, and new-session reset must not leak pinned state. Treat every
+  component prop as agent-controlled terminal text: sanitize controls, measure
+  Unicode display cells, and clamp to the card viewport before creating spans.
 
 - Normal launch (2026-07-13, owner-directed) opens a centered OCEAN chooser
   over a clean chat-only workspace: `+ new in <cwd>`, `resume session`, blank
