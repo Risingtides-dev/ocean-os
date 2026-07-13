@@ -22,6 +22,8 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 - Avoid client-specific assumptions; daemon, TUI, and surface clients share this session layer.
 - Refresh the recorded `cwd` on every bind; update `workspace_root` and git metadata when the caller moves into a different workspace.
 - When changing prompt text, include tests for client-type differences when relevant.
+- Keep the base prompt compact and tool-agnostic: runtime tool schemas describe mechanics; the prompt governs selection, batching, and verification.
+- Memory guidance must not encourage unconditional recall. Call `recall` only when prior conversations, preferences, or decisions are needed and not already injected.
 
 ## Verification
 

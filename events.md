@@ -2394,3 +2394,12 @@ area:      [backend]
 
 Restored legacy `edit` alongside `hashline_edit` for hashline-enabled sessions after a controlled alternating GPT-5.6 Terra benchmark isolated a severe model-behavior regression from the hashline-only tool surface. Both-editor runs completed 6/6 in 29.57s and 21.69s; hashline-only runs completed 6/6 in 57.06s and 60.10s. The restoration reran 6/6 in 31.77s and 26.82s, with runtime CPU remaining negligible. Added a capability regression for dual-editor exposure; all 162 ocean-runtime tests, `cargo check --workspace`, and `cargo fmt --check` pass. The benchmark harness itself was not modified.
 _________________________________________________________________________________
+
+time:      [09:44pm] [12-07-26]
+agent:     [omp], [gpt-5.6-sol]
+worktree:  perf/tighten-agent-prompt
+type:      [refactor]
+area:      [backend]
+
+Tightened Ocean's production system prompt after benchmark traces showed unnecessary provider rounds. Replaced the 7.2KB hardcoded repo/tool/browser catalog with a 1.5KB tool-agnostic operating contract that tells models to batch independent calls, avoid repeated investigation, and trust runtime tool schemas. Changed memory guidance from recalling at the start of every substantive task to recall only when prior conversations, preferences, or decisions are actually required and not already injected. Removed the local Stitchpad MCP server and Stop hook from Ocean configuration. Focused ocean-agent prompt tests pass.
+_________________________________________________________________________________
