@@ -2643,3 +2643,13 @@ area:  [testing]: CI run 29225077002 passed Ubuntu, macOS, and cargo-deny
 
 GitHub Actions validated commit 5f9d82b8 on ubuntu-latest and macos-latest, including the Unix direct-child and descendant Halt regressions in the full repository gate. The cargo-deny lane also passed. Phase 0B-2/1B-2 is complete; the only workflow annotation is GitHub's non-blocking Node 20 deprecation warning for actions/checkout@v4.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [01:04am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [workflow]: Deploy Shell Halt process-tree fix
+area:  [backend]: Rebuild clean main and restart supervised ocean-daemon
+
+After final-tip CI run 29225232240 passed, I confirmed a clean synchronized main and zero turns in flight, built the release workspace, and restarted only `dev.risingtides.ocean-daemon` through launchd. Health returned revision 2cdf34f15f4e with zero persistence/GC failures; neutral cwd `/Users/risingtidesdev`, PID 71451, and zero active turns were verified.
+_________________________________________________________________________________
