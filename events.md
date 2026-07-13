@@ -2693,3 +2693,13 @@ area:  [testing]: Release matrix, allocation evidence, and independent methodolo
 
 Ran the Phase 0B-4 history kernel benchmark from clean revision 7ad3bd8d on an Apple M4 with five warm-ups and thirty samples across all nine 10/100/1,000-message × 1/5/20-round cells. The largest median was 9.316 ms with 29.4 MB cumulative allocation traffic; this M4 kernel result does not justify a runtime redesign and is not an end-to-end latency claim. Independent review caught missing machine-readable metadata for the 10µs absolute timing floor and an overbroad scaling interpretation; both were fixed, the artifact was regenerated from a clean revision, and second-pass review passed. Artifact invariants, `cargo xtask ci`, workspace test check, formatting, docs integrity, and diff checks pass locally; the hosted macOS/Ubuntu matrix remains the completion gate.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [02:13am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [workflow]: Complete Phase 0B-4 gate and deploy browser reliability fix
+area:  [backend]: Hosted validation and supervised daemon restart
+
+GitHub Actions run 29228061344 passed the full repository gate on macOS and Ubuntu plus cargo-deny for the clean history-cost baseline checkpoint. From clean synchronized main at 6459b7907c60, I reconfirmed zero turns in flight, built the release workspace, and restarted only `dev.risingtides.ocean-daemon`. Health reports revision 6459b7907c60 with zero persistence/GC failures; PID changed from 96905 to 44616, cwd remains neutral at `/Users/risingtidesdev`, and the post-restart in-flight gauge is zero. The browser single-flight fix is now live and Phase 0B-4 is complete.
+_________________________________________________________________________________

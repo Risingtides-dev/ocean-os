@@ -78,3 +78,5 @@ Repository validation also passed:
 - independent concurrency and process-safety review after fixes for completed-flight re-probing and PID cleanup identity.
 
 GitHub Actions run [29226786986](https://github.com/Risingtides-dev/ocean-os/actions/runs/29226786986) passed the full repository gate on both `ubuntu-latest` and `macos-latest`, plus `cargo-deny`, completing the supported-platform checkpoint.
+
+The fix was deployed from clean synchronized `main` at `6459b7907c60` after confirming zero turns in flight. The supervised daemon restarted under neutral cwd `/Users/risingtidesdev`; health returned the deployed revision with zero persistence or GC failures.

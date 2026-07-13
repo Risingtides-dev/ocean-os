@@ -3,7 +3,7 @@
 **Date:** 2026-07-13
 **Plan checkpoint:** Phase 0B-4
 **Harness revision:** `7ad3bd8d9c6e9d04cb4e0b18e723acd4bcaa3514`
-**Status:** Clean-revision baseline captured and independently reviewed; local gate passed, hosted matrix pending
+**Status:** Complete — clean baseline, independent review, and macOS/Linux gates passed
 
 ## Scope
 
@@ -87,3 +87,4 @@ No performance fix is proposed from this baseline. Use it to evaluate later hist
 - `cargo xtask ci` passed locally, including the repository tests and strict Clippy gate.
 - `cargo check --workspace --tests`, `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check` passed.
 - Independent methodology review passed after the absolute timing floor was added to policy metadata and the interpretation was bounded to the measured fixture.
+- GitHub Actions run [29228061344](https://github.com/Risingtides-dev/ocean-os/actions/runs/29228061344) passed the full repository gate on `macos-latest` and `ubuntu-latest`, plus `cargo-deny`.
