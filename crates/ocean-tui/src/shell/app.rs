@@ -2726,12 +2726,9 @@ impl App {
     /// grabs). The four content rects are pairwise disjoint, so order is only
     /// by routing precedence.
     fn pane_rect_at(&self, pos: (u16, u16)) -> Option<Rect> {
-        for r in [self.r_sessions, self.r_tree, self.r_term, self.r_center] {
-            if rect_has(r, pos) {
-                return Some(r);
-            }
-        }
-        None
+        [self.r_sessions, self.r_tree, self.r_term, self.r_center]
+            .into_iter()
+            .find(|&rect| rect_has(rect, pos))
     }
 
     fn apply_focus(&mut self) {

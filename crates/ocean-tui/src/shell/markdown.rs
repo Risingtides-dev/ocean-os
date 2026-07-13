@@ -50,11 +50,13 @@ pub struct Markdown {
 }
 
 impl Markdown {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Cache-hit accounting since construction / last [`clear`](Self::clear).
+    #[cfg(test)]
     pub fn stats(&self) -> CacheStats {
         self.stats
     }

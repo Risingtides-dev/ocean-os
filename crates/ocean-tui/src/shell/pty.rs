@@ -134,12 +134,6 @@ impl TermPane {
             self.send(&bytes);
         }
     }
-
-    pub fn scroll(&mut self, lines: isize) {
-        let next = (self.scrollback as isize + lines).max(0) as usize;
-        self.scrollback = next;
-        self.parser.set_scrollback(next);
-    }
 }
 
 /// Translate a crossterm key event into the byte sequence a shell expects.

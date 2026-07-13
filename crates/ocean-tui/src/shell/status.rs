@@ -182,13 +182,6 @@ fn truncate_cells(s: &str, max: usize) -> String {
     out
 }
 
-/// Total display cells of `segs` rendered with two-space separators and the
-/// leading pad space.
-fn row_width(segs: &[Segment]) -> usize {
-    let text: usize = segs.iter().map(|s| s.text.width()).sum();
-    text + segs.len().saturating_sub(1) * SEP_W + 1
-}
-
 /// Git: `branch [~dirty +ahead -behind]` (plain ASCII). The branch is
 /// identity and renders whenever the workspace is a repo; the counts stay
 /// exceptional — appended (and the tone warns) only when nonzero.

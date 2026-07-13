@@ -310,6 +310,7 @@ fn direct_spawn(binary: &Path) -> Result<(), String> {
 /// All side effects are closures: eligibility env, launchd probe, kickstart
 /// execution, and binary-discovery+spawn. In production, use
 /// [`maybe_autostart_prod`].
+#[cfg(test)]
 pub fn maybe_autostart_with(
     url: &str,
     guard: &AutostartGuard,

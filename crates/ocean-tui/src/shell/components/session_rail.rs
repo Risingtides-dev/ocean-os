@@ -31,7 +31,7 @@ use crate::shell::{
     action::Action,
     component::Component,
     panel,
-    sessions::{ago, discover, Session, Sort},
+    sessions::{ago, discover, Session},
     theme::{self, g},
 };
 
@@ -102,7 +102,7 @@ pub struct SessionRailComponent {
 
 impl SessionRailComponent {
     pub fn new(root: PathBuf) -> Self {
-        let groups = build_groups(&root, discover(&root, Sort::Date));
+        let groups = build_groups(&root, discover(&root));
         Self {
             root,
             groups,
@@ -177,7 +177,7 @@ impl SessionRailComponent {
                     .map(move |b| format!("{}\u{0}{}", d.key, b.key))
             })
             .collect();
-        self.groups = build_groups(&self.root, discover(&self.root, Sort::Date));
+        self.groups = build_groups(&self.root, discover(&self.root));
         if !dirs_open.is_empty() || !branches_open.is_empty() {
             for dir in &mut self.groups {
                 dir.expanded = dirs_open.contains(&dir.key);

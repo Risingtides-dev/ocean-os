@@ -112,7 +112,6 @@ impl DaemonClient {
     /// or 5xx failure has an unknown outcome and must not be replayed. The daemon
     /// normally acknowledges immediately while output continues over SSE; the
     /// long timeout is only a deadman for a wedged acknowledgement path.
-
     pub async fn agent_turn_retrying(
         &self,
         req: &AgentTurnRequest,
@@ -240,29 +239,26 @@ impl DaemonClient {
                 if let Some(id) = &last_event_id {
                     req = req.header("Last-Event-ID", id.clone());
                 }
-                match req.send().await.and_then(|r| r.error_for_status()) {
-                    Ok(resp) => {
-                        // Typed recovery: clears ONLY the SSE source — no
-                        // connected/reconnected success text is rendered.
-                        let _ = actions.send(Action::HealthRecovered(HealthSource::Sse));
-                        let mut stream = resp.bytes_stream();
-                        let mut buf = String::new();
-                        while let Some(chunk) = stream.next().await {
-                            let Ok(bytes) = chunk else { break };
-                            buf.push_str(&String::from_utf8_lossy(&bytes));
-                            while let Some(idx) = buf.find("\n\n") {
-                                let frame = buf[..idx].to_string();
-                                buf.drain(..idx + 2);
-                                if let Some(id) = parse_sse_id(&frame) {
-                                    last_event_id = Some(id);
-                                }
-                                if let Some(evt) = parse_sse_frame(&frame) {
-                                    let _ = actions.send(Action::AgentEvent(Box::new(evt)));
-                                }
+                if let Ok(resp) = req.send().await.and_then(|r| r.error_for_status()) {
+                    // Typed recovery: clears ONLY the SSE source — no
+                    // connected/reconnected success text is rendered.
+                    let _ = actions.send(Action::HealthRecovered(HealthSource::Sse));
+                    let mut stream = resp.bytes_stream();
+                    let mut buf = String::new();
+                    while let Some(chunk) = stream.next().await {
+                        let Ok(bytes) = chunk else { break };
+                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(idx) = buf.find("\n\n") {
+                            let frame = buf[..idx].to_string();
+                            buf.drain(..idx + 2);
+                            if let Some(id) = parse_sse_id(&frame) {
+                                last_event_id = Some(id);
+                            }
+                            if let Some(evt) = parse_sse_frame(&frame) {
+                                let _ = actions.send(Action::AgentEvent(Box::new(evt)));
                             }
                         }
                     }
-                    Err(_) => {}
                 }
                 // Dropped (or failed to connect): mark the SSE source degraded,
                 // brief backoff, then resubscribe with the last seen id so the

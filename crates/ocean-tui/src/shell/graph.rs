@@ -28,7 +28,6 @@ pub struct Bounds3d {
 #[derive(Clone, Debug)]
 pub struct GraphNode {
     pub path: PathBuf,
-    pub rel: String,
     pub title: String,
     pub kind: NodeKind,
     pub x: f32,
@@ -45,7 +44,6 @@ pub struct ProjectGraph {
     /// unit-radius normalized node cloud; the default pose frames the whole
     /// cloud with margin.
     pub camera: Camera,
-    pub truncated: bool,
 }
 
 #[derive(Clone)]
@@ -63,7 +61,6 @@ impl ProjectGraph {
     pub fn scan(root: &Path) -> Self {
         let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let mut drafts = Vec::new();
-        let mut truncated = false;
 
         let walker = ignore::WalkBuilder::new(&root_abs)
             .hidden(false)
@@ -82,7 +79,6 @@ impl ProjectGraph {
                 continue;
             };
             if drafts.len() >= MAX_NODES {
-                truncated = true;
                 break;
             }
             let Ok(content) = std::fs::read_to_string(path) else {
@@ -133,7 +129,6 @@ impl ProjectGraph {
             .iter()
             .map(|d| GraphNode {
                 path: d.path.clone(),
-                rel: d.rel.clone(),
                 title: d.title.clone(),
                 kind: d.kind,
                 x: 0.0,
@@ -179,18 +174,14 @@ impl ProjectGraph {
             edges,
             selected,
             camera: Camera::new(),
-            truncated,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
     }
 
     pub fn selected_path(&self) -> Option<PathBuf> {
         self.nodes.get(self.selected).map(|n| n.path.clone())
     }
 
+    #[cfg(test)]
     pub fn selected_label(&self) -> String {
         self.nodes
             .get(self.selected)
@@ -227,9 +218,9 @@ impl ProjectGraph {
         };
         for n in &self.nodes {
             let p = [n.x, n.y, n.z];
-            for axis in 0..3 {
-                b.min[axis] = b.min[axis].min(p[axis]);
-                b.max[axis] = b.max[axis].max(p[axis]);
+            for (axis, value) in p.into_iter().enumerate() {
+                b.min[axis] = b.min[axis].min(value);
+                b.max[axis] = b.max[axis].max(value);
             }
         }
         Some(b)
@@ -634,7 +625,6 @@ mod tests {
         (0..n)
             .map(|i| GraphNode {
                 path: PathBuf::from(format!("n{i}.md")),
-                rel: format!("n{i}.md"),
                 title: format!("n{i}"),
                 kind: NodeKind::Other,
                 x: 0.0,
@@ -704,12 +694,7 @@ mod live {
                 PathBuf::from("/Users/risingtidesdev/dev/ocean-os/crates/ocean-tui")
             });
         let g = ProjectGraph::scan(&root);
-        println!(
-            "graph: {} nodes, {} edges (truncated={})",
-            g.nodes.len(),
-            g.edges.len(),
-            g.truncated
-        );
+        println!("graph: {} nodes, {} edges", g.nodes.len(), g.edges.len());
         println!("start node: {}", g.selected_label());
     }
 }

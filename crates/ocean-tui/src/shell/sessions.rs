@@ -25,12 +25,6 @@ pub struct Session {
     pub path: PathBuf,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Sort {
-    Worktree,
-    Date,
-}
-
 fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
 }
@@ -193,10 +187,10 @@ fn worktree_label(root: &Path, cwd: &Path) -> Option<String> {
 }
 
 /// Discover all Ocean sessions for `root`, sorted.
-pub fn discover(root: &Path, sort: Sort) -> Vec<Session> {
+pub fn discover(root: &Path) -> Vec<Session> {
     let mut out = Vec::new();
     discover_ocean(root, &mut out);
-    sort_sessions(&mut out, sort);
+    sort_sessions(&mut out);
     out
 }
 
@@ -273,23 +267,8 @@ fn resolve_in(base: &Path, query: &str) -> Result<Session, String> {
     }
 }
 
-pub fn sort_sessions(v: &mut [Session], sort: Sort) {
-    match sort {
-        Sort::Date => v.sort_by_key(|s| std::cmp::Reverse(s.mtime)),
-        Sort::Worktree => v.sort_by(|a, b| {
-            let ka = (
-                a.worktree != "main",
-                a.worktree.as_str(),
-                std::cmp::Reverse(a.mtime),
-            );
-            let kb = (
-                b.worktree != "main",
-                b.worktree.as_str(),
-                std::cmp::Reverse(b.mtime),
-            );
-            ka.cmp(&kb)
-        }),
-    }
+pub fn sort_sessions(v: &mut [Session]) {
+    v.sort_by_key(|session| std::cmp::Reverse(session.mtime));
 }
 
 /// A single transcript message loaded from a session's on-disk record.
@@ -607,7 +586,7 @@ mod tests {
         let root = std::env::var("OCEAN_TUI_LIST_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/Users/risingtidesdev/dev/ocean-os"));
-        let found = discover(&root, Sort::Date);
+        let found = discover(&root);
         println!(
             "discovered {} ocean sessions under {}",
             found.len(),
@@ -627,7 +606,7 @@ mod live_transcript {
     fn dump_one_transcript() {
         // Newest ocean-os session on disk.
         let root = PathBuf::from("/Users/risingtidesdev/dev/ocean-os");
-        let sessions = discover(&root, Sort::Date);
+        let sessions = discover(&root);
         let Some(s) = sessions.first() else {
             println!("no sessions");
             return;
