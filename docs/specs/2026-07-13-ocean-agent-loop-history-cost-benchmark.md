@@ -2,8 +2,8 @@
 
 **Date:** 2026-07-13
 **Plan checkpoint:** Phase 0B-4
-**Harness revision:** pending commit
-**Status:** Harness smoke-tested; clean-revision baseline pending
+**Harness revision:** `7ad3bd8d9c6e9d04cb4e0b18e723acd4bcaa3514`
+**Status:** Clean-revision baseline captured and independently reviewed; local gate passed, hosted matrix pending
 
 ## Scope
 
@@ -56,4 +56,34 @@ Flag a cell for investigation when its median wall time or median allocated byte
 
 ## Baseline
 
-Pending a clean-revision run and review.
+Artifact: `docs/specs/2026-07-13-ocean-agent-loop-history-cost-baseline.json`
+
+Clean-tree command wall time (including a 1.68s incremental release rebuild): **2.54s real / 0.53s user / 0.18s sys**.
+
+| Messages | Rounds | Median | p95 | Median allocs | Median allocated bytes |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 1 | 4.875 µs | 4.917 µs | 69 | 26,579 |
+| 10 | 5 | 32.875 µs | 33.292 µs | 569 | 165,795 |
+| 10 | 20 | 323.208 µs | 455.417 µs | 4,893 | 1,063,938 |
+| 100 | 1 | 47.541 µs | 73.750 µs | 654 | 154,019 |
+| 100 | 5 | 242.833 µs | 388.458 µs | 3,494 | 836,115 |
+| 100 | 20 | 1,152.167 µs | 1,390.417 µs | 16,591 | 3,623,778 |
+| 1,000 | 1 | 492.500 µs | 2,450.833 µs | 6,504 | 1,428,419 |
+| 1,000 | 5 | 2,488.709 µs | 4,256.625 µs | 32,744 | 7,539,315 |
+| 1,000 | 20 | 9,316.042 µs | 14,499.542 µs | 133,591 | 29,442,978 |
+
+### Interpretation
+
+- Single-round median cost scales near-linearly with starting history size. Across repeated rounds the transcript grows by a tool-call/result pair, so total work follows roughly `rounds × starting_history + rounds²`; small starting histories therefore rise faster than linearly in round count.
+- On this M4 fixture, the largest median is ~9.32 ms and is small relative to typical remote-provider latency; this checkpoint does not justify a runtime redesign.
+- Allocation traffic is the clearer future optimization signal: the largest cell requests ~29.4 MB across ~133.6k allocations. These are cumulative allocation bytes, not retained memory.
+- p95 outliers in the 1,000-message cells are visible in the raw arrays and should be compared on the same host/toolchain before drawing regression conclusions.
+
+No performance fix is proposed from this baseline. Use it to evaluate later history, serialization, or transcript-structure changes.
+
+## Verification
+
+- Machine-readable artifact validation passed: clean revision/status, release profile, 9-cell matrix, 30 raw samples per metric/cell, sorted timing arrays, and both regression thresholds.
+- `cargo xtask ci` passed locally, including the repository tests and strict Clippy gate.
+- `cargo check --workspace --tests`, `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check` passed.
+- Independent methodology review passed after the absolute timing floor was added to policy metadata and the interpretation was bounded to the measured fixture.

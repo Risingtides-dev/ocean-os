@@ -2683,3 +2683,13 @@ area:  [testing]: Fixed matrix, wall time, allocation traffic, and machine metad
 
 Implemented a release-only benchmark example for the real per-provider-round history preparation kernel (`trim_to_context_window` plus valid intermediate tool-pair appends). The fixed 10/100/1,000-message × 1/5/20-round matrix records raw and summarized wall-time/allocation samples after five warm-ups, along with clean-revision/toolchain/machine metadata and a defined regression threshold. A 1-warm-up/2-sample nine-cell smoke run and strict example Clippy pass; the clean-revision 30-sample baseline is next.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [02:06am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [feature-request]: Clean agent-loop history-cost baseline captured
+area:  [testing]: Release matrix, allocation evidence, and independent methodology review
+
+Ran the Phase 0B-4 history kernel benchmark from clean revision 7ad3bd8d on an Apple M4 with five warm-ups and thirty samples across all nine 10/100/1,000-message × 1/5/20-round cells. The largest median was 9.316 ms with 29.4 MB cumulative allocation traffic; this M4 kernel result does not justify a runtime redesign and is not an end-to-end latency claim. Independent review caught missing machine-readable metadata for the 10µs absolute timing floor and an overbroad scaling interpretation; both were fixed, the artifact was regenerated from a clean revision, and second-pass review passed. Artifact invariants, `cargo xtask ci`, workspace test check, formatting, docs integrity, and diff checks pass locally; the hosted macOS/Ubuntu matrix remains the completion gate.
+_________________________________________________________________________________
