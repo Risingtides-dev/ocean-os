@@ -21,6 +21,7 @@ const ROUND_COUNTS: [usize; 3] = [1, 5, 20];
 const CONTEXT_WINDOW: u32 = 128_000;
 const MAX_OUTPUT_TOKENS: u32 = 8_192;
 const REGRESSION_THRESHOLD_PERCENT: u64 = 20;
+const REGRESSION_ABSOLUTE_FLOOR_US: u64 = 10;
 
 static COUNTING_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +145,7 @@ fn main() {
             "system_prompt_bytes": system_prompt.len(),
             "allocation_scope": "process-global counting allocator; benchmark is single-threaded; base history construction/clone excluded",
             "meaningful_regression_percent": REGRESSION_THRESHOLD_PERCENT,
+            "meaningful_regression_absolute_floor_us": REGRESSION_ABSOLUTE_FLOOR_US,
         },
         "results": results,
     });
