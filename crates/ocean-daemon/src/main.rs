@@ -21156,6 +21156,7 @@ mod tests {
             let _ = tx.send(AgentEventEnvelope {
                 id: Uuid::new_v4(),
                 event: delta_event(other, &format!("other-{i}")),
+                encoded_bytes: 0,
             });
         }
 

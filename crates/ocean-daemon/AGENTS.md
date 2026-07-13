@@ -17,6 +17,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - HTTP turn routes must resolve effective cwd from client cwd/project metadata and must never fall back to daemon process cwd.
 - Do not bypass runtime permission gates from daemon route code.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
+- Agent SSE replay is globally bounded by both 2,048 events and 32 MiB of serialized event payload. Oldest envelopes evict until both limits hold; an individually oversized event remains live but is not replay-retained. Preserve full live delivery and the existing explicit subscriber-lag signal.
 
 ## Work Guidance
 
@@ -27,6 +28,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ## Verification
 
+- `cargo test -p ocean-daemon bus::tests::`
 - `cargo test -p ocean-daemon`
 - `cargo check --workspace`
 - Manual daemon health check when route/startup behavior changes: `curl http://127.0.0.1:4780/health`

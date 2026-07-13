@@ -2470,3 +2470,17 @@ Completed the second and final approved intact `ocean-agent` Phase 2A move. Extr
 
 Verification: 24 focused session tests, all 148 ocean-agent tests, workspace check, docs-check (25 packages / 93 active Markdown files / 56 links), and the full `cargo xtask ci` gate passed, including strict all-target Clippy, format, and cargo-deny. The first reviewer run found only a leading blank line rejected by rustfmt; it was removed, the full gate reran cleanly, and reviewer follow-up returned PASS with no remaining blockers. Manifest: `docs/specs/2026-07-12-ocean-agent-session-extraction-manifest.md`.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [11:06pm] [12-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [bug report]
+area:      [testing]
+
+Completed Phase 0B-1 event-payload characterization and the smallest test-proven Phase 1B retention fix. Exhaustively mapped all 17 runtime `AgentEvent` variants, the runtime→agent→daemon→broadcast/replay→SSE ownership/clone path, built-in/MCP/plugin/LSP/browser output bounds, overflow behavior, and durable-evidence gaps. Finite child tests used fixed 8/9 × 1 MiB payloads, one thread, 30-second timeout, and 256-MiB RSS ceiling: the runtime unbounded queue retained all eight full events until deterministic drain (18.5 MiB peak), while a capacity-2 daemon subscriber lagged by six and baseline replay retained all nine full payloads (26.8 MiB peak). This proved that a 2,048-event count limit was not a memory limit; it could retain GiB-class payload totals before reconnect cloning/serialization.
+
+Added a 32-MiB serialized-event-payload ceiling alongside the existing 2,048-event replay limit. Oldest envelopes evict under one mutex until both limits hold; a single oversized event remains full-fidelity live but is not replay-retained. Byte counting uses a non-allocating serializer writer. Deque + aggregate share one poison-recovering state; a regression intentionally poisons after a stale aggregate mutation and proves recomputation/eviction. Tests also cover cloned bus handles, exact byte counting, slow lag, disconnect, replay, and oversized live-only delivery. Post-fix isolated RSS fell to 17.2 MiB for the same replay case. Public `AgentTurnEvent`/SSE shapes, live delivery, transcript persistence, and replay/live subscription ordering are unchanged.
+
+Verification: runtime 113 tests, daemon 294 tests, workspace test check, strict affected-crate Clippy, fmt/diff/docs checks, full repository gate, and fresh security review PASS after the poison-safety correction. The per-turn runtime MPSC queue and generic live-event sizes remain honestly documented residual risks. Report: `docs/specs/2026-07-12-ocean-event-payload-characterization.md`.
+_________________________________________________________________________________

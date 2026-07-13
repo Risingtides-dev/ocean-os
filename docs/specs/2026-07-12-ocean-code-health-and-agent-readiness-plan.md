@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — Phase 0A, 1A, and both intact Phase 2A moves complete
+**Status:** Approved by operator — Phase 0A/1A/2A intact moves and event-retention checkpoint complete
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -178,6 +178,8 @@ These are separate changes with separate owners and artifacts. Browser and perfo
 2. Inventory maximum `content` and `details` payloads from built-in, MCP, plugin, and browser tools.
 3. Run oversized-output stress in an isolated child process with a hard timeout/RSS ceiling, finite deterministic payload/concurrency limits, a slow or disconnected consumer, and assertions for drain/replay behavior.
 
+**Result (2026-07-12): RED baseline; smallest fix PASS.** The checked 17-variant/lifecycle/tool-source inventory and finite child tests proved that the per-turn runtime queue is unbounded and the 2,048-event replay ring had no byte ceiling. Eight/nine 1 MiB events passed deterministic drain/lag/disconnect/replay assertions at 18.5/26.8 MiB maximum RSS under 30-second/256-MiB limits. The daemon now also enforces a 32-MiB serialized-payload replay ceiling while preserving full live delivery; focused/full gates and independent security review passed. See `docs/specs/2026-07-12-ocean-event-payload-characterization.md`.
+
 ##### 0B-2. Shell Halt behavior
 
 1. Keep the existing direct-child timeout test.
@@ -230,7 +232,7 @@ Add `docs-check` to CI after its own tests pass. Add parity tests so the workflo
 
 Implement only findings demonstrated by tests:
 
-1. The event byte/lifetime policy is mandatory documentation from 0B-1. If stress proves a product risk, implement the smallest approved inline cap, overflow signal, or backpressure fix. Artifact-backed large results remain a separately approved Phase 3 design.
+1. **Complete:** the checked event byte/lifetime policy proved replay retention risk, so the daemon now enforces both 2,048-event and 32-MiB serialized-payload replay ceilings while preserving full live delivery. Focused/full gates and security review passed. Runtime-channel/live-payload redesign and artifact-backed large results remain deferred.
 2. Add process-group/tree termination only if direct-child or descendant Halt characterization fails.
 3. Replace the browser startup lock pattern only if characterization shows unacceptable blocking or broken cancellation. Preserve exactly-one-launch behavior.
 4. Inventory supported feature combinations, then add a release-profile lane and an MSRV lane (`cargo +1.80 check --workspace --all-targets`) only if dependency compatibility and CI cost are acceptable. For daemon call paths, the supported compile matrix is default, `--features livekit-tap`, and `--features deepgram-stt` (which already implies `livekit-tap`).
@@ -368,7 +370,7 @@ After this plan is approved, start with independently reviewable changes:
 1. **Ground-truth docs PR — complete:** repo boundaries, handoff, gates, canonical crate index, active links, and before/after cold-agent benchmark are reconciled.
 2. **Docs automation PR — complete:** `cargo xtask docs-check`, one executable CI manifest, manifest unit coverage, and GitHub Actions consumption are implemented and passing.
 3. **Intact `ocean-agent` extraction wave — complete:** both private modules moved with behavior/tests preserved and independent review passed.
-4. **Event-policy characterization PR:** produce the checked event table and isolated payload/RSS stress evidence.
+4. **Event-policy characterization/fix — complete:** checked event table, isolated payload/RSS stress, smallest replay-byte retention fix, full gate, and security review passed.
 5. **Shell Halt characterization PR:** direct-child and descendant-tree tests by supported OS.
 6. **Browser characterization PR:** injected single-flight/deadline/cancellation tests.
 7. **Agent-loop benchmark PR:** reproducible history-cost benchmark and baseline artifact.

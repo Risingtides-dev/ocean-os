@@ -1413,6 +1413,78 @@ mod tests {
         }
     }
 
+    /// Characterize the live-event seam with finite deterministic pressure.
+    /// `apply_outcome` intentionally emits the full tool result while retaining
+    /// only a capped transcript copy. Because the event sink is unbounded, all
+    /// eight 1 MiB payloads remain queued until the bridge drains them.
+    #[test]
+    fn runtime_event_queue_retains_full_tool_payload_until_drained() {
+        const EVENT_COUNT: usize = 8;
+        const TEXT_BYTES: usize = 1024 * 1024;
+        const DETAILS_BYTES: usize = 64 * 1024;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let events = Some(tx);
+        let sid = Some("stress-session".to_string());
+        let details_blob = "d".repeat(DETAILS_BYTES);
+        let mut messages = Vec::new();
+
+        for index in 0..EVENT_COUNT {
+            let terminate = apply_outcome(
+                &events,
+                &sid,
+                &mut messages,
+                &format!("call-{index}"),
+                "stress_tool",
+                Outcome {
+                    content: vec![Content::text("x".repeat(TEXT_BYTES))],
+                    is_error: false,
+                    terminate: false,
+                    side_effects: Vec::new(),
+                    details: serde_json::json!({
+                        "index": index,
+                        "blob": details_blob,
+                    }),
+                },
+            );
+            assert!(!terminate);
+        }
+
+        assert_eq!(
+            rx.len(),
+            EVENT_COUNT,
+            "the unbounded sink retains every event"
+        );
+        assert_eq!(messages.len(), EVENT_COUNT);
+        for message in &messages {
+            let Message::ToolResult(result) = message else {
+                panic!("apply_outcome must append a tool result");
+            };
+            let retained = result.content[0]
+                .as_text()
+                .expect("transcript copy should stay text");
+            assert!(retained.len() < MAX_TOOL_RESULT_BYTES + 256);
+            assert!(retained.contains("truncated to fit context"));
+        }
+
+        for index in 0..EVENT_COUNT {
+            let event = rx.try_recv().expect("queued live event should drain");
+            let AgentEvent::ToolExecutionEnd {
+                content, details, ..
+            } = event
+            else {
+                panic!("expected ToolExecutionEnd");
+            };
+            assert_eq!(content[0].as_text().map(str::len), Some(TEXT_BYTES));
+            assert_eq!(details["index"], index);
+            assert_eq!(details["blob"].as_str().map(str::len), Some(DETAILS_BYTES));
+        }
+        assert!(
+            rx.is_empty(),
+            "the queue must be empty after deterministic drain"
+        );
+    }
+
     /// A config carrying an already-cancelled token must abort the run with
     /// `AgentError::Cancelled` *before* touching the provider (OCEAN-57). The
     /// cancellation check sits at the top of the turn loop, ahead of any
