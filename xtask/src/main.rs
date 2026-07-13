@@ -6,7 +6,7 @@
 //!
 //! Commands:
 //!   docs-check                       Validate active docs and workspace index.
-//!   ci [--dry-run] [--skip-deny]     Run the repository quality-gate manifest.
+//!   ci [LANE] [--dry-run] [--skip-deny]  Run a repository/compatibility/MSRV gate.
 //!   check-webrtc-cache [--fix]       Detect a poisoned/partial libwebrtc cache.
 //!   clear-webrtc-cache [--rebuild]   Remove poisoned libwebrtc build artifacts.
 //!   help                             Print usage.
@@ -59,13 +59,18 @@ COMMANDS:
         package index with Cargo.toml, and require rationale for non-default
         workspace members.
 
-    ci [--dry-run] [--skip-deny]
-        Run docs-check and the repository's required Rust quality-gate manifest
-        in order: build, test, Clippy, format, and cargo-deny. Fails fast.
+    ci [--compatibility | --msrv] [--dry-run] [--skip-deny]
+        Run one dependency-free Rust quality-gate manifest. With no lane flag,
+        run docs-check, build, test, Clippy, format, and cargo-deny. Fails fast.
 
-        Flags:
-            --dry-run    Print the command manifest and CI-only lanes without running them.
-            --skip-deny  Omit cargo-deny when it is run as a separate CI job.
+        Lane flags:
+            --compatibility  Check supported daemon features and release all-targets.
+            --msrv           Under Rust 1.88.x, check default and supported features.
+
+        Other flags:
+            --dry-run    Print the selected manifest without running it; the default
+                         repository dry-run also reports CI-only lanes and setup.
+            --skip-deny  Omit cargo-deny from the default repository lane only.
 
     check-webrtc-cache [--fix]
         Detect a poisoned/partial libwebrtc download-cache *before* the build

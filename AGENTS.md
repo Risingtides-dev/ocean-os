@@ -40,6 +40,7 @@ Use `crates/AGENTS.md` for all 25 workspace packages, ownership exclusions, entr
 - Optimize for cold-agent discoverability: ownership, entry point, critical invariant, and narrow validation must remain findable from the root plus `crates/AGENTS.md`.
 - Behavior-neutral extraction requires a written extraction manifest and must not bundle redesign, protocol changes, renames, or opportunistic fixes.
 - Once the operator explicitly authorizes an ongoing program, continue through safe approved checkpoints without repeated approval prompts. Close each bounded change with verification, review, commit, upstream reconciliation, and a clean tree; pause only for a concrete blocker or required design decision.
+- Minimum supported Rust is 1.88, enforced by the MSRV lane; do not lower it without pinning the resolved dependency graph and proving every supported feature.
 - Build: `cargo build --workspace --release`.
 - TUI change: `cargo build -p ocean-tui --release`.
 - Daemon restarts: standing authorization to restart from `main`; use specific-PID kill, not blind `pkill`.
@@ -60,6 +61,8 @@ Use `crates/AGENTS.md` for all 25 workspace packages, ownership exclusions, entr
 - `cargo check --workspace`
 - Relevant crate tests; use `cargo check --workspace --tests` when shared enums/events fan out across crates.
 - Feature-specific checks named by the owning crate contract.
+- `cargo xtask ci --compatibility` checks supported daemon features and release-profile all-target compilation on stable Rust.
+- `cargo +1.88.0 xtask ci --msrv` checks default and supported daemon feature paths at the declared MSRV.
 
 ### Merge / PR gate (mirrors CI)
 
@@ -67,7 +70,7 @@ Use `crates/AGENTS.md` for all 25 workspace packages, ownership exclusions, entr
 - `cargo xtask ci --dry-run` prints the portable command manifest plus omitted CI-only matrix/setup lanes without executing them.
 - Fresh reviewer acknowledgement is required for feature, logic, security, protocol, or architecture changes.
 
-CI consumes the same xtask manifest on macOS and Ubuntu with `--skip-deny`; `cargo-deny` remains a separate Ubuntu job. A local single-host run does not replace that matrix.
+CI consumes the repository and compatibility manifests on macOS and Ubuntu, runs the MSRV manifest under pinned Rust 1.88 on Ubuntu, and keeps `cargo-deny` in a separate Ubuntu job. A local single-host run does not replace those lanes.
 
 ## Child devlog Index
 

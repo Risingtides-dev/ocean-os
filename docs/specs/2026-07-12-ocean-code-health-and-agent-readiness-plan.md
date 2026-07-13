@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — Phase 0B complete; supported build/release/MSRV compatibility checkpoint next
+**Status:** Approved by operator — build compatibility lanes pass locally/reviewed; hosted matrix pending
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -101,7 +101,7 @@ The agent loop serializes messages to estimate size and clones retained messages
 
 #### CI coverage
 
-CI does not currently compile the release profile or verify the declared Rust 1.80 MSRV. Add those only after confirming dependency compatibility and acceptable CI cost.
+At baseline, CI did not compile the release profile or verify the declared Rust 1.80 MSRV. Characterization later proved 1.80 incompatible with the resolved graph, established 1.88 as the truthful floor, and added release/feature/MSRV manifests; see Phase 1B-4.
 
 ## 4. Success criteria
 
@@ -243,7 +243,7 @@ Implement only findings demonstrated by tests:
 1. **Complete:** the checked event byte/lifetime policy proved replay retention risk, so the daemon now enforces both 2,048-event and 32-MiB serialized-payload replay ceilings while preserving full live delivery. Focused/full gates and security review passed. Runtime-channel/live-payload redesign and artifact-backed large results remain deferred.
 2. **Complete:** descendant Halt failed while direct-child Halt passed, so Unix Bash commands now run in a child-owned process group killed by an RAII guard on cancellation/timeout; macOS and Ubuntu gates pass.
 3. **Complete:** characterization preserved the correct mutex single-flight pattern and cancellation semantics, but proved missing stall bounds; lock wait, liveness, and launch now have explicit deadlines without weakening exactly-one-launch behavior, and macOS/Ubuntu gates pass.
-4. Inventory supported feature combinations, then add a release-profile lane and an MSRV lane (`cargo +1.80 check --workspace --all-targets`) only if dependency compatibility and CI cost are acceptable. For daemon call paths, the supported compile matrix is default, `--features livekit-tap`, and `--features deepgram-stt` (which already implies `livekit-tap`).
+4. **Build compatibility (2026-07-13): implemented/reviewed; local pass, hosted matrix pending.** The exact Rust 1.80 check failed before Ocean compilation because current ACP and other resolved dependencies require newer Cargo/Rust; downgrading that graph was broader risk than correcting the false contract. The workspace now declares/enforces Rust 1.88, with one behavior-equivalent session path comparison fix. Dependency-free xtask lanes cover strict stable Clippy for daemon `livekit-tap` and `deepgram-stt`, release-profile workspace all-target compilation, and default plus supported-feature compilation under pinned Rust 1.88. Fresh-target local runs completed in about 4m19s per lane, within the retained 40-minute CI ceiling. See `docs/specs/2026-07-13-ocean-build-compatibility-characterization.md`.
 
 **Gate:** focused regressions; `cargo test -p ocean-runtime`; `cargo test -p ocean-daemon`; `cargo check --workspace --tests`; supported feature checks; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo fmt --all -- --check`; and a fresh security-focused review of process/payload behavior.
 

@@ -158,7 +158,7 @@ fn pair_symbols(line: &str, anchors: &mut [Anchor], anchor_spans: &[(usize, usiz
         else {
             return; // no anchors (callers guarantee otherwise)
         };
-        if held[idx].map_or(true, |d| dist < d) {
+        if held[idx].is_none_or(|d| dist < d) {
             held[idx] = Some(dist);
             anchors[idx].symbol = Some(cap[1].to_string());
         }

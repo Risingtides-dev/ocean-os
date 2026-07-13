@@ -67,7 +67,7 @@ impl Session {
         let same_root = self
             .workspace_root
             .as_deref()
-            .map(|r| *r == new_root)
+            .map(|r| Path::new(r) == new_root.as_path())
             .unwrap_or(false);
         self.cwd = Some(cwd.to_string_lossy().into_owned());
         if same_root {
@@ -335,7 +335,7 @@ pub fn session_file_gc(config_dir: &Path, ttl: Option<std::time::Duration>) -> u
         };
         if age > ttl && std::fs::remove_file(&path).is_ok() {
             pruned += 1;
-            if oldest_age.map_or(true, |o| age > o) {
+            if oldest_age.is_none_or(|o| age > o) {
                 oldest_age = Some(age);
             }
         }

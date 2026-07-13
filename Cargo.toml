@@ -62,7 +62,8 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 authors = ["Ocean OS"]
-rust-version = "1.80"
+# Enforced by `cargo xtask ci --msrv`; the resolved dependency graph requires 1.88.
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -38,6 +38,12 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install pkg-config
 
+      - name: Install system deps (Ubuntu feature lanes)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
       - name: Install Rust toolchain (stable + clippy)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,6 +58,34 @@ jobs:
       # job below, so this matrix invocation explicitly omits that final step.
       - name: Repository gate
         run: cargo xtask ci --skip-deny
+
+      # Reuse the stable-toolchain build cache to cover supported daemon feature
+      # combinations and release-only compilation on both supported platforms.
+      - name: Supported features + release profile
+        run: cargo xtask ci --compatibility
+
+  # ── minimum supported Rust version ───────────────────────────────────────
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (Ubuntu feature lanes)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Default + supported-feature checks
+        run: cargo xtask ci --msrv
 
   # ── supply-chain audit ───────────────────────────────────────────────────
   deny:

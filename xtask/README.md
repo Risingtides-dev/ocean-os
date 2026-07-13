@@ -32,12 +32,14 @@ The check fails on missing active repo-local Markdown file targets (inline and r
 Run the single executable manifest shared by local development and CI:
 
 ```bash
-cargo xtask ci                 # docs, build, test, Clippy, format, cargo-deny
-cargo xtask ci --dry-run       # print the command manifest + CI-only lanes
-cargo xtask ci --skip-deny     # CI matrix; cargo-deny runs in its own job
+cargo xtask ci                         # docs, build, test, Clippy, format, cargo-deny
+cargo xtask ci --dry-run               # print the manifest + CI-only lanes
+cargo xtask ci --skip-deny             # main CI matrix; cargo-deny is separate
+cargo xtask ci --compatibility         # supported daemon features + release profile
+cargo +1.88.0 xtask ci --msrv          # default + supported features at the MSRV
 ```
 
-The command fails fast. GitHub Actions calls this manifest on macOS and Ubuntu instead of duplicating individual Rust commands in YAML.
+Each lane fails fast and owns exact Cargo commands in one dependency-free static manifest. GitHub Actions calls the repository and compatibility lanes on macOS and Ubuntu, and the MSRV lane on pinned Rust 1.88 under Ubuntu, rather than duplicating commands in YAML. `--skip-deny` applies only to the default repository lane.
 
 ## `clear-webrtc-cache`
 

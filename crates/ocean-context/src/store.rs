@@ -215,7 +215,7 @@ pub fn read_freshest(dir: &Path, repo: &str, branch: &str) -> Result<Option<Hand
         let text = fs::read_to_string(&path)?;
         match from_markdown(&text) {
             Ok(h) if h.repo == repo && h.branch == branch => {
-                if best.as_ref().map_or(true, |b| h.written_at > b.written_at) {
+                if best.as_ref().is_none_or(|b| h.written_at > b.written_at) {
                     best = Some(h);
                 }
             }

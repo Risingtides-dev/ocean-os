@@ -2723,3 +2723,13 @@ area:  [testing]: CI run 29228821337 passed Ubuntu, macOS, and cargo-deny
 
 GitHub Actions validated the strict production lint inventory artifacts on ubuntu-latest and macos-latest, with cargo-deny also passing. The warning-level command, exact 79-site set, scope/exclusions, raw evidence, machine-readable counts, independent reproduction, local gate, and hosted gate are complete. Phase 0B is closed without treating invariant sites as bugs or enabling blanket unwrap/expect denial; supported feature, release-profile, and truthful MSRV compatibility is next.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [03:07am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [pi/build-compat-20260713]
+type:  [workflow]: Establish truthful Rust and supported build compatibility lanes
+area:  [testing]: Feature matrix, release profile, and MSRV enforcement
+
+Characterization proved the declared Rust 1.80 floor was already impossible: Cargo 1.80 could not parse the Edition-2024 ACP dependency, and the resolved graph contains multiple Rust-1.88 dependencies. In an isolated worktree (to avoid concurrent TUI startup work on main), I raised the truthful workspace floor to 1.88, made one behavior-equivalent session path comparison compatible, and added xtask-owned stable compatibility and pinned-MSRV manifests consumed by CI. Stable strict feature checks cover daemon livekit-tap/deepgram-stt; release all-target and Rust-1.88 default/feature checks pass. Fresh-target lanes each completed in about 4m19s, the full local repository gate passed, and independent implementation review found no blocker. Hosted macOS/Ubuntu compatibility and Ubuntu MSRV timings remain.
+_________________________________________________________________________________
