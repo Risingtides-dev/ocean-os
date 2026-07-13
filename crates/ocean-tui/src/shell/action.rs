@@ -136,6 +136,12 @@ pub enum Action {
     },
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
+    /// Blocking session discovery for the startup resume picker completed.
+    /// The workspace key prevents a late result from replacing a newer root.
+    ResumeSessionsLoaded {
+        workspace_root: String,
+        sessions: Vec<crate::shell::sessions::Session>,
+    },
     /// Resume a session natively in the chat: load its transcript from `path`,
     /// bind future turns to `id`, and re-root the workbench to `cwd` (the dir
     /// the session ran in) so files/graph/turns follow the session.

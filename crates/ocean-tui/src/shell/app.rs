@@ -9,10 +9,10 @@
 //! └ status row ──────────────────────────────────────────────┘
 //! ```
 //!
-//! No tabs: sessions, tree, and the terminal dock are ALWAYS visible (the dock
-//! appears when a shell is hydrated). The center holds the working surface —
-//! chat by default, the editor when a file is open, the graph as a toggle —
-//! the same way CTRL swaps its center between editor and graph.
+//! No tabs: sessions, tree, and the terminal dock are collapsible around one
+//! center working surface. Normal startup presents a modal route chooser over a
+//! clean chat-only surface; explicit `--session` bypasses it. The center swaps
+//! between chat, editor, and graph without changing the launch workspace.
 //!
 //! Keys: ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat · ⌃⌥4 editor · ⌃⌥5 graph toggle ·
 //! ⌃⌥6 terminal · Tab cycles focus · Esc → back to chat (double-Esc leaves the
@@ -35,14 +35,19 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 use tokio::sync::mpsc;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     action::{Action, HealthSource, LoginTarget, Nav},
     client::{DaemonClient, ModelEntry, TurnSubmitError},
     component::Component,
     components::{
-        chat::ChatComponent, editor::EditorComponent, file_tree::FileTreeComponent,
-        graph::GraphComponent, pty_pane::PtyComponent, session_rail::SessionRailComponent,
+        chat::{sanitize_line, ChatComponent},
+        editor::EditorComponent,
+        file_tree::FileTreeComponent,
+        graph::GraphComponent,
+        pty_pane::PtyComponent,
+        session_rail::SessionRailComponent,
     },
     daemon_boot, errfmt,
     event::{Event, EventHandler},
@@ -370,6 +375,16 @@ pub struct App {
     providers_sel: usize,
     providers_rows: Vec<ProviderRow>,
     providers_mode: ProvidersMode,
+    /// Startup chooser; the clean chat surface stays behind it until a route is selected.
+    launch_open: bool,
+    launch_sel: usize,
+    launch_hit: Vec<(Rect, usize)>,
+    /// Flat, current-workspace session list opened from the launch chooser.
+    resume_open: bool,
+    resume_loading: bool,
+    resume_sel: usize,
+    resume_sessions: Vec<crate::shell::sessions::Session>,
+    resume_hit: Vec<(Rect, usize)>,
 }
 
 /// A title-bar button — the clickable icon toggles on the right of the title
@@ -452,9 +467,9 @@ impl App {
             sel_rect: None,
             selection: None,
             frame_cells: Vec::new(),
-            show_sessions: true,
-            show_tree: true,
-            show_term: true,
+            show_sessions: false,
+            show_tree: false,
+            show_term: false,
             buttons: Vec::new(),
             esc_armed: false,
             last_tree_scan: Instant::now(),
@@ -467,6 +482,14 @@ impl App {
             providers_sel: 0,
             providers_rows: Vec::new(),
             providers_mode: ProvidersMode::List,
+            launch_open: true,
+            launch_sel: 0,
+            launch_hit: Vec::new(),
+            resume_open: false,
+            resume_loading: false,
+            resume_sel: 0,
+            resume_sessions: Vec::new(),
+            resume_hit: Vec::new(),
         };
         app.apply_focus();
         // `@` file mentions index the launch project from the start.
@@ -474,18 +497,8 @@ impl App {
             .set_mention_root(PathBuf::from(&app.workspace_root));
         // Welcome empty-state: tell the chat whether providers are configured.
         app.refresh_welcome_provider_line();
-        // Auto-resume the most recent session for this workspace so `ocean`
-        // (or `cd project && ocean`) drops you BACK INTO your last conversation
-        // — transcript rehydrated from disk, not just the session id bound (the
-        // replay ring only holds recent events, so binding alone shows an empty
-        // pane for anything older). `/new` starts a clean session. Legacy/
-        // non-UUID records are skipped.
-        if let Some((id, path)) = app.rail.latest_resumable() {
-            app.chat
-                .load_history(crate::shell::sessions::load_transcript(&path));
-            app.bind_session_with(id, false); // transcript came from disk
-            app.rail.live_id = Some(id.0.to_string());
-        }
+        // A normal launch starts clean. Explicit `--session` remains a direct
+        // opt-in handled by `resume_initial_session`.
         app
     }
 
@@ -501,6 +514,7 @@ impl App {
             .load_history(crate::shell::sessions::load_transcript(&session.path));
         self.bind_session_with(id, false);
         self.rail.live_id = Some(session.id);
+        self.launch_open = false;
         Ok(())
     }
 
@@ -764,6 +778,24 @@ impl App {
                 CrosstermEvent::Paste(_) => return,
                 _ => {}
             }
+        }
+        // The startup chooser is modal and owns input until the operator selects
+        // a destination. Resume is its nested modal.
+        if self.resume_open {
+            match evt {
+                CrosstermEvent::Key(k) => self.resume_key(k),
+                CrosstermEvent::Mouse(m) => self.resume_mouse(m),
+                _ => {}
+            }
+            return;
+        }
+        if self.launch_open {
+            match evt {
+                CrosstermEvent::Key(k) => self.launch_key(k),
+                CrosstermEvent::Mouse(m) => self.launch_mouse(m),
+                _ => {}
+            }
+            return;
         }
         // The `/models` picker is modal: keys and mouse both drive it while
         // open (clicking a row selects/applies, clicking outside closes).
@@ -1204,6 +1236,20 @@ impl App {
                 self.center = Center::Editor;
                 self.focus_to(Focus::Center);
             }
+            Action::ResumeSessionsLoaded {
+                workspace_root,
+                sessions,
+            } => {
+                if *workspace_root == self.workspace_root {
+                    self.resume_loading = false;
+                    if self.resume_open {
+                        self.resume_sessions = sessions.clone();
+                        self.resume_sel = self
+                            .resume_sel
+                            .min(self.resume_sessions.len().saturating_sub(1));
+                    }
+                }
+            }
             Action::ResumeSession { id, path, cwd } => {
                 self.chat
                     .load_history(crate::shell::sessions::load_transcript(path));
@@ -1607,6 +1653,147 @@ impl App {
                                          // Force the file tree to re-read on the next tick rather than waiting
                                          // out the throttle window.
         self.last_tree_scan = Instant::now() - Duration::from_secs(2);
+    }
+
+    /// Startup chooser rows: new session, saved-session picker, blank editor,
+    /// and graph. Esc dismisses it to the clean chat surface.
+    const LAUNCH_ROWS: usize = 4;
+
+    fn launch_key(&mut self, k: crossterm::event::KeyEvent) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.launch_open = false,
+            KeyCode::Up | KeyCode::Char('k') => self.launch_sel = self.launch_sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.launch_sel = (self.launch_sel + 1).min(Self::LAUNCH_ROWS - 1)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.launch_apply(),
+            _ => {}
+        }
+    }
+
+    fn launch_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.launch_sel = self.launch_sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                self.launch_sel = (self.launch_sel + 1).min(Self::LAUNCH_ROWS - 1)
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = (m.column, m.row);
+                if let Some(index) = self
+                    .launch_hit
+                    .iter()
+                    .find(|(rect, _)| rect_has(*rect, pos))
+                    .map(|(_, index)| *index)
+                {
+                    self.launch_sel = index;
+                    self.launch_apply();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn launch_apply(&mut self) {
+        match self.launch_sel {
+            0 => {
+                self.launch_open = false;
+                self.dispatch(Action::NewSession);
+            }
+            1 => {
+                self.resume_sel = 0;
+                self.resume_sessions.clear();
+                self.resume_open = true;
+                self.request_resume_sessions();
+            }
+            2 => {
+                self.launch_open = false;
+                self.show_tree = true;
+                self.center = Center::Editor;
+                self.focus_to(Focus::Center);
+            }
+            3 => {
+                self.launch_open = false;
+                self.center = Center::Graph;
+                self.focus_to(Focus::Center);
+            }
+            _ => {}
+        }
+    }
+
+    fn request_resume_sessions(&mut self) {
+        if self.resume_loading {
+            return;
+        }
+        self.resume_loading = true;
+        let workspace_root = self.workspace_root.clone();
+        let root = PathBuf::from(&workspace_root);
+        let tx = self.actions_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let sessions = crate::shell::sessions::discover(&root)
+                .into_iter()
+                .filter(|session| uuid::Uuid::parse_str(&session.id).is_ok())
+                .collect();
+            let _ = tx.send(Action::ResumeSessionsLoaded {
+                workspace_root,
+                sessions,
+            });
+        });
+    }
+
+    fn resume_key(&mut self, k: crossterm::event::KeyEvent) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.resume_open = false,
+            KeyCode::Up | KeyCode::Char('k') => self.resume_sel = self.resume_sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.resume_sessions.is_empty() {
+                    self.resume_sel = (self.resume_sel + 1).min(self.resume_sessions.len() - 1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.resume_apply(),
+            KeyCode::Char('r') => self.request_resume_sessions(),
+            _ => {}
+        }
+    }
+
+    fn resume_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.resume_sel = self.resume_sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                if !self.resume_sessions.is_empty() {
+                    self.resume_sel = (self.resume_sel + 1).min(self.resume_sessions.len() - 1);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = (m.column, m.row);
+                if let Some(index) = self
+                    .resume_hit
+                    .iter()
+                    .find(|(rect, _)| rect_has(*rect, pos))
+                    .map(|(_, index)| *index)
+                {
+                    self.resume_sel = index;
+                    self.resume_apply();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn resume_apply(&mut self) {
+        let Some(session) = self.resume_sessions.get(self.resume_sel).cloned() else {
+            return;
+        };
+        let Ok(id) = uuid::Uuid::parse_str(&session.id) else {
+            self.set_notice("session cannot be resumed".into());
+            return;
+        };
+        self.resume_open = false;
+        self.launch_open = false;
+        self.dispatch(Action::ResumeSession {
+            id: AgentSessionId(id),
+            path: session.path,
+            cwd: session.cwd,
+        });
     }
 
     /// Number of interactive rows in the `/settings` overlay.
@@ -2594,9 +2781,184 @@ impl App {
         }
     }
 
-    /// Render the `/settings` overlay: a centered modal on the SLATE bed with
-    /// toggle rows (on/off pills), the dock-height stepper, and a read-only
-    /// info section for the live session.
+    fn draw_launch(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        self.launch_hit.clear();
+        let full = frame.area();
+        let width = 56u16.min(full.width.saturating_sub(4));
+        let height = 9u16.min(full.height.saturating_sub(2));
+        let area = Rect::new(
+            full.x + (full.width.saturating_sub(width)) / 2,
+            full.y + (full.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                " OCEAN ",
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let cwd = sanitize_line(
+            &std::path::Path::new(&self.workspace_root)
+                .display()
+                .to_string(),
+        );
+        let rows = [
+            format!("+ new in {cwd}"),
+            "resume session".into(),
+            "editor".into(),
+            "open graph".into(),
+        ];
+        let visible = inner.height.saturating_sub(1) as usize;
+        let start = selection_window_start(self.launch_sel, rows.len(), visible);
+        for (slot, (index, label)) in rows
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            let selected = index == self.launch_sel;
+            let marker = if selected { g("▎", ">") } else { " " };
+            let label = truncate_cells(&format!("{marker} {label}"), inner.width as usize);
+            let rect = Rect::new(inner.x, inner.y + slot as u16, inner.width, 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(if selected { theme::FG } else { theme::COMMENT })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ))
+                .style(Style::default().bg(if selected {
+                    theme::BG_HL
+                } else {
+                    theme::SLATE
+                })),
+                rect,
+            );
+            self.launch_hit.push((rect, index));
+        }
+        let footer_y = inner.y + inner.height.saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " ↑↓ select · enter open · esc chat ",
+                Style::default().fg(theme::COMMENT),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+    }
+
+    fn draw_resume(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear};
+        self.resume_hit.clear();
+        let full = frame.area();
+        let width = 56u16.min(full.width.saturating_sub(4));
+        let height = 14u16.min(full.height.saturating_sub(2));
+        let area = Rect::new(
+            full.x + (full.width.saturating_sub(width)) / 2,
+            full.y + (full.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                " RESUME SESSION ",
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        if self.resume_sessions.is_empty() {
+            let message = if self.resume_loading {
+                " loading sessions… "
+            } else {
+                " no resumable Ocean sessions in this workspace "
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    truncate_cells(message, inner.width as usize),
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+        } else {
+            let visible = inner.height.saturating_sub(1) as usize;
+            let start =
+                selection_window_start(self.resume_sel, self.resume_sessions.len(), visible);
+            for (slot, (index, session)) in self
+                .resume_sessions
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .enumerate()
+            {
+                let selected = index == self.resume_sel;
+                let marker = if selected { g("▎", ">") } else { " " };
+                let title = sanitize_line(&session.title);
+                let age = sanitize_line(&crate::shell::sessions::ago(session.mtime));
+                let label =
+                    truncate_cells(&format!("{marker} {title}  {age}"), inner.width as usize);
+                let rect = Rect::new(inner.x, inner.y + slot as u16, inner.width, 1);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        label,
+                        Style::default()
+                            .fg(if selected { theme::FG } else { theme::COMMENT })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ))
+                    .style(Style::default().bg(if selected {
+                        theme::BG_HL
+                    } else {
+                        theme::SLATE
+                    })),
+                    rect,
+                );
+                self.resume_hit.push((rect, index));
+            }
+        }
+        let footer_y = inner.y + inner.height.saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " ↑↓ select · enter resume · r refresh · esc back ",
+                Style::default().fg(theme::COMMENT),
+            ))
+            .style(Style::default().bg(theme::SLATE)),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+    }
+
     fn draw_settings(&mut self, frame: &mut ratatui::Frame) {
         use ratatui::widgets::{Block, Borders, Clear};
         let full = frame.area();
@@ -2974,6 +3336,13 @@ impl App {
 
         // `/settings` + `/models` modal overlays — drawn last so they float
         // over everything.
+        // Startup + session-resume overlays float over the clean workbench.
+        if self.launch_open {
+            self.draw_launch(frame);
+        }
+        if self.resume_open {
+            self.draw_resume(frame);
+        }
         if self.settings_open {
             self.draw_settings(frame);
         }
@@ -3129,6 +3498,52 @@ impl App {
             );
         }
     }
+}
+
+/// Start index for a selection-relative list window. The selected row remains
+/// visible even when the modal is shorter than the full list.
+fn selection_window_start(selected: usize, len: usize, visible: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+    selected
+        .min(len - 1)
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(len - visible)
+}
+
+/// Sanitize one terminal row and clamp it by display cells, reserving an
+/// ellipsis where it fits. Paths and transcript-derived titles are untrusted
+/// terminal text even when they originated on the local filesystem.
+fn truncate_cells(raw: &str, max_width: usize) -> String {
+    let clean = sanitize_line(raw);
+    if UnicodeWidthStr::width(clean.as_str()) <= max_width {
+        return clean;
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let ellipsis = g("…", "...");
+    let ellipsis_width = UnicodeWidthStr::width(ellipsis);
+    let (limit, suffix) = if ellipsis_width <= max_width {
+        (max_width - ellipsis_width, ellipsis)
+    } else {
+        (max_width, "")
+    };
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in clean.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width > limit {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str(suffix);
+    out
 }
 
 /// Does `pos` (col, row) fall inside `r`?
@@ -3561,12 +3976,9 @@ mod tests {
         );
     }
 
-    /// Build an `App` against a throwaway workspace root so `App::new`'s
-    /// auto-resume finds no session and never spawns a network stream — keeping
-    /// these `/login` dispatch tests fully offline (no daemon, no browser, no
-    /// OAuth callback). `DaemonClient::new` only builds a `reqwest::Client`; it
-    /// does not connect.
-    fn offline_app() -> App {
+    /// Build an `App` against a throwaway workspace root. `DaemonClient::new`
+    /// only constructs a reqwest client; it does not connect.
+    fn launch_app() -> App {
         let client = DaemonClient::new("http://127.0.0.1:1")
             .expect("DaemonClient builds without connecting");
         let root = std::env::temp_dir().join(format!(
@@ -3579,6 +3991,204 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&root);
         App::new(client, root.to_string_lossy().into_owned())
+    }
+
+    /// Most existing tests exercise an already-open workbench rather than the
+    /// startup chooser.
+    fn offline_app() -> App {
+        let mut app = launch_app();
+        app.launch_open = false;
+        app
+    }
+
+    fn resumable_session(index: u128, title: &str) -> crate::shell::sessions::Session {
+        let root = std::env::temp_dir().join(format!("ocean-resume-{index}"));
+        crate::shell::sessions::Session {
+            id: uuid::Uuid::from_u128(index + 1).to_string(),
+            title: title.into(),
+            cwd: root.clone(),
+            worktree: "main".into(),
+            branch: Some("main".into()),
+            mtime: index as u64,
+            path: root.join("session.json"),
+        }
+    }
+
+    #[test]
+    fn normal_startup_is_clean_chat_behind_launch_chooser() {
+        let app = launch_app();
+        assert!(app.launch_open, "normal startup presents the chooser");
+        assert!(app.center == Center::Chat && app.focus == Focus::Center);
+        assert!(!app.show_sessions && !app.show_tree && !app.show_term);
+        assert!(
+            app.session_id.is_none(),
+            "normal startup never auto-resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_session_bypasses_chooser_without_replacing_launch_root() {
+        let mut app = launch_app();
+        let launch_root = app.workspace_root.clone();
+        let session = resumable_session(7, "explicit session");
+        let want = AgentSessionId(uuid::Uuid::parse_str(&session.id).unwrap());
+
+        app.resume_initial_session(session)
+            .expect("explicit resume");
+
+        assert!(!app.launch_open);
+        assert_eq!(app.workspace_root, launch_root);
+        assert_eq!(app.session_id, Some(want));
+    }
+
+    #[test]
+    fn launch_keyboard_routes_editor_graph_and_new_session() {
+        let mut editor = launch_app();
+        editor.launch_sel = 2;
+        editor.launch_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(!editor.launch_open && editor.center == Center::Editor);
+        assert!(editor.show_tree, "editor route reveals files");
+
+        let mut graph = launch_app();
+        graph.launch_sel = 3;
+        graph.launch_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(!graph.launch_open && graph.center == Center::Graph);
+
+        let mut fresh = launch_app();
+        fresh.session_id = Some(AgentSessionId(uuid::Uuid::new_v4()));
+        fresh.launch_sel = 0;
+        fresh.launch_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(!fresh.launch_open && fresh.session_id.is_none());
+        assert!(fresh.center == Center::Chat);
+    }
+
+    #[test]
+    fn launch_mouse_click_routes_and_short_window_keeps_selection_visible() {
+        let mut app = launch_app();
+        app.launch_sel = 3;
+        let narrow = render_app_to_string(&mut app, 40, 8);
+        assert!(
+            narrow.contains("open graph"),
+            "selected final row remains visible in a short terminal: {narrow:?}"
+        );
+        assert!(app.launch_hit.iter().any(|(_, index)| *index == 3));
+
+        let mut app = launch_app();
+        render_app_to_string(&mut app, 80, 20);
+        let editor = app
+            .launch_hit
+            .iter()
+            .find(|(_, index)| *index == 2)
+            .expect("editor hit row")
+            .0;
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            editor.x + 1,
+            editor.y,
+        ));
+        assert!(!app.launch_open && app.center == Center::Editor);
+        assert!(app.show_tree);
+    }
+
+    #[test]
+    fn resume_window_tracks_selection_and_sanitizes_terminal_text() {
+        let mut app = launch_app();
+        app.resume_open = true;
+        app.resume_sessions = (0..20)
+            .map(|index| {
+                let title = if index == 19 {
+                    "selected\t\u{1b}row"
+                } else {
+                    "ordinary"
+                };
+                resumable_session(index, title)
+            })
+            .collect();
+        app.resume_sel = 19;
+
+        let screen = render_app_to_string(&mut app, 40, 8);
+        assert!(screen.contains("selected"), "selected tail row is visible");
+        assert!(!screen.contains('\t') && !screen.contains('\u{1b}'));
+        assert!(app.resume_hit.iter().any(|(_, index)| *index == 19));
+
+        app.resume_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.resume_sel, 18);
+        app.resume_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.resume_sel, 19);
+    }
+
+    #[tokio::test]
+    async fn resume_mouse_click_applies_visible_row() {
+        let mut app = launch_app();
+        app.resume_open = true;
+        app.resume_sessions = vec![
+            resumable_session(1, "first"),
+            resumable_session(2, "second"),
+        ];
+        render_app_to_string(&mut app, 80, 20);
+        let second = app
+            .resume_hit
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .expect("second resume hit row")
+            .0;
+        let want = AgentSessionId(uuid::Uuid::parse_str(&app.resume_sessions[1].id).unwrap());
+
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second.x + 1,
+            second.y,
+        ));
+
+        assert!(!app.resume_open && !app.launch_open);
+        assert_eq!(app.session_id, Some(want));
+    }
+
+    #[tokio::test]
+    async fn resume_discovery_returns_through_action_channel() {
+        let mut app = launch_app();
+        while app.actions_rx.try_recv().is_ok() {}
+        app.launch_sel = 1;
+        app.launch_apply();
+        assert!(app.resume_open && app.resume_loading);
+
+        let action = tokio::time::timeout(Duration::from_secs(2), app.actions_rx.recv())
+            .await
+            .expect("bounded discovery")
+            .expect("discovery action");
+        assert!(matches!(action, Action::ResumeSessionsLoaded { .. }));
+        app.dispatch(action);
+        assert!(!app.resume_loading);
+    }
+
+    #[test]
+    fn chooser_helpers_scroll_and_clamp_by_terminal_cells() {
+        assert_eq!(selection_window_start(0, 20, 5), 0);
+        assert_eq!(selection_window_start(4, 20, 5), 0);
+        assert_eq!(selection_window_start(19, 20, 5), 15);
+        assert_eq!(selection_window_start(3, 4, 5), 0);
+        let clean = truncate_cells("ab\t界\u{1b}tail", 8);
+        assert!(!clean.contains('\t') && !clean.contains('\u{1b}'));
+        assert!(UnicodeWidthStr::width(clean.as_str()) <= 8);
     }
 
     // ── bracketed paste routing ─────────────────────────────────────────────
@@ -3661,18 +4271,18 @@ mod tests {
             let first = app.buttons.first().expect("sessions button").0;
             let last = app.buttons.last().expect("files button").0;
             assert!(
-                app.show_sessions && app.show_tree,
-                "fresh app shows both rails"
+                !app.show_sessions && !app.show_tree,
+                "fresh app starts with both rails hidden"
             );
             click(&mut app, first);
             assert!(
-                !app.show_sessions,
-                "clicking the sessions button hides the rail at {width} cols"
+                app.show_sessions,
+                "clicking the sessions button shows the rail at {width} cols"
             );
             click(&mut app, last);
             assert!(
-                !app.show_tree,
-                "clicking the files button hides the tree at {width} cols"
+                app.show_tree,
+                "clicking the files button shows the tree at {width} cols"
             );
         }
     }

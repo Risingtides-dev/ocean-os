@@ -2744,3 +2744,13 @@ area:  [testing]: Hosted feature, release, MSRV, and policy validation
 
 Corrected GitHub Actions run 29231934039 passed macOS stable, Ubuntu stable, pinned Rust 1.88, and cargo-deny after the workflow made Ubuntu's required libglib2.0-dev prerequisite explicit. The stable jobs verified strict supported-feature Clippy and release all-target compilation; the MSRV job verified default and supported-feature compilation at the enforced floor. The slowest hosted job completed in 8m51s, within the retained 40-minute ceiling. The characterization and approved code-health/agent-readiness foundation plan now record this checkpoint complete.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [04:01] [13-07-26]
+agent:     [ocean-tui], [OpenAI API assistant]
+worktree:  [ocean/tui-launch-chooser-20260713]
+type:      [feature-request]: Clean terminal workbench launch chooser
+area:      [frontend]: Ratatui startup navigation
+
+Changed ocean-tui normal startup to a clean chat-only workbench with a centered OCEAN chooser: new session in the active cwd, resume-session picker, blank editor with files revealed, and graph. Removed implicit latest-session auto-resume while preserving explicit --session; documented the local contract and removed the obsolete rail helper. Hardened the owner-directed design with off-thread session discovery, keyboard/mouse parity, visible selection windows, terminal-safe labels, and focused startup/overlay tests. Verified with cargo fmt --check, strict all-target Clippy, cargo check -p ocean-tui, cargo test -p ocean-tui (280 passed, 4 ignored), cargo check --workspace --tests, and cargo build -p ocean-tui --release.
+_________________________________________________________________________________
