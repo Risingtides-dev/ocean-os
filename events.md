@@ -2633,3 +2633,13 @@ area:  [testing]: PID characterization and Unix process-group termination
 
 Phase 0B-2 proved the existing direct-child `kill_on_drop` path passed but a signal-resistant background descendant survived Halt (baseline PID 20796). BashTool now launches a child-owned Unix process group and uses an RAII SIGKILL guard on cancellation/timeout, draining inherited pipes before reaping to prevent PGID reuse. Direct/descendant PID regressions pass; immediate abort-on-drop test cleanup covers marker failures. The full `cargo xtask ci` gate, supported daemon feature checks, workspace test check, and two independent process/test reviews pass on macOS. Linux CI remains the completion gate.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [12:59am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [gh actions]: Shell Halt supported-platform gate complete
+area:  [testing]: CI run 29225077002 passed Ubuntu, macOS, and cargo-deny
+
+GitHub Actions validated commit 5f9d82b8 on ubuntu-latest and macos-latest, including the Unix direct-child and descendant Halt regressions in the full repository gate. The cargo-deny lane also passed. Phase 0B-2/1B-2 is complete; the only workflow annotation is GitHub's non-blocking Node 20 deprecation warning for actions/checkout@v4.
+_________________________________________________________________________________

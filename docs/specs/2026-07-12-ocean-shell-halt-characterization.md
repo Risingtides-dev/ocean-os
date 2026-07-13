@@ -3,7 +3,7 @@
 **Date:** 2026-07-12
 **Plan checkpoint:** Phase 0B-2 / Phase 1B-2
 **Baseline:** `8c190e86`
-**Status:** macOS characterization, full local gate, and independent security review passed; Linux CI pending
+**Status:** Complete — macOS/Linux characterization, full gates, and independent security review passed
 
 ## Question
 
@@ -70,4 +70,4 @@ Repository validation also passed:
 - daemon checks with `--features livekit-tap` and `--features deepgram-stt`;
 - independent process-safety and test-portability review after fixes for PGID-reuse and pre-marker cleanup hazards.
 
-Linux uses the same Unix `setpgid`/negative-PGID signal contract and the same tests. Completion requires the GitHub Actions Ubuntu lane to pass after push.
+Linux uses the same Unix `setpgid`/negative-PGID signal contract and the same tests. GitHub Actions run [29225077002](https://github.com/Risingtides-dev/ocean-os/actions/runs/29225077002) passed the full repository gate on both `ubuntu-latest` and `macos-latest`, completing the supported-platform checkpoint.
