@@ -1,7 +1,6 @@
-//! PtyComponent — hosts a live embedded terminal for a resumed Ocean session.
-//! Wraps `shell::pty::TermPane` and renders it with tui-term. Empty until a
-//! session is opened from the rail; then it runs that session's `ocean --resume`
-//! line in a shell.
+//! PtyComponent — hosts the workbench's embedded project terminal.
+//! Wraps `shell::pty::TermPane` and renders it with tui-term. Session resume is
+//! native to chat; this pane is only for operator shell commands.
 
 use std::path::Path;
 

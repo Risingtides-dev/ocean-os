@@ -6,7 +6,7 @@
 > added). The per-crate prose descriptions (ocean-call routes, ocean-heartbeat
 > subcommands, etc.) were last validated 2026-06-06 and are unverified since.
 
-Ocean OS is a Rust-native coding-agent runtime and daemon. The daemon owns runtime authority; `ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over that runtime.
+Ocean OS is a Rust-native coding-agent runtime and daemon. The daemon owns runtime authority; `ocean-tui` is the active terminal workbench over that runtime.
 
 ## Crates
 
@@ -145,14 +145,13 @@ ocean-cli
   Thin terminal client for daemon control and one-shot prompts.
 
 ocean-tui
-  Active ratatui steering cockpit and Rust-native Tides Mesh MeshFloor. It
-  renders floor state, prompts, sessions, requests, events, approvals, and
-  mesh panels while leaving provider calls, tools, sessions, and agent loops
-  under daemon authority.
 
-  Main layout/parity references:
-  - docs/OCEAN_TUI_TIDES_MESH_PARITY.md
-  - docs/OCEAN_TUI_MOCKUPS.md
+  Active ratatui workbench. It renders chat, session rail, files, editor,
+  project graph, terminal dock, tool activity, permissions, and daemon health
+  while leaving provider calls, tools, sessions, and agent loops under daemon
+  authority. The former Track-0 room cockpit and mesh parity UI are archived
+  history, not runtime surfaces.
+
 ```
 
 ## Shipped since the original integration list
@@ -272,7 +271,7 @@ One related item is still partial and tracked in its own doc:
 
 ## API model
 
-Clients do not directly run agents. They connect to the daemon. `ocean-tui` is still an active operator cockpit: it steers requests, approvals, cancellation, and MeshFloor visibility through protocol calls instead of becoming a second runtime.
+Clients do not directly run agents. They connect to the daemon. `ocean-tui` remains an active operator workbench: it steers turns, approvals, cancellation, sessions, and project surfaces through protocol calls instead of becoming a second runtime.
 
 ```text
 OceanTUI ─┐

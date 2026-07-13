@@ -6,14 +6,14 @@ This guide is for operators running the current `ocean-rs` Rust-native Pi-style 
 
 `ocean-daemon` is the runtime authority. It owns agent execution, sessions, request state, permission waiters, and event emission. Clients (`ocean-rs`, `ocean-tui`, GUI clients, curl) should treat the daemon as the source of truth and should not run a second agent loop.
 
-`ocean-tui` is the active steering cockpit and Rust-native Tides Mesh MeshFloor over this harness. It is not a passive daemon dashboard: it is where operators steer requests, inspect sessions/events, handle approvals/cancellation, and monitor floor state while the daemon keeps runtime authority.
+`ocean-tui` is the active terminal workbench over this harness. Operators steer turns, inspect native sessions, edit/browse project files, use the graph and terminal dock, and handle approvals while the daemon keeps runtime authority.
 
 Current crates in the operator path:
 
 - `ocean-daemon` — local HTTP daemon, default bind `127.0.0.1:4780`.
 - `ocean-agent` — in-process prompt/runtime facade used by the daemon.
 - `ocean-cli` — command named `ocean-rs`; thin CLI client.
-- `ocean-tui` — ratatui steering cockpit plus Rust-native TIDES-MESH MeshFloor/parity view.
+- `ocean-tui` — ratatui chat/session/files/editor/graph/terminal workbench.
 - `ocean-core` — shared protocol types for health, prompts, requests, permissions, sessions, and events.
 
 ## Startup
@@ -407,78 +407,35 @@ Default coding-agent workspace:
 cargo run -p ocean-tui
 ```
 
-Default launch now opens the Ocean coding-agent workspace first, with daemon health and system state surfaced as supporting primitives rather than as a standalone monitor view. The primary shell keeps the agent transcript/composer/tool/approval/session surfaces visible while TIDES-MESH rooms are exposed as top-level tabs. Daemon health stays visible but no longer owns the surface.
+Default launch opens the sole Ocean terminal workbench. The left rail resumes
+UUID-backed daemon sessions natively; it never launches another TUI inside the
+terminal dock. The former Track-0 room cockpit, `--legacy` escape hatch, and
+`ocean-tui mesh` parity surface have been removed.
 
-Workspace operator keys:
+Primary controls:
 
-- `Tab` — cycle TIDES-MESH rooms
-- `F1`..`F7` — jump to `Orchestrator`, `Writers`, `Rev`, `TideDash`, `WorkOps`, `WorldMap`, `PM`
-- `Up` / `Down` — change the session target (`new session` or a saved session ID)
-- `Enter` — send composer prompt
-- `Ctrl-J` — insert newline into the multiline composer
-- `Ctrl-U` — clear the composer
-- `Ctrl-C` — cancel the latest active request
-- `Shift-Y` — allow the newest pending permission request
-- `Shift-N` — deny the newest pending permission request
-- `F10` or `?` — toggle the inline help surface
-- `s` — refresh sessions
-- `r` — refresh health/requests/sessions/support state
-- `q` / `Esc` — quit
+- `Enter` — submit the chat composer or resume the selected session
+- `Ctrl-J` — insert a composer newline
+- `Ctrl-R` — search prompt history
+- `Ctrl-O` — expand/collapse tool drawers
+- `Ctrl-Y` / `Ctrl-N` — allow/deny a pending permission request
+- `Tab` — complete an active slash/file picker, otherwise cycle focus
+- bottom navigation buttons — sessions, chat, editor, graph, terminal, files
+- `/new` — start a fresh daemon session in the active project
+- `/models`, `/thinking`, `/login`, `/settings` — runtime controls
 
-Current honest placeholders in the workspace shell:
-
-- full session transcript inspection still needs `GET /v1/sessions/:id`
-- some non-Orchestrator room widgets still render cache/task placeholders instead of embedded native panes
-- diff/edit capture is opportunistic from SSE tool output and assistant text, not yet a structured daemon diff feed
-
-### Product direction: permanent multi-room command center
-
-The operator correction after task-26 is explicit:
-
-- Ocean TUI is a permanent Rust-native Ratatui command center, not a daemon monitor with chat attached.
-- The default workspace shell stays first-class.
-- Daemon monitoring is only one primitive and should eventually live inside an Ops/Systems-style room rather than define the whole product.
-
-Next-phase room model to preserve in docs/planning:
-
-- `PM` — operator communication / PM terminal space
-- `Writers Room` — NoteDash-style notes, sources, actions, plus Henry terminal/context lane
-- `Tides Mesh` — main mesh command center with Glyph anchor, board/events/inbox/agents primitives, orchestrator control, and live roster/info panel
-- `Review Room` — Rev chat plus WorkDash-style PR / Linear / git / diff review primitives
-- `TideDash`, `WorkOps/OpsDash`, `WorldMap`, and file-tree contexts as dedicated rooms or panes
-
-Primitive-source rule for future implementation work:
-
-- read `rising-tuis/opsdash.py` for service/ports/cloud health primitives
-- read `rising-tuis/workdash.py` for review/git/Linear primitives
-- read `rising-tuis/notedash.py` and `rising-tuis/notedash_api.py` for Writers Room notes/source/action primitives
-- read `rising-tuis/tidedash.py`, `rising-tuis/world_time_map.py`, and `rising-tuis/file_tree_tui.py` for campaign/world/files primitives
-- reimplement the useful primitives natively in Rust/Ratatui rather than treating the Python TUIs as the target surface
-
-Current task-26/task-27 constraint:
-
-- these docs record the roadmap, but they do not authorize new UI/code expansion by themselves
-- further implementation should wait for explicit routing/review approval
-
-TIDES-MESH MeshFloor/parity view:
+Launch targeting:
 
 ```bash
-cargo run -p ocean-tui -- mesh --root . --tab board
-cargo run -p ocean-tui -- mesh --root . --tab events
-cargo run -p ocean-tui -- mesh --root . --tab inbox
-cargo run -p ocean-tui -- mesh --root . --tab agents
+cargo run -p ocean-tui -- --project /path/to/repo
+cargo run -p ocean-tui -- --project /path/to/repo --session <uuid-or-prefix>
 ```
 
-Mesh view also honors:
 
-- `TIDES_MESH_AGENT`
-- `PIMESH_TAB`
-- `PIMESH_REFRESH_MS`
+`--session` resolves persisted Ocean sessions and binds their transcript/event
+stream directly in the workbench. Without it, the rail auto-resumes the newest
+UUID session for the launch project; `/new` explicitly starts clean.
 
-Main MeshFloor references:
-
-- [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](OCEAN_TUI_TIDES_MESH_PARITY.md) — active parity contract
-- [`docs/OCEAN_TUI_MOCKUPS.md`](OCEAN_TUI_MOCKUPS.md) — active cockpit reference
 
 ## HTTP API quick reference
 

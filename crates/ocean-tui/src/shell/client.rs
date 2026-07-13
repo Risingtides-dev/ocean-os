@@ -90,14 +90,6 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn create_agent_session(
-        &self,
-        workspace_root: &str,
-    ) -> Result<AgentSessionCreateResponse, String> {
-        self.create_agent_session_retrying(workspace_root, |_, _| {})
-            .await
-    }
-
     /// Session mint with mid-blip retry — see [`Self::agent_turn_retrying`] for
     /// the policy (connect-class failures only).
     pub async fn create_agent_session_retrying(
@@ -114,20 +106,13 @@ impl DaemonClient {
         self.post_json_retrying(&url, &req, on_retry).await
     }
 
-    pub async fn agent_turn(
-        &self,
-        req: &AgentTurnRequest,
-    ) -> Result<AgentTurnResponse, TurnSubmitError> {
-        self.agent_turn_retrying(req, |_, _| {}).await
-    }
-
     /// Submit a fire-and-ack turn, riding out a daemon restart without risking
     /// duplicate side effects. Only connect failures are retried; they prove no
     /// HTTP connection existed. Once connected, any timeout, transport, decode,
     /// or 5xx failure has an unknown outcome and must not be replayed. The daemon
-    /// normally returns an [`AgentTurnResponse`] immediately after acceptance,
-    /// while output continues over `/v1/agent/events`; the 1800-second timeout is
-    /// only a deadman for a wedged acknowledgement path.
+    /// normally acknowledges immediately while output continues over SSE; the
+    /// long timeout is only a deadman for a wedged acknowledgement path.
+
     pub async fn agent_turn_retrying(
         &self,
         req: &AgentTurnRequest,
@@ -383,7 +368,6 @@ fn bool_true() -> bool {
 /// The daemon's currently-selected global model.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CurrentModel {
-    pub provider: String,
     pub model: String,
 }
 
@@ -398,11 +382,8 @@ pub struct ModelsResponse {
 /// One retained memory from `GET /v1/memory`, for the `/memory` browser.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct MemoryEntry {
-    pub id: String,
     pub kind: String,
     pub text: String,
-    #[serde(default)]
-    pub updated_at: i64,
 }
 
 /// Response shape of `GET /v1/memory`.
@@ -463,10 +444,6 @@ pub struct LspServer {
     pub command: String,
     #[serde(default)]
     pub extensions: Vec<String>,
-    #[serde(default)]
-    pub root: Option<String>,
-    #[serde(default)]
-    pub binary_available: bool,
     #[serde(default)]
     pub ready: bool,
 }
@@ -567,7 +544,10 @@ mod tests {
 
         let ws = "/tmp/ocean-tui-live-test";
         std::fs::create_dir_all(ws).unwrap();
-        let sess = client.create_agent_session(ws).await.expect("mint session");
+        let sess = client
+            .create_agent_session_retrying(ws, |_, _| {})
+            .await
+            .expect("mint session");
         println!("session: {}", sess.session_id);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -591,7 +571,7 @@ mod tests {
             advisor: None,
         };
         let client2 = client.clone();
-        let turn = tokio::spawn(async move { client2.agent_turn(&req).await });
+        let turn = tokio::spawn(async move { client2.agent_turn_retrying(&req, |_, _| {}).await });
 
         let mut got_started = false;
         let mut text = String::new();

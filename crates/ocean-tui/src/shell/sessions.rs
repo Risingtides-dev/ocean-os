@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
     pub title: String,
@@ -23,30 +23,6 @@ pub struct Session {
     pub branch: Option<String>,
     pub mtime: u64, // unix seconds
     pub path: PathBuf,
-}
-
-impl Session {
-    /// The command that resumes this session, run in `cwd`.
-    ///
-    /// Always forces `--legacy`: this spawns inside the workbench's own
-    /// terminal dock, and once this branch merges, `ocean` (no flags) IS the
-    /// workbench. Without `--legacy` here, resuming a session from the dock
-    /// would recursively launch a whole second workbench inside its own PTY
-    /// pane. `--legacy` is the escape hatch main.rs already wires up
-    /// (`OCEAN_TUI_LEGACY` / `--legacy`, see `main.rs`) to force the old,
-    /// non-workbench TUI — exactly what a nested dock session needs.
-    pub fn resume_command(&self) -> (String, Vec<String>) {
-        (
-            "ocean".into(),
-            vec![
-                "--project".into(),
-                self.cwd.display().to_string(),
-                "--session".into(),
-                self.id.clone(),
-                "--legacy".into(),
-            ],
-        )
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,6 +200,79 @@ pub fn discover(root: &Path, sort: Sort) -> Vec<Session> {
     out
 }
 
+/// Resolve an exact session id or unambiguous prefix across every persisted
+/// Ocean workspace. Exact duplicate files choose the newest record; prefixes
+/// must identify one distinct session id.
+pub fn resolve(query: &str) -> Result<Session, String> {
+    resolve_in(&home().join(".config/ocean-rs/sessions"), query)
+}
+
+fn resolve_in(base: &Path, query: &str) -> Result<Session, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("session id cannot be empty".into());
+    }
+
+    let mut matches = Vec::new();
+    if let Ok(dirs) = fs::read_dir(base) {
+        for dir in dirs
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| p.is_dir())
+        {
+            let Ok(files) = fs::read_dir(dir) else {
+                continue;
+            };
+            for path in files.flatten().map(|entry| entry.path()) {
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let Some(id) = json_str(&value, "id") else {
+                    continue;
+                };
+                if id != query && !id.starts_with(query) {
+                    continue;
+                }
+                let Some(root) = json_str(&value, "workspace_root")
+                    .or_else(|| json_str(&value, "cwd"))
+                    .map(PathBuf::from)
+                else {
+                    continue;
+                };
+                if let Some(session) = ocean_session_from_value(&root, &path, &value) {
+                    matches.push(session);
+                }
+            }
+        }
+    }
+
+    let exact = matches
+        .iter()
+        .filter(|session| session.id == query)
+        .max_by_key(|session| session.mtime)
+        .cloned();
+    if let Some(session) = exact {
+        return Ok(session);
+    }
+
+    matches.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| b.mtime.cmp(&a.mtime)));
+    matches.dedup_by(|a, b| a.id == b.id);
+    match matches.len() {
+        0 => Err(format!("session not found: {query}")),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!(
+            "session prefix '{query}' is ambiguous ({} matches)",
+            matches.len()
+        )),
+    }
+}
+
 pub fn sort_sessions(v: &mut [Session], sort: Sort) {
     match sort {
         Sort::Date => v.sort_by_key(|s| std::cmp::Reverse(s.mtime)),
@@ -370,6 +419,79 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn resolver_fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-tui-resolver-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("bucket")).expect("create resolver fixture");
+        dir
+    }
+
+    fn write_session(base: &Path, file: &str, id: &str, updated_ms: u64, title: &str) {
+        let workspace = base.join("workspace");
+        let value = json!({
+            "id": id,
+            "updated_ms": updated_ms,
+            "model": "fake-ok",
+            "provider": "fake",
+            "workspace_root": workspace,
+            "cwd": workspace,
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "text", "text": title }]
+            }]
+        });
+        fs::write(
+            base.join("bucket").join(file),
+            serde_json::to_vec(&value).expect("encode session"),
+        )
+        .expect("write session");
+    }
+
+    #[test]
+    fn resolver_prefers_newest_exact_duplicate() {
+        let base = resolver_fixture("exact");
+        let id = "a1111111-1111-4111-8111-111111111111";
+        write_session(&base, "old.json", id, 1_000, "old");
+        write_session(&base, "new.json", id, 2_000, "new");
+
+        let resolved = resolve_in(&base, id).expect("resolve exact duplicate");
+        assert_eq!(resolved.title, "new");
+        assert_eq!(resolved.mtime, 2);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resolver_accepts_unique_prefix_and_rejects_ambiguous_or_missing() {
+        let base = resolver_fixture("prefix");
+        write_session(
+            &base,
+            "one.json",
+            "a1111111-1111-4111-8111-111111111111",
+            1_000,
+            "one",
+        );
+        write_session(
+            &base,
+            "two.json",
+            "a2222222-2222-4222-8222-222222222222",
+            1_000,
+            "two",
+        );
+
+        assert_eq!(resolve_in(&base, "a111").unwrap().title, "one");
+        assert!(resolve_in(&base, "a").unwrap_err().contains("ambiguous"));
+        assert!(resolve_in(&base, "missing")
+            .unwrap_err()
+            .contains("not found"));
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn parses_ocean_session_summary() {
         let root = PathBuf::from("/tmp/ocean-tui-root");
@@ -392,10 +514,6 @@ mod tests {
         assert_eq!(s.branch.as_deref(), Some("feat/sessions"));
         assert_eq!(s.title, "make sessions visible");
         assert_eq!(s.mtime, 1_781_151_304);
-        let (cmd, args) = s.resume_command();
-        assert_eq!(cmd, "ocean");
-        assert_eq!(args.first().map(String::as_str), Some("--project"));
-        assert_eq!(args.get(3).map(String::as_str), Some(s.id.as_str()));
     }
 
     #[test]
@@ -428,29 +546,6 @@ mod tests {
         let root = PathBuf::from("/tmp/project-a");
         let v = json!({ "id": "x", "workspace_root": "/tmp/project-b", "messages": [] });
         assert!(ocean_session_from_value(&root, Path::new("/tmp/s.json"), &v).is_none());
-    }
-
-    /// Defect 5: resuming a session from the dock must never re-launch the
-    /// workbench recursively. Once `ocean` (no flags) IS the workbench, the
-    /// resume command MUST force `--legacy` so the hydrated PTY runs the old
-    /// TUI, not another copy of the shell it's embedded in.
-    #[test]
-    fn resume_command_forces_legacy_flag() {
-        let s = Session {
-            id: "7f99e2ec-2d8e-44d4-b61c-8c4d40bd850b".into(),
-            title: "t".into(),
-            cwd: PathBuf::from("/tmp/ocean-tui-root"),
-            worktree: "main".into(),
-            branch: None,
-            mtime: 0,
-            path: PathBuf::from("/tmp/s.json"),
-        };
-        let (cmd, args) = s.resume_command();
-        assert_eq!(cmd, "ocean");
-        assert!(
-            args.iter().any(|a| a == "--legacy"),
-            "resume command must pass --legacy to avoid launching the workbench inside its own dock: {args:?}"
-        );
     }
 
     /// Defect 4: the `[TUI]` client-type tag must be stripped from

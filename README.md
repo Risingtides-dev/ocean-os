@@ -66,7 +66,7 @@ Cross-repo routing and ownership map: [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_P
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the daemon ↔ client model, and [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md) for runtime ops.
 
-TUI design: [`docs/OCEAN_TUI_MOCKUPS.md`](docs/OCEAN_TUI_MOCKUPS.md), [`docs/OCEAN_TUI_TIDES_MESH_PARITY.md`](docs/OCEAN_TUI_TIDES_MESH_PARITY.md).
+The active terminal workbench lives in [`crates/ocean-tui/src/shell/`](crates/ocean-tui/src/shell/); its maintenance contract is [`crates/ocean-tui/AGENTS.md`](crates/ocean-tui/AGENTS.md). Historical room/mesh mockups are archived under `docs/.agentarchive/`.
 
 Internals: [`docs/OCEAN_NATIVE_INTERNALS_MAP.md`](docs/OCEAN_NATIVE_INTERNALS_MAP.md).
 

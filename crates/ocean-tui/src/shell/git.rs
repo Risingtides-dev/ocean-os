@@ -1,5 +1,5 @@
-//! Lightweight git surface: shells out to `git` (no libgit2 dep) for branch
-//! status, the changed-files list, and per-line gutter marks.
+//! Lightweight git surface: shells out to `git` (no libgit2 dependency) for
+//! branch status and per-line gutter marks.
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -18,13 +18,6 @@ pub struct Status {
     pub dirty: usize,
     pub ahead: usize,
     pub behind: usize,
-}
-
-#[derive(Clone)]
-pub struct Change {
-    pub code: String, // 2-char porcelain status, e.g. " M", "??", "A "
-    pub path: String,
-    pub staged: bool,
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
@@ -65,23 +58,6 @@ pub fn status(root: &Path) -> Status {
         ahead,
         behind,
     }
-}
-
-pub fn changes(root: &Path) -> Vec<Change> {
-    let Some(out) = git(root, &["status", "--porcelain"]) else {
-        return Vec::new();
-    };
-    let mut v = Vec::new();
-    for line in out.lines() {
-        if line.len() < 3 {
-            continue;
-        }
-        let code = line[..2].to_string();
-        let path = line[3..].to_string();
-        let staged = !code.starts_with(' ') && !code.starts_with('?');
-        v.push(Change { code, path, staged });
-    }
-    v
 }
 
 /// Per-line gutter marks for one file (0-based rows), from `git diff -U0`.

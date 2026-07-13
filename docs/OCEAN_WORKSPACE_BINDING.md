@@ -6,7 +6,7 @@ Architecture decision: how Ocean discovers and binds to a project workspace so i
 
 ### What works
 
-- **TUI captures cwd at launch:** `ocean-tui/src/main.rs:2367` calls `env::current_dir()`, resolves relative `--root`, stores absolute path in `app.root`. This is sent as `cwd` on every turn.
+- **TUI captures cwd at launch:** `ocean-tui/src/main.rs` resolves relative `--project` against `env::current_dir()` and passes that root into the workbench. It is sent as `cwd` on every turn.
 - **Daemon resolves cwd correctly:** `ocean-agent/src/lib.rs:819` (`resolve_cwd_for_turn`) prefers client-supplied cwd, falls back to project workspace root, refuses to guess if neither is present.
 - **System prompt walks up from cwd:** `build_system_prompt` at line 4446 discovers `AGENTS.md`, `CLAUDE.md`, `.ocean/AGENTS.md` by walking up from the turn's cwd.
 - **Workspace root resolves via git:** `workspace_root()` at line 2047 invokes `git rev-parse --show-toplevel`, falls back to cwd.
@@ -19,7 +19,7 @@ The old first-write-wins bug is gone. `bind_workspace` now refreshes `cwd` on ev
 ```
 cd /project-a && ocean          # session-1 → cwd=/project-a ✓
 # ... later ...
-cd /project-b && ocean --resume session-1   # cwd=/project-b, session rebinds ✓
+cd /project-b && ocean --session session-1  # cwd=/project-b, session rebinds ✓
 ```
 
 That was the root cause of "ocean doesn't work across projects" and "launch cwd gets ignored."
@@ -67,37 +67,25 @@ if session.workspace_root.as_deref().map(PathBuf::from) != Some(new_root.clone()
 - **Devlog discovery:** `build_system_prompt` already walks from cwd upward. Rebind means it walks from the correct cwd.
 - **TUI behavior:** TUI captures `env::current_dir()` at launch and keeps that launch cwd as the surface root, even when a session resumes.
 
-## Decision: Fresh-launch auto-resume
+## Decision: Native workbench resume
 
 ### Rule
 
-When `ocean` is launched without `--session`, the TUI queries the daemon for sessions matching the launch cwd:
+The workbench is the only TUI. It discovers persisted Ocean session files for
+the launch project and resumes the newest UUID-backed session directly in chat.
+Selecting another UUID session in the rail rehydrates its transcript and swaps
+the scoped SSE stream in place; no nested terminal process is launched.
 
-- **Zero sessions** → create a new session
-- **Exactly one session** → auto-resume it
-- **Multiple sessions** → create a new session (no picker in this pass)
-
-No hidden global resume. No cross-project guessing. No stale session surprise.
-
-### Implementation
-
-In `ocean-tui/src/main.rs`, `run_daemon()` around line 2386, when `resumed` is `None`:
-
-```rust
-let sessions = client.sessions(&url, Some(&cwd_str), false)?;
-if sessions.len() == 1 {
-    resumed = Some(sessions[0].id.clone());
-}
-```
-
-The `GET /v1/agent/sessions?cwd=...` endpoint already filters by workspace root. The launcher still resolves the matching session from that workspace, but it no longer swaps its root to the stored session root.
+`--session <id-or-prefix>` performs the same native binding explicitly. Exact
+duplicate records choose the newest file, while ambiguous prefixes fail before
+terminal setup. The launch cwd remains authoritative for future turns.
 
 ### Acceptance
 
-- `cd repo && ocean` (first time) → new session, scoped to repo
-- `cd repo && ocean` (second time) → auto-resumes the one session for that repo and keeps the launch cwd
-- `cd repo && ocean` (with 3 sessions for that repo) → new session
-- `cd repo && ocean --session <id>` → explicit resume, launch cwd still wins
+- `cd repo && ocean` → native workbench, newest project session selected when present
+- `cd repo && ocean --session <id>` → requested transcript/event stream, launch cwd retained
+- selecting a session in the rail → in-place resume, never a nested TUI process
+- `/new` → unbind current history and mint on the next prompt
 
 ## Devlog discovery root
 
@@ -109,5 +97,5 @@ If cwd is not in a git repo, the cwd itself is the discovery root. The agent wal
 
 - `cargo check --workspace` must pass
 - `cargo test -p ocean-agent` must pass (existing `bind_workspace` tests at line 2620+)
-- Manual: `cd /project-a && ocean` → new session → `cd /project-b && ocean --resume <id>` → agent detects project-b context
-- Manual: `cd /project-a && ocean` → new session → `cd /project-a/subdir && ocean --resume <id>` → launch cwd stays `/project-a/subdir`
+- Manual: `cd /project-a && ocean` → new session → `cd /project-b && ocean --session <id>` → agent detects project-b context
+- Manual: `cd /project-a && ocean` → new session → `cd /project-a/subdir && ocean --session <id>` → launch cwd stays `/project-a/subdir`

@@ -12,8 +12,6 @@ use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, ThinkingLevel};
 pub enum Nav {
     Sessions,
     Files,
-    Chat,
-    Editor,
     Graph,
     Terminal,
 }
@@ -75,10 +73,6 @@ pub enum Action {
     /// A health source recovered. Clears only that source; success is never
     /// rendered as text.
     HealthRecovered(HealthSource),
-    /// Open a discovered session in the PTY: run `line` in a shell rooted at `cwd`.
-    OpenSession { line: String, cwd: PathBuf },
-    /// Move keyboard focus to the next pane.
-    CycleFocus,
     /// Navigate the workbench to a pane/center surface — emitted by the `/`
     /// palette so chat never reaches into the app's private Focus/Center.
     Navigate(Nav),

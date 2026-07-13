@@ -489,6 +489,21 @@ impl App {
         app
     }
 
+    /// Apply an explicit `--session` selection after normal construction. The
+    /// launch workspace remains authoritative for future turns; only transcript
+    /// history and the scoped event stream switch to the requested session.
+    pub fn resume_initial_session(
+        &mut self,
+        session: crate::shell::sessions::Session,
+    ) -> anyhow::Result<()> {
+        let id = AgentSessionId(uuid::Uuid::parse_str(&session.id)?);
+        self.chat
+            .load_history(crate::shell::sessions::load_transcript(&session.path));
+        self.bind_session_with(id, false);
+        self.rail.live_id = Some(session.id);
+        Ok(())
+    }
+
     pub async fn run(mut self, terminal: &mut tui::Tui) -> anyhow::Result<()> {
         // One-shot startup fetch of the model registry so the status row can
         // show the daemon's current model BEFORE the first turn (chat.model()
@@ -1184,13 +1199,6 @@ impl App {
                 }
             }
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
-            Action::OpenSession { line, cwd } => {
-                // Hydrate into the terminal DOCK (appears at the bottom of the
-                // center column, CTRL-style) and focus it.
-                self.pty.open(cwd, line);
-                self.show_term = true;
-                self.focus_to(Focus::Term);
-            }
             Action::OpenFile(path) => {
                 self.editor.open(path.clone());
                 self.center = Center::Editor;
@@ -1222,7 +1230,6 @@ impl App {
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
             }
-            Action::CycleFocus => self.cycle_focus(),
             Action::Navigate(nav) => match *nav {
                 Nav::Sessions => {
                     self.show_sessions = true;
@@ -1231,16 +1238,6 @@ impl App {
                 Nav::Files => {
                     self.show_tree = true;
                     self.focus_to(Focus::Tree);
-                }
-                Nav::Chat => {
-                    self.center = Center::Chat;
-                    self.focus_to(Focus::Center);
-                }
-                Nav::Editor => {
-                    if self.editor.has_tabs() {
-                        self.center = Center::Editor;
-                    }
-                    self.focus_to(Focus::Center);
                 }
                 Nav::Graph => {
                     // Mirror the ⌃⌥5 toggle: off returns to editor (if tabs) else chat.
@@ -2762,7 +2759,7 @@ impl App {
         // Offshore mode (flag file ~/.config/offshore/mode, shared with the
         // offshore CLI): re-read per submit so toggles — from the legacy TUI's
         // /offshore command or the CLI — apply to the very next turn.
-        let guidance = crate::offshore_guidance(crate::read_offshore_mode());
+        let guidance = super::offshore::guidance(super::offshore::enabled());
 
         tokio::spawn(async move {
             // Both the session mint and the turn POST ride the daemon-blip

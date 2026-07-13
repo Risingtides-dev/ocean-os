@@ -1,10 +1,8 @@
-//! Session-first shell — the Phase 1 spine of the ocean-tui rebuild.
+//! Ocean's terminal workbench.
 //!
-//! Component architecture (Component trait + tokio + event/action channels)
-//! replacing the monolithic daemon UI in `main.rs`. Launched behind `--next`
-//! until it reaches feature parity; the old surface stays the default.
-//!
-//! See docs/specs/2026-07-03-ocean-tui-shell-rebuild-design.md.
+//! The component architecture (Elm actions, async daemon client, and focused
+//! panes) is the sole TUI implementation. The former Track-0 room cockpit was
+//! removed after native session resume reached parity.
 
 mod action;
 mod app;
@@ -23,6 +21,7 @@ mod history;
 mod kitty;
 mod markdown;
 mod mentions;
+mod offshore;
 mod panel;
 mod pty;
 mod sessions;
@@ -38,16 +37,26 @@ use client::DaemonClient;
 
 /// Entry point for the new shell. Blocks on a tokio runtime, runs the app loop,
 /// and always restores the terminal on the way out.
-pub fn run(url: &str, workspace_root: String) -> anyhow::Result<()> {
+pub fn run(
+    url: &str,
+    workspace_root: String,
+    requested_session: Option<&str>,
+) -> anyhow::Result<()> {
+    let requested_session = requested_session
+        .map(sessions::resolve)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let client = DaemonClient::new(url)?;
+        let mut app = App::new(client, workspace_root);
+        if let Some(session) = requested_session {
+            app.resume_initial_session(session)?;
+        }
         let mut terminal = tui::init()?;
         // The OCEAN splash: hold, then slide-and-fade. Runs before the event
         // pump spawns, so its direct crossterm polling can't race the app loop.
         crate::splash::play(&mut terminal)?;
-        let result = App::new(client, workspace_root).run(&mut terminal).await;
-        tui::restore()?;
-        result
+        app.run(&mut terminal).await
     })
 }

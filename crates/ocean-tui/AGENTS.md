@@ -22,16 +22,17 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   alive several seconds — `--help` exits before terminal setup and proves
   nothing.
 - Keep TUI behavior aligned with daemon API contracts; clients do not own sessions.
+- The `shell/` workbench is the sole TUI. Do not reintroduce `--legacy`, nested TUI session resume, Track-0 room tabs, or the mesh parity subcommand.
 - Do not introduce agent/session logic into the TUI; session state lives in the daemon via `ocean-agent`.
 
 ## Hard Rules (violations have broken the build before — 2026-07-08)
 
-1. **Enums are additive, never destructive.** NEVER remove, rename, or replace
-   an existing variant of `Action` (`shell/action.rs`) or any shared event enum
-   (`AgentEvent`, `AgentTurnEvent`). Add your new variant alongside. A variant
-   you don't recognize has call sites you haven't read — `grep -rn <Variant>`
-   across the workspace BEFORE touching it. (An agent replaced `SetModel` with
-   `SetThinking` and broke four call sites; both now coexist. Keep it that way.)
+1. **Shared event enums are additive.** NEVER remove, rename, or replace a
+   shared wire variant (`AgentEvent`, `AgentTurnEvent`) without an explicit
+   protocol migration. Local `Action` variants may be deleted only as part of
+   an owner-approved feature removal after workspace-wide reference search and
+   tests; ordinary feature work remains additive. A variant you don't recognize
+   has call sites you haven't read — `rg <Variant>` across the workspace first.
 2. **Compile before you finish.** `cargo check -p ocean-tui` must pass before
    you end your turn. If you touched a shared enum, run
    `cargo check --workspace --tests` — exhaustive matches fan out into

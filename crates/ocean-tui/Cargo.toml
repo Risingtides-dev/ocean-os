@@ -13,7 +13,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 ocean-agent-sdk.workspace = true
 ocean-core.workspace = true
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

@@ -226,14 +226,12 @@ impl SessionRailComponent {
 
     fn resume(&self, row: Row) -> Option<Action> {
         let s = self.session_at(row)?;
-        match uuid::Uuid::parse_str(&s.id) {
-            Ok(uuid) => Some(Action::ResumeSession {
-                id: AgentSessionId(uuid),
-                path: s.path.clone(),
-                cwd: s.cwd.clone(),
-            }),
-            Err(_) => self.open_in_terminal(row),
-        }
+        let uuid = uuid::Uuid::parse_str(&s.id).ok()?;
+        Some(Action::ResumeSession {
+            id: AgentSessionId(uuid),
+            path: s.path.clone(),
+            cwd: s.cwd.clone(),
+        })
     }
 
     /// `+ new` in the node the given row belongs to: a dir header roots at the
@@ -245,20 +243,6 @@ impl SessionRailComponent {
             Row::Branch(di, bi) | Row::Session(di, bi, _) => self.branch_at(di, bi)?.cwd.clone(),
         };
         Some(Action::NewSessionInProject { cwd })
-    }
-
-    fn open_in_terminal(&self, row: Row) -> Option<Action> {
-        let s = self.session_at(row)?;
-        let (cmd, args) = s.resume_command();
-        let mut line = format!("{} {}", cmd, args.join(" "));
-        if s.cwd != self.root {
-            line = format!("cd {} && {}", s.cwd.display(), line);
-        }
-        line.push('\n');
-        Some(Action::OpenSession {
-            line,
-            cwd: s.cwd.clone(),
-        })
     }
 
     /// The most-recently-active session for this project that can be resumed
@@ -320,7 +304,6 @@ impl Component for SessionRailComponent {
                 None
             }
             KeyCode::Enter => self.activate(),
-            KeyCode::Char('t') => self.selected_row().and_then(|r| self.open_in_terminal(r)),
             // `n` (or `+`): new session in the selected row's dir/branch.
             KeyCode::Char('n') | KeyCode::Char('+') => {
                 self.selected_row().and_then(|r| self.new_session_in(r))
