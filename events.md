@@ -2765,3 +2765,14 @@ area:  [testing]: Hosted gates, supervised daemon restart, and PTY installation 
 
 PR #275 and PR #276 merged after their macOS, Ubuntu, pinned-Rust-1.88, and cargo-deny jobs passed; TUI run 29234214171 completed all four jobs successfully. I built the release workspace from clean synchronized main at ff194119bd86 with zero turns in flight, atomically replaced the former ~/.local/bin/ocean symlink with a real copied binary, matched SHA-256 5760a631833c0389d6823d46e41f76f5f19e784e25fa494426674589e089b505, and passed codesign --verify --deep --strict. A real 120x40 PTY kept the installed TUI alive for 4.36 seconds, observed all chooser routes, and exited cleanly. The supervised daemon restarted from PID 44616 to 74102 at revision ff194119bd86 with neutral cwd, zero turns in flight, and zero persistence/GC failures.
 _________________________________________________________________________________
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [04:38] [13-07-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [pi/shell-halt-ci-startup-window-20260713]
+type:  [bug report]: Separate Shell Halt fixture startup slack from kill deadline
+area:  [testing]: Hosted Unix process-cleanup regression reliability
+
+Main CI run 29235174509 first failed on Ubuntu because both Shell Halt smoke fixtures could not write their PID markers inside the nominal two-second startup probe while the runner was saturated; the same job passed unchanged on rerun. I bounded marker discovery with a hard five-second timeout while leaving the stricter two-second post-Halt process-termination deadline and all survivor assertions unchanged. Ten parallel focused repetitions, the focused/full runtime suites, strict runtime Clippy, workspace check, formatting, and diff checks pass. Independent read-only review confirmed the change is finite, cleanup-safe, test-only, and does not weaken the descendant-kill contract.
+_________________________________________________________________________________
