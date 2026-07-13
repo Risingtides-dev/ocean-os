@@ -2819,3 +2819,18 @@ Verification:
 - `cargo build -p ocean-tui --release`
 - `cargo fmt --all -- --check`
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [07:10pm] [13-07-26]
+agent:     [pi], [gpt-5.2-pro]
+worktree:  [main]
+type:      [bug report]: align fallback TUI prompt with component rendering
+area:      [backend]: client-specific system prompt assembly
+
+Updated Ocean's compiled TUI fallback prompt so missing external profiles no longer tell agents that component_render is unavailable. The fallback now names the supported terminal projections and preserves the boundary against arbitrary web/HTML layouts. Added a client-type regression assertion for the positive component contract.
+
+Verification:
+- `cargo test -p ocean-agent system_prompt` (22 passed)
+- `cargo fmt --all -- --check`
+- `git diff --check`
+_________________________________________________________________________________

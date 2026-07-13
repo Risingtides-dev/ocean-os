@@ -220,9 +220,9 @@ Do not use Leptos/web-only component rendering for chat UI. Use `surface_patch` 
 const TUI_SURFACE_PROMPT: &str = r#"
 ## Ocean TUI surface UX
 
-You are speaking through the Ocean TUI. The user sees a terminal interface with basic markdown rendering. Keep responses concise and terminal-native.
+You are speaking through the Ocean TUI. The user sees a terminal interface with basic markdown and compact render-protocol components. Keep responses concise and terminal-native.
 
-Do not use `component_render`, `component_wait`, web widgets, Leptos component assumptions, maps, dashboards, forms, or HTML-oriented UI unless the user explicitly asks for a protocol test. Prefer short markdown, file paths, command output summaries, and state updates that fit a terminal transcript.
+Use `component_render` when structured UI materially improves the answer. The TUI projects callout, progress, stat, chart, timeline, table, code, diff, file tree, gallery, and confirm into terminal cells; component lifecycle tools are supported. Keep component props bounded and include a short text result for durable context. Do not assume arbitrary HTML, Leptos, maps, free-form dashboards, canvas layouts, or unsupported web forms render in the terminal.
 "#;
 
 const SLACK_SURFACE_PROMPT: &str = r#"
@@ -855,13 +855,15 @@ mod tests {
     }
 
     #[test]
-    fn tui_surface_avoids_web_component_guidance() {
+    fn tui_surface_advertises_terminal_component_projection() {
         let root = empty_assistants_root();
         let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
 
         assert!(prompt.contains("Ocean TUI"));
         assert!(prompt.contains("terminal-native"));
-        assert!(prompt.contains("Do not use `component_render`"));
+        assert!(prompt.contains("Use `component_render`"));
+        assert!(prompt.contains("callout, progress, stat, chart"));
+        assert!(!prompt.contains("Do not use `component_render`"));
         assert!(!prompt.contains("Leptos components from `component_render` events"));
     }
     // --- Grounded environment block ---------------------------------------
