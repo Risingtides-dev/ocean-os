@@ -23,7 +23,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 | Package | Owns | Does not own | Primary entry | Local contract | Narrow validation |
 |---|---|---|---|---|---|
 | `ocean-acp` | ACP stdio bridge for Zed/editors | Runtime/session authority | `ocean-acp/src/main.rs`, `daemon.rs` | — | `cargo test -p ocean-acp` |
-| `ocean-agent` | Sessions/history, prompt assembly, capability/runtime facade | Provider wire encoding; client UI | `ocean-agent/src/lib.rs` | `ocean-agent/AGENTS.md` | `cargo test -p ocean-agent` |
+| `ocean-agent` | Sessions/history, prompt assembly, capability/runtime facade | Provider wire encoding; client UI | `ocean-agent/src/lib.rs`, `ocean-agent/src/system_prompt.rs` | `ocean-agent/AGENTS.md` | `cargo test -p ocean-agent` |
 | `ocean-agent-sdk` | Product session/turn/event/surface vocabulary | Daemon execution and persistence | `ocean-agent-sdk/src/lib.rs` | — | `cargo test -p ocean-agent-sdk` |
 | `ocean-ast` | Standalone tree-sitter read-time structural summarization | Handoff extraction; hashline mutation; live runtime wiring | `ocean-ast/src/lib.rs::summarize_code` | — | `cargo test -p ocean-ast` |
 | `ocean-browser` | Typed Chrome DevTools handle, launch, tabs, perception, network/downloads | Runtime permission policy and tool registration | `ocean-browser/src/lib.rs` | — | `cargo test -p ocean-browser` |

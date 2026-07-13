@@ -2447,3 +2447,14 @@ Completed the approved Phase 0A ground-truth/navigation pass and Phase 1A automa
 Added dependency-free `cargo xtask docs-check` and `cargo xtask ci`. The docs check validates Cargo/index parity, non-default rationale, inline/reference-style repo-local Markdown file targets, and archive boundaries; GitHub Actions now consumes the xtask gate manifest on macOS and Ubuntu while retaining cargo-deny as a separate Ubuntu job. Final `cargo xtask ci` passed: docs-check reported 25 packages / 92 active Markdown files / 56 local links; workspace build/tests, strict all-target Clippy, format, and cargo-deny all passed. Fresh automation review found one reference-link gap, which was fixed and re-reviewed PASS.
 _________________________________________________________________________________
 
+_________________________________________________________________________________
+time:      [09:51pm] [12-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [refactor]
+area:      [backend]
+
+Completed the first behavior-neutral Phase 2A source extraction. Moved the private 59,425-byte `ocean-agent::system_prompt` module intact from the upstream-adjusted 7,297-line `src/lib.rs` into `src/system_prompt.rs`, preserving all prompt literals, loaders, surface routing, memory/project context, crate-private caller paths, visibility, and embedded tests. The pre-format module body matched SHA-256 `c8d1aa6e35c3bdb160ce010e6675b33dc640fade3314f1fd8572ca8a6e6d66bd` before/after the move; `lib.rs` is now 6,149 lines. Upstream prompt-tightening commit `eba86f04` preceded and is preserved by the move.
+
+Verification after upstream reconciliation: 22 focused system-prompt tests and all 149 ocean-agent tests passed, along with format/diff checks. Workspace/docs/full-gate revalidation and a fresh comparison review are recorded at rebase closeout. The extraction manifest is `docs/specs/2026-07-12-ocean-agent-system-prompt-extraction-manifest.md`; the move preserves upstream prompt commit `eba86f04` without additional wording or public-behavior changes.
+_________________________________________________________________________________

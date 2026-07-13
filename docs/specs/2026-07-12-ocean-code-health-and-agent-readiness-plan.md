@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — Phase 0A and 1A complete; first Phase 2A extraction next
+**Status:** Approved by operator — Phase 0A, 1A, and first Phase 2A extraction complete
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -245,7 +245,7 @@ Before each move, write a short extraction manifest naming exact symbols/files, 
 
 #### 2A. `ocean-agent` intact module moves
 
-1. Move the embedded `system_prompt` module to `src/system_prompt.rs` intact.
+1. **Complete:** moved the embedded `system_prompt` module to `src/system_prompt.rs` intact; focused/full tests and independent review passed. Manifest: `docs/specs/2026-07-12-ocean-agent-system-prompt-extraction-manifest.md`.
 2. Move the embedded session module to `src/session/mod.rs` intact.
 3. Preserve all `ocean_agent::...` public paths through re-exports.
 4. Stop after the intact moves. Splitting session internals changes the internal dependency/privacy graph and requires separate Phase 3 approval.
@@ -367,13 +367,13 @@ After this plan is approved, start with independently reviewable changes:
 
 1. **Ground-truth docs PR — complete:** repo boundaries, handoff, gates, canonical crate index, active links, and before/after cold-agent benchmark are reconciled.
 2. **Docs automation PR — complete:** `cargo xtask docs-check`, one executable CI manifest, manifest unit coverage, and GitHub Actions consumption are implemented and passing.
-3. **First intact source extraction — next:** move `ocean-agent::system_prompt` as one private module with prompt behavior/tests preserved.
+3. **First intact source extraction — complete:** `ocean-agent::system_prompt` moved as one private module with prompt behavior/tests preserved and independent review passed.
 4. **Event-policy characterization PR:** produce the checked event table and isolated payload/RSS stress evidence.
 5. **Shell Halt characterization PR:** direct-child and descendant-tree tests by supported OS.
 6. **Browser characterization PR:** injected single-flight/deadline/cancellation tests.
 7. **Agent-loop benchmark PR:** reproducible history-cost benchmark and baseline artifact.
 
-Ground-truth docs and automation are complete. The first intact move is next and does not touch event, shell, browser, or history-cost paths. Further event/daemon/runtime moves remain blocked on their applicable characterization and safety disposition.
+Ground-truth docs and automation are complete. The first intact move does not touch event, shell, browser, or history-cost paths. Further event/daemon/runtime moves remain blocked on their applicable characterization and safety disposition.
 
 ## 10. Decisions requested
 
