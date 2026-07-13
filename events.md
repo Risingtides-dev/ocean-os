@@ -2496,3 +2496,13 @@ Reconciled the five local code-health commits onto fetched `origin/main` at `772
 
 Post-rebase validation: 22 prompt tests, 24 session tests, 149 full ocean-agent tests, 294 daemon tests, 113 runtime tests, dual-editor regressions, docs/index checks, workspace build/tests, strict all-target Clippy, format, cargo-deny, and the full `cargo xtask ci` gate passed. A fresh preservation reviewer compared both extracted modules to their new rebased parents, verified the replay-byte/poison-safety fix, and returned PASS with no blockers. Backup ref `backup/pi-code-health-pre-rebase-20260712` retains the pre-rebase commit chain; main is clean and ahead of origin with no remaining divergence.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [11:20pm] [12-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [workflow]
+area:      [automations]
+
+Deployed the reviewed code-health/event-retention wave through the supervised main-built daemon. Preflight found one active turn, so restart was deferred rather than interrupted; after the turn drained to zero, built `cargo build -p ocean-daemon --release` and confirmed the artifact embedded rev `3827524ab188`. Restarted only the LaunchAgent-managed PID via `launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon` (PID 88117 → 43445). Post-restart `/health` returned ok at the expected revision, process cwd remained the neutral `/Users/risingtidesdev` rather than a repo, and `ocean_turns_in_flight` was zero.
+_________________________________________________________________________________
