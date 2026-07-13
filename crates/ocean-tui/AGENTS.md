@@ -119,6 +119,13 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   reconnect statuses; failed turns render `Turn::ErrorNotice`, not advisor
   cards.
 
+- Normal launch (2026-07-13, owner-directed) opens a centered OCEAN chooser
+  over a clean chat-only workspace: `+ new in <cwd>`, `resume session`, blank
+  `editor` (which reveals files), or `open graph`. Startup never auto-resumes;
+  explicit `--session` remains direct opt-in. Resume is a nested, current-
+  workspace picker with keyboard/mouse parity, selection-relative scrolling,
+  terminal-safe labels, and off-thread session discovery through `Action`.
+
 ## Verification
 
 - `cargo build -p ocean-tui --release`
