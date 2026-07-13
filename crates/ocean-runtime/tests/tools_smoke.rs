@@ -91,15 +91,21 @@ impl Drop for PidCleanup {
 
 #[cfg(unix)]
 async fn wait_for_pid(path: &std::path::Path) -> i32 {
-    for _ in 0..100 {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(pid) = text.trim().parse::<i32>() {
-                return pid;
+    // A saturated hosted runner can take more than two seconds to schedule the
+    // just-spawned shell. Keep the probe finite, but separate startup slack
+    // from the stricter post-Halt termination deadline below.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return pid;
+                }
             }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("PID marker was not written: {}", path.display());
+    })
+    .await
+    .unwrap_or_else(|_| panic!("PID marker was not written: {}", path.display()))
 }
 
 #[cfg(unix)]
