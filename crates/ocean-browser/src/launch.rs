@@ -187,6 +187,141 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    #[cfg(unix)]
+    struct AbortTaskOnDrop<T> {
+        handle: Option<tokio::task::JoinHandle<T>>,
+    }
+
+    #[cfg(unix)]
+    impl<T> AbortTaskOnDrop<T> {
+        fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+            Self {
+                handle: Some(handle),
+            }
+        }
+
+        fn abort(&self) {
+            if let Some(handle) = &self.handle {
+                handle.abort();
+            }
+        }
+
+        async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+            self.handle
+                .take()
+                .expect("test task handle can only be joined once")
+                .await
+        }
+    }
+
+    #[cfg(unix)]
+    impl<T> Drop for AbortTaskOnDrop<T> {
+        fn drop(&mut self) {
+            if let Some(handle) = &self.handle {
+                handle.abort();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct PidCleanup {
+        pid: i32,
+        identity: String,
+        armed: bool,
+    }
+
+    #[cfg(unix)]
+    impl PidCleanup {
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PidCleanup {
+        fn drop(&mut self) {
+            if self.armed
+                && process_command(self.pid).is_some_and(|command| command.contains(&self.identity))
+            {
+                // SAFETY: the PID still identifies this test's uniquely-named
+                // executable; a reused unrelated PID is never signalled.
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn scratch_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ocean-browser-launch-{nanos:x}-{count}"));
+        std::fs::create_dir_all(&dir).expect("create browser launch scratch dir");
+        dir
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid(path: &Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "fake browser PID marker was not written: {}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_command(pid: i32) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: i32) -> bool {
+        // SAFETY: signal 0 probes process existence without sending a signal.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => !String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z'),
+            _ => false,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_not_running(pid: i32) -> bool {
+        for _ in 0..100 {
+            if !process_is_running(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
     #[test]
     fn flags_include_profile_and_extension() {
         let cfg = LaunchConfig {
@@ -238,5 +373,85 @@ mod tests {
         let args = cfg.to_args();
         assert!(args.iter().any(|a| a == "--user-data-dir=/tmp/real-chrome"));
         assert!(args.iter().any(|a| a == "--profile-directory=Default"));
+    }
+
+    /// Chromiumoxide owns a kill-on-drop child from the moment it spawns the
+    /// executable. Cancelling Ocean's launch future must therefore terminate a
+    /// process that stalls before publishing its DevTools websocket endpoint.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_browser_launch_does_not_orphan_spawned_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir();
+        let pid_file = dir.join("browser.pid");
+        let executable = dir.join("fake-browser");
+        let fifo = dir.join("block.fifo");
+        let profile = dir.join("profile");
+        std::fs::create_dir_all(&profile).expect("create fake browser profile");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo for fake browser");
+        assert!(mkfifo.success(), "mkfifo must create the launch blocker");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"{}\"\nread _ < \"{}\"\n",
+                pid_file.display(),
+                fifo.display()
+            ),
+        )
+        .expect("write fake browser executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("stat fake browser executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make fake browser executable runnable");
+
+        let cfg = LaunchConfig {
+            profile_dir: profile,
+            profile_directory: None,
+            extension_dir: None,
+            chrome_executable: Some(executable.clone()),
+            headless: true,
+            port: 0,
+        };
+        let mut task = AbortTaskOnDrop::new(tokio::spawn(async move { launch(&cfg).await }));
+        let pid = wait_for_pid(&pid_file).await;
+        let identity = executable
+            .canonicalize()
+            .expect("canonicalize fake browser identity")
+            .to_string_lossy()
+            .to_string();
+        let mut cleanup = PidCleanup {
+            pid,
+            identity: identity.clone(),
+            armed: true,
+        };
+        assert!(
+            process_is_running(pid),
+            "fake browser must be live before cancellation"
+        );
+        assert!(
+            process_command(pid).is_some_and(|command| command.contains(&identity)),
+            "PID {pid} must still identify the fake browser before cancellation"
+        );
+
+        task.abort();
+        let join_result = tokio::time::timeout(std::time::Duration::from_secs(1), task.join())
+            .await
+            .expect("cancelled browser launch joins before outer deadline");
+        let join = match join_result {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled browser launch task must abort"),
+        };
+        assert!(join.is_cancelled());
+        assert!(
+            wait_until_not_running(pid).await,
+            "fake browser process {pid} survived cancellation"
+        );
+        cleanup.disarm();
     }
 }

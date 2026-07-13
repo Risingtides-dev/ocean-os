@@ -2653,3 +2653,13 @@ area:  [backend]: Rebuild clean main and restart supervised ocean-daemon
 
 After final-tip CI run 29225232240 passed, I confirmed a clean synchronized main and zero turns in flight, built the release workspace, and restarted only `dev.risingtides.ocean-daemon` through launchd. Health returned revision 2cdf34f15f4e with zero persistence/GC failures; neutral cwd `/Users/risingtidesdev`, PID 71451, and zero active turns were verified.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [01:36am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [bug report]: Browser startup phases lacked bounded single-flight deadlines
+area:  [testing]: Injected concurrency seams, retry safety, and launch PID cleanup
+
+Phase 0B-3 confirmed the existing LazyBrowser mutex already enforced exactly one launch and cancellation-safe partial-cache behavior, but lock wait, liveness, and full attach/launch could stall until the much larger turn deadline. The state machine now bounds those phases at 40/3/30 seconds, preserves a cached handle on liveness timeout, and lets existing waiters consume a completed flight without serial re-probes. Eight deterministic runtime tests plus a real chromiumoxide fake-executable PID cancellation regression pass. Full local CI, supported daemon features, complete browser/runtime suites, and independent concurrency/process reviews pass; Linux CI remains.
+_________________________________________________________________________________

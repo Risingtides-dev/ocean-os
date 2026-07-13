@@ -15,6 +15,7 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - Permission gates are mandatory; do not add execution paths that bypass them.
 - Built-in filesystem/process tools must resolve relative paths and shell commands against the turn's `SessionContext.cwd`, not the daemon process cwd.
 - On Unix, `BashTool` owns a fresh process group and Halt/timeout must kill the complete ordinary descendant tree before dropping the direct child handle. Disarm group cleanup only after `child.wait()` completes; deliberately re-sessioned descendants and non-Unix tree termination are outside this contract.
+- `LazyBrowser` startup remains mutex-single-flight: one caller probes/launches while peers wait. Bound lock wait, liveness, and launch separately; a liveness timeout preserves the cached handle, while cancellation/launch timeout must cache nothing partial and leave the slot retryable.
 - Tool-using turns must reserve a final synthesis path: do not let repeated tool calls consume the entire turn budget without a user-visible assistant reply.
 - Assistant text present in a provider's terminal message must be emitted as `TextDelta` when the provider did not stream text chunks, so SSE clients always render the final reply.
 - Emit `TurnCheckpoint` only at provider-valid round boundaries. Its delta must preserve transcript order and, for tool rounds, include the assistant tool-call message followed by every corresponding ordered `ToolResult`; never checkpoint an incomplete batch.
@@ -37,6 +38,8 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 
 - `cargo test -p ocean-runtime runtime_event_queue_retains_full_tool_payload_until_drained`
 - `cargo test -p ocean-runtime bash_halt_ -- --test-threads=1`
+- `cargo test -p ocean-runtime lazy_browser_ -- --test-threads=1`
+- `cargo test -p ocean-browser cancelled_browser_launch_does_not_orphan_spawned_process -- --test-threads=1`
 - `cargo test -p ocean-runtime`
 - `cargo check --workspace`
 
