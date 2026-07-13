@@ -2386,3 +2386,11 @@ area:      [backend]
 Removed the competing legacy `edit` tool from hashline-enabled Ocean sessions while preserving it for plain Web/Voice and unbound profiles; `write` remains universal. TUI, CLI/default, and future ACP sessions now receive one coherent surgical editor, `hashline_edit`, so the model cannot stochastically downgrade to repeated single-replacement edits instead of a batched multi-file patch. Added red/green capability tests for both profile contracts and retained the existing read-to-hashline integration coverage. Verification: 162 ocean-runtime tests, three hashline wiring tests, `cargo check --workspace`, and `cargo fmt --check`.
 _________________________________________________________________________________
 
+time:      [09:11pm] [12-07-26]
+agent:     [omp], [gpt-5.6-sol]
+worktree:  fix/restore-dual-editors
+type:      [bug-report]
+area:      [backend]
+
+Restored legacy `edit` alongside `hashline_edit` for hashline-enabled sessions after a controlled alternating GPT-5.6 Terra benchmark isolated a severe model-behavior regression from the hashline-only tool surface. Both-editor runs completed 6/6 in 29.57s and 21.69s; hashline-only runs completed 6/6 in 57.06s and 60.10s. The restoration reran 6/6 in 31.77s and 26.82s, with runtime CPU remaining negligible. Added a capability regression for dual-editor exposure; all 162 ocean-runtime tests, `cargo check --workspace`, and `cargo fmt --check` pass. The benchmark harness itself was not modified.
+_________________________________________________________________________________

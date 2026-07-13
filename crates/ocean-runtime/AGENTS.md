@@ -23,9 +23,10 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - Every provider round in a bound agent session must copy
   `AgentConfig::session_id` into `StreamOptions::session_id`; providers use that
   stable identity for cross-round prompt caching and request correlation.
-- Hashline-enabled sessions expose `hashline_edit` as their only surgical
-  editor; plain profiles retain `edit`, and every profile retains `write`.
-  Never offer both surgical editors to one session.
+- Hashline-enabled sessions expose both `edit` and `hashline_edit`; every
+  profile retains `write`. Controlled GPT-5.6 Terra benchmarks showed that
+  hiding `edit` changed model exploration behavior and doubled wall time even
+  when the model still selected `hashline_edit`.
 
 
 
