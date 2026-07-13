@@ -22,7 +22,7 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   alive several seconds — `--help` exits before terminal setup and proves
   nothing.
 - Keep TUI behavior aligned with daemon API contracts; clients do not own sessions.
-- The `shell/` workbench is the sole TUI. Do not reintroduce `--legacy`, nested TUI session resume, Track-0 room tabs, or the mesh parity subcommand.
+- The `shell/` workbench is the sole TUI. Do not reintroduce `--legacy`, nested TUI session resume, Track-0 room tabs, the mesh parity subcommand, or room-scoped `AgentTurnRequest` fields.
 - Do not introduce agent/session logic into the TUI; session state lives in the daemon via `ocean-agent`.
 
 ## Hard Rules (violations have broken the build before — 2026-07-08)

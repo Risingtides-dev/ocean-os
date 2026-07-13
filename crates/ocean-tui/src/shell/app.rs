@@ -2802,7 +2802,6 @@ impl App {
                 prompt: prompt.clone(),
                 cwd: workspace,
                 guidance,
-                room_id: None,
                 project_id: None,
                 client_type: Some("tui".into()),
                 agent: None,

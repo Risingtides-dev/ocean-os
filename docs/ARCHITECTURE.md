@@ -101,7 +101,7 @@ ocean-heartbeat
   src/main.rs) and an HTTP *client* of the daemon — NOT wired into the daemon
   and not depended on by it (nothing in the workspace references
   ocean-heartbeat). Meant to run under launchd/cron, it reads a TOML routine
-  (id, cwd, prompt, optional room_id/project_id, durable session file), GET-
+  (id, cwd, prompt, optional project_id, durable session file), GET-
   prechecks the daemon's /health, then POSTs the routine prompt to
   /v1/agent/turns and persists the returned session_id so successive runs
   resume the same session. Subcommands: `run` (fire one routine now), `init`

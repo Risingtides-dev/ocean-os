@@ -558,7 +558,6 @@ mod tests {
             prompt: "reply with exactly: ok".into(),
             cwd: ws.into(),
             guidance: None,
-            room_id: None,
             project_id: None,
             client_type: Some("tui".into()),
             agent: None,

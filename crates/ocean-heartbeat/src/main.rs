@@ -90,8 +90,6 @@ struct RoutineConfig {
     session_file: Option<PathBuf>,
     /// Prompt-injection hook for the scheduled agent turn.
     prompt: String,
-    /// Optional room id for specialist routing.
-    room_id: Option<String>,
     /// Optional project id for daemon project routing.
     project_id: Option<String>,
     /// Request timeout in seconds.
@@ -146,9 +144,6 @@ async fn run_once(daemon_url: &str, path: &Path) -> Result<()> {
         "cwd": cfg.cwd,
         "client_type": cfg.client_type,
     });
-    if let Some(room_id) = cfg.room_id {
-        body["room_id"] = json!(room_id);
-    }
     if let Some(project_id) = cfg.project_id {
         body["project_id"] = json!(project_id);
     }
@@ -227,7 +222,6 @@ fn print_component(path: &Path, session_id: Option<String>, props_only: bool) ->
             "session_file": state.session_file,
             "last_session_id": state.last_session_id,
             "timeout_seconds": cfg.timeout_seconds,
-            "room_id": cfg.room_id,
             "project_id": cfg.project_id
         }
     });
@@ -298,7 +292,6 @@ fn init_config(path: &Path, cwd: &Path, id: &str) -> Result<()> {
         client_type: "heartbeat-cron".into(),
         session_file: Some(PathBuf::from("~/.local/state/ocean-heartbeat/ocean-site-docs.session")),
         prompt: "Heartbeat: resume work on the Ocean OS documentation website in docs/ocean-os-site.\n\nRules:\n- Work in ONE small slice only.\n- Inspect the current site and repo state first.\n- Prefer the next incomplete docs page in order.\n- Ground claims in current repo files.\n- After edits, launch or leave a clear file:// URL.".into(),
-        room_id: None,
         project_id: None,
         timeout_seconds: default_timeout_seconds(),
     };

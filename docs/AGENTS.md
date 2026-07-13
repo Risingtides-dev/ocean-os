@@ -26,6 +26,7 @@ This child doc governs the `docs/` subtree: architecture notes, operator guides,
 - Prefer concise operational docs over historical notes.
 - Link to source crates when documenting implementation behavior.
 - Keep daemon/client protocol documentation stable and simple.
+- Document rooms as durable `/v1/rooms/persistent/*` collaboration plus the independent LiveKit token route; the former Track-0 projection API is historical only.
 - Update the root `AGENTS.md` child index if durable doc boundaries change.
 
 ## Verification

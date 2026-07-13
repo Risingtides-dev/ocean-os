@@ -101,7 +101,6 @@ POST /v1/agent/turns
     "client_type": "surface-gpui",        # optional render/communication medium
     "project_id": "<uuid>",               # optional; with empty cwd the daemon binds the
                                           #   turn to the project's workspace_root
-    "room_id": "<id>",                    # optional; Track-0 room-scoped turns
     "guidance": ["focus on tests"],       # optional list of guidance hints
     "thinking_level": "high",             # optional ThinkingLevel; per-turn reasoning-effort
                                           #   override, applied to this turn only (does not
@@ -143,12 +142,10 @@ Beyond turn lifecycle deltas (`TurnStarted`, `AssistantTextDelta`,
 
 ## Persistent Rooms (OCEAN-65)
 
-The **persistent `Room`** is the durable collaboration entity — distinct from
-the Track-0 `RoomSnapshot` projection served by `GET /v1/rooms` and
-`GET /v1/rooms/{room_id}`. A `Room` owns a free-form id (`RoomKey`), a name, a
-participant roster, created/updated timestamps, an append-only transcript, and an
-optional trigger policy. The persistent lifecycle is namespaced under
-`/v1/rooms/persistent` so it never shadows the projection route. Source of truth:
+The **persistent `Room`** is Ocean's durable collaboration entity. A `Room`
+owns a free-form id (`RoomKey`), a name, a participant roster, created/updated
+timestamps, an append-only transcript, and an optional trigger policy. Its
+lifecycle is namespaced under `/v1/rooms/persistent`. Source of truth:
 `crates/ocean-core/src/lib.rs` (`Room`, `RoomKey`, `RoomParticipant`,
 `RoomMessage`, `RoomTriggerPolicy`, `RoomTriggerEvent`, `evaluate_trigger_policy`)
 and `crates/ocean-agent` (`RoomRegistry` store, `RoomStoreError`).
@@ -164,6 +161,9 @@ POST /v1/rooms/persistent/{key}/participants               # join (add participa
 DEL  /v1/rooms/persistent/{key}/participants/{participant_id}  # leave
 POST /v1/rooms/persistent/{key}/messages                   # append a transcript entry
 GET  /v1/rooms/persistent/{key}/transcript                 # read transcript (after_seq tail)
+GET  /v1/rooms/persistent/{key}/snapshot                   # hydrate durable room state
+GET  /v1/rooms/persistent/{key}/events                     # tail durable room events
+POST /v1/rooms/{room_id}/livekit-token                     # mint voice/video join token
 ```
 
 **Transcript** is a flat, append-only event log of `RoomMessage` entries, each

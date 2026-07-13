@@ -12,11 +12,13 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 ## Local Contracts
 
+
 - Treat each package as an ownership boundary.
 - Read the target package's local `AGENTS.md` when the index links one.
 - Do not introduce cross-crate coupling without documenting the contract in affected owner docs.
 - When adding/removing/renaming a workspace package, update this index in the same change and verify it against `cargo metadata --no-deps --format-version=1`.
 - Keep entry points and narrow validation current; stale routing information is a correctness defect for agent work.
+- Agent turns are session/workspace scoped and do not carry a Track-0 `room_id`. Durable collaboration uses `RoomKey` and `/v1/rooms/persistent/*`; LiveKit token minting remains independent at `/v1/rooms/{room_id}/livekit-token`.
 
 ## Workspace Package Index
 
@@ -66,6 +68,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 | HTTP/SSE route | daemon plus core/SDK consumers | Narrow route tests + daemon tests + client compile/tests |
 | TUI shared enum/render/event flow | TUI plus event owner | TUI tests/release build; workspace tests for shared enums |
 | Persistence schema | owning store/memory/context/Longhouse package | Migration/backward-compat and restart-persistence tests |
+
 
 ## Work Guidance
 

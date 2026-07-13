@@ -245,7 +245,6 @@ impl DaemonClient {
             prompt,
             cwd,
             guidance: None,
-            room_id: None,
             project_id: None,
             client_type: Some(CLIENT_TYPE.to_string()),
             // Per-turn reasoning override from ACP metadata; None preserves the

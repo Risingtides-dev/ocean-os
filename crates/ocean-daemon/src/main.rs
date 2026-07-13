@@ -20,7 +20,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, TimeZone, Utc};
-use ocean_agent::{room_guidance, AgentRuntime, PromptControl};
+use ocean_agent::{AgentRuntime, PromptControl};
 use ocean_agent_sdk::{
     AgentOwningProject, AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse,
     AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurn,
@@ -28,18 +28,14 @@ use ocean_agent_sdk::{
     ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
     ToolCall, ToolCallId, ToolResult,
 };
-// OCEAN-277: surface-patch op vocabulary the per-room component ledger folds.
-use ocean_agent_sdk::surface::{CanvasId, ComponentId, SurfacePatch};
 use ocean_core::{
     evaluate_trigger_policy, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionStatus, PermissionsResponse, Project, ProjectConfig, ProjectId, ProjectRef,
     ProjectResponse, PromptRequest, RequestControlResponse, RequestCreateResponse, RequestId,
-    RequestState, RequestStatus, RequestsResponse, RoomEventsResponse, RoomId, RoomKey,
-    RoomMessageKind, RoomPanelSnapshot, RoomParticipant, RoomParticipantKind, RoomProjectedMessage,
-    RoomProjection, RoomProjectionProvenance, RoomProjectionResponse, RoomSnapshot,
-    RoomTriggerEvent, RoomTriggerPolicy, RoomTurn, RoomsResponse, SessionDetail, SessionId,
-    SessionResponse, SessionRunState, SessionSummary,
+    RequestState, RequestStatus, RequestsResponse, RoomKey, RoomMessageKind, RoomParticipant,
+    RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy, SessionDetail, SessionId,
+    SessionResponse, SessionRunState,
 };
 use ocean_runtime::{
     tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
@@ -116,9 +112,8 @@ struct AppState {
     /// observability deck survives a refresh (OCEAN-58). Convergence is still
     /// decided only by the per-council `QuorumEngine`; this only mirrors it.
     longhouse: LonghouseRegistryHandle,
-    /// Persistent Room lifecycle store (OCEAN-65 / OCEAN-107): the durable `Room`
-    /// entities (roster + transcript + trigger policy), distinct from the Track-0
-    /// `RoomSnapshot` projection served by `GET /v1/rooms`. Backed by
+    /// Persistent Room lifecycle store (OCEAN-65 / OCEAN-107): durable room
+    /// entities (roster + transcript + trigger policy), backed by
     /// `ocean_store::SqliteRoomStore` (OCEAN-86) so rooms and transcripts survive
     /// daemon restarts. Held behind a std `Mutex` like the longhouse registry —
     /// the guard is always dropped before any `await`, and every store method is
@@ -198,13 +193,6 @@ struct AppState {
     /// live content back here. Held behind a std `Mutex` (the guard is always
     /// dropped before any `await`).
     canvas_fulfillments: CanvasFulfillmentStore,
-    /// Per-Track-0-room component + participant ledger (OCEAN-277). Backs the
-    /// `components`/`participants` fields of `GET /v1/rooms/{room_id}/snapshot`,
-    /// which OCEAN-256 shipped always-empty. Fed by the surface-patch relay
-    /// (components) and room-bound-turn registration (participants); read by
-    /// [`build_room_projection`]. Bounded by [`gc_room_canvas`]. See
-    /// [`RoomCanvasStore`].
-    room_canvas: RoomCanvasStore,
     /// Daemon-wide shutdown signal (OCEAN-300). Fired once when the process
     /// receives SIGTERM/SIGINT. The infinite SSE handlers (`/v1/events`,
     /// `/v1/agent/events`) clone this and `take_until` it, so their otherwise
@@ -480,79 +468,6 @@ struct CanvasFulfillment {
     received_at: DateTime<Utc>,
 }
 
-/// Per-Track-0-room component + participant ledger (OCEAN-277).
-///
-/// Track-0 rooms (`pm`/`writers`/`orch_mesh`/`review`) are role lenses over the
-/// global runtime, not canvas-partitioned workspaces — so before this there was
-/// no per-room component or roster source and the projection shipped both fields
-/// always-empty (OCEAN-256). This store backs them from real state without faking:
-///
-/// - **components**: when a turn is submitted *with* a `room_id`, that turn's
-///   session is bound to the room (see [`bind_room_session`]). The surface-patch
-///   relay — which already has the turn's `room_id` and `session_id` in scope —
-///   feeds every `AgentTurnEvent::SurfacePatch` it emits into that room's
-///   component ledger via [`RoomCanvasLedger::apply_patch`], folding the
-///   upsert/move/resize/delete ops into the latest snapshot per
-///   `(canvas, component)`. The projection reads this back as real components.
-/// - **participants**: the set of sessions that have run a room-bound turn, i.e.
-///   the agents/operators actually active in that room's domain. Honest and
-///   derived, not a configured/fabricated roster.
-///
-/// A turn submitted with **no** `room_id` (the common foreground TUI case) binds
-/// to no Track-0 room, so its patches are intentionally *not* attributed to any
-/// room here — there is no room to attribute them to. That room's components stay
-/// honestly empty.
-///
-/// Bounded like the canvas-fulfillment store (OCEAN-273): every entry carries a
-/// last-touched timestamp and the GC sweep evicts by TTL + a hard per-store cap so
-/// a long-lived daemon never leaks (see [`gc_room_canvas`]). Held behind a std
-/// `Mutex`; the guard is always dropped before any `await`.
-type RoomCanvasStore = Arc<Mutex<HashMap<RoomId, RoomCanvasLedger>>>;
-
-/// One room's live component + participant ledger (OCEAN-277). Built incrementally
-/// from the surface-patch relay and the room-bound-turn registration; read by the
-/// projection. Nothing here is persisted — it is a live mirror of in-flight state,
-/// exactly like the rest of the Track-0 projection.
-#[derive(Default)]
-struct RoomCanvasLedger {
-    /// Latest component snapshot per `(canvas, component)` for this room. Folded
-    /// from surface-patch ops: `UpsertComponent` inserts/replaces, `Move`/`Resize`
-    /// update geometry on an existing entry, `DeleteComponent` removes. View-state
-    /// and edge ops (`Select`/`Focus`/`SetViewport`/`Connect`/…) don't define a
-    /// component register, so they don't create entries.
-    components: HashMap<(CanvasId, ComponentId), TrackedComponent>,
-    /// Sessions that have run a room-bound turn here — the room's real roster.
-    participants: HashMap<SessionId, RoomParticipantEntry>,
-}
-
-/// One tracked component in a [`RoomCanvasLedger`] (OCEAN-277): the latest known
-/// kind/geometry/content/metadata for a component on a room's canvas, plus when it
-/// was last touched (drives TTL eviction).
-#[derive(Clone)]
-struct TrackedComponent {
-    canvas_id: CanvasId,
-    component_id: ComponentId,
-    /// Component kind/template (`"card"`, `"brief_card"`, …) from the last upsert.
-    kind: String,
-    /// Latest placement, if any op has set one.
-    rect: Option<ocean_agent_sdk::surface::Rect>,
-    z_index: Option<i32>,
-    /// Latest free-form content payload (`null` until an upsert sets it).
-    content: Value,
-    /// Latest free-form metadata (`null` until an upsert sets it).
-    metadata: Value,
-    /// Last time a patch touched this component. Used by the GC sweep.
-    updated_at: DateTime<Utc>,
-}
-
-/// One participant in a [`RoomCanvasLedger`] (OCEAN-277): a session bound to the
-/// room by having run a turn there, plus the last time it did (drives TTL).
-#[derive(Clone)]
-struct RoomParticipantEntry {
-    session_id: SessionId,
-    last_seen: DateTime<Utc>,
-}
-
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
 type RoomStoreHandle = Arc<Mutex<ocean_store::SqliteRoomStore>>;
 /// Shared handle to the daemon's **persisted** Longhouse title registry
@@ -680,22 +595,6 @@ const REGISTRY_MAX_ENTRIES: usize = 10_000;
 /// runtime's lookup registry) expire on the same schedule.
 const CANVAS_FULFILLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
 
-/// TTL for entries in the per-room component/participant ledger (OCEAN-277). Like
-/// `canvas_fulfillments`, a tracked component or participant has no terminal state
-/// — the projection reads it without consuming it — so it is evictable purely by
-/// age. A component the agent stopped touching, or a session that long since went
-/// idle, is dropped once stale so the store mirrors *live* room state rather than
-/// accreting forever. Generous (well past a typical turn) so an active room keeps
-/// its components for the projection's lifetime.
-const ROOM_CANVAS_TTL: chrono::Duration = chrono::Duration::hours(6);
-
-/// Hard cap on tracked components (and, separately, participants) *per room*
-/// (OCEAN-277). A burst backstop independent of the TTL: on overflow the oldest
-/// (by last-touched) are evicted first, so a runaway producer can't grow one
-/// room's ledger without bound between GC ticks. Four rooms × this cap is the
-/// worst case, which stays small.
-const ROOM_CANVAS_MAX_PER_ROOM: usize = 2_000;
-
 impl RequestControl {
     /// Whether this request has reached a terminal lifecycle state.
     fn is_terminal(&self) -> bool {
@@ -727,10 +626,9 @@ impl PermissionWaiter {
 
 /// One GC sweep: drop terminal entries older than [`REGISTRY_TERMINAL_TTL`],
 /// then enforce [`REGISTRY_MAX_ENTRIES`] by evicting oldest-terminal first.
-/// Also bounds the `canvas_fulfillments` store, the runtime's process-global
-/// fulfillment lookup registry (OCEAN-273), and the per-room component/participant
-/// ledger (OCEAN-277) on the same tick. `now` is injected so the sweep is
-/// deterministic in tests.
+/// Also bounds the `canvas_fulfillments` store and the runtime's process-global
+/// fulfillment lookup registry (OCEAN-273) on the same tick. `now` is injected
+/// so the sweep is deterministic in tests.
 /// Record a failed background registry-GC sweep (OCEAN-371): bump the daemon-wide
 /// `gc_failures` total and escalate to `error!`. Factored out of the GC loop so the
 /// increment is unit-testable without injecting a real panic into `gc_registries`.
@@ -750,7 +648,6 @@ async fn gc_registries(
     requests: &RequestRegistry,
     permissions: &PermissionRegistry,
     canvas_fulfillments: &CanvasFulfillmentStore,
-    room_canvas: &RoomCanvasStore,
     now: DateTime<Utc>,
 ) {
     let ttl = REGISTRY_TERMINAL_TTL;
@@ -792,8 +689,6 @@ async fn gc_registries(
         ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL,
         ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_MAX_ENTRIES,
     );
-    // OCEAN-277: bound the per-room component/participant ledger on the same tick.
-    gc_room_canvas(room_canvas, now);
 }
 
 /// Trim `map` down to [`REGISTRY_MAX_ENTRIES`]. Removes oldest-terminal entries
@@ -820,255 +715,6 @@ where
         b.1.cmp(&a.1).then(a.2.cmp(&b.2))
     });
     for (key, _, _) in ranked.into_iter().take(overflow) {
-        map.remove(&key);
-    }
-}
-
-// --- Per-room component/participant ledger (OCEAN-277) -----------------------
-
-impl RoomCanvasLedger {
-    /// Fold one surface-patch op into this room's component ledger (OCEAN-277).
-    ///
-    /// `now` is injected so the sweep/recency is deterministic in tests. Only ops
-    /// that define a *component register* mutate the snapshot:
-    ///
-    /// - `UpsertComponent` inserts or replaces the component, carrying its
-    ///   kind/rect/z-index/content/metadata.
-    /// - `MoveComponent` / `ResizeComponent` update geometry on an existing entry
-    ///   (a move/resize for a component we've never seen is ignored — there is no
-    ///   register to mutate, and fabricating one would invent a component the
-    ///   upsert never created).
-    /// - `DeleteComponent` removes the entry.
-    ///
-    /// Edge ops (`Connect`/`Disconnect`), selection/focus/viewport view-state, and
-    /// `Layout`/`Group` (which touch many components without defining any) are not
-    /// component registers, so they are intentionally no-ops here — exactly the
-    /// same partition [`SurfacePatch::target_component`] draws for the merge layer.
-    fn apply_patch(&mut self, canvas_id: &CanvasId, patch: &SurfacePatch, now: DateTime<Utc>) {
-        match patch {
-            SurfacePatch::UpsertComponent { component } => {
-                let key = (canvas_id.clone(), component.id.clone());
-                self.components.insert(
-                    key,
-                    TrackedComponent {
-                        canvas_id: canvas_id.clone(),
-                        component_id: component.id.clone(),
-                        kind: component.kind.clone(),
-                        rect: component.rect,
-                        z_index: component.z_index,
-                        content: component.content.clone(),
-                        metadata: component.metadata.clone(),
-                        updated_at: now,
-                    },
-                );
-            }
-            SurfacePatch::MoveComponent { component_id, x, y } => {
-                if let Some(c) = self
-                    .components
-                    .get_mut(&(canvas_id.clone(), component_id.clone()))
-                {
-                    let mut rect = c.rect.unwrap_or(ocean_agent_sdk::surface::Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: 0.0,
-                        h: 0.0,
-                    });
-                    rect.x = *x;
-                    rect.y = *y;
-                    c.rect = Some(rect);
-                    c.updated_at = now;
-                }
-            }
-            SurfacePatch::ResizeComponent {
-                component_id,
-                width,
-                height,
-            } => {
-                if let Some(c) = self
-                    .components
-                    .get_mut(&(canvas_id.clone(), component_id.clone()))
-                {
-                    let mut rect = c.rect.unwrap_or(ocean_agent_sdk::surface::Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: 0.0,
-                        h: 0.0,
-                    });
-                    rect.w = *width;
-                    rect.h = *height;
-                    c.rect = Some(rect);
-                    c.updated_at = now;
-                }
-            }
-            SurfacePatch::DeleteComponent { component_id } => {
-                self.components
-                    .remove(&(canvas_id.clone(), component_id.clone()));
-            }
-            // Edge / view-state / multi-component ops don't define a component
-            // register (see `SurfacePatch::target_component`) — nothing to track.
-            SurfacePatch::Connect { .. }
-            | SurfacePatch::Disconnect { .. }
-            | SurfacePatch::Focus { .. }
-            | SurfacePatch::Select { .. }
-            | SurfacePatch::SetViewport { .. }
-            | SurfacePatch::Layout { .. }
-            | SurfacePatch::Group { .. } => {}
-        }
-    }
-
-    /// Record that `session` ran a turn in this room at `now` (OCEAN-277) — i.e.
-    /// it is a live participant. Idempotent: re-touches `last_seen` so an active
-    /// session is never GC'd out from under the projection.
-    fn touch_participant(&mut self, session: SessionId, now: DateTime<Utc>) {
-        self.participants
-            .entry(session)
-            .and_modify(|p| p.last_seen = now)
-            .or_insert(RoomParticipantEntry {
-                session_id: session,
-                last_seen: now,
-            });
-    }
-
-    /// True once nothing live remains, so the room's whole entry can be dropped.
-    fn is_empty(&self) -> bool {
-        self.components.is_empty() && self.participants.is_empty()
-    }
-}
-
-/// Bind a session to a Track-0 room (OCEAN-277): record it as a participant of the
-/// room it ran a turn in. Called from the agent-turn handler for a room-bound turn
-/// (`room_id == Some`). A turn with no `room_id` binds to no room and is not
-/// recorded — there is no Track-0 room to attribute it to. The std-`Mutex` guard
-/// is taken and dropped synchronously (no `await` held).
-fn bind_room_session(
-    store: &RoomCanvasStore,
-    room_id: RoomId,
-    session: SessionId,
-    now: DateTime<Utc>,
-) {
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
-    store
-        .entry(room_id)
-        .or_default()
-        .touch_participant(session, now);
-}
-
-/// Fold a relayed surface patch into a room's component ledger (OCEAN-277). Called
-/// from the surface-patch relay for a room-bound turn. The guard is taken and
-/// dropped synchronously.
-fn apply_room_surface_patch(
-    store: &RoomCanvasStore,
-    room_id: RoomId,
-    canvas_id: &CanvasId,
-    patch: &SurfacePatch,
-    now: DateTime<Utc>,
-) {
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
-    store
-        .entry(room_id)
-        .or_default()
-        .apply_patch(canvas_id, patch, now);
-}
-
-/// Snapshot the components + participants tracked for `room_id`, oldest-first by
-/// last-touched (OCEAN-277). Returns `(components, participants)` already shaped as
-/// the projection's `serde_json::Value` rows, so `build_room_projection` stays a
-/// pure function of its [`RoomProjectionInput`]. Empty vecs when nothing is
-/// tracked for the room — honestly empty, never fabricated.
-fn room_canvas_snapshot(store: &RoomCanvasStore, room_id: RoomId) -> (Vec<Value>, Vec<Value>) {
-    let store = store.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(ledger) = store.get(&room_id) else {
-        return (Vec::new(), Vec::new());
-    };
-
-    let mut components: Vec<&TrackedComponent> = ledger.components.values().collect();
-    components.sort_by_key(|c| c.updated_at);
-    let components = components
-        .into_iter()
-        .map(|c| {
-            let mut obj = serde_json::Map::new();
-            obj.insert("canvas_id".into(), json!(c.canvas_id.as_str()));
-            obj.insert("component_id".into(), json!(c.component_id.as_str()));
-            obj.insert("kind".into(), json!(c.kind));
-            if let Some(rect) = c.rect {
-                obj.insert(
-                    "rect".into(),
-                    json!({ "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h }),
-                );
-            }
-            if let Some(z) = c.z_index {
-                obj.insert("z_index".into(), json!(z));
-            }
-            if !c.content.is_null() {
-                obj.insert("content".into(), c.content.clone());
-            }
-            if !c.metadata.is_null() {
-                obj.insert("metadata".into(), c.metadata.clone());
-            }
-            obj.insert("updated_at".into(), json!(c.updated_at));
-            Value::Object(obj)
-        })
-        .collect();
-
-    let mut participants: Vec<&RoomParticipantEntry> = ledger.participants.values().collect();
-    participants.sort_by_key(|p| p.last_seen);
-    let participants = participants
-        .into_iter()
-        .map(|p| {
-            json!({
-                "kind": "session",
-                "session_id": p.session_id,
-                "last_seen": p.last_seen,
-            })
-        })
-        .collect();
-
-    (components, participants)
-}
-
-/// Bound the per-room component/participant ledger (OCEAN-277), mirroring the
-/// canvas-fulfillment sweep (OCEAN-273). For every room: drop components and
-/// participants older than [`ROOM_CANVAS_TTL`], then enforce
-/// [`ROOM_CANVAS_MAX_PER_ROOM`] on each map (oldest-by-last-touched evicted first),
-/// and finally drop any room whose ledger went fully empty so the outer map
-/// doesn't retain empty shells. `now` is injected for deterministic tests.
-fn gc_room_canvas(store: &RoomCanvasStore, now: DateTime<Utc>) {
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
-    let ttl = ROOM_CANVAS_TTL;
-    for ledger in store.values_mut() {
-        ledger.components.retain(|_, c| (now - c.updated_at) <= ttl);
-        if ledger.components.len() > ROOM_CANVAS_MAX_PER_ROOM {
-            evict_overflow_to(&mut ledger.components, ROOM_CANVAS_MAX_PER_ROOM, |c| {
-                c.updated_at
-            });
-        }
-        ledger
-            .participants
-            .retain(|_, p| (now - p.last_seen) <= ttl);
-        if ledger.participants.len() > ROOM_CANVAS_MAX_PER_ROOM {
-            evict_overflow_to(&mut ledger.participants, ROOM_CANVAS_MAX_PER_ROOM, |p| {
-                p.last_seen
-            });
-        }
-    }
-    store.retain(|_, ledger| !ledger.is_empty());
-}
-
-/// Trim `map` down to `max` entries, evicting oldest-by-`at` first (OCEAN-277).
-/// A simpler sibling of [`evict_overflow`] for the per-room ledger maps, whose
-/// entries have no terminal/live distinction — only an age.
-fn evict_overflow_to<K, V, FAt>(map: &mut HashMap<K, V>, max: usize, at: FAt)
-where
-    K: std::hash::Hash + Eq + Clone,
-    FAt: Fn(&V) -> DateTime<Utc>,
-{
-    if map.len() <= max {
-        return;
-    }
-    let overflow = map.len() - max;
-    let mut ranked: Vec<(K, DateTime<Utc>)> = map.iter().map(|(k, v)| (k.clone(), at(v))).collect();
-    ranked.sort_by_key(|(_, at)| *at);
-    for (key, _) in ranked.into_iter().take(overflow) {
         map.remove(&key);
     }
 }
@@ -1499,7 +1145,6 @@ async fn main() -> anyhow::Result<()> {
         sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-        room_canvas: Arc::new(Mutex::new(HashMap::new())),
         // OCEAN-300: a single daemon-wide shutdown token, cloned into the SSE
         // handlers and fired by the signal handler so live streams terminate.
         shutdown: CancellationToken::new(),
@@ -1519,7 +1164,6 @@ async fn main() -> anyhow::Result<()> {
         let requests = state.requests.clone();
         let permissions = state.permissions.clone();
         let canvas_fulfillments = state.canvas_fulfillments.clone();
-        let room_canvas = state.room_canvas.clone();
         let gc_failures = state.gc_failures.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(REGISTRY_GC_INTERVAL);
@@ -1536,10 +1180,10 @@ async fn main() -> anyhow::Result<()> {
                 let reqs = requests.clone();
                 let perms = permissions.clone();
                 let canvas = canvas_fulfillments.clone();
-                let rooms = room_canvas.clone();
-                let sweep = tokio::spawn(async move {
-                    gc_registries(&reqs, &perms, &canvas, &rooms, Utc::now()).await
-                });
+                let sweep =
+                    tokio::spawn(
+                        async move { gc_registries(&reqs, &perms, &canvas, Utc::now()).await },
+                    );
                 if let Err(join_err) = sweep.await {
                     // OCEAN-371: bump the daemon-wide `gc_failures_total` counter
                     // (surfaced at `GET /health` + `GET /metrics`) so a sustained
@@ -1619,54 +1263,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/requests/{id}/cancel", post(cancel_request))
         .route("/v1/permissions", get(permissions))
         .route("/v1/permissions/{id}/decision", post(permission_decision))
-        .route("/v1/rooms", get(rooms))
-        // Persistent Room lifecycle (OCEAN-65). Namespaced under `/persistent`
-        // so it never shadows the Track-0 projection route `/v1/rooms/{room_id}`
-        // below: `persistent` is a reserved segment, real room keys live one
-        // level deeper at `/v1/rooms/persistent/{key}`.
-        .route(
-            "/v1/rooms/persistent",
-            get(rooms_list_persistent).post(room_create),
-        )
-        .route("/v1/rooms/persistent/{key}", get(room_get))
-        .route("/v1/rooms/persistent/{key}/participants", post(room_join))
-        .route(
-            "/v1/rooms/persistent/{key}/participants/{participant_id}",
-            axum::routing::delete(room_leave),
-        )
-        .route(
-            "/v1/rooms/persistent/{key}/messages",
-            post(room_post_message),
-        )
-        .route(
-            "/v1/rooms/persistent/{key}/transcript",
-            get(room_transcript),
-        )
-        // OCEAN-232: store-backed room hydration. `snapshot` is the one-read
-        // "load full state on room switch" the collaboration model calls for;
-        // `events` is its live-tail companion (`?after_seq=`). Both sit in the
-        // persistent block beside `transcript` since they read the same store.
-        .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
-        .route("/v1/rooms/persistent/{key}/events", get(room_events))
-        .route("/v1/rooms/{room_id}", get(room))
-        // OCEAN-256: the richer Track-0 projection. `snapshot` carries per-room
-        // turns / active_turn / message feed computed live from runtime state;
-        // `events` is its `?after_seq=` live-tail. The projection counterpart to
-        // the persistent rooms' snapshot/events, but for the four computed rooms.
-        // `{room_id}` here is a Track-0 enum id, never `persistent` (that block is
-        // matched by the routes above), so these never shadow each other.
-        .route(
-            "/v1/rooms/{room_id}/snapshot",
-            get(room_projection_snapshot),
-        )
-        .route("/v1/rooms/{room_id}/events", get(room_projection_events))
-        // OCEAN-137: mint a LiveKit join token for a room. The proxy + web
-        // surface already POST to this path; the daemon honors it here so
-        // in-room voice/video connects on web instead of 404ing.
-        .route(
-            "/v1/rooms/{room_id}/livekit-token",
-            post(room_livekit_token),
-        )
+        .merge(room_routes())
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
         // Folder-as-agent classification (read-only): list + resolve agents from
@@ -1989,10 +1586,6 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/requests/{id}/cancel",
         "GET /v1/permissions",
         "POST /v1/permissions/{id}/decision",
-        "GET /v1/rooms",
-        "GET /v1/rooms/{room_id}",
-        "GET /v1/rooms/{room_id}/snapshot",
-        "GET /v1/rooms/{room_id}/events",
         "POST /v1/rooms/{room_id}/livekit-token",
         "GET /v1/rooms/persistent",
         "POST /v1/rooms/persistent",
@@ -3097,6 +2690,37 @@ async fn yolo_setting_set(Json(req): Json<YoloSetRequest>) -> Json<serde_json::V
 /// convene/quorum flow, and `docs/LONGHOUSE.md` documents the council path as a
 /// live route. Both names dispatch to the identical `longhouse_convene` handler
 /// so a client following the canonical doc no longer 404s.
+/// Durable collaboration room routes plus the independent LiveKit media-token
+/// endpoint. Kept as one router group so tests can prove the retired Track-0
+/// projection paths stay unmounted without constructing the entire daemon.
+fn room_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/v1/rooms/persistent",
+            get(rooms_list_persistent).post(room_create),
+        )
+        .route("/v1/rooms/persistent/{key}", get(room_get))
+        .route("/v1/rooms/persistent/{key}/participants", post(room_join))
+        .route(
+            "/v1/rooms/persistent/{key}/participants/{participant_id}",
+            axum::routing::delete(room_leave),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/messages",
+            post(room_post_message),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/transcript",
+            get(room_transcript),
+        )
+        .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
+        .route("/v1/rooms/persistent/{key}/events", get(room_events))
+        .route(
+            "/v1/rooms/{room_id}/livekit-token",
+            post(room_livekit_token),
+        )
+}
+
 fn longhouse_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/longhouse/demo", post(longhouse_demo))
@@ -5438,7 +5062,7 @@ async fn longhouse_topics(State(state): State<AppState>) -> Json<serde_json::Val
 
 /// `GET /v1/longhouse/topics/{topic_id}` — one topic's full observable state by
 /// id. 404 if the topic id is unknown, 400 if it isn't a valid UUID. Mirrors the
-/// `GET /v1/rooms/{room_id}` shape: a typed error body, never a panic.
+/// client-facing API shape: a typed error body, never a panic.
 async fn longhouse_topic(
     State(state): State<AppState>,
     Path(topic_id): Path<String>,
@@ -6140,8 +5764,7 @@ async fn longhouse_board_post(
 //
 // These routes serve the *persistent* `Room` lifecycle: create, fetch, roster
 // join/leave, post message, read transcript. They are intentionally additive and
-// fully separate from the Track-0 `RoomSnapshot` projection (`GET /v1/rooms`,
-// `GET /v1/rooms/{room_id}`), which is untouched. They also live entirely apart
+// fully separate from ephemeral agent sessions. They also live entirely apart
 // from the `agent_turn` handler and its cwd/permission machinery, which is in
 // flight on held security PRs — none of this code touches turn execution.
 //
@@ -6470,8 +6093,8 @@ async fn room_post_message(
             };
 
             // Emit a notice onto the agent event bus so any subscriber sees the
-            // convene. Uses the generic Extension event so it never collides
-            // with the Track-0/longhouse event scoping rules.
+            // convene. Uses the generic Extension event so it respects the
+            // existing agent-event scoping rules.
             state.agent_events.emit(AgentTurnEvent::Extension {
                 extension: "room_trigger".into(),
                 payload: json!({
@@ -6883,10 +6506,8 @@ async fn room_transcript(
 ///
 /// This is the store-backed realization of the collaboration model's "Room
 /// hydration / snapshot" step (OCEAN-232): switching into a room must load full
-/// state, not just subscribe to future events. The richer Track-0 projection
-/// snapshot (per-room turns / rendered components / active_turn) stays a planned
-/// follow-up — that data isn't persisted yet — but persistent rooms carry
-/// everything hydration needs today, so we serve it rather than 404.
+/// state, not just subscribe to future events. Persistent rooms carry everything
+/// hydration needs, so this endpoint serves the durable snapshot directly.
 ///
 /// Like `room_get`/`room_transcript`, falls back to the soft-closed audit view so
 /// a finished call's frozen room (closed on `CallEnded`, OCEAN-170) stays
@@ -7725,697 +7346,6 @@ async fn session(
     }
 }
 
-async fn rooms(State(state): State<AppState>) -> Json<RoomsResponse> {
-    let input = room_projection_input(&state, None).await;
-    Json(RoomsResponse {
-        ok: true,
-        rooms: build_room_snapshots(&input),
-        error: None,
-    })
-}
-
-async fn room(
-    State(state): State<AppState>,
-    Path(room_id): Path<String>,
-) -> (StatusCode, Json<RoomsResponse>) {
-    let room_id = match parse_room_id(&room_id) {
-        Ok(room_id) => room_id,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(RoomsResponse {
-                    ok: false,
-                    rooms: vec![],
-                    error: Some(error),
-                }),
-            );
-        }
-    };
-
-    let input = room_projection_input(&state, None).await;
-    let room = build_room_snapshot(&input, room_id);
-    (
-        StatusCode::OK,
-        Json(RoomsResponse {
-            ok: true,
-            rooms: vec![room],
-            error: None,
-        }),
-    )
-}
-
-/// `GET /v1/rooms/{room_id}/snapshot` — the richer Track-0 projection (OCEAN-256):
-/// per-room **turns**, the **active_turn**, and a **messages** feed, all computed
-/// live from daemon runtime state (the request registry + recent event ring), not
-/// a store. `components`/`participants` ship empty and are flagged in
-/// `projection.planned` because no per-room component ledger / Track-0 roster is
-/// persisted yet — the response self-documents real vs planned rather than faking
-/// fields.
-///
-/// This is the projection counterpart to the persistent-room
-/// `GET /v1/rooms/persistent/{key}/snapshot`. An unknown room id (anything that
-/// is not one of the four Track-0 rooms) is **404** — these four are a closed set,
-/// so an unrecognized id is a missing resource, not a malformed request.
-async fn room_projection_snapshot(
-    State(state): State<AppState>,
-    Path(room_id): Path<String>,
-) -> (StatusCode, Json<RoomProjectionResponse>) {
-    let Some(room_id) = RoomId::parse(room_id.trim()) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(RoomProjectionResponse {
-                ok: false,
-                room: None,
-                error: Some(format!(
-                    "no Track-0 room '{room_id}'; expected pm, writers, orch_mesh, or review"
-                )),
-            }),
-        );
-    };
-
-    let input = room_projection_input(&state, Some(room_id)).await;
-    let projection = build_room_projection(&input, room_id);
-    (
-        StatusCode::OK,
-        Json(RoomProjectionResponse {
-            ok: true,
-            room: Some(projection),
-            error: None,
-        }),
-    )
-}
-
-/// `GET /v1/rooms/{room_id}/events?after_seq=N` — the live-tail companion to the
-/// projection snapshot (OCEAN-256). Returns the projected message feed with
-/// `seq > N` (omit `after_seq` for the whole current feed), plus `last_seq` so a
-/// client that just snapshotted can poll only what is new. The feed is the
-/// daemon's recent runtime event ring reshaped per the room lens — the same
-/// `messages` the snapshot carries — so this stays a thin filter over
-/// [`build_room_projection`]. Unknown room id ⇒ 404, matching `snapshot`.
-async fn room_projection_events(
-    State(state): State<AppState>,
-    Path(room_id): Path<String>,
-    Query(q): Query<TranscriptQuery>,
-) -> (StatusCode, Json<RoomEventsResponse>) {
-    let Some(room_id) = RoomId::parse(room_id.trim()) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(RoomEventsResponse {
-                ok: false,
-                events: vec![],
-                last_seq: None,
-                error: Some(format!(
-                    "no Track-0 room '{room_id}'; expected pm, writers, orch_mesh, or review"
-                )),
-            }),
-        );
-    };
-
-    let input = room_projection_input(&state, Some(room_id)).await;
-    let projection = build_room_projection(&input, room_id);
-    let after = q.after_seq.unwrap_or(0);
-    let events: Vec<RoomProjectedMessage> = projection
-        .messages
-        .into_iter()
-        .filter(|m| m.seq > after)
-        .collect();
-    let last_seq = events.last().map(|m| m.seq);
-    (
-        StatusCode::OK,
-        Json(RoomEventsResponse {
-            ok: true,
-            events,
-            last_seq,
-            error: None,
-        }),
-    )
-}
-
-fn parse_room_id(room_id: &str) -> Result<RoomId, String> {
-    RoomId::parse(room_id).ok_or_else(|| {
-        format!("invalid room id '{room_id}'; expected pm, writers, orch_mesh, or review")
-    })
-}
-
-struct RoomProjectionInput {
-    runtime_status: String,
-    sessions: Vec<SessionSummary>,
-    requests: Vec<RequestStatus>,
-    permissions: Vec<PermissionStatus>,
-    events: Vec<EventEnvelope>,
-    /// Components tracked for the room being projected (OCEAN-277), already shaped
-    /// as JSON rows by [`room_canvas_snapshot`]. Empty for room-agnostic callers
-    /// (the multi-room `RoomSnapshot` views, which don't carry components) and for
-    /// a room with no surface-patch activity.
-    room_components: Vec<Value>,
-    /// Participants (room-bound sessions) tracked for the room being projected
-    /// (OCEAN-277). Empty for room-agnostic callers and idle rooms.
-    room_participants: Vec<Value>,
-}
-
-/// Gather the live state the room projection lenses. `room` scopes the per-room
-/// component/participant ledger (OCEAN-277): pass `Some(room)` for the structured
-/// `/v1/rooms/{room}/snapshot` projection so its `components`/`participants` are
-/// backed, or `None` for the room-agnostic `RoomSnapshot` views which carry
-/// neither. The runtime-status/sessions/requests/events lenses are global either
-/// way (Track-0 rooms share the same underlying runtime state).
-async fn room_projection_input(state: &AppState, room: Option<RoomId>) -> RoomProjectionInput {
-    let sessions = state.runtime.list_sessions(None).unwrap_or_default();
-    let requests = state
-        .requests
-        .read()
-        .await
-        .values()
-        .map(|control| control.status.clone())
-        .collect::<Vec<_>>();
-    let permissions = pending_permissions_snapshot(&state.permissions).await;
-    let events = state.events.recent(32);
-    let (room_components, room_participants) = match room {
-        Some(room) => room_canvas_snapshot(&state.room_canvas, room),
-        None => (Vec::new(), Vec::new()),
-    };
-
-    RoomProjectionInput {
-        runtime_status: runtime_status_line(state.runtime.as_ref()),
-        sessions,
-        requests,
-        permissions,
-        events,
-        room_components,
-        room_participants,
-    }
-}
-
-fn build_room_snapshots(input: &RoomProjectionInput) -> Vec<RoomSnapshot> {
-    [
-        RoomId::Pm,
-        RoomId::Writers,
-        RoomId::OrchMesh,
-        RoomId::Review,
-    ]
-    .into_iter()
-    .map(|room_id| build_room_snapshot(input, room_id))
-    .collect()
-}
-
-fn build_room_snapshot(input: &RoomProjectionInput, room_id: RoomId) -> RoomSnapshot {
-    let updated_ms = input
-        .events
-        .first()
-        .map(|event| event.at.timestamp_millis())
-        .unwrap_or_else(|| Utc::now().timestamp_millis());
-
-    let panels = match room_id {
-        RoomId::Pm => vec![
-            panel(
-                "Prompt rail",
-                "event feed",
-                if input.events.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_events(&input.events, 4),
-            ),
-            panel(
-                "Sessions",
-                "session list",
-                if input.sessions.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_sessions(&input.sessions, 4),
-            ),
-            panel(
-                "Runtime",
-                "daemon state",
-                "status",
-                vec![
-                    input.runtime_status.clone(),
-                    format!("requests: {}", input.requests.len()),
-                ],
-            ),
-        ],
-        RoomId::Writers => vec![
-            panel(
-                "Drafts",
-                "session list",
-                if input.sessions.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_sessions(&input.sessions, 5),
-            ),
-            panel(
-                "Transcript cues",
-                "event feed",
-                if input.events.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_events(&input.events, 5),
-            ),
-            panel(
-                "Runtime",
-                "daemon state",
-                "status",
-                vec![
-                    input.runtime_status.clone(),
-                    format!("sessions: {}", input.sessions.len()),
-                ],
-            ),
-        ],
-        RoomId::OrchMesh => vec![
-            panel(
-                "Board",
-                "request rail",
-                if input.requests.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_requests(&input.requests, 5),
-            ),
-            panel(
-                "Permissions",
-                "approval rail",
-                if input.permissions.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_permissions(&input.permissions, 5),
-            ),
-            panel(
-                "Events",
-                "control feed",
-                if input.events.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_events(&input.events, 6),
-            ),
-        ],
-        RoomId::Review => vec![
-            panel(
-                "Review queue",
-                "request rail",
-                if input.requests.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_requests(&input.requests, 4),
-            ),
-            panel(
-                "Evidence",
-                "event rail",
-                if input.events.is_empty() {
-                    "empty"
-                } else {
-                    "active"
-                },
-                summarize_events(&input.events, 4),
-            ),
-            panel(
-                "Gate",
-                "release status",
-                "status",
-                vec![
-                    input.runtime_status.clone(),
-                    format!("pending permissions: {}", input.permissions.len()),
-                ],
-            ),
-        ],
-    };
-
-    RoomSnapshot {
-        room_id,
-        title: room_id.title().into(),
-        summary: room_id.summary().into(),
-        status: input.runtime_status.clone(),
-        updated_ms,
-        panels,
-    }
-}
-
-/// Reshape one tracked request into a [`RoomTurn`] for the projection. A turn IS
-/// a request in the daemon's model, so this is a 1:1 view, plus the derived
-/// `active` flag (true until the request reaches a terminal state).
-fn request_to_turn(status: &RequestStatus) -> RoomTurn {
-    RoomTurn {
-        turn_id: status.request_id,
-        session_id: status.session_id,
-        state: request_state_label(status.state).to_string(),
-        active: !status.state.is_terminal(),
-        message: status.message.clone(),
-        started_at: status.started_at,
-        updated_at: status.updated_at,
-        finished_at: status.finished_at,
-    }
-}
-
-/// Order key for turn recency: newest activity first. Falls back through the
-/// available timestamps so a freshly-queued turn (no `started_at` yet) still
-/// sorts sensibly.
-fn turn_recency(status: &RequestStatus) -> DateTime<Utc> {
-    status
-        .finished_at
-        .or(status.updated_at)
-        .or(status.started_at)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now))
-}
-
-/// Compute the richer Track-0 projection for one room (OCEAN-256).
-///
-/// This is the real, computed backing for `GET /v1/rooms/{room_id}/snapshot`. It
-/// derives **turns** and the **active_turn** from the daemon's live request
-/// registry, and a **messages** feed from the recent runtime event ring — both
-/// real tracked state. As of OCEAN-277 **components** and **participants** are also
-/// real: they come from the per-room ledger ([`RoomCanvasStore`]) carried on the
-/// [`RoomProjectionInput`], folded from this room's bound turns' surface patches
-/// (components) and the room's bound sessions (participants). All are honestly
-/// empty — never fabricated — for a room with no such activity.
-///
-/// Track-0 rooms are role lenses over the *same* global runtime state rather than
-/// workspace-partitioned rooms with private transcripts, so every room sees the
-/// same underlying request/event set (just as the summary panels in
-/// [`build_room_snapshot`] already do). The projection's value over the panels is
-/// that it is *structured* — turns/active_turn/messages a client can render and
-/// correlate — not pre-summarized strings.
-fn build_room_projection(input: &RoomProjectionInput, room_id: RoomId) -> RoomProjection {
-    // --- turns + active_turn (REAL: from the tracked request registry) ---
-    let mut ordered: Vec<&RequestStatus> = input.requests.iter().collect();
-    // Most-recent activity first.
-    ordered.sort_by_key(|status| std::cmp::Reverse(turn_recency(status)));
-
-    let turns: Vec<RoomTurn> = ordered
-        .iter()
-        .map(|status| request_to_turn(status))
-        .collect();
-
-    // The active turn is the most-recently-active non-terminal request. Track-0
-    // does not enforce one-active-turn-per-room, so we surface the freshest live
-    // turn as the room's current focus (and the full set stays in `turns`).
-    let active_turn = ordered
-        .iter()
-        .find(|status| !status.state.is_terminal())
-        .map(|status| request_to_turn(status));
-
-    // --- messages (REAL: from the recent runtime event ring) ---
-    // `events.recent()` returns newest-first; reverse to oldest-first so `seq` is
-    // monotonic-ascending and `after_seq` tailing behaves like the persistent
-    // rooms' transcript.
-    let mut chronological: Vec<&EventEnvelope> = input.events.iter().collect();
-    chronological.reverse();
-    let messages: Vec<RoomProjectedMessage> = chronological
-        .iter()
-        .enumerate()
-        .map(|(idx, env)| RoomProjectedMessage {
-            seq: (idx as u64) + 1,
-            at: env.at,
-            session_id: env.session_id,
-            request_id: env.request_id,
-            summary: event_summary(env),
-        })
-        .collect();
-    let last_seq = messages.last().map(|m| m.seq);
-
-    let updated_ms = input
-        .events
-        .first()
-        .map(|event| event.at.timestamp_millis())
-        .unwrap_or_else(|| Utc::now().timestamp_millis());
-
-    let updated_ms = input
-        .room_components
-        .iter()
-        .chain(input.room_participants.iter())
-        .filter_map(|row| row.get("updated_at").or_else(|| row.get("last_seen")))
-        .filter_map(|v| v.as_str())
-        .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.timestamp_millis())
-        .chain(std::iter::once(updated_ms))
-        .max()
-        .unwrap_or(updated_ms);
-
-    RoomProjection {
-        room_id,
-        title: room_id.title().into(),
-        summary: room_id.summary().into(),
-        status: input.runtime_status.clone(),
-        updated_ms,
-        messages,
-        turns,
-        // REAL (OCEAN-277): folded from this turn's relayed surface patches and the
-        // room's bound sessions. Honestly empty when this room has had no
-        // surface-patch activity / no room-bound turns — the *source* exists either
-        // way, exactly like `turns`/`messages` are real-but-empty for an idle room.
-        components: input.room_components.clone(),
-        participants: input.room_participants.clone(),
-        active_turn,
-        last_seq,
-        projection: RoomProjectionProvenance {
-            real: vec![
-                "turns".into(),
-                "active_turn".into(),
-                "messages".into(),
-                "last_seq".into(),
-                "status".into(),
-                // OCEAN-277: now backed by the per-room component/participant ledger.
-                "components".into(),
-                "participants".into(),
-            ],
-            planned: vec![],
-        },
-    }
-}
-
-fn panel(title: &str, kind: &str, status: &str, mut lines: Vec<String>) -> RoomPanelSnapshot {
-    if lines.is_empty() {
-        lines.push("no live data yet".into());
-    }
-
-    RoomPanelSnapshot {
-        title: title.into(),
-        kind: kind.into(),
-        status: status.into(),
-        lines,
-    }
-}
-
-fn runtime_status_line(runtime: &AgentRuntime) -> String {
-    let readiness = runtime.provider_readiness();
-    let mut status = format!(
-        "{} · {} · {} · {}",
-        runtime.backend_name(),
-        readiness.provider.as_str(),
-        readiness.model,
-        if readiness.ok { "ready" } else { "degraded" }
-    );
-
-    if let Some(error) = readiness.error.as_ref() {
-        status.push_str(" · ");
-        status.push_str(&error.to_string());
-    }
-
-    status
-}
-
-fn summarize_sessions(sessions: &[SessionSummary], limit: usize) -> Vec<String> {
-    let mut lines = sessions
-        .iter()
-        .take(limit)
-        .map(|session| {
-            format!(
-                "{} · {} turns · {}",
-                short_id(session.id),
-                session.turns,
-                session.title
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if lines.is_empty() {
-        lines.push("no sessions yet".into());
-    }
-
-    lines
-}
-
-fn summarize_requests(requests: &[RequestStatus], limit: usize) -> Vec<String> {
-    let mut lines = requests
-        .iter()
-        .take(limit)
-        .map(|status| {
-            let mut line = format!(
-                "{} · {}",
-                short_id(status.request_id),
-                request_state_label(status.state)
-            );
-            if let Some(message) = status.message.as_deref() {
-                line.push_str(" · ");
-                line.push_str(message);
-            }
-            line
-        })
-        .collect::<Vec<_>>();
-
-    if lines.is_empty() {
-        lines.push("no requests yet".into());
-    }
-
-    lines
-}
-
-fn summarize_permissions(permissions: &[PermissionStatus], limit: usize) -> Vec<String> {
-    let mut lines = permissions
-        .iter()
-        .take(limit)
-        .map(|permission| {
-            format!(
-                "{} · {} · {}",
-                short_id(permission.request_id),
-                permission.tool,
-                permission.reason
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if lines.is_empty() {
-        lines.push("no pending permissions".into());
-    }
-
-    lines
-}
-
-fn summarize_events(events: &[EventEnvelope], limit: usize) -> Vec<String> {
-    let mut lines = events
-        .iter()
-        .take(limit)
-        .map(event_summary)
-        .collect::<Vec<_>>();
-
-    if lines.is_empty() {
-        lines.push("no recent events".into());
-    }
-
-    lines
-}
-
-fn event_summary(event: &EventEnvelope) -> String {
-    let actor = event
-        .request_id
-        .map(short_id)
-        .or_else(|| event.session_id.map(short_id))
-        .unwrap_or_else(|| short_id(event.id));
-
-    match &event.event {
-        OceanEvent::SessionCreated => format!("{actor} · session created"),
-        OceanEvent::UserMessage { text } => format!("{actor} · user: {}", trim_line(text, 48)),
-        OceanEvent::AssistantDelta { text } => {
-            format!("{actor} · assistant: {}", trim_line(text, 48))
-        }
-        OceanEvent::ToolStarted { tool, .. } => format!("{actor} · tool start: {tool}"),
-        OceanEvent::ToolOutput {
-            tool,
-            text,
-            is_error,
-        } => format!(
-            "{actor} · tool {}: {}",
-            tool,
-            if *is_error {
-                trim_line(text, 42)
-            } else {
-                trim_line(text, 48)
-            }
-        ),
-        OceanEvent::ToolEnded { tool, is_error } => format!(
-            "{actor} · tool end: {tool}{}",
-            if *is_error { " (error)" } else { "" }
-        ),
-        OceanEvent::PermissionRequest { tool, reason, .. } => {
-            format!("{actor} · perm: {tool} · {reason}")
-        }
-        OceanEvent::PermissionDecision { allowed, reason } => format!(
-            "{actor} · permission {}{}",
-            if *allowed { "allowed" } else { "denied" },
-            reason
-                .as_deref()
-                .map(|reason| format!(": {reason}"))
-                .unwrap_or_default()
-        ),
-        OceanEvent::TurnFinished { ok, wall_ms } => {
-            format!(
-                "{actor} · turn {} · {wall_ms}ms",
-                if *ok { "ok" } else { "failed" }
-            )
-        }
-        OceanEvent::Cancelled { reason } => format!(
-            "{actor} · cancelled{}",
-            reason
-                .as_deref()
-                .map(|reason| format!(": {reason}"))
-                .unwrap_or_default()
-        ),
-        OceanEvent::Error { message } => format!("{actor} · error: {}", trim_line(message, 48)),
-        OceanEvent::CallStarted { room_id, .. } => format!("{actor} · call started · {room_id}"),
-        OceanEvent::CallTranscriptSegment { speaker, text, .. } => {
-            format!("{actor} · {speaker}: {}", trim_line(text, 42))
-        }
-        OceanEvent::CallSummaryUpdated { summary, .. } => {
-            format!("{actor} · call summary: {}", trim_line(summary, 42))
-        }
-        OceanEvent::CallTaskDetected { title, .. } => {
-            format!("{actor} · task: {}", trim_line(title, 44))
-        }
-        OceanEvent::CallWakeTriggered { utterance } => {
-            format!("{actor} · wake: {}", trim_line(utterance, 44))
-        }
-        OceanEvent::CallAgentSpoke { text } => {
-            format!("{actor} · spoke: {}", trim_line(text, 44))
-        }
-        OceanEvent::CallEnded { duration_ms, .. } => {
-            format!("{actor} · call ended · {duration_ms}ms")
-        }
-    }
-}
-
-fn request_state_label(state: RequestState) -> &'static str {
-    match state {
-        RequestState::Queued => "queued",
-        RequestState::Running => "running",
-        RequestState::WaitingForPermission => "waiting-permission",
-        RequestState::Cancelling => "cancelling",
-        RequestState::Cancelled => "cancelled",
-        RequestState::Completed => "completed",
-        RequestState::Errored => "errored",
-    }
-}
-
-fn short_id(id: uuid::Uuid) -> String {
-    id.to_string().chars().take(8).collect()
-}
-
-fn trim_line(text: &str, max_chars: usize) -> String {
-    let trimmed = text.lines().next().unwrap_or_default().trim();
-    let count = trimmed.chars().count();
-    if count <= max_chars {
-        return trimmed.to_string();
-    }
-
-    let mut clipped = trimmed
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    clipped.push('…');
-    clipped
-}
-
 async fn enrich_session_detail(state: &AppState, session: &mut SessionDetail) {
     let requests = state.requests.read().await;
     let mut matching = requests
@@ -8800,8 +7730,6 @@ struct AgentVoiceRequest {
     #[serde(default)]
     cwd: String,
     #[serde(default)]
-    room_id: Option<String>,
-    #[serde(default)]
     project_id: Option<Uuid>,
     /// Per-turn permission secret (OCEAN-224, extending OCEAN-185). A voice
     /// caller that can answer a permission prompt (the surface proxy relaying
@@ -8898,7 +7826,6 @@ async fn agent_voice(
         prompt: req.transcript,
         cwd: req.cwd,
         guidance: None,
-        room_id: req.room_id,
         project_id: req.project_id,
         // Canonical voice client_type (see AgentTurnRequest::client_type docs).
         client_type: Some("leo-voice".to_string()),
@@ -9187,9 +8114,8 @@ async fn agent_turn(
         // OCEAN-143: previously `guidance: _` — the documented `guidance`
         // turn-field was destructured and dropped on the floor, so it was
         // advertised as live but never reached the model. It is now folded into
-        // the turn prompt below, layered with room guidance.
+        // the turn prompt below.
         guidance,
-        room_id,
         project_id,
         client_type,
         thinking_level,
@@ -9366,29 +8292,6 @@ async fn agent_turn(
         );
     }
 
-    // Parse room_id for F1-F4 guidance injection (new in Track-0 room migration).
-    let room_id = match parse_agent_turn_room(room_id.as_deref()) {
-        Ok(room_id) => room_id,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(AgentTurnResponse {
-                    ok: false,
-                    turn_id,
-                    session_id,
-                    status: AgentTurnStatus::Failed,
-                    event_id_prefix: event_prefix,
-                    error: Some(error),
-                    output_tokens: None,
-                    input_tokens: None,
-                    cache_read_tokens: None,
-                    tokens_per_second: None,
-                    wall_ms: None,
-                }),
-            );
-        }
-    };
-
     // Emit turn_started, tagged with the model driving this turn so clients
     // can show it live and reflect a mid-session swap. A per-turn `model_id`
     // override (OCEAN-36) wins over the global model for this readout, so the
@@ -9415,7 +8318,7 @@ async fn agent_turn(
     // The bypass is opt-in, never the silent default.
     let yolo = effective_yolo();
 
-    let guided_prompt = apply_turn_guidance(room_id, guidance.as_deref(), &prompt);
+    let guided_prompt = apply_turn_guidance(guidance.as_deref(), &prompt);
 
     // Folder-as-agent: when the turn names an `agent`, prepend that agent's
     // `instructions.md` as a steering layer — the same purely-additive prompt
@@ -9526,23 +8429,6 @@ async fn agent_turn(
     let bridge_bus = state.agent_events.clone();
     let bridge_turn_id = turn_id;
     let bridge_session_id = session_id;
-
-    // OCEAN-277: a turn submitted *with* a `room_id` binds its session to that
-    // Track-0 room. Record the participant now (so the projection shows the room's
-    // roster even before any patch lands) and hand the room into the bridge below,
-    // so every surface patch this turn emits is folded into that room's component
-    // ledger. A turn with no `room_id` binds to no room — nothing is recorded, and
-    // its patches are attributed to no Track-0 room (there is none to attribute to).
-    let bridge_room_id = room_id;
-    if let Some(room) = bridge_room_id {
-        bind_room_session(
-            &state.room_canvas,
-            room,
-            core_sid(bridge_session_id),
-            Utc::now(),
-        );
-    }
-    let bridge_room_canvas = state.room_canvas.clone();
 
     let bridge = tokio::spawn(async move {
         let mut tool_call_ids: HashMap<String, ToolCallId> = HashMap::new();
@@ -9714,46 +8600,21 @@ async fn agent_turn(
                     };
                     let canvas = CanvasId::new(canvas_id);
                     let created_at_ms = ocean_protocol::now_ms();
-                    // OCEAN-277: if this turn is room-bound, fold each patch into
-                    // that room's component ledger before it is moved into its
-                    // envelope. This is a *projection mirror*, not the merge
-                    // authority — exactly like the SSE relay below, the daemon only
-                    // observes the patch stream; the surface ledger remains the
-                    // source of truth for the canvas (masterbuild §4). Off the
-                    // critical path: a `None` room (no `room_id` on the turn) skips
-                    // it entirely.
-                    let now = Utc::now();
                     let envelopes: Vec<SurfacePatchEnvelope> = patches
                         .into_iter()
-                        .map(|patch| {
-                            if let Some(room) = bridge_room_id {
-                                apply_room_surface_patch(
-                                    &bridge_room_canvas,
-                                    room,
-                                    &canvas,
-                                    &patch,
-                                    now,
-                                );
-                            }
-                            SurfacePatchEnvelope {
-                                patch_id: PatchId::new(Uuid::new_v4().to_string()),
-                                session_id: bridge_session_id,
-                                surface_id: SurfaceId::new("gpui:local"),
-                                canvas_id: canvas.clone(),
-                                actor: ActorRef::agent(None),
-                                created_at_ms,
-                                patch,
-                                // OCEAN-258: the daemon is a transport, not the merge
-                                // authority — the ledger is where the operator's local
-                                // edits and the agent's streamed patches actually meet,
-                                // so the *surface ledger* stamps the convergent-merge
-                                // `version` (from its per-canvas Lamport clock) when it
-                                // applies this patch. Stamping an authoritative rev here
-                                // would split-brain the clock across daemon + ledger and
-                                // violate masterbuild §4 ("no daemon table is the source
-                                // of truth for the canvas"). Left None on the wire.
-                                version: None,
-                            }
+                        .map(|patch| SurfacePatchEnvelope {
+                            patch_id: PatchId::new(Uuid::new_v4().to_string()),
+                            session_id: bridge_session_id,
+                            surface_id: SurfaceId::new("gpui:local"),
+                            canvas_id: canvas.clone(),
+                            actor: ActorRef::agent(None),
+                            created_at_ms,
+                            patch,
+                            // OCEAN-258: the daemon is a transport, not the merge
+                            // authority — the surface ledger stamps the convergent-
+                            // merge `version` when it applies this patch. Stamping an
+                            // authoritative revision here would split-brain the clock.
+                            version: None,
                         })
                         .collect();
                     bridge_bus.emit(AgentTurnEvent::SurfacePatch {
@@ -10116,23 +8977,6 @@ async fn agent_turn(
     )
 }
 
-fn parse_agent_turn_room(room_id: Option<&str>) -> Result<Option<RoomId>, String> {
-    let Some(room_id) = room_id.map(str::trim).filter(|room_id| !room_id.is_empty()) else {
-        return Ok(None);
-    };
-
-    RoomId::parse(room_id).map(Some).ok_or_else(|| {
-        format!("unsupported room_id '{room_id}'; supported rooms: pm, writers, orch_mesh, review")
-    })
-}
-
-fn apply_room_guidance(room_id: Option<RoomId>, prompt: &str) -> String {
-    match room_id {
-        Some(room_id) => format!("{}\n\n{}", room_guidance(room_id), prompt),
-        None => prompt.to_string(),
-    }
-}
-
 /// Render the operator's per-turn `guidance` hints (OCEAN-143) into a steering
 /// block, or `None` when there is nothing to inject.
 ///
@@ -10159,23 +9003,13 @@ fn render_turn_guidance(guidance: Option<&[String]>) -> Option<String> {
     Some(block)
 }
 
-/// Compose the prompt the model actually sees for a turn, layering (in order)
-/// any room guidance, then the operator's per-turn `guidance` hints, then the
-/// operator's prompt.
-///
-/// Both layers are prepended — matching how room guidance was already injected
-/// (`apply_room_guidance`) before OCEAN-143 — so steering text precedes the task
-/// without mutating it. With neither present this is exactly the bare prompt,
-/// preserving the legacy turn shape for clients that send no guidance.
-fn apply_turn_guidance(
-    room_id: Option<RoomId>,
-    guidance: Option<&[String]>,
-    prompt: &str,
-) -> String {
-    let with_room = apply_room_guidance(room_id, prompt);
+/// Compose the prompt the model actually sees for a turn, prepending the
+/// operator's per-turn `guidance` hints to the operator's prompt. With no
+/// guidance this is exactly the bare prompt.
+fn apply_turn_guidance(guidance: Option<&[String]>, prompt: &str) -> String {
     match render_turn_guidance(guidance) {
-        Some(block) => format!("{block}\n\n{with_room}"),
-        None => with_room,
+        Some(block) => format!("{block}\n\n{prompt}"),
+        None => prompt.to_string(),
     }
 }
 
@@ -12143,12 +10977,6 @@ mod tests {
         );
     }
 
-    /// Empty per-room ledger for `gc_registries` calls that don't exercise the
-    /// OCEAN-277 room-canvas sweep (the room-canvas GC has its own focused tests).
-    fn empty_room_canvas_store() -> RoomCanvasStore {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
     fn status(request_id: RequestId, state: RequestState) -> RequestControl {
         RequestControl {
             status: RequestStatus {
@@ -13282,20 +12110,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_room_id_rejects_unknown_ids() {
-        let error = parse_agent_turn_room(Some("bogus")).unwrap_err();
-        assert!(error.contains("unsupported room_id 'bogus'"));
-        assert!(error.contains("pm, writers, orch_mesh, review"));
-    }
-
-    #[test]
-    fn room_guidance_is_optional_for_legacy_requests() {
-        assert_eq!(parse_agent_turn_room(None).unwrap(), None);
-        let guided = apply_room_guidance(None, "build the thing");
-        assert_eq!(guided, "build the thing");
-    }
-
-    #[test]
     fn agent_event_filter_requires_session_or_explicit_global_opt_in() {
         let session_a = AgentSessionId::new_v4();
         let session_b = AgentSessionId::new_v4();
@@ -13357,21 +12171,6 @@ mod tests {
         assert!(should_emit_agent_event(None, true, &scoped));
     }
 
-    #[test]
-    fn room_guidance_is_prepended_for_canonical_rooms() {
-        for (wire, room_name) in [
-            ("pm", "PM room"),
-            ("writers", "Writers Room"),
-            ("orch_mesh", "ORCH + MESH"),
-            ("review", "Review Room"),
-        ] {
-            let room = parse_agent_turn_room(Some(wire)).unwrap().unwrap();
-            let guided = apply_room_guidance(Some(room), "verify the diff");
-            assert!(guided.contains(room_name));
-            assert!(guided.ends_with("verify the diff"));
-        }
-    }
-
     // OCEAN-143: the documented `guidance` turn-field used to be destructured
     // and discarded (`guidance: _`), so it never reached the model. These tests
     // pin the fix: guidance is folded into the turn prompt the model sees.
@@ -13379,7 +12178,7 @@ mod tests {
     #[test]
     fn turn_guidance_is_injected_into_the_prompt() {
         let guidance = vec!["focus on tests".to_string(), "be concise".to_string()];
-        let guided = apply_turn_guidance(None, Some(&guidance), "ship the feature");
+        let guided = apply_turn_guidance(Some(&guidance), "ship the feature");
 
         // Both hints reach the prompt, as bullets under the operator header,
         // and the operator's prompt is preserved at the end.
@@ -13392,615 +12191,21 @@ mod tests {
     #[test]
     fn turn_guidance_absent_or_blank_leaves_the_prompt_untouched() {
         // No guidance field at all → bare prompt (legacy turn shape).
-        assert_eq!(
-            apply_turn_guidance(None, None, "do the thing"),
-            "do the thing"
-        );
+        assert_eq!(apply_turn_guidance(None, "do the thing"), "do the thing");
         // Empty list → nothing to inject.
         assert_eq!(
-            apply_turn_guidance(None, Some(&[]), "do the thing"),
+            apply_turn_guidance(Some(&[]), "do the thing"),
             "do the thing"
         );
         // All-whitespace entries are dropped, yielding the bare prompt.
         let blank = vec!["   ".to_string(), "\t".to_string()];
         assert_eq!(
-            apply_turn_guidance(None, Some(&blank), "do the thing"),
+            apply_turn_guidance(Some(&blank), "do the thing"),
             "do the thing"
         );
         // render_turn_guidance reports "nothing to inject" directly.
         assert!(render_turn_guidance(None).is_none());
         assert!(render_turn_guidance(Some(&blank)).is_none());
-    }
-
-    #[test]
-    fn turn_guidance_layers_on_top_of_room_guidance() {
-        let room = parse_agent_turn_room(Some("review")).unwrap().unwrap();
-        let guidance = vec!["check the migration".to_string()];
-        let guided = apply_turn_guidance(Some(room), Some(&guidance), "verify the diff");
-
-        // All three layers are present...
-        assert!(guided.contains("Operator guidance for this turn:"));
-        assert!(guided.contains("- check the migration"));
-        assert!(guided.contains("Review Room"));
-        assert!(guided.ends_with("verify the diff"));
-
-        // ...in order: operator guidance precedes room guidance precedes prompt.
-        let op = guided.find("Operator guidance for this turn:").unwrap();
-        let room_at = guided.find("Review Room").unwrap();
-        let prompt_at = guided.find("verify the diff").unwrap();
-        assert!(
-            op < room_at,
-            "operator guidance should precede room guidance"
-        );
-        assert!(
-            room_at < prompt_at,
-            "room guidance should precede the prompt"
-        );
-    }
-
-    #[test]
-    fn room_projection_renders_empty_panels() {
-        let input = RoomProjectionInput {
-            runtime_status: "ocean-native-fake · fake · model · ready".into(),
-            sessions: vec![],
-            requests: vec![],
-            permissions: vec![],
-            events: vec![],
-            room_components: vec![],
-            room_participants: vec![],
-        };
-
-        let room = build_room_snapshot(&input, RoomId::Pm);
-        let rooms = build_room_snapshots(&input);
-
-        assert_eq!(room.room_id, RoomId::Pm);
-        assert_eq!(room.panels.len(), 3);
-        assert_eq!(room.panels[0].lines, vec!["no recent events".to_string()]);
-        assert!(room.status.contains("ocean-native-fake"));
-        assert_eq!(rooms.len(), 4);
-        assert_eq!(rooms[0].room_id, RoomId::Pm);
-        assert_eq!(rooms[3].room_id, RoomId::Review);
-    }
-
-    // --- OCEAN-256: Track-0 projection (turns / active_turn / messages) ------
-
-    /// A `RequestStatus` fixture for projection tests, with explicit timestamps so
-    /// recency ordering is deterministic.
-    fn projection_request(state: RequestState, updated_secs: i64, message: &str) -> RequestStatus {
-        let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        let updated = base + chrono::Duration::seconds(updated_secs);
-        RequestStatus {
-            request_id: RequestId::new_v4(),
-            session_id: Some(SessionId::new_v4()),
-            state,
-            permission_id: None,
-            message: Some(message.into()),
-            started_at: Some(base),
-            updated_at: Some(updated),
-            finished_at: if state.is_terminal() {
-                Some(updated)
-            } else {
-                None
-            },
-        }
-    }
-
-    fn projection_event(request_id: RequestId, text: &str) -> EventEnvelope {
-        let mut env = EventEnvelope::new(OceanEvent::AssistantDelta { text: text.into() });
-        env.request_id = Some(request_id);
-        env
-    }
-
-    #[test]
-    fn projection_computes_turns_and_active_turn_from_requests() {
-        // A running, a queued, and a completed request — only the non-terminal
-        // ones are "active"; the freshest active one is the room's active_turn.
-        let completed = projection_request(RequestState::Completed, 10, "done");
-        let queued = projection_request(RequestState::Queued, 20, "queued");
-        let running = projection_request(RequestState::Running, 30, "running");
-        let running_id = running.request_id;
-
-        let input = RoomProjectionInput {
-            runtime_status: "ocean-native-fake · fake · model · ready".into(),
-            sessions: vec![],
-            requests: vec![completed, queued, running],
-            permissions: vec![],
-            events: vec![],
-            room_components: vec![],
-            room_participants: vec![],
-        };
-
-        let proj = build_room_projection(&input, RoomId::Pm);
-
-        // turns: all three requests, newest activity first (running > queued > done).
-        assert_eq!(proj.turns.len(), 3);
-        assert_eq!(proj.turns[0].turn_id, running_id);
-        assert_eq!(proj.turns[0].state, "running");
-        assert!(proj.turns[0].active, "running turn is active");
-        assert!(!proj.turns[2].active, "completed turn is not active");
-
-        // active_turn: the freshest non-terminal turn.
-        let active = proj.active_turn.expect("a live turn exists");
-        assert_eq!(active.turn_id, running_id);
-        assert!(active.active);
-
-        // provenance (OCEAN-277): turns/active_turn AND components/participants are
-        // all REAL now — the latter are backed by the per-room ledger, just empty
-        // here because this fixture has no room-bound surface activity. Nothing is
-        // listed as planned for the structured snapshot.
-        assert!(proj.projection.real.contains(&"turns".to_string()));
-        assert!(proj.projection.real.contains(&"active_turn".to_string()));
-        assert!(proj.projection.real.contains(&"components".to_string()));
-        assert!(proj.projection.real.contains(&"participants".to_string()));
-        assert!(proj.projection.planned.is_empty());
-        // Real-but-empty (no fabrication) when there is no source for this room.
-        assert!(proj.components.is_empty());
-        assert!(proj.participants.is_empty());
-    }
-
-    #[test]
-    fn projection_idle_room_has_no_active_turn() {
-        let done = projection_request(RequestState::Completed, 5, "done");
-        let input = RoomProjectionInput {
-            runtime_status: "fake".into(),
-            sessions: vec![],
-            requests: vec![done],
-            permissions: vec![],
-            events: vec![],
-            room_components: vec![],
-            room_participants: vec![],
-        };
-        let proj = build_room_projection(&input, RoomId::Review);
-        assert_eq!(proj.turns.len(), 1);
-        assert!(
-            proj.active_turn.is_none(),
-            "no live turn ⇒ active_turn is null"
-        );
-    }
-
-    #[test]
-    fn projection_messages_are_seq_ordered_oldest_first() {
-        // events.recent() yields newest-first; the projection must reverse to
-        // oldest-first so `seq` ascends and `after_seq` tailing works.
-        let req = RequestId::new_v4();
-        let newest = projection_event(req, "third");
-        let middle = projection_event(req, "second");
-        let oldest = projection_event(req, "first");
-        // Mimic recent(): newest first.
-        let input = RoomProjectionInput {
-            runtime_status: "fake".into(),
-            sessions: vec![],
-            requests: vec![],
-            permissions: vec![],
-            events: vec![newest, middle, oldest],
-            room_components: vec![],
-            room_participants: vec![],
-        };
-
-        let proj = build_room_projection(&input, RoomId::OrchMesh);
-        assert_eq!(proj.messages.len(), 3);
-        assert_eq!(proj.messages[0].seq, 1);
-        assert!(
-            proj.messages[0].summary.contains("first"),
-            "oldest is seq 1"
-        );
-        assert_eq!(proj.messages[2].seq, 3);
-        assert!(proj.messages[2].summary.contains("third"), "newest is last");
-        assert_eq!(proj.last_seq, Some(3));
-    }
-
-    // --- OCEAN-277: per-room component/participant ledger ---------------------
-
-    fn upsert(id: &str, kind: &str) -> SurfacePatch {
-        SurfacePatch::UpsertComponent {
-            component: ocean_agent_sdk::surface::CanvasComponentPatch {
-                id: ComponentId::new(id),
-                kind: kind.into(),
-                rect: None,
-                z_index: None,
-                content: json!({ "n": id }),
-                metadata: Value::Null,
-            },
-        }
-    }
-
-    #[test]
-    fn ledger_folds_upsert_move_resize_delete() {
-        let mut ledger = RoomCanvasLedger::default();
-        let canvas = CanvasId::new("c:main");
-        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-
-        // Upsert creates the component.
-        ledger.apply_patch(&canvas, &upsert("a", "card"), t0);
-        assert_eq!(ledger.components.len(), 1);
-
-        // Move + resize update geometry on the existing entry (no new entry).
-        ledger.apply_patch(
-            &canvas,
-            &SurfacePatch::MoveComponent {
-                component_id: ComponentId::new("a"),
-                x: 5.0,
-                y: 6.0,
-            },
-            t0,
-        );
-        ledger.apply_patch(
-            &canvas,
-            &SurfacePatch::ResizeComponent {
-                component_id: ComponentId::new("a"),
-                width: 100.0,
-                height: 50.0,
-            },
-            t0,
-        );
-        let c = ledger
-            .components
-            .get(&(canvas.clone(), ComponentId::new("a")))
-            .unwrap();
-        let rect = c.rect.expect("rect set by move/resize");
-        assert_eq!((rect.x, rect.y, rect.w, rect.h), (5.0, 6.0, 100.0, 50.0));
-
-        // A move for an unknown component is ignored — never fabricates an entry.
-        ledger.apply_patch(
-            &canvas,
-            &SurfacePatch::MoveComponent {
-                component_id: ComponentId::new("ghost"),
-                x: 1.0,
-                y: 1.0,
-            },
-            t0,
-        );
-        assert_eq!(ledger.components.len(), 1, "move on unknown id is a no-op");
-
-        // Delete removes it.
-        ledger.apply_patch(
-            &canvas,
-            &SurfacePatch::DeleteComponent {
-                component_id: ComponentId::new("a"),
-            },
-            t0,
-        );
-        assert!(ledger.components.is_empty(), "delete removes the component");
-    }
-
-    #[test]
-    fn ledger_ignores_non_component_ops() {
-        let mut ledger = RoomCanvasLedger::default();
-        let canvas = CanvasId::new("c:main");
-        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        // Selection/viewport are view-state, not a component register.
-        ledger.apply_patch(
-            &canvas,
-            &SurfacePatch::Select {
-                ids: vec![ComponentId::new("x")],
-            },
-            t0,
-        );
-        ledger.apply_patch(
-            &canvas,
-            &SurfacePatch::SetViewport {
-                viewport: ocean_agent_sdk::surface::Viewport::default(),
-            },
-            t0,
-        );
-        assert!(
-            ledger.components.is_empty(),
-            "view-state ops never create components"
-        );
-    }
-
-    #[test]
-    fn snapshot_shapes_components_and_participants_oldest_first() {
-        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
-        let canvas = CanvasId::new("c:main");
-        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        let t1 = t0 + chrono::Duration::seconds(10);
-
-        // Two components on PM, touched at different times → snapshot oldest-first.
-        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("a", "card"), t0);
-        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("b", "node"), t1);
-        let s1 = SessionId::new_v4();
-        bind_room_session(&store, RoomId::Pm, s1, t1);
-
-        let (components, participants) = room_canvas_snapshot(&store, RoomId::Pm);
-        assert_eq!(components.len(), 2);
-        assert_eq!(components[0]["component_id"], "a", "oldest component first");
-        assert_eq!(components[1]["component_id"], "b");
-        assert_eq!(components[0]["canvas_id"], "c:main");
-        assert_eq!(participants.len(), 1);
-        assert_eq!(participants[0]["kind"], "session");
-
-        // A room with no ledger is honestly empty.
-        let (ec, ep) = room_canvas_snapshot(&store, RoomId::Review);
-        assert!(ec.is_empty() && ep.is_empty());
-    }
-
-    #[test]
-    fn binding_a_session_twice_keeps_one_participant() {
-        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
-        let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        let s1 = SessionId::new_v4();
-        bind_room_session(&store, RoomId::Writers, s1, t0);
-        bind_room_session(
-            &store,
-            RoomId::Writers,
-            s1,
-            t0 + chrono::Duration::seconds(5),
-        );
-        let (_c, participants) = room_canvas_snapshot(&store, RoomId::Writers);
-        assert_eq!(
-            participants.len(),
-            1,
-            "re-binding the same session is idempotent"
-        );
-    }
-
-    #[test]
-    fn gc_room_canvas_evicts_stale_and_drops_empty_rooms() {
-        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
-        let canvas = CanvasId::new("c:main");
-        let old = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        let fresh = old + ROOM_CANVAS_TTL - chrono::Duration::minutes(1);
-        let now = old + ROOM_CANVAS_TTL + chrono::Duration::minutes(1);
-
-        // PM: one stale component (at `old`) + one fresh (at `fresh`).
-        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("stale", "card"), old);
-        apply_room_surface_patch(&store, RoomId::Pm, &canvas, &upsert("fresh", "card"), fresh);
-        // Review: only a stale participant → whole room should drop after GC.
-        bind_room_session(&store, RoomId::Review, SessionId::new_v4(), old);
-
-        gc_room_canvas(&store, now);
-
-        let (pm_components, _) = room_canvas_snapshot(&store, RoomId::Pm);
-        assert_eq!(
-            pm_components.len(),
-            1,
-            "only the fresh component survives TTL"
-        );
-        assert_eq!(pm_components[0]["component_id"], "fresh");
-
-        let guard = store.lock().unwrap();
-        assert!(
-            !guard.contains_key(&RoomId::Review),
-            "a room emptied by GC is dropped, not kept as a shell"
-        );
-    }
-
-    #[test]
-    fn gc_room_canvas_caps_per_room() {
-        let store: RoomCanvasStore = Arc::new(Mutex::new(HashMap::new()));
-        let canvas = CanvasId::new("c:main");
-        let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        // Insert cap + 5 components, each fresh but at strictly increasing times.
-        for i in 0..(ROOM_CANVAS_MAX_PER_ROOM + 5) {
-            let at = base + chrono::Duration::milliseconds(i as i64);
-            apply_room_surface_patch(
-                &store,
-                RoomId::Pm,
-                &canvas,
-                &upsert(&format!("c{i}"), "card"),
-                at,
-            );
-        }
-        // GC at a time within TTL: nothing expires, so only the cap trims.
-        gc_room_canvas(&store, base + chrono::Duration::seconds(1));
-        let (components, _) = room_canvas_snapshot(&store, RoomId::Pm);
-        assert_eq!(
-            components.len(),
-            ROOM_CANVAS_MAX_PER_ROOM,
-            "trimmed to the per-room cap"
-        );
-        // Oldest were evicted: c0..c4 gone, the snapshot's oldest is c5.
-        assert_eq!(components[0]["component_id"], "c5");
-    }
-
-    #[tokio::test]
-    async fn projection_snapshot_handler_returns_real_projection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = fake_convene_state(&tmp);
-
-        // Seed one live request so the projection has a turn to surface.
-        let running = projection_request(RequestState::Running, 30, "live work");
-        let running_id = running.request_id;
-        {
-            let mut reqs = state.requests.write().await;
-            reqs.insert(
-                running.request_id,
-                RequestControl {
-                    status: running,
-                    cancel: CancellationToken::new(),
-                    handle: None,
-                    decision_token: None,
-                },
-            );
-        }
-
-        let (status, Json(resp)) =
-            room_projection_snapshot(State(state.clone()), Path("pm".to_string())).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(resp.ok);
-        let room = resp.room.expect("projection present");
-        assert_eq!(room.room_id, RoomId::Pm);
-        assert_eq!(
-            room.turns.len(),
-            1,
-            "the seeded request projects as one turn"
-        );
-        assert_eq!(room.turns[0].turn_id, running_id);
-        assert_eq!(
-            room.active_turn.map(|t| t.turn_id),
-            Some(running_id),
-            "the live request is the active turn"
-        );
-        // OCEAN-277: with no room-bound surface activity yet, components +
-        // participants are honestly empty — but now declared REAL (the source
-        // exists), not planned.
-        assert!(room.components.is_empty());
-        assert!(room.participants.is_empty());
-        assert!(room.projection.real.contains(&"components".to_string()));
-        assert!(room.projection.real.contains(&"participants".to_string()));
-        assert!(room.projection.planned.is_empty());
-
-        // Now seed the per-room ledger the way the relay + turn-binding would: a
-        // bound session (participant) and an upserted component on PM's canvas.
-        let now = Utc::now();
-        let session = SessionId::new_v4();
-        bind_room_session(&state.room_canvas, RoomId::Pm, session, now);
-        apply_room_surface_patch(
-            &state.room_canvas,
-            RoomId::Pm,
-            &CanvasId::new("canvas:main"),
-            &SurfacePatch::UpsertComponent {
-                component: ocean_agent_sdk::surface::CanvasComponentPatch {
-                    id: ComponentId::new("brief-1"),
-                    kind: "brief_card".into(),
-                    rect: Some(ocean_agent_sdk::surface::Rect::new(
-                        10.0, 20.0, 300.0, 200.0,
-                    )),
-                    z_index: None,
-                    content: json!({ "title": "Sales Brief" }),
-                    metadata: json!({ "source": "longhouse.sales" }),
-                },
-            },
-            now,
-        );
-
-        // The very next projection reflects the real per-room state — and only for
-        // the room it was bound to.
-        let (_s, Json(resp2)) =
-            room_projection_snapshot(State(state.clone()), Path("pm".to_string())).await;
-        let pm = resp2.room.expect("pm projection");
-        assert_eq!(pm.components.len(), 1, "the upserted component projects");
-        assert_eq!(pm.components[0]["component_id"], "brief-1");
-        assert_eq!(pm.components[0]["kind"], "brief_card");
-        assert_eq!(pm.components[0]["content"]["title"], "Sales Brief");
-        assert_eq!(pm.participants.len(), 1, "the bound session projects");
-        assert_eq!(pm.participants[0]["kind"], "session");
-
-        // A different room saw none of it — honestly empty, no cross-room bleed.
-        let (_s, Json(resp3)) =
-            room_projection_snapshot(State(state.clone()), Path("review".to_string())).await;
-        let review = resp3.room.expect("review projection");
-        assert!(
-            review.components.is_empty(),
-            "components don't bleed across rooms"
-        );
-        assert!(
-            review.participants.is_empty(),
-            "participants don't bleed across rooms"
-        );
-    }
-
-    #[tokio::test]
-    async fn projection_events_handler_filters_by_after_seq() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = fake_convene_state(&tmp);
-
-        // Two events in the ring → projected feed has seq 1..=2.
-        let req = RequestId::new_v4();
-        state.events.emit(projection_event(req, "first"));
-        state.events.emit(projection_event(req, "second"));
-
-        // No after_seq ⇒ whole feed.
-        let (status, Json(all)) = room_projection_events(
-            State(state.clone()),
-            Path("orch_mesh".to_string()),
-            Query(TranscriptQuery {
-                after_seq: None,
-                limit: None,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(all.ok);
-        assert_eq!(all.events.len(), 2);
-        assert_eq!(all.last_seq, Some(2));
-
-        // after_seq = last_seq ⇒ empty tail (nothing newer yet).
-        let (status, Json(tail)) = room_projection_events(
-            State(state.clone()),
-            Path("orch_mesh".to_string()),
-            Query(TranscriptQuery {
-                after_seq: Some(2),
-                limit: None,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            tail.events.is_empty(),
-            "after_seq at the head returns nothing"
-        );
-        assert!(tail.last_seq.is_none());
-
-        // after_seq = 1 ⇒ only the newer half.
-        let (_, Json(some)) = room_projection_events(
-            State(state.clone()),
-            Path("orch_mesh".to_string()),
-            Query(TranscriptQuery {
-                after_seq: Some(1),
-                limit: None,
-            }),
-        )
-        .await;
-        assert_eq!(some.events.len(), 1);
-        assert_eq!(some.events[0].seq, 2);
-    }
-
-    #[tokio::test]
-    async fn projection_unknown_room_is_404() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = fake_convene_state(&tmp);
-
-        let (status, Json(resp)) =
-            room_projection_snapshot(State(state.clone()), Path("nope".to_string())).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(!resp.ok);
-        assert!(resp.room.is_none());
-
-        let (status, Json(ev)) = room_projection_events(
-            State(state.clone()),
-            Path("nope".to_string()),
-            Query(TranscriptQuery {
-                after_seq: None,
-                limit: None,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(!ev.ok);
-        assert!(ev.events.is_empty());
-    }
-
-    #[tokio::test]
-    async fn event_bus_records_recent_history() {
-        let events = EventBus::new(4);
-        let request_id = RequestId::new_v4();
-        let session_id = SessionId::new_v4();
-
-        emit(
-            &events,
-            Some(session_id),
-            Some(request_id),
-            None,
-            OceanEvent::UserMessage {
-                text: "hello".into(),
-            },
-        );
-        emit(
-            &events,
-            Some(session_id),
-            Some(request_id),
-            None,
-            OceanEvent::AssistantDelta {
-                text: "world".into(),
-            },
-        );
-
-        let recent = events.recent(2);
-        assert_eq!(recent.len(), 2);
-        assert!(matches!(recent[0].event, OceanEvent::AssistantDelta { .. }));
-        assert!(matches!(recent[1].event, OceanEvent::UserMessage { .. }));
     }
 
     // --- OCEAN-13: session detail uses real data, not stubs -----------------
@@ -14191,14 +12396,7 @@ mod tests {
         ])));
         let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-        gc_registries(
-            &requests,
-            &permissions,
-            &empty_canvas_store(),
-            &empty_room_canvas_store(),
-            now,
-        )
-        .await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let reqs = requests.read().await;
         assert!(!reqs.contains_key(&old_terminal), "old terminal evicted");
@@ -14244,14 +12442,7 @@ mod tests {
         ])));
         let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-        gc_registries(
-            &requests,
-            &permissions,
-            &empty_canvas_store(),
-            &empty_room_canvas_store(),
-            now,
-        )
-        .await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let perms = permissions.read().await;
         assert!(!perms.contains_key(&leaked), "old consumed waiter evicted");
@@ -15618,7 +13809,6 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
@@ -15639,9 +13829,8 @@ mod tests {
         state
     }
 
-    /// A minimal text turn for `agent_turn`. `session_id: None` → a new session,
-    /// so the fake-ok runtime can create-and-run it; `room_id: None` keeps it on
-    /// the happy path past the room-parse guard. `cwd` is a real existing dir (the
+    /// A minimal text turn for `agent_turn`. `session_id: None` creates a new
+    /// session. `cwd` is a real existing dir (the
     /// crate manifest dir) so the new-session cwd resolution/binding guards pass —
     /// the daemon refuses an empty cwd with no project to bind to.
     fn sample_agent_turn() -> AgentTurnRequest {
@@ -15650,7 +13839,6 @@ mod tests {
             prompt: "ping".to_string(),
             cwd: env!("CARGO_MANIFEST_DIR").to_string(),
             guidance: None,
-            room_id: None,
             project_id: None,
             client_type: Some("test".to_string()),
             thinking_level: None,
@@ -15807,17 +13995,17 @@ mod tests {
         assert_eq!(body.error, None, "an accepted turn carries no error");
     }
 
-    /// The permit releases on an EARLY-ERROR exit too: a turn that fails the
-    /// room-parse guard (an unsupported `room_id`) returns 400 *after* acquiring
-    /// the permit, and the RAII guard must still return the slot to the pool.
+    /// The permit releases on an EARLY-ERROR exit too: a turn with an invalid
+    /// working directory returns 400 after acquiring the permit, and the RAII
+    /// guard must still return the slot to the pool.
     #[tokio::test]
     async fn agent_turn_releases_permit_on_error() {
-        // The room-parse error returns before any tool runs; assertions are on
-        // status + permit count, so no env serialization is required.
+        // Invalid cwd returns before any tool runs; assertions are on status +
+        // permit count, so no env serialization is required.
         let state = capped_turn_state(1);
 
         let mut turn = sample_agent_turn();
-        turn.room_id = Some("not-a-real-room".to_string());
+        turn.cwd = "/tmp/ocean/../escape".to_string();
         let (status, body) = agent_turn(State(state.clone()), Json(turn)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(!body.ok);
@@ -16307,7 +14495,6 @@ mod tests {
             session_id: None,
             transcript: "delete the old branches".to_string(),
             cwd: String::new(),
-            room_id: None,
             project_id: None,
             // The dead-end input: no token to approve a gate with.
             decision_token: None,
@@ -16801,7 +14988,6 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
@@ -17316,7 +15502,6 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            room_canvas: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
@@ -18519,14 +16704,7 @@ mod tests {
             );
         }
 
-        gc_registries(
-            &requests,
-            &permissions,
-            &empty_canvas_store(),
-            &empty_room_canvas_store(),
-            now,
-        )
-        .await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let reqs = requests.read().await;
         assert!(
@@ -18587,14 +16765,7 @@ mod tests {
             }
         }
 
-        gc_registries(
-            &requests,
-            &permissions,
-            &empty_canvas_store(),
-            &empty_room_canvas_store(),
-            now,
-        )
-        .await;
+        gc_registries(&requests, &permissions, &empty_canvas_store(), now).await;
 
         let reqs = requests.read().await;
         assert_eq!(
@@ -18648,14 +16819,7 @@ mod tests {
             ),
         ])));
 
-        gc_registries(
-            &requests,
-            &permissions,
-            &store,
-            &empty_room_canvas_store(),
-            now,
-        )
-        .await;
+        gc_registries(&requests, &permissions, &store, now).await;
 
         let s = store.lock().unwrap();
         assert!(
@@ -18697,14 +16861,7 @@ mod tests {
             }
         }
 
-        gc_registries(
-            &requests,
-            &permissions,
-            &store,
-            &empty_room_canvas_store(),
-            now,
-        )
-        .await;
+        gc_registries(&requests, &permissions, &store, now).await;
 
         let s = store.lock().unwrap();
         assert_eq!(
@@ -19954,7 +18111,7 @@ mod tests {
     #[test]
     fn turn_seam_injects_consult_when_present_and_is_unchanged_when_absent() {
         let guidance = vec!["focus on tests".to_string()];
-        let guided = apply_turn_guidance(None, Some(&guidance), "build the widget");
+        let guided = apply_turn_guidance(Some(&guidance), "build the widget");
 
         // Consult disabled (None) → composed prompt IS the guided prompt, verbatim.
         assert_eq!(
@@ -21239,6 +19396,69 @@ mod tests {
         );
     }
 
+    // Room route retirement + retained-contract guards
+    // -------------------------------------------------
+
+    #[tokio::test]
+    async fn room_router_retires_track0_gets_and_keeps_persistent_and_livekit_routes() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let app = room_routes().with_state(fake_convene_state(&tmp));
+
+        for path in [
+            "/v1/rooms",
+            "/v1/rooms/pm",
+            "/v1/rooms/pm/snapshot",
+            "/v1/rooms/pm/events",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        let persistent = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/rooms/persistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(persistent.status(), StatusCode::OK);
+
+        for retained_get in [
+            "/v1/rooms/persistent/missing/snapshot",
+            "/v1/rooms/persistent/missing/events",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::post(retained_get).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{retained_get}"
+            );
+        }
+
+        let livekit = app
+            .oneshot(
+                Request::get("/v1/rooms/call-room/livekit-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(livekit.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
     // OCEAN-333 — banner route-list integrity guards
     // -----------------------------------------------
 
@@ -21273,6 +19493,32 @@ mod tests {
 
     /// Every entry in the banner must be `"METHOD /path"` — no blank strings,
     /// no accidental trailing whitespace that would silently mis-render.
+    #[test]
+    fn banner_routes_omit_retired_track0_rooms_and_keep_durable_room_contracts() {
+        let routes = banner_routes();
+        for retired in [
+            "GET /v1/rooms",
+            "GET /v1/rooms/{room_id}",
+            "GET /v1/rooms/{room_id}/snapshot",
+            "GET /v1/rooms/{room_id}/events",
+        ] {
+            assert!(
+                !routes.contains(&retired),
+                "retired route still advertised: {retired}"
+            );
+        }
+        for retained in [
+            "GET /v1/rooms/persistent",
+            "GET /v1/rooms/persistent/{key}/snapshot",
+            "POST /v1/rooms/{room_id}/livekit-token",
+        ] {
+            assert!(
+                routes.contains(&retained),
+                "retained route missing: {retained}"
+            );
+        }
+    }
+
     #[test]
     fn banner_routes_entries_are_well_formed() {
         for &route in banner_routes() {

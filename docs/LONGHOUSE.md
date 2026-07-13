@@ -84,8 +84,8 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
   `{ "ok": true, "topics": [...] }` from the in-process topic registry.
 - `GET /v1/longhouse/topics/{topic_id}` — one topic's full observable state by
   id. Returns `{ "ok": true, "topic": {...} }`; `400` with a typed `{ ok, error }`
-  body when `topic_id` is not a valid UUID, `404` when the id is unknown. Mirrors
-  the `GET /v1/rooms/{room_id}` error shape — never a panic.
+  body when `topic_id` is not a valid UUID, `404` when the id is unknown — never
+  a panic.
 - `POST /v1/longhouse/claim` — daemon-held `claim_outcome` gate (OCEAN-272).
 - `POST /v1/longhouse/board` — `board_post` append note/evidence (OCEAN-272).
 - `POST /v1/longhouse/revoke` — hard recall of a persisted title (OCEAN-272).

@@ -17,10 +17,12 @@ Do not maintain another repo inventory here. Read the target repo's `AGENTS.md` 
 
 `ocean-daemon` is the local runtime/body. It owns provider calls, the agent loop, permission-gated tools, local sessions, and SSE events. Clients carry a `session_id` and steer the same daemon; they do not own independent session state.
 
+
 ```text
 POST /v1/agent/turns    { prompt, cwd, session_id?, ... }
 GET  /v1/agent/events   session-scoped SSE
 GET  /health            daemon liveness
+
 ```
 
 Session persistence lives in `crates/ocean-agent`. A load/save/rebind bug there affects TUI and ocean-surface together.

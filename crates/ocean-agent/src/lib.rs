@@ -8,7 +8,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
-    ImageMeta, Project, ProjectId, PromptImage, PromptRequest, PromptResponse, RequestId, RoomId,
+    ImageMeta, Project, ProjectId, PromptImage, PromptRequest, PromptResponse, RequestId,
     SessionDetail, SessionId, SessionRunState, SessionSummary, SessionToolContext,
     SessionTranscriptEntry, TokenUsage,
 };
@@ -195,24 +195,6 @@ fn strip_data_url_prefix(s: &str) -> &str {
 /// (mirrors how MCP servers are config-driven and how the config dir itself is
 /// env-overridable).
 const PLUGINS_DIRNAME: &str = "plugins";
-
-/// Room-specific operator guidance injected by the daemon before runtime turns.
-pub fn room_guidance(room_id: RoomId) -> &'static str {
-    match room_id {
-        RoomId::Pm => {
-            "PM room: operator proxy and foreground agent turns. Keep focus on the current instruction, streamed output, and command status."
-        }
-        RoomId::Writers => {
-            "Writers Room: drafts, sources, and handoff context. Keep output oriented to writing, doc edits, and source references."
-        }
-        RoomId::OrchMesh => {
-            "ORCH + MESH: route requests, permissions, and event state. Keep changes operational, concise, and traceable."
-        }
-        RoomId::Review => {
-            "Review Room: review notes, validation evidence, and release proof. Focus on risks, diffs, and test results."
-        }
-    }
-}
 
 /// Inner runtime state that's swappable at runtime (model, provider, key).
 /// Kept behind an `Arc<RwLock<_>>` so a single AgentRuntime instance can
@@ -3720,14 +3702,6 @@ done
             .await
             .expect("aborted child dropped promptly")
             .expect("drop signal delivered");
-    }
-
-    #[test]
-    fn room_guidance_matches_track0_rooms() {
-        assert!(room_guidance(RoomId::Pm).contains("PM room"));
-        assert!(room_guidance(RoomId::Writers).contains("Writers Room"));
-        assert!(room_guidance(RoomId::OrchMesh).contains("ORCH + MESH"));
-        assert!(room_guidance(RoomId::Review).contains("Review Room"));
     }
 
     fn lock_runtime(name: &str) -> AgentRuntime {

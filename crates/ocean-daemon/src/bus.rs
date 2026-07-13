@@ -114,14 +114,6 @@ impl EventBus {
         (replay, rx)
     }
 
-    pub(crate) fn recent(&self, limit: usize) -> Vec<EventEnvelope> {
-        let history = self
-            .history
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        history.iter().rev().take(limit).cloned().collect()
-    }
-
     pub(crate) fn emit(&self, event: EventEnvelope) {
         {
             let mut history = self

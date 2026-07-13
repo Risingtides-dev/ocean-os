@@ -277,9 +277,6 @@ pub struct AgentTurnRequest {
     /// Optional guidance hints passed to the agent (e.g. "focus on tests").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance: Option<Vec<String>>,
-    /// Optional room identifier for Track-0 room-scoped turns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub room_id: Option<String>,
     /// The project this turn belongs to. When set with an empty `cwd`, the
     /// daemon binds the turn to the project's `workspace_root` — letting a thin
     /// client steer by project id without re-resolving directory paths.
@@ -1334,7 +1331,6 @@ mod tests {
             prompt: "list the src directory".into(),
             cwd: "/home/user/project".into(),
             guidance: Some(vec!["be concise".into()]),
-            room_id: Some("pm".into()),
             project_id: None,
             client_type: Some("surface-web".into()),
             thinking_level: Some(ThinkingLevel::High),
@@ -1349,12 +1345,10 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"prompt\""));
         assert!(json.contains("\"cwd\""));
-        assert!(json.contains("\"room_id\":\"pm\""));
         // `ThinkingLevel` serializes lowercase (see ocean_protocol::ThinkingLevel).
         assert!(json.contains("\"thinking_level\":\"high\""));
         let back: AgentTurnRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.prompt, "list the src directory");
-        assert_eq!(back.room_id.as_deref(), Some("pm"));
         assert_eq!(back.thinking_level, Some(ThinkingLevel::High));
     }
 
@@ -1367,7 +1361,6 @@ mod tests {
             prompt: "hi".into(),
             cwd: "/tmp".into(),
             guidance: None,
-            room_id: None,
             project_id: None,
             client_type: None,
             thinking_level: None,
@@ -1418,7 +1411,6 @@ mod tests {
             prompt: "summarize this tab".into(),
             cwd: "/home/user/project".into(),
             guidance: None,
-            room_id: None,
             project_id: None,
             client_type: Some("surface-extension".into()),
             thinking_level: None,

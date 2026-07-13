@@ -4345,7 +4345,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn unknown_turn_outcome_never_restores_prompt() {
         let mut chat = ChatComponent {
@@ -4612,6 +4611,5 @@ mod tests {
             !screen.contains('◆'),
             "no decorative diamond anywhere on the palette screen"
         );
-
     }
 }

@@ -470,13 +470,6 @@ POST   /v1/requests/{id}/cancel           cancel an in-flight request
 GET    /v1/permissions                    list pending permission requests
 POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
 
-# Rooms — Track-0 projection (RoomSnapshot); {room_id} ∈ {pm,writers,orch_mesh,review}
-GET    /v1/rooms                          list room projections
-GET    /v1/rooms/{room_id}                room projection detail
-GET    /v1/rooms/{room_id}/snapshot       richer projection: turns, active_turn, messages feed (?after_seq=N)
-GET    /v1/rooms/{room_id}/events         live-tail of projection messages (?after_seq=N); returns last_seq
-POST   /v1/rooms/{room_id}/livekit-token  mint a LiveKit join token for the room (web in-room voice/video)
-
 # Rooms — persistent lifecycle (SQLite-backed; survives restarts)
 GET    /v1/rooms/persistent               list persistent rooms
 POST   /v1/rooms/persistent               create a room { key, name, trigger_policy? }
@@ -487,6 +480,9 @@ POST   /v1/rooms/persistent/{key}/messages                post message { author_
 GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N&limit=M)
 GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+has_more (?after_seq=N&limit=M)
 GET    /v1/rooms/persistent/{key}/events                  live-tail: events since after_seq (?after_seq=N&limit=M); returns last_seq+next_seq+has_more
+
+# Room media — retained independently from the retired projection API
+POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join token for web in-room voice/video
 
 # Sessions (legacy view)
 GET    /v1/sessions                       list sessions

@@ -42,8 +42,9 @@ implicitly (submit a turn with `session_id: None`).
 
 - Request: [`AgentTurnRequest`] — at minimum `{ prompt, cwd }`. Carry a
   `session_id` to continue an existing session; omit it (`None`) to create one.
-  Other optional fields: `guidance`, `room_id`, `project_id`, `client_type`,
-  `thinking_level`, `model_id`, `images`.
+  Other optional fields include `guidance`, `project_id`, `client_type`,
+  `agent`, `thinking_level`, `model_id`, `role`, `images`, `decision_token`,
+  `client_context`, and `advisor`.
 - Response: [`AgentTurnResponse`] — `{ ok, turn_id, session_id, status,
   event_id_prefix, error? }`. `event_id_prefix` is the first 8 chars of the
   turn id, so you can correlate this HTTP response with its SSE events.
@@ -138,12 +139,16 @@ async fn main() -> anyhow::Result<()> {
         prompt: "list the files in src/".into(),
         cwd: "/path/to/your/repo".into(),
         guidance: None,
-        room_id: None,
         project_id: None,
         client_type: Some("my-integration".into()),
+        agent: None,
         thinking_level: None,
         model_id: None,
+        role: None,
         images: None,
+        decision_token: None,
+        client_context: None,
+        advisor: None,
     };
     let resp: AgentTurnResponse = http
         .post(format!("{BASE}/v1/agent/turns"))
