@@ -2713,3 +2713,13 @@ area:  [testing]: Raw diagnostics, machine-readable sites, and bounded interpret
 
 Ran the exact warning-level production lint command from the approved plan on clean revision 546287bd across workspace library, binary, and example targets with default features. It exited 0 and recorded 16 unwrap, 57 expect, 0 panic, 6 unreachable, and 0 await-holding-lock diagnostics (79 total). The report, JSON, and 10,259-byte raw output retain scope/exclusions, toolchain/machine metadata, all source sites, counting rules, and SHA-256. Independent rerun reproduced the exact set and passed review; artifact invariants, full local CI, workspace test check, docs integrity, and diff checks pass. These remain invariant sites rather than defects, and no blanket denial was enabled; hosted validation remains.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [02:32am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [gh actions]: Phase 0B-5 strict lint inventory gate complete
+area:  [testing]: CI run 29228821337 passed Ubuntu, macOS, and cargo-deny
+
+GitHub Actions validated the strict production lint inventory artifacts on ubuntu-latest and macos-latest, with cargo-deny also passing. The warning-level command, exact 79-site set, scope/exclusions, raw evidence, machine-readable counts, independent reproduction, local gate, and hosted gate are complete. Phase 0B is closed without treating invariant sites as bugs or enabling blanket unwrap/expect denial; supported feature, release-profile, and truthful MSRV compatibility is next.
+_________________________________________________________________________________

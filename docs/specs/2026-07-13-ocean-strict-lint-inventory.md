@@ -3,7 +3,7 @@
 **Date:** 2026-07-13
 **Plan checkpoint:** Phase 0B-5
 **Revision:** `546287bd6ab5ed1aca5e5ce891bdc0f9aec258cd`
-**Status:** Clean-revision inventory captured and independently reviewed; local gate passed, hosted matrix pending
+**Status:** Complete — clean inventory, independent reproduction, and macOS/Linux gates passed
 
 ## Purpose
 
@@ -104,3 +104,4 @@ This is directional context only: the repository changed substantially between r
 - An independent rerun exited 0 and reproduced the exact 79-site diagnostic set, counts, package totals, source locations, messages, raw byte length, and SHA-256.
 - Machine-readable validation passed for category/package sums, raw hash/length, source-path existence, and source-line bounds.
 - `cargo xtask ci`, `cargo check --workspace --tests`, `cargo xtask docs-check`, and `git diff --check` passed locally.
+- GitHub Actions run [29228821337](https://github.com/Risingtides-dev/ocean-os/actions/runs/29228821337) passed the full repository gate on `macos-latest` and `ubuntu-latest`, plus `cargo-deny`.

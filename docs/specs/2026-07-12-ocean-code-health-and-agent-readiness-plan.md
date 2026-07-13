@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — Phase 0B complete locally/reviewed; hosted strict-lint artifact gate pending
+**Status:** Approved by operator — Phase 0B complete; supported build/release/MSRV compatibility checkpoint next
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -207,7 +207,7 @@ These are separate changes with separate owners and artifacts. Browser and perfo
 
 Store the exact command from §3.1, toolchain, raw output, feature/target exclusions, and machine-readable counts without enabling blanket `unwrap_used`/`expect_used` denial.
 
-**Inventory (2026-07-13): captured from clean revision and independently reproduced; local gate passed, hosted matrix pending.** Default-feature library/binary/example targets report 16 `unwrap_used`, 57 `expect_used`, 0 `panic`, 6 `unreachable`, and 0 `await_holding_lock` diagnostics (79 total). Exact output, all source sites, scope, toolchain/machine metadata, and counting rules are retained in `docs/specs/2026-07-13-ocean-strict-lint-inventory.md` and its JSON/raw artifacts. The sites remain an invariant inventory, not a bug count; no blanket denial is enabled.
+**Inventory (2026-07-13): complete.** Default-feature library/binary/example targets report 16 `unwrap_used`, 57 `expect_used`, 0 `panic`, 6 `unreachable`, and 0 `await_holding_lock` diagnostics (79 total). Exact output, all source sites, scope, toolchain/machine metadata, and counting rules are retained in `docs/specs/2026-07-13-ocean-strict-lint-inventory.md` and its JSON/raw artifacts. The sites remain an invariant inventory, not a bug count; no blanket denial is enabled.
 
 **Gate:** each checkpoint records observed pass/failure honestly. A red regression proving a bug lands with its corresponding fix in the same safety PR; no ignored or nondeterministic test lands without an explicit tracked disposition.
 
@@ -382,7 +382,7 @@ After this plan is approved, start with independently reviewable changes:
 5. **Shell Halt characterization/fix — complete:** direct/descendant PID tests and Unix process-group cleanup pass on macOS and Ubuntu.
 6. **Browser characterization/fix — complete:** injected healthy/dead/stalled/cancelled single-flight tests, bounded phases, and real launch-cancellation PID coverage pass on macOS and Ubuntu.
 7. **Agent-loop benchmark — complete:** clean 30-sample baseline, independent methodology review, and macOS/Ubuntu repository gates passed.
-8. **Strict lint inventory — captured/reviewed, hosted matrix pending:** exact raw diagnostics and machine-readable 79-site inventory retained without enabling blanket denial.
+8. **Strict lint inventory — complete:** exact raw diagnostics and machine-readable 79-site inventory retained without blanket denial; independent reproduction and macOS/Ubuntu gates passed.
 
 Ground-truth docs and automation are complete. The first intact move does not touch event, shell, browser, or history-cost paths. Further event/daemon/runtime moves remain blocked on their applicable characterization and safety disposition.
 
