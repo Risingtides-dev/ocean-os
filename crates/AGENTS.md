@@ -48,7 +48,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 | `ocean-runtime` | Agent loop, permission gates, cancellation, capability/tool execution, runtime events | Session persistence; model credential routing | `ocean-runtime/src/lib.rs`, `agent_loop.rs` | `ocean-runtime/AGENTS.md` | `cargo test -p ocean-runtime` |
 | `ocean-store` | SQLite durable rooms/rosters/transcripts behind `RoomStore` | Agent sessions, memory, Longhouse titles | `ocean-store/src/lib.rs` | — | `cargo test -p ocean-store` |
 | `ocean-tui` | Ratatui steering cockpit and client interaction | Agent/session/runtime authority | `ocean-tui/src/main.rs`, `shell/` | `ocean-tui/AGENTS.md` | `cargo test -p ocean-tui && cargo build -p ocean-tui --release` |
-| `xtask` | Repository docs/index checks, canonical CI manifest, WebRTC-cache recovery | Production runtime behavior | `../xtask/src/main.rs` | `../xtask/README.md` | `cargo test -p xtask && cargo xtask docs-check` |
+| `xtask` | Repository docs/index checks, canonical repository/compatibility/MSRV gate manifests, WebRTC-cache recovery | Production runtime behavior | `../xtask/src/main.rs` | `../xtask/README.md` | `cargo test -p xtask && cargo xtask docs-check && cargo xtask ci --compatibility` |
 
 ## Non-default Members
 
@@ -81,7 +81,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 - Index parity: compare this table with `cargo metadata --no-deps --format-version=1`.
 - Package logic: run the row's narrow command and the nearest local contract checks.
-- Repo-wide completion: follow `../AGENTS.md`.
+- Repo-wide completion: follow `../AGENTS.md`, including compatibility and MSRV lanes when build/dependency contracts change.
 
 ## Child devlog Index
 

@@ -151,11 +151,12 @@ pub mod live {
             let mut lifecycle = super::TapLifecycle::Ended;
             while let Some(event) = room_events.recv().await {
                 match event {
-                    RoomEvent::TrackSubscribed { track, .. } => {
-                        if let RemoteTrack::Audio(audio) = track {
-                            let tx = tx.clone();
-                            tokio::spawn(pump_track(audio, tx));
-                        }
+                    RoomEvent::TrackSubscribed {
+                        track: RemoteTrack::Audio(audio),
+                        ..
+                    } => {
+                        let tx = tx.clone();
+                        tokio::spawn(pump_track(audio, tx));
                     }
                     RoomEvent::Disconnected { reason } => {
                         // Mid-call drop: record why and stop. (A normal end

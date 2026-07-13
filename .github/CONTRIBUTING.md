@@ -50,7 +50,7 @@ Use `cargo check --workspace --tests` when shared enums/events affect test-only 
 cargo xtask ci
 ```
 
-This canonical manifest runs docs/index integrity, workspace build/test, all-target Clippy with denied warnings, format, and `cargo deny check`. Use `cargo xtask ci --dry-run` to print the portable command manifest and CI-only lanes. CI consumes the same manifest on macOS and Ubuntu and keeps `cargo-deny` in its separate Ubuntu job. Feature-gated areas may require additional commands from their local contract.
+This canonical manifest runs docs/index integrity, workspace build/test, all-target Clippy with denied warnings, format, and `cargo deny check`. Use `cargo xtask ci --dry-run` to print it plus the CI-only lanes. CI also runs `cargo xtask ci --compatibility` on macOS and Ubuntu for supported daemon features and release-profile compilation, and `cargo xtask ci --msrv` under pinned Rust 1.88 on Ubuntu. `cargo-deny` remains a separate Ubuntu job. Run a relevant compatibility lane locally when changing feature-gated, release-sensitive, dependency, or MSRV code.
 
 ## Review
 

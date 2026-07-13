@@ -6438,7 +6438,7 @@ fn read_transcript_page(
                     let mut msgs: Vec<_> = rec
                         .transcript
                         .into_iter()
-                        .filter(|m| after_seq.map_or(true, |after| m.seq > after))
+                        .filter(|m| after_seq.is_none_or(|after| m.seq > after))
                         .collect();
                     let has_more = msgs.len() > effective_limit;
                     if has_more {
