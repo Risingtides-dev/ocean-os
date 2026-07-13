@@ -24,11 +24,16 @@ on crash (`KeepAlive`) and starts it at login/reboot (`RunAtLoad`).
 | Launcher it execs | `deploy/ocean-daemon.sh` |
 | Installed plist path | `~/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist` |
 | Binary run | `target/release/ocean-daemon` (prebuilt, from **main**) |
-| Working directory | ocean-os repo root |
+| Working directory | neutral directory outside any git repo (`$HOME` by default; override with `OCEAN_DAEMON_CWD`) |
 | Bind address | `127.0.0.1:4780` (binary default; env `OCEAN_BIND` to override) |
 | Env | `OCEAN_YOLO=1` (matches the prior hand-launch) |
 | Logs (stdout+stderr) | `/private/tmp/ocean-daemon.log` |
 
+> The daemon must **never run from the repository root**. Turns carry their own
+> cwd, and the startup guard rejects a repository cwd so an unbound fallback
+> cannot silently bind to ocean-os. The launcher resolves the binary by absolute
+> path, then runs from `$HOME` or `OCEAN_DAEMON_CWD`.
+>
 > ### Build from MAIN — always
 > Per operator rule, **never build/deploy/run the daemon from a feature branch.**
 > The LaunchAgent runs a **prebuilt** `target/release/ocean-daemon` — it does
@@ -38,8 +43,8 @@ on crash (`KeepAlive`) and starts it at login/reboot (`RunAtLoad`).
 > git checkout main && git pull
 > cargo build -p ocean-daemon --release
 > ```
-> `ops/install-ocean-daemon.sh` does the build for you and warns if you're not on
-> `main`. **To ship new daemon code:** merge to main → rebuild from main →
+> `ops/install-ocean-daemon.sh` does the build for you and fails immediately if
+> the checkout is not on `main`. **To ship new daemon code:** merge to main → rebuild from main →
 > `launchctl kickstart -k` (see "Restart" below). A rebuild alone does nothing
 > until the running process is restarted.
 
@@ -57,7 +62,7 @@ on crash (`KeepAlive`) and starts it at login/reboot (`RunAtLoad`).
 ops/install-ocean-daemon.sh
 ```
 
-This builds the daemon (release, warns if not on `main`), copies the plist into
+This requires `main`, builds the daemon (release), copies the plist into
 `~/Library/LaunchAgents/`, then bootstraps + enables + kickstarts the job.
 Idempotent — safe to re-run after a pull/rebuild. (Equivalent manual steps:
 `cp deploy/dev.risingtides.ocean-daemon.plist ~/Library/LaunchAgents/` then
@@ -94,8 +99,9 @@ launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon
 tail -f /private/tmp/ocean-daemon.log
 ```
 
-> A `kickstart -k` **drops whatever turn is in flight** (sessions live in the
-> daemon's memory). Don't restart a live daemon mid-session unless you mean to.
+> A `kickstart -k` **drops whatever turn is in flight**. Persisted sessions remain
+> on disk and can resume after restart, but the active turn itself is interrupted.
+> Don't restart a live daemon mid-turn unless you mean to.
 
 ### Uninstall / stop supervision
 

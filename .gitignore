@@ -10,6 +10,7 @@ dist/
 !.env.example
 
 # Pi/local orchestration state
+/.pi-subagents/
 .pi/messenger/
 .pi/extensions/
 .pi/extensions.disabled/
@@ -52,6 +53,7 @@ __pycache__/
 # Playwright MCP test artifacts
 .playwright-mcp/
 
-# local plugin/session scaffolding + stale CI build dir — keep provenance stamps clean
+# local plugin/session scaffolding + stale/alternate build dirs — keep provenance stamps clean
 .superpowers/
 target-ci/
+/target3/

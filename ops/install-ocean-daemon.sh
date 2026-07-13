@@ -2,8 +2,9 @@
 # Install + supervise the Ocean daemon under launchd (OCEAN-253).
 #
 # Idempotent. Safe to re-run after a pull/rebuild. What it does:
-#   1. Builds the daemon binary (release) — you should be on MAIN (operator rule:
-#      never deploy/run the daemon from a feature branch).
+#   1. Requires MAIN, then builds the daemon binary (release). The installer
+#      fails closed on every other branch (operator rule: never deploy/run the
+#      daemon from a feature branch).
 #   2. Copies the LaunchAgent plist into ~/Library/LaunchAgents/.
 #   3. Bootstraps + enables + kickstarts the job in the per-user GUI domain.
 #
@@ -22,13 +23,15 @@ DOMAIN="gui/$(id -u)"
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 
 # --- build-from-main guard (operator rule) -------------------------------------
-# Warn loudly if the repo isn't on main. The daemon must run a main-built binary.
+# Fail closed if the repo isn't on main. A warning-and-continue path can deploy
+# a feature-branch binary while every operator contract claims production is
+# main-built, so branch mismatch is a hard configuration error.
 branch="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 if [[ "$branch" != "main" ]]; then
-  echo "WARNING: repo at $REPO is on branch '$branch', not 'main'." >&2
-  echo "         Operator rule: build/deploy the daemon from MAIN only." >&2
-  echo "         Continuing in 3s — Ctrl-C to abort and 'git checkout main' first." >&2
-  sleep 3
+  echo "FATAL: repo at $REPO is on branch '$branch', not 'main'." >&2
+  echo "       Operator rule: build/deploy the daemon from MAIN only." >&2
+  echo "       Switch the main checkout to main, update it, then re-run this installer." >&2
+  exit 64 # EX_USAGE
 fi
 
 echo "==> [1/3] building ocean-daemon (release) from '$branch'"
