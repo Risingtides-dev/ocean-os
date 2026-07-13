@@ -2673,3 +2673,13 @@ area:  [testing]: CI run 29226786986 passed Ubuntu, macOS, and cargo-deny
 
 GitHub Actions validated f45a65df on ubuntu-latest and macos-latest, including the injected browser state-machine matrix and real chromiumoxide launch-cancellation PID test. The cargo-deny lane passed. Phase 0B-3/1B-3 is complete; the only annotation is GitHub's non-blocking Node 20 deprecation notice for actions/checkout@v4.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [01:52am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [feature-request]: Reproducible agent-loop history-cost benchmark harness
+area:  [testing]: Fixed matrix, wall time, allocation traffic, and machine metadata
+
+Implemented a release-only benchmark example for the real per-provider-round history preparation kernel (`trim_to_context_window` plus valid intermediate tool-pair appends). The fixed 10/100/1,000-message × 1/5/20-round matrix records raw and summarized wall-time/allocation samples after five warm-ups, along with clean-revision/toolchain/machine metadata and a defined regression threshold. A 1-warm-up/2-sample nine-cell smoke run and strict example Clippy pass; the clean-revision 30-sample baseline is next.
+_________________________________________________________________________________

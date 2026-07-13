@@ -1,7 +1,7 @@
 # Ocean OS Code Health and Agent Readiness Plan
 
 **Date:** 2026-07-12
-**Status:** Approved by operator — event, Shell Halt, and browser supported-platform checkpoints complete
+**Status:** Approved by operator — safety checkpoints complete; history-cost harness smoke-tested and clean-revision baseline pending
 **Owner:** Smaths / Ocean OS
 **Primary goal:** Make Ocean OS easier for humans and agents to understand, navigate, modify, and verify without destabilizing its behavior or turning cleanup into a rewrite.
 
@@ -201,6 +201,8 @@ These are separate changes with separate owners and artifacts. Browser and perfo
 1. Add a reproducible benchmark for 10/100/1,000-message histories across 1/5/20 rounds.
 2. Record command, toolchain, machine metadata, warm-up/sample policy, allocations/bytes where practical, wall time, and threshold for meaningful regression.
 
+**Harness (2026-07-13): smoke PASS; clean baseline pending.** A release-only, dependency-free example measures the real trim/JSON-estimation/provider-validity/clone kernel over all nine matrix cells, with a process-global allocation counter, five warm-ups, thirty samples, raw distributions, machine/toolchain metadata, and a 20% + 10µs timing review threshold. See `docs/specs/2026-07-13-ocean-agent-loop-history-cost-benchmark.md`.
+
 ##### 0B-5. Strict lint inventory
 
 Store the exact command from §3.1, toolchain, raw output, feature/target exclusions, and machine-readable counts without enabling blanket `unwrap_used`/`expect_used` denial.
@@ -377,7 +379,7 @@ After this plan is approved, start with independently reviewable changes:
 4. **Event-policy characterization/fix — complete:** checked event table, isolated payload/RSS stress, smallest replay-byte retention fix, full gate, and security review passed.
 5. **Shell Halt characterization/fix — complete:** direct/descendant PID tests and Unix process-group cleanup pass on macOS and Ubuntu.
 6. **Browser characterization/fix — complete:** injected healthy/dead/stalled/cancelled single-flight tests, bounded phases, and real launch-cancellation PID coverage pass on macOS and Ubuntu.
-7. **Agent-loop benchmark PR:** reproducible history-cost benchmark and baseline artifact.
+7. **Agent-loop benchmark — harness smoke-tested, clean baseline pending:** reproducible history-cost matrix and allocation/timing capture implemented.
 
 Ground-truth docs and automation are complete. The first intact move does not touch event, shell, browser, or history-cost paths. Further event/daemon/runtime moves remain blocked on their applicable characterization and safety disposition.
 

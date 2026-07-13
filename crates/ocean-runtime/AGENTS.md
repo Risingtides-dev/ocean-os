@@ -25,6 +25,7 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - A tool-call batch runs through the concurrency scheduler (`agent_loop.rs`): consecutive `Concurrency::Shared` (read-only) tools run in one concurrent segment; a `Concurrency::Exclusive` tool (the default) is a full barrier. A new tool defaults to `Exclusive` — only override `concurrency()` to `Shared` when the tool is genuinely side-effect-free. Live `ToolExecutionEnd` + side-effect events must emit in completion order as each segment member finishes; persisted `ToolResult`s must remain in original batch order for provider pairing.
 - Blocking await boundaries in the agent loop (provider stream read, tool execution, retry backoff) must race the cancel token pre-yield via a biased `tokio::select!` on `cancelled(config)`. At a tool cancellation boundary, checkpoint the entire assistant tool-call batch with ordered real or conservative results, including not-yet-started barrier calls; completed side effects must never disappear into replayable history.
 - Every provider round in a bound agent session must copy `AgentConfig::session_id` into `StreamOptions::session_id`; providers use that stable identity for cross-round prompt caching and request correlation.
+- The reproducible history-cost kernel is `examples/history_cost_bench.rs`: run it in release mode from a clean revision with the fixed 10/100/1,000-message × 1/5/20-round matrix. Treat it as trim/serialization/clone scaling evidence, not end-to-end turn latency.
 - Hashline-enabled sessions expose both `edit` and `hashline_edit`; every profile retains `write`. Controlled GPT-5.6 Terra benchmarks showed that hiding `edit` changed model exploration behavior and doubled wall time even when the model still selected `hashline_edit`.
 
 
@@ -41,6 +42,7 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - `cargo test -p ocean-runtime lazy_browser_ -- --test-threads=1`
 - `cargo test -p ocean-browser cancelled_browser_launch_does_not_orphan_spawned_process -- --test-threads=1`
 - `cargo test -p ocean-runtime`
+- `cargo run --release -p ocean-runtime --example history_cost_bench -- --warmup 5 --samples 30 --output <path>`
 - `cargo check --workspace`
 
 ## Child devlog Index
