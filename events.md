@@ -2754,3 +2754,14 @@ area:      [frontend]: Ratatui startup navigation
 
 Changed ocean-tui normal startup to a clean chat-only workbench with a centered OCEAN chooser: new session in the active cwd, resume-session picker, blank editor with files revealed, and graph. Removed implicit latest-session auto-resume while preserving explicit --session; documented the local contract and removed the obsolete rail helper. Hardened the owner-directed design with off-thread session discovery, keyboard/mouse parity, visible selection windows, terminal-safe labels, and focused startup/overlay tests. Verified with cargo fmt --check, strict all-target Clippy, cargo check -p ocean-tui, cargo test -p ocean-tui (280 passed, 4 ignored), cargo check --workspace --tests, and cargo build -p ocean-tui --release.
 _________________________________________________________________________________
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [04:21] [13-07-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [workflow]: Merge and deploy build compatibility plus clean TUI startup
+area:  [testing]: Hosted gates, supervised daemon restart, and PTY installation proof
+
+PR #275 and PR #276 merged after their macOS, Ubuntu, pinned-Rust-1.88, and cargo-deny jobs passed; TUI run 29234214171 completed all four jobs successfully. I built the release workspace from clean synchronized main at ff194119bd86 with zero turns in flight, atomically replaced the former ~/.local/bin/ocean symlink with a real copied binary, matched SHA-256 5760a631833c0389d6823d46e41f76f5f19e784e25fa494426674589e089b505, and passed codesign --verify --deep --strict. A real 120x40 PTY kept the installed TUI alive for 4.36 seconds, observed all chooser routes, and exited cleanly. The supervised daemon restarted from PID 44616 to 74102 at revision ff194119bd86 with neutral cwd, zero turns in flight, and zero persistence/GC failures.
+_________________________________________________________________________________
