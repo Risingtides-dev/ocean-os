@@ -9,16 +9,16 @@ Longhouse is not a separate "Hive" product. **Longhouse is the hive.** It is the
 Ocean has two load-bearing pieces:
 
 - **`ocean-daemon` = local runtime/body**
-  - Owns sessions and transcript persistence.
+  - Owns HTTP/SSE composition and local execution authority.
   - Streams client events over the Ocean HTTP/SSE API.
-  - Executes local filesystem, shell, tool, MCP, and destructive actions.
-  - Enforces local permission gates.
-  - Remains the authority for actions on a user machine.
+  - Executes local filesystem, shell, tool, MCP, and destructive actions through `ocean-runtime`.
+  - Enforces local permission gates through `ocean-runtime`.
+  - Leaves product session/history persistence to `ocean-agent`.
 
 - **`ocean-longhouse` = hive brain / coordination layer**
-  - Owns skills, SOPs, routines, workflows, tool/MCP discovery, shared memory/knowledge, subagent specs, and quorum/council logic.
+  - Owns advisory preparation, SOP/workflow coordination, tool/MCP discovery, and quorum/council logic. Local typed memory belongs to `ocean-memory`; shared knowledge belongs to Ocean Bedrock.
   - Coordinates and recommends; it does not bypass daemon permissions.
-  - May host model subagents and council workflows, but local file edits/bash/destructive actions must route back through the daemon execution authority.
+  - May run bounded council model calls for quorum workflows. General subagent definitions, dispatch, lifecycle, and orchestration belong to extensions, whose local side effects still route through daemon execution authority.
 
 This separation lets Ocean become team-aware without turning a remote service into a root shell on every coworker laptop.
 
@@ -30,9 +30,9 @@ Longhouse is the canonical place for:
 2. **Routines/workflows** — repeatable preflight/planning/check/review sequences.
 3. **Tools and MCP discovery** — what tools exist, when to use them, and which daemon can execute them.
 4. **Skills** — compact, task-specific capability briefs that can be injected into the main Ocean agent.
-5. **Data/memory layers** — company memory, project memory, per-agent notes, run records, and knowledge retrieval.
-6. **Subagent specs/runtimes** — role, objective, model policy, allowed tools, memory namespace, output schema, max turns, and budget.
-7. **Quorum/council workflows** — multi-agent propose → endorse/inhibit → converge flows with deterministic quorum arithmetic.
+5. **Data/memory coordination** — discovers and stages relevant local `ocean-memory` and shared Bedrock knowledge without taking storage ownership.
+6. **Advisory preparation/spec assembly** — compact recommendations that extensions may consume; Longhouse does not spawn or manage general subagents.
+7. **Quorum/council workflows** — bounded multi-model propose → endorse/inhibit → converge flows with deterministic quorum arithmetic.
 
 ## Deployment modes
 
@@ -93,7 +93,7 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
 - `POST /v1/longhouse/breach` — breach-of-conduct report (OCEAN-272).
 - `POST /v1/skills/query` — skill-librarian prefilter (OCEAN-281).
 - `POST /v1/skills/fetch` — fetch one skill's full body by id (OCEAN-281).
-- `POST /v1/subagents/spec` — assemble a subagent spec from skills + defaults (OCEAN-282).
+- `POST /v1/subagents/spec` — compatibility endpoint that assembles an advisory spec from skills + defaults (OCEAN-282); it does not spawn a worker and is pending a separately approved extension migration.
 - `POST /v1/workflows/prepare` — read-only workflow-brief preparation step (OCEAN-340).
 
 Local/remote service shape now starts with:
@@ -116,7 +116,7 @@ The smallest useful dynamic integration is a **read-only preparation step**:
    - relevant skills,
    - SOP reminders,
    - workflow/routine suggestions,
-   - optional subagent/council recommendation.
+   - optional extension/council recommendation.
 4. Daemon injects those briefs into the main agent prompt/context.
 5. Main agent still uses daemon tools and permission gates for all local execution.
 
@@ -139,23 +139,11 @@ Selection path:
 3. Return 3–7 compact skill briefs.
 4. Daemon injects those briefs into the main Ocean agent.
 
-## Subagent future
+## Extension-owned subagent boundary
 
-Longhouse should assemble subagent specs from skills + routines + token scopes + memory + model/tool policy.
+General subagents are extension-owned. Extensions own role definitions, objectives, prompts, model/tool policy, skill selection, budgets, spawn/join lifecycle, and orchestration. Here an extension is a separately shipped/runtime-loaded capability provider over Ocean's plugin, MCP, subprocess, or future WASM seams—not another named module compiled into the daemon. Core crates must not add a daemon-native `task`, `spawn_worker`, fleet scheduler, or named-subagent runtime.
 
-A subagent spec should include:
-
-- role,
-- objective,
-- model policy,
-- skill ids,
-- allowed tools,
-- memory namespace,
-- output schema,
-- max turns,
-- budget.
-
-Subagents can be orchestrated by Longhouse, but local side effects still return through daemon permission gates.
+Core remains responsible only for generic permission-gated turns, cancellation, capability-provider registration, and extension event/tool transport. The existing `POST /v1/subagents/spec` assembler is read-only compatibility behavior: it returns an advisory description and never spawns a worker. Moving or removing that route and the folder-agent `subagents` metadata requires a separate migration; neither is precedent for new core orchestration.
 
 ## Current implementation notes
 
@@ -246,8 +234,7 @@ and emits `Converged`/`Aborted`.
   remain future work.
 - **Validator process-veto** and the **subsidiarity escalation predicate** (most
   things should never convene a council at all) — still stubbed.
-- **Sybil hardening (step 7).** Credential-split on `spawn_worker`,
-  self-renewal block, validator veto — not built.
+- **Sybil hardening (step 7).** Credential conservation when an extension spawns workers, exposed through a generic issuance seam, plus self-renewal block and validator veto — not built. Longhouse does not own the worker spawn.
 
 The convergence engine, the unforgeable `claim_outcome` gate (OCEAN-229), and now
 the persisted escrow trio (OCEAN-246) are real code. The remaining anti-capture

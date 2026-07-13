@@ -20,10 +20,12 @@ This child contract governs current architecture, operations, cross-repository r
 - `ARCHITECTURE.md` describes implemented composition and state authority; package inventory belongs only in `../crates/AGENTS.md`.
 - `OPERATIONS.md` is the concise runbook. The extended runtime operator guide is reference material and remains subordinate to source and current scripts.
 - `DAEMON_REFACTOR_MISSION.md` is the living authority for the active behavior-neutral daemon extraction program. Its completed extraction manifests are retained evidence; do not mistake an individual completed checkpoint for completion of the mission.
+- `ocean-daemon` owns HTTP/SSE composition and local execution authority; `ocean-agent` owns product sessions/history, and `ocean-runtime` owns tool execution and permission gates.
+- `ocean-longhouse` owns advisory preparation, SOP/workflow coordination, and quorum/council behavior without bypassing daemon authority. Local typed memory belongs to `ocean-memory`; shared knowledge belongs to Ocean Bedrock.
+- Subagent definitions, dispatch, lifecycle, and orchestration policy belong to extensions, not core crates. Existing core subagent-shaped APIs and metadata are compatibility surfaces pending a separately approved migration.
 - Active docs must not require `docs/.agentarchive/`. Archive material is loaded only when the operator explicitly asks for historical or forensic context.
 - A document under `specs/` or `superpowers/` is not current architecture merely because it exists. Preserve its status and verify implementation before using it as a work order.
 - Rooms means durable `/v1/rooms/persistent/*` collaboration plus the independent LiveKit token route; Track-0 projection-room material is historical.
-- Longhouse coordination does not bypass daemon execution, cwd, or permission authority.
 
 ## Work Guidance
 
@@ -31,6 +33,7 @@ This child contract governs current architecture, operations, cross-repository r
 - Name source anchors and executable validation for behavioral claims.
 - Put open product work in `../ROADMAP.md`; daemon-refactor progress stays in `DAEMON_REFACTOR_MISSION.md`; chronology belongs in `../events.md`.
 - Avoid copied route, model, crate, or package inventories when a typed source or executable manifest exists.
+- Do not port Pi TypeScript line-by-line; document idiomatic Rust concepts and boundaries.
 - Mark a known mismatch honestly instead of documenting intended behavior as shipped.
 
 ## Verification

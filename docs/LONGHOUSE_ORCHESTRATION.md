@@ -1,9 +1,12 @@
 # Longhouse — non-hierarchical agent coordination on Ocean's one event bus
 
-> Status: **design**. Replaces `COUNCIL_ORCHESTRATION.md` (the chair-led council is
-> discarded — see "Why the council died" below). Rides on the shipped
-> `CapabilityRegistry` + `ocean-mcp` work and the existing session / SSE / turn-injection
-> model. New daemon surface is deliberately small.
+> Status: **design**, authoritative only for Longhouse quorum/governance. Replaces
+> `COUNCIL_ORCHESTRATION.md` (the chair-led council is discarded — see "Why the
+> council died" below). Sections that place `spawn_worker`, general subagent dispatch,
+> lifecycle, or orchestration inside Longhouse/core are superseded: those responsibilities
+> belong to extensions. Core retains only generic permission-gated execution, cancellation,
+> capability-provider, and extension event/tool seams. Do not implement the superseded
+> core-spawn portions of this document.
 >
 > One-line thesis: **emergent coordination for exploration, escrowed authority for
 > termination.** No standing chair. Agents converge on a shared blackboard by quorum;
@@ -29,7 +32,7 @@ What survives from the council doc, re-homed:
 | One SSE event bus tagged by `session_id` | **Kept verbatim** — it is the substrate. |
 | Turn-injection as the steering primitive | **Kept** — it's how convergence and termination write into a session. |
 | Blackboard (shared deliberation artifact) | **Promoted to a first-class primitive** (stigmergy), not chair-curated. |
-| `spawn_worker` etc. as registry capabilities | **Kept**, re-scoped: any agent can convene, none chairs. |
+| Worker spawn/dispatch | **Removed from core.** Extensions own worker lifecycle; Longhouse only governs council credentials/quorum through generic seams. |
 | Chair decides who speaks | **Deleted.** Replaced by domain-routed convening + quorum. |
 | Chair declares consensus | **Deleted.** Replaced by daemon-computed quorum + an escrow `firekeeper` role. |
 | `max_rounds` / token budget | **Kept and hardened** into daemon-enforced termination. |
@@ -82,8 +85,8 @@ What does *not* dissolve under "they're just agents," and therefore must be **bu
   collapse to one signed, logged actor — the escrow `firekeeper` role (§3). A swarm cannot
   be "the one to blame."
 - **Sybil capture is cheaper for agents than for anyone.** A human can't fork 50 copies of
-  themselves to fake a quorum; an agent runtime's whole job is `spawn_worker`. Quorum that
-  counts messages instead of credentials is trivially flooded (§6).
+  themselves to fake a quorum; an orchestration extension can create workers cheaply. Quorum
+  that counts messages instead of conserved credentials is trivially flooded (§6).
 
 So the org chart flips because **agents lack the constraints the hierarchy was compensating
 for** (trust, bandwidth, mortality, careers) **while retaining the few that are
@@ -456,14 +459,13 @@ is the swarm-robotics token-economy idea (Strobel/Dorigo) minus the blockchain: 
 trusted runtime the daemon *is* the scarce-credential authority — it knows exactly which
 sessions are real because it minted them.
 
-**C2 — Credentials are minted only by the daemon, scoped per real spawn.** A worker's
-credential is issued by the Title Registry **at convening time**, one per routed session, and
-**cannot be cloned by the LLM** — the session_id is the daemon's record, not a value the model
-supplies. `spawn_worker` (a capability, §7) mints a fresh credential per child and the
-**parent's quorum weight is split, not duplicated** across its children (a duplication-style
-attack — fork 50 workers to fake quorum — yields the *same total weight* as one, because the
-budget is conserved across the lineage). This directly defeats "spawn a clone army to
-manufacture consensus."
+**C2 — Credentials are minted only by the daemon, scoped per real council participant.** A
+worker's credential is issued by the Title Registry **at convening time**, one per admitted
+session, and **cannot be cloned by the LLM** — the session id is the daemon's record, not a
+value the model supplies. If an extension introduces child workers into a council, it must use
+a generic credential-allocation seam that conserves the parent's quorum weight rather than
+duplicating it. Longhouse validates that conservation; it does not spawn or manage the child.
+This directly defeats "spawn a clone army to manufacture consensus."
 
 **C3 — Self-renewal is structurally impossible.** A worker cannot mint, transfer, or renew its
 own token (the grant/exercise/revoke split, §2.3, enforced: `claim_outcome` and the recall
@@ -526,20 +528,18 @@ ocean-daemon                           ── 2 read endpoints; routes turn-inje
                                           reuses the existing CancellationToken per request
 ```
 
-`spawn_worker` is **a capability, not a chair power.** The council doc made it a chair-only
-tool; here it's available to any convened worker (subject to the credential-split rule C2) so
-sub-convening is recursive (Contract-Net / holonic: a worker can convene a sub-topic, then
-revert to worker — authority is contextual, not standing). It mints a child session (existing
-session create), records `parent = caller`, applies a role/competence prompt + toolset from the
-registry, and **splits the parent's quorum credential** across children. Returns the child
-`session_id`. The recall/cancel of a parent cascades to children via the existing
-`CancellationToken` (delegation-cascade tear-down, Brief 1's EROS reference).
+General worker dispatch is **not a Longhouse capability**. An installed extension may create
+workers, apply role/tool policy, join results, and cascade cancellation through generic daemon
+turn/cancellation APIs. If those workers participate in a council, Longhouse admits their
+credentials through the conservation rule C2 and continues to own only quorum/governance.
+Longhouse must not create child sessions, define worker prompts/toolsets, or expose a core
+`spawn_worker` tool.
 
-Why this is clean: caching is the provider's job (registry contract), the provider serves a
-per-turn snapshot, built-ins-first dedup means Longhouse tools can never shadow `bash`/`write`,
-and a malformed/absent Longhouse config leaves the daemon running built-ins-only (zero
-behavior change) — identical to how MCP degrades. Longhouse is **opt-in per workspace** via
-`ocean.toml`.
+Why this is clean: extensions own orchestration policy and degrade independently, while the
+daemon retains generic permission/cancellation authority and Longhouse retains deterministic
+quorum. Built-ins-first capability dedup still prevents extensions from shadowing
+`bash`/`write`; absent extensions leave the daemon and councils running without a hidden core
+worker scheduler.
 
 ---
 
@@ -565,8 +565,7 @@ behavior change) — identical to how MCP degrades. Longhouse is **opt-in per wo
 6. **Escrow trio:** TitleRegistry + Revoker + firekeeper/validator titles + `claim_outcome`
    gate + graduated/hard recall (T6). Now authority is split three ways and revocation is
    fail-safe.
-7. **Sybil hardening:** credential-weighted quorum (C1), credential split on `spawn_worker`
-   (C2), self-renewal block (C3), validator process-veto (C4). Capture defenses.
+7. **Sybil hardening:** credential-weighted quorum (C1), conserved allocation for extension-owned council workers (C2), self-renewal block (C3), validator process-veto (C4). Capture defenses; no core worker spawn.
 8. **2 read endpoints + monitor/command-deck.** `GET /v1/longhouse/topics[/{id}]`; the 8-bit
    deck subscribes and animates topics/quorum live. Operator recall via existing cancel.
 9. *(Later, not v1)* Vote-synchrony anomaly detection (C5); cross-daemon Kaswentha federation
@@ -622,7 +621,7 @@ last because it's pure observation.
 | Graduated-then-hard recall | Three warnings vs. crime-in-office (1,3) | strike counter + immediate `RoleRevoked` |
 | Justified binding veto | Apache `-1` with reason (3) | `Veto` with machine-checkable justification |
 | Process validator (no content vote) | Hononwiretonh listener-validator (1) | validator title; procedural `Veto` |
-| Credential split on spawn | Sybil cost-gating (3) | `spawn_worker` conserves parent weight |
+| Conserved child credential allocation | Sybil cost-gating (3) | generic issuance seam validates parent-weight conservation for extension-owned workers |
 | Cross-daemon non-interference | Two-row wampum / Kaswentha (1) | *(federation, not v1)* capped external mark weight |
 
 **Dropped as human-only** (named so the next reader doesn't re-import them): the

@@ -76,7 +76,7 @@ Expected role:
 
 - rank candidate workflow specs for a turn;
 - return compact phase/checklist context;
-- optionally recommend subagent specs;
+- optionally recommend extension-owned worker capabilities;
 - never execute local side effects.
 
 This complements, not replaces, the daemon's normal `/v1/agent/turns` path.
@@ -89,7 +89,7 @@ Once workflow prep exists, run a factory tick entirely from Ocean:
 2. Longhouse injects the factory skill + workflow brief.
 3. Ocean uses GitHub/Linear/FS/shell/browser tools normally.
 4. Ocean creates tickets before branches.
-5. Ocean dispatches isolated worktrees or bounded subagent specs.
+5. An installed orchestration extension may dispatch isolated worktrees or bounded workers through generic daemon permission/execution seams.
 6. Ocean reports the tick and updates ledgers.
 
 ## Immediate next tickets worth creating
@@ -105,10 +105,10 @@ Use Linear to mint real IDs before branch/PR work.
 3. **Workflow prepare endpoint**
    - File scope: `crates/ocean-daemon/src/main.rs`, `crates/ocean-longhouse`.
    - Outcome: documented `POST /v1/workflows/prepare` exists and is read-only/fail-open.
-4. **Subagent dispatch bridge design**
+4. **Extension-owned dispatch bridge design**
    - File scope: docs/design only first.
-   - Outcome: clear boundary for Longhouse spec assembly vs daemon-executed local actions.
+   - Outcome: extensions own worker definitions and orchestration while Longhouse remains advisory and daemon APIs remain generic, permission-gated execution seams.
 
 ## Operating rule
 
-Do not move authority into Longhouse. Longhouse stages context and recommends workflows. Ocean daemon executes actions, enforces gates, owns sessions, and preserves the local-first trust boundary.
+Do not move authority into Longhouse. Longhouse stages context and recommends workflows. `ocean-daemon` owns HTTP/SSE composition and local execution authority, `ocean-runtime` executes actions and enforces gates, and `ocean-agent` owns product sessions/history. Together they preserve the local-first trust boundary.

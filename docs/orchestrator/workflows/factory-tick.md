@@ -5,7 +5,9 @@ description: Ocean-native factory loop for keeping ocean-os, ocean-surface, and 
 
 # Workflow: Ocean OS Factory Tick
 
-This is the Ocean-native factory loop for keeping `ocean-os`, `ocean-surface`, and `ocean-agents` moving without depending on any external orchestrator repository. The Ocean agent runs this workflow directly through normal daemon-mediated tools. Longhouse may surface this workflow as advisory context, but the daemon remains the execution authority for filesystem, shell, browser, GitHub, Linear, and any gated action.
+This is the Ocean-native factory loop for keeping `ocean-os`, `ocean-surface`, and `ocean-agents` moving without depending on an external orchestrator repository. A single Ocean agent can execute serial steps through normal daemon-mediated tools, but every worker dispatch/fanout instruction in this workflow requires an installed orchestration extension. Without that extension, treat dispatch phases as an advisory/manual checklist—core daemon/runtime and Longhouse do not spawn workers. Longhouse may surface the workflow as context; the daemon remains generic permission-gated execution authority.
+
+Throughout this document, **orchestrator** means that installed extension, never a core daemon/runtime/Longhouse subsystem. The extension owns worker definitions, tier routing, worktree lanes, lifecycle, and joins; it calls generic daemon tools and APIs for gated actions.
 
 ## Identity
 
@@ -34,7 +36,7 @@ A successful tick does at least one of:
 
 ## Model routing (read before every tick)
 
-This loop is run by an orchestrator that **routes**, it does not read the world
+When the orchestration extension is installed, it **routes** rather than reading the world
 itself. Each phase below is tagged with the tier that does its work (see the model
 routing rail in `FACTORY_GOAL.md` for the tier table):
 
@@ -235,9 +237,9 @@ End every tick with a concise report:
 
 Do not claim Done from intention. Report skipped verification as skipped.
 
-## Subagent lane template
+## Extension-owned worker lane template
 
-When dispatching an implementation lane, give the worker:
+This payload is consumed by an installed orchestration extension; Longhouse/core may recommend it but do not spawn or manage the worker. When the extension dispatches an implementation lane, give the worker:
 
 ```text
 Tier: mid                          # cheap | mid | expensive — match the rail's tier table

@@ -11,5 +11,6 @@ When given a question:
 3. Cite. Every non-obvious claim gets a source (file path or URL).
 4. Say what you don't know. A clear "no source for X" beats a confident guess.
 
-Keep findings tight: the answer first, then the evidence. Hand off anything
-that needs a second opinion to the `fact-checker` subagent.
+Keep findings tight: the answer first, then the evidence. Mark anything that
+needs a second opinion for the extension-owned `fact-checker`; core does not
+dispatch that child automatically.

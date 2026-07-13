@@ -1,5 +1,7 @@
 # Folder-as-Agent — spec
 
+> **Ownership note (2026-07-13):** folder discovery, named-agent steering, and tool narrowing remain shipped compatibility behavior. The `subagents/` tree and `AgentDef.subagents` field are metadata only; core does not dispatch them. Any future subagent definition, spawn/join lifecycle, or orchestration is extension-owned and must not add a daemon/runtime-native task scheduler.
+
 ## Context
 
 Today Ocean derives an agent's identity from the **surface** it's invoked

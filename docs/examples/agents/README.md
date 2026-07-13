@@ -17,7 +17,7 @@ researcher/                      the agent name IS the folder name
         └── instructions.md
 ```
 
-Identity comes from the path — you never write a `name`/`id` field.
+Identity comes from the path — you never write a `name`/`id` field. The nested `subagents/` entry is currently resolver/picker compatibility metadata only; core does not dispatch it. An orchestration extension must own any future child execution.
 
 ## Use it
 

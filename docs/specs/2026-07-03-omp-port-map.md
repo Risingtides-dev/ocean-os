@@ -3,6 +3,8 @@
 **Date:** 2026-07-03 · **Status:** Research complete (all 5 slices) · **Owner:** Smaths / Ocean
 **Source:** deep source inspection of [oh-my-pi](https://github.com/can1357/oh-my-pi) (MIT, ~15.7k★) by 5 parallel research agents reading actual `.rs`/`.ts` files — not docs. This is the standing backlog: every feature worth reverse-engineering into Ocean, mapped to a destination crate, so features never need to be re-named one by one.
 
+> **Ownership update (2026-07-13):** backlog entries that place subagent definitions, `task`/spawn, lifecycle, or orchestration in core are superseded. Those capabilities must ship as extensions over generic permission-gated execution/capability seams; do not port their original core placement.
+
 ## Organizing principle: harness profiles
 
 Per John (2026-07-03): the IDE-grade harness is **surface-scoped, not global**. The daemon

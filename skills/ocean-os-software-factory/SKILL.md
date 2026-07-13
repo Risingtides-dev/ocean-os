@@ -22,7 +22,8 @@ Do not depend on `../ocean-orchestrator` for normal operation. It is legacy refe
 
 ## Non-negotiables
 
-- Model routing: the orchestrator routes, it does not read the world. Push status
+- Orchestration prerequisite: worker dispatch/fanout requires an installed extension. Without one, run this skill serially/manual through normal daemon tools; core daemon/runtime/Longhouse do not spawn workers.
+- Model routing: the extension orchestrator routes, it does not read the world. Push status
   sweeps / CI & log reads / ledger read-back / discovery scans to **cheap-tier**
   workers and consume their compact findings; **mid-tier** runs implementation
   lanes; reserve the **expensive (opus) tier** for judgment — merges on flagged PRs,
@@ -43,7 +44,8 @@ The old `../ocean-orchestrator/*.workflow.js` files are legacy reference materia
 
 - repo-local Longhouse skills/SOP briefs under `./skills/**`, so the daemon prep hook injects them automatically;
 - durable workflow docs under `docs/orchestrator/workflows/**`;
-- future `POST /v1/workflows/prepare` / subagent specs for structured dispatch;
+- `POST /v1/workflows/prepare` and other advisory preparation for installed extensions;
+- extension-owned worker dispatch/orchestration over generic daemon execution seams;
 - normal Ocean daemon tools for all local actions.
 
-Longhouse can recommend, rank, convene, and assemble specs. It must not bypass daemon permission gates or mutate local state directly.
+Longhouse can recommend, rank, convene, and assemble advisory briefs. It must not own general subagent dispatch, bypass daemon permission gates, or mutate local state directly.

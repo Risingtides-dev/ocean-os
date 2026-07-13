@@ -2920,4 +2920,12 @@ area:      [backend]: ocean-daemon Phase 2C leaf extraction
 
 Moved the exhaustive SDK-to-legacy-core event mirror and SDK SSE event-name helpers into private `src/event_adapter.rs`, preserving both production match bodies except for minimal parent visibility. Added three focused tests covering every current SDK wire tag, every intentionally agent-only event, all mirrored payload classes, placeholder tool behavior, error polarity, completion semantics, and wall-time fallback. Bus publication order, legacy envelope session/provenance stamping, runtime relay and TurnCheckpoint filtering, SSE scoping/serialization/replay/lag behavior, routes, and state remain in composition unchanged. Focused, router, full daemon, workspace-test compilation, both supported feature checks, formatting, docs, diff checks, and independent review passed. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
+
+time:  [18:31] [14-07-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [pi/extension-subagent-ownership-20260713]
+type:  [plan]: Make Ocean subagent orchestration extension-owned
+area:  [agent-building]: Core/Longhouse ownership boundary and stale-design cleanup
+
+Recorded the operator decision that general subagent definitions, prompts, model/tool policy, spawn/join lifecycle, budgets, and orchestration belong to separately shipped/runtime-loaded extensions rather than ocean-daemon, ocean-runtime, or Longhouse core. Core remains limited to generic permission-gated turn, cancellation, capability-provider, and extension event/tool seams. Current /v1/subagents/spec and folder-agent subagent metadata are documented as compatibility surfaces pending a separate migration. Active factory, Longhouse, folder-agent, operator, and workspace contracts now agree; the obsolete core TaskTool/fleet design and stale Longhouse work order moved to the opt-in archive. After rebasing onto the current documentation hierarchy, `cargo xtask docs-check` passes with 25 packages, 99 active Markdown files, and 106 local links.
 _________________________________________________________________________________
