@@ -2663,3 +2663,13 @@ area:  [testing]: Injected concurrency seams, retry safety, and launch PID clean
 
 Phase 0B-3 confirmed the existing LazyBrowser mutex already enforced exactly one launch and cancellation-safe partial-cache behavior, but lock wait, liveness, and full attach/launch could stall until the much larger turn deadline. The state machine now bounds those phases at 40/3/30 seconds, preserves a cached handle on liveness timeout, and lets existing waiters consume a completed flight without serial re-probes. Eight deterministic runtime tests plus a real chromiumoxide fake-executable PID cancellation regression pass. Full local CI, supported daemon features, complete browser/runtime suites, and independent concurrency/process reviews pass; Linux CI remains.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [01:43am] [07-13-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [main]
+type:  [gh actions]: Browser single-flight supported-platform gate complete
+area:  [testing]: CI run 29226786986 passed Ubuntu, macOS, and cargo-deny
+
+GitHub Actions validated f45a65df on ubuntu-latest and macos-latest, including the injected browser state-machine matrix and real chromiumoxide launch-cancellation PID test. The cargo-deny lane passed. Phase 0B-3/1B-3 is complete; the only annotation is GitHub's non-blocking Node 20 deprecation notice for actions/checkout@v4.
+_________________________________________________________________________________

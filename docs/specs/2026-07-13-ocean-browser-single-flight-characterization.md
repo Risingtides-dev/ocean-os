@@ -3,7 +3,7 @@
 **Date:** 2026-07-13
 **Plan checkpoint:** Phase 0B-3 / Phase 1B-3
 **Baseline:** `762ee25b`
-**Status:** macOS characterization, full local gate, and independent review passed; Linux CI pending
+**Status:** Complete — macOS/Linux gates and independent concurrency/process review passed
 
 ## Question
 
@@ -77,4 +77,4 @@ Repository validation also passed:
 - complete `ocean-browser` and `ocean-runtime` test suites;
 - independent concurrency and process-safety review after fixes for completed-flight re-probing and PID cleanup identity.
 
-The GitHub macOS/Ubuntu matrix remains before checkpoint completion.
+GitHub Actions run [29226786986](https://github.com/Risingtides-dev/ocean-os/actions/runs/29226786986) passed the full repository gate on both `ubuntu-latest` and `macos-latest`, plus `cargo-deny`, completing the supported-platform checkpoint.
