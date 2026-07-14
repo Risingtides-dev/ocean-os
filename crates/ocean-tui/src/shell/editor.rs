@@ -12,6 +12,10 @@ pub struct EditorTab {
     pub cursor_col: usize,
     pub scroll: usize,
     pub dirty: bool,
+    /// Top visual row for prose soft-wrap mode.
+    pub visual_scroll: usize,
+    /// Left terminal-cell offset for unwrapped source-code mode.
+    pub horizontal_scroll: usize,
     pub highlighted: Vec<StyledLine>,
     pub git_lines: HashMap<usize, Mark>,
     // incremental-highlight bookkeeping: edits re-highlight only the touched
@@ -44,6 +48,8 @@ impl EditorTab {
             cursor_col: 0,
             scroll: 0,
             dirty: false,
+            visual_scroll: 0,
+            horizontal_scroll: 0,
             highlighted,
             git_lines: HashMap::new(),
             needs_full_hl: false,
@@ -159,6 +165,13 @@ impl EditorTab {
         } else if viewport_h > 0 && self.cursor_row >= self.scroll + viewport_h {
             self.scroll = self.cursor_row + 1 - viewport_h;
         }
+    }
+
+    /// Move the logical-line viewport directly (mouse wheel). Cursor movement
+    /// remains independent; the next keyboard move snaps it back into view.
+    pub fn scroll_lines(&mut self, delta: isize, viewport_h: usize) {
+        let max = self.lines.len().saturating_sub(viewport_h.max(1));
+        self.scroll = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
     }
 
     fn byte_idx(line: &str, col: usize) -> usize {

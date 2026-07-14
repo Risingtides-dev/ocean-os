@@ -59,6 +59,8 @@ use super::{
 
 const SESS_W: u16 = 30;
 const TREE_W: u16 = 30;
+const MIN_RAIL_W: u16 = 16;
+const MIN_WORKSPACE_W: u16 = 40;
 /// Default terminal-dock height; resizable at runtime (drag the splitter / ⌃⌥↑↓).
 const TERM_H: u16 = 14;
 /// How long an ephemeral notice occupies the bottom status row before the
@@ -73,6 +75,17 @@ const MIN_CENTER_H: u16 = 5;
 fn max_term_h(center_h: u16) -> u16 {
     // reserve: 1 crumb + 1 splitter + MIN_CENTER_H surface.
     center_h.saturating_sub(2 + MIN_CENTER_H).max(MIN_TERM_H)
+}
+
+/// Largest width one side rail may occupy while preserving the center and the
+/// currently visible opposite rail. Each visible rail also owns a 1-cell
+/// splitter; hidden rails consume no width regardless of their stored size.
+fn max_rail_width(body_w: u16, opposite_w: Option<u16>) -> u16 {
+    body_w
+        .saturating_sub(MIN_WORKSPACE_W)
+        .saturating_sub(1)
+        .saturating_sub(opposite_w.map_or(0, |w| w.saturating_add(1)))
+        .max(MIN_RAIL_W)
 }
 
 /// What the center surface is showing (CTRL swaps editor↔graph the same way).
@@ -288,6 +301,7 @@ pub struct App {
     decision_tokens: HashMap<RequestId, String>,
     perm_request: HashMap<ocean_core::PermissionId, RequestId>,
     /// Pane rects from the last draw, for mouse routing.
+    r_body: Rect,
     r_sessions: Rect,
     r_tree: Rect,
     r_center: Rect,
@@ -296,6 +310,13 @@ pub struct App {
     /// a terminal-dock resize against the available height.
     r_center_col: Rect,
     r_split_term: Rect,
+    /// Vertical rail splitters and their operator-controlled widths.
+    r_split_sessions: Rect,
+    r_split_tree: Rect,
+    sessions_w: u16,
+    tree_w: u16,
+    dragging_sessions: bool,
+    dragging_tree: bool,
     /// Terminal dock height in rows — resizable (drag the splitter or ⌃⌥↑/↓).
     term_h: u16,
     /// True while the operator is dragging the horizontal dock splitter.
@@ -433,12 +454,19 @@ impl App {
             pending_submit_token: None,
             decision_tokens: HashMap::new(),
             perm_request: HashMap::new(),
+            r_body: Rect::default(),
             r_sessions: Rect::default(),
             r_tree: Rect::default(),
             r_center: Rect::default(),
             r_term: Rect::default(),
             r_center_col: Rect::default(),
             r_split_term: Rect::default(),
+            r_split_sessions: Rect::default(),
+            r_split_tree: Rect::default(),
+            sessions_w: SESS_W,
+            tree_w: TREE_W,
+            dragging_sessions: false,
+            dragging_tree: false,
             term_h: TERM_H,
             dragging_term: false,
             models_open: false,
@@ -854,6 +882,43 @@ impl App {
         // forwarded to whichever pane the cursor is over (CTRL behavior).
         if let CrosstermEvent::Mouse(m) = evt {
             let pos = (m.column, m.row);
+            // Vertical rail splitters resize the sidebars. Clamp both rails so
+            // the center workspace always retains its minimum width.
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) if rect_has(self.r_split_sessions, pos) => {
+                    self.dragging_sessions = true;
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left) if rect_has(self.r_split_tree, pos) => {
+                    self.dragging_tree = true;
+                    return;
+                }
+                MouseEventKind::Drag(MouseButton::Left) if self.dragging_sessions => {
+                    let opposite = self.show_tree.then_some(self.tree_w);
+                    let max = max_rail_width(self.r_body.width, opposite);
+                    let candidate = m.column.saturating_sub(self.r_body.x);
+                    self.sessions_w = candidate.clamp(MIN_RAIL_W, max);
+                    return;
+                }
+                MouseEventKind::Drag(MouseButton::Left) if self.dragging_tree => {
+                    let opposite = self.show_sessions.then_some(self.sessions_w);
+                    let max = max_rail_width(self.r_body.width, opposite);
+                    let candidate = self
+                        .r_body
+                        .right()
+                        .saturating_sub(m.column.saturating_add(1));
+                    self.tree_w = candidate.clamp(MIN_RAIL_W, max);
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left)
+                    if self.dragging_sessions || self.dragging_tree =>
+                {
+                    self.dragging_sessions = false;
+                    self.dragging_tree = false;
+                    return;
+                }
+                _ => {}
+            }
             // Terminal-dock resize: grab the horizontal splitter and drag it up
             // (taller) or down (shorter). Wins over pane routing while dragging.
             match m.kind {
@@ -3214,14 +3279,18 @@ impl App {
 
         // body: [sessions][splitter][center][splitter][tree] — CTRL's columns.
         // Rails collapse to 0 when toggled off from the title bar.
-        let sess_w = if self.show_sessions { SESS_W } else { 0 };
-        let tree_w = if self.show_tree { TREE_W } else { 0 };
+        let sess_w = if self.show_sessions {
+            self.sessions_w
+        } else {
+            0
+        };
+        let tree_w = if self.show_tree { self.tree_w } else { 0 };
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(sess_w),
                 Constraint::Length(if sess_w > 0 { 1 } else { 0 }),
-                Constraint::Min(40),
+                Constraint::Min(MIN_WORKSPACE_W),
                 Constraint::Length(if tree_w > 0 { 1 } else { 0 }),
                 Constraint::Length(tree_w),
             ])
@@ -3252,11 +3321,14 @@ impl App {
                 .split(center);
             (rows[0], rows[1], Rect::default(), Rect::default())
         };
+        self.r_body = body;
         self.r_sessions = r_sessions;
         self.r_tree = r_tree;
         self.r_center = r_center;
         self.r_term = r_term;
         self.r_center_col = center;
+        self.r_split_sessions = r_split_a;
+        self.r_split_tree = r_split_b;
         self.r_split_term = r_split_term;
 
         // deep chrome first
@@ -3929,6 +4001,71 @@ mod tests {
             app.sel_press.is_none() && app.sel_rect.is_none(),
             "splitter Down arms no selection"
         );
+    }
+
+    #[test]
+    fn rail_drag_limits_count_only_the_visible_opposite_rail() {
+        let mut app = offline_app();
+        app.show_sessions = true;
+        app.show_tree = true;
+        render_app_to_string(&mut app, 140, 28);
+        let body_w = app.r_body.width;
+        let with_tree = max_rail_width(body_w, Some(app.tree_w));
+        let session_split = app.r_split_sessions;
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            session_split.x,
+            session_split.y + 1,
+        ));
+        app.on_crossterm(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            app.r_body.right(),
+            session_split.y + 1,
+        ));
+        assert_eq!(app.sessions_w, with_tree);
+        app.on_crossterm(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            app.r_body.right(),
+            session_split.y + 1,
+        ));
+
+        app.show_tree = false;
+        render_app_to_string(&mut app, 140, 28);
+        let without_tree = max_rail_width(app.r_body.width, None);
+        let session_split = app.r_split_sessions;
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            session_split.x,
+            session_split.y + 1,
+        ));
+        app.on_crossterm(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            app.r_body.right(),
+            session_split.y + 1,
+        ));
+        assert_eq!(app.sessions_w, without_tree);
+        assert!(without_tree > with_tree);
+    }
+
+    #[test]
+    fn tree_drag_limit_counts_visible_sessions() {
+        let mut app = offline_app();
+        app.show_sessions = true;
+        app.show_tree = true;
+        render_app_to_string(&mut app, 140, 28);
+        let expected = max_rail_width(app.r_body.width, Some(app.sessions_w));
+        let split = app.r_split_tree;
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            split.x,
+            split.y + 1,
+        ));
+        app.on_crossterm(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            app.r_body.x,
+            split.y + 1,
+        ));
+        assert_eq!(app.tree_w, expected);
     }
 
     fn entry(id: &str, provider: &str, ready: bool) -> ModelEntry {

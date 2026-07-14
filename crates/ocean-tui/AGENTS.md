@@ -89,6 +89,8 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 - Prefer clear status/error presentation over hidden failures (see
   `ModelRerouted` — resilience must never silently lie to the operator).
 - Keep the launch cwd as the active surface root; auto-resume must not overwrite it with a stored session root.
+- Side-rail widths are operator-resizable but must clamp against the body width, the minimum center workspace, and only the currently visible opposite rail; a hidden rail's stored width consumes no layout budget.
+- Editor viewport behavior is content-aware: prose extensions soft-wrap vertically, source code scrolls horizontally, mouse-wheel scrolling stays independent until the next keyboard edit/navigation, and rendered text/cursor geometry share terminal sanitization plus Unicode cell widths.
 - Coordinate API/event changes with `ocean-daemon` and `ocean-core`.
 - The model registry lives in `ocean-providers` (`known_models` + resolver
   arms + `Model` constructors in `ocean-protocol` + the claude-code mapping in

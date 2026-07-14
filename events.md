@@ -2834,3 +2834,12 @@ Verification:
 - `cargo fmt --all -- --check`
 - `git diff --check`
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [07:15am] [14-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [feature-request]: resizable workbench rails and content-aware editor viewports
+area:      [frontend]: ocean-tui shell layout and editor
+
+Checkpointed the pending TUI work before the session-component tray: both side rails now resize by mouse while preserving the minimum center workspace and ignoring hidden opposite-rail widths. The editor soft-wraps prose, horizontally scrolls source, keeps mouse-wheel position until keyboard movement resumes cursor-following, and aligns cursor/render geometry through control-byte sanitization and Unicode cell widths. Review found and fixed incorrect rail clamp math, viewport snapback, an eager `then_some` underflow, unsanitized file text, tab/caret disagreement, and half-clipped wide-glyph drift. Added focused rail-drag, manual-scroll, sanitization, and wide-character regressions. The operator-owned deploy/dev.risingtides.ocean-daemon.plist remained untouched.
