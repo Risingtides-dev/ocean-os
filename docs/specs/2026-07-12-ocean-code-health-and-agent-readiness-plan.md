@@ -286,7 +286,7 @@ Before each move, write a short extraction manifest naming exact symbols/files, 
    - **Complete (2026-07-14):** moved the pure lexical traversal, caller-cwd pass-through, and session-detail workspace-scope policy plus nine existing tests intact into private `src/workspace_policy.rs`; startup repo-cwd enforcement, persisted-session lookup, query resolution, HTTP mapping, room/call fallbacks, runtime rebinding, and persistence remain in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-workspace-policy-extraction-manifest.md`.
    - voice wrappers;
    - **Complete (2026-07-14):** characterized the model get/list/set HTTP contracts, then moved the four catalog/selection adapter symbols intact into private `src/model_catalog.rs`; canonical provider routing, readiness, ordering, credential discovery, and persistence remain owner-controlled, while `/ready`, Longhouse filtering, roles, turn overrides, and YOLO policy stay in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-model-catalog-extraction-manifest.md`.
-   - YOLO settings policy and handlers;
+   - **Complete (2026-07-14):** characterized exact settings responses, persistence timing, env masking, safe precedence, and the inert request wire flag, then moved all seven YOLO preference/effective-policy and GET/POST adapter symbols intact into private `src/yolo_settings.rs`; router/call sites, permission and decision-token authority, voice fail-fast behavior, shared environment locks/order, and parent tests remain in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-yolo-settings-extraction-manifest.md`.
    - projects/filesystem;
    - canvas routes.
 3. Move state registries/control plane, room projection, persistent rooms, Longhouse, and calls one domain at a time.

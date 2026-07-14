@@ -1,9 +1,9 @@
 # Ocean Daemon YOLO Settings Extraction Manifest
 
 **Date:** 2026-07-14
-**Status:** Characterization and security-doc clarification complete; extraction, full validation, and review pending
+**Status:** Complete; characterization, security-doc clarification, focused/full/feature validation, and independent review passed
 **Owner:** Ocean OS
-**Rollback point:** `ddc0f2c`
+**Rollback point:** `529e0ed`
 
 ## Purpose
 
@@ -138,9 +138,9 @@ An independent security-focused reviewer must compare all seven moved definition
 
 Two direct-handler tests now freeze exact GET/POST response values, env masking, nullable override fields, and persistence-before-effective resolution. The security documentation now matches the existing inert-wire behavior. Focused settings/precedence/wire/voice tests, all five router contracts, all 294 daemon tests, formatting, documentation, and diff checks pass at the characterization point.
 
-## Planned result
+## Result
 
-A private `yolo_settings.rs` owns only env/persisted effective-policy resolution and GET/POST setting adapters. Parent composition retains every caller, permission boundary, shared env lock, and integration test.
+A private `yolo_settings.rs` now owns only env/persisted effective-policy resolution and the GET/POST settings adapters. All seven moved definitions are unchanged from characterization commit `529e0ed` except for minimal `pub(super)` visibility. Parent composition retains every caller, permission and decision-token boundary, voice fail-fast path, router registration, both shared environment locks, and all characterization/integration tests. Focused settings, precedence, inert-wire, voice, agent, runtime, router, daemon, workspace-test compilation, both supported-feature, formatting, documentation, and diff checks passed. Fresh security-focused review found no unresolved medium-or-higher issue.
 
 ## Rollback
 

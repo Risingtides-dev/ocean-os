@@ -65,18 +65,18 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Core↔SDK event adapters | Complete | Private `src/event_adapter.rs`; exhaustive legacy-mirror and SDK SSE-name adapters plus three focused tests; publication, provenance, runtime relay, filtering, replay, and framing stay in composition |
 | Workspace/cwd policy | Complete | Private `src/workspace_policy.rs`; traversal, caller pass-through, scoped-read policy, and nine tests moved intact; startup guard, lookup, queries, HTTP mapping, runtime rebinding, room/call fallbacks, and persistence stay in composition |
 | Model catalog | Complete | Private `src/model_catalog.rs`; get/list/set adapters moved after four characterization tests; canonical routing, ordered readiness, credential discovery, and persistence stay owner-controlled; `/ready` and turn/domain model policy stay in composition |
-| YOLO settings | Next | Env → persisted → safe-off precedence, inert wire flag, permission authority, shared test locks, and GET/POST shapes must remain exact |
+| YOLO settings | Complete | Private `src/yolo_settings.rs`; env → persisted → safe-off precedence, inert wire flag, exact GET/POST shapes, persistence timing, permission authority, voice fail-fast, and shared test-lock order remain exact |
 | Projects and filesystem | Queued | Preserve HOME sandboxing, canonicalization, response shapes, limits, and project/session behavior |
 | Canvas bridge | Queued, higher coupling | Store, runtime registry, SSE re-emit, TTL, cap, and GC must move together or remain together |
 | Persistent rooms, Longhouse, calls, registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
-At this checkpoint, `main.rs` is approximately 19.7k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, and model-catalog HTTP adapters now independently owned. Model-catalog characterization added four full-shape tests before the move, so raw line count alone understates progress. The important movement is ownership: behavior now has a checked boundary before it leaves the monolith.
+At this checkpoint, `main.rs` is approximately 19.7k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model-catalog HTTP adapters, and security-sensitive YOLO settings policy now independently owned. Catalog and settings characterization added six direct-handler tests before their moves, so raw line count alone understates progress. The important movement is ownership: behavior now has a checked boundary before it leaves the monolith.
 
 ## Course from here
 
-1. Extract the YOLO settings leaf without changing env/persisted precedence, inert-wire hardening, permission authority, shared test-lock ordering, or HTTP shapes.
-2. Separate filesystem and project concerns only after their security and response contracts are fully indexed.
+1. Separate filesystem and project concerns only after their security and response contracts are fully indexed.
+2. Keep permission authority, settings policy, and call-site orchestration fixed while lower-risk leaves move.
 3. Move canvas and stateful domains only with explicit lifecycle/GC manifests.
 4. Move turn/SSE orchestration last.
 5. Request separate Phase 3 approval before splitting `AppState`, generating route metadata, creating a daemon library, or redesigning internal service boundaries.
@@ -104,5 +104,6 @@ A wave is complete only when:
 - [Event-adapters extraction manifest](specs/2026-07-14-ocean-daemon-event-adapters-extraction-manifest.md)
 - [Workspace-policy extraction manifest](specs/2026-07-14-ocean-daemon-workspace-policy-extraction-manifest.md)
 - [Model-catalog extraction manifest](specs/2026-07-14-ocean-daemon-model-catalog-extraction-manifest.md)
+- [YOLO-settings extraction manifest](specs/2026-07-14-ocean-daemon-yolo-settings-extraction-manifest.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)

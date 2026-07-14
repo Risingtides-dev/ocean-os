@@ -2969,3 +2969,13 @@ area:      [backend]: ocean-daemon Phase 2C settings foundation
 Added direct GET/POST settings tests under the established YOLO-then-auto-convene environment-lock order. They freeze exact persisted/effective/env-override response values, nullable override fields, explicit env-off masking of persisted true, persistence-before-effective resolution, and persisted overwrite behavior. Corrected stale documentation that still implied an untrusted per-request wire flag could opt into YOLO; current and required behavior discards that flag and uses operator env → persisted preference → safe-off only. Focused settings, precedence, inert-wire, voice, router, and full 294-test daemon gates plus formatting, docs, and diff checks pass. Permission gates/tokens/call sites, concurrent ACP documentation, and the operator deploy plist remain unchanged.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [07:33pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: extract daemon YOLO settings policy intact
+area:      [backend]: ocean-daemon Phase 2C security-sensitive settings leaf
+
+Moved the test-only env parser target, env preference parser, effective precedence resolver, inert-wire resolver, request body, and GET/POST settings adapters into private `src/yolo_settings.rs`. All seven definitions remain byte-identical to characterization commit `529e0ed` after normalizing only minimal parent visibility. Operator env → persisted preference → safe-off, explicit env-off masking, request-wire inertness, exact response shapes, persistence-before-resolution, permission and decision-token authority, call sites, voice fail-fast behavior, router/middleware, and shared YOLO-then-auto-convene lock order remain unchanged. Focused settings/precedence/wire/voice, agent, runtime, router, full 294-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed; fresh security review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
