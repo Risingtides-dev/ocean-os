@@ -2846,6 +2846,16 @@ Checkpointed the pending TUI work before the session-component tray: both side r
 _________________________________________________________________________________
 _________________________________________________________________________________
 
+time:      [06:11am] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: establish daemon route and middleware parity gate
+area:      [backend]: ocean-daemon Phase 2C router foundation
+
+Began the approved behavior-neutral daemon leaf-extraction sequence with its required safety checkpoint. Extracted the complete Axum assembly into a reusable private `app_router` seam without moving handlers or changing state, route, fallback, or middleware behavior. Characterization found the live router already had 72 explicit method/path pairs while GET / discovery omitted four and the operator guide omitted thirteen; corrected those discovery inventories before the mechanical seam. Five focused contract tests now compare the live registration source bidirectionally with the banner and guide, construct and probe the full router, preserve default 404/405 and trailing-slash behavior, exercise global CORS/preflights and representative implicit HEAD, and freeze the existing static/dynamic persistent-room/LiveKit precedence edge. The operator-owned deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
 time:      [07:32am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]

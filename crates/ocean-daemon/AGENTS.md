@@ -21,6 +21,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - Build provenance must follow normal branch commits and linked worktrees: `build.rs` watches Git `HEAD`, its resolved symbolic branch ref, and `packed-refs`; `/health` and `/ready` must report the exact main-built revision after deployment.
 - `AgentEvent::TurnCheckpoint` is an internal persistence signal consumed by `ocean-agent`; daemon bridges must filter it rather than exposing transcript deltas on SSE.
 - The Track-0 projection routes (`GET /v1/rooms`, detail, snapshot, events) are retired. Preserve `/v1/rooms/persistent/*` and `/v1/rooms/{room_id}/livekit-token`; these are separate durable-collaboration and media contracts.
+- The explicit method/path set in `app_router`, `banner_routes()`, and the operator-guide HTTP quick reference must remain identical. Preserve Axum's default 404/405 fallback and the global layer order: HTTP tracing outside CORS outside route dispatch.
 
 ## Work Guidance
 
@@ -32,6 +33,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 ## Verification
 
 - `cargo test -p ocean-daemon bus::tests::`
+- `cargo test -p ocean-daemon router_contract -- --nocapture`
 - `cargo test -p ocean-daemon`
 - `cargo check --workspace`
 - Manual daemon health check when route/startup behavior changes: `curl http://127.0.0.1:4780/health`

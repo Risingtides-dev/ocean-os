@@ -278,7 +278,7 @@ Before each move, write a short extraction manifest naming exact symbols/files, 
 
 #### 2C. `ocean-daemon` composition and leaf extraction
 
-1. Establish a reusable internal router seam while preserving method/path sets, nesting/fallback behavior, and middleware layering. Preserve registration order only where an Axum match or fallback test proves it behaviorally relevant.
+1. **Complete (2026-07-14):** established a reusable internal router seam and checked the full explicit method/path, discovery-banner, operator-guide, merge, fallback, CORS, implicit-HEAD, and static/dynamic room-precedence contracts. Characterization found and corrected four pre-existing banner omissions and thirteen operator-guide omissions without changing the mounted route graph. Manifest: `docs/specs/2026-07-14-ocean-daemon-router-parity-extraction-manifest.md`.
 2. Move leaf concerns first:
    - metrics;
    - CORS policy;

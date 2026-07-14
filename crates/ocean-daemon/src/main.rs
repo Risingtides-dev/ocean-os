@@ -979,6 +979,108 @@ fn is_loopback_origin(origin: &str) -> bool {
     host_only == "localhost" || host_only == "127.0.0.1"
 }
 
+/// Build the daemon's CORS layer from an already-normalized operator allowlist.
+///
+/// Keeping layer construction outside [`main`] lets the production router and
+/// the route-contract tests exercise the same origin, method, and header policy.
+fn cors_layer(extra_origins: Vec<String>) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _req| {
+            is_trusted_origin(origin, &extra_origins)
+        }))
+        .allow_methods(cors_allowed_methods())
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+}
+
+/// Assemble the complete daemon router before binding [`AppState`].
+///
+/// This is the behavior-neutral Phase 2C seam: route registration, grouped
+/// merges, Axum's default fallback, and middleware order now have one reusable
+/// construction path. Layers remain in their original order: CORS is inner and
+/// HTTP tracing is outer, so requests enter tracing before CORS/route dispatch.
+fn app_router(cors: CorsLayer) -> Router<AppState> {
+    Router::new()
+        .route("/", get(root))
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        // OCEAN-303: Prometheus-text turn metrics (latency histogram + counters).
+        .route("/metrics", get(metrics))
+        .route("/v1/agent/turns", post(agent_turn))
+        .route("/v1/agent/voice", post(agent_voice))
+        .route("/v1/agent/events", get(agent_events))
+        // OCEAN-262: the Slack canvas bridge (`ocean-agents`) POSTs a fulfilled
+        // awareness result here after round-tripping a `read`/`list`/`create` to
+        // the live Slack Canvas API; a `GET` queries the stored fulfillment per
+        // `(session_id, canvas_id)`. Closes the `slack_canvas` loop opened by the
+        // OCEAN-235 SSE relay.
+        .route(
+            "/v1/agent/canvas/fulfill",
+            get(canvas_fulfillment_get).post(canvas_fulfillment_post),
+        )
+        .route(
+            "/v1/agent/sessions",
+            get(agent_sessions).post(agent_sessions_create),
+        )
+        .route("/v1/agent/sessions/{id}", get(agent_session))
+        // Voice phases 2/3: ephemeral Realtime client-secret mint (the
+        // browser talks WebRTC directly to OpenAI with the returned secret;
+        // the API key never leaves the daemon) and the voice agent's handoff
+        // append into a chat session.
+        .route(
+            "/v1/voice/realtime/client-secret",
+            post(voice_realtime_client_secret),
+        )
+        // Voice phase 4: STT + TTS endpoints. The daemon holds the xAI key;
+        // the surface proxy forwards `/api/stt` and `/api/tts` here.
+        .route("/v1/voice/stt", post(voice_stt))
+        .route("/v1/voice/tts", post(voice_tts))
+        .route(
+            "/v1/agent/sessions/{id}/messages",
+            post(agent_session_message_append),
+        )
+        .route("/v1/events", get(events))
+        .route("/v1/prompt", post(prompt))
+        .route("/v1/requests", get(requests).post(create_request))
+        .route("/v1/requests/{id}/cancel", post(cancel_request))
+        .route("/v1/permissions", get(permissions))
+        .route("/v1/permissions/{id}/decision", post(permission_decision))
+        .merge(room_routes())
+        .route("/v1/sessions", get(sessions))
+        .route("/v1/sessions/{id}", get(session))
+        // Folder-as-agent classification (read-only): list + resolve agents from
+        // the agents root. See docs/specs/folder-as-agent.md.
+        .route("/v1/agents", get(agents_list))
+        .route("/v1/agents/{name}", get(agent_def))
+        .route("/v1/projects", get(projects_list).post(project_create))
+        .route(
+            "/v1/projects/{id}",
+            get(project_get).patch(project_patch).delete(project_delete),
+        )
+        .route("/v1/fs/dirs", get(fs_dirs))
+        .route("/v1/fs/file", get(fs_file))
+        .route("/v1/browser/screencast", get(browser_screencast))
+        .route("/v1/browser/input", post(browser_input))
+        .route("/v1/model", get(model_get).post(model_set))
+        .route("/v1/models", get(models_list))
+        .route("/v1/memory", get(memory_list))
+        .route("/v1/lsp", get(lsp_list))
+        .route(
+            "/v1/settings/yolo",
+            get(yolo_setting_get).post(yolo_setting_set),
+        )
+        .route("/v1/component/event", post(component_event))
+        // Longhouse + council convene routes (incl. the `/v1/council/convene`
+        // alias and the read-only `/v1/longhouse/prepare` prep step) live in one
+        // reusable group so the router here and the HTTP route test below
+        // register exactly the same table (OCEAN-227, OCEAN-226).
+        .merge(longhouse_routes())
+        .route("/v1/calls/demo", post(call_demo))
+        .route("/v1/calls/place", post(call_place))
+        .route("/v1/calls/webhook", post(call_webhook))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // OCEAN-274: render per-turn span context so concurrent turns are
@@ -1211,93 +1313,7 @@ async fn main() -> anyhow::Result<()> {
     if !extra_origins.is_empty() {
         tracing::info!(origins = ?extra_origins, "OCEAN_ALLOWED_ORIGINS: extra CORS origins");
     }
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(move |origin, _req| {
-            is_trusted_origin(origin, &extra_origins)
-        }))
-        .allow_methods(cors_allowed_methods())
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
-
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        // OCEAN-303: Prometheus-text turn metrics (latency histogram + counters).
-        .route("/metrics", get(metrics))
-        .route("/v1/agent/turns", post(agent_turn))
-        .route("/v1/agent/voice", post(agent_voice))
-        .route("/v1/agent/events", get(agent_events))
-        // OCEAN-262: the Slack canvas bridge (`ocean-agents`) POSTs a fulfilled
-        // awareness result here after round-tripping a `read`/`list`/`create` to
-        // the live Slack Canvas API; a `GET` queries the stored fulfillment per
-        // `(session_id, canvas_id)`. Closes the `slack_canvas` loop opened by the
-        // OCEAN-235 SSE relay.
-        .route(
-            "/v1/agent/canvas/fulfill",
-            get(canvas_fulfillment_get).post(canvas_fulfillment_post),
-        )
-        .route(
-            "/v1/agent/sessions",
-            get(agent_sessions).post(agent_sessions_create),
-        )
-        .route("/v1/agent/sessions/{id}", get(agent_session))
-        // Voice phases 2/3: ephemeral Realtime client-secret mint (the
-        // browser talks WebRTC directly to OpenAI with the returned secret;
-        // the API key never leaves the daemon) and the voice agent's handoff
-        // append into a chat session.
-        .route(
-            "/v1/voice/realtime/client-secret",
-            post(voice_realtime_client_secret),
-        )
-        // Voice phase 4: STT + TTS endpoints. The daemon holds the xAI key;
-        // the surface proxy forwards `/api/stt` and `/api/tts` here.
-        .route("/v1/voice/stt", post(voice_stt))
-        .route("/v1/voice/tts", post(voice_tts))
-        .route(
-            "/v1/agent/sessions/{id}/messages",
-            post(agent_session_message_append),
-        )
-        .route("/v1/events", get(events))
-        .route("/v1/prompt", post(prompt))
-        .route("/v1/requests", get(requests).post(create_request))
-        .route("/v1/requests/{id}/cancel", post(cancel_request))
-        .route("/v1/permissions", get(permissions))
-        .route("/v1/permissions/{id}/decision", post(permission_decision))
-        .merge(room_routes())
-        .route("/v1/sessions", get(sessions))
-        .route("/v1/sessions/{id}", get(session))
-        // Folder-as-agent classification (read-only): list + resolve agents from
-        // the agents root. See docs/specs/folder-as-agent.md.
-        .route("/v1/agents", get(agents_list))
-        .route("/v1/agents/{name}", get(agent_def))
-        .route("/v1/projects", get(projects_list).post(project_create))
-        .route(
-            "/v1/projects/{id}",
-            get(project_get).patch(project_patch).delete(project_delete),
-        )
-        .route("/v1/fs/dirs", get(fs_dirs))
-        .route("/v1/fs/file", get(fs_file))
-        .route("/v1/browser/screencast", get(browser_screencast))
-        .route("/v1/browser/input", post(browser_input))
-        .route("/v1/model", get(model_get).post(model_set))
-        .route("/v1/models", get(models_list))
-        .route("/v1/memory", get(memory_list))
-        .route("/v1/lsp", get(lsp_list))
-        .route(
-            "/v1/settings/yolo",
-            get(yolo_setting_get).post(yolo_setting_set),
-        )
-        .route("/v1/component/event", post(component_event))
-        // Longhouse + council convene routes (incl. the `/v1/council/convene`
-        // alias and the read-only `/v1/longhouse/prepare` prep step) live in one
-        // reusable group so the router here and the HTTP route test below
-        // register exactly the same table (OCEAN-227, OCEAN-226).
-        .merge(longhouse_routes())
-        .route("/v1/calls/demo", post(call_demo))
-        .route("/v1/calls/place", post(call_place))
-        .route("/v1/calls/webhook", post(call_webhook))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http());
+    let app = app_router(cors_layer(extra_origins));
 
     // Drain the registry of in-flight turn tasks AFTER axum finishes draining
     // open connections (OCEAN-184). `with_graceful_shutdown` only waits for live
@@ -15011,6 +15027,32 @@ mod tests {
     /// `.await` without tripping `clippy::await_holding_lock`.
     static AUTO_CONVENE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Panic-safe restoration for process-global environment changed while
+    /// constructing deterministic test runtimes.
+    struct TestEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl TestEnvRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     /// Build an `AppState` whose runtime is pinned to the Fake provider (so a
     /// turn runs synchronously and deterministically with no live LLM) and whose
     /// room store is a fresh in-memory SQLite DB. Returns the state plus the
@@ -19628,6 +19670,513 @@ mod tests {
                 "banner entry {route:?} path does not start with '/'"
             );
         }
+    }
+
+    fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing source marker {start:?}"));
+        let tail = &source[start..];
+        let end = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing source marker {end:?}"));
+        &tail[..end]
+    }
+
+    /// Extract `.route(...)` calls while respecting nested method-router calls
+    /// and quoted path literals. This intentionally parses only the narrow,
+    /// stable router-builder syntax; a structural rewrite must update the
+    /// characterization rather than silently weakening route discovery.
+    fn route_calls(source: &str) -> Vec<&str> {
+        let mut calls = Vec::new();
+        let mut cursor = 0;
+        while let Some(relative) = source[cursor..].find(".route(") {
+            let start = cursor + relative + ".route(".len();
+            let mut depth = 1usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut end = None;
+            for (offset, ch) in source[start..].char_indices() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(start + offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.expect("unterminated .route(...) call");
+            calls.push(&source[start..end]);
+            cursor = end + 1;
+        }
+        calls
+    }
+
+    fn route_call_contains(call: &str, method: &str) -> bool {
+        let needle = format!("{method}(");
+        call.match_indices(&needle).any(|(index, _)| {
+            index == 0
+                || !call.as_bytes()[index - 1].is_ascii_alphanumeric()
+                    && call.as_bytes()[index - 1] != b'_'
+        })
+    }
+
+    fn source_registered_routes() -> std::collections::BTreeSet<String> {
+        let source = include_str!("main.rs");
+        let app_router_source = source_section(source, "fn app_router(", "#[tokio::main]");
+        let merge_targets: std::collections::BTreeSet<&str> = app_router_source
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix(".merge(")
+                    .and_then(|target| target.strip_suffix(')'))
+            })
+            .collect();
+        assert_eq!(
+            app_router_source.matches(".merge(").count(),
+            merge_targets.len(),
+            "every app_router merge must remain a one-line checked target"
+        );
+        assert_eq!(
+            merge_targets,
+            ["longhouse_routes()", "room_routes()"]
+                .into_iter()
+                .collect(),
+            "new route groups must be added to the parity parser"
+        );
+        let sections = [
+            app_router_source,
+            source_section(source, "fn room_routes(", "fn longhouse_routes("),
+            source_section(source, "fn longhouse_routes(", "async fn longhouse_demo("),
+        ];
+        let mut routes = std::collections::BTreeSet::new();
+        for call in sections.into_iter().flat_map(route_calls) {
+            let path_start = call.find('"').expect("route call has a quoted path") + 1;
+            let path_end = path_start
+                + call[path_start..]
+                    .find('"')
+                    .expect("route path has a closing quote");
+            let path = &call[path_start..path_end];
+            for (rust_name, wire_name) in [
+                ("get", "GET"),
+                ("post", "POST"),
+                ("put", "PUT"),
+                ("patch", "PATCH"),
+                ("delete", "DELETE"),
+            ] {
+                if route_call_contains(call, rust_name) {
+                    routes.insert(format!("{wire_name} {path}"));
+                }
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn router_contract_source_banner_and_operator_guide_are_in_parity() {
+        let registered = source_registered_routes();
+        let banner: std::collections::BTreeSet<String> = banner_routes()
+            .iter()
+            .map(|route| (*route).into())
+            .collect();
+        assert_eq!(
+            registered, banner,
+            "live Router::route registrations and GET / discovery must match"
+        );
+        assert_eq!(
+            banner.len(),
+            72,
+            "route baseline changed; review the manifest"
+        );
+
+        let guide = include_str!("../../../docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md");
+        let quick_ref = source_section(
+            guide,
+            "## HTTP API quick reference",
+            "### Synchronous prompt",
+        );
+        let documented: std::collections::BTreeSet<String> = quick_ref
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let method = parts.next()?;
+                let path = parts.next()?;
+                matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE")
+                    .then(|| format!("{method} {path}"))
+            })
+            .collect();
+        assert_eq!(
+            banner, documented,
+            "operator HTTP quick reference and GET / discovery must match"
+        );
+    }
+
+    #[test]
+    fn router_contract_middleware_and_default_fallback_snapshot_is_explicit() {
+        let source = include_str!("main.rs");
+        let builder = source_section(source, "fn app_router(", "#[tokio::main]");
+        let cors = builder.find(".layer(cors)").expect("CORS layer is mounted");
+        let trace = builder
+            .find(".layer(TraceLayer::new_for_http())")
+            .expect("HTTP trace layer is mounted");
+        assert!(
+            cors < trace,
+            "Axum layers are applied inner-to-outer: CORS must remain inside HTTP tracing"
+        );
+        assert!(
+            !builder.contains(".fallback("),
+            "the production router must retain Axum's default 404/405 fallback"
+        );
+    }
+
+    fn materialize_route_path(path: &str) -> String {
+        let mut output = String::with_capacity(path.len());
+        let mut in_parameter = false;
+        for ch in path.chars() {
+            match ch {
+                '{' => {
+                    in_parameter = true;
+                    output.push_str("route-probe");
+                }
+                '}' => in_parameter = false,
+                _ if !in_parameter => output.push(ch),
+                _ => {}
+            }
+        }
+        output
+    }
+
+    async fn route_contract_state(tmp: &tempfile::TempDir) -> AppState {
+        let _lock = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        fake_convene_state(tmp)
+    }
+
+    async fn route_probe_sentinel(
+        _request: axum::extract::Request,
+        _next: axum::middleware::Next,
+    ) -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn router_contract_live_methods_fallback_and_cors_match_snapshot() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = route_contract_state(&tmp).await;
+        let app = app_router(cors_layer(Vec::new()))
+            .route_layer(axum::middleware::from_fn(route_probe_sentinel))
+            .fallback(|| async { (StatusCode::IM_A_TEAPOT, "route-contract fallback") })
+            .with_state(state.clone());
+
+        for route in banner_routes() {
+            let (method, path) = route.split_once(' ').expect("well-formed banner route");
+            let request = Request::builder()
+                .method(Method::from_bytes(method.as_bytes()).unwrap())
+                .uri(materialize_route_path(path))
+                // Reject body-extracting mutation handlers before their bodies run.
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "advertised method/path did not reach the matched-route sentinel: {route}"
+            );
+        }
+
+        let production = app_router(cors_layer(Vec::new())).with_state(state);
+        let unknown = production
+            .clone()
+            .oneshot(
+                Request::get("/definitely-not-an-ocean-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let wrong_method = production
+            .clone()
+            .oneshot(Request::put("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        for method in ["GET", "POST", "PATCH", "DELETE"] {
+            let preflight = production
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri("/v1/projects/route-probe")
+                        .header(header::ORIGIN, "http://localhost:8080")
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, method)
+                        .header(
+                            header::ACCESS_CONTROL_REQUEST_HEADERS,
+                            "content-type,authorization",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(preflight.status().is_success(), "{method} preflight failed");
+            assert_eq!(
+                preflight.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static("http://localhost:8080"))
+            );
+            let methods = preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert!(
+                methods.contains(method),
+                "preflight omitted {method}: {methods}"
+            );
+            let headers = preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert!(
+                headers.contains("content-type"),
+                "preflight omitted content-type"
+            );
+            assert!(
+                headers.contains("authorization"),
+                "preflight omitted authorization"
+            );
+            let vary = preflight
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(",");
+            for required in [
+                "origin",
+                "access-control-request-method",
+                "access-control-request-headers",
+            ] {
+                assert!(
+                    vary.contains(required),
+                    "preflight Vary omitted {required}: {vary}"
+                );
+            }
+        }
+
+        let untrusted = production
+            .oneshot(
+                Request::get("/health")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            untrusted
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "untrusted origins must not receive CORS authorization"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn router_contract_fallback_headers_and_implicit_methods_match_snapshot() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_router(cors_layer(Vec::new())).with_state(route_contract_state(&tmp).await);
+        let trusted_origin = "http://localhost:8080";
+
+        for (method, path, status, allow) in [
+            (
+                Method::GET,
+                "/definitely-not-an-ocean-route",
+                StatusCode::NOT_FOUND,
+                None,
+            ),
+            (
+                Method::PUT,
+                "/health",
+                StatusCode::METHOD_NOT_ALLOWED,
+                Some("GET,HEAD"),
+            ),
+            (Method::GET, "/health/", StatusCode::NOT_FOUND, None),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::ORIGIN, trusted_origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static(trusted_origin)),
+                "global CORS must cover fallback responses: {path}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ALLOW)
+                    .and_then(|value| value.to_str().ok()),
+                allow,
+                "Allow header drifted: {path}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                body.is_empty(),
+                "Axum fallback body must stay empty: {path}"
+            );
+        }
+
+        let bare_options = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/health")
+                    .header(header::ORIGIN, trusted_origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare_options.status(), StatusCode::OK);
+        assert_eq!(
+            bare_options
+                .headers()
+                .get(header::ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("GET,HEAD")
+        );
+        assert_eq!(
+            bare_options
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static(trusted_origin))
+        );
+
+        for path in ["/health", "/metrics", "/v1/agent/events"] {
+            let head = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                head.status().is_success(),
+                "implicit HEAD failed for {path}"
+            );
+            let body = head.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                body.is_empty(),
+                "HEAD must suppress the response body: {path}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn router_contract_room_static_dynamic_precedence_matches_snapshot() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_router(cors_layer(Vec::new())).with_state(route_contract_state(&tmp).await);
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/rooms/persistent/livekit-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.status(),
+            StatusCode::NOT_FOUND,
+            "the static persistent-room branch must win for GET"
+        );
+        assert_eq!(
+            detail.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+
+        let overlap_post = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/rooms/persistent/livekit-token")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            overlap_post.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Axum must not backtrack from the static persistent-room branch"
+        );
+        assert_eq!(
+            overlap_post
+                .headers()
+                .get(header::ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("GET,HEAD")
+        );
+
+        let livekit_control = app
+            .oneshot(
+                Request::post("/v1/rooms/call-room/livekit-token")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            livekit_control.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a non-overlapping room id must reach the LiveKit JSON extractor"
+        );
     }
 
     // ---- Filesystem helpers (unit) ------------------------------------------
