@@ -1380,6 +1380,7 @@ impl AgentRuntime {
             agent_model: _,
             tool_allowlist,
             agent_capabilities,
+            tools_disabled,
             hashline_edits,
             artifact_spill,
         } = control;
@@ -1393,11 +1394,16 @@ impl AgentRuntime {
             artifacts: artifact_spill,
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
-        // Folder-as-agent tool narrowing: a named agent's declared `tools` list
-        // restricts this turn to those tools. Fail-safe — if the allowlist
-        // matches no available tool (typo / renamed tool), keep the full set and
-        // warn rather than running the agent with zero tools.
-        let mut tools = narrow_tools(tools, tool_allowlist.as_deref());
+        // `tools_disabled` is a fail-closed authorization boundary. Unlike an
+        // empty/unmatched allowlist, it clears every registered capability and
+        // prevents folder-agent subprocess capabilities from being added later.
+        let mut tools = if tools_disabled {
+            Vec::new()
+        } else {
+            // Folder-as-agent tool narrowing is intentionally fail-open for bad
+            // configuration and is not a security control.
+            narrow_tools(tools, tool_allowlist.as_deref())
+        };
         // A2 — folder-as-agent capability binding. When the turn's agent declares
         // tier-1 subprocess capabilities, launch each as an `ocean-plugin`
         // subprocess and APPEND its tools (namespaced `plugin__<name>__*`, always
@@ -1408,22 +1414,24 @@ impl AgentRuntime {
         // can't spawn is skipped inside the builder, so a bad capability never
         // breaks the turn. No caps → the toolset is unchanged (behavior-neutral
         // for every other turn). First-wins dedup keeps built-ins unshadowable.
-        if let Some((agent_root, caps)) = agent_capabilities {
-            let extra = build_agent_capability_providers(&caps, &agent_root).await;
-            if !extra.is_empty() {
-                let mut seen: std::collections::HashSet<String> =
-                    tools.iter().map(|t| t.name().to_string()).collect();
-                for provider in &extra {
-                    for tool in provider.tools(&tool_ctx).await {
-                        let name = tool.name().to_string();
-                        if seen.insert(name.clone()) {
-                            tools.push(tool);
-                        } else {
-                            tracing::warn!(
-                                tool = %name,
-                                provider = %provider.id(),
-                                "agent capability tool name collides with an existing tool; keeping the existing one"
-                            );
+        if !tools_disabled {
+            if let Some((agent_root, caps)) = agent_capabilities {
+                let extra = build_agent_capability_providers(&caps, &agent_root).await;
+                if !extra.is_empty() {
+                    let mut seen: std::collections::HashSet<String> =
+                        tools.iter().map(|t| t.name().to_string()).collect();
+                    for provider in &extra {
+                        for tool in provider.tools(&tool_ctx).await {
+                            let name = tool.name().to_string();
+                            if seen.insert(name.clone()) {
+                                tools.push(tool);
+                            } else {
+                                tracing::warn!(
+                                    tool = %name,
+                                    provider = %provider.id(),
+                                    "agent capability tool name collides with an existing tool; keeping the existing one"
+                                );
+                            }
                         }
                     }
                 }
@@ -1793,6 +1801,9 @@ pub struct PromptControl {
     /// unchanged. Fail-soft: a spec that can't spawn is warned and skipped, never
     /// breaking the turn.
     pub agent_capabilities: Option<(PathBuf, Vec<agentdir::SubprocessCapability>)>,
+    /// Fail-closed per-turn control that suppresses every tool source, including
+    /// dynamically registered and folder-agent subprocess capabilities.
+    pub tools_disabled: bool,
     /// Hashline-edit harness capability for this turn (W1 / harness profiles).
     /// When true the turn's `read` tags output + records snapshots and a
     /// `hashline_edit` tool is offered. Set by the daemon from the surface's
@@ -1847,9 +1858,18 @@ impl PromptControl {
             tool_allowlist: None,
             agent_model: None,
             agent_capabilities: None,
+            tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
         }
+    }
+
+    /// Disable every tool for this turn. This is the fail-closed control for
+    /// contexts that must never execute capabilities; do not substitute an
+    /// empty allowlist, whose semantics intentionally remain fail-open.
+    pub fn without_tools(mut self) -> Self {
+        self.tools_disabled = true;
+        self
     }
 
     /// Enable the hashline-edit harness for this turn (W1). Set from the
@@ -2765,6 +2785,21 @@ mod tests {
             .with_agent_model(Some("agentmodel".into()));
         assert_eq!(ctl.model_id.as_deref(), Some("explicit"));
         assert_eq!(ctl.agent_model.as_deref(), Some("agentmodel"));
+    }
+
+    #[test]
+    fn prompt_control_defaults_to_tools_enabled_and_without_tools_is_explicit() {
+        let default = PromptControl::yolo(false);
+        assert!(!default.tools_disabled);
+
+        let disabled = PromptControl::yolo(true)
+            .with_tool_allowlist(vec!["read".into()])
+            .without_tools();
+        assert!(disabled.tools_disabled);
+        assert_eq!(
+            disabled.tool_allowlist.as_deref(),
+            Some(["read".into()].as_slice())
+        );
     }
 
     #[test]

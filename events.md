@@ -3121,3 +3121,12 @@ area:      [backend]: ocean-daemon Phase 2C leaf compatibility seam
 Added five direct-handler tests covering exact validation order and 400/404/410/500/200 envelopes, scoped key matching, explicit/default payload delivery, one-shot consumption, dropped receivers, and registry poison behavior. Then moved the unchanged 72-line `POST /v1/component/event` adapter into private `src/component_interaction.rs`. Route/banner/operator-guide composition remains in `main.rs`; `ocean-runtime` retains wait-registry ownership, permission/session binding, registration, timeout, ordinary post-await cleanup, and existing cancellation-drop behavior. Five handler tests, 16 focused runtime component tests plus lifecycle integration, all 122 runtime tests and integrations, 154 agent tests, five router contracts, all 310 daemon tests, workspace-test compilation, both feature checks, formatting, docs, and diff gates passed. Fresh parity/security review found no unresolved medium-or-higher issue. The dirty primary worktree remained untouched.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [12:00pm] [14-07-26]
+agent:     [pi-subagent], [openai]
+worktree:  /tmp/ocean-os-voice-planner-20260714
+ type:      [bug report]
+area:      [backend]
+
+Hardened call-voice turns to an explicit Voice profile with yolo disabled and a fail-closed PromptControl no-tools boundary. Empty and unmatched folder-agent allowlists retain their existing fail-open semantics and are not used as an authorization control.

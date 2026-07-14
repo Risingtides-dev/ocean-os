@@ -78,6 +78,12 @@ ever raised). With no token **and** yolo off, the daemon rejects the turn up fro
 with `400` and a clear, speakable message ("turn on yolo, or send a
 decision_token") instead of letting it stall on an un-answerable prompt.
 
+The call active lane is stricter and independent of that wrapper: every
+`client_type: "call-voice"` turn uses the Voice harness profile, forces
+`yolo: false`, and disables the complete tool registry. `OCEAN_YOLO=1` does not
+loosen this posture, so a call answer cannot execute tools or raise a permission
+request.
+
 ```bash
 # Default: gated. Mutating tools require approval.
 (cd "$HOME" && "$OCEAN_DAEMON_BIN")

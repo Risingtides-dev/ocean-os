@@ -3792,9 +3792,9 @@ fn with_rooms_handle<T>(
 /// The active lane's [`ocean_call::TurnRunner`]: runs one ephemeral agent turn
 /// over a wake command and returns the assistant's reply text for TTS.
 ///
-/// It drives the *same* `AgentRuntime` every other turn uses — so a call answer
-/// is a real agent turn (tools, permissions, the operator's model) — but in its
-/// own throwaway session per call (`call:<room>`), tagged `client_type =
+/// It drives the *same* `AgentRuntime` every other turn uses, but call answers
+/// are deliberately fail-closed: Voice profile, `yolo: false`, and zero tools.
+/// The turn lives in its own throwaway session per call (`call:<room>`), tagged `client_type =
 /// "call-voice"`, so a call never pollutes a user's chat session. The reply is
 /// `res.stdout`, the full assistant text the runtime already streamed.
 ///
@@ -3840,16 +3840,17 @@ impl ocean_call::TurnRunner for DaemonTurnRunner {
         let request_id = Uuid::new_v4();
         let cancel = CancellationToken::new();
 
-        // Permission posture follows operator policy, same as any other turn.
-        let yolo = effective_yolo();
+        // Call voice cannot present or answer permission prompts. Ignore global
+        // and persisted YOLO and enforce a fail-closed zero-tools posture.
         let control = build_prompt_control(
             &self.state,
             request_id,
             Some(session_id),
-            yolo,
+            false,
             cancel,
             None,
-        );
+        )
+        .without_tools();
 
         let prompt_req = PromptRequest {
             prompt: command.to_string(),
@@ -3858,7 +3859,7 @@ impl ocean_call::TurnRunner for DaemonTurnRunner {
             session_id: Some(session_id),
             create_if_missing: is_new,
             max_turns: None,
-            yolo,
+            yolo: false,
             cwd: self.cwd.clone(),
             project_id: None,
             client_type: Some("call-voice".to_string()),

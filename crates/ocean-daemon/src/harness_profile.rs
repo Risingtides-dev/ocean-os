@@ -78,12 +78,12 @@ impl HarnessProfile {
     /// Known mappings:
     /// - `"tui"` → [`Tui`]
     /// - `"surface-web"`, `"surface-extension"` → [`Web`]
-    /// - `"leo-voice"` → [`Voice`]
+    /// - `"leo-voice"`, `"call-voice"` → [`Voice`]
     /// - `"cli"` → [`Cli`]
     ///
     /// Anything else (including unrecognised surfaces like `"surface-gpui"` /
-    /// `"surface-native"`, transient `client_type`s such as `"call-voice"` /
-    /// `"room"`, or a missing `client_type`) falls back to [`Cli`]. `Cli` is the
+    /// `"surface-native"`, transient `client_type`s such as `"room"`, or a
+    /// missing `client_type`) falls back to [`Cli`]. `Cli` is the
     /// conservative default: it grants reliable edits + artifacts but withholds
     /// the heavy IDE machinery (LSP, stream rules, rich context), so an unknown
     /// caller never silently inherits the full harness weight — it opts in by
@@ -97,7 +97,7 @@ impl HarnessProfile {
         match client_type {
             Some("tui") => HarnessProfile::Tui,
             Some("surface-web") | Some("surface-extension") => HarnessProfile::Web,
-            Some("leo-voice") => HarnessProfile::Voice,
+            Some("leo-voice") | Some("call-voice") => HarnessProfile::Voice,
             Some("cli") => HarnessProfile::Cli,
             _ => HarnessProfile::Cli,
         }
@@ -194,6 +194,10 @@ mod tests {
             HarnessProfile::Voice
         );
         assert_eq!(
+            HarnessProfile::from_client_type(Some("call-voice")),
+            HarnessProfile::Voice
+        );
+        assert_eq!(
             HarnessProfile::from_client_type(Some("cli")),
             HarnessProfile::Cli
         );
@@ -208,10 +212,6 @@ mod tests {
         );
         assert_eq!(
             HarnessProfile::from_client_type(Some("surface-native")),
-            HarnessProfile::Cli
-        );
-        assert_eq!(
-            HarnessProfile::from_client_type(Some("call-voice")),
             HarnessProfile::Cli
         );
         assert_eq!(
