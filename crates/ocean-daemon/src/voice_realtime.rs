@@ -13,6 +13,7 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 /// Default Realtime model — current public id; the surface may override
 /// per-request (e.g. the cheaper mini variant) via the request body.
@@ -30,6 +31,20 @@ const SECRET_TTL_SECS: u32 = 600;
 const BRIEFING_MAX_ENTRIES: usize = 30;
 const BRIEFING_CHAR_BUDGET: usize = 8_000;
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RealtimePurpose {
+    #[default]
+    Conversation,
+    Planner,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct VoicePlannerContext {
+    pub project_id: Uuid,
+    pub workspace_root: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct RealtimeSecretRequest {
     /// Chat session to brief the voice agent on (and the target of its
@@ -40,6 +55,13 @@ pub(crate) struct RealtimeSecretRequest {
     /// Realtime model override; defaults to [`DEFAULT_REALTIME_MODEL`].
     #[serde(default)]
     pub model: Option<String>,
+    /// Additive mode selector. Omitted preserves the conversation contract.
+    #[serde(default)]
+    pub purpose: RealtimePurpose,
+    /// Browser-selected ids are validated against daemon-owned project and live
+    /// worktree state before credentials are resolved.
+    #[serde(default)]
+    pub planner_context: Option<VoicePlannerContext>,
 }
 
 /// Render the voice agent's instructions: a fixed header describing the two
@@ -114,6 +136,56 @@ pub(crate) fn upstream_body(model: &str, instructions: &str) -> Value {
                 }
             ]
         }
+    })
+}
+
+/// Pre-session planner instructions. The project name and canonical workspace
+/// are daemon-owned values, never browser labels.
+pub(crate) fn build_planner_instructions(project_name: &str, workspace_root: &str) -> String {
+    format!(
+        "You are Ocean's propose-only realtime Voice Planner. Gather and refine a PRD conversationally for project `{project_name}` in validated workspace `{workspace_root}`. Use only these daemon-validated labels. When the proposal is ready, call `propose_handoff`; that call only proposes structured data for local human review and executes nothing. A human must click Create draft or Create & start before any session, message, turn, file, or work is created. Never claim that files, sessions, messages, turns, or work were created. No other tools exist."
+    )
+}
+
+/// Planner mint body: exactly one strict, bounded proposal tool.
+pub(crate) fn planner_upstream_body(model: &str, instructions: &str) -> Value {
+    json!({
+        "expires_after": { "anchor": "created_at", "seconds": SECRET_TTL_SECS },
+        "session": {
+            "type": "realtime",
+            "model": model,
+            "instructions": instructions,
+            "audio": { "output": { "voice": "marin" } },
+            "tools": [{
+                "type": "function",
+                "name": "propose_handoff",
+                "description": "Propose a structured PRD handoff for human review. This does not create a session or start work.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "title": {"type": "string", "maxLength": 120},
+                        "problem": {"type": "string", "maxLength": 2000},
+                        "users": bounded_string_array_schema(),
+                        "goals": bounded_string_array_schema(),
+                        "non_goals": bounded_string_array_schema(),
+                        "requirements": bounded_string_array_schema(),
+                        "acceptance_criteria": bounded_string_array_schema(),
+                        "constraints": bounded_string_array_schema(),
+                        "open_questions": bounded_string_array_schema()
+                    },
+                    "required": ["title", "problem", "users", "goals", "non_goals", "requirements", "acceptance_criteria", "constraints", "open_questions"]
+                }
+            }]
+        }
+    })
+}
+
+fn bounded_string_array_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": 32,
+        "items": {"type": "string", "maxLength": 2000}
     })
 }
 
@@ -253,6 +325,47 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "render_component");
         assert_eq!(tools[1]["name"], "write_handoff");
+    }
+
+    #[test]
+    fn omitted_purpose_defaults_to_byte_compatible_conversation() {
+        let req: RealtimeSecretRequest =
+            serde_json::from_value(json!({"session_id":"abc"})).unwrap();
+        assert_eq!(req.purpose, RealtimePurpose::Conversation);
+        assert!(req.planner_context.is_none());
+        let tools = upstream_body("m", "i")["session"]["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["render_component", "write_handoff"]
+        );
+    }
+
+    #[test]
+    fn planner_body_has_only_strict_bounded_proposal_tool() {
+        let instructions = build_planner_instructions("Ocean", "/tmp/ocean");
+        let body = planner_upstream_body("m", &instructions);
+        let tools = body["session"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "propose_handoff");
+        let params = &tools[0]["parameters"];
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["properties"]["title"]["maxLength"], 120);
+        assert_eq!(params["properties"]["requirements"]["maxItems"], 32);
+        assert_eq!(
+            params["properties"]["requirements"]["items"]["maxLength"],
+            2000
+        );
+        assert_eq!(params["required"].as_array().unwrap().len(), 9);
+        assert!(instructions.contains("human must click"));
+        assert!(instructions.contains("executes nothing"));
+        assert!(!instructions.contains("render_component"));
+        assert!(!instructions.contains("write_handoff"));
     }
 
     #[test]

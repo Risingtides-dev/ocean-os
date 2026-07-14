@@ -214,6 +214,24 @@ async fn enriched_project_json(project: &Project) -> serde_json::Value {
     j
 }
 
+pub(super) async fn discover_project_worktrees(
+    project_root: &str,
+) -> Result<Vec<ocean_agent::WorktreeInfo>, String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .output()
+        .await
+        .map_err(|e| format!("git worktree discovery failed: {e}"))?;
+    if !out.status.success() {
+        return Err("git worktree discovery failed".into());
+    }
+    Ok(parse_worktree_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Parse `git worktree list --porcelain` output into WorktreeInfo entries.
 /// Strips `refs/heads/` from branch refs.
 pub(super) fn parse_worktree_list(raw: &str) -> Vec<ocean_agent::WorktreeInfo> {

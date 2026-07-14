@@ -8586,6 +8586,14 @@ struct SessionMessageAppendRequest {
     kind: Option<String>,
 }
 
+fn format_session_append(kind: Option<&str>, content: &str) -> String {
+    match kind {
+        Some("handoff") => format!("[voice handoff] {content}"),
+        Some("planner_handoff") => format!("[voice planner handoff]\n\n{content}"),
+        _ => content.to_string(),
+    }
+}
+
 /// Append an out-of-turn message to a persisted session. Today this serves
 /// the voice agent's `write_handoff` tool: the note lands in the transcript
 /// so the text agent's next turn picks it up. Only `role: "user"` is
@@ -8611,10 +8619,7 @@ async fn agent_session_message_append(
     }
     // Handoff notes are tagged inline so the next turn (and a human reading
     // the transcript) can tell them from typed prompts.
-    let text = match req.kind.as_deref() {
-        Some("handoff") => format!("[voice handoff] {content}"),
-        _ => content.to_string(),
-    };
+    let text = format_session_append(req.kind.as_deref(), content);
     match state
         .runtime
         .append_session_message(core_sid(session_id), text)
@@ -8635,14 +8640,98 @@ async fn agent_session_message_append(
     }
 }
 
-/// Mint an ephemeral OpenAI Realtime client secret (voice phases 2/3). The
-/// daemon resolves the OpenAI credential and briefs the voice agent on the
-/// target chat session; the browser connects to OpenAI over WebRTC with the
-/// returned short-lived secret. The API key never leaves this process.
+#[derive(Debug)]
+struct ValidatedPlannerContext {
+    project_name: String,
+    workspace_root: String,
+}
+
+async fn validate_voice_planner_context(
+    runtime: &AgentRuntime,
+    context: &voice_realtime::VoicePlannerContext,
+) -> Result<ValidatedPlannerContext, String> {
+    let project = runtime
+        .find_project(context.project_id)
+        .map_err(|e| format!("project lookup failed: {e}"))?
+        .ok_or_else(|| "unknown project_id".to_string())?;
+    if context.workspace_root.trim().is_empty() {
+        return Err("workspace_root must not be blank".into());
+    }
+    let project_root = std::fs::canonicalize(&project.workspace_root)
+        .map_err(|_| "registered project root is unavailable".to_string())?;
+    if !project_root.is_dir() {
+        return Err("registered project root is not a directory".into());
+    }
+    let requested = std::fs::canonicalize(context.workspace_root.trim())
+        .map_err(|_| "workspace_root is missing or inaccessible".to_string())?;
+    if !requested.is_dir() {
+        return Err("workspace_root is not a directory".into());
+    }
+
+    let mut allowed = vec![project_root.clone()];
+    let (is_git, _) = ocean_agent::git_head_info(&project_root);
+    if is_git {
+        // Failure is acceptable only for the always-allowed registered main
+        // root. A non-main request fails closed.
+        match discover_project_worktrees(&project_root.to_string_lossy()).await {
+            Ok(worktrees) => {
+                for wt in worktrees {
+                    if let Ok(path) = std::fs::canonicalize(&wt.path) {
+                        allowed.push(path);
+                    }
+                }
+            }
+            Err(err) if requested != project_root => return Err(err),
+            Err(_) => {}
+        }
+    }
+    if !allowed.iter().any(|path| path == &requested) {
+        return Err("workspace_root is not a live worktree of the project".into());
+    }
+    Ok(ValidatedPlannerContext {
+        project_name: project.name,
+        workspace_root: requested.to_string_lossy().into_owned(),
+    })
+}
+
+/// Mint an ephemeral OpenAI Realtime client secret. Conversation mode preserves
+/// the original session briefing; planner mode is pre-session and propose-only.
 async fn voice_realtime_client_secret(
     State(state): State<AppState>,
     Json(req): Json<voice_realtime::RealtimeSecretRequest>,
 ) -> (StatusCode, Json<Value>) {
+    // Validate mode/context before credential resolution so malformed or
+    // unauthorized planner requests return 400 rather than a credential error.
+    let planner = match req.purpose {
+        voice_realtime::RealtimePurpose::Conversation => {
+            if req.planner_context.is_some() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "planner_context is invalid for conversation purpose"})),
+                );
+            }
+            None
+        }
+        voice_realtime::RealtimePurpose::Planner => {
+            if req.session_id.is_some() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "session_id is invalid for planner purpose"})),
+                );
+            }
+            let Some(context) = req.planner_context.as_ref() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "planner_context is required for planner purpose"})),
+                );
+            };
+            match validate_voice_planner_context(&state.runtime, context).await {
+                Ok(validated) => Some(validated),
+                Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))),
+            }
+        }
+    };
+
     let credential = match ocean_providers::resolve_credential_from_env(
         &ocean_providers::ProviderId::OpenAi,
     ) {
@@ -8685,8 +8774,19 @@ async fn voice_realtime_client_secret(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or(voice_realtime::DEFAULT_REALTIME_MODEL)
         .to_string();
-    let instructions = voice_realtime::build_instructions(&transcript);
-    let body = voice_realtime::upstream_body(&model, &instructions);
+    let (instructions, body) = if let Some(context) = planner {
+        let instructions = voice_realtime::build_planner_instructions(
+            &context.project_name,
+            &context.workspace_root,
+        );
+        let body = voice_realtime::planner_upstream_body(&model, &instructions);
+        (instructions, body)
+    } else {
+        let instructions = voice_realtime::build_instructions(&transcript);
+        let body = voice_realtime::upstream_body(&model, &instructions);
+        (instructions, body)
+    };
+    let _ = instructions;
     match voice_realtime::mint_client_secret(credential.secret.expose(), &model, &body).await {
         Ok(normalized) => (StatusCode::OK, Json(normalized)),
         Err(err) => {
@@ -8975,6 +9075,19 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planner_handoff_uses_exact_truthful_marker() {
+        assert_eq!(
+            format_session_append(Some("planner_handoff"), "# Brief"),
+            "[voice planner handoff]\n\n# Brief"
+        );
+        assert_eq!(
+            format_session_append(Some("handoff"), "note"),
+            "[voice handoff] note"
+        );
+        assert_eq!(format_session_append(None, "plain"), "plain");
+    }
 
     // ── Component interaction HTTP adapter ──────────────────────────────────
 

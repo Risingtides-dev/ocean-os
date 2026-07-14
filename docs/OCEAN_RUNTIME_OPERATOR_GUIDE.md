@@ -463,6 +463,23 @@ POST   /v1/voice/realtime/client-secret   mint an ephemeral OpenAI Realtime clie
 POST   /v1/voice/stt                      transcribe audio through xAI speech-to-text
 POST   /v1/voice/tts                      synthesize speech through xAI text-to-speech
 
+The Realtime secret request defaults to conversation when `purpose` is omitted,
+preserving its `render_component` and `write_handoff` tools. The additive Voice
+Planner request is:
+
+```json
+{"purpose":"planner","planner_context":{"project_id":"<uuid>","workspace_root":"/canonical/project-or-worktree"}}
+```
+
+The daemon resolves the registered project, canonicalizes the main root and live
+Git worktrees, and advertises exactly one bounded `propose_handoff` tool. That
+tool is non-executing. Only a human click in Surface crosses the mutation
+boundary: both flows create through `POST /v1/agent/sessions`; Create draft then
+appends `kind: "planner_handoff"` through the existing messages route, while
+Create & start submits exactly one normal `POST /v1/agent/turns` with a fresh
+decision token. Planner minting itself creates no session, message, turn, or
+filesystem change.
+
 # Legacy / debug prompt + request API
 GET    /v1/events                         global SSE stream (debug/legacy)
 POST   /v1/prompt                         synchronous one-shot prompt

@@ -3130,3 +3130,12 @@ worktree:  /tmp/ocean-os-voice-planner-20260714
 area:      [backend]
 
 Hardened call-voice turns to an explicit Voice profile with yolo disabled and a fail-closed PromptControl no-tools boundary. Empty and unmatched folder-agent allowlists retain their existing fail-open semantics and are not used as an authorization control.
+
+_________________________________________________________________________________
+time:      [12:30pm] [14-07-26]
+agent:     [pi-subagent], [openai]
+worktree:  /tmp/ocean-os-voice-planner-20260714
+type:      [feature-request]
+area:      [backend]
+
+Added the additive propose-only Realtime Voice Planner mint contract. Planner context is validated against daemon-owned registered projects and canonical live worktrees before credential lookup; planner sessions advertise only the strict bounded propose_handoff schema. The existing session-message route now truthfully marks planner handoffs without starting a turn.
