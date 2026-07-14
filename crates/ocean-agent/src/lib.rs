@@ -3105,6 +3105,83 @@ mod tests {
         assert_eq!(again, 0, "second pass must not churn bytes");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_capability_process_probe_child() {
+        use std::io::{BufRead, Write};
+
+        if std::env::var_os("OCEAN_AGENT_PHASE0_PROBE").is_none() {
+            return;
+        }
+
+        let observation_path =
+            std::env::var_os("OCEAN_AGENT_PHASE0_OBSERVATION").expect("probe observation path");
+        let observation = serde_json::json!({
+            "pwd": std::env::var("PWD").ok(),
+            "cwd": std::env::current_dir()
+                .expect("probe current dir")
+                .to_string_lossy(),
+        });
+        std::fs::write(observation_path, serde_json::to_vec(&observation).unwrap()).unwrap();
+
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": { "tools": [] }
+        });
+        let mut stdout = std::io::stdout();
+        writeln!(stdout, "\n{response}").unwrap();
+        stdout.flush().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_subprocess_declared_cwd_changes_pwd_not_real_cwd() {
+        let agent_root = temp_config_dir("agent-cap-cwd");
+        let declared_cwd = agent_root.join("declared-cwd");
+        std::fs::create_dir_all(&declared_cwd).unwrap();
+        let observation = agent_root.join("observation.json");
+        let parent_cwd = std::env::current_dir().unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("OCEAN_AGENT_PHASE0_PROBE".to_string(), "1".to_string());
+        env.insert(
+            "OCEAN_AGENT_PHASE0_OBSERVATION".to_string(),
+            observation.to_string_lossy().into_owned(),
+        );
+        let cap = agentdir::SubprocessCapability {
+            name: Some("cwd-probe".to_string()),
+            command: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![
+                "--exact".to_string(),
+                "tests::agent_capability_process_probe_child".to_string(),
+                "--nocapture".to_string(),
+                "--test-threads=1".to_string(),
+            ],
+            cwd: Some("declared-cwd".to_string()),
+            env,
+        };
+
+        let providers = build_agent_capability_providers(&[cap], &agent_root).await;
+        assert_eq!(providers.len(), 1, "probe capability must bind");
+        let observed: Value =
+            serde_json::from_slice(&std::fs::read(&observation).unwrap()).unwrap();
+        assert_eq!(observed["pwd"], declared_cwd.to_string_lossy().as_ref());
+        assert_eq!(
+            observed["cwd"],
+            parent_cwd.to_string_lossy().as_ref(),
+            "declared cwd currently changes PWD input without changing getcwd()"
+        );
+
+        drop(providers);
+        let _ = std::fs::remove_dir_all(agent_root);
+    }
+
     /// Write a tiny stdio "plugin" — a shell script that speaks the same
     /// JSON-RPC wire as `ocean-plugin`'s echo_plugin: it answers `list_tools`
     /// with one `echo` tool and `invoke_tool` by echoing the args back. Returns
