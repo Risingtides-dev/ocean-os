@@ -1,6 +1,13 @@
 # Ocean runtime operator guide
 
-This guide is for operators running the current `ocean-rs` Rust-native Pi-style coding-agent harness/runtime and its clients. It reflects the repo state as validated from source on 2026-06-13.
+Status: extended configuration/API/troubleshooting reference. Start with the
+current concise runbook in [`OPERATIONS.md`](OPERATIONS.md). This file contains
+more detailed subsystem guidance accumulated over time; exact routes, fields,
+model aliases, and deployment behavior remain subordinate to current typed
+source, tracked scripts, and tests.
+
+This guide is for operators running the `ocean-rs` Rust-native agent runtime and
+its clients.
 
 ## Operating model
 
@@ -18,12 +25,14 @@ Current crates in the operator path:
 
 ## Startup
 
-From the repo root (`OCEAN_ALLOW_REPO_CWD=1` is required for a dev launch
-from inside the git tree — the daemon's startup guard otherwise refuses a
-repo cwd so unbound fallback turns can't bind to ocean-os):
+Build in the repository, then start the absolute daemon binary from a neutral
+working directory. Do not bypass the repository-cwd guard: an unbound fallback
+turn must never inherit this checkout accidentally.
 
 ```bash
-OCEAN_ALLOW_REPO_CWD=1 cargo run -p ocean-daemon
+cargo build -p ocean-daemon
+export OCEAN_DAEMON_BIN="$(pwd)/target/debug/ocean-daemon"
+(cd "$HOME" && "$OCEAN_DAEMON_BIN")
 ```
 
 The daemon logs a listening line similar to:
@@ -37,7 +46,7 @@ If another daemon is already bound to the same address, startup fails with `Addr
 For a different bind address:
 
 ```bash
-OCEAN_BIND=127.0.0.1:4781 cargo run -p ocean-daemon
+(cd "$HOME" && OCEAN_BIND=127.0.0.1:4781 "$OCEAN_DAEMON_BIN")
 ```
 
 Keep `OCEAN_BIND` loopback-only unless the operator has explicitly approved remote exposure and a security layer. CORS is now restricted to a localhost whitelist by default (see [Trust boundary](#trust-boundary-permissions--cors)); the daemon should still be treated as local-only.
@@ -55,8 +64,8 @@ By default (`OCEAN_YOLO` unset), the product agent-turn path
 (`POST /v1/agent/turns` and the `POST /v1/agent/voice` wrapper) **gates every
 mutating tool call** through the permission machinery: the daemon emits a
 `permission_request` event and the turn blocks until an operator allows or denies
-it via `POST /v1/permissions/{id}/decision` (the TUI does this with `Shift-Y` /
-`Shift-N`).
+it via `POST /v1/permissions/{id}/decision` (the TUI does this with `Ctrl-Y` /
+`Ctrl-N`).
 
 **Voice turns and permissions (OCEAN-224).** A spoken interface has no permission
 card to click, so a gated voice turn that nothing can answer would silently hang.
@@ -71,10 +80,10 @@ decision_token") instead of letting it stall on an un-answerable prompt.
 
 ```bash
 # Default: gated. Mutating tools require approval.
-cargo run -p ocean-daemon
+(cd "$HOME" && "$OCEAN_DAEMON_BIN")
 
 # Opt in to fire-and-forget for trusted automation. Every tool auto-approved.
-OCEAN_YOLO=1 cargo run -p ocean-daemon
+(cd "$HOME" && OCEAN_YOLO=1 "$OCEAN_DAEMON_BIN")
 ```
 
 Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Falsey:
@@ -129,21 +138,18 @@ It now only accepts:
 - Loopback web origins on **any** port — `http(s)://localhost`, `http(s)://127.0.0.1`,
   `http(s)://[::1]` (covers `trunk serve` :8080, vite :5173, the surface proxy
   :8790, and the daemon itself).
-- `chrome-extension://…` origins — the Ocean side-panel runs from a per-install
-  extension id and already declares the daemon in its MV3 `host_permissions`.
+- `chrome-extension://…` origins — the Ocean side-panel runs from a per-install extension id and already declares the daemon in its MV3 `host_permissions`.
+- Tauri webview origins `tauri://localhost` and `https://tauri.localhost`.
 - Anything listed in `OCEAN_ALLOWED_ORIGINS` (comma-separated, exact match,
   trailing slash optional) — e.g. a tunnel hostname for phone access.
 
 ```bash
 # Add a tunnel/host origin for remote (e.g. phone-over-tunnel) access:
-OCEAN_ALLOWED_ORIGINS="https://ocean.mytunnel.dev,https://app.example.com" \
-  cargo run -p ocean-daemon
+(cd "$HOME" && OCEAN_ALLOWED_ORIGINS="https://ocean.mytunnel.dev,https://app.example.com" \
+  "$OCEAN_DAEMON_BIN")
 ```
 
-The surface **proxy** and the **native GPUI** client are server-side / native
-HTTP callers and never send a browser `Origin`, so CORS does not gate them — only
-direct browser-to-daemon calls (the PWA pointed straight at `:4780`, and the
-Chrome extension) are affected.
+The surface proxy and native GPUI client are server-side/native HTTP callers and do not send a browser `Origin`. Direct browser, extension, and Tauri webview requests are origin-checked against the policy above.
 
 ### Daemon URL for clients
 
@@ -173,28 +179,7 @@ The daemon resolves model selection in this order (`resolve_model_selection` in 
 
 So a cold start with no model anywhere fails fast rather than silently picking one. Set `OCEAN_MODEL`, or pick a model via `POST /v1/model` (which persists the selection so it flows back in as `OCEAN_MODEL` next time).
 
-Currently mapped model IDs and their aliases (from `resolve_model_selection`; `known_models()` lists the headline set surfaced to clients):
-
-- `deepseek` / `deepseek-chat`
-- `deepseek-v4-flash`
-- `deepseek-v4-pro` (`deepseek-v4`, `deepseek-pro`, `v4-pro`, and `DeepSeek V4 Pro` normalize here)
-- `deepseek-reasoner` / `deepseek-r1`
-- `gpt-4o`
-- `gpt-4o-mini`
-- `gpt-5.5` / `gpt-5-5` (Codex)
-- `gpt-5.4` / `gpt-5-4` (Codex)
-- `gpt-5.4-mini` / `gpt-5-4-mini` (Codex)
-- `gpt-5.3-codex-spark` / `gpt-5-3-codex-spark` (Codex)
-- `claude-sonnet-5` / `claude-sonnet` / `sonnet`
-- `claude-opus-4-8` / `claude-opus` / `opus`
-- `minimax` / `minimax-m2` (maps to `MiniMax-M2`)
-- `minimax-m2.7` / `minimax-m2-7` (maps to `MiniMax-M2.7`)
-- `kimi` / `kimi-k2.6` / `kimi-k2-6`
-- `kimi-k2` / `moonshot-v1`
-- `gemini` / `gemini-2.0-flash` / `gemini-2-0-flash`
-- `fake` / `fake-ok`, `fake-tool`, `fake-surface` (keyless test providers)
-
-Any other model ID uses the OpenAI-compatible provider only when `OCEAN_OPENAI_BASE_URL` is set; otherwise it is rejected as unknown.
+Do not copy the model inventory into operational docs: it changes independently of this guide. `ocean-providers::known_models` and `resolve_model_selection` are authoritative, and clients should use the daemon's model catalog/readiness routes. Unknown model IDs use the OpenAI-compatible provider only when `OCEAN_OPENAI_BASE_URL` is set; otherwise they are rejected.
 
 Historical note: earlier audits found `deepseek-v4-flash` falling through to the generic OpenAI-compatible path, and stale Pi-era model environment could shadow the operator's intended model. Ocean now keys off `OCEAN_MODEL` only, and maps `deepseek-v4-pro` explicitly so V4 Pro does not silently become Flash.
 
@@ -226,7 +211,7 @@ The current health endpoint reports daemon availability and backend name; it doe
 3. `$HOME/.config/ocean-rs`
 4. fallback `.ocean-rs`
 
-Sessions are currently JSON-backed. Avoid concurrent prompts into the same session until per-session locking/storage hardening lands.
+Sessions are currently JSON-backed. Same-session load, run, and save is serialized by a per-session execution lock; different sessions can run concurrently.
 
 Two additional SQLite databases live alongside sessions and the config dir:
 
@@ -336,7 +321,7 @@ curl -fsS http://127.0.0.1:4780/ready | jq -e '.ok == true' >/dev/null
 
 **Tradeoff and recommendation:**
 
-- The launchd job (`ocean-daemon-preview`) should key its `KeepAlive` /
+- The launchd job (`dev.risingtides.ocean-daemon`) should key its `KeepAlive` /
   liveness restart on **`/health`**. Restart only when the process is truly
   gone. Wiring `KeepAlive` to `/ready` would restart-thrash the daemon on a
   transient or operator-pending provider issue (e.g. key not yet set), which
@@ -353,7 +338,7 @@ Restart the launchd-supervised daemon (a restart drops any in-flight session,
 so only restart when intended, not to clear a transient `/ready` blip):
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/ocean-daemon-preview
+launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon
 ```
 
 ### Graceful shutdown
@@ -373,10 +358,10 @@ daemon logs a warning and exits anyway, so a stuck turn can't hang shutdown.
 
 #### `OCEAN_MAX_CONCURRENT_TURNS` — concurrent-turn ceiling (OCEAN-304)
 
-The daemon limits how many agent turns can run simultaneously via a bounded semaphore. When the pool is full any new turn submission (`POST /v1/agent/turns`, `POST /v1/requests`) is rejected immediately with **HTTP 429** — it never queues. Default: **24**. Set `OCEAN_MAX_CONCURRENT_TURNS` to a positive integer to override; a `0` or non-numeric value falls back to the default rather than shutting off intake.
+The daemon limits how many agent turns can run simultaneously via a bounded semaphore. When the pool is full, `POST /v1/agent/turns` returns HTTP 429. The lower-level `POST /v1/requests` compatibility route returns its normal HTTP 200 envelope with `ok:false`; neither route queues the turn. Default: **24**. Set `OCEAN_MAX_CONCURRENT_TURNS` to a positive integer to override; a `0` or non-numeric value falls back to the default rather than shutting off intake.
 
 ```bash
-OCEAN_MAX_CONCURRENT_TURNS=8 cargo run -p ocean-daemon
+(cd "$HOME" && OCEAN_MAX_CONCURRENT_TURNS=8 "$OCEAN_DAEMON_BIN")
 ```
 
 This ceiling is high enough that normal multi-room / multi-client use never trips it; it exists to bound burst or runaway-loop fan-out before it exhausts provider quota or host memory.
@@ -673,7 +658,7 @@ Status: `200` with `{ revoked: false, strikes, threshold }` while below threshol
 Foreground daemon logs go to stderr/stdout through `tracing_subscriber`. Use `RUST_LOG` to adjust verbosity:
 
 ```bash
-RUST_LOG=ocean_daemon=debug cargo run -p ocean-daemon
+(cd "$HOME" && RUST_LOG=ocean_daemon=debug "$OCEAN_DAEMON_BIN")
 ```
 
 If running under a user service, inspect the relevant journal unit, for example:
@@ -751,13 +736,13 @@ Look for a request in `waiting_for_permission` and a matching `permission_reques
 
 ### Prompt/session history looks wrong
 
-Sessions are currently JSON-backed and not fully hardened for concurrent writes. Avoid launching overlapping prompts into the same session. Capture the request ID, session ID, command, and logs before handing off.
+Same-session execution is serialized. If history still looks wrong, capture the request ID, session ID, command, and logs before handing off; check for persistence errors or incorrect workspace/session selection rather than assuming a concurrent-write race.
 
 ### TUI is stale or blocked
 
 - Verify the daemon URL with `OCEAN_DAEMON_URL` or `--url`.
-- Confirm `/health` and `/v1/events` work via curl.
-- For mesh mode, verify the `--root` path points at the repo containing `.pi/messenger` state.
+- Confirm `/health` and the session-scoped `/v1/agent/events?session_id=<id>` stream work via curl.
+- The retired mesh mode is not a supported recovery path.
 
 ### Security concern
 

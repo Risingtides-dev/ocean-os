@@ -1,21 +1,14 @@
 # Agent Render Protocol — dynamic UI from agent output
 
-## Problem
+Status: implemented protocol with client-dependent rendering coverage. Typed render and unmount events, component tools, and the pending-interaction route are shipped; not every client renders every component kind.
 
-Ocean is a coding agent, but coding is not the only thing users do with a long-running
-agent. They ask for status boards, input forms, kanban trackers, inline tables, charts.
-Today the agent can only emit text (markdown) and tool calls. Text-to-UI is a dead end:
-the user reads, the agent waits, the turn ends. No interactivity.
+## Purpose
 
-We want the agent to be able to **render live, interactive UI components** into the client,
-and have those components **call back into the agent** when the user interacts with them
-(button click, form submit, card drag).
+Ocean can emit typed live UI components alongside markdown and tool activity. Capable clients project those events into their own interface and may return a bounded interaction when the running agent is explicitly waiting for one.
 
 ## Constraints
 
-- The agent runs in `ocean-daemon`. It emits an SSE stream of `AgentEvent` to all
-  connected clients. The protocol must be **event-driven** — no new connection types,
-  no websocket upgrade, no polling.
+- The agent runs in `ocean-daemon`. It emits an SSE stream of `AgentEvent` to subscribers for the owning session; the explicit `?all=1` debug/global stream can observe all sessions. The protocol is event-driven — no new connection type, websocket upgrade, or polling.
 - Clients (TUI, web surface, voice surface, CLI) each render components differently.
   The protocol describes **what** to render, not **how**.
 - Components are **agent-session-scoped**. A kanban board for project X lives in the
@@ -27,7 +20,7 @@ and have those components **call back into the agent** when the user interacts w
 
 ## Protocol
 
-### New event type: `AgentEvent::Render`
+### Render event
 
 ```rust
 pub struct RenderEvent {
@@ -50,7 +43,7 @@ This is emitted on the same `AgentEvent` enum as `TextDelta`, `ThinkingDelta`,
 `ToolExecutionStart`, etc. Clients filter `Render` events and forward them to
 their component registry.
 
-### New event type: `AgentEvent::Unmount`
+### Unmount event
 
 ```rust
 pub struct UnmountEvent {
@@ -75,15 +68,7 @@ POST /v1/component/event
 }
 ```
 
-The daemon:
-1. Looks up the active session's agent loop (if still running) or queues the event
-   for the next turn.
-2. Injects a synthetic tool result or user message into the agent's message stream
-   describing the interaction.
-3. The agent processes it and may emit new `Render` events in response.
-
-If the session has no active run, the daemon starts a new turn with the component
-event as the prompt.
+The daemon resolves the event only when that session/component has a pending `component_wait`. A successful interaction completes that waiter so the running tool call can continue. If no matching waiter exists, the route returns `404`; it does not queue the event and does not start a new turn. Clients that want a separate follow-up turn must submit one through the normal agent-turn API.
 
 ### Built-in component kinds
 
@@ -349,13 +334,9 @@ The result includes the interaction event. This lets the agent do:
 
 ### ocean-tui (ratatui)
 
-- Same `ComponentRegistry` in app state.
-- Renders components as inline widgets. `kanban` could be a multi-pane layout,
-  `form` could be a modal overlay, `table` is a table widget.
-- User interaction via keyboard shortcuts (tab between columns, enter to click,
-  type into focused form field).
-- `component_wait` pauses the agent loop and enters a "component interaction mode"
-  in the TUI event loop.
+- Projects supported render/unmount events into bounded terminal cells and maintains shell-owned component state.
+- The current session component tray derives todo projections from correlated tool events and is separate from the file tree.
+- Posting `/v1/component/event` from TUI interactions remains a future phase. The current TUI does not enter a general component-interaction mode.
 
 ### ocean-gui (GPUI native)
 
@@ -366,8 +347,8 @@ The result includes the interaction event. This lets the agent do:
 
 ### CLI
 
-- Skip render events silently.
-- `component_wait` doesn't block — return an error or noop.
+- The CLI has no general component renderer.
+- `component_wait` still blocks the running tool call until a matching interaction or timeout because waiting is daemon/runtime behavior, not a client-rendering choice. Avoid wait-based component flows when no attached client can post the interaction.
 
 ## Layout
 
@@ -393,13 +374,9 @@ The agent can re-render the dashboard with different children at any time.
 
 ## Security
 
-- Component events are scoped to the session. The daemon validates `session_id`
-  on the `component/event` endpoint.
-- The agent's permission policy gates `component_render` and `component_wait`
-  like any other tool. `component_wait` could be persistently denied if the
-  user doesn't want blocking interactions.
-- Component props are JSON — no inline HTML, no script execution. The web surface
-  renders them with Leptos, not `innerHTML`.
+- The interaction endpoint requires string `session_id` and `component_id` values and resolves only an exact pending `(session_id, component_id)` waiter key. That correlation is not authentication or proof of session ownership; callers still rely on the daemon's local trust boundary.
+- `component_render` and unmount are ungated presentation operations. `component_wait` is permission-gated because it blocks the turn while awaiting an external interaction.
+- Component props are typed JSON. Clients must treat agent-provided content as untrusted presentation data. Ocean Surface sanitizes rendered markdown before assigning it through its HTML rendering sink; new component kinds must preserve an equivalent no-script boundary.
 
 ## Future
 

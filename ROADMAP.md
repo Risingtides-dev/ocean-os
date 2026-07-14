@@ -1,103 +1,54 @@
-# ocean-rs roadmap
+# Ocean OS roadmap
 
-## Phase 0: daemon shell
-- [x] Name/runtime: ocean-rs
-- [x] Workspace scaffold
-- [x] Local daemon API
-- [x] CLI client
-- [x] Temporary pi-rs-deepseek backend adapter
-- [x] Remove external pi-rs-deepseek process from daemon prompt path
-- [x] Add in-process ocean-agent crate for DeepSeek-backed prompt runs
+Status: open work only. Implemented behavior belongs in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); completed work belongs in
+[`events.md`](events.md) or retained characterization reports.
 
-## Phase 1: real daemon protocol
-- [x] WebSocket/SSE streaming endpoint
-- [x] Persistent sessions
-- [x] Request queue and cancellation
-- [x] OceanTUI integration
-- [ ] Ocean GUI integration
+This roadmap is intentionally short. An unchecked item is a direction, not an
+approved design or permission to alter public contracts.
 
-## Phase 2: native agent runtime
-- [x] First daemon-owned agent facade
-- [x] Daemon-safe non-interactive permission default
-- [x] Ocean-owned tool registry
-- [x] Approval protocol for mutating tools
-- [ ] Native DeepSeek provider crate
-- [x] OpenAI-compatible provider abstraction
-- [x] Native read/write/edit/bash tools
+## Near-term integration gaps
 
-## Phase 3: runtime + surface integration
-- [x] Longhouse engine recovered — daemon-computed quorum + convene flow (OCEAN-9)
-- [x] Gemini/Google provider routing (OCEAN-10)
-- [x] `POST /v1/agent/sessions` — create-before-turn session allocation (OCEAN-11)
-- [x] Per-turn wall-clock timeout (OCEAN-17)
-- [x] Session registry GC + real session detail/list fields (OCEAN-12/13/19)
-- [x] Session-scoped SSE — `?session_id=` filtering for first-party surfaces (OCEAN-15)
-- [x] Extension-event scoping — Extension/Longhouse events scoped, Invariant 5 exception documented (OCEAN-56)
-- [x] Per-session / per-turn model override — independent windows pin their own model (OCEAN-36/46)
-- [x] Per-turn `thinking_level` — per-turn reasoning-effort override without mutating global state (OCEAN-28/41/35)
-- [x] Surface-extension system prompt — `surface-extension` arm in `append_client_type` (OCEAN-14/16/50)
-- [x] Persistent `Room` struct — durable rooms + read-only browser tool perms + MCP per-session unblock (OCEAN-20/44/39)
-- [x] Longhouse topics endpoints — `GET /v1/longhouse/topics` + `/topics/{id}`, claim_outcome quorum gate (OCEAN-58/59)
-- [x] Call pipeline — inbound+outbound Twilio/LiveKit call-intelligence service (`ocean-call`)
-- [x] Browser control surface — CDP-driven Chrome tool suite (Layer-3 input,
-      live network capture, downloads, tab shell)
-- [x] ACP bridge — Ocean daemon exposed to Zed and other ACP editors
-- [x] MCP client — external MCP servers wired in as agent tools
+- [ ] Reconcile the Tauri surface identity. `ocean-surface` currently emits
+      `client_type = "surface-tauri"`, while `ocean-agent::surface_flag` does not
+      map that value; Tauri turns therefore use the generic fallback profile
+      instead of an authored Ocean Agents profile.
+- [ ] Wire configured lifecycle hooks into the completed-turn path. The
+      `ocean-hooks` protocol and config parsing exist, but production turn code
+      does not currently call `run_hooks`.
+- [ ] Keep cross-repository session, voice, component, and room contracts under
+      executable drift checks rather than prose-only synchronization.
 
-## Phase 4: OS integration
-- [ ] systemd user service
-- [ ] Unix socket
-- [ ] desktop notifications
-- [ ] distro config defaults
-- [ ] sandbox profiles
+## Reliability and scale
 
-## Phase 5: extensibility
-- [x] Subprocess plugins — `ocean-plugin` crate; tools reach live turns via
-      `PluginProvider` registration in `build_capability_registry`
-      (`crates/ocean-agent/src/lib.rs:1612`) (OCEAN-95)
-- [ ] WASM plugins via wasmtime
-- [x] Skill/prompt packs — Ocean-native user library `~/.config/ocean-rs/skills`
-      (`OCEAN_SKILLS_DIR` overrides), ranked into turns by the Longhouse
-      librarian alongside spawner/codex/repo sources (`SkillSource::Ocean`)
-- [ ] Theme/client protocol
+- [ ] Design a bounded policy for the runtime-to-daemon per-turn event channel;
+      replay retention is bounded, but the live per-turn MPSC design remains a
+      separate decision.
+- [ ] Establish artifact-backed large tool results before increasing retained
+      event or transcript payload limits.
+- [ ] Add end-to-end retained-size and slow-client measurements before changing
+      history/event architecture.
+- [ ] Continue process-tree portability work beyond the current Unix
+      process-group guarantee if non-Unix execution becomes supported.
 
-## Built, pending daemon integration — RESOLVED
+## Structure
 
-Everything this section used to track as built-but-not-wired has since shipped
-into the live daemon path. Re-verified against source on main, 2026-07-01;
-anchors below. See `docs/ARCHITECTURE.md` § "Shipped since the original
-integration list" for operator impact.
+The active behavior-neutral daemon extraction is tracked in [`docs/DAEMON_REFACTOR_MISSION.md`](docs/DAEMON_REFACTOR_MISSION.md), not duplicated as unchecked roadmap items. The executable 72-route parity seam, CORS leaf, and metrics leaf have landed; subsequent checkpoints remain bounded by that mission and their extraction manifests.
 
-- [x] `ocean-store` (SqliteRoomStore) wired — the daemon opens the durable
-      store at startup (`crates/ocean-daemon/src/main.rs:1612`) and holds it on
-      `AppState.rooms` (main.rs:88, constructed at main.rs:1639); rooms and
-      transcripts survive restart (OCEAN-86/107)
-- [x] `PluginProvider` registered — `build_capability_registry`
-      (`crates/ocean-agent/src/lib.rs:1546`) calls `discover_plugin_providers`
-      (lib.rs:1612) and registers each `ocean_plugin::PluginProvider`
-      (connected at lib.rs:1693) (OCEAN-95)
-- [x] Room auto-convene queues a real agent turn — `room_post_message` calls
-      `spawn_room_agent_turn` (`crates/ocean-daemon/src/main.rs:6517`, defined
-      at main.rs:6642) when a mention resolves to a roster `Agent`
-      (OCEAN-111/128/225)
-- [x] ACP permission forwarding active — ACP turns run gated by default
-      (`yolo_enabled()`, OCEAN-51) and `run_turn`
-      (`crates/ocean-acp/src/main.rs:710`) subscribes the control stream
-      before `submit_turn` (main.rs:742-785), so `spawn_permission_bridge`
-      (main.rs:973) delivers editor-side approval prompts (OCEAN-146)
-- [x] Cross-provider `Content::Image` — encoded on all four provider wire
-      paths under `crates/ocean-protocol/src/providers/`: anthropic.rs:159,194;
-      openai.rs:218,306; google.rs:140,244; codex.rs:66,154
-      (OCEAN-99/131/132/133)
-- [x] Longhouse escrow trio on AppState — persisted `SqliteTitleRegistry`
-      opened at startup (`crates/ocean-daemon/src/main.rs:1628`) and held on
-      `AppState` with the `Revoker` and quorum-of-recall registry
-      (main.rs:1640-1642); `/v1/longhouse/revoke` and `/v1/longhouse/recall`
-      routes live (OCEAN-229/246/272/302)
+- [ ] Split the intact session module, `AppState`, or public daemon shape only under a separately approved architecture plan after the behavior-neutral mission reaches its target.
 
-Still genuinely open:
+## Platform and operations
 
-- [ ] Longhouse validator/staking *economics* — the escrow ledger mechanics
-      exist (`crates/ocean-longhouse/src/escrow.rs`) but the economic policy
-      (stake sizing, forfeiture schedule) is not designed
-      (see `docs/LONGHOUSE.md` § "Built vs unbuilt")
+- [ ] Decide whether to support systemd and a Unix socket; macOS launchd and
+      loopback HTTP are the current operated path.
+- [ ] Define sandbox profiles before advertising stronger isolation than
+      permission gates and cwd/process controls provide.
+- [ ] Keep supported model, feature, release, and Rust 1.88 compatibility lanes
+      truthful as the dependency graph changes.
+
+## Explicitly not implied
+
+This file does not approve legacy API removal, session schema changes, room
+federation, Longhouse economic policy, a daemon library, or a performance
+rewrite. Those require current evidence, a bounded design, compatibility gates,
+and independent review.

@@ -6,7 +6,7 @@ Status: active contract for runtime and first-party surfaces.
 
 - `Project`: repo/product identity. A project is the durable named thing Ocean recognizes, configures, and caretakes.
 - `Workspace`: one concrete checkout/worktree/local directory on disk. A workspace has a path and may belong to a project.
-- `Session`: one agent/human work thread rooted in exactly one workspace.
+- `Session`: one daemon-owned agent/human work thread with a persisted workspace binding that an explicit later request may rebind under current workspace-resolution rules.
 - `Surface`: a UI/client attached to a session, such as GPUI, the Chrome extension, web, TUI, ACP, CLI, or voice.
 - `Canvas`: a tldraw/CRDT document visible from a surface. Concurrent
   operator+agent edits converge via the per-component version-vector merge
@@ -17,7 +17,7 @@ Status: active contract for runtime and first-party surfaces.
 ## Invariants
 
 1. A product surface chooses or creates a session before it submits a turn.
-2. A session stores its workspace root when created; turns inherit cwd from the session.
+2. A session stores its workspace root, but every turn request still carries the required `cwd` field. A caller may send an explicit cwd, or an empty cwd together with `project_id`; an empty cwd without a project is rejected. A valid new binding may intentionally rebind and persist the resumed session.
 3. Product surfaces subscribe with `GET /v1/agent/events?session_id=<id>`.
 4. Product surfaces submit turns with `session_id=<id>`.
 5. SSE events never change a surface's active session, and never cross between
@@ -63,7 +63,7 @@ choose/create Project or local directory
 choose/create Workspace
 POST /v1/agent/sessions
 GET /v1/agent/events?session_id=<id>
-POST /v1/agent/turns { session_id, prompt, client_type }
+POST /v1/agent/turns { session_id, prompt, cwd, project_id?, client_type }
 ```
 
 `POST /v1/agent/sessions` is **live** in the daemon today. It explicitly
@@ -81,9 +81,7 @@ POST /v1/agent/sessions
      "client_type": "surface-gpui" }
 ```
 
-The returned `session_id` is then carried on `GET /v1/agent/events?session_id=<id>`
-and on every `POST /v1/agent/turns`. The session owns its `cwd`; turns inherit it
-and do not need to resend a workspace root.
+The returned `session_id` is then carried on `GET /v1/agent/events?session_id=<id>` and on every `POST /v1/agent/turns`. Resuming does not make `cwd` optional: each turn must provide it, or provide an empty value with `project_id` so the daemon can resolve the project workspace. A different valid binding intentionally rebinds the persisted session.
 
 Two surfaces intentionally sharing one session both subscribe to the same `session_id`.
 Two surfaces on different sessions cannot receive each other's session-bearing events.

@@ -2896,3 +2896,19 @@ area:      [documentation]: GitHub-visible refactor course
 
 Added docs/DAEMON_REFACTOR_MISSION.md as the durable GitHub-facing statement of mission, non-negotiable invariants, completed foundation and Phase 2C checkpoints, current 19.9k-line composition baseline, ordered extraction course, final target, and completion gate. Linked it from the root and docs contracts so a cold contributor can find the current objective without reconstructing it from events or manifests.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [18:09] [14-07-26]
+agent: [pi] [gpt-5]
+worktree: [docs/current-state-reset-reconciled-20260714]
+type:  [refactor]
+area:  [writing]
+
+Preserved and transplanted the July 13 documentation reset onto current origin/main without
+overwriting concurrent daemon, TUI, or provider-halt work. Rebuilt the documentation
+hierarchy around current architecture, operations, open roadmap work, and the active daemon
+refactor mission; corrected stale operator, render-protocol, session-binding, deployment,
+route/CORS/metrics, model-inventory, and TUI component-tray claims. Verified docs/index
+integrity plus executable daemon router and CORS contracts; fresh semantic review drove the
+remaining source-backed corrections before closeout.
+_________________________________________________________________________________
