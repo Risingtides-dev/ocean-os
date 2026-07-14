@@ -48,6 +48,7 @@ use super::{
         graph::GraphComponent,
         pty_pane::PtyComponent,
         session_rail::SessionRailComponent,
+        session_tray::SessionComponentTray,
     },
     daemon_boot, errfmt,
     event::{Event, EventHandler},
@@ -69,6 +70,8 @@ const STATUS_TTL: Duration = Duration::from_secs(8);
 /// Floor for the dock and the main surface so neither can be squeezed to nothing.
 const MIN_TERM_H: u16 = 3;
 const MIN_CENTER_H: u16 = 5;
+const MIN_TREE_WITH_TRAY_H: u16 = 5;
+const MIN_TRAY_H: u16 = 6;
 
 /// Largest dock height that still leaves the main surface `MIN_CENTER_H` rows,
 /// given the center column's total height (crumb + surface + splitter + dock).
@@ -86,6 +89,23 @@ fn max_rail_width(body_w: u16, opposite_w: Option<u16>) -> u16 {
         .saturating_sub(1)
         .saturating_sub(opposite_w.map_or(0, |w| w.saturating_add(1)))
         .max(MIN_RAIL_W)
+}
+
+/// Split the visible Files rail into independent file-tree and session-component
+/// panes. Tiny terminals and empty trays preserve the old full-height tree.
+fn file_rail_rects(area: Rect, tray_visible: bool, desired_tray_h: u16) -> (Rect, Rect, Rect) {
+    if !tray_visible || area.height < MIN_TREE_WITH_TRAY_H + 1 + MIN_TRAY_H || area.width == 0 {
+        return (area, Rect::default(), Rect::default());
+    }
+    let tray_h = desired_tray_h
+        .max(MIN_TRAY_H)
+        .min(area.height - MIN_TREE_WITH_TRAY_H - 1);
+    let tree_h = area.height - tray_h - 1;
+    (
+        Rect::new(area.x, area.y, area.width, tree_h),
+        Rect::new(area.x, area.y + tree_h, area.width, 1),
+        Rect::new(area.x, area.y + tree_h + 1, area.width, tray_h),
+    )
 }
 
 /// What the center surface is showing (CTRL swaps editor↔graph the same way).
@@ -263,6 +283,7 @@ pub struct App {
     workspace_root: String,
     rail: SessionRailComponent,
     tree: FileTreeComponent,
+    tray: SessionComponentTray,
     chat: ChatComponent,
     pty: PtyComponent,
     editor: EditorComponent,
@@ -304,12 +325,14 @@ pub struct App {
     r_body: Rect,
     r_sessions: Rect,
     r_tree: Rect,
+    r_tray: Rect,
     r_center: Rect,
     r_term: Rect,
     /// The full center COLUMN (crumb + surface + splitter + dock), for clamping
     /// a terminal-dock resize against the available height.
     r_center_col: Rect,
     r_split_term: Rect,
+    r_split_tray: Rect,
     /// Vertical rail splitters and their operator-controlled widths.
     r_split_sessions: Rect,
     r_split_tree: Rect,
@@ -433,6 +456,7 @@ impl App {
             workspace_root,
             rail: SessionRailComponent::new(root.clone()),
             tree: FileTreeComponent::new(root.clone()),
+            tray: SessionComponentTray::new(),
             chat: ChatComponent::new(),
             pty: PtyComponent::default(),
             editor: EditorComponent::new(root.clone()),
@@ -457,10 +481,12 @@ impl App {
             r_body: Rect::default(),
             r_sessions: Rect::default(),
             r_tree: Rect::default(),
+            r_tray: Rect::default(),
             r_center: Rect::default(),
             r_term: Rect::default(),
             r_center_col: Rect::default(),
             r_split_term: Rect::default(),
+            r_split_tray: Rect::default(),
             r_split_sessions: Rect::default(),
             r_split_tree: Rect::default(),
             sessions_w: SESS_W,
@@ -543,6 +569,10 @@ impl App {
         self.chat
             .load_history(crate::shell::sessions::load_transcript(&session.path));
         self.bind_session_with(id, false);
+        // This initialization path intentionally skips dispatch (replay_first
+        // differs from a fresh mint), so explicitly deliver the same bind
+        // action to session-scoped components.
+        let _ = self.tray.update(&Action::SessionBound(id));
         self.rail.live_id = Some(session.id);
         self.launch_open = false;
         Ok(())
@@ -1662,6 +1692,9 @@ impl App {
             _ => {}
         }
         if let Some(next) = self.chat.update(&action) {
+            self.dispatch(next);
+        }
+        if let Some(next) = self.tray.update(&action) {
             self.dispatch(next);
         }
     }
@@ -3155,9 +3188,15 @@ impl App {
     /// grabs). The four content rects are pairwise disjoint, so order is only
     /// by routing precedence.
     fn pane_rect_at(&self, pos: (u16, u16)) -> Option<Rect> {
-        [self.r_sessions, self.r_tree, self.r_term, self.r_center]
-            .into_iter()
-            .find(|&rect| rect_has(rect, pos))
+        [
+            self.r_sessions,
+            self.r_tree,
+            self.r_tray,
+            self.r_term,
+            self.r_center,
+        ]
+        .into_iter()
+        .find(|&rect| rect_has(rect, pos))
     }
 
     fn apply_focus(&mut self) {
@@ -3255,9 +3294,35 @@ impl App {
 
     // ── the CTRL frame ───────────────────────────────────────────────────────
 
+    fn clear_frame_geometry(&mut self) {
+        self.r_body = Rect::default();
+        self.r_sessions = Rect::default();
+        self.r_tree = Rect::default();
+        self.r_tray = Rect::default();
+        self.r_center = Rect::default();
+        self.r_term = Rect::default();
+        self.r_center_col = Rect::default();
+        self.r_split_sessions = Rect::default();
+        self.r_split_tree = Rect::default();
+        self.r_split_term = Rect::default();
+        self.r_split_tray = Rect::default();
+        self.buttons.clear();
+        self.launch_hit.clear();
+        self.resume_hit.clear();
+        self.models_hit.clear();
+        self.advisor_hit.clear();
+        self.sel_press = None;
+        self.sel_rect = None;
+        self.selection = None;
+        self.dragging_sessions = false;
+        self.dragging_tree = false;
+        self.dragging_term = false;
+    }
+
     fn draw(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
         if full.width < 40 || full.height < 8 {
+            self.clear_frame_geometry();
             frame.render_widget(
                 Paragraph::new("window too small")
                     .style(Style::default().fg(theme::YELLOW).bg(theme::BG_DARK)),
@@ -3295,8 +3360,13 @@ impl App {
                 Constraint::Length(tree_w),
             ])
             .split(body);
-        let (r_sessions, r_split_a, center, r_split_b, r_tree) =
+        let (r_sessions, r_split_a, center, r_split_b, r_file_rail) =
             (cols[0], cols[1], cols[2], cols[3], cols[4]);
+        let (r_tree, r_split_tray, r_tray) = file_rail_rects(
+            r_file_rail,
+            self.tray.is_visible(),
+            self.tray.desired_height(),
+        );
 
         // center: breadcrumb / main surface / docked terminal (CTRL's rows).
         let term_visible = self.pty.is_active() && self.show_term;
@@ -3324,12 +3394,14 @@ impl App {
         self.r_body = body;
         self.r_sessions = r_sessions;
         self.r_tree = r_tree;
+        self.r_tray = r_tray;
         self.r_center = r_center;
         self.r_term = r_term;
         self.r_center_col = center;
         self.r_split_sessions = r_split_a;
         self.r_split_tree = r_split_b;
         self.r_split_term = r_split_term;
+        self.r_split_tray = r_split_tray;
 
         // deep chrome first
         frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), full);
@@ -3362,6 +3434,10 @@ impl App {
         }
         if tree_w > 0 {
             self.tree.draw(frame, r_tree);
+            if r_tray.height > 0 {
+                splitter(frame, r_split_tray, false);
+                self.tray.draw(frame, r_tray);
+            }
             splitter(frame, r_split_b, true);
         }
         if term_visible {
@@ -4004,6 +4080,162 @@ mod tests {
     }
 
     #[test]
+    fn file_rail_splits_only_for_visible_tray_with_enough_height() {
+        let area = Rect::new(70, 1, 30, 28);
+        let (tree, split, tray) = file_rail_rects(area, false, 8);
+        assert_eq!(tree, area);
+        assert_eq!(split, Rect::default());
+        assert_eq!(tray, Rect::default());
+
+        let (tree, split, tray) = file_rail_rects(area, true, 8);
+        assert_eq!(tree.height + split.height + tray.height, area.height);
+        assert_eq!(split.height, 1);
+        assert_eq!(tray.height, 8);
+        assert_eq!(tree.bottom(), split.y);
+        assert_eq!(split.bottom(), tray.y);
+
+        let tiny = Rect::new(70, 1, 30, 11);
+        let (tree, split, tray) = file_rail_rects(tiny, true, 8);
+        assert_eq!(tree, tiny);
+        assert_eq!(split, Rect::default());
+        assert_eq!(tray, Rect::default());
+    }
+
+    #[test]
+    fn too_small_frame_clears_stale_mouse_geometry() {
+        let mut app = offline_app();
+        app.show_tree = true;
+        render_app_to_string(&mut app, 100, 28);
+        let old_tree = app.r_tree;
+        assert!(old_tree.width > 0 && old_tree.height > 0);
+
+        render_app_to_string(&mut app, 39, 7);
+        assert_eq!(app.r_body, Rect::default());
+        assert_eq!(app.r_tree, Rect::default());
+        assert_eq!(app.r_tray, Rect::default());
+        assert_eq!(app.r_split_tree, Rect::default());
+        assert!(app.buttons.is_empty());
+
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            old_tree.x + 1,
+            old_tree.y + 2,
+        ));
+        assert!(app.sel_press.is_none() && app.sel_rect.is_none());
+        assert!(!app.dragging_tree && !app.dragging_sessions && !app.dragging_term);
+    }
+
+    #[test]
+    fn too_small_frame_clears_stale_modal_hits() {
+        let mut app = launch_app();
+        render_app_to_string(&mut app, 80, 20);
+        let old_hit = app.launch_hit[0].0;
+        assert!(old_hit.x < 39 && old_hit.y < 7);
+
+        render_app_to_string(&mut app, 39, 7);
+        assert!(app.launch_hit.is_empty());
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            old_hit.x,
+            old_hit.y,
+        ));
+        assert!(
+            app.launch_open,
+            "invisible stale launch row cannot activate"
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_events_reveal_session_tray_and_new_turn_reclaims_tree() {
+        let mut app = offline_app();
+        app.show_tree = true;
+        let sid = AgentSessionId(uuid::Uuid::from_u128(1));
+        let tid = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(2));
+        let cid = ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(3));
+        app.dispatch(Action::SessionBound(sid));
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            session_id: sid,
+            turn_id: tid,
+            model: None,
+        })));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallStarted {
+                session_id: sid,
+                turn_id: tid,
+                call: ocean_agent_sdk::ToolCall {
+                    id: cid.clone(),
+                    name: "todo".into(),
+                    args_json: serde_json::json!({"action": "add", "text": "tray task"}),
+                },
+            },
+        )));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallFinished {
+                session_id: sid,
+                turn_id: tid,
+                call_id: cid,
+                result: ocean_agent_sdk::ToolResult {
+                    ok: true,
+                    output: "1 [ ] tray task\n".into(),
+                    metadata_json: None,
+                },
+            },
+        )));
+
+        let screen = render_app_to_string(&mut app, 100, 28);
+        assert!(screen.contains("SESSION COMPONENT"));
+        assert!(screen.contains("tray task"));
+        assert!(app.r_tree.bottom() < app.r_tray.y);
+
+        let anchor = (app.r_tray.x + 2, app.r_tray.y + 2);
+        app.on_crossterm(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            anchor.0,
+            anchor.1,
+        ));
+        assert_eq!(app.sel_rect, Some(app.r_tray));
+        app.on_crossterm(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            app.r_tree.x + 1,
+            app.r_tree.y,
+        ));
+        let (_, head) = app.selection.expect("tray drag selects inside tray");
+        assert_eq!(head.1, app.r_tray.y, "selection cannot enter file tree");
+
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            session_id: sid,
+            turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(4)),
+            model: None,
+        })));
+        render_app_to_string(&mut app, 100, 28);
+        assert_eq!(app.r_tray, Rect::default());
+        assert_eq!(app.r_split_tray, Rect::default());
+    }
+
+    #[tokio::test]
+    async fn stale_session_todo_event_cannot_mount_tray() {
+        let mut app = offline_app();
+        app.show_tree = true;
+        app.dispatch(Action::SessionBound(AgentSessionId(uuid::Uuid::from_u128(
+            1,
+        ))));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallStarted {
+                session_id: AgentSessionId(uuid::Uuid::from_u128(9)),
+                turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(2)),
+                call: ocean_agent_sdk::ToolCall {
+                    id: ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(3)),
+                    name: "todo".into(),
+                    args_json: serde_json::json!({"action": "add", "text": "leak"}),
+                },
+            },
+        )));
+        let screen = render_app_to_string(&mut app, 100, 28);
+        assert!(!screen.contains("SESSION COMPONENT"));
+        assert_eq!(app.r_tray, Rect::default());
+    }
+
+    #[test]
     fn rail_drag_limits_count_only_the_visible_opposite_rail() {
         let mut app = offline_app();
         app.show_sessions = true;
@@ -4178,6 +4410,38 @@ mod tests {
         assert!(!app.launch_open);
         assert_eq!(app.workspace_root, launch_root);
         assert_eq!(app.session_id, Some(want));
+
+        let turn_id = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(77));
+        let call_id = ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(78));
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            session_id: want,
+            turn_id,
+            model: None,
+        })));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallStarted {
+                session_id: want,
+                turn_id,
+                call: ocean_agent_sdk::ToolCall {
+                    id: call_id.clone(),
+                    name: "todo".into(),
+                    args_json: serde_json::json!({"action": "add", "text": "resumed"}),
+                },
+            },
+        )));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallFinished {
+                session_id: want,
+                turn_id,
+                call_id,
+                result: ocean_agent_sdk::ToolResult {
+                    ok: true,
+                    output: String::new(),
+                    metadata_json: None,
+                },
+            },
+        )));
+        assert!(app.tray.is_visible(), "explicit session binds the tray");
     }
 
     #[test]

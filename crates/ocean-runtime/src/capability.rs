@@ -107,9 +107,9 @@ pub trait CapabilityProvider: Send + Sync {
 
 /// The built-in toolset, wrapped as a [`CapabilityProvider`].
 ///
-/// Constructs the built-in tools once via [`default_tools`] and returns a clone
-/// on each `tools()` call. Behaviour-preserving: the exact set, in the exact
-/// order, that the agent loop used before the registry existed.
+/// Constructs the built-in tool templates once via [`default_tools`] and clones
+/// them on each `tools()` call. Run-local stateful tools are rebuilt from those
+/// templates so separate agent runs cannot observe one another's memory.
 pub struct BuiltinProvider {
     tools: Vec<SharedTool>,
     /// Session-scoped hashline snapshot stores, keyed by session id. Lives on
@@ -195,6 +195,14 @@ impl CapabilityProvider for BuiltinProvider {
 
     async fn tools(&self, ctx: &SessionContext) -> Vec<SharedTool> {
         let mut tools = self.tools.clone();
+        // `todo` promises one agent run of in-memory state. The provider lives
+        // for the daemon lifetime, so cloning its Arc here would otherwise leak
+        // one list across turns and sessions. Rebuild it for every tool query.
+        for tool in &mut tools {
+            if tool.name() == "todo" {
+                *tool = Arc::new(crate::tools::todo::TodoTool::new());
+            }
+        }
         // Session-scoped rebinds: a few built-ins must key shared daemon state on
         // the session the daemon resolves against, so they're rebuilt per-turn
         // with this turn's authoritative session id (never a model-supplied one).
@@ -532,6 +540,33 @@ mod tests {
         let got = provider.tools(&ctx()).await;
         let expected = default_tools();
         assert_eq!(names(&got), names(&expected));
+    }
+
+    #[tokio::test]
+    async fn builtin_provider_rebuilds_todo_for_each_agent_run() {
+        let provider = BuiltinProvider::new();
+        let first = provider.tools(&ctx()).await;
+        let todo = first
+            .iter()
+            .find(|tool| tool.name() == "todo")
+            .expect("todo present");
+        todo.execute("add", json!({"action": "add", "text": "first run"}))
+            .await
+            .expect("add succeeds");
+
+        let second = provider.tools(&ctx()).await;
+        let todo = second
+            .iter()
+            .find(|tool| tool.name() == "todo")
+            .expect("todo present");
+        let listed = todo
+            .execute("list", json!({"action": "list"}))
+            .await
+            .expect("list succeeds");
+        assert!(matches!(
+            listed.content.as_slice(),
+            [ocean_protocol::Content::Text { text }] if text == "(empty)"
+        ));
     }
 
     #[tokio::test]

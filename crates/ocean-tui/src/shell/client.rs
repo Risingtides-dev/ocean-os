@@ -254,7 +254,9 @@ impl DaemonClient {
                             if let Some(id) = parse_sse_id(&frame) {
                                 last_event_id = Some(id);
                             }
-                            if let Some(evt) = parse_sse_frame(&frame) {
+                            if parse_sse_event(&frame) == Some("error") {
+                                let _ = actions.send(Action::AgentStreamGap(session_id));
+                            } else if let Some(evt) = parse_sse_frame(&frame) {
                                 let _ = actions.send(Action::AgentEvent(Box::new(evt)));
                             }
                         }
@@ -264,6 +266,7 @@ impl DaemonClient {
                 // brief backoff, then resubscribe with the last seen id so the
                 // daemon replays what we missed. The typed transition persists
                 // until THIS source reconnects — unrelated notices can't clear it.
+                let _ = actions.send(Action::AgentStreamGap(session_id));
                 let _ = actions.send(Action::HealthDegraded {
                     source: HealthSource::Sse,
                     condition: "stream reconnecting".into(),
@@ -460,6 +463,14 @@ fn parse_sse_id(frame: &str) -> Option<String> {
     })
 }
 
+fn parse_sse_event(frame: &str) -> Option<&str> {
+    frame.lines().find_map(|line| {
+        line.strip_prefix("event:")
+            .map(str::trim)
+            .filter(|event| !event.is_empty())
+    })
+}
+
 /// Decode one SSE frame's `data:` payload as `T`.
 fn parse_sse_data<T: serde::de::DeserializeOwned>(frame: &str) -> Option<T> {
     let mut data = String::new();
@@ -526,6 +537,13 @@ mod tests {
     #[test]
     fn none_when_no_data_line() {
         assert!(parse_sse_frame(": just a comment\nid: x").is_none());
+    }
+
+    #[test]
+    fn recognizes_agent_stream_error_event() {
+        let frame = "event: error\ndata: {\"error\":\"subscriber lagged\"}";
+        assert_eq!(parse_sse_event(frame), Some("error"));
+        assert!(parse_sse_frame(frame).is_none());
     }
 
     /// Live end-to-end against the local daemon: mint a session, subscribe its

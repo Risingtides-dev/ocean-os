@@ -16,6 +16,7 @@ use ratatui::{
 use crate::shell::{
     action::Action,
     component::Component,
+    components::chat::sanitize_line,
     panel,
     theme::{self, g},
     tree::Tree,
@@ -105,6 +106,7 @@ impl Component for FileTreeComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        self.body_rect = Rect::default();
         let body = panel::draw(frame, area, "FILES", None, self.focused);
         if body.width == 0 {
             return;
@@ -163,7 +165,7 @@ impl Component for FileTreeComponent {
                 )),
                 Rect::new(body.x, y, 1, 1),
             );
-            let txt = format!("{}{caret}{name}", "  ".repeat(e.depth));
+            let txt = sanitize_line(&format!("{}{caret}{name}", "  ".repeat(e.depth)));
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     panel::pad_to(&txt, body.width.saturating_sub(1) as usize),
@@ -176,5 +178,19 @@ impl Component for FileTreeComponent {
 
         // Reserved footer row stays for stable panel geometry; nothing to say.
         panel::footer(frame, area, "");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn file_rows_sanitize_controls_and_fit_terminal_cells() {
+        let safe = sanitize_line("  ▸ bad\t\u{1b}界界");
+        let row = panel::pad_to(&safe, 12);
+        assert!(!row.contains('\t') && !row.contains('\u{1b}'));
+        assert_eq!(UnicodeWidthStr::width(row.as_str()), 12);
     }
 }

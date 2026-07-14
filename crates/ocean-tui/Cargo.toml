@@ -19,6 +19,7 @@ serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
 pulldown-cmark = { version = "0.13", default-features = false }
 # Phase-1 shell (session-first rebuild): async component architecture.
 tokio = { workspace = true }

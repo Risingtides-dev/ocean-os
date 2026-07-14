@@ -47,6 +47,10 @@ pub enum Action {
     AgentEvent(Box<AgentTurnEvent>),
     /// Session was minted/adopted; scope the stream to it.
     SessionBound(AgentSessionId),
+    /// The scoped agent stream lost continuity (disconnect, replay lag/error,
+    /// or daemon restart). Session projections must invalidate derived state
+    /// until a fresh authoritative turn boundary arrives.
+    AgentStreamGap(AgentSessionId),
     /// Submit the composer's current text as a new turn.
     SubmitPrompt(String),
     /// A non-fatal error to surface in the status line.

@@ -2843,3 +2843,13 @@ type:      [feature-request]: resizable workbench rails and content-aware editor
 area:      [frontend]: ocean-tui shell layout and editor
 
 Checkpointed the pending TUI work before the session-component tray: both side rails now resize by mouse while preserving the minimum center workspace and ignoring hidden opposite-rail widths. The editor soft-wraps prose, horizontally scrolls source, keeps mouse-wheel position until keyboard movement resumes cursor-following, and aligns cursor/render geometry through control-byte sanitization and Unicode cell widths. Review found and fixed incorrect rail clamp math, viewport snapback, an eager `then_some` underflow, unsanitized file text, tab/caret disagreement, and half-clipped wide-glyph drift. Added focused rail-drag, manual-scroll, sanitization, and wide-character regressions. The operator-owned deploy/dev.risingtides.ocean-daemon.plist remained untouched.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [07:32am] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [feature-request]: session-scoped component tray with truthful run-local todos
+area:      [frontend]: ocean-tui Files rail; [backend]: ocean-runtime tool lifecycle
+
+Added a separate SESSION COMPONENT tray beneath the file tree rather than coupling todo rendering to FileTreeComponent. The first adapter correlates canonical todo ToolCallStarted/ToolCallFinished events, mutates only after successful finishes, displays sanitized run-local items, clears at turn/session boundaries, ignores stale-session events, and returns all vertical space to Files when inactive or too short. The context meter remains absent because the daemon still lacks truthful current occupancy, capacity, provenance, and measurement time. Recon found the long-lived BuiltinProvider was accidentally sharing one TodoTool Arc across all turns/sessions despite the tool's single-run contract; it now rebuilds TodoTool for every agent-run tool query, with a regression proving no cross-run bleed. Layout, stale-event isolation, tiny-height fallback, pane-bounded selection, failed-effect, incomplete-stream, and terminal-safety tests were added. The operator-owned deploy/dev.risingtides.ocean-daemon.plist remained untouched.

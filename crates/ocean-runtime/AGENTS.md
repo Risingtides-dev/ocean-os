@@ -27,6 +27,7 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - Every provider round in a bound agent session must copy `AgentConfig::session_id` into `StreamOptions::session_id`; providers use that stable identity for cross-round prompt caching and request correlation.
 - The reproducible history-cost kernel is `examples/history_cost_bench.rs`: run it in release mode from a clean revision with the fixed 10/100/1,000-message × 1/5/20-round matrix. Treat it as trim/serialization/clone scaling evidence, not end-to-end turn latency.
 - Hashline-enabled sessions expose both `edit` and `hashline_edit`; every profile retains `write`. Controlled GPT-5.6 Terra benchmarks showed that hiding `edit` changed model exploration behavior and doubled wall time even when the model still selected `hashline_edit`.
+- `TodoTool` state is run-local and non-durable. `BuiltinProvider::tools` must rebuild it for each agent run; never share its in-memory list across turns or sessions.
 
 
 ## Work Guidance

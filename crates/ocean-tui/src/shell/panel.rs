@@ -14,6 +14,8 @@ use ratatui::{
     widgets::{Block, Paragraph},
     Frame,
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::theme;
 
@@ -102,11 +104,32 @@ pub fn footer(f: &mut Frame, area: Rect, text: &str) {
     );
 }
 
+pub fn fit_cells(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    for grapheme in s.graphemes(true) {
+        let mut candidate = out.clone();
+        candidate.push_str(grapheme);
+        if UnicodeWidthStr::width(candidate.as_str()) > width {
+            break;
+        }
+        out = candidate;
+    }
+    out
+}
+
 pub fn pad_to(s: &str, w: usize) -> String {
-    let n = s.chars().count();
-    if n >= w {
-        s.chars().take(w).collect()
-    } else {
-        format!("{s}{}", " ".repeat(w - n))
+    let fitted = fit_cells(s, w);
+    let n = UnicodeWidthStr::width(fitted.as_str());
+    format!("{fitted}{}", " ".repeat(w.saturating_sub(n)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_cells_keeps_contextual_emoji_whole() {
+        assert_eq!(fit_cells(" 👩‍💻 tail", 4), " 👩‍💻 ");
+        assert!(UnicodeWidthStr::width(fit_cells("界界", 3).as_str()) <= 3);
     }
 }

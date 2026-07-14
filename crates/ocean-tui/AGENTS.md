@@ -75,6 +75,13 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   context-window display until the daemon exposes real occupancy
   (`ModelSelection.context_window` + usage provenance are the pending daemon
   follow-ups — never estimate from cumulative turn usage).
+- The lower Files rail is a separate session-component tray, never part of
+  `FileTreeComponent`. Its todo adapter applies only successful correlated
+  tool finishes, clears on a new turn/session, labels the view run-local, and
+  invalidates to `state incomplete` on SSE gaps/orphan finishes. It never parses
+  human-formatted todo output into invented durable state. Empty
+  or short layouts return the full rail to the file tree; tray selection and
+  mouse routing remain pane-bounded.
 - Tool drawers (`shell/components/chat.rs`): one per call, independently
   expandable (`▸`/`▾` via `g()`), collapsed header never wraps; consecutive
   VISIBLE tool turns render single-spaced — a suppressed Thinking turn between
