@@ -281,7 +281,7 @@ Before each move, write a short extraction manifest naming exact symbols/files, 
 1. **Complete (2026-07-14):** established a reusable internal router seam and checked the full explicit method/path, discovery-banner, operator-guide, merge, fallback, CORS, implicit-HEAD, and static/dynamic room-precedence contracts. Characterization found and corrected four pre-existing banner omissions and thirteen operator-guide omissions without changing the mounted route graph. Manifest: `docs/specs/2026-07-14-ocean-daemon-router-parity-extraction-manifest.md`.
 2. Move leaf concerns first:
    - metrics;
-   - CORS policy;
+   - **Complete (2026-07-14):** moved CORS origin parsing, trust policy, method/header policy, layer construction, and focused tests intact into private `src/cors.rs`; the full-router middleware contract remains unchanged. Manifest: `docs/specs/2026-07-14-ocean-daemon-cors-extraction-manifest.md`.
    - workspace/cwd policy;
    - core↔SDK event adapters;
    - voice wrappers;

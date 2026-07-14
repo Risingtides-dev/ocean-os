@@ -2863,3 +2863,14 @@ type:      [feature-request]: session-scoped component tray with truthful run-lo
 area:      [frontend]: ocean-tui Files rail; [backend]: ocean-runtime tool lifecycle
 
 Added a separate SESSION COMPONENT tray beneath the file tree rather than coupling todo rendering to FileTreeComponent. The first adapter correlates canonical todo ToolCallStarted/ToolCallFinished events, mutates only after successful finishes, displays sanitized run-local items, clears at turn/session boundaries, ignores stale-session events, and returns all vertical space to Files when inactive or too short. The context meter remains absent because the daemon still lacks truthful current occupancy, capacity, provenance, and measurement time. Recon found the long-lived BuiltinProvider was accidentally sharing one TodoTool Arc across all turns/sessions despite the tool's single-run contract; it now rebuilds TodoTool for every agent-run tool query, with a regression proving no cross-run bleed. Layout, stale-event isolation, tiny-height fallback, pane-bounded selection, failed-effect, incomplete-stream, and terminal-safety tests were added. The operator-owned deploy/dev.risingtides.ocean-daemon.plist remained untouched.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [06:24am] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: extract daemon CORS policy leaf intact
+area:      [backend]: ocean-daemon Phase 2C leaf extraction
+
+Moved the complete browser-origin trust policy, normalized operator allowlist parser, allowed method/header contract, concrete CorsLayer builder, and all seven focused tests from the daemon monolith into private `src/cors.rs`. Parent visibility is limited to composition's `cors_layer` and `parse_allowed_origins`; the 72-route graph, global CORS-inside-tracing placement, fallback coverage, handlers, and state are unchanged. The router contract and full daemon suite remain the behavior gate. The operator-owned deploy plist remained excluded.
+_________________________________________________________________________________
