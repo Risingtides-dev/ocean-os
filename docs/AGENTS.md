@@ -20,6 +20,7 @@ This child doc governs the `docs/` subtree: architecture notes, operator guides,
 - Do not port Pi TypeScript line-by-line; document idiomatic Rust concepts and boundaries.
 - Active docs must not require material from `.agentarchive` to explain current behavior. Historical evidence may be retained there as opt-in operator context, but current contracts point to active sources.
 - Active code-health/agent-readiness plan: `specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md`.
+- Living daemon-refactor mission, progress, and target: `DAEMON_REFACTOR_MISSION.md`.
 
 ## Work Guidance
 

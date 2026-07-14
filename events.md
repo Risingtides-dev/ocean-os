@@ -2885,3 +2885,14 @@ area:      [backend]: ocean-daemon Phase 2C leaf extraction
 
 Moved the relaxed-atomic turn counters, cumulative latency histogram, byte-stable Prometheus renderer, cancellation-safe in-flight RAII guard, test parsing helpers, and four focused unit tests into private `src/metrics.rs`. The thin GET /metrics handler and endpoint/cross-counter integration tests remain in main.rs so AppState and externally-owned persistence, GC, and SSE counters are not redesigned. Route registration, content type, rendered metric names/order, hot-path calls, and synchronization semantics remain unchanged. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [06:51am] [14-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [documentation]: publish daemon refactor mission and status
+area:      [documentation]: GitHub-visible refactor course
+
+Added docs/DAEMON_REFACTOR_MISSION.md as the durable GitHub-facing statement of mission, non-negotiable invariants, completed foundation and Phase 2C checkpoints, current 19.9k-line composition baseline, ordered extraction course, final target, and completion gate. Linked it from the root and docs contracts so a cold contributor can find the current objective without reconstructing it from events or manifests.
+_________________________________________________________________________________
