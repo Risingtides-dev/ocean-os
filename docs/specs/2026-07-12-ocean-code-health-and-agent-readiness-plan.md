@@ -283,7 +283,7 @@ Before each move, write a short extraction manifest naming exact symbols/files, 
    - **Complete (2026-07-14):** moved turn counters, cumulative latency histogram rendering, Prometheus text generation, the cancellation-safe in-flight RAII guard, and four focused tests intact into private `src/metrics.rs`; the thin state-extracting HTTP handler remains in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-metrics-extraction-manifest.md`.
    - **Complete (2026-07-14):** moved CORS origin parsing, trust policy, method/header policy, layer construction, and focused tests intact into private `src/cors.rs`; the full-router middleware contract remains unchanged. Manifest: `docs/specs/2026-07-14-ocean-daemon-cors-extraction-manifest.md`.
    - **Complete (2026-07-14):** moved the exhaustive SDK→legacy-core event mirror and SDK SSE event-name adapters intact into private `src/event_adapter.rs`, adding three focused characterization tests while leaving publication, envelope provenance, runtime relay, filtering, replay, and framing in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-event-adapters-extraction-manifest.md`.
-   - workspace/cwd policy;
+   - **Complete (2026-07-14):** moved the pure lexical traversal, caller-cwd pass-through, and session-detail workspace-scope policy plus nine existing tests intact into private `src/workspace_policy.rs`; startup repo-cwd enforcement, persisted-session lookup, query resolution, HTTP mapping, room/call fallbacks, runtime rebinding, and persistence remain in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-workspace-policy-extraction-manifest.md`.
    - voice wrappers;
    - catalog/settings;
    - projects/filesystem;

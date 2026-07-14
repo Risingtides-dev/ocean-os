@@ -63,23 +63,22 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | CORS policy leaf | Complete | Private `src/cors.rs`; policy and seven tests moved intact |
 | Turn-metrics primitives | Complete | Private `src/metrics.rs`; counters, histogram renderer, in-flight guard, and four focused tests moved intact; HTTP handler stays in composition |
 | Core↔SDK event adapters | Complete | Private `src/event_adapter.rs`; exhaustive legacy-mirror and SDK SSE-name adapters plus three focused tests; publication, provenance, runtime relay, filtering, replay, and framing stay in composition |
-| Workspace/cwd policy | Next | Lexical traversal, caller binding, session workspace checks, and startup repo-cwd guard must remain exact |
-| Catalog and settings | Queued | Model routing/readiness and YOLO precedence remain unchanged |
+| Workspace/cwd policy | Complete | Private `src/workspace_policy.rs`; traversal, caller pass-through, scoped-read policy, and nine tests moved intact; startup guard, lookup, queries, HTTP mapping, runtime rebinding, room/call fallbacks, and persistence stay in composition |
+| Catalog and settings | Next | Model routing/readiness and YOLO precedence remain unchanged |
 | Projects and filesystem | Queued | Preserve HOME sandboxing, canonicalization, response shapes, limits, and project/session behavior |
 | Canvas bridge | Queued, higher coupling | Store, runtime registry, SSE re-emit, TTL, cap, and GC must move together or remain together |
 | Persistent rooms, Longhouse, calls, registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
-At this checkpoint, `main.rs` is approximately 19.9k lines, with CORS, metrics, and pure event adapters now independently owned. The route characterization and adapter characterization added substantial test coverage before and during line reduction, so raw line count alone understates progress. The important movement is ownership: behavior now has a checked boundary before it leaves the monolith.
+At this checkpoint, `main.rs` is approximately 19.6k lines, with CORS, metrics, pure event adapters, and ordinary turn/session-read workspace policy now independently owned. The route characterization and adapter characterization added substantial test coverage before and during line reduction, so raw line count alone understates progress. The important movement is ownership: behavior now has a checked boundary before it leaves the monolith.
 
 ## Course from here
 
-1. Extract workspace/cwd policy with the existing traversal, rebind, and cross-workspace tests.
-2. Extract catalog/settings leaves without changing provider resolution or YOLO precedence.
-3. Separate filesystem and project concerns only after their security and response contracts are fully indexed.
-4. Move canvas and stateful domains only with explicit lifecycle/GC manifests.
-5. Move turn/SSE orchestration last.
-6. Request separate Phase 3 approval before splitting `AppState`, generating route metadata, creating a daemon library, or redesigning internal service boundaries.
+1. Extract catalog/settings leaves without changing provider resolution or YOLO precedence.
+2. Separate filesystem and project concerns only after their security and response contracts are fully indexed.
+3. Move canvas and stateful domains only with explicit lifecycle/GC manifests.
+4. Move turn/SSE orchestration last.
+5. Request separate Phase 3 approval before splitting `AppState`, generating route metadata, creating a daemon library, or redesigning internal service boundaries.
 
 ## Completion standard for every wave
 
@@ -102,5 +101,6 @@ A wave is complete only when:
 - [CORS extraction manifest](specs/2026-07-14-ocean-daemon-cors-extraction-manifest.md)
 - [Metrics extraction manifest](specs/2026-07-14-ocean-daemon-metrics-extraction-manifest.md)
 - [Event-adapters extraction manifest](specs/2026-07-14-ocean-daemon-event-adapters-extraction-manifest.md)
+- [Workspace-policy extraction manifest](specs/2026-07-14-ocean-daemon-workspace-policy-extraction-manifest.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)

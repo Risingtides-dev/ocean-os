@@ -2921,3 +2921,13 @@ area:      [backend]: ocean-daemon Phase 2C leaf extraction
 Moved the exhaustive SDK-to-legacy-core event mirror and SDK SSE event-name helpers into private `src/event_adapter.rs`, preserving both production match bodies except for minimal parent visibility. Added three focused tests covering every current SDK wire tag, every intentionally agent-only event, all mirrored payload classes, placeholder tool behavior, error polarity, completion semantics, and wall-time fallback. Bus publication order, legacy envelope session/provenance stamping, runtime relay and TurnCheckpoint filtering, SSE scoping/serialization/replay/lag behavior, routes, and state remain in composition unchanged. Focused, router, full daemon, workspace-test compilation, both supported feature checks, formatting, docs, diff checks, and independent review passed. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [06:44pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: extract daemon workspace policy leaf intact
+area:      [backend]: ocean-daemon Phase 2C leaf extraction
+
+Moved the lexical parent-traversal guard, caller-cwd pass-through, session-detail workspace-scope policy, shared error vocabulary, and all nine existing focused tests into private `src/workspace_policy.rs`, preserving every production and test body except for minimal parent visibility. Ordinary turns still rebind to the caller's cwd across subdirectories and workspaces, while scoped detail reads still reject only when both raw workspace roots exist and differ. Startup repo-cwd enforcement and placement, persisted-session lookup/fallback, query precedence, HTTP error mapping, runtime rebinding/persistence, and room/call cwd fallbacks remain in composition unchanged. Focused policy/session/rebinding tests, full agent/runtime/daemon suites, router contracts, workspace-test compilation, both supported feature checks, formatting, docs, diff checks, and independent review passed. Concurrent ACP documentation and the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
