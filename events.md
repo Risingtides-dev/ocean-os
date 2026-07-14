@@ -2939,3 +2939,13 @@ area:      [backend]: ocean-daemon Phase 2C leaf extraction
 Moved the lexical parent-traversal guard, caller-cwd pass-through, session-detail workspace-scope policy, shared error vocabulary, and all nine existing focused tests into private `src/workspace_policy.rs`, preserving every production and test body except for minimal parent visibility. Ordinary turns still rebind to the caller's cwd across subdirectories and workspaces, while scoped detail reads still reject only when both raw workspace roots exist and differ. Startup repo-cwd enforcement and placement, persisted-session lookup/fallback, query precedence, HTTP error mapping, runtime rebinding/persistence, and room/call cwd fallbacks remain in composition unchanged. Focused policy/session/rebinding tests, full agent/runtime/daemon suites, router contracts, workspace-test compilation, both supported feature checks, formatting, docs, diff checks, and independent review passed. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [06:54pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [test]: characterize daemon model catalog adapters before extraction
+area:      [backend]: ocean-daemon Phase 2C catalog foundation
+
+Added four direct-handler contract tests before moving model catalog ownership. The tests freeze exact get/list/set top-level JSON keys, current provider/model projection, flat ordered readiness-entry fields, successful selection mutation, invalid-selection error shape, and no mutation on rejection. The characterization reuses the existing broad AppState fixture and will remain in composition rather than introducing a test-only substate. Focused catalog tests, router contracts, the full 292-test daemon suite, formatting, docs, and diff checks pass. Provider routing, readiness, persistence, `/ready`, roles, Longhouse filtering, YOLO settings, concurrent ACP documentation, and the operator deploy plist remain unchanged.
+_________________________________________________________________________________
+_________________________________________________________________________________

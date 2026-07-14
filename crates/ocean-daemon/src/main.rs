@@ -13334,6 +13334,109 @@ mod tests {
         }
     }
 
+    // --- Phase 2C: model catalog HTTP adapter characterization ---------------
+
+    #[tokio::test]
+    async fn model_catalog_get_reports_current_selection() {
+        let state = permission_test_state();
+        let (provider, model) = state.runtime.current_model();
+
+        let Json(body) = model_get(State(state)).await;
+
+        assert_eq!(
+            body,
+            json!({"ok": true, "provider": provider, "model": model})
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_list_preserves_picker_shape_and_readiness_fields() {
+        let state = permission_test_state();
+        let (provider, model) = state.runtime.current_model();
+
+        let Json(body) = models_list(State(state)).await;
+        let top = body
+            .as_object()
+            .expect("model list response must be an object");
+        assert_eq!(top.len(), 3, "top-level model-list keys must stay exact");
+        assert_eq!(top.get("ok"), Some(&json!(true)));
+        assert_eq!(
+            top.get("current"),
+            Some(&json!({"provider": provider, "model": model}))
+        );
+
+        let models = top
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .expect("models must remain an array");
+        assert!(
+            !models.is_empty(),
+            "the public picker catalog must not be empty"
+        );
+        for entry in models {
+            let entry = entry
+                .as_object()
+                .expect("every picker entry must remain an object");
+            assert!(entry.contains_key("id"));
+            assert!(entry.contains_key("provider"));
+            assert!(entry.contains_key("label"));
+            assert!(entry.contains_key("ready"));
+            assert!(
+                entry.len() == 4 || (entry.len() == 5 && entry.contains_key("credential_source")),
+                "picker entries may add only the optional credential_source field: {entry:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_set_reports_success_and_updates_current_selection() {
+        let state = permission_test_state();
+
+        let Json(body) = model_set(
+            State(state.clone()),
+            Json(ModelSetRequest {
+                model: "fake-tool".into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            body,
+            json!({"ok": true, "provider": "fake", "model": "fake-tool"})
+        );
+        assert_eq!(
+            state.runtime.current_model(),
+            ("fake".to_string(), "fake-tool".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_set_rejects_invalid_selection_without_mutation() {
+        let state = permission_test_state();
+        let before = state.runtime.current_model();
+
+        let Json(body) = model_set(
+            State(state.clone()),
+            Json(ModelSetRequest {
+                model: "definitely-not-an-ocean-model".into(),
+            }),
+        )
+        .await;
+
+        let body = body
+            .as_object()
+            .expect("model-set rejection must remain an object");
+        assert_eq!(body.len(), 2, "rejection keys must stay exact");
+        assert_eq!(body.get("ok"), Some(&json!(false)));
+        assert!(
+            body.get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.contains("failed to resolve model")),
+            "rejection must preserve the resolver error: {body:?}"
+        );
+        assert_eq!(state.runtime.current_model(), before);
+    }
+
     // --- OCEAN-304: turn-intake backpressure ---------------------------------
 
     /// `permission_test_state` (fake-ok runtime) but with a deliberately small
