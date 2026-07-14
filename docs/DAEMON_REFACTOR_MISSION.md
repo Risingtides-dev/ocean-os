@@ -2,7 +2,7 @@
 
 **Status:** Active, green, and shipping in bounded checkpoints
 **Updated:** 2026-07-14
-**Published implementation:** `6363964`
+**Published implementation:** `36ca285`
 **Scope:** `crates/ocean-daemon`
 
 ## Mission
