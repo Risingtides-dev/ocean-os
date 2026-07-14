@@ -8657,6 +8657,14 @@ async fn validate_voice_planner_context(
     if context.workspace_root.trim().is_empty() {
         return Err("workspace_root must not be blank".into());
     }
+    if project.name.chars().count() > voice_realtime::PLANNER_PROJECT_NAME_MAX_CHARS {
+        return Err("registered project name is too long for planner minting".into());
+    }
+    if context.workspace_root.trim().chars().count()
+        > voice_realtime::PLANNER_WORKSPACE_ROOT_MAX_CHARS
+    {
+        return Err("workspace_root is too long for planner minting".into());
+    }
     let project_root = std::fs::canonicalize(&project.workspace_root)
         .map_err(|_| "registered project root is unavailable".to_string())?;
     if !project_root.is_dir() {
@@ -8676,6 +8684,9 @@ async fn validate_voice_planner_context(
         match discover_project_worktrees(&project_root.to_string_lossy()).await {
             Ok(worktrees) => {
                 for wt in worktrees {
+                    if wt.prunable {
+                        continue;
+                    }
                     if let Ok(path) = std::fs::canonicalize(&wt.path) {
                         allowed.push(path);
                     }
@@ -8688,9 +8699,22 @@ async fn validate_voice_planner_context(
     if !allowed.iter().any(|path| path == &requested) {
         return Err("workspace_root is not a live worktree of the project".into());
     }
+    if requested != project_root {
+        // Registration alone is insufficient: prove the linked worktree still
+        // resolves to the same Git common directory as the registered project.
+        let project_common = canonical_git_common_dir(&project_root).await?;
+        let requested_common = canonical_git_common_dir(&requested).await?;
+        if requested_common != project_common {
+            return Err("workspace_root belongs to a different Git repository".into());
+        }
+    }
+    let workspace_root = requested.to_string_lossy().into_owned();
+    if workspace_root.chars().count() > voice_realtime::PLANNER_WORKSPACE_ROOT_MAX_CHARS {
+        return Err("canonical workspace_root is too long for planner minting".into());
+    }
     Ok(ValidatedPlannerContext {
         project_name: project.name,
-        workspace_root: requested.to_string_lossy().into_owned(),
+        workspace_root,
     })
 }
 
@@ -19486,18 +19510,22 @@ branch refs/heads/feat-x
 
 worktree /Users/x/project/bugfix
 branch refs/heads/bug-fix
+prunable gitdir file points to non-existent location
 ";
         let wts = parse_worktree_list(raw);
         assert_eq!(wts.len(), 3);
 
         assert_eq!(wts[0].path, "/Users/x/project/main");
         assert!(wts[0].branch.is_none());
+        assert!(!wts[0].prunable);
 
         assert_eq!(wts[1].path, "/Users/x/project/feat-branch");
         assert_eq!(wts[1].branch.as_deref(), Some("feat-x"));
+        assert!(!wts[1].prunable);
 
         assert_eq!(wts[2].path, "/Users/x/project/bugfix");
         assert_eq!(wts[2].branch.as_deref(), Some("bug-fix"));
+        assert!(wts[2].prunable);
     }
 
     #[test]
@@ -19513,6 +19541,128 @@ branch refs/heads/bug-fix
         assert_eq!(wts.len(), 1);
         assert_eq!(wts[0].path, "/a/path");
         assert_eq!(wts[0].branch.as_deref(), Some("main"));
+        assert!(!wts[0].prunable);
+    }
+
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("git command starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn planner_context_allows_main_and_live_worktree_but_rejects_invalid_and_prunable() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let main = tmp.path().join("repo");
+        std::fs::create_dir_all(&main).unwrap();
+        run_git(&main, &["init", "-b", "main"]);
+        run_git(
+            &main,
+            &["config", "user.email", "planner-test@example.invalid"],
+        );
+        run_git(&main, &["config", "user.name", "Planner Test"]);
+        std::fs::write(main.join("README.md"), "planner\n").unwrap();
+        run_git(&main, &["add", "README.md"]);
+        run_git(&main, &["commit", "-m", "init"]);
+
+        let live = tmp.path().join("live-worktree");
+        let live_arg = live.to_string_lossy().into_owned();
+        run_git(&main, &["worktree", "add", "-b", "live", &live_arg]);
+        let stale = tmp.path().join("stale-worktree");
+        let stale_arg = stale.to_string_lossy().into_owned();
+        run_git(&main, &["worktree", "add", "-b", "stale", &stale_arg]);
+
+        let project_id = uuid::Uuid::new_v4();
+        state
+            .runtime
+            .upsert_project(
+                Project {
+                    id: project_id,
+                    name: "Planner project".into(),
+                    workspace_root: main.to_string_lossy().into_owned(),
+                    config: ProjectConfig::default(),
+                    created_ms: 1,
+                    updated_ms: 1,
+                },
+                1,
+            )
+            .unwrap();
+        let context = |root: &std::path::Path| voice_realtime::VoicePlannerContext {
+            project_id,
+            workspace_root: root.to_string_lossy().into_owned(),
+        };
+
+        let validated = validate_voice_planner_context(&state.runtime, &context(&main))
+            .await
+            .expect("registered main root is valid");
+        assert_eq!(
+            validated.workspace_root,
+            std::fs::canonicalize(&main).unwrap().to_string_lossy()
+        );
+        validate_voice_planner_context(&state.runtime, &context(&live))
+            .await
+            .expect("live linked worktree is valid");
+
+        let unrelated = tmp.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let error = validate_voice_planner_context(&state.runtime, &context(&unrelated))
+            .await
+            .unwrap_err();
+        assert!(error.contains("not a live worktree"));
+
+        // Leave Git's registration intact, but recreate the removed path as an
+        // ordinary directory. Porcelain marks this record prunable.
+        std::fs::remove_dir_all(&stale).unwrap();
+        std::fs::create_dir(&stale).unwrap();
+        let discovered = discover_project_worktrees(&main.to_string_lossy())
+            .await
+            .unwrap();
+        let stale_canonical = std::fs::canonicalize(&stale)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(discovered
+            .iter()
+            .any(|wt| wt.path == stale_canonical && wt.prunable));
+        let error = validate_voice_planner_context(&state.runtime, &context(&stale))
+            .await
+            .unwrap_err();
+        assert!(error.contains("not a live worktree"));
+
+        std::env::remove_var("OCEAN_YOLO");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn planner_handler_rejects_invalid_context_before_credential_lookup() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (status, Json(body)) = voice_realtime_client_secret(
+            State(state),
+            Json(voice_realtime::RealtimeSecretRequest {
+                session_id: None,
+                model: None,
+                purpose: voice_realtime::RealtimePurpose::Planner,
+                planner_context: Some(voice_realtime::VoicePlannerContext {
+                    project_id: uuid::Uuid::new_v4(),
+                    workspace_root: tmp.path().to_string_lossy().into_owned(),
+                }),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "unknown project_id");
+        std::env::remove_var("OCEAN_YOLO");
     }
 
     // -- project_create existing-dir -----------------------------------------
