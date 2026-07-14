@@ -282,8 +282,8 @@ Before each move, write a short extraction manifest naming exact symbols/files, 
 2. Move leaf concerns first:
    - **Complete (2026-07-14):** moved turn counters, cumulative latency histogram rendering, Prometheus text generation, the cancellation-safe in-flight RAII guard, and four focused tests intact into private `src/metrics.rs`; the thin state-extracting HTTP handler remains in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-metrics-extraction-manifest.md`.
    - **Complete (2026-07-14):** moved CORS origin parsing, trust policy, method/header policy, layer construction, and focused tests intact into private `src/cors.rs`; the full-router middleware contract remains unchanged. Manifest: `docs/specs/2026-07-14-ocean-daemon-cors-extraction-manifest.md`.
+   - **Complete (2026-07-14):** moved the exhaustive SDK→legacy-core event mirror and SDK SSE event-name adapters intact into private `src/event_adapter.rs`, adding three focused characterization tests while leaving publication, envelope provenance, runtime relay, filtering, replay, and framing in composition. Manifest: `docs/specs/2026-07-14-ocean-daemon-event-adapters-extraction-manifest.md`.
    - workspace/cwd policy;
-   - core↔SDK event adapters;
    - voice wrappers;
    - catalog/settings;
    - projects/filesystem;

@@ -91,6 +91,8 @@ mod browser_stream;
 mod bus;
 /// Browser-origin trust policy and global CORS middleware construction.
 mod cors;
+/// Pure adapters between full-fidelity SDK agent events and the legacy core rail.
+mod event_adapter;
 /// In-process turn counters, Prometheus rendering, and in-flight RAII guard.
 mod metrics;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
@@ -101,6 +103,7 @@ mod voice_realtime;
 mod voice_speech;
 use browser_stream::{input as browser_input, screencast_stream as browser_screencast};
 use cors::{cors_layer, parse_allowed_origins};
+use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use metrics::{InFlightGuard, TurnMetrics};
 
 #[cfg(test)]
@@ -10260,79 +10263,6 @@ fn emit_agent(
         env.session_id = Some(core_sid(session_id));
         env.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
         events.emit(env);
-    }
-}
-
-fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> {
-    match event {
-        AgentTurnEvent::TurnStarted { .. } => None,
-        AgentTurnEvent::AssistantTextDelta {
-            turn_id: _, delta, ..
-        } => Some(OceanEvent::AssistantDelta { text: delta }),
-        AgentTurnEvent::ModelRerouted { .. } => None,
-        AgentTurnEvent::ThinkingDelta { .. } => None,
-        AgentTurnEvent::ToolCallStarted {
-            turn_id: _, call, ..
-        } => Some(OceanEvent::ToolStarted {
-            tool: call.name,
-            args: call.args_json,
-        }),
-        AgentTurnEvent::TurnFinished {
-            status, wall_ms, ..
-        } => Some(OceanEvent::TurnFinished {
-            ok: matches!(status, AgentTurnStatus::Completed),
-            wall_ms: wall_ms.unwrap_or(0),
-        }),
-        AgentTurnEvent::ToolCallChunk {
-            turn_id: _,
-            call_id: _,
-            chunk,
-            ..
-        } => Some(OceanEvent::ToolOutput {
-            tool: "tool".into(),
-            text: chunk,
-            is_error: false,
-        }),
-        AgentTurnEvent::ToolCallFinished {
-            turn_id: _,
-            call_id: _,
-            result,
-            ..
-        } => Some(OceanEvent::ToolEnded {
-            tool: "tool".into(),
-            is_error: !result.ok,
-        }),
-        AgentTurnEvent::SessionCreated {
-            session_id: _,
-            title: _,
-            cwd: _,
-        } => Some(OceanEvent::SessionCreated),
-        AgentTurnEvent::Extension { .. } => None,
-        AgentTurnEvent::ComponentRender { .. } => None,
-        AgentTurnEvent::ComponentUnmount { .. } => None,
-        AgentTurnEvent::BrowserActivity { .. } => None,
-        AgentTurnEvent::SurfacePatch { .. } => None,
-        AgentTurnEvent::SlackCanvas { .. } => None,
-    }
-}
-
-fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
-    match event {
-        AgentTurnEvent::TurnStarted { .. } => "turn_started",
-        AgentTurnEvent::ModelRerouted { .. } => "model_rerouted",
-        AgentTurnEvent::AssistantTextDelta { .. } => "assistant_text_delta",
-        AgentTurnEvent::ThinkingDelta { .. } => "thinking_delta",
-        AgentTurnEvent::ToolCallStarted { .. } => "tool_call_started",
-        AgentTurnEvent::ToolCallChunk { .. } => "tool_call_chunk",
-        AgentTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
-        AgentTurnEvent::TurnFinished { .. } => "turn_finished",
-        AgentTurnEvent::SessionCreated { .. } => "session_created",
-        AgentTurnEvent::Extension { .. } => "extension",
-        AgentTurnEvent::ComponentRender { .. } => "component_render",
-        AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
-        AgentTurnEvent::BrowserActivity { .. } => "browser_activity",
-        AgentTurnEvent::SurfacePatch { .. } => "surface_patch",
-        AgentTurnEvent::SlackCanvas { .. } => "slack_canvas",
     }
 }
 
