@@ -2989,3 +2989,13 @@ area:      [backend]: ocean-daemon Phase 2C filesystem foundation
 Added three direct-handler tests for the home-sandboxed directory and file endpoints. They freeze canonicalization-based rejection of directory and file symlink escapes, the null-parent canonical HOME boundary, distinct missing/outside status codes, exact directory error bodies, and every key/default in the uniform no-`ok` file-error envelope. Existing tests continue pinning tilde expansion, separator-bounded containment, text/binary/cap/size behavior, sorting, hidden-directory and dotfile policy, git fields, and optional files omission. All nine filesystem tests, all three retained project-helper callers, five router contracts, all 297 daemon tests, formatting, docs, and diff checks pass from an isolated clean-main verification tree; concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [07:55pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: extract daemon filesystem sandbox intact
+area:      [backend]: ocean-daemon Phase 2C filesystem leaf
+
+Moved tilde/canonicalization/containment helpers, endpoint-specific resolution errors, directory and file queries/handlers, content caps, capped reading, and the file-error envelope into private `src/filesystem.rs`. Every moved definition remains byte-identical to characterization commit `b7a7aeb` after normalizing only minimal parent visibility. Canonicalization-before-containment, symlink-escape and sibling-prefix rejection, exact statuses/errors/shapes, optional files, sorting, hidden/dotfile policy, git fields, true size, 512-KiB cap, 8-KiB NUL sniff, lossy UTF-8, and synchronous handler boundaries remain unchanged. Router/banner/middleware and shared query parsing stay in composition; project CRUD retains the same imported tilde/canonicalization calls. Focused filesystem/project, agent, router, full 297-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed from clean main; fresh security review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________

@@ -66,17 +66,18 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Workspace/cwd policy | Complete | Private `src/workspace_policy.rs`; traversal, caller pass-through, scoped-read policy, and nine tests moved intact; startup guard, lookup, queries, HTTP mapping, runtime rebinding, room/call fallbacks, and persistence stay in composition |
 | Model catalog | Complete | Private `src/model_catalog.rs`; get/list/set adapters moved after four characterization tests; canonical routing, ordered readiness, credential discovery, and persistence stay owner-controlled; `/ready` and turn/domain model policy stay in composition |
 | YOLO settings | Complete | Private `src/yolo_settings.rs`; env → persisted → safe-off precedence, inert wire flag, exact GET/POST shapes, persistence timing, permission authority, voice fail-fast, and shared test-lock order remain exact |
-| Projects and filesystem | Queued | Preserve HOME sandboxing, canonicalization, response shapes, limits, and project/session behavior |
+| Filesystem sandbox | Complete | Private `src/filesystem.rs`; canonical HOME containment, symlink-escape rejection, statuses, response envelopes, caps, binary sniffing, sorting, and git fields preserved |
+| Project registry | Next | Preserve runtime persistence, pagination, session association, git/worktree enrichment, mkdir/canonicalization, response shapes, and timestamps |
 | Canvas bridge | Queued, higher coupling | Store, runtime registry, SSE re-emit, TTL, cap, and GC must move together or remain together |
 | Persistent rooms, Longhouse, calls, registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
-At this checkpoint, `main.rs` is approximately 19.7k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model-catalog HTTP adapters, and security-sensitive YOLO settings policy now independently owned. Catalog and settings characterization added six direct-handler tests before their moves, so raw line count alone understates progress. The important movement is ownership: behavior now has a checked boundary before it leaves the monolith.
+At this checkpoint, `main.rs` is approximately 19.5k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model-catalog HTTP adapters, security-sensitive YOLO settings policy, and the home-sandboxed filesystem HTTP surface now independently owned. Catalog, settings, and filesystem characterization added nine direct-handler tests before their moves, so raw line count alone understates progress. The important movement is ownership: behavior now has a checked boundary before it leaves the monolith.
 
 ## Course from here
 
-1. Separate filesystem and project concerns only after their security and response contracts are fully indexed.
-2. Keep permission authority, settings policy, and call-site orchestration fixed while lower-risk leaves move.
+1. Characterize and extract project-registry HTTP adapters without moving runtime persistence, session ownership, or cwd resolution.
+2. Keep filesystem policy, permission authority, settings policy, and call-site orchestration fixed while lower-risk leaves move.
 3. Move canvas and stateful domains only with explicit lifecycle/GC manifests.
 4. Move turn/SSE orchestration last.
 5. Request separate Phase 3 approval before splitting `AppState`, generating route metadata, creating a daemon library, or redesigning internal service boundaries.
@@ -105,5 +106,6 @@ A wave is complete only when:
 - [Workspace-policy extraction manifest](specs/2026-07-14-ocean-daemon-workspace-policy-extraction-manifest.md)
 - [Model-catalog extraction manifest](specs/2026-07-14-ocean-daemon-model-catalog-extraction-manifest.md)
 - [YOLO-settings extraction manifest](specs/2026-07-14-ocean-daemon-yolo-settings-extraction-manifest.md)
+- [Filesystem extraction manifest](specs/2026-07-14-ocean-daemon-filesystem-extraction-manifest.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)

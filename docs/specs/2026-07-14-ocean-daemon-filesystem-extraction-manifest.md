@@ -1,7 +1,7 @@
 # Ocean Daemon Filesystem Extraction Manifest
 
 **Date:** 2026-07-14
-**Status:** Characterization complete; extraction, full validation, and review pending
+**Status:** Complete; characterization, focused/full/feature validation, and independent security review passed
 **Owner:** Ocean OS
 **Rollback point:** `d0a4cab`
 
@@ -137,9 +137,9 @@ An independent security-focused reviewer must compare every moved definition aga
 
 Three direct-handler tests now freeze symlink-escape rejection for both endpoints, the null-parent home boundary, distinct missing/outside status mappings, exact directory error bodies, and every key/default in the uniform file-error envelope. All nine focused filesystem tests, all three project-helper callers, all five router contracts, all 297 daemon tests, formatting, documentation, and diff checks pass at the characterization point.
 
-## Planned result
+## Result
 
-A private `filesystem.rs` owns the two home-sandboxed HTTP handlers and their complete path/read policy. Parent composition retains router registration, the shared SSE query parser, project CRUD, and all characterization/integration tests.
+A private `filesystem.rs` now owns the two home-sandboxed HTTP handlers and their complete path/read policy. All listed definitions are unchanged from characterization commit `b7a7aeb` except for minimal `pub(super)` visibility. Parent composition retains router registration, the shared SSE query parser, project CRUD, both project path-helper call sites, and all characterization/integration tests. Nine filesystem tests, three project-helper callers, 150 agent tests, five router contracts, all 297 daemon tests, workspace-test compilation, both supported-feature checks, formatting, documentation, and diff checks passed from an isolated clean-main verification tree. Fresh security review found no unresolved medium-or-higher issue.
 
 ## Rollback
 
