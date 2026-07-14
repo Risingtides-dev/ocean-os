@@ -2874,3 +2874,14 @@ area:      [backend]: ocean-daemon Phase 2C leaf extraction
 
 Moved the complete browser-origin trust policy, normalized operator allowlist parser, allowed method/header contract, concrete CorsLayer builder, and all seven focused tests from the daemon monolith into private `src/cors.rs`. Parent visibility is limited to composition's `cors_layer` and `parse_allowed_origins`; the 72-route graph, global CORS-inside-tracing placement, fallback coverage, handlers, and state are unchanged. The router contract and full daemon suite remain the behavior gate. The operator-owned deploy plist remained excluded.
 _________________________________________________________________________________
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [06:42am] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: extract daemon turn-metrics primitives intact
+area:      [backend]: ocean-daemon Phase 2C leaf extraction
+
+Moved the relaxed-atomic turn counters, cumulative latency histogram, byte-stable Prometheus renderer, cancellation-safe in-flight RAII guard, test parsing helpers, and four focused unit tests into private `src/metrics.rs`. The thin GET /metrics handler and endpoint/cross-counter integration tests remain in main.rs so AppState and externally-owned persistence, GC, and SSE counters are not redesigned. Route registration, content type, rendered metric names/order, hot-path calls, and synchronization semantics remain unchanged. Concurrent ACP documentation and the operator deploy plist remained excluded.
+_________________________________________________________________________________
