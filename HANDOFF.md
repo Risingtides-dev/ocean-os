@@ -1,14 +1,27 @@
 # Ocean OS handoff
 
-This root file is an evergreen handoff pointer, not a snapshot of a branch, deployment, active lane, or dirty worktree.
+This is an evergreen routing file, not a branch, deployment, or worktree
+snapshot.
 
 ## Current authority
 
-- Work contract and current invariants: [`AGENTS.md`](AGENTS.md)
-- Canonical package ownership/entry/test index: [`crates/AGENTS.md`](crates/AGENTS.md)
-- Cross-repo routing: [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md)
-- Active improvement plan: [`docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md`](docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md)
-- Chronological implementation/deployment record: [`events.md`](events.md)
-- Current Git state: inspect `git status`, branch, HEAD, and live daemon health directly.
+- Work contract: [`AGENTS.md`](AGENTS.md)
+- Documentation map and status: [`docs/README.md`](docs/README.md)
+- Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Operations and deployment: [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
+- Package ownership and tests: [`crates/AGENTS.md`](crates/AGENTS.md)
+- Cross-repository boundary: [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md)
+- Open work: [`ROADMAP.md`](ROADMAP.md)
+- Chronology: [`events.md`](events.md)
 
-Historical handoff snapshots live in the opt-in `docs/.agentarchive/` and are not active context. Do not infer current ownership, deployment state, or unfinished work from an archived handoff.
+Before continuing work, derive current state directly:
+
+```bash
+git status --short --branch
+git log -1 --oneline --decorate
+curl -fsS http://127.0.0.1:4780/health
+```
+
+Historical handoff snapshots and completed programs are optional evidence, not
+active instructions. Material that could redirect a cold agent away from the
+current state belongs under `docs/.agentarchive/`.

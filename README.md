@@ -1,85 +1,103 @@
-# Ocean
-<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/4bf6221b-7b77-4303-9268-3ba2be698cd9" />
+# Ocean OS
 
-> Rust-native coding-agent runtime, daemon, and TUI cockpit.
+Ocean OS is the local Rust runtime for Ocean. A long-running daemon owns agent
+turns, provider calls, permission-gated tools, sessions, and event delivery.
+The terminal UI, CLI, ACP bridge, and sibling product surfaces are clients of
+that daemon; they are not separate agent runtimes.
 
-Ocean OS is an agentic operating system written in Rust. A long-running daemon owns the agent loop, tool execution, provider calls, sessions, and permissions. Clients (CLI, TUI, future GUI / web / voice) are thin shells that steer the daemon over a stable protocol.
-
-## What's in this repo
-
-The canonical ownership/entry/test index for all 25 workspace packages is [`crates/AGENTS.md`](crates/AGENTS.md). It is checked against Cargo metadata; this README does not duplicate the package inventory.
-
-Core execution path:
+## What this repository owns
 
 ```text
-clients -> ocean-daemon -> ocean-agent -> ocean-runtime -> ocean-protocol/providers
+clients (TUI / CLI / ACP / Ocean Surface)
+  -> ocean-daemon (:4780; HTTP + SSE authority)
+  -> ocean-agent (sessions, prompts, capabilities)
+  -> ocean-runtime (agent loop, tools, permissions, cancellation)
+  -> ocean-protocol + ocean-providers (provider wire + model/auth routing)
 ```
 
-Cross-repo work routes through [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md), which covers `ocean-os`, `ocean-surface`, `ocean-agents`, and `ocean-bedrock`.
+The canonical package, entry-point, and narrow-test index for all workspace
+members is [`crates/AGENTS.md`](crates/AGENTS.md). The cross-repository boundary
+is [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md).
 
-## Product framing
+Ocean OS does **not** own product UI chrome, agent-package content, or the shared
+Bedrock data plane:
 
-- `ocean-rs` is the canonical Rust-native coding-agent harness/runtime.
-- `ocean-daemon` owns runtime authority: provider calls, agent loops, tools, sessions, permissions, and events.
-- `ocean-tui` is the agent terminal coding surface.
-- Ocean GUI and service layers remain thin clients; see the sibling `ocean-surface` repo.
+- [`ocean-surface`](https://github.com/Risingtides-dev/ocean-surface) owns the
+  Leptos UI and its browser, extension, and Tauri hosts.
+- [`ocean-agents`](https://github.com/Risingtides-dev/ocean-agents) owns editable
+  assistant profiles, specialist packages, and couriers.
+- [`ocean-bedrock`](https://github.com/Risingtides-dev/ocean-bedrock) owns the
+  authenticated shared files, ledger, ingest, graph, and semantic-search plane.
 
 ## Quick start
 
-Run the daemon:
+Prerequisites: Rust 1.88 or newer and a configured model/provider. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for credentials, supported build
+lanes, supervision, and recovery.
 
 ```bash
-# Build
 cargo build --workspace --release
 
-# Configure provider credentials (any one of these is enough)
-export OCEAN_DEEPSEEK_API_KEY=...   # DeepSeek (default)
-export OCEAN_ANTHROPIC_API_KEY=...  # Anthropic
-export OCEAN_OPENAI_API_KEY=...     # OpenAI
+# The daemon intentionally refuses a repository cwd. Start it from a neutral
+# directory so an unbound turn cannot accidentally bind to this checkout.
+OCEAN_MODEL=<model-alias> \
+  sh -c 'cd "$HOME" && /absolute/path/to/ocean-os/target/release/ocean-daemon'
 
-# Run the daemon
-./target/release/ocean-daemon
+curl -fsS http://127.0.0.1:4780/health
 
-# In another shell:
-curl http://127.0.0.1:4780/health
+# In another terminal:
 ./target/release/ocean-rs prompt "Reply with: pong"
-
-# Launch the TUI cockpit
-./target/release/ocean-tui   # or: ocean   (if symlinked into ~/.local/bin)
+./target/release/ocean-tui
 ```
 
-## Provider configuration
+For the supervised macOS service, use `ops/install-ocean-daemon.sh` rather than hand-copying a daemon binary. The script enforces the `main` branch; operators must separately verify a clean tree and `HEAD == origin/main` as documented in `docs/OPERATIONS.md`.
 
-Model selection via `OCEAN_MODEL` — there is no hardcoded default model; with nothing set the daemon errors (`NoModelSelected`) rather than picking one for you (see [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md#model-selection)). Supported model strings include:
+## Runtime contracts
 
-- `deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash`, `deepseek-v4-pro`
-- `gpt-4o`, `gpt-4o-mini`
-- `claude-sonnet-5`, `claude-opus-4-8`, `claude-haiku-4-5` (+ `claude-code-*` subscription variants incl. `claude-code-fable-5`)
-- `fake` (no creds — for testing)
-- any OpenAI-compatible base via `OCEAN_PROVIDER=openai-compatible` + `OCEAN_BASE_URL`
+- The daemon is the execution and HTTP/SSE authority.
+- Product clients create or select a session, subscribe to that session's
+  events, and submit turns carrying `session_id`, `cwd`, and `client_type`.
+- Session persistence lives in `ocean-agent`; a session defect affects every
+  first-party client.
+- Mutating tools remain permission-gated unless the operator explicitly selects
+  a trusted bypass.
+- The daemon must run from a neutral cwd.
+- Durable collaboration uses `/v1/rooms/persistent/*`; the retired Track-0 room
+  projection is not an active client contract.
 
-Provider env-var lookup order is documented in [`crates/ocean-providers/src/lib.rs`](crates/ocean-providers/src/lib.rs).
+## Documentation
 
-## Architecture
+Start at [`docs/README.md`](docs/README.md).
 
-Cross-repo routing and ownership map: [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md).
+| Need | Canonical document |
+| --- | --- |
+| Current architecture and state ownership | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| Build, run, verify, deploy, recover | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) |
+| Detailed runtime/API operator reference | [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md) |
+| Four-repository routing and contracts | [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md) |
+| Package ownership and narrow tests | [`crates/AGENTS.md`](crates/AGENTS.md) |
+| Open work only | [`ROADMAP.md`](ROADMAP.md) |
+| Historical chronology | [`events.md`](events.md) |
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the daemon ↔ client model, and [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md) for runtime ops.
+Plans and characterization reports under `docs/specs/` are evidence, not the
+current architecture unless a current contract explicitly says otherwise.
+Completed or superseded context belongs under `docs/.agentarchive/`.
 
-The active terminal workbench lives in [`crates/ocean-tui/src/shell/`](crates/ocean-tui/src/shell/); its maintenance contract is [`crates/ocean-tui/AGENTS.md`](crates/ocean-tui/AGENTS.md). Historical room/mesh mockups are archived under `docs/.agentarchive/`.
+## Development gate
 
-Internals: [`docs/OCEAN_NATIVE_INTERNALS_MAP.md`](docs/OCEAN_NATIVE_INTERNALS_MAP.md).
+```bash
+cargo xtask docs-check       # docs/index/archive integrity
+cargo xtask ci               # canonical local merge gate
+cargo xtask ci --dry-run     # print the executable manifest
+```
 
-## Roadmap
-
-Active runtime roadmap: [`ROADMAP.md`](ROADMAP.md).
-
-Longer-horizon vision — Ocean OS as a shared agentic knowledge layer (PRDs, market research, ingestion architecture, MCP service design) — lives on the [`roadmap/ocean-os-v2`](https://github.com/Risingtides-dev/ocean-os/tree/roadmap/ocean-os-v2) branch. That branch preserves the v2 product work and the TypeScript ingestion/orchestrator/MCP scaffolding; cherry-pick from it as those pieces graduate into the runtime.
-
-## Third-party attributions
-
-See [`NOTICE.md`](NOTICE.md).
+Compatibility lanes also run supported daemon features and release builds on
+stable Rust and the default/supported feature paths on pinned Rust 1.88. See
+[`AGENTS.md`](AGENTS.md) and [`xtask/README.md`](xtask/README.md).
 
 ## Contributing
 
-See [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md). For repo routing and Linear team rules, see [`docs/linear-teams-routing.md`](docs/linear-teams-routing.md) and [`docs/AGENTS.md`](docs/AGENTS.md).
+Read [`AGENTS.md`](AGENTS.md) before editing and then follow every nearer
+`AGENTS.md` on the path to the target file. See
+[`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md) for the contribution flow
+and [`NOTICE.md`](NOTICE.md) for third-party attributions.

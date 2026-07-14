@@ -1,315 +1,177 @@
 # Ocean OS architecture
 
-> Last validated against source: 2026-07-01 for the "Shipped since the original
-> integration list" reconciliation (all file:line anchors re-checked on main),
-> the Longhouse governance status, and the crate inventory below (five crates
-> added). The per-crate prose descriptions (ocean-call routes, ocean-heartbeat
-> subcommands, etc.) were last validated 2026-06-06 and are unverified since.
+Status: implemented current-state architecture. Package-level ownership and
+narrow validation live in [`../crates/AGENTS.md`](../crates/AGENTS.md); this
+document explains composition and state flow without duplicating all 25 package
+rows.
 
-Ocean OS is a Rust-native coding-agent runtime and daemon. The daemon owns runtime authority; `ocean-tui` is the active terminal workbench over that runtime.
+## Runtime model
 
-## Crates
-
-```text
-ocean-core
-  Shared protocol types: requests, responses, events, sessions.
-
-ocean-protocol
-  Unified multi-provider LLM wire protocol (Anthropic, OpenAI, Google,
-  OpenAI-compatible). SSE streaming, retry, cancellation.
-
-ocean-runtime
-  Agent loop with permission-gated tool execution. Built-in tools:
-  read, write, edit, bash, ls, grep, glob, web_fetch, todo.
-
-ocean-providers
-  Ocean-owned provider registry: model routing, credential resolution,
-  readiness checks.
-
-ocean-agent
-  Native Ocean agent facade. Owns model selection, credential discovery,
-  session persistence, daemon-safe permissions, project prompt loading, and
-  protocol/event mapping. Wraps ocean-runtime + ocean-protocol in-process.
-
-ocean-agent-sdk
-  Typed product vocabulary shared by the daemon and all clients: AgentSession,
-  AgentTurn, AgentTurnEvent (the canonical SSE payload), session create/list
-  request/response types, and LonghouseEvent. Deliberately separate from
-  ocean-core so the product contract is explicit and isolated.
-
-ocean-mcp
-  Ocean as an MCP *client*. Connects to external Model Context Protocol servers
-  and exposes their tools to the agent through the runtime's CapabilityProvider
-  seam — this is how the keys in tools.env (Brave, Slack, Linear, …) become
-  agent tools without hardcoded native Rust tools. Depends one-way on
-  ocean-runtime; the runtime never depends back on it.
-
-ocean-browser
-  Typed async handle to a Chrome instance driven over the DevTools Protocol.
-  Launch/attach, navigation, screenshot, hybrid read_page, inspect, Layer-3
-  input, live network capture, downloads, and a tab shell that treats tabs as
-  first-class addressable objects. Powers the runtime's browser tool suite.
-
-ocean-longhouse
-  The real quorum engine and convening flow behind the longhouse deck. A pure,
-  daemon-computed QuorumEngine counts credential-weighted, time-decaying,
-  cross-inhibiting marks and decides when a proposal crosses quorum — never an
-  LLM. The convene flow staffs a council with real LLM workers on cheap models,
-  runs a two-round propose → endorse/inhibit protocol, and emits the existing
-  LonghouseEvents so the deck renders a live council with zero deck changes.
-
-ocean-store
-  SQLite-backed durable storage (OCEAN-86). `SqliteRoomStore` behind the
-  `RoomStore` trait — the persistent counterpart to the old in-memory
-  RoomRegistry. Constructed by the daemon at startup; see "Shipped since the
-  original integration list" below.
-
-ocean-plugin
-  Subprocess-first plugin runtime for agent skill packs. A plugin declares
-  tools behind the `Plugin` trait; `PluginProvider` adapts them onto the
-  runtime's CapabilityProvider seam as `plugin__<plugin>__<tool>`. Registered
-  into live turns by ocean-agent; see "Shipped since" below.
-
-ocean-hooks
-  Plugin-agnostic runtime hooks: run configured subprocesses at lifecycle
-  events, stable JSON payload on stdin, JSON stdout interpreted as a decision.
-  Deliberately independent of any one plugin or MCP server.
-
-ocean-memory
-  Typed memory primitive for Ocean agents: a queryable, provenance-bearing
-  SQLite store at Agent / Operator / Shared scopes. A memory row is an
-  attested claim (this store owns Agent and Operator rows; Shared lives in
-  ocean-bedrock).
-
-ocean-context
-  The handoff as a context primitive: sets of claims, each with provenance,
-  that a receiving session distrusts by default and reverifies against ground
-  truth (spec: docs/specs/ocean-context-handoff-engine.md). Also home of the
-  OKF profile — `src/okf.rs` is the typed concept-type registry for Ocean's
-  knowledge artifacts (handoff/claim/memory/agent/event/note) plus per-source
-  loader adapters (TOML/YAML/devlog frontmatter). Validation is
-  diagnostic-only: a missing field is a work-item for a normalizer, never a
-  rejection.
-
-ocean-acp
-  ACP (Agent Client Protocol) bridge. Exposes the Ocean daemon to Zed and other
-  ACP editors over stdio, mapping editor sessions onto daemon turns.
-
-ocean-heartbeat
-  Standalone scheduler CLI for Ocean daemon routines: prompt-injection hooks
-  now, courier jobs later. It is a separate binary (`crates/ocean-heartbeat`,
-  src/main.rs) and an HTTP *client* of the daemon — NOT wired into the daemon
-  and not depended on by it (nothing in the workspace references
-  ocean-heartbeat). Meant to run under launchd/cron, it reads a TOML routine
-  (id, cwd, prompt, optional project_id, durable session file), GET-
-  prechecks the daemon's /health, then POSTs the routine prompt to
-  /v1/agent/turns and persists the returned session_id so successive runs
-  resume the same session. Subcommands: `run` (fire one routine now), `init`
-  (write a starter routine TOML), `component` (print a render-protocol stat
-  snapshot for PWA/dashboard clients), and `launchd` (print a macOS launchd
-  plist for the routine — does not install it). Targets the daemon at
-  OCEAN_DAEMON_URL / http://127.0.0.1:4780 by default.
-
-ocean-call
-  Daemon-side Twilio/LiveKit call-intelligence pipeline. A real phone number,
-  bridged via Twilio SIP into a LiveKit room, that Ocean joins as a server-side
-  participant. Over one shared audio stream it runs two lanes: a passive lane
-  (server-side room audio tap → streaming STT → rolling summarizer + task
-  detection, emitting call OceanEvents onto the daemon SSE rail) and an
-  active, wake-word-gated lane ("hey Ocean…" → wake-gate → one ephemeral agent
-  turn → TTS speaker back into the call). Components: room_tap, frame
-  re-chunker, stt (+ stt_xai), summarizer, task_detector, wake gate,
-  sip_bridge, speaker (TTS), and a Twilio/LiveKit webhook. Backs three daemon
-  routes (handlers in crates/ocean-daemon/src/main.rs):
-  - POST /v1/calls/place  — place a real outbound call: { "to": "<number>" }.
-    Normalizes to E.164, and if the SIP/LiveKit env is configured
-    (LIVEKIT_URL/_API_KEY/_API_SECRET + OCEAN_CALL_OUTBOUND_TRUNK +
-    OCEAN_CALL_CALLER_NUMBER) it mints a call room, emits CallStarted, and dials
-    via the LiveKit SIP bridge. Returns 503 naming the unset env when telephony
-    is not provisioned; emits CallEnded on a failed dial so no phantom call is
-    left "in progress".
-  - POST /v1/calls/webhook — LiveKit webhook receiver. Verifies the signature
-    and, on a room_started/room_finished for a call_ room, emits
-    CallStarted/CallEnded onto the SSE rail — the path that lets an INBOUND call
-    reach the pipeline.
-  - POST /v1/calls/demo  — scripted, no-telephony demo: runs a canned transcript
-    through the passive lane (summarizer + wake gate) and streams call
-    OceanEvents onto /v1/events. Proves the pipeline without a real phone line.
-
-ocean-daemon
-  Long-running OS service. Owns API surface for OceanTUI/Ocean GUI and
-  calls the native runtime in-process. It must not shell out to a second agent
-  runtime.
-
-ocean-cli
-  Thin terminal client for daemon control and one-shot prompts.
-
-ocean-tui
-
-  Active ratatui workbench. It renders chat, session rail, files, editor,
-  project graph, terminal dock, tool activity, permissions, and daemon health
-  while leaving provider calls, tools, sessions, and agent loops under daemon
-  authority. The former Track-0 room cockpit and mesh parity UI are archived
-  history, not runtime surfaces.
-
-```
-
-## Shipped since the original integration list
-
-This section used to read "Built, pending daemon integration" and listed a set of
-crates and types as existing-but-not-wired. **All of them are now constructed and
-live in the daemon path** (file:line anchors below re-verified against main on
-2026-07-01). They are recorded here so the history is clear. The one gap this
-section used to carry — a display-only transcript flattener that dropped image
-evidence — was closed by OCEAN-177 (see the Content::Image entry).
+Ocean OS is one local runtime with multiple clients.
 
 ```text
-ocean-store — WIRED (durable rooms).
-  SQLite-backed durable Room store (`SqliteRoomStore`) behind the `RoomStore`
-  trait. The daemon depends on it (`crates/ocean-daemon/Cargo.toml:45
-  ocean-store.workspace = true`) and constructs it at startup
-  (`crates/ocean-daemon/src/main.rs:1612 ocean_store::SqliteRoomStore::open(...)`),
-  holding it as `AppState.rooms: RoomStoreHandle` — an
-  `Arc<Mutex<ocean_store::SqliteRoomStore>>` (main.rs:88, 511) — instead of
-  the old in-memory `RoomRegistry`. Every persistent-room handler routes through
-  it via `with_rooms(...)` (main.rs:6189) (OCEAN-86 / 107).
-  OPERATOR IMPACT: rooms, rosters, and transcripts now PERSIST across daemon
-  restarts — they live in the rooms SQLite db, not process memory.
-
-ocean-plugin — WIRED (plugin tools reach the agent).
-  Subprocess plugin runtime + a `PluginProvider` implementing the runtime's
-  `CapabilityProvider` seam, exposing plugin tools as `plugin__<plugin>__<tool>`
-  (OCEAN-95). `ocean-agent` depends on it (`crates/ocean-agent/Cargo.toml:17
-  ocean-plugin.workspace = true`). `build_capability_registry`
-  (`crates/ocean-agent/src/lib.rs:1546`) calls
-  `discover_plugin_providers(config_dir)` and registers each returned
-  `ocean_plugin::PluginProvider` (registration loop at lib.rs:1612,
-  connected at lib.rs:1693). PluginProvider tools report
-  `requires_permission == true`, so they gate like any mutating tool.
-  OPERATOR IMPACT: installed plugins now contribute their tools to a turn; the
-  live agent path discovers, lists, and calls them.
-
-Content::Image (cross-provider vision) — WIRED on the model wire path; the
-  display-side gap is closed too (OCEAN-177).
-  The protocol type `Content::Image { data, mime_type }` is produced by the
-  browser/computer-use tools and now encoded by ALL FOUR providers on the way to
-  the model:
-    - Anthropic — `crates/ocean-protocol/src/providers/anthropic.rs:159,194`
-    - OpenAI    — `crates/ocean-protocol/src/providers/openai.rs:218,306`
-                  (OCEAN-99 user-message vision, OCEAN-131 tool-result images)
-    - Gemini    — `crates/ocean-protocol/src/providers/google.rs:140,244`
-                  (OCEAN-99 / OCEAN-132)
-    - Codex     — `crates/ocean-protocol/src/providers/codex.rs:66,154`
-                  (OCEAN-133)
-  The old "OpenAI text-only / Gemini has no Image arm" claim is OBSOLETE — a
-  screenshot taken mid-turn now reaches every provider's model.
-  The formerly-listed display gap is FIXED: the transcript flattener
-  `text_from_content` (`crates/ocean-agent/src/lib.rs:2589`) still keeps only
-  `Text`/`Thinking` in the flattened text, but `images_from_content`
-  (lib.rs:2606, OCEAN-177) projects `Content::Image` blocks to lightweight
-  `ImageMeta` (mime type, never the base64 data) so a session-detail view
-  records that an image was attached; the raw bytes remain in
-  `SessionDetail::messages`.
-
-ocean-acp permission forwarding — WIRED and functional (race fixed, OCEAN-146).
-  The per-turn ACP permission bridge (`spawn_permission_bridge`) watches the
-  daemon control stream, forwards each scoped `PermissionRequest` to the editor as
-  `session/request_permission`, and POSTs the decision back. Gating is real: the
-  daemon decides the mode per turn (`yolo_enabled()`, default GATED, OCEAN-51).
-  The old subscribe-order race is FIXED. `run_turn`
-  (`crates/ocean-acp/src/main.rs:710`) now subscribes the control stream BEFORE
-  submitting the turn (control stream connected at main.rs:742,
-  `spawn_permission_bridge` at main.rs:766, then `submit_turn` at main.rs:785;
-  the bridge itself is defined at main.rs:973), so the
-  bridge is listening before the daemon can emit the gated `PermissionRequest`.
-  Because the broadcast channel has no replay, this ordering is what makes
-  delivery work. The turn's `request_id` is learned from the event stream, not
-  from `submit_turn`'s (deadlock-prone) response.
-  OPERATOR IMPACT: in Zed today a gated Ocean tool call surfaces an editor-side
-  approval prompt — it no longer hangs.
-
-Room auto-convene — WIRED (a resolved mention now wakes the agent).
-  `room_post_message` evaluates the stored trigger policy
-  (`evaluate_trigger_policy`, called at `crates/ocean-daemon/src/main.rs:6450`)
-  on an `@mention`. When the policy says convene AND the mentioned id resolves to a real
-  `Agent` in the roster, the handler emits the `room_trigger` notice (main.rs:6487),
-  writes an `auto-convene:` audit line, and — crucially — calls
-  `spawn_room_agent_turn(...)` (main.rs:6517, defined at main.rs:6642), which
-  spawns an actual agent turn for the mentioned participant (resumes the
-  deterministic room+agent session, builds a transcript-tail prompt, runs it).
-  Note OCEAN-128: the `room_trigger` event and audit line only fire once an Agent
-  is actually resolved, so a mention of a non-agent id no longer claims a convene
-  that never happened. (OCEAN-111 / OCEAN-128.)
-  OPERATOR IMPACT: mentioning a room agent now actually wakes it; no agent-turn is
-  queued for human/bot/system or unknown mentions.
+TUI / CLI / ACP / Ocean Surface
+        |
+        | HTTP requests + session-scoped SSE
+        v
+  ocean-daemon (:4780)
+        |
+        +-- ocean-agent -------- sessions, prompt assembly, capabilities
+        |       |
+        |       +-- ocean-runtime ---- agent loop, tools, permissions, halt
+        |       +-- ocean-mcp -------- external MCP tools
+        |       +-- ocean-plugin ----- subprocess plugin tools
+        |       `-- ocean-hooks ------ hook protocol/config substrate
+        |
+        +-- ocean-providers ---------- model catalog, auth, readiness
+        +-- ocean-protocol ----------- provider requests/streams/retry
+        +-- ocean-store -------------- durable local rooms
+        +-- ocean-memory ------------- local typed memory
+        +-- ocean-longhouse ---------- council/quorum/title coordination
+        `-- ocean-browser/ocean-call - browser and optional call capabilities
 ```
 
-One related item is still partial and tracked in its own doc:
+The daemon composes these packages in-process. It does not shell out to another
+agent runtime. Clients do not call providers or execute tools themselves.
 
-- **Longhouse governance (quorum steps 6+)** — the convergence engine (steps
-  1–5) is built and tested. The unforgeable `claim_outcome` gate is now **built**
-  (OCEAN-229): the firekeeper title is minted server-side at convene time with an
-  unforgeable token (the OCEAN-185 decision-token primitive) and `claim_outcome`
-  verifies it in constant time, so a forged firekeeper that only names the public
-  firekeeper id cannot claim an outcome. The escrow trio is now **built**
-  (OCEAN-246, `crates/ocean-longhouse/src/escrow.rs`): a persisted
-  `SqliteTitleRegistry` (titles survive across turns; the secret token is never
-  stored — only a salted SHA-256 verifier), a separate `Revoker` principal
-  (graduated `Warned` strikes → hard `RoleRevoked`; a revoked title fails
-  `claim_outcome` even with the right token; revocation requires the Revoker's
-  own server-minted key so it can't be forged), and a validator escrow ledger
-  (stake → held → released-on-claim / forfeited-on-abort). The persisted
-  registry is now **wired onto the daemon's `AppState`** (OCEAN-272/302,
-  re-verified 2026-07-01): the daemon opens the titles DB at startup
-  (`crates/ocean-daemon/src/main.rs:1628`) and holds `titles` / `revoker` /
-  `recalls` on `AppState` (main.rs:1640-1642, fields at main.rs:96-110), with
-  live `/v1/longhouse/revoke` and `/v1/longhouse/recall` routes (quorum-of-recall
-  tallies distinct credentialed marks before the daemon's single `Revoker`
-  executes). Remaining follow-up: the staking *economics* (stake sizing,
-  forfeiture schedule) — the ledger mechanics exist, the policy is not designed.
-  See `docs/LONGHOUSE.md` § "Built vs unbuilt".
+## Authority and state ownership
 
-## API model
+| State or decision | Owner | Notes |
+| --- | --- | --- |
+| HTTP routes, middleware, live request registry, event buses, metrics, runtime composition | `ocean-daemon` | Long-running service and only first-party HTTP/SSE authority; cohesive private leaves are being extracted under the active daemon mission |
+| Product sessions, transcript/history persistence, workspace rebinding | `ocean-agent` | Shared by every client; no client-local session authority |
+| Provider rounds, tool execution, permission waits, cancellation | `ocean-runtime` | Receives capabilities assembled by `ocean-agent` |
+| Product session/turn/event wire vocabulary | `ocean-agent-sdk` | Used by daemon and first-party clients |
+| Lower-level daemon control/event vocabulary | `ocean-core` | Legacy/control paths and shared leaf types |
+| Provider request/stream encoding | `ocean-protocol` | Anthropic, OpenAI/Codex-compatible, and Gemini paths |
+| Model aliases, credentials, routing, readiness | `ocean-providers` | Separate from provider wire encoding |
+| Durable local rooms/rosters/transcripts | `ocean-store` | SQLite-backed daemon state |
+| Agent/operator memory rows | `ocean-memory` | Shared Bedrock knowledge remains external |
+| Quorum, councils, titles, escrow, recall/revocation | `ocean-longhouse` | Daemon still owns execution and permissions |
+| Product rendering and interaction | clients | TUI or sibling `ocean-surface`; no runtime authority |
 
-Clients do not directly run agents. They connect to the daemon. `ocean-tui` remains an active operator workbench: it steers turns, approvals, cancellation, sessions, and project surfaces through protocol calls instead of becoming a second runtime.
+## Product turn flow
+
+First-party surfaces create or select a session before steering it:
 
 ```text
-OceanTUI ─┐
-OceanGUI ─┼── HTTP/WebSocket/Unix socket ── ocean-daemon ── agent workers
-CLI      ─┘
+1. POST /v1/agent/sessions
+2. GET  /v1/agent/events?session_id=<id>
+3. POST /v1/agent/turns
+4. daemon binds session/cwd/model/profile and starts one runtime turn
+5. runtime emits text, tool, permission, component, and completion events
+6. daemon streams the session-scoped projection to attached clients
+7. ocean-agent persists the completed session/history
 ```
 
-## Core protocol target
+`AgentTurnRequest` is defined in `ocean-agent-sdk`. Its current optional controls
+include project binding, named agent selection, model/role, thinking level,
+images, permission decision token, client context, and advisor control. Read the
+type rather than copying its full field list into client documentation.
 
-Shared protocol types live in `crates/ocean-core` and cover:
+The lower-level `/v1/prompt`, `/v1/events`, request, permission, and legacy
+session routes remain compatibility/control surfaces. New product clients use
+the session-scoped agent API.
 
-- `RequestId`, `SessionId`, and `PermissionId`
-- `PromptRequest` / `PromptResponse`
-- `RequestState` / `RequestStatus`
-- `EventEnvelope` / `OceanEvent`
-- `PermissionDecision` / `PermissionDecisionRequest`
-- `CancelRequest`
-- `SessionSummary`
+## Session and workspace invariants
 
-The stream envelope is flat and carries request/session correlation at the top level:
+- A session has one daemon-owned transcript and persistence record.
+- A turn binds to a caller cwd/project under daemon policy; the daemon itself
+  runs from a neutral cwd so fallback cannot bind to this repository.
+- Same-session load → run → save is serialized to prevent transcript corruption.
+- Explicit resume and create behavior stay distinct; an unknown explicit session
+  must not silently fork.
+- Images remain in raw messages while lightweight session projections avoid
+  copying encoded image bytes.
+- Two clients share a conversation only by attaching to the same session id.
 
-```json
-{"id":"...","at":"...","session_id":"...","request_id":"...","type":"session_created"}
-{"id":"...","at":"...","session_id":"...","request_id":"...","type":"user_message","text":"..."}
-{"id":"...","at":"...","session_id":"...","request_id":"...","type":"assistant_delta","text":"..."}
-{"id":"...","at":"...","session_id":"...","request_id":"...","type":"tool_started","tool":"bash","args":{}}
-{"id":"...","at":"...","session_id":"...","request_id":"...","type":"tool_output","tool":"bash","text":"..."}
-{"id":"...","at":"...","session_id":"...","request_id":"...","type":"tool_ended","tool":"bash","is_error":false}
-{"id":"...","at":"...","session_id":"...","request_id":"...","permission_id":"...","type":"permission_request","tool":"write","reason":"...","args":{}}
-{"id":"...","at":"...","session_id":"...","request_id":"...","type":"turn_finished","ok":true,"wall_ms":12}
-{"id":"...","at":"...","request_id":"...","type":"cancelled","reason":"user cancelled"}
-{"id":"...","at":"...","type":"error","message":"..."}
-```
+See [`OCEAN_WORKSPACE_BINDING.md`](OCEAN_WORKSPACE_BINDING.md).
 
-Compatibility notes:
+## Tools, capabilities, and permissions
 
-- `GET /health` is unchanged.
-- `POST /v1/prompt` still accepts the legacy body; `request_id` is optional and responses may omit it for older callers.
-- `GET /v1/sessions` still emits `id`, and `ocean-core` also accepts `session_id` as a deserialize alias.
-- New event/session fields are additive; old clients can ignore them.
+`ocean-agent` assembles the capability registry for a turn from built-in
+runtime tools plus configured MCP and plugin providers. `ocean-runtime` exposes
+schemas to the selected model, executes calls, records results, and applies
+permission/cancellation policy.
 
+Mutating tools are gated by default. A client may carry a per-turn decision
+token so approvals cannot be replayed by an unrelated localhost observer.
+Trusted bypass modes are explicit operator choices; documentation and surfaces
+must never imply a silent allow.
+
+Unix shell commands run in a child-owned process group. Halt/timeout/drop kills
+the ordinary descendant tree before the direct child is reaped. Deliberately
+re-sessioned descendants and non-Unix tree termination are outside that
+contract.
+
+## Events and retention
+
+Live runtime events are delivered to the daemon for the active turn. The daemon
+maintains a replay buffer for reconnecting clients with two ceilings:
+
+- 2,048 retained events;
+- 32 MiB of serialized retained payload.
+
+An oversized event is still delivered live but is not retained for replay. This
+bounds replay memory without truncating the active stream. The per-turn
+runtime-to-daemon MPSC remains a separate live-queue design concern tracked in
+[`../ROADMAP.md`](../ROADMAP.md).
+
+## Profiles and named agents
+
+For ordinary surface turns, `ocean-agent` maps `client_type` to a surface flag
+and prefers an on-disk profile at `assistants/<FLAG>/system.md`, falling back to
+a compiled seed when no non-empty file resolves. `OCEAN_ASSISTANTS_DIR`
+overrides the default profile root. Profile content is owned by the sibling
+Ocean Agents repository.
+
+Named folder-as-agent turns use the agent folder selected by
+`AgentTurnRequest.agent`; discovery is exposed through `/v1/agents`. Runtime
+tool and permission enforcement remains in Ocean OS regardless of profile
+source.
+
+Known mismatch: Ocean Surface's Tauri host currently emits `surface-tauri`,
+which is not mapped by `ocean-agent::surface_flag`; see the project map and
+roadmap.
+
+## Other daemon domains
+
+The daemon also exposes current route families for:
+
+- models, projects, filesystem views, browser stream/input, memory, and LSP;
+- persistent rooms and independent LiveKit token minting;
+- render-protocol component events;
+- Longhouse/council, skills, subagent specs, and workflow preparation;
+- optional call placement/webhooks/demo and daemon-owned voice endpoints;
+- health, readiness, metrics, cancellation, and permission decisions.
+
+The canonical `app_router` currently registers 72 explicit method/path pairs. Executable parity tests keep router registration, discovery output, and the operator-guide quick reference synchronized while preserving Axum fallback behavior and tracing/CORS middleware order. CORS policy and turn metrics are private daemon leaves; composition remains in `main.rs`. The extended route reference is [`OCEAN_RUNTIME_OPERATOR_GUIDE.md`](OCEAN_RUNTIME_OPERATOR_GUIDE.md), and ongoing extraction boundaries live in [`DAEMON_REFACTOR_MISSION.md`](DAEMON_REFACTOR_MISSION.md).
+
+## Clients
+
+- `ocean-tui` is the active Ratatui coding cockpit. It steers the daemon and can render bounded render-protocol component projections; it is not another runtime. A shell-owned session component tray below Files derives run-local todo state only from successful correlated tool events, clears across turns/sessions, and marks incomplete projections when SSE gaps prevent trustworthy reconstruction.
+- `ocean-cli` builds the `ocean-rs` one-shot/control client.
+- `ocean-acp` maps editor sessions and permission requests to daemon contracts.
+- `ocean-heartbeat` is an external scheduler CLI that calls the daemon; it is
+  not in-daemon scheduling authority.
+- `ocean-surface` is a sibling repository containing the product web/PWA,
+  extension, proxy, and Tauri hosts.
+
+## Process and deployment boundary
+
+The supported operated daemon path on this Mac is a launchd LaunchAgent named
+`dev.risingtides.ocean-daemon`. `ops/install-ocean-daemon.sh` requires the `main` branch, builds release code, installs the plist, and starts the daemon with a neutral cwd. Cleanliness and synchronization with `origin/main` are operator preconditions enforced by the commands in `OPERATIONS.md`, not by the installer itself. A release binary copied or built from another branch is not a supported deploy.
+
+See [`OPERATIONS.md`](OPERATIONS.md) for the current commands and
+[`../crates/AGENTS.md`](../crates/AGENTS.md) for change-impact validation.
+
+## Deliberate non-claims
+
+Ocean OS does not currently claim:
+
+- sandbox-grade isolation beyond its documented permission/cwd/process controls;
+- bounded live per-turn MPSC memory;
+- runtime composition of Ocean Agents `_shared`/`_base` profile sources;
+- wired production execution of configured lifecycle hooks;
+- `surface-tauri` profile mapping;
+- shared cloud storage authority (Ocean Bedrock owns that plane).

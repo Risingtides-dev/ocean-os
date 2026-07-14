@@ -1,59 +1,48 @@
-# Ocean OS — bootstrap context
+# Ocean OS bootstrap
 
-**Read `AGENTS.md` first.** The `AGENTS.md` hierarchy is the cross-harness work contract for Claude, Codex, Pi, ocean-native agents, and every other runtime. This file is only a compact bootstrap pointer and never overrides that contract.
+**Read [`AGENTS.md`](AGENTS.md) first.** It is the binding cross-harness work
+contract. This file is only a compact orientation pointer.
 
-## System boundary
+## Current system boundary
 
-Ocean is a connected four-repo system. The canonical routing and ownership map is [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md):
+Ocean is four connected repositories with separate authorities:
 
-- runtime, daemon, tools, permissions, providers, sessions, TUI, ACP, MCP client → `ocean-os`;
-- GUI/web/PWA/browser/editor/voice/canvas surfaces → `ocean-surface`;
-- assistant packages, profiles, SOPs, couriers → `ocean-agents`;
-- shared files, context, handoffs, ledger, graph/search, Bedrock APIs → `ocean-bedrock`.
+- `ocean-os` — local runtime, daemon, providers, tools, permissions, sessions,
+  events, TUI, CLI, ACP, and local coordination primitives;
+- `ocean-surface` — the Leptos product UI and its browser, extension, proxy, and
+  Tauri shells;
+- `ocean-agents` — editable profiles, named specialist packages, and couriers;
+- `ocean-bedrock` — authenticated shared files, ledger, ingest, graph, and
+  semantic-search services.
 
-Do not maintain another repo inventory here. Read the target repo's `AGENTS.md` before editing it.
+Use [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md) before making a
+cross-repository claim.
 
 ## Runtime authority
 
-`ocean-daemon` is the local runtime/body. It owns provider calls, the agent loop, permission-gated tools, local sessions, and SSE events. Clients carry a `session_id` and steer the same daemon; they do not own independent session state.
+```text
+client -> ocean-daemon -> ocean-agent -> ocean-runtime -> provider/tool
+                     \-> session-scoped SSE -> client
+```
 
+The daemon owns execution. Clients carry intent and render state; they do not
+own provider calls, permissions, or session persistence. The product session
+flow is:
 
 ```text
-POST /v1/agent/turns    { prompt, cwd, session_id?, ... }
-GET  /v1/agent/events   session-scoped SSE
-GET  /health            daemon liveness
-
+POST /v1/agent/sessions
+GET  /v1/agent/events?session_id=<id>
+POST /v1/agent/turns
 ```
 
-Session persistence lives in `crates/ocean-agent`. A load/save/rebind bug there affects TUI and ocean-surface together.
+## Navigation
 
-Longhouse is the local-first coordination hive for SOPs, routines/workflows, tool/skill discovery, memory/knowledge, subagent specs, and councils. It coordinates and recommends; it never bypasses daemon execution or permission authority. Canonical reference: [`docs/LONGHOUSE.md`](docs/LONGHOUSE.md).
-
-## Workspace navigation
-
-The canonical index for all 25 workspace packages is [`crates/AGENTS.md`](crates/AGENTS.md). It records ownership, exclusions, entry points, local contracts, narrow tests, non-default-member rationale, and cross-crate fanout.
-
-Core flow:
-
-```text
-clients -> ocean-daemon -> ocean-agent -> ocean-runtime -> ocean-protocol/providers
-```
-
-## Build and run
-
-```bash
-cargo build --workspace --release
-./target/release/ocean-daemon
-curl -fsS http://127.0.0.1:4780/health
-./target/release/ocean-tui   # or: ocean
-```
-
-The supervised daemon runs from a neutral cwd, not the repo. After TUI changes, rebuild `cargo build -p ocean-tui --release` because the global `ocean` command points at that artifact.
-
-## Current work
-
-- Active code-health/agent-readiness program: [`docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md`](docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md)
+- Documentation index: [`docs/README.md`](docs/README.md)
 - Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- Operator guide: [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md)
-- Cross-repo routing: [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md)
-- Historical chronology: `events.md`
+- Operations: [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
+- Package index: [`crates/AGENTS.md`](crates/AGENTS.md)
+- Open work: [`ROADMAP.md`](ROADMAP.md)
+- Chronology: [`events.md`](events.md)
+
+Historical plans and handoffs are not current authority. Inspect source, Git
+state, and live health directly when the distinction matters.
