@@ -19509,6 +19509,167 @@ mod tests {
         assert_eq!(resp["dirs"].as_array().unwrap().len(), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_file_errors_preserve_uniform_envelope() {
+        let assert_uniform_error = |resp: &serde_json::Value| {
+            let obj = resp.as_object().expect("fs/file body is an object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["binary", "content", "error", "path", "size", "truncated"]
+            );
+            assert_eq!(resp["path"], "");
+            assert_eq!(resp["content"], "");
+            assert_eq!(resp["truncated"], false);
+            assert_eq!(resp["binary"], false);
+            assert_eq!(resp["size"], 0);
+            assert!(resp["error"].is_string());
+            assert!(resp.get("ok").is_none());
+        };
+
+        let under_home = home_tempdir();
+        let missing = under_home.path().join("missing.txt");
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery {
+            path: missing.to_string_lossy().to_string(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_uniform_error(&resp);
+        assert!(resp["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("path does not exist:"));
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
+        let outside_raw = outside_file.to_string_lossy().to_string();
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery {
+            path: outside_raw.clone(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_uniform_error(&resp);
+        assert_eq!(
+            resp["error"],
+            format!("access denied: {outside_raw} is outside home directory")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_dirs_preserves_home_boundary_and_error_contracts() {
+        let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+        let home_raw = home.to_string_lossy().to_string();
+        let (status, Json(resp)) = fs_dirs(Query(FsDirsQuery {
+            path: Some(home_raw.clone()),
+            files: None,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut keys: Vec<&str> = resp
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["dirs", "home", "ok", "parent", "path"]);
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["path"], home_raw);
+        assert_eq!(resp["home"], home_raw);
+        assert!(resp["parent"].is_null(), "HOME must not expose a parent");
+        assert!(resp["dirs"].is_array());
+        assert!(resp.get("files").is_none());
+
+        let missing = home.join(format!("ocean-fs-missing-{}", uuid::Uuid::new_v4()));
+        let (status, Json(resp)) = fs_dirs(Query(FsDirsQuery {
+            path: Some(missing.to_string_lossy().to_string()),
+            files: None,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.as_object().unwrap().len(), 2);
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("path does not exist:"));
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_raw = outside.path().to_string_lossy().to_string();
+        let (status, Json(resp)) = fs_dirs(Query(FsDirsQuery {
+            path: Some(outside_raw.clone()),
+            files: None,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp,
+            json!({
+                "ok": false,
+                "error": format!("access denied: {outside_raw} is outside home directory"),
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_endpoints_reject_symlink_escape_outside_home() {
+        use std::os::unix::fs::symlink;
+
+        let inside = home_tempdir();
+        let outside = tempfile::tempdir().unwrap();
+        let home_canon = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+        let outside_target = std::fs::canonicalize(outside.path()).unwrap();
+        assert!(
+            !path_is_under(
+                &outside_target.to_string_lossy(),
+                &home_canon.to_string_lossy()
+            ),
+            "test target must be outside HOME"
+        );
+
+        let dir_link = inside.path().join("outside-dir");
+        symlink(outside.path(), &dir_link).unwrap();
+        let dir_raw = dir_link.to_string_lossy().to_string();
+        let (status, Json(resp)) = fs_dirs(Query(FsDirsQuery {
+            path: Some(dir_raw.clone()),
+            files: None,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp,
+            json!({
+                "ok": false,
+                "error": format!("access denied: {dir_raw} is outside home directory"),
+            })
+        );
+
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
+        let file_link = inside.path().join("outside-file");
+        symlink(&outside_file, &file_link).unwrap();
+        let file_raw = file_link.to_string_lossy().to_string();
+        let (status, Json(resp)) = fs_file(Query(FsFileQuery {
+            path: file_raw.clone(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp,
+            json!({
+                "path": "",
+                "content": "",
+                "truncated": false,
+                "binary": false,
+                "size": 0,
+                "error": format!("access denied: {file_raw} is outside home directory"),
+            })
+        );
+    }
+
     // ---- Project create: mkdir-on-create ------------------------------------
 
     /// Creating a project with a workspace_root that doesn't exist yet succeeds

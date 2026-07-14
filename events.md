@@ -2979,3 +2979,13 @@ area:      [backend]: ocean-daemon Phase 2C security-sensitive settings leaf
 Moved the test-only env parser target, env preference parser, effective precedence resolver, inert-wire resolver, request body, and GET/POST settings adapters into private `src/yolo_settings.rs`. All seven definitions remain byte-identical to characterization commit `529e0ed` after normalizing only minimal parent visibility. Operator env → persisted preference → safe-off, explicit env-off masking, request-wire inertness, exact response shapes, persistence-before-resolution, permission and decision-token authority, call sites, voice fail-fast behavior, router/middleware, and shared YOLO-then-auto-convene lock order remain unchanged. Focused settings/precedence/wire/voice, agent, runtime, router, full 294-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed; fresh security review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [07:46pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [test]: characterize daemon filesystem sandbox before extraction
+area:      [backend]: ocean-daemon Phase 2C filesystem foundation
+
+Added three direct-handler tests for the home-sandboxed directory and file endpoints. They freeze canonicalization-based rejection of directory and file symlink escapes, the null-parent canonical HOME boundary, distinct missing/outside status codes, exact directory error bodies, and every key/default in the uniform no-`ok` file-error envelope. Existing tests continue pinning tilde expansion, separator-bounded containment, text/binary/cap/size behavior, sorting, hidden-directory and dotfile policy, git fields, and optional files omission. All nine filesystem tests, all three retained project-helper callers, five router contracts, all 297 daemon tests, formatting, docs, and diff checks pass from an isolated clean-main verification tree; concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
