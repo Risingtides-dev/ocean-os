@@ -440,7 +440,14 @@ UUID session for the launch project; `/new` explicitly starts clean.
 ## HTTP API quick reference
 
 Full daemon route table, read from `crates/ocean-daemon/src/main.rs` (the
-`Router::route()` calls). Grouped by concern:
+`Router::route()` calls). The daemon's route-contract test keeps this table and
+`GET /` discovery in exact parity with the assembled router:
+
+```bash
+cargo test -p ocean-daemon router_contract -- --nocapture
+```
+
+Grouped by concern:
 
 ```text
 # Liveness / observability
@@ -458,6 +465,12 @@ GET    /v1/agent/canvas/fulfill           query a stored canvas fulfillment ?ses
 POST   /v1/agent/sessions                 create a session before the first turn
 GET    /v1/agent/sessions                 list agent sessions
 GET    /v1/agent/sessions/{id}            agent session detail
+POST   /v1/agent/sessions/{id}/messages   append an out-of-turn user message to an existing session
+
+# Voice surface support
+POST   /v1/voice/realtime/client-secret   mint an ephemeral OpenAI Realtime client secret
+POST   /v1/voice/stt                      transcribe audio through xAI speech-to-text
+POST   /v1/voice/tts                      synthesize speech through xAI text-to-speech
 
 # Legacy / debug prompt + request API
 GET    /v1/events                         global SSE stream (debug/legacy)
@@ -488,6 +501,10 @@ POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join to
 GET    /v1/sessions                       list sessions
 GET    /v1/sessions/{id}                  session detail / transcript
 
+# Folder-as-agent definitions
+GET    /v1/agents                         list discoverable agent folders
+GET    /v1/agents/{name}                  resolve one agent folder
+
 # Projects (named directory-bound workspaces)
 GET    /v1/projects                       list registered projects
 POST   /v1/projects                       create a project bound to a directory
@@ -495,10 +512,20 @@ GET    /v1/projects/{id}                  project detail
 PATCH  /v1/projects/{id}                  update name and/or config (partial)
 DELETE /v1/projects/{id}                  delete a project (sessions become project-less)
 
+# Filesystem and browser surface support
+GET    /v1/fs/dirs                        list home-sandboxed directories
+GET    /v1/fs/file                        read a home-sandboxed file
+GET    /v1/browser/screencast             SSE stream of the agent browser's screencast
+POST   /v1/browser/input                  forward pointer/keyboard input to the agent browser
+
 # Model selection
 GET    /v1/model                          current provider/model
 POST   /v1/model                          set provider/model
 GET    /v1/models                         available models for a client picker
+
+# Memory and workspace intelligence
+GET    /v1/memory                         list retained long-term memories
+GET    /v1/lsp                            list language-server readiness for a workspace
 
 # Settings
 GET    /v1/settings/yolo                  read persisted + effective YOLO posture
@@ -522,6 +549,7 @@ POST   /v1/longhouse/board                append a note/evidence mark to a topic
 POST   /v1/longhouse/revoke               operator hard-pull of a live title { title_id, reason? }
 POST   /v1/longhouse/recall               cast a no-confidence vote in a seated firekeeper { topic_id, firekeeper_id, voter_id, threshold? }
 POST   /v1/longhouse/breach               report a policy breach, accruing a graduated strike { title_id, detail? }
+POST   /v1/workflows/prepare              select advisory workflow briefs for a turn
 
 # Calls (Twilio/LiveKit call-intelligence pipeline — ocean-call)
 POST   /v1/calls/demo                     scripted call-pipeline demo (fake transcript/events)
