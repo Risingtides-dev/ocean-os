@@ -623,10 +623,10 @@ fn yolo_env_pref() -> Option<bool> {
 ///      `POST /v1/settings/yolo`, survives restarts),
 ///   3. the built-in default: **off** (permission gating ON).
 ///
-/// The per-request `req.yolo` flag (a client opting INTO yolo for one turn)
-/// sits ABOVE this whole chain and is applied at the call site (`req.yolo ||
-/// effective_yolo()`), so an explicit per-request opt-in always wins while
-/// absence falls through to env → persisted → off.
+/// The legacy per-request `req.yolo` wire flag is deliberately ignored by
+/// [`resolve_request_yolo`]: an untrusted client cannot opt itself into the
+/// permission bypass. Every live call site resolves from operator policy only:
+/// env → persisted → off.
 ///
 /// Default-off is the safety invariant: nothing configured ⇒ gated. This
 /// function only decides whether tools auto-approve; it does NOT touch the
@@ -13970,6 +13970,99 @@ mod tests {
             "persisted false must overwrite the prior true"
         );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn yolo_settings_get_reports_persisted_effective_and_env_override() {
+        let _guard = yolo_env_guard_async().await;
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let prior_yolo = env::var("OCEAN_YOLO").ok();
+        let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
+        let tmp = std::env::temp_dir().join(format!("ocean-yolo-get-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", &tmp);
+        env::remove_var("OCEAN_YOLO");
+        ocean_agent::persist_yolo_pref(&tmp, true);
+
+        let Json(body) = yolo_setting_get().await;
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "persisted": true,
+                "effective": true,
+                "env_override": null,
+            })
+        );
+
+        env::set_var("OCEAN_YOLO", "0");
+        let Json(body) = yolo_setting_get().await;
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "persisted": true,
+                "effective": false,
+                "env_override": false,
+            })
+        );
+
+        match prior_yolo {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+        match prior_cfg {
+            Some(v) => env::set_var("OCEAN_CONFIG_DIR", v),
+            None => env::remove_var("OCEAN_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn yolo_settings_set_persists_before_resolving_effective_and_reports_mask() {
+        let _guard = yolo_env_guard_async().await;
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let prior_yolo = env::var("OCEAN_YOLO").ok();
+        let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
+        let tmp = std::env::temp_dir().join(format!("ocean-yolo-set-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", &tmp);
+        env::set_var("OCEAN_YOLO", "0");
+
+        let Json(body) = yolo_setting_set(Json(YoloSetRequest { enabled: true })).await;
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "persisted": true,
+                "effective": false,
+                "env_override": false,
+            })
+        );
+        assert_eq!(ocean_agent::load_yolo_pref(&tmp), Some(true));
+
+        env::remove_var("OCEAN_YOLO");
+        let Json(body) = yolo_setting_set(Json(YoloSetRequest { enabled: false })).await;
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "persisted": false,
+                "effective": false,
+                "env_override": null,
+            })
+        );
+        assert_eq!(ocean_agent::load_yolo_pref(&tmp), Some(false));
+
+        match prior_yolo {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+        match prior_cfg {
+            Some(v) => env::set_var("OCEAN_CONFIG_DIR", v),
+            None => env::remove_var("OCEAN_CONFIG_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

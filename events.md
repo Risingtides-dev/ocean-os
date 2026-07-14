@@ -2959,3 +2959,13 @@ area:      [backend]: ocean-daemon Phase 2C catalog leaf
 Moved `ModelSetRequest` and the GET current-model, GET model-list, and POST model-selection handlers into private `src/model_catalog.rs`, preserving all production bodies except minimal parent visibility. The retained full-shape characterization now compares the complete picker payload against the canonical owner under the established shared environment-lock order, freezing ordered IDs, labels, readiness values, and credential provenance; success/error shapes and no-mutation rejection remain pinned. Provider alias/routing/readiness/persistence authority, `/ready`, Longhouse filtering, roles/advisor, turn overrides, router/middleware, AppState, and all YOLO settings/locks remain unchanged. Focused catalog, provider, agent, router, daemon, workspace-test compilation, supported feature, formatting, docs, diff checks, and fresh re-review passed with no medium-or-higher issue. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [07:10pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [test]: characterize daemon YOLO settings before extraction
+area:      [backend]: ocean-daemon Phase 2C settings foundation
+
+Added direct GET/POST settings tests under the established YOLO-then-auto-convene environment-lock order. They freeze exact persisted/effective/env-override response values, nullable override fields, explicit env-off masking of persisted true, persistence-before-effective resolution, and persisted overwrite behavior. Corrected stale documentation that still implied an untrusted per-request wire flag could opt into YOLO; current and required behavior discards that flag and uses operator env → persisted preference → safe-off only. Focused settings, precedence, inert-wire, voice, router, and full 294-test daemon gates plus formatting, docs, and diff checks pass. Permission gates/tokens/call sites, concurrent ACP documentation, and the operator deploy plist remain unchanged.
+_________________________________________________________________________________
+_________________________________________________________________________________
