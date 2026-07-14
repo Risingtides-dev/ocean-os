@@ -19,6 +19,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 - When adding/removing/renaming a workspace package, update this index in the same change and verify it against `cargo metadata --no-deps --format-version=1`.
 - Keep entry points and narrow validation current; stale routing information is a correctness defect for agent work.
 - Agent turns are session/workspace scoped and do not carry a Track-0 `room_id`. Durable collaboration uses `RoomKey` and `/v1/rooms/persistent/*`; LiveKit token minting remains independent at `/v1/rooms/{room_id}/livekit-token`.
+- Subagent definitions and orchestration are extension-owned. Core crates may provide generic permission-gated execution/capability seams, but must not own named subagent roles, spawn/join policy, worker budgets, or orchestration schedulers.
 
 ## Workspace Package Index
 
@@ -37,7 +38,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 | `ocean-hashline` | File-hash-anchored surgical edits and stale recovery | General AST summarization or session persistence | `ocean-hashline/src/lib.rs`, `patcher.rs` | — | `cargo test -p ocean-hashline` |
 | `ocean-heartbeat` | Scheduled/routine CLI that calls the daemon | In-daemon scheduling authority | `ocean-heartbeat/src/main.rs` | — | `cargo test -p ocean-heartbeat` |
 | `ocean-hooks` | Plugin-agnostic subprocess lifecycle hooks | Plugin/MCP tool protocols | `ocean-hooks/src/lib.rs` | — | `cargo test -p ocean-hooks` |
-| `ocean-longhouse` | Quorum, council/convene, titles, escrow, recall/revocation, preparation | Daemon permission/execution authority | `ocean-longhouse/src/lib.rs`, `quorum.rs`, `escrow.rs` | — | `cargo test -p ocean-longhouse` |
+| `ocean-longhouse` | Quorum, council/convene, titles, escrow, recall/revocation, skills/workflow preparation, advisory spec assembly | Daemon execution authority; extension-owned subagent dispatch/orchestration | `ocean-longhouse/src/lib.rs`, `quorum.rs`, `escrow.rs` | — | `cargo test -p ocean-longhouse` |
 | `ocean-lsp` | Language-server clients, discovery, diagnostics ledger, `lsp` tool | General AST parsing or editor UI | `ocean-lsp/src/lib.rs`, `tool.rs` | `ocean-lsp/AGENTS.md` | `cargo test -p ocean-lsp` |
 | `ocean-mcp` | Client connections to external MCP servers and tool adapters | Ocean MCP server; subprocess plugins | `ocean-mcp/src/lib.rs`, `provider.rs` | — | `cargo test -p ocean-mcp` |
 | `ocean-memory` | Typed provenance-bearing SQLite memory and ingest | Session transcripts; shared Bedrock storage | `ocean-memory/src/lib.rs` | — | `cargo test -p ocean-memory` |

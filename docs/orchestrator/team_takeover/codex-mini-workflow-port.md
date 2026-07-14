@@ -55,9 +55,9 @@
 - **Workflow prepare endpoint**
   - Scope: `crates/ocean-daemon/src/main.rs`, `crates/ocean-longhouse`
   - Goal: documented `POST /v1/workflows/prepare` that ranks briefs and returns compact context, read-only/fail-open
-- **Subagent dispatch bridge design**
+- **Extension-owned worker dispatch bridge design**
   - Scope: docs only first
-  - Goal: define the boundary between Longhouse context prep and daemon-executed actions before any automation work
+  - Goal: define extension-owned orchestration over Longhouse advisory context and generic daemon permission/execution seams before any automation work
 
 ## Blockers
 

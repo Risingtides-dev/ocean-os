@@ -70,7 +70,7 @@ The `.claude/worktrees/` directory contains ~120 worktree directories for ticket
 
 The board shows 21 tickets in `todo`, 0 in `wip`. This is unusual — the factory should have fired at least one disjoint cluster. Either the factory ticks stopped after the last handoff wrote the E12 queue, or no agent was dispatched to fire them. The tickets span:
 - **P0 (daemon):** OCEAN-300 (graceful shutdown hang), OCEAN-301 (shutdown watchdog), OCEAN-302 (Revoker triggers)
-- **P1 (daemon/longhouse/surface/store):** OCEAN-303 (metrics), OCEAN-304 (concurrency cap), OCEAN-305 (subagent SPAWN), OCEAN-306 (reranker), OCEAN-307 (cursor channel), OCEAN-308 (SQLite compaction), OCEAN-309 (corruption tolerance)
+- **P1 (daemon/longhouse/surface/store):** OCEAN-303 (metrics), OCEAN-304 (concurrency cap), OCEAN-305 (superseded as a core spawn ticket; subagent dispatch is extension-owned), OCEAN-306 (reranker), OCEAN-307 (cursor channel), OCEAN-308 (SQLite compaction), OCEAN-309 (corruption tolerance)
 - **P2-P3:** OCEAN-310 through OCEAN-320 (quality, ACP, call, longhouse, surface)
 
 ---

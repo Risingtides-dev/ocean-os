@@ -35,6 +35,14 @@ GET  /v1/agent/events?session_id=<id>
 POST /v1/agent/turns
 ```
 
+Longhouse owns advisory preparation, workflow coordination, and council/quorum
+behavior without bypassing daemon execution or permissions. Product sessions
+remain in `ocean-agent`, local typed memory remains in `ocean-memory`, and shared
+knowledge remains in Ocean Bedrock.
+Subagent definitions, dispatch, lifecycle, and orchestration policy are
+extension-owned; core retains generic permission-gated execution and extension
+seams rather than a competing orchestration authority.
+
 ## Navigation
 
 - Documentation index: [`docs/README.md`](docs/README.md)

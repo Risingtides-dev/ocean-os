@@ -5,7 +5,7 @@ description: Discover verified, ticketable improvements across the Ocean ecosyst
 
 # Workflow: Ocean OS Refinement Wave
 
-This is the Ocean-native discovery/refinement workflow for finding the next real work in Ocean OS without relying on external workflow files. The Ocean agent runs it through normal daemon tools. Longhouse may recommend divisions, skills, or subagent specs; it does not execute local side effects.
+This is the Ocean-native discovery/refinement workflow for finding the next real work in Ocean OS without relying on external workflow files. The Ocean agent runs it through normal daemon tools. Longhouse may recommend divisions, skills, or extension briefs; it does not dispatch general subagents or execute local side effects.
 
 ## Identity
 
@@ -55,8 +55,8 @@ Pick 3–6 divisions based on current system risk. Default set:
    - `crates/ocean-daemon`, `crates/ocean-runtime`, session/event flows, permissions, cancellation.
 2. **Protocol parity**
    - daemon SDK/core types vs web/native/ACP/Slack/voice consumers.
-3. **Longhouse / workflow / subagent readiness**
-   - `crates/ocean-longhouse`, prep hook, skills, workflow briefs, subagent specs, council tooling.
+3. **Longhouse / workflow / extension readiness**
+   - `crates/ocean-longhouse`, prep hook, skills, workflow briefs, advisory specs, council tooling, and installed extension availability.
 4. **Surface completion**
    - `../ocean-surface`, GUI/PWA/voice/canvas/client state.
 5. **Docs vs code**

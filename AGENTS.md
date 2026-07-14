@@ -40,6 +40,7 @@ Use `crates/AGENTS.md` for all 25 workspace packages, ownership exclusions, entr
 - The active behavior-neutral daemon refactor is governed by `docs/DAEMON_REFACTOR_MISSION.md` and the supporting code-health plan under `docs/specs/`.
 - Optimize for cold-agent discoverability: ownership, entry point, critical invariant, and narrow validation must remain findable from the root, `docs/README.md`, and `crates/AGENTS.md`.
 - Behavior-neutral extraction requires a written extraction manifest and must not bundle redesign, protocol changes, renames, or opportunistic fixes.
+- Subagent definitions, dispatch, lifecycle, and orchestration policy are extension-owned. Do not add a core daemon/runtime `task`, `spawn_worker`, fleet scheduler, or named-subagent runtime; core may expose only generic permission-gated execution, cancellation, capability-provider, and extension event/tool seams. Existing core subagent-shaped metadata/spec routes are compatibility surfaces pending a separately approved extension migration.
 - Once the operator explicitly authorizes an ongoing program, continue through safe approved checkpoints without repeated approval prompts. Close each bounded change with verification, review, commit, upstream reconciliation, and a clean tree; pause only for a concrete blocker or required design decision.
 - Minimum supported Rust is 1.88, enforced by the MSRV lane; do not lower it without pinning the resolved dependency graph and proving every supported feature.
 - Build: `cargo build --workspace --release`.

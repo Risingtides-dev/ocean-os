@@ -17,6 +17,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - HTTP turn routes must resolve effective cwd from client cwd/project metadata and must never fall back to daemon process cwd.
 - Do not bypass runtime permission gates from daemon route code.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
+- Subagent roles, dispatch, lifecycle, and orchestration are extension-owned. Do not add daemon-native `task`/`spawn_worker`/fleet machinery. The daemon may expose generic permission-gated turn, cancellation, capability-provider, and extension event/tool seams; current `/v1/subagents/spec` and folder-agent subagent metadata remain compatibility surfaces until a separately approved extension migration.
 - Agent SSE replay is globally bounded by both 2,048 events and 32 MiB of serialized event payload. Oldest envelopes evict until both limits hold; an individually oversized event remains live but is not replay-retained. Preserve full live delivery and the existing explicit subscriber-lag signal.
 - Build provenance must follow normal branch commits and linked worktrees: `build.rs` watches Git `HEAD`, its resolved symbolic branch ref, and `packed-refs`; `/health` and `/ready` must report the exact main-built revision after deployment.
 - `AgentEvent::TurnCheckpoint` is an internal persistence signal consumed by `ocean-agent`; daemon bridges must filter it rather than exposing transcript deltas on SSE.

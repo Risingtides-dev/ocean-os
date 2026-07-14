@@ -6,6 +6,8 @@ gate it through review, land it, and keep every ledger truthful. The factory's
 product is not commits; it is **verified, reviewed, ledger-tracked improvements
 to the live system**.
 
+This orchestrator is an installed extension, not an Ocean core subsystem. Without that extension, use this document as a manual/advisory operating goal; daemon/runtime/Longhouse do not dispatch workers.
+
 ## Scope
 
 Three repos, one system:

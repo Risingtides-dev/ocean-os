@@ -113,7 +113,7 @@ Ocean remembers *how to do things* — not just facts.
 
 ## 6. Agent Team Memory (Multi-Agent)
 
-If Ocean spawns sub-agents (Flux, Pixel, Brick, etc.), they should share memory:
+If an Ocean extension spawns sub-agents (Flux, Pixel, Brick, etc.), they should share memory through generic provenance-bearing interfaces:
 
 | Feature | Description | Priority |
 |---|---|---|

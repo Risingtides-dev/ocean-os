@@ -526,7 +526,7 @@ POST   /v1/council/convene                alias of /v1/longhouse/convene (same h
 POST   /v1/longhouse/prepare              read-only pre-turn prep: compact skill briefs (advisory, no gate bypass)
 POST   /v1/skills/query                   skill-librarian prefilter: rank skills for an intent (advisory, read-only)
 POST   /v1/skills/fetch                   skill-librarian fetch: one skill's full body by id (advisory, read-only)
-POST   /v1/subagents/spec                 assemble a subagent spec from skills + defaults (advisory, returns a spec; no spawn)
+POST   /v1/subagents/spec                 compatibility: assemble advisory spec only (no spawn; extension migration pending)
 GET    /v1/longhouse/topics               list longhouse topics
 GET    /v1/longhouse/topics/{topic_id}    longhouse topic detail
 POST   /v1/longhouse/claim                ratify a converged outcome against the title registry { title_id, agent_id, token, decision }
