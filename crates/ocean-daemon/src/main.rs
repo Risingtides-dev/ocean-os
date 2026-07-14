@@ -95,6 +95,8 @@ mod cors;
 mod event_adapter;
 /// In-process turn counters, Prometheus rendering, and in-flight RAII guard.
 mod metrics;
+/// Model catalog, current-selection, and persisted-selection HTTP adapters.
+mod model_catalog;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
 /// pure pieces behind `POST /v1/voice/realtime/client-secret`.
 mod voice_realtime;
@@ -107,12 +109,15 @@ use browser_stream::{input as browser_input, screencast_stream as browser_screen
 use cors::{cors_layer, parse_allowed_origins};
 use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use metrics::{InFlightGuard, TurnMetrics};
+use model_catalog::{model_get, model_set, models_list};
 use workspace_policy::{resolve_bound_cwd, session_detail_scope_check};
 
 #[cfg(test)]
 use axum::http::Method;
 #[cfg(test)]
 use metrics::{labelled_value, metric_value};
+#[cfg(test)]
+use model_catalog::ModelSetRequest;
 
 #[derive(Clone)]
 struct AppState {
@@ -2243,37 +2248,6 @@ async fn sessions(
         })),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ModelSetRequest {
-    model: String,
-}
-
-async fn model_get(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (provider, model) = state.runtime.current_model();
-    Json(json!({"ok": true, "provider": provider, "model": model}))
-}
-
-/// List the models the daemon can route to, plus the currently selected one,
-/// for a client model picker.
-async fn models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (provider, model) = state.runtime.current_model();
-    // Per-model readiness (credential visible to THIS daemon process) so a
-    // picker can tell the menu apart from what's actually selectable. Additive:
-    // entries keep id/provider/label top-level and gain ready/credential_source.
-    // Auth-file reads are blocking I/O, so they ride spawn_blocking.
-    let models = tokio::task::spawn_blocking(|| {
-        let env = ocean_agent::ProviderEnv::from_process();
-        ocean_agent::known_models_with_readiness(&env)
-    })
-    .await
-    .unwrap_or_default();
-    Json(json!({
-        "ok": true,
-        "current": { "provider": provider, "model": model },
-        "models": models,
-    }))
 }
 
 /// `GET /v1/memory` — the operator's retained long-term memories (from the
@@ -6364,19 +6338,6 @@ async fn room_events(
             )
         }
         Err(e) => room_store_error_response(e),
-    }
-}
-
-async fn model_set(
-    State(state): State<AppState>,
-    Json(req): Json<ModelSetRequest>,
-) -> Json<serde_json::Value> {
-    match state.runtime.set_model(&req.model) {
-        Ok((provider, model)) => {
-            tracing::info!(provider, model, "model swapped");
-            Json(json!({"ok": true, "provider": provider, "model": model}))
-        }
-        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
 }
 
@@ -13351,10 +13312,20 @@ mod tests {
 
     #[tokio::test]
     async fn model_catalog_list_preserves_picker_shape_and_readiness_fields() {
+        let _guard = yolo_env_guard_async().await;
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let state = permission_test_state();
         let (provider, model) = state.runtime.current_model();
 
         let Json(body) = models_list(State(state)).await;
+        let expected_models = tokio::task::spawn_blocking(|| {
+            let env = ocean_agent::ProviderEnv::from_process();
+            ocean_agent::known_models_with_readiness(&env)
+        })
+        .await
+        .expect("canonical picker catalog task must join");
+        let expected_models =
+            serde_json::to_value(expected_models).expect("canonical picker catalog must serialize");
         let top = body
             .as_object()
             .expect("model list response must be an object");
@@ -13365,6 +13336,11 @@ mod tests {
             Some(&json!({"provider": provider, "model": model}))
         );
 
+        assert_eq!(
+            top.get("models"),
+            Some(&expected_models),
+            "daemon picker ordering, ids, labels, readiness, and credential provenance must match the canonical owner"
+        );
         let models = top
             .get("models")
             .and_then(serde_json::Value::as_array)

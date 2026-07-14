@@ -1,9 +1,9 @@
 # Ocean Daemon Model Catalog Extraction Manifest
 
 **Date:** 2026-07-14
-**Status:** Characterization complete; extraction, full validation, and review pending
+**Status:** Complete; characterization, focused/full/feature validation, and independent review passed
 **Owner:** Ocean OS
-**Rollback point:** `6d13d82`
+**Rollback point:** `5a89c1a`
 
 ## Purpose
 
@@ -111,9 +111,9 @@ An independent reviewer must compare all four moved production bodies against th
 
 Four direct-handler tests now freeze the get/list/set response contracts before ownership moves. The focused catalog tests, all five router-contract tests, all 292 daemon tests, formatting, documentation, and diff checks pass at the characterization point.
 
-## Planned result
+## Result
 
-A private `model_catalog.rs` owns only the model get/list/set HTTP adapters. The parent keeps full-router characterization tests and composition; provider owners keep routing/readiness/persistence authority; YOLO settings remain a separate security-sensitive checkpoint.
+A private `model_catalog.rs` now owns only the model get/list/set HTTP adapters. All four production definitions are unchanged from characterization commit `5a89c1a` except for minimal `pub(super)` visibility. The parent keeps full-shape characterization tests and composition; the list test compares the complete serialized result against the canonical owner under the established shared environment-lock order, freezing ordering, IDs, labels, readiness values, and credential provenance. Provider owners retain routing/readiness/persistence authority; `/ready`, domain/turn model policy, and YOLO settings remain untouched. Focused catalog, provider, agent, router, daemon, workspace-test compilation, both supported feature, formatting, documentation, and diff checks passed. Independent review's initial characterization finding was fixed and fresh re-review found no unresolved medium-or-higher issue.
 
 ## Rollback
 

@@ -2949,3 +2949,13 @@ area:      [backend]: ocean-daemon Phase 2C catalog foundation
 Added four direct-handler contract tests before moving model catalog ownership. The tests freeze exact get/list/set top-level JSON keys, current provider/model projection, flat ordered readiness-entry fields, successful selection mutation, invalid-selection error shape, and no mutation on rejection. The characterization reuses the existing broad AppState fixture and will remain in composition rather than introducing a test-only substate. Focused catalog tests, router contracts, the full 292-test daemon suite, formatting, docs, and diff checks pass. Provider routing, readiness, persistence, `/ready`, roles, Longhouse filtering, YOLO settings, concurrent ACP documentation, and the operator deploy plist remain unchanged.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [07:04pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: extract daemon model catalog adapters intact
+area:      [backend]: ocean-daemon Phase 2C catalog leaf
+
+Moved `ModelSetRequest` and the GET current-model, GET model-list, and POST model-selection handlers into private `src/model_catalog.rs`, preserving all production bodies except minimal parent visibility. The retained full-shape characterization now compares the complete picker payload against the canonical owner under the established shared environment-lock order, freezing ordered IDs, labels, readiness values, and credential provenance; success/error shapes and no-mutation rejection remain pinned. Provider alias/routing/readiness/persistence authority, `/ready`, Longhouse filtering, roles/advisor, turn overrides, router/middleware, AppState, and all YOLO settings/locks remain unchanged. Focused catalog, provider, agent, router, daemon, workspace-test compilation, supported feature, formatting, docs, diff checks, and fresh re-review passed with no medium-or-higher issue. Concurrent ACP documentation and the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
