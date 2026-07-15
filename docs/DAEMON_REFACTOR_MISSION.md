@@ -71,14 +71,15 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Slack Canvas host fulfillment | Complete | Private `src/slack_canvas_fulfillment.rs`; host ingress/query store, runtime lookup, fulfilled SSE re-emit, TTL/cap, and coupled GC moved together; external Slack transport remains extension-owned |
 | Component interaction fulfillment | Complete | Private `src/component_interaction.rs`; exact HTTP validation, scoped runtime-registry lookup, remove-before-send delivery, and 200/400/404/410/500 envelopes frozen by five direct tests |
 | Model roles | Complete | Private `src/model_roles.rs`; once-at-startup fail-open config loading plus exact turn/advisor precedence and verbatim string behavior frozen by focused tests |
-| Persistent rooms, Longhouse, calls, registries | Later domain waves | One reviewed domain at a time |
+| Request/permission control records | Ready for publication | Private `src/request_control.rs`; local characterization, extraction, dedicated-target gates, and fresh reviews passed; policy, token verification, HTTP/events, GC scheduling, and shutdown drain stay in composition; push, hosted CI, merge, and deployment remain |
+| Persistent rooms, Longhouse, calls, remaining registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
-At this checkpoint, `main.rs` is approximately 19.8k lines after concurrent Voice Planner coverage landed, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model catalog and roles, security-sensitive YOLO settings, the home-sandboxed filesystem surface, project-registry adapters, Slack Canvas host fulfillment, and component-interaction fulfillment now independently owned. The model-role module owns only immutable startup loading and pure precedence; `AppState`, warnings, provider routing/readiness, persisted selection, and advisor execution remain composition/owner controlled. Characterization tests deliberately keep checked contracts visible even when they increase raw line count.
+At this checkpoint, `main.rs` is approximately 20.1k lines after concurrent Voice Planner coverage and the expanded request-lifecycle characterization suite landed. CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model catalog and roles, security-sensitive YOLO settings, the home-sandboxed filesystem surface, project-registry adapters, Slack Canvas host fulfillment, component-interaction fulfillment, and request/permission control records now have independent private owners. The 238-line request-control module owns storage mechanics and exact bounded transitions only; `AppState`, permission policy, token verification, HTTP/event orchestration, GC scheduling, active-turn projection, and shutdown draining remain in composition. Characterization tests deliberately keep checked contracts visible even when they increase raw line count.
 
 ## Course from here
 
-1. Move one state registry or control-plane domain at a time before turn/SSE orchestration.
+1. Move one remaining state registry or control-plane domain at a time before turn/SSE orchestration.
 2. Keep filesystem/project policy, permission authority, settings policy, host/extension ownership, and call-site orchestration fixed while domain boundaries move.
 3. Move persistent rooms, Longhouse, and calls only with explicit lifecycle/persistence manifests.
 4. Move turn/SSE orchestration last.
@@ -113,5 +114,6 @@ A wave is complete only when:
 - [Slack Canvas host-fulfillment extraction manifest](specs/2026-07-14-ocean-daemon-canvas-bridge-extraction-manifest.md)
 - [Component-interaction extraction manifest](specs/2026-07-15-ocean-daemon-component-interaction-extraction-manifest.md)
 - [Model-roles extraction manifest](specs/2026-07-15-ocean-daemon-model-roles-extraction-manifest.md)
+- [Request-control extraction manifest](specs/2026-07-15-ocean-daemon-request-control-extraction-manifest.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)
