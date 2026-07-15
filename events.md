@@ -2999,3 +2999,13 @@ area:      [backend]: ocean-daemon Phase 2C filesystem leaf
 Moved tilde/canonicalization/containment helpers, endpoint-specific resolution errors, directory and file queries/handlers, content caps, capped reading, and the file-error envelope into private `src/filesystem.rs`. Every moved definition remains byte-identical to characterization commit `b7a7aeb` after normalizing only minimal parent visibility. Canonicalization-before-containment, symlink-escape and sibling-prefix rejection, exact statuses/errors/shapes, optional files, sorting, hidden/dotfile policy, git fields, true size, 512-KiB cap, 8-KiB NUL sniff, lossy UTF-8, and synchronous handler boundaries remain unchanged. Router/banner/middleware and shared query parsing stay in composition; project CRUD retains the same imported tilde/canonicalization calls. Focused filesystem/project, agent, router, full 297-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed from clean main; fresh security review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [08:08pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [test]: characterize daemon project registry before extraction
+area:      [backend]: ocean-daemon Phase 2C project foundation
+
+Added five direct-handler tests covering the project list, create, get, patch, and delete adapters before ownership moves. They freeze sequential git enrichment and failure fallbacks, persistence-error list shape, exact workspace-session association and fail-open session listing, un-enriched detail, partial-update identity/root/config/created-time preservation with runtime-stamped updates, delete-without-session-deletion, tilde/canonical create payloads with equal initial timestamps, and success/not-found/path/persistence response contracts. Existing pagination, create-path, and worktree-parser coverage remains intact. Focused project tests, all five router contracts, all 302 daemon tests, formatting, docs, and diff checks pass from isolated clean main; runtime persistence, cwd/project turn resolution, filesystem policy, concurrent ACP and agent/CLI/core/protocol/runtime work, and the operator deploy plist remain unchanged.
+_________________________________________________________________________________
+_________________________________________________________________________________

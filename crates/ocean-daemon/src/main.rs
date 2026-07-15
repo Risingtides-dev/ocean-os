@@ -19335,6 +19335,396 @@ mod tests {
         );
     }
 
+    // ---- Project registry handlers -----------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projects_list_preserves_git_enrichment_and_failure_fallbacks() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let git_init = std::process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(&repo_root)
+            .output()
+            .unwrap();
+        assert!(
+            git_init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&git_init.stderr)
+        );
+
+        let repo_root = std::fs::canonicalize(repo_root).unwrap();
+
+        let broken_root = tmp.path().join("broken-repo");
+        std::fs::create_dir_all(broken_root.join(".git")).unwrap();
+        std::fs::write(broken_root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let good = Project {
+            id: uuid::Uuid::new_v4(),
+            name: "good-repo".into(),
+            workspace_root: repo_root.to_string_lossy().to_string(),
+            config: ProjectConfig::default(),
+            created_ms: 2000,
+            updated_ms: 2000,
+        };
+        let broken = Project {
+            id: uuid::Uuid::new_v4(),
+            name: "broken-repo".into(),
+            workspace_root: broken_root.to_string_lossy().to_string(),
+            config: ProjectConfig::default(),
+            created_ms: 1000,
+            updated_ms: 1000,
+        };
+        state.runtime.upsert_project(good.clone(), 2000).unwrap();
+        state.runtime.upsert_project(broken.clone(), 1000).unwrap();
+
+        let (status, Json(resp)) = projects_list(
+            State(state.clone()),
+            Query(ProjectsListQuery {
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut top_keys: Vec<&str> = resp
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        top_keys.sort_unstable();
+        assert_eq!(top_keys, vec!["has_more", "next_cursor", "ok", "projects"]);
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["has_more"], false);
+        assert!(resp["next_cursor"].is_null());
+
+        let projects = resp["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 2);
+
+        let mut expected_good = serde_json::to_value(&good).unwrap();
+        expected_good["git_branch"] = json!("main");
+        expected_good["git_dirty"] = json!(false);
+        expected_good["worktrees"] = json!([]);
+        assert_eq!(
+            projects[0], expected_good,
+            "live git fields are additive and the project root worktree is excluded"
+        );
+
+        let mut expected_broken = serde_json::to_value(&broken).unwrap();
+        expected_broken["git_branch"] = json!("main");
+        expected_broken["git_dirty"] = serde_json::Value::Null;
+        expected_broken["worktrees"] = json!([]);
+        assert_eq!(
+            projects[1], expected_broken,
+            "git subprocess failures degrade to null/empty enrichment"
+        );
+
+        std::fs::write(tmp.path().join("projects.json"), "{ malformed").unwrap();
+        let (status, Json(resp)) = projects_list(
+            State(state),
+            Query(ProjectsListQuery {
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp["ok"], false);
+        assert_eq!(resp["projects"], json!([]));
+        assert!(resp["error"].as_str().unwrap().contains("parse"));
+        assert!(resp["next_cursor"].is_null());
+        assert_eq!(resp["has_more"], false);
+        assert_eq!(resp.as_object().unwrap().len(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_get_preserves_workspace_session_association_and_response_contracts() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let project = Project {
+            id: uuid::Uuid::new_v4(),
+            name: "workspace-project".into(),
+            workspace_root: workspace.clone(),
+            config: ProjectConfig::default(),
+            created_ms: 1000,
+            updated_ms: 1000,
+        };
+        let project = state.runtime.upsert_project(project, 1000).unwrap();
+        let (session_id, _, _) = state.runtime.create_session(&workspace, None).unwrap();
+
+        let (status, Json(resp)) = project_get(State(state.clone()), Path(project.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut keys: Vec<&str> = resp
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["ok", "project", "sessions"]);
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["project"], serde_json::to_value(&project).unwrap());
+        let sessions = resp["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["id"], session_id.to_string());
+        assert!(resp["project"].get("git_branch").is_none());
+
+        // A session-store listing failure is deliberately fail-open for project
+        // detail: the project still returns 200 with an empty sessions array.
+        std::fs::remove_dir_all(tmp.path().join("sessions")).unwrap();
+        std::fs::write(tmp.path().join("sessions"), "not a directory").unwrap();
+        let (status, Json(resp)) = project_get(State(state.clone()), Path(project.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["project"], serde_json::to_value(&project).unwrap());
+        assert_eq!(resp["sessions"], json!([]));
+
+        let unknown = uuid::Uuid::new_v4();
+        let (status, Json(resp)) = project_get(State(state.clone()), Path(unknown)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp,
+            json!({"ok": false, "error": format!("unknown project {unknown}")})
+        );
+
+        std::fs::write(tmp.path().join("projects.json"), "{ malformed").unwrap();
+        let (status, Json(resp)) = project_get(State(state), Path(project.id)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.as_object().unwrap().len(), 2);
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().unwrap().contains("parse"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_patch_preserves_partial_fields_identity_and_timestamps() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let original_config = ProjectConfig {
+            default_model: Some("fake-ok".into()),
+            allowed_tools: Some(vec!["read".into()]),
+        };
+        let project = Project {
+            id: uuid::Uuid::new_v4(),
+            name: "before".into(),
+            workspace_root: "/workspace/immutable".into(),
+            config: original_config.clone(),
+            created_ms: 1000,
+            updated_ms: 1000,
+        };
+        let project = state.runtime.upsert_project(project, 1000).unwrap();
+
+        let (status, Json(resp)) = project_patch(
+            State(state.clone()),
+            Path(project.id),
+            Json(PatchProjectRequest {
+                name: Some("after".into()),
+                config: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+        let renamed = resp.project.unwrap();
+        assert_eq!(renamed.id, project.id);
+        assert_eq!(renamed.name, "after");
+        assert_eq!(renamed.workspace_root, project.workspace_root);
+        assert_eq!(renamed.config, original_config);
+        assert_eq!(renamed.created_ms, project.created_ms);
+        assert!(renamed.updated_ms > project.updated_ms);
+
+        let replacement_config = ProjectConfig {
+            default_model: Some("anthropic/claude-sonnet-4".into()),
+            allowed_tools: None,
+        };
+        let (status, Json(resp)) = project_patch(
+            State(state.clone()),
+            Path(project.id),
+            Json(PatchProjectRequest {
+                name: None,
+                config: Some(replacement_config.clone()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let reconfigured = resp.project.unwrap();
+        assert_eq!(reconfigured.name, "after", "omitted name is preserved");
+        assert_eq!(reconfigured.config, replacement_config);
+        assert_eq!(reconfigured.id, project.id);
+        assert_eq!(reconfigured.workspace_root, project.workspace_root);
+        assert_eq!(reconfigured.created_ms, project.created_ms);
+
+        let unknown = uuid::Uuid::new_v4();
+        let (status, Json(resp)) = project_patch(
+            State(state.clone()),
+            Path(unknown),
+            Json(PatchProjectRequest {
+                name: None,
+                config: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!resp.ok);
+        assert!(resp.project.is_none());
+        assert_eq!(resp.error, Some(format!("unknown project {unknown}")));
+
+        std::fs::write(tmp.path().join("projects.json"), "{ malformed").unwrap();
+        let (status, Json(resp)) = project_patch(
+            State(state),
+            Path(project.id),
+            Json(PatchProjectRequest {
+                name: None,
+                config: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!resp.ok);
+        assert!(resp.project.is_none());
+        assert!(resp.error.unwrap().contains("parse"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_delete_preserves_sessions_and_response_contracts() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let workspace = tmp.path().join("delete-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let project = Project {
+            id: uuid::Uuid::new_v4(),
+            name: "delete-me".into(),
+            workspace_root: workspace.clone(),
+            config: ProjectConfig::default(),
+            created_ms: 1000,
+            updated_ms: 1000,
+        };
+        let project = state.runtime.upsert_project(project, 1000).unwrap();
+        let (session_id, _, _) = state.runtime.create_session(&workspace, None).unwrap();
+
+        let (status, Json(resp)) = project_delete(State(state.clone()), Path(project.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp, json!({"ok": true}));
+        assert!(state.runtime.find_project(project.id).unwrap().is_none());
+        let sessions = state.runtime.list_sessions(Some(&workspace)).unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "delete must not remove workspace sessions"
+        );
+        assert_eq!(sessions[0].id, session_id);
+
+        let (status, Json(resp)) = project_delete(State(state.clone()), Path(project.id)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp,
+            json!({"ok": false, "error": format!("unknown project {}", project.id)})
+        );
+
+        std::fs::write(tmp.path().join("projects.json"), "{ malformed").unwrap();
+        let (status, Json(resp)) = project_delete(State(state), Path(uuid::Uuid::new_v4())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.as_object().unwrap().len(), 2);
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().unwrap().contains("parse"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_create_preserves_payload_timestamps_and_error_contracts() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let home_dir = home_tempdir();
+        let home_name = home_dir.path().file_name().unwrap().to_string_lossy();
+        let requested = format!("~/{home_name}/created-project");
+        let config = ProjectConfig {
+            default_model: Some("fake-ok".into()),
+            allowed_tools: Some(vec!["read".into(), "glob".into()]),
+        };
+
+        let (status, Json(resp)) = project_create(
+            State(state.clone()),
+            Json(CreateProjectRequest {
+                name: "payload-project".into(),
+                workspace_root: requested,
+                config: config.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+        let created = resp.project.unwrap();
+        assert_eq!(created.name, "payload-project");
+        assert_eq!(created.config, config);
+        assert_eq!(created.created_ms, created.updated_ms);
+        assert!(created.created_ms > 0);
+        assert_eq!(
+            created.workspace_root,
+            std::fs::canonicalize(home_dir.path().join("created-project"))
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        let blocker = tmp.path().join("not-a-directory");
+        std::fs::write(&blocker, "file").unwrap();
+        let (status, Json(resp)) = project_create(
+            State(state.clone()),
+            Json(CreateProjectRequest {
+                name: "mkdir-failure".into(),
+                workspace_root: blocker.join("child").to_string_lossy().to_string(),
+                config: ProjectConfig::default(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!resp.ok);
+        assert!(resp.project.is_none());
+        assert!(resp
+            .error
+            .unwrap()
+            .starts_with("cannot create workspace directory:"));
+        assert_eq!(state.runtime.list_projects().unwrap().len(), 1);
+
+        std::fs::write(tmp.path().join("projects.json"), "{ malformed").unwrap();
+        let (status, Json(resp)) = project_create(
+            State(state),
+            Json(CreateProjectRequest {
+                name: "persist-failure".into(),
+                workspace_root: String::new(),
+                config: ProjectConfig::default(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!resp.ok);
+        assert!(resp.project.is_none());
+        assert!(resp.error.unwrap().contains("parse"));
+    }
+
     // ---- Project create: mkdir-on-create ------------------------------------
 
     /// Creating a project with a workspace_root that doesn't exist yet succeeds

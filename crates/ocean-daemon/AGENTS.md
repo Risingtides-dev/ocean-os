@@ -39,6 +39,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon fs_ -- --nocapture`
 - `cargo test -p ocean-daemon metrics::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon model_catalog_ -- --nocapture`
+- `cargo test -p ocean-daemon project -- --nocapture`
 - `cargo test -p ocean-daemon workspace_policy::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon yolo_settings_ -- --nocapture`
 - `cargo test -p ocean-daemon router_contract -- --nocapture`
