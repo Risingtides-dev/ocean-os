@@ -3111,3 +3111,13 @@ area:      [backend]: ocean-daemon Phase 2C stateful domain
 Moved the ten characterized host-fulfillment definitions together into private `src/slack_canvas_fulfillment.rs`: local ingress/query storage, daemon/runtime key and result bridging, fulfilled session SSE re-emission, and coupled TTL/cap GC. State assembly, router mounting, generic scheduling, initial pending runtime-event relay, and parent integration tests remain in composition. This is explicitly the temporary typed session/permission/runtime/event compatibility seam for future `ocean-slack`; Socket Mode, Slack API/credentials, reconnect, replies, files, and real Canvas delivery remain extension-owned. Eleven fulfillment, two pending-relay, ten GC, 25 runtime-canvas, all 122 runtime tests plus integrations, 154 agent tests, five router contracts, all 305 daemon tests, workspace-test compilation, both supported-feature checks, formatting, docs, and diff gates passed from this isolated worktree. Fresh security/architecture review verified characterization parity and found no unresolved medium-or-higher issue. The dirty primary worktree was not modified.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [12:52am] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-registries]
+type:      [refactor]: extract component interaction fulfillment adapter intact
+area:      [backend]: ocean-daemon Phase 2C leaf compatibility seam
+
+Added five direct-handler tests covering exact validation order and 400/404/410/500/200 envelopes, scoped key matching, explicit/default payload delivery, one-shot consumption, dropped receivers, and registry poison behavior. Then moved the unchanged 72-line `POST /v1/component/event` adapter into private `src/component_interaction.rs`. Route/banner/operator-guide composition remains in `main.rs`; `ocean-runtime` retains wait-registry ownership, permission/session binding, registration, timeout, ordinary post-await cleanup, and existing cancellation-drop behavior. Five handler tests, 16 focused runtime component tests plus lifecycle integration, all 122 runtime tests and integrations, 154 agent tests, five router contracts, all 310 daemon tests, workspace-test compilation, both feature checks, formatting, docs, and diff gates passed. Fresh parity/security review found no unresolved medium-or-higher issue. The dirty primary worktree remained untouched.
+_________________________________________________________________________________
+_________________________________________________________________________________

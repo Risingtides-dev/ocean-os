@@ -19,6 +19,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
 - Subagent roles, dispatch, lifecycle, and orchestration are extension-owned. Do not add daemon-native `task`/`spawn_worker`/fleet machinery. The daemon may expose generic permission-gated turn, cancellation, capability-provider, and extension event/tool seams; current `/v1/subagents/spec` and folder-agent subagent metadata remain compatibility surfaces until a separately approved extension migration.
 - Slack Socket Mode, API/credential access, reconnects, replies, files, and real Canvas delivery are `ocean-slack` extension concerns. Private `slack_canvas_fulfillment.rs` is only the temporary typed host ingress/readback, runtime lookup, scoped-event, and lifecycle-enforcement compatibility seam; do not grow it into a second Slack transport authority.
+- `component_interaction.rs` is a leaf HTTP fulfillment adapter over the runtime-owned `COMPONENT_WAIT_REGISTRY`: preserve exact key scoping, remove-before-send semantics, poison/error responses, and runtime ownership of wait registration, timeout, and ordinary cleanup.
 - Agent SSE replay is globally bounded by both 2,048 events and 32 MiB of serialized event payload. Oldest envelopes evict until both limits hold; an individually oversized event remains live but is not replay-retained. Preserve full live delivery and the existing explicit subscriber-lag signal.
 - Build provenance must follow normal branch commits and linked worktrees: `build.rs` watches Git `HEAD`, its resolved symbolic branch ref, and `packed-refs`; `/health` and `/ready` must report the exact main-built revision after deployment.
 - `AgentEvent::TurnCheckpoint` is an internal persistence signal consumed by `ocean-agent`; daemon bridges must filter it rather than exposing transcript deltas on SSE.
@@ -37,6 +38,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon bus::tests::`
 - `cargo test -p ocean-daemon fulfillment -- --nocapture`
 - `cargo test -p ocean-daemon cors::tests:: -- --nocapture`
+- `cargo test -p ocean-daemon component_event_ -- --nocapture`
 - `cargo test -p ocean-daemon event_adapter::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon fs_ -- --nocapture`
 - `cargo test -p ocean-daemon metrics::tests:: -- --nocapture`

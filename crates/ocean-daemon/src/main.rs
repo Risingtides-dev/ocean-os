@@ -36,10 +36,7 @@ use ocean_core::{
     RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
     SessionDetail, SessionId, SessionResponse, SessionRunState,
 };
-use ocean_runtime::{
-    tools::component::COMPONENT_WAIT_REGISTRY, AgentEvent,
-    PermissionDecision as AgentPermissionDecision, PermissionPolicy,
-};
+use ocean_runtime::{AgentEvent, PermissionDecision as AgentPermissionDecision, PermissionPolicy};
 // Brings the `RoomStore` trait methods (create/get/list/append_message/…) into
 // scope on `SqliteRoomStore` for the persistent-room handlers (OCEAN-107).
 use ocean_store::RoomStore;
@@ -88,6 +85,8 @@ mod browser_stream;
 /// Event buses — parallel broadcast/pub-sub for legacy `OceanEvent` and
 /// full-fidelity `AgentTurnEvent`.
 mod bus;
+/// HTTP fulfillment adapter for runtime-owned interactive component waits.
+mod component_interaction;
 /// Browser-origin trust policy and global CORS middleware construction.
 mod cors;
 /// Pure adapters between full-fidelity SDK agent events and the legacy core rail.
@@ -113,6 +112,7 @@ mod workspace_policy;
 /// Operator YOLO preference, effective permission posture, and settings adapters.
 mod yolo_settings;
 use browser_stream::{input as browser_input, screencast_stream as browser_screencast};
+use component_interaction::component_event;
 use cors::{cors_layer, parse_allowed_origins};
 use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
@@ -8120,75 +8120,6 @@ async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_lo
     }
 }
 
-/// Receive a user interaction event for a rendered component and deliver it
-/// to the waiting `component_wait` tool call.
-///
-/// Request body:
-/// ```json
-/// {
-///   "session_id": "uuid-of-session",
-///   "component_id": "agent-chosen-id",
-///   "event": { "type": "submit", "data": { ... } }
-/// }
-/// ```
-///
-/// Returns 200 if the event was delivered, 404 if nobody is waiting on that
-/// component, 400 on missing fields.
-async fn component_event(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
-    let session_id = match body.get("session_id").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "missing 'session_id'" })),
-            );
-        }
-    };
-    let component_id = match body.get("component_id").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "missing 'component_id'" })),
-            );
-        }
-    };
-    let event = body.get("event").cloned().unwrap_or(json!({}));
-
-    let sender = {
-        let mut pending = match COMPONENT_WAIT_REGISTRY.pending.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("registry lock: {e}") })),
-                );
-            }
-        };
-        pending.remove(&(session_id.clone(), component_id.clone()))
-    };
-
-    match sender {
-        Some(tx) => {
-            if tx.send(event).is_err() {
-                // Receiver dropped (timeout or cancellation) — not an error for the caller.
-                (
-                    StatusCode::GONE,
-                    Json(json!({ "status": "nobody waiting" })),
-                )
-            } else {
-                (StatusCode::OK, Json(json!({ "status": "delivered" })))
-            }
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(
-                json!({ "error": "no pending wait for component", "session_id": session_id, "component_id": component_id }),
-            ),
-        ),
-    }
-}
-
 #[derive(Debug, serde::Deserialize, Default)]
 struct AgentEventsQuery {
     /// When set, the SSE stream only delivers events for this session.
@@ -9043,6 +8974,188 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Component interaction HTTP adapter ──────────────────────────────────
+
+    static COMPONENT_EVENT_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    fn reset_component_wait_registry() {
+        let mut pending = ocean_runtime::tools::component::COMPONENT_WAIT_REGISTRY
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        pending.clear();
+        ocean_runtime::tools::component::COMPONENT_WAIT_REGISTRY
+            .pending
+            .clear_poison();
+    }
+
+    #[tokio::test]
+    async fn component_event_rejects_missing_or_non_string_ids() {
+        let _serial = COMPONENT_EVENT_TEST_LOCK.lock().await;
+        reset_component_wait_registry();
+
+        let (status, Json(body)) = component_event(Json(json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({ "error": "missing 'session_id'" }));
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": 7,
+            "component_id": "form"
+        })))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({ "error": "missing 'session_id'" }));
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": "session"
+        })))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({ "error": "missing 'component_id'" }));
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": "session",
+            "component_id": false
+        })))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({ "error": "missing 'component_id'" }));
+    }
+
+    #[tokio::test]
+    async fn component_event_unknown_waiter_preserves_scoped_not_found_envelope() {
+        let _serial = COMPONENT_EVENT_TEST_LOCK.lock().await;
+        reset_component_wait_registry();
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": "unknown-session",
+            "component_id": "unknown-component",
+            "event": { "type": "submit" }
+        })))
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            json!({
+                "error": "no pending wait for component",
+                "session_id": "unknown-session",
+                "component_id": "unknown-component"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn component_event_delivers_explicit_and_default_payload_once() {
+        let _serial = COMPONENT_EVENT_TEST_LOCK.lock().await;
+        reset_component_wait_registry();
+
+        let explicit_key = ("delivery-session".to_string(), "explicit".to_string());
+        let (explicit_tx, explicit_rx) = tokio::sync::oneshot::channel();
+        ocean_runtime::tools::component::COMPONENT_WAIT_REGISTRY
+            .pending
+            .lock()
+            .unwrap()
+            .insert(explicit_key, explicit_tx);
+
+        let expected = json!({ "type": "form_submit", "data": { "answer": 42 } });
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": "delivery-session",
+            "component_id": "explicit",
+            "event": expected.clone()
+        })))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "status": "delivered" }));
+        assert_eq!(explicit_rx.await.unwrap(), expected);
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": "delivery-session",
+            "component_id": "explicit",
+            "event": { "type": "duplicate" }
+        })))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "no pending wait for component");
+
+        let default_key = ("delivery-session".to_string(), "default".to_string());
+        let (default_tx, default_rx) = tokio::sync::oneshot::channel();
+        ocean_runtime::tools::component::COMPONENT_WAIT_REGISTRY
+            .pending
+            .lock()
+            .unwrap()
+            .insert(default_key, default_tx);
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": "delivery-session",
+            "component_id": "default"
+        })))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "status": "delivered" }));
+        assert_eq!(default_rx.await.unwrap(), json!({}));
+    }
+
+    #[tokio::test]
+    async fn component_event_dropped_receiver_is_gone_and_consumed() {
+        let _serial = COMPONENT_EVENT_TEST_LOCK.lock().await;
+        reset_component_wait_registry();
+
+        let key = ("gone-session".to_string(), "gone-component".to_string());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        ocean_runtime::tools::component::COMPONENT_WAIT_REGISTRY
+            .pending
+            .lock()
+            .unwrap()
+            .insert(key.clone(), tx);
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": key.0,
+            "component_id": key.1,
+            "event": { "type": "late" }
+        })))
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body, json!({ "status": "nobody waiting" }));
+        assert!(ocean_runtime::tools::component::COMPONENT_WAIT_REGISTRY
+            .pending
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn component_event_poisoned_registry_preserves_internal_error() {
+        let _serial = COMPONENT_EVENT_TEST_LOCK.lock().await;
+        reset_component_wait_registry();
+
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = ocean_runtime::tools::component::COMPONENT_WAIT_REGISTRY
+                .pending
+                .lock()
+                .unwrap();
+            panic!("poison component wait registry for characterization");
+        });
+        assert!(poisoned.is_err());
+
+        let (status, Json(body)) = component_event(Json(json!({
+            "session_id": "poison-session",
+            "component_id": "poison-component"
+        })))
+        .await;
+        // Clear shared-global poison before assertions so a future assertion
+        // failure cannot cascade into unrelated daemon tests.
+        reset_component_wait_registry();
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            json!({ "error": "registry lock: poisoned lock: another task failed inside" })
+        );
+    }
 
     // ── Advisor observer pure helpers ───────────────────────────────────────
 
