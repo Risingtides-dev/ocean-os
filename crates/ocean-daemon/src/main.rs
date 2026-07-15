@@ -97,6 +97,8 @@ mod filesystem;
 mod metrics;
 /// Model catalog, current-selection, and persisted-selection HTTP adapters.
 mod model_catalog;
+/// Immutable startup model-role loading and pure turn/advisor role resolution.
+mod model_roles;
 /// Project registry CRUD, pagination, git enrichment, and session association adapters.
 mod project_registry;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
@@ -118,6 +120,7 @@ use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
+use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
     project_get, project_patch, projects_list,
@@ -688,31 +691,6 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/calls/webhook", post(call_webhook))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-}
-
-// Model roles (oh-my-pi-style indirection) loaded once from `ocean.toml`'s
-// `[roles]` table. A malformed config here is non-fatal for roles — the
-// daemon already validated + loaded the same file for MCP/hooks at runtime
-// construction, so a parse error would have surfaced there; if it somehow
-// doesn't parse now we log and fall back to an empty table (roles + advisor
-// simply off), never blocking startup.
-fn load_model_roles(config_dir: &std::path::Path) -> HashMap<String, String> {
-    match ocean_agent::DaemonConfig::load(config_dir) {
-        Ok(cfg) => {
-            if !cfg.roles.is_empty() {
-                tracing::info!(
-                    role_count = cfg.roles.len(),
-                    advisor = cfg.advisor_model().is_some(),
-                    "loaded model roles from ocean.toml [roles]"
-                );
-            }
-            cfg.roles
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load [roles] from ocean.toml; roles disabled");
-            HashMap::new()
-        }
-    }
 }
 
 #[tokio::main]
@@ -6785,30 +6763,6 @@ fn advisor_user_prompt(operator_prompt: &str, assistant_response: &str) -> Strin
 /// the empty string and the sentinel "NOTHING" (case-insensitive, ignoring
 /// surrounding punctuation/whitespace) so a "nothing wrong" verdict emits no
 /// event. Returns the trimmed note when there is genuine content.
-/// Decide which model alias the post-turn advisor runs on, given the per-turn
-/// override and the global `[roles]` table. Precedence:
-///
-/// - override `enabled:false` → `None` (suppress even a configured global role)
-/// - override `enabled:true`  → the override's `model`, else the global
-///   `advisor` role; `None` when neither exists (nothing to run on)
-/// - no override → the global `advisor` role (today's behavior)
-///
-/// Pure so the precedence is unit-testable without a full turn.
-fn resolve_advisor_alias(
-    override_ctl: Option<&ocean_agent_sdk::AdvisorControl>,
-    roles: &std::collections::HashMap<String, String>,
-) -> Option<String> {
-    match override_ctl {
-        Some(ctl) if !ctl.enabled => None,
-        Some(ctl) => ctl
-            .model
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .or_else(|| roles.get("advisor").cloned()),
-        None => roles.get("advisor").cloned(),
-    }
-}
-
 fn advisor_note_if_actionable(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -6853,32 +6807,6 @@ fn advisor_severity(note: &str) -> &'static str {
         "info"
     } else {
         "concern"
-    }
-}
-
-/// Resolve the EFFECTIVE per-turn model from an explicit `model_id`, an optional
-/// symbolic `role`, and the loaded `[roles]` table. Pure so the precedence rules
-/// are unit-testable without a full turn:
-///
-/// - An explicit `model_id` ALWAYS wins (role is ignored entirely).
-/// - Otherwise a known `role` resolves to its configured alias.
-/// - An unknown role (or no role) yields `None` → the runtime's global model.
-///
-/// The `bool` is `true` when a role was given but did NOT resolve — the caller
-/// logs a warning for that case (a typo'd role silently using the global model
-/// would be surprising).
-fn resolve_effective_model_id(
-    model_id: Option<&str>,
-    role: Option<&str>,
-    roles: &std::collections::HashMap<String, String>,
-) -> (Option<String>, bool) {
-    match (model_id, role) {
-        (Some(m), _) => (Some(m.to_string()), false),
-        (None, Some(r)) => match roles.get(r) {
-            Some(alias) => (Some(alias.clone()), false),
-            None => (None, true),
-        },
-        (None, None) => (None, false),
     }
 }
 

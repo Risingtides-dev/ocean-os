@@ -3,7 +3,7 @@
 **Date:** 2026-07-15
 **Status:** Characterization complete and independently reviewed; production extraction pending
 **Owner:** Ocean OS
-**Rollback point:** `d3f1040`
+**Rollback point:** `2c326bd`
 
 ## Purpose
 
@@ -40,7 +40,7 @@ After characterization passes, move from `crates/ocean-daemon/src/main.rs` to ne
 - `resolve_advisor_alias`
 - `resolve_effective_model_id`
 
-Move each symbol's attached documentation with it. The only permitted code changes are minimal `pub(super)` visibility and module-local imports/formatting.
+Move each symbol's role-specific documentation with it. Keep the pre-existing advisor-completion normalization documentation in `main.rs` with `advisor_note_if_actionable` when removing the intervening role resolver. The only permitted code changes are minimal `pub(super)` visibility, that documentation reattachment, and module-local imports/formatting.
 
 ## Files in scope
 
@@ -131,7 +131,7 @@ A fresh reviewer must compare the moved definitions against the characterization
 
 ## Characterization result
 
-A behavior-neutral `load_model_roles` helper now holds the exact startup match from baseline `d3f1040`, with its call at the same startup position. Three new tests freeze missing/malformed/invalid-whole-config fail-open behavior, verbatim aliases and keys, exact/case-sensitive lookup, blank alias behavior, and explicit-model precedence; existing advisor and role-precedence tests remain authoritative. Two loader tests, two role-resolution tests, advisor precedence, ten `ocean-agent` config tests, all five router contracts, all 313 daemon tests, formatting, documentation, and diff checks pass in a dedicated target directory. Independent review found no unresolved medium-or-higher issue.
+A behavior-neutral `load_model_roles` helper now holds the exact startup match on post-rebase baseline `2c326bd`, with its call at the same startup position. Three new tests freeze missing/malformed/invalid-whole-config fail-open behavior, verbatim aliases and keys, exact/case-sensitive lookup, blank alias behavior, and explicit-model precedence; existing advisor and role-precedence tests remain authoritative. Two loader tests, two role-resolution tests, advisor precedence, ten `ocean-agent` config tests, all five router contracts, all 313 daemon tests, formatting, documentation, and diff checks pass in a dedicated target directory. Independent review found no unresolved medium-or-higher issue.
 
 ## Result
 
