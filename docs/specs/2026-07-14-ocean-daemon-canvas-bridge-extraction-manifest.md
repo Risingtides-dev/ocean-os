@@ -1,15 +1,27 @@
-# Ocean Daemon Canvas Bridge Extraction Manifest
+# Ocean Daemon Slack Canvas Host Fulfillment Extraction Manifest
 
 **Date:** 2026-07-14
-**Status:** Characterization and GC seam complete; module extraction, full validation, and final review pending
+**Status:** Complete; aligned host ownership, characterization/GC seam, focused/full/feature validation, and independent review passed
 **Owner:** Ocean OS
 **Rollback point:** `8024ffa`
 
 ## Purpose
 
-Characterize and then move the daemon-owned fulfilled Slack Canvas bridge lifecycle into one private binary module without changing bridge validation, raw-result storage, runtime lookup delivery, fulfilled SSE re-emission, query behavior, TTL/cap eviction, scheduler order, or pending turn-event relay behavior.
+Characterize and then move the daemon-owned Slack Canvas **host fulfillment seam** into one private binary module without changing bridge validation, raw-result storage, runtime lookup delivery, fulfilled SSE re-emission, query behavior, TTL/cap eviction, scheduler order, or pending turn-event relay behavior.
 
-The bridge boundary is intentionally all-or-nothing for its local lifecycle: daemon query store, key/value types, bridge-to-SDK conversion, POST/GET adapters, runtime-registry write, fulfilled SSE re-emit, TTL/cap policy, and the canvas portion of registry GC move together. The initial pending `AgentEvent::SlackCanvas` relay remains in parent turn orchestration because it is part of the runtime-event match, not the fulfillment lifecycle.
+The host boundary is intentionally all-or-nothing for its local lifecycle: daemon query store, key/value types, bridge-to-SDK conversion, POST/GET adapters, runtime-registry write, fulfilled SSE re-emit, TTL/cap policy, and the canvas portion of registry GC move together. The initial pending `AgentEvent::SlackCanvas` relay remains in parent turn orchestration because it is part of the runtime-event match, not the fulfillment lifecycle.
+
+## Extension-program alignment
+
+This checkpoint follows the approved split in `2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`:
+
+- the future `ocean-slack` extension owns Socket Mode, Slack credentials/API access, reconnect/intake, replies, files, and real Canvas delivery;
+- `ocean-os` temporarily retains the typed Slack Canvas protocol plus session, permission, runtime lookup, scoped-event, and fulfillment-ingress enforcement needed by that extension during parity migration;
+- `ocean-agents` retains deployment-specific content-agent identity and policy;
+- this extraction adds no Slack transport or API behavior to core and does not compete with the extension implementation;
+- retiring or generalizing the typed Slack-specific host seam happens only after extension parity under a separate protocol proposal.
+
+The module is therefore named `slack_canvas_fulfillment.rs`, not `canvas_bridge.rs`: it is a host compatibility/enforcement seam, while the actual Slack bridge belongs to the extension.
 
 ## Characterization and GC seam before module extraction
 
@@ -40,7 +52,7 @@ Existing parent tests continue to pin:
 
 ## Exact symbols to move intact
 
-After the seam and characterization are green, move from `crates/ocean-daemon/src/main.rs` to new `crates/ocean-daemon/src/canvas_bridge.rs`:
+After the seam and characterization are green, move from `crates/ocean-daemon/src/main.rs` to new `crates/ocean-daemon/src/slack_canvas_fulfillment.rs`:
 
 - `CanvasFulfillmentStore`
 - `CanvasFulfillmentKey`
@@ -58,7 +70,7 @@ After the seam and characterization are green, move from `crates/ocean-daemon/sr
 ## Files in scope
 
 - `crates/ocean-daemon/src/main.rs`
-- new `crates/ocean-daemon/src/canvas_bridge.rs`
+- new `crates/ocean-daemon/src/slack_canvas_fulfillment.rs`
 - `crates/ocean-daemon/AGENTS.md`
 - `docs/DAEMON_REFACTOR_MISSION.md`
 - `docs/specs/2026-07-12-ocean-code-health-and-agent-readiness-plan.md`
@@ -155,9 +167,9 @@ A fresh security-focused reviewer must compare all moved definitions against the
 
 The generic overflow helper now accepts an explicit cap while all existing production callers pass the same current 10,000 value. The canvas-local and runtime-registry sweep blocks are mechanically grouped into one synchronous main-local helper at the same scheduler position. Three tests freeze all-op daemon/runtime key parity, injected-cap oldest-first eviction, same-clock coupled GC, and exact-TTL retention. Eleven fulfillment tests, two pending-relay tests, ten daemon GC tests, 25 runtime canvas tests, all five router contracts, all 305 daemon tests, formatting, documentation, and diff checks pass from isolated clean main. Independent seam review found no unresolved medium-or-higher issue.
 
-## Planned result
+## Result
 
-A private `canvas_bridge.rs` owns the complete fulfilled-canvas bridge lifecycle. Parent composition retains state assembly, route mounting, generic registry scheduling, the pending runtime-event relay, and all characterization/integration tests.
+A private `slack_canvas_fulfillment.rs` now owns the complete host fulfillment lifecycle retained for the future `ocean-slack` extension. All ten moved definitions are unchanged from characterization commit `65ca2ee` except for minimal `pub(super)` visibility and formatting. Parent composition retains state assembly, route mounting, generic registry scheduling, the pending runtime-event relay, and all characterization/integration tests. No Slack transport, API, credential, reconnect, reply, file, or real Canvas-delivery behavior moved into core; those remain assigned to the extension program. Eleven fulfillment tests, two pending-relay tests, ten daemon GC tests, 25 runtime canvas tests, the full 122-test runtime suite plus integrations, 154 agent tests, all five router contracts, all 305 daemon tests, workspace-test compilation, both supported-feature checks, formatting, documentation, and diff checks passed. Fresh security/architecture review found no unresolved medium-or-higher issue.
 
 ## Rollback
 

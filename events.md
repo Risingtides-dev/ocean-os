@@ -3101,4 +3101,13 @@ type:  [bug report]: Correct Longhouse shipped-versus-target claims
 area:  [writing]: Source-backed orchestration boundary and historical archive
 
 A late semantic review of merged PR #278 found that active Longhouse docs still described planned controls as shipped, including a hard deadline timer, aggregate token ceiling, domain/subsidiarity routing, validator veto, session rebinding, and revoke-driven cancellation. Replaced the stale orchestration design with a concise source-backed current reference, retained the former design under the opt-in archive, corrected HTTP/capability/standalone model behavior and skill ranking, and preserved extension-owned general subagent orchestration. `cargo test -p ocean-longhouse` passed with 113 tests and one ignored; `cargo xtask docs-check`, `git diff --check`, and fresh semantic review passed.
+
+time:      [11:53pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-slack-canvas-extract]
+type:      [refactor]: extract temporary Slack Canvas host fulfillment seam intact
+area:      [backend]: ocean-daemon Phase 2C stateful domain
+
+Moved the ten characterized host-fulfillment definitions together into private `src/slack_canvas_fulfillment.rs`: local ingress/query storage, daemon/runtime key and result bridging, fulfilled session SSE re-emission, and coupled TTL/cap GC. State assembly, router mounting, generic scheduling, initial pending runtime-event relay, and parent integration tests remain in composition. This is explicitly the temporary typed session/permission/runtime/event compatibility seam for future `ocean-slack`; Socket Mode, Slack API/credentials, reconnect, replies, files, and real Canvas delivery remain extension-owned. Eleven fulfillment, two pending-relay, ten GC, 25 runtime-canvas, all 122 runtime tests plus integrations, 154 agent tests, five router contracts, all 305 daemon tests, workspace-test compilation, both supported-feature checks, formatting, docs, and diff gates passed from this isolated worktree. Fresh security/architecture review verified characterization parity and found no unresolved medium-or-higher issue. The dirty primary worktree was not modified.
+_________________________________________________________________________________
 _________________________________________________________________________________
