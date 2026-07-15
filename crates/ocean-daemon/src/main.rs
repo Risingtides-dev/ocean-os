@@ -77,6 +77,8 @@ mod startup;
 /// future harness features scope per surface instead of behind a global flag.
 mod harness_profile;
 
+/// Bounded, fail-open post-turn advisor execution and attribution.
+mod advisor;
 /// Browser-screencast backend — streams the agent's live Chrome (JPEG frames
 /// + input forwarding) for Ocean Desktop's Browser tab over
 /// `/v1/browser/screencast` (SSE) and `/v1/browser/input`. Attaches as a SECOND
@@ -118,6 +120,9 @@ mod voice_speech;
 mod workspace_policy;
 /// Operator YOLO preference, effective permission posture, and settings adapters.
 mod yolo_settings;
+use advisor::{
+    execute_advisor, AdvisorExecution, AdvisorLimiter, ADVISOR_CONCURRENCY_LIMIT, ADVISOR_TIMEOUT,
+};
 use browser_stream::{input as browser_input, screencast_stream as browser_screencast};
 use component_interaction::component_event;
 use cors::{cors_layer, parse_allowed_origins};
@@ -292,6 +297,10 @@ struct AppState {
     /// every exit path (it's an owned permit dropped — success, error, panic).
     /// Sized by [`max_concurrent_turns`] (`OCEAN_MAX_CONCURRENT_TURNS`).
     turn_limiter: TurnLimiter,
+    /// Dedicated two-permit post-turn advisor pool. It is intentionally
+    /// independent of `turn_limiter`: saturation drops advisor work immediately
+    /// and never changes admission or completion of a main turn.
+    advisor_limiter: AdvisorLimiter,
     /// Named model *roles* loaded once at startup from `ocean.toml`'s `[roles]`
     /// table (oh-my-pi-style indirection). Maps a symbolic role name (e.g.
     /// `"fast"`, `"advisor"`) to a concrete model alias. A turn carrying a `role`
@@ -804,6 +813,7 @@ async fn main() -> anyhow::Result<()> {
         // OCEAN-304: concurrent-turn ceiling. One permit per running turn;
         // exhaustion → 429/busy at intake instead of unbounded provider fan-out.
         turn_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_turns())),
+        advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
     };
 
     // Background GC: the request/permission/canvas-fulfillment registries are
@@ -6523,85 +6533,6 @@ fn session_workspace_binding(
     }
 }
 
-// ── Advisor observer (post-turn) ────────────────────────────────────────────
-//
-// When an `advisor` role is configured, the daemon runs ONE fresh single
-// completion after each operator turn, on the advisor model, silently reviewing
-// the exchange. A non-empty, actionable note is emitted as an
-// `AgentTurnEvent::Extension { extension: "advisor", .. }` scoped to the
-// session. The heavy lifting (the provider call) is fire-and-forget in a spawned
-// task; the pieces below are the PURE, network-free helpers it composes — kept
-// standalone so they're unit-testable without a provider.
-
-/// The advisor's tight system instruction. It watches, it does not chat: a real
-/// concern in 1-2 sentences, or exactly nothing.
-fn advisor_system_prompt() -> &'static str {
-    "You are an advisor silently watching another coding agent. Review the \
-     exchange below. If you see a real correctness concern, risk, or blocker, \
-     state it in 1-2 sentences. If nothing is wrong, reply with exactly the \
-     empty string / NOTHING."
-}
-
-/// Build the advisor's user turn: the operator prompt + the assistant response,
-/// clearly delimited. Pure — no I/O.
-fn advisor_user_prompt(operator_prompt: &str, assistant_response: &str) -> String {
-    format!(
-        "OPERATOR PROMPT:\n{operator_prompt}\n\nASSISTANT RESPONSE:\n{assistant_response}\n\n\
-         Now give your advisor note (1-2 sentences), or NOTHING."
-    )
-}
-
-/// Normalize an advisor completion to an *actionable* note, or `None`. Suppresses
-/// the empty string and the sentinel "NOTHING" (case-insensitive, ignoring
-/// surrounding punctuation/whitespace) so a "nothing wrong" verdict emits no
-/// event. Returns the trimmed note when there is genuine content.
-fn advisor_note_if_actionable(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Strip surrounding quotes/punctuation for the sentinel check only.
-    let sentinel = trimmed
-        .trim_matches(|c: char| !c.is_alphanumeric())
-        .to_ascii_lowercase();
-    if sentinel.is_empty() || sentinel == "nothing" || sentinel == "none" {
-        return None;
-    }
-    Some(trimmed.to_string())
-}
-
-/// Heuristic severity for an advisor note. Strong "this will hurt" language →
-/// `"blocker"`; mild/hedged language → `"info"`; everything else → `"concern"`
-/// (the default). Pure string classification.
-fn advisor_severity(note: &str) -> &'static str {
-    let lower = note.to_ascii_lowercase();
-    const BLOCKER: &[&str] = &[
-        "must not",
-        "will break",
-        "data loss",
-        "will fail",
-        "security vulnerability",
-        "critical",
-        "corrupt",
-        "irreversible",
-    ];
-    const MILD: &[&str] = &[
-        "minor",
-        "nitpick",
-        "consider",
-        "might want",
-        "optional",
-        "cosmetic",
-    ];
-    if BLOCKER.iter().any(|w| lower.contains(w)) {
-        "blocker"
-    } else if MILD.iter().any(|w| lower.contains(w)) {
-        "info"
-    } else {
-        "concern"
-    }
-}
-
 async fn agent_turn(
     State(state): State<AppState>,
     Json(req): Json<AgentTurnRequest>,
@@ -7421,40 +7352,33 @@ async fn agent_turn(
                     let runtime = bg_state.runtime.clone();
                     let events = bg_state.events.clone();
                     let agent_events = bg_state.agent_events.clone();
+                    let advisor_limiter = bg_state.advisor_limiter.clone();
+                    let metrics = bg_state.metrics.clone();
                     tokio::spawn(async move {
-                        let user = advisor_user_prompt(&operator_prompt, &assistant_text);
-                        match runtime
-                            .complete_once(&advisor_alias, advisor_system_prompt(), &user)
-                            .await
-                        {
-                            Ok((note, model_id)) => {
-                                if let Some(clean) = advisor_note_if_actionable(&note) {
-                                    let severity = advisor_severity(&clean);
-                                    tracing::info!(
-                                        %session_id,
-                                        severity,
-                                        model = %model_id,
-                                        "advisor observer note"
-                                    );
-                                    emit_agent(
-                                        &events,
-                                        &agent_events,
-                                        session_id,
-                                        AgentTurnEvent::Extension {
-                                            extension: "advisor".into(),
-                                            payload: serde_json::json!({
-                                                "note": clean,
-                                                "severity": severity,
-                                                "model": model_id,
-                                            }),
-                                            scope: Some(session_id),
-                                        },
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "advisor observer failed; dropping");
-                            }
+                        let execution = execute_advisor(
+                            advisor_limiter,
+                            metrics,
+                            ADVISOR_TIMEOUT,
+                            turn_id,
+                            advisor_alias,
+                            operator_prompt,
+                            assistant_text,
+                            move |alias, system, user| async move {
+                                runtime.complete_once(&alias, &system, &user).await
+                            },
+                        )
+                        .await;
+                        if let AdvisorExecution::Emitted(emission) = execution {
+                            emit_agent(
+                                &events,
+                                &agent_events,
+                                session_id,
+                                AgentTurnEvent::Extension {
+                                    extension: "advisor".into(),
+                                    payload: emission.payload(),
+                                    scope: Some(session_id),
+                                },
+                            );
                         }
                     });
                 }
@@ -9191,49 +9115,6 @@ mod tests {
     }
 
     #[test]
-    fn advisor_suppresses_empty_and_nothing() {
-        assert_eq!(advisor_note_if_actionable(""), None);
-        assert_eq!(advisor_note_if_actionable("   \n  "), None);
-        assert_eq!(advisor_note_if_actionable("NOTHING"), None);
-        assert_eq!(advisor_note_if_actionable("nothing"), None);
-        assert_eq!(advisor_note_if_actionable("  NOTHING.  "), None);
-        assert_eq!(advisor_note_if_actionable("\"NOTHING\""), None);
-        assert_eq!(advisor_note_if_actionable("None"), None);
-    }
-
-    #[test]
-    fn advisor_keeps_real_notes_trimmed() {
-        assert_eq!(
-            advisor_note_if_actionable("  The retry loop never breaks on cancel.  "),
-            Some("The retry loop never breaks on cancel.".to_string())
-        );
-    }
-
-    #[test]
-    fn advisor_severity_heuristic() {
-        // Strong words → blocker.
-        assert_eq!(
-            advisor_severity("This will break the migration and cause data loss."),
-            "blocker"
-        );
-        assert_eq!(
-            advisor_severity("You must not drop the table here."),
-            "blocker"
-        );
-        // Mild/hedged → info.
-        assert_eq!(
-            advisor_severity("Minor nitpick: rename the variable."),
-            "info"
-        );
-        assert_eq!(advisor_severity("Consider adding a doc comment."), "info");
-        // Default → concern.
-        assert_eq!(
-            advisor_severity("The error path returns Ok, which hides the failure."),
-            "concern"
-        );
-    }
-
-    #[test]
     fn role_resolution_known_unknown_and_model_id_precedence() {
         let mut roles = std::collections::HashMap::new();
         roles.insert("fast".to_string(), "deepseek/deepseek-chat".to_string());
@@ -9262,15 +9143,6 @@ mod tests {
             resolve_effective_model_id(None, None, &roles),
             (None, false)
         );
-    }
-
-    #[test]
-    fn advisor_user_prompt_contains_both_sides() {
-        let p = advisor_user_prompt("do X", "I did Y");
-        assert!(p.contains("do X"));
-        assert!(p.contains("I did Y"));
-        assert!(p.contains("OPERATOR PROMPT"));
-        assert!(p.contains("ASSISTANT RESPONSE"));
     }
 
     /// Serializes every test that mutates the process-global env this module
@@ -12713,6 +12585,7 @@ mod tests {
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
+            advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
         }
     }
 
@@ -14083,6 +13956,7 @@ mod tests {
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
+            advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
         }
     }
 
@@ -14715,6 +14589,7 @@ mod tests {
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
+            advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
         }
     }
 

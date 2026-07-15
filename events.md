@@ -3327,3 +3327,18 @@ Verification:
 - `git diff --check` passed
 - fresh source-backed documentation review found no factual, classification, or ownership-boundary issue
 _________________________________________________________________________________
+
+time:      [07:37pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  /tmp/ocean-advisor-bounds-20260715
+type:      [feature]: bound and attribute post-turn advisor execution
+area:      [backend]: ocean-daemon advisor control and observability
+
+Hardened the existing post-turn advisor without changing activation, alias precedence, or main-turn completion: advisor events now carry the authoritative originating `turn_id`; a dedicated two-permit pool drops saturated reviews instead of queueing; provider work has a fixed 30-second timeout; and Prometheus exposes fixed-cardinality emitted/suppressed/provider-error/timeout/saturated outcomes, an in-flight gauge, and cumulative latency. Existing note/severity/model payload fields remain intact. Provider-error bodies are deliberately discarded before logging so provider response text cannot leak prompt, response, or note content.
+
+Verification:
+- six focused advisor tests cover behavior parity, exact production bounds, attribution, timeout, saturation, permit release, suppression, and non-formatted provider errors
+- five focused metrics tests cover fixed outcomes, gauge balance, cumulative buckets, `+Inf`/count parity, sums, and label privacy
+- all 341 daemon tests passed
+- `cargo check --workspace --tests`, `cargo fmt --all`, `cargo xtask docs-check`, and `git diff --check` passed
+- fresh async/protocol review found no correctness or compatibility issue; fresh metrics/privacy review's provider-error logging blocker was fixed, with its two requested regression gaps closed
