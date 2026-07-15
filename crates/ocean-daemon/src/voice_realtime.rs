@@ -171,7 +171,9 @@ pub(crate) fn build_planner_instructions(project_name: &str, workspace_root: &st
     )
 }
 
-/// Planner mint body: exactly one strict, bounded proposal tool.
+/// Planner mint body: exactly one closed, bounded proposal tool. The Realtime
+/// client-secret API rejects the Responses API's function-level `strict` field,
+/// so schema closure and bounds live entirely under `parameters`.
 pub(crate) fn planner_upstream_body(model: &str, instructions: &str) -> Value {
     json!({
         "expires_after": { "anchor": "created_at", "seconds": SECRET_TTL_SECS },
@@ -184,7 +186,6 @@ pub(crate) fn planner_upstream_body(model: &str, instructions: &str) -> Value {
                 "type": "function",
                 "name": "propose_handoff",
                 "description": "Propose a structured PRD handoff for human review. This does not create a session or start work.",
-                "strict": true,
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -372,22 +373,35 @@ mod tests {
     }
 
     #[test]
-    fn planner_body_has_only_strict_bounded_proposal_tool() {
+    fn planner_mint_body_has_only_realtime_compatible_closed_bounded_tool() {
         let instructions = build_planner_instructions("Ocean", "/tmp/ocean");
         let body = planner_upstream_body("m", &instructions);
         let tools = body["session"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "propose_handoff");
-        assert_eq!(tools[0]["strict"], true);
-        let params = &tools[0]["parameters"];
-        assert_eq!(params["additionalProperties"], false);
-        assert_eq!(params["properties"]["title"]["maxLength"], 120);
-        assert_eq!(params["properties"]["requirements"]["maxItems"], 32);
         assert_eq!(
-            params["properties"]["requirements"]["items"]["maxLength"],
-            2000
+            tools,
+            &vec![json!({
+                "type": "function",
+                "name": "propose_handoff",
+                "description": "Propose a structured PRD handoff for human review. This does not create a session or start work.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "title": {"type": "string", "maxLength": 120},
+                        "problem": {"type": "string", "maxLength": 2000},
+                        "users": bounded_string_array_schema(),
+                        "goals": bounded_string_array_schema(),
+                        "non_goals": bounded_string_array_schema(),
+                        "requirements": bounded_string_array_schema(),
+                        "acceptance_criteria": bounded_string_array_schema(),
+                        "constraints": bounded_string_array_schema(),
+                        "open_questions": bounded_string_array_schema()
+                    },
+                    "required": ["title", "problem", "users", "goals", "non_goals", "requirements", "acceptance_criteria", "constraints", "open_questions"]
+                }
+            })]
         );
-        assert_eq!(params["required"].as_array().unwrap().len(), 9);
+        assert!(tools[0].get("strict").is_none());
         assert!(instructions.contains("human must click"));
         assert!(instructions.contains("executes nothing"));
         assert!(!instructions.contains("render_component"));

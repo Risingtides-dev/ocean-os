@@ -3138,7 +3138,7 @@ worktree:  /tmp/ocean-os-voice-planner-20260714
 type:      [feature-request]
 area:      [backend]
 
-Added the additive propose-only Realtime Voice Planner mint contract. Planner context is validated against daemon-owned registered projects and canonical live worktrees before credential lookup; planner sessions advertise only the strict bounded propose_handoff schema. The existing session-message route now truthfully marks planner handoffs without starting a turn.
+Added the additive propose-only Realtime Voice Planner mint contract. Planner context is validated against daemon-owned registered projects and canonical live worktrees before credential lookup; planner sessions advertise only the closed bounded propose_handoff schema. The existing session-message route now truthfully marks planner handoffs without starting a turn.
 
 _________________________________________________________________________________
 time:      [01:00pm] [14-07-26]
@@ -3148,3 +3148,12 @@ type:      [test]
 area:      [backend]: ocean-daemon call-voice safety
 
 Added an executable regression through the real DaemonTurnRunner using the keyless adversarial fake-tool provider with operator YOLO enabled. The test proves call turns still expose zero capabilities: the scripted write remains unexecuted, no permission waiter is registered, the persisted call session records an unknown-tool error, and a second answer reuses the same session without weakening the boundary.
+
+_________________________________________________________________________________
+time:      [02:00pm] [14-07-26]
+agent:     [worker], [openai]
+worktree:  /private/tmp/ocean-os-voice-planner-20260714
+type:      [bug report]
+area:      [backend]: OpenAI Realtime planner mint compatibility
+
+Removed the unsupported function-level `strict` property from the planner Realtime client-secret body after live OpenAI testing returned HTTP 400 `unknown_parameter` for `session.tools[0].strict`. The one-tool proposal contract remains closed and bounded under `parameters`, and its exact wire shape is covered by regression testing; Surface validation and mutation boundaries are unchanged.
