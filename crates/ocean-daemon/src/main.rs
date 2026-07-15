@@ -321,6 +321,44 @@ type RevokerHandle = Arc<ocean_longhouse::Revoker>;
 /// the guard is dropped before any `await`, so it never blocks the scheduler.
 type RecallRegistryHandle = Arc<Mutex<HashMap<Uuid, ocean_longhouse::RecallVote>>>;
 
+fn new_recall_registry() -> RecallRegistryHandle {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Run a closure with the locked recall registry, recovering a poisoned lock the
+/// same way the other longhouse handlers do. Synchronous: the guard drops before
+/// this returns, so no `await` is held across it.
+fn with_recalls<T>(
+    recalls: &RecallRegistryHandle,
+    f: impl FnOnce(&mut HashMap<Uuid, ocean_longhouse::RecallVote>) -> T,
+) -> T {
+    let mut guard = match recalls.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut guard)
+}
+
+fn cast_recall_vote(
+    recalls: &RecallRegistryHandle,
+    title_id: Uuid,
+    voter_id: Uuid,
+    threshold: usize,
+) -> ocean_longhouse::RecallOutcome {
+    with_recalls(recalls, |recalls| {
+        let recall = recalls
+            .entry(title_id)
+            .or_insert_with(|| ocean_longhouse::RecallVote::new(title_id, threshold));
+        recall.cast(voter_id)
+    })
+}
+
+fn remove_recall_tally(recalls: &RecallRegistryHandle, title_id: Uuid) {
+    with_recalls(recalls, |recalls| {
+        recalls.remove(&title_id);
+    });
+}
+
 // --- Turn-intake backpressure (OCEAN-304) -----------------------------------
 //
 // Both turn-intake paths (`POST /v1/agent/turns` and `POST /v1/requests`)
@@ -788,7 +826,7 @@ async fn main() -> anyhow::Result<()> {
         rooms: Arc::new(Mutex::new(room_store)),
         titles: Arc::new(Mutex::new(title_registry)),
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
-        recalls: Arc::new(Mutex::new(HashMap::new())),
+        recalls: new_recall_registry(),
         persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         // OCEAN-371: daemon-wide failed-GC-sweep total surfaced at `/health` +
         // `/metrics`; incremented by the background GC task on a sweep failure.
@@ -4879,20 +4917,6 @@ async fn longhouse_revoke(
 //     via `warn`; the daemon escalates to a hard `revoke` once the strike count
 //     reaches the threshold — the existing graduated model, now actually driven.
 
-/// Run a closure with the locked recall registry, recovering a poisoned lock the
-/// same way the other longhouse handlers do. Synchronous: the guard drops before
-/// this returns, so no `await` is held across it.
-fn with_recalls<T>(
-    state: &AppState,
-    f: impl FnOnce(&mut HashMap<Uuid, ocean_longhouse::RecallVote>) -> T,
-) -> T {
-    let mut guard = match state.recalls.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    f(&mut guard)
-}
-
 /// The strike count at which the daemon escalates a graduated policy-breach to a
 /// hard recall. Three strikes is the documented graduated default ("warn twice,
 /// pull on the third"); a true zero-tolerance breach uses `revoke` directly.
@@ -4987,12 +5011,7 @@ async fn longhouse_recall(
     // the threshold fixed there). The threshold on later requests is ignored — it
     // cannot be lowered to forge a quick carry.
     let threshold = req.threshold.unwrap_or(0); // RecallVote clamps 0 → 1
-    let outcome = with_recalls(&state, |recalls| {
-        let recall = recalls
-            .entry(title.title_id)
-            .or_insert_with(|| ocean_longhouse::RecallVote::new(title.title_id, threshold));
-        recall.cast(voter_id)
-    });
+    let outcome = cast_recall_vote(&state.recalls, title.title_id, voter_id, threshold);
 
     // Pending → report the running count. Not carried: the title is untouched.
     if let ocean_longhouse::RecallOutcome::Pending { votes, threshold } = outcome {
@@ -5022,7 +5041,7 @@ async fn longhouse_recall(
         Ok(revocation) => {
             // Drop the now-spent tally so a re-opened recall on a fresh title is
             // not shadowed by a carried one.
-            with_recalls(&state, |recalls| recalls.remove(&title.title_id));
+            remove_recall_tally(&state.recalls, title.title_id);
             tracing::info!(
                 topic = %topic_id,
                 title = %revocation.title_id,
@@ -12722,7 +12741,7 @@ mod tests {
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
-            recalls: Arc::new(Mutex::new(HashMap::new())),
+            recalls: new_recall_registry(),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -14092,7 +14111,7 @@ mod tests {
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
-            recalls: Arc::new(Mutex::new(HashMap::new())),
+            recalls: new_recall_registry(),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -14717,7 +14736,7 @@ mod tests {
             rooms: Arc::new(Mutex::new(store)),
             titles: Arc::new(Mutex::new(titles)),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
-            recalls: Arc::new(Mutex::new(HashMap::new())),
+            recalls: new_recall_registry(),
             persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -14747,6 +14766,229 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, json)
+    }
+
+    #[test]
+    fn recall_registry_preserves_first_threshold_distinct_voters_and_latching() {
+        let recalls = new_recall_registry();
+        let title_id = esc_uid(80);
+        let voter_a = esc_uid(81);
+        let voter_b = esc_uid(82);
+        let voter_c = esc_uid(83);
+        let voter_d = esc_uid(84);
+
+        assert_eq!(
+            cast_recall_vote(&recalls, title_id, voter_a, 3),
+            ocean_longhouse::RecallOutcome::Pending {
+                votes: 1,
+                threshold: 3,
+            }
+        );
+        assert_eq!(
+            cast_recall_vote(&recalls, title_id, voter_a, 1),
+            ocean_longhouse::RecallOutcome::Pending {
+                votes: 1,
+                threshold: 3,
+            },
+            "a duplicate voter stays one credential and a later threshold cannot lower the first"
+        );
+        assert_eq!(
+            cast_recall_vote(&recalls, title_id, voter_b, 1),
+            ocean_longhouse::RecallOutcome::Pending {
+                votes: 2,
+                threshold: 3,
+            }
+        );
+        assert_eq!(
+            cast_recall_vote(&recalls, title_id, voter_c, 1),
+            ocean_longhouse::RecallOutcome::Carried { title_id, votes: 3 }
+        );
+        assert_eq!(
+            cast_recall_vote(&recalls, title_id, voter_d, usize::MAX),
+            ocean_longhouse::RecallOutcome::Carried { title_id, votes: 4 },
+            "the owner tally remains latched after carrying"
+        );
+    }
+
+    #[test]
+    fn recall_registry_zero_threshold_clamps_to_one_in_owner_engine() {
+        let recalls = new_recall_registry();
+        let title_id = esc_uid(85);
+        assert_eq!(
+            cast_recall_vote(&recalls, title_id, esc_uid(86), 0),
+            ocean_longhouse::RecallOutcome::Carried { title_id, votes: 1 }
+        );
+    }
+
+    #[test]
+    fn recall_registry_removes_only_the_named_tally() {
+        let recalls = new_recall_registry();
+        let title_a = esc_uid(87);
+        let title_b = esc_uid(88);
+        let _ = cast_recall_vote(&recalls, title_a, esc_uid(89), 2);
+        let _ = cast_recall_vote(&recalls, title_b, esc_uid(90), 2);
+
+        remove_recall_tally(&recalls, title_a);
+
+        with_recalls(&recalls, |tallies| {
+            assert!(!tallies.contains_key(&title_a));
+            assert!(tallies.contains_key(&title_b));
+            assert_eq!(tallies.len(), 1);
+        });
+    }
+
+    #[test]
+    fn recall_registry_recovers_a_poisoned_mutex_for_cast_and_remove() {
+        let recalls = new_recall_registry();
+        let poison_target = recalls.clone();
+        let poison = std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("poison recall registry for characterization");
+        });
+        assert!(poison.join().is_err());
+
+        let title_id = esc_uid(91);
+        assert_eq!(
+            cast_recall_vote(&recalls, title_id, esc_uid(92), 2),
+            ocean_longhouse::RecallOutcome::Pending {
+                votes: 1,
+                threshold: 2,
+            }
+        );
+        remove_recall_tally(&recalls, title_id);
+        with_recalls(&recalls, |tallies| assert!(tallies.is_empty()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recall_route_rejects_bad_or_unknown_coordinates_without_opening_tally() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let app = longhouse_routes().with_state(state.clone());
+
+        let (bad_status, bad_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/recall",
+            json!({
+                "topic_id": "not-a-uuid",
+                "firekeeper_id": esc_uid(93).to_string(),
+                "voter_id": esc_uid(94).to_string(),
+                "threshold": 2,
+            }),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            bad_body,
+            json!({
+                "ok": false,
+                "error": "`topic_id` is not a valid UUID: \"not-a-uuid\"",
+            })
+        );
+
+        let topic_id = esc_uid(95);
+        let firekeeper_id = esc_uid(96);
+        let (missing_status, missing_body) = post_json(
+            app,
+            "/v1/longhouse/recall",
+            json!({
+                "topic_id": topic_id.to_string(),
+                "firekeeper_id": firekeeper_id.to_string(),
+                "voter_id": esc_uid(97).to_string(),
+                "threshold": 2,
+            }),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing_body,
+            json!({
+                "ok": false,
+                "error": format!(
+                    "no live firekeeper title for topic '{topic_id}' held by '{firekeeper_id}'"
+                ),
+            })
+        );
+        with_recalls(&state.recalls, |tallies| assert!(tallies.is_empty()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recall_route_preserves_pending_threshold_and_removes_only_after_successful_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let topic_id = esc_uid(98);
+        let firekeeper_id = esc_uid(99);
+        let voter_a = esc_uid(100);
+        let voter_b = esc_uid(101);
+        let title_id = with_titles(&state, |titles| {
+            titles
+                .grant(topic_id, firekeeper_id, AgentRole::Firekeeper, 0)
+                .unwrap()
+                .0
+                .title_id
+        });
+        let app = longhouse_routes().with_state(state.clone());
+
+        let recall_body = |voter_id: Uuid, threshold: usize| {
+            json!({
+                "topic_id": topic_id.to_string(),
+                "firekeeper_id": firekeeper_id.to_string(),
+                "voter_id": voter_id.to_string(),
+                "threshold": threshold,
+            })
+        };
+
+        let (first_status, first_body) =
+            post_json(app.clone(), "/v1/longhouse/recall", recall_body(voter_a, 2)).await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(
+            first_body,
+            json!({
+                "ok": true,
+                "carried": false,
+                "title_id": title_id,
+                "votes": 1,
+                "threshold": 2,
+            })
+        );
+
+        let (duplicate_status, duplicate_body) =
+            post_json(app.clone(), "/v1/longhouse/recall", recall_body(voter_a, 1)).await;
+        assert_eq!(duplicate_status, StatusCode::OK);
+        assert_eq!(duplicate_body["votes"], json!(1));
+        assert_eq!(
+            duplicate_body["threshold"],
+            json!(2),
+            "a later request cannot lower the first tally threshold"
+        );
+
+        let (carried_status, carried_body) =
+            post_json(app.clone(), "/v1/longhouse/recall", recall_body(voter_b, 1)).await;
+        assert_eq!(carried_status, StatusCode::OK);
+        assert_eq!(
+            carried_body,
+            json!({
+                "ok": true,
+                "carried": true,
+                "title_id": title_id,
+                "topic_id": topic_id,
+                "agent_id": firekeeper_id,
+                "reason": "hard recall: quorum-of-recall: 2 no-confidence votes",
+            })
+        );
+        with_recalls(&state.recalls, |tallies| assert!(tallies.is_empty()));
+        assert_eq!(
+            with_titles(&state, |titles| titles
+                .lookup(title_id)
+                .unwrap()
+                .unwrap()
+                .status),
+            ocean_longhouse::TitleStatus::Revoked
+        );
+
+        let (closed_status, _) =
+            post_json(app, "/v1/longhouse/recall", recall_body(esc_uid(102), 1)).await;
+        assert_eq!(closed_status, StatusCode::NOT_FOUND);
+        with_recalls(&state.recalls, |tallies| assert!(tallies.is_empty()));
     }
 
     // THE CORE OCEAN-272 PROPERTY, through the daemon: a firekeeper title minted +
