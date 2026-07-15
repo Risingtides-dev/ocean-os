@@ -19,6 +19,23 @@ approved design or permission to alter public contracts.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
       executable drift checks rather than prose-only synchronization.
 
+## Harness evolution
+
+The source-researched mechanism inventory and dated implementation matrix live in
+[`docs/specs/2026-07-03-omp-port-map.md`](docs/specs/2026-07-03-omp-port-map.md).
+Ocean ports mechanisms into current owners rather than reproducing OMP package boundaries.
+
+- [ ] Reconcile the harness-profile contract: decide which capabilities are surface-scoped,
+      then carry that policy through runtime composition instead of leaving logged-only flags.
+- [ ] Bound and attribute the post-turn advisor before broadening it: source turn identity,
+      timeout/concurrency policy, observable outcome, and truthful usage/failure accounting.
+- [ ] Make the default-on Longhouse pre-turn consult inspectable and tune relevance while
+      preserving its read-only, permission-neutral, fail-open boundary.
+- [ ] Implement the command-output minimizer, then a shared walker/search substrate, as
+      independent reviewed checkpoints over existing artifact and capability seams.
+- [ ] Route isolation, task dispatch, typed yields, joins, budgets, and orchestration policy
+      through the approved extension architecture; do not revive their superseded core placement.
+
 ## Reliability and scale
 
 - [ ] Design a bounded policy for the runtime-to-daemon per-turn event channel;

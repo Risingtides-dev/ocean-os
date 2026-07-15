@@ -3313,3 +3313,17 @@ Verification:
 - `cargo fmt --all -- --check`
 - `git diff --check`
 _________________________________________________________________________________
+
+time:      [07:14pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-omp-program-20260715]
+type:      [documentation]: refresh OMP port status and route the continuation program
+area:      [architecture]: harness, advisor, Longhouse consult, extension boundary
+
+Re-audited the OMP-to-Ocean mechanism map against current source and replaced the stale 2026-07-05 snapshot with an explicit W0-W7 matrix: W1 built, W2 strong partial, W5 substantial partial, W6 absent, and the original W7 core placement superseded by extension ownership. Corrected the old claims that the hashline no-op guard was dead, grep was substring-only, LSP and memory were unwired, TUI streaming mechanisms were absent, and compaction only dropped history. Indexed the map as an implementation reference rather than current architecture, and routed the open program through a concise ROADMAP sequence covering effective profile policy, bounded/attributed advisor work, inspectable Longhouse preparation, minimizer plus shared search, and extension-owned orchestration.
+
+Verification:
+- `cargo xtask docs-check` passed (26 packages, 113 active Markdown files, 122 local links)
+- `git diff --check` passed
+- fresh source-backed documentation review found no factual, classification, or ownership-boundary issue
+_________________________________________________________________________________
