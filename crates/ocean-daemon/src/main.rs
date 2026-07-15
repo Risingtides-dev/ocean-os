@@ -13721,6 +13721,82 @@ mod tests {
         None
     }
 
+    #[tokio::test]
+    async fn call_runner_exposes_no_tools_even_when_operator_yolo_is_on() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_CALL_CWD",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = fake_convene_state(&tmp);
+        std::env::set_var("OCEAN_MODEL", ocean_runtime::FAKE_TOOL_MODEL);
+        std::env::set_var("OCEAN_CALL_CWD", tmp.path());
+        state.runtime = Arc::new(AgentRuntime::from_env().expect("fake-tool runtime"));
+
+        let target = std::path::Path::new(ocean_runtime::FAKE_TOOL_TARGET_PATH);
+        let _ = std::fs::remove_file(target);
+        let mut runner = DaemonTurnRunner::new(state.clone(), "safe-call".into());
+
+        let first = ocean_call::TurnRunner::run(&mut runner, "try the write").await;
+        assert_eq!(
+            first.expect("call turn must complete safely").trim(),
+            "done"
+        );
+        assert!(!target.exists(), "the unavailable write tool must not run");
+        assert!(
+            state.permissions.read().await.is_empty(),
+            "zero exposed capabilities must not create a permission waiter"
+        );
+
+        let session_id = runner.session_id.expect("call turn must persist a session");
+        let detail = state
+            .runtime
+            .session_detail(session_id)
+            .expect("call session must be readable");
+        assert_eq!(detail.client_type.as_deref(), Some("call-voice"));
+        let attempted_write = detail.tool_context.iter().any(|entry| {
+            entry.kind == "call"
+                && entry.tool_call_id == ocean_runtime::FAKE_TOOL_CALL_ID
+                && entry.tool_name == "write"
+        });
+        let unavailable_result = detail.tool_context.iter().any(|entry| {
+            entry.kind == "result"
+                && entry.tool_call_id == ocean_runtime::FAKE_TOOL_CALL_ID
+                && entry.tool_name == "write"
+                && entry.is_error == Some(true)
+                && entry.text == "unknown tool: write"
+        });
+        assert!(
+            attempted_write,
+            "the adversarial provider's call must persist"
+        );
+        assert!(
+            unavailable_result,
+            "the persisted result must prove write was not an exposed capability"
+        );
+
+        let second = ocean_call::TurnRunner::run(&mut runner, "try again").await;
+        assert_eq!(
+            second
+                .expect("second call turn must complete safely")
+                .trim(),
+            "done"
+        );
+        assert_eq!(
+            runner.session_id,
+            Some(session_id),
+            "one call runner must reuse its lazily-created session"
+        );
+        assert!(
+            !target.exists(),
+            "session reuse must not weaken the boundary"
+        );
+        assert!(state.permissions.read().await.is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn at_mention_queues_turn_and_posts_reply_back() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;

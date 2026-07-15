@@ -3139,3 +3139,12 @@ type:      [feature-request]
 area:      [backend]
 
 Added the additive propose-only Realtime Voice Planner mint contract. Planner context is validated against daemon-owned registered projects and canonical live worktrees before credential lookup; planner sessions advertise only the strict bounded propose_handoff schema. The existing session-message route now truthfully marks planner handoffs without starting a turn.
+
+_________________________________________________________________________________
+time:      [01:00pm] [14-07-26]
+agent:     [worker], [openai]
+worktree:  /private/tmp/ocean-os-voice-planner-20260714
+type:      [test]
+area:      [backend]: ocean-daemon call-voice safety
+
+Added an executable regression through the real DaemonTurnRunner using the keyless adversarial fake-tool provider with operator YOLO enabled. The test proves call turns still expose zero capabilities: the scripted write remains unexecuted, no permission waiter is registered, the persisted call session records an unknown-tool error, and a second answer reuses the same session without weakening the boundary.
