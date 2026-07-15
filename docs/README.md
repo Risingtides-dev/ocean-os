@@ -51,6 +51,10 @@ plans, extraction manifests, benchmarks, and characterization reports. Their
 presence does not mean an item is current or unimplemented. Read the status in
 the document and verify source before using one as a work order.
 
+Active plans:
+
+- [`specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md) — approved extension architecture, ownership boundaries, accepted Phase 0 evidence, and staged migration gates; Phase 1 is next.
+
 Completed extraction manifests are retained evidence, not independent work orders. The broader behavior-neutral daemon refactor remains active under `DAEMON_REFACTOR_MISSION.md`; consult its progress section and the current code-health plan before selecting the next checkpoint.
 
 ## Historical archive

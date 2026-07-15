@@ -285,40 +285,153 @@ mod tests {
         assert!(parsed.hooks.stop[0].enabled);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn block_decision_stops_chain() {
+    async fn hook_chain_characterizes_process_context_and_control_flow() {
+        use std::sync::OnceLock;
+
+        static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        const ENV_KEY: &str = "OCEAN_HOOKS_PHASE0_INHERITED_ENV";
+
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(previous) = &self.0 {
+                    std::env::set_var(ENV_KEY, previous);
+                } else {
+                    std::env::remove_var(ENV_KEY);
+                }
+            }
+        }
+
+        let _lock = ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let previous = std::env::var_os(ENV_KEY);
+        std::env::set_var(ENV_KEY, "inherited-hook-value");
+        let _env = EnvGuard(previous);
+
         let dir = tempfile::tempdir().unwrap();
-        let blocker = dir.path().join("block.sh");
+        let fixture = dir.path().join("hook-fixture.sh");
+        let order = dir.path().join("order.txt");
+        let payload = dir.path().join("payload.json");
+        let observed_cwd = dir.path().join("cwd.txt");
+        let observed_env = dir.path().join("env.txt");
+        let disabled = dir.path().join("disabled.txt");
+        let after_block = dir.path().join("after-block.txt");
         std::fs::write(
-            &blocker,
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"decision\":\"block\",\"reason\":\"mention pending\"}'\n",
+            &fixture,
+            r#"#!/bin/sh
+mode=$1
+order=$2
+case "$mode" in
+  capture)
+    printf '%s\n' capture >> "$order"
+    pwd > "$3"
+    cat > "$4"
+    printf '%s' "$OCEAN_HOOKS_PHASE0_INHERITED_ENV" > "$5"
+    ;;
+  fail)
+    cat >/dev/null
+    printf '%s\n' fail >> "$order"
+    printf '%s\n' 'fixture failure' >&2
+    exit 7
+    ;;
+  block)
+    cat >/dev/null
+    printf '%s\n' block >> "$order"
+    printf '%s' '{"decision":"block","reason":"phase zero block"}'
+    ;;
+  disabled|after-block)
+    cat >/dev/null
+    printf '%s' reached > "$3"
+    ;;
+esac
+"#,
         )
         .unwrap();
-        make_executable(&blocker);
+        make_executable(&fixture);
 
-        let config = HooksConfig {
-            stop: vec![HookCommand {
-                command: blocker.to_string_lossy().to_string(),
-                args: vec![],
-                timeout_secs: 5,
-                enabled: true,
-            }],
+        let command = |mode: &str, extra: Vec<String>, enabled: bool| HookCommand {
+            command: fixture.to_string_lossy().into_owned(),
+            args: std::iter::once(mode.to_string())
+                .chain(std::iter::once(order.to_string_lossy().into_owned()))
+                .chain(extra)
+                .collect(),
+            timeout_secs: 5,
+            enabled,
         };
-        let result = run_hooks(
-            &config,
-            HookEvent::Stop,
-            &HookContext::new(dir.path().to_string_lossy(), "ses_test"),
-            false,
-        )
-        .await;
+        let config = HooksConfig {
+            stop: vec![
+                command(
+                    "capture",
+                    vec![
+                        observed_cwd.to_string_lossy().into_owned(),
+                        payload.to_string_lossy().into_owned(),
+                        observed_env.to_string_lossy().into_owned(),
+                    ],
+                    true,
+                ),
+                command(
+                    "disabled",
+                    vec![disabled.to_string_lossy().into_owned()],
+                    false,
+                ),
+                command("fail", vec![], true),
+                command("block", vec![], true),
+                command(
+                    "after-block",
+                    vec![after_block.to_string_lossy().into_owned()],
+                    true,
+                ),
+            ],
+        };
+        let mut context = HookContext::new(dir.path().to_string_lossy(), "ses_phase0");
+        context
+            .metadata
+            .insert("source".to_string(), serde_json::json!("fixture"));
+
+        let result = run_hooks(&config, HookEvent::Stop, &context, true).await;
 
         assert_eq!(
             result.outcome,
             HookOutcome::Block {
-                reason: "mention pending".to_string()
+                reason: "phase zero block".to_string()
             }
         );
-        assert!(result.warnings.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("exited with status"));
+        assert!(result.warnings[0].contains("fixture failure"));
+        assert_eq!(
+            std::fs::read_to_string(&order).unwrap(),
+            "capture\nfail\nblock\n"
+        );
+        assert!(!disabled.exists(), "disabled hook must not run");
+        assert!(
+            !after_block.exists(),
+            "block must short-circuit later hooks"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&observed_cwd).unwrap().trim(),
+            std::fs::canonicalize(dir.path()).unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&observed_env).unwrap(),
+            "inherited-hook-value"
+        );
+        let observed_payload: HookPayload =
+            serde_json::from_slice(&std::fs::read(&payload).unwrap()).unwrap();
+        assert_eq!(
+            observed_payload,
+            HookPayload {
+                hook_event_name: "Stop".to_string(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                session_id: "ses_phase0".to_string(),
+                stop_hook_active: true,
+                metadata: BTreeMap::from([("source".to_string(), serde_json::json!("fixture"))]),
+            }
+        );
     }
 
     #[tokio::test]
