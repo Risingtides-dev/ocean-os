@@ -2,7 +2,7 @@
 
 **Status:** Active, green, and shipping in bounded checkpoints
 **Updated:** 2026-07-15
-**Published implementation:** `ee3860a`
+**Published implementation:** `3e051c1`
 **Scope:** `crates/ocean-daemon`
 
 ## Mission
@@ -34,7 +34,7 @@ No extraction may introduce a public daemon library, service-trait architecture,
 - `GET /health` remains the liveness path.
 - All 72 explicit method/path pairs remain synchronized with `GET /` discovery and the operator guide.
 - Axum's default 404/405 behavior and global HTTP-tracing/CORS order remain stable.
-- Turns execute in the caller's cwd; daemon process cwd is never the turn fallback.
+- Caller-submitted HTTP turns execute in the caller's cwd; daemon process cwd is never their fallback. Internal auto-convene for a legacy persistent room with no workspace binding retains the existing neutral daemon cwd fallback until a separately approved workspace-binding migration; the startup guard still forbids repository cwd.
 - Runtime permission gates remain authoritative.
 - Session persistence remains owned by `ocean-agent`.
 - Agent SSE replay remains bounded by 2,048 events and 32 MiB, with full live delivery and visible lag signals.
@@ -72,17 +72,18 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Component interaction fulfillment | Complete | Private `src/component_interaction.rs`; exact HTTP validation, scoped runtime-registry lookup, remove-before-send delivery, and 200/400/404/410/500 envelopes frozen by five direct tests |
 | Model roles | Complete | Private `src/model_roles.rs`; once-at-startup fail-open config loading plus exact turn/advisor precedence and verbatim string behavior frozen by focused tests |
 | Request/permission control records | Published | Private `src/request_control.rs`; PR #286 merged as `ee3860a` after characterization, extraction, dedicated-target gates, fresh reviews, and hosted CI; policy, token verification, HTTP/events, GC scheduling, and shutdown drain stay in composition; live daemon supervision/deployment is owned by the concurrent operator workstream |
-| Recall tally registry | Ready for publication | Private `src/recall_registry.rs`; first-threshold ownership, distinct-voter semantics, zero clamp, poison recovery, exact HTTP responses, persisted revocation, and successful-only cleanup are characterized; full dedicated-target gates and two fresh reviews passed; hosted CI and merge remain |
-| Persistent rooms, Longhouse, calls, remaining registries | Later domain waves | One reviewed domain at a time |
+| Recall tally registry | Published | Private `src/recall_registry.rs`; first-threshold ownership, distinct-voter semantics, zero clamp, poison recovery, exact HTTP responses, persisted revocation, and successful-only cleanup were characterized; dedicated-target gates, two fresh reviews, hosted CI, and PR #287 merge `3e051c1` passed |
+| Persistent rooms | Characterizing | Exact HTTP envelopes/defaults, trigger event/audit/spawn ordering, closed-room audit asymmetry/paging, poison recovery, and static/dynamic route precedence are the next bounded checkpoint |
+| Longhouse, calls, remaining registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
 At this checkpoint, `main.rs` is approximately 20.4k lines after concurrent permission-mode coverage plus the expanded request and recall lifecycle characterization suites landed. CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model catalog and roles, security-sensitive settings, the home-sandboxed filesystem surface, project-registry adapters, Slack Canvas host fulfillment, component-interaction fulfillment, request/permission control records, and recall tally storage now have independent private owners. The 238-line request-control module owns storage mechanics and exact bounded transitions only. The 52-line recall-registry module owns memory-only tally construction, casting, poison recovery, and named removal only; live-title lookup, persisted escrow, the daemon-held Revoker, HTTP mapping, and successful-only cleanup ordering remain in composition. Characterization tests deliberately keep checked contracts visible even when they increase raw line count.
 
 ## Course from here
 
-1. Publish the recall-registry checkpoint, then move one remaining state registry or control-plane domain at a time before turn/SSE orchestration.
+1. Complete the persistent-room characterization and bounded extraction, then move one remaining state registry or control-plane domain at a time before turn/SSE orchestration.
 2. Keep filesystem/project policy, permission authority, settings policy, host/extension ownership, and call-site orchestration fixed while domain boundaries move.
-3. Move persistent rooms next, then Longhouse and calls, only with explicit lifecycle/persistence manifests.
+3. Move Longhouse and calls after persistent rooms, only with explicit lifecycle/persistence manifests.
 4. Move turn/SSE orchestration last.
 5. Request separate Phase 3 approval before splitting `AppState`, generating route metadata, creating a daemon library, or redesigning internal service boundaries.
 
@@ -117,5 +118,6 @@ A wave is complete only when:
 - [Model-roles extraction manifest](specs/2026-07-15-ocean-daemon-model-roles-extraction-manifest.md)
 - [Request-control extraction manifest](specs/2026-07-15-ocean-daemon-request-control-extraction-manifest.md)
 - [Recall-registry extraction manifest](specs/2026-07-15-ocean-daemon-recall-registry-extraction-manifest.md)
+- [Persistent-rooms extraction manifest](specs/2026-07-15-ocean-daemon-persistent-rooms-extraction-manifest.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)

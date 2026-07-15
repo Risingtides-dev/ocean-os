@@ -43,7 +43,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 ## Work Guidance
 
 - Keep HTTP/SSE contracts stable for both `ocean-tui` and `ocean-surface`.
-- Turns execute in the caller's cwd; never pin resumed turns to the daemon launch cwd or the first session cwd.
+- Caller-submitted and resumed turns execute in the caller's cwd; never pin them to the daemon launch cwd or the first session cwd. Internal auto-convene for a legacy persistent room with no workspace binding retains its existing neutral daemon cwd compatibility fallback until a separately approved migration; startup rejects repository cwd.
 - Build from up-to-date `main` before daemon restarts when doing operator work.
 - Prefer narrow route tests for API behavior and workspace checks before merge.
 

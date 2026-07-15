@@ -3326,6 +3326,22 @@ Verification:
 - `cargo xtask docs-check` passed (26 packages, 113 active Markdown files, 122 local links)
 - `git diff --check` passed
 - fresh source-backed documentation review found no factual, classification, or ownership-boundary issue
+time:      [07:19pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [pi/daemon-persistent-rooms-20260715]
+type:      [refactor]: characterize persistent-room extraction boundary
+area:      [backend]: ocean-daemon Phase 2C durable room adapter
+
+Added the persistent-room extraction manifest and daemon-level characterization for exact real-router create/list/detail/join/message/leave envelopes, serde defaults, custom versus Axum errors, store-error mapping, persisted-author/event/audit/spawn ordering, closed-room ordinary-read versus audit-read asymmetry, bounded cursor replay, shared-handle poison recovery, and retained static/dynamic route precedence. Reconciled the pre-existing internal unbound-room neutral-cwd compatibility fallback without weakening caller-submitted/resumed cwd policy, and updated merged recall PR #287 documentation to published merge `3e051c1`. No persistent-room production body has moved yet, and `ocean-store` retains schema/transaction/paging authority.
+
+Verification:
+- focused persistent-room HTTP, poison, trigger, paging, route-precedence, and route-retirement tests passed
+- all 343 daemon tests passed serialized
+- all 38 `ocean-store` tests passed
+- `cargo fmt --all -- --check`
+- `cargo xtask docs-check` (26 packages, 114 active Markdown files, 120 links)
+- `git diff --check`
+- two fresh characterization/boundary re-reviews: PASS, no unresolved medium-or-higher issue
 _________________________________________________________________________________
 
 time:      [07:37pm] [15-07-26]

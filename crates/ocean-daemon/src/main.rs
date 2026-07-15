@@ -12027,23 +12027,457 @@ mod tests {
         assert!(parse_mentions("email me @ work").is_empty());
     }
 
+    /// The runtime assertions prove the emitted payload and final transcript;
+    /// this source-order characterization closes the otherwise-unobservable
+    /// synchronous seam between `AgentEventBus::emit`, the audit append, and the
+    /// non-awaited spawn. It is intentionally updated to read the owning private
+    /// module when the production body moves mechanically.
     #[test]
-    fn room_store_error_maps_to_expected_status() {
+    fn room_post_message_source_preserves_persist_event_audit_spawn_order() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn room_post_message(")
+            .expect("room_post_message production body must exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n}\n\n/// Extract `@id` mentions")
+            .expect("room_post_message body terminator must remain identifiable");
+        let body = &tail[..end];
+
+        let persisted_author = body
+            .find("\n    let append = with_rooms(&state")
+            .expect("author append must stay in the handler");
+        let emitted_event = body
+            .find("\n            state.agent_events.emit(")
+            .expect("room_trigger event emission must stay in the handler");
+        let appended_audit = body
+            .find("\n            let _ = with_rooms(&state")
+            .expect("auto-convene audit append must stay in the handler");
+        let spawned_turn = body
+            .find("\n            spawn_room_agent_turn(state.clone()")
+            .expect("room-agent turn spawn must stay in the handler");
+
+        assert!(
+            persisted_author < emitted_event
+                && emitted_event < appended_audit
+                && appended_audit < spawned_turn,
+            "required order is persisted author row → emitted event → audit row → spawn"
+        );
+    }
+
+    #[test]
+    fn room_store_error_maps_to_exact_status_and_envelope() {
         use ocean_store::RoomStoreError;
-        let (s, _) = room_store_error_response(RoomStoreError::BadKey("".into()));
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-        let (s, _) = room_store_error_response(RoomStoreError::UnknownRoom(RoomKey::new("x")));
-        assert_eq!(s, StatusCode::NOT_FOUND);
-        let (s, _) = room_store_error_response(RoomStoreError::AlreadyExists(RoomKey::new("x")));
-        assert_eq!(s, StatusCode::CONFLICT);
-        let (s, _) = room_store_error_response(RoomStoreError::UnknownParticipant {
-            room: RoomKey::new("x"),
-            participant: "p".into(),
+
+        let cases = [
+            (
+                RoomStoreError::BadKey("".into()),
+                StatusCode::BAD_REQUEST,
+                "invalid room key ''; must be non-empty".to_string(),
+            ),
+            (
+                RoomStoreError::UnknownRoom(RoomKey::new("x")),
+                StatusCode::NOT_FOUND,
+                "no room with key 'x'".to_string(),
+            ),
+            (
+                RoomStoreError::AlreadyExists(RoomKey::new("x")),
+                StatusCode::CONFLICT,
+                "room 'x' already exists".to_string(),
+            ),
+            (
+                RoomStoreError::UnknownParticipant {
+                    room: RoomKey::new("x"),
+                    participant: "p".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "room 'x' has no participant 'p'".to_string(),
+            ),
+            (
+                RoomStoreError::Db(rusqlite::Error::QueryReturnedNoRows),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sqlite error: Query returned no rows".to_string(),
+            ),
+            (
+                RoomStoreError::Encode("boom".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encode error: boom".to_string(),
+            ),
+        ];
+
+        for (err, expected_status, expected_error) in cases {
+            let (status, Json(body)) = room_store_error_response(err);
+            assert_eq!(status, expected_status);
+            assert_eq!(
+                body,
+                json!({ "ok": false, "error": expected_error }),
+                "the mapper owns an exact two-key typed error envelope"
+            );
+        }
+    }
+
+    /// Send one request through the exact persistent-room router mounted by
+    /// `main()`, retaining the raw body so Axum extractor rejection text is part
+    /// of the adapter contract rather than being bypassed by direct handler calls.
+    async fn persistent_room_http_request(
+        app: Router,
+        method: axum::http::Method,
+        uri: &str,
+        body: Option<String>,
+        json_content_type: bool,
+    ) -> (StatusCode, Option<String>, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt as _;
+
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if json_content_type {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        let request = builder
+            .body(axum::body::Body::from(body.unwrap_or_default()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            content_type,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
+    }
+
+    fn persistent_room_http_json(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).unwrap_or_else(|error| {
+            panic!("persistent-room response was not JSON ({error}): {raw:?}")
+        })
+    }
+
+    fn assert_json_object_keys(value: &serde_json::Value, expected: &[&str]) {
+        let mut actual: Vec<&str> = value
+            .as_object()
+            .expect("JSON value must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    /// Characterize the ordinary persistent-room HTTP lifecycle through Axum:
+    /// exact envelopes/statuses, key/workspace normalization, serde actor-kind
+    /// defaults, transcript exclusion from list, and dense join→message→leave
+    /// ordering all survive the later mechanical module move.
+    #[tokio::test]
+    async fn persistent_room_http_lifecycle_preserves_envelopes_and_ordering() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let app = room_routes().with_state(fake_convene_state(&tmp));
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(
+                json!({
+                    "key": "  lifecycle-room  ",
+                    "name": "  Verbatim Room Name  ",
+                    "workspace_root": "   "
+                })
+                .to_string(),
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        let create = persistent_room_http_json(&raw);
+        assert_json_object_keys(&create, &["ok", "room"]);
+        assert_eq!(create["ok"], true);
+        assert_eq!(create["room"]["id"], "lifecycle-room");
+        assert_eq!(create["room"]["name"], "  Verbatim Room Name  ");
+        assert_eq!(create["room"]["participants"], json!([]));
+        assert!(create["room"].get("workspace_root").is_none());
+        assert!(create["room"].get("trigger_policy").is_none());
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list = persistent_room_http_json(&raw);
+        assert_json_object_keys(&list, &["ok", "rooms", "next_cursor", "has_more"]);
+        assert_eq!(list["ok"], true);
+        assert_eq!(list["rooms"].as_array().unwrap().len(), 1);
+        assert_eq!(list["rooms"][0]["id"], "lifecycle-room");
+        assert_eq!(list["rooms"][0]["name"], "  Verbatim Room Name  ");
+        assert!(list["rooms"][0].get("workspace_root").is_none());
+        assert!(list["rooms"][0].get("trigger_policy").is_none());
+        assert!(list["rooms"][0].get("transcript").is_none());
+        assert_eq!(list["next_cursor"], serde_json::Value::Null);
+        assert_eq!(list["has_more"], false);
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/lifecycle-room",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let detail = persistent_room_http_json(&raw);
+        assert_json_object_keys(&detail, &["ok", "room", "transcript"]);
+        assert_eq!(detail["ok"], true);
+        assert_eq!(detail["room"]["id"], "lifecycle-room");
+        assert_eq!(detail["room"]["name"], "  Verbatim Room Name  ");
+        assert!(detail["room"].get("workspace_root").is_none());
+        assert!(detail["room"].get("trigger_policy").is_none());
+        assert_eq!(detail["transcript"], json!([]));
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/lifecycle-room/participants",
+            Some(json!({ "id": "alice", "display_name": "Alice" }).to_string()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let join = persistent_room_http_json(&raw);
+        assert_json_object_keys(&join, &["ok", "room"]);
+        assert_eq!(join["ok"], true);
+        assert_eq!(join["room"]["id"], "lifecycle-room");
+        assert_eq!(join["room"]["participants"][0]["id"], "alice");
+        assert_eq!(join["room"]["participants"][0]["kind"], "human");
+        assert_eq!(join["room"]["participants"][0]["display_name"], "Alice");
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/lifecycle-room/messages",
+            Some(json!({ "author_id": "alice", "body": "hello room" }).to_string()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let posted = persistent_room_http_json(&raw);
+        assert_json_object_keys(&posted, &["ok", "message", "triggers_fired"]);
+        assert_eq!(posted["ok"], true);
+        assert_eq!(posted["message"]["seq"], 1);
+        assert_eq!(posted["message"]["author_id"], "alice");
+        assert_eq!(posted["message"]["author_kind"], "human");
+        assert_eq!(posted["message"]["kind"], "message");
+        assert_eq!(posted["message"]["body"], "hello room");
+        assert_eq!(posted["triggers_fired"], json!([]));
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::DELETE,
+            "/v1/rooms/persistent/lifecycle-room/participants/alice",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let leave = persistent_room_http_json(&raw);
+        assert_json_object_keys(&leave, &["ok", "room"]);
+        assert_eq!(leave["ok"], true);
+        assert_eq!(leave["room"]["id"], "lifecycle-room");
+        assert_eq!(leave["room"]["participants"], json!([]));
+
+        let (_, _, raw) = persistent_room_http_request(
+            app,
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/lifecycle-room",
+            None,
+            false,
+        )
+        .await;
+        let detail = persistent_room_http_json(&raw);
+        let transcript = detail["transcript"].as_array().unwrap();
+        assert_eq!(transcript.len(), 3);
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|row| row["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(transcript[0]["kind"], "participant_joined");
+        assert_eq!(transcript[1]["kind"], "message");
+        assert_eq!(transcript[1]["body"], "hello room");
+        assert_eq!(transcript[2]["kind"], "participant_left");
+    }
+
+    /// Characterize custom room errors independently from Axum's path/JSON/query
+    /// extractor rejections. The latter are raw text responses and must not be
+    /// accidentally wrapped or normalized during extraction.
+    #[tokio::test]
+    async fn persistent_room_http_errors_preserve_custom_and_axum_shapes() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let app = room_routes().with_state(fake_convene_state(&tmp));
+
+        let create = |key: &str| json!({ "key": key, "name": "Error Room" }).to_string();
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(create("   ")),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "invalid room key ''; must be non-empty" })
+        );
+
+        let (status, _, _) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(create("duplicate")),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(create("duplicate")),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "room 'duplicate' already exists" })
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/missing",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "no room with key 'missing'" })
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::DELETE,
+            "/v1/rooms/persistent/duplicate/participants/missing",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "room 'duplicate' has no participant 'missing'" })
+        );
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some("{\"key\":".to_string()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+        assert_eq!(
+            raw,
+            "Failed to parse the request body as JSON: key: EOF while parsing a value at line 1 column 7"
+        );
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent?limit=not-a-number",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+        assert_eq!(
+            raw,
+            "Failed to deserialize query string: limit: invalid digit found in string"
+        );
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app,
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/%20",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "invalid room key; must be non-empty" })
+        );
+    }
+
+    /// Both room-lock adapters deliberately recover `PoisonError` rather than
+    /// making a prior panic permanently disable HTTP, call persistence, and
+    /// LiveKit authorization. One poisoned handle must remain usable through
+    /// both entry points.
+    #[tokio::test]
+    async fn room_store_helpers_recover_one_poisoned_handle() {
+        use ocean_store::RoomStore as _;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let rooms = state.rooms.clone();
+        let poison_target = rooms.clone();
+        let panicked = std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("intentional room-store poison");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(rooms.is_poisoned());
+
+        let key = RoomKey::new("poison-recovery");
+        with_rooms_handle(&rooms, |store| {
+            store
+                .create(key.clone(), "Recovered", None, Utc::now())
+                .unwrap();
         });
-        assert_eq!(s, StatusCode::NOT_FOUND);
-        // Durable-backend failures are 500s, not misleading 4xx.
-        let (s, _) = room_store_error_response(RoomStoreError::Encode("boom".into()));
-        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        let recovered = with_rooms(&state, |store| store.get(&key).unwrap());
+        assert_eq!(recovered.unwrap().room.name, "Recovered");
+        assert!(
+            rooms.is_poisoned(),
+            "recovery does not hide the prior panic"
+        );
     }
 
     /// OCEAN-107: rooms + transcripts must survive a daemon restart. Open the
@@ -14244,6 +14678,9 @@ mod tests {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        // Subscribe before the post: the room_trigger notice must be emitted
+        // synchronously between the persisted author row and audit append.
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         // Room with an agent participant `helper` and an on_mention policy.
         let key = RoomKey::new("convene-room");
@@ -14282,15 +14719,83 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        let returned_message = &body.0["message"];
+        assert_eq!(returned_message["seq"], 1);
+        assert_eq!(returned_message["author_id"], "john");
+        assert_eq!(returned_message["author_kind"], "human");
+        assert_eq!(
+            returned_message["body"],
+            "@helper can you summarize the plan?"
+        );
         let fired = body
             .0
             .get("triggers_fired")
             .and_then(|v| v.as_array())
             .unwrap();
         assert_eq!(
-            fired.len(),
-            1,
+            fired,
+            &[json!({
+                "should_convene": true,
+                "target_participant": "helper",
+                "reason": "on_mention: @helper mentioned",
+            })],
             "mention of an agent must fire exactly one trigger"
+        );
+
+        let envelope = trigger_rx
+            .try_recv()
+            .expect("resolved Agent mention must emit room_trigger");
+        match envelope.event {
+            AgentTurnEvent::Extension {
+                extension,
+                payload,
+                scope,
+            } => {
+                assert_eq!(extension, "room_trigger");
+                assert_eq!(
+                    payload,
+                    json!({
+                        "room": "convene-room",
+                        "target": "helper",
+                        "reason": "on_mention: @helper mentioned",
+                        "triggered_by_seq": 1,
+                    })
+                );
+                assert_eq!(scope, None, "room triggers remain globally scoped");
+            }
+            other => panic!("expected room_trigger Extension event, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                trigger_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "one resolved mention emits exactly one trigger event"
+        );
+
+        // The event is followed synchronously by the audit append. The spawned
+        // turn may already have replied, but these first three persisted rows
+        // must stay densely ordered: join → author row → auto-convene audit.
+        let immediate = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert!(immediate.len() >= 3);
+        let returned: ocean_core::RoomMessage =
+            serde_json::from_value(returned_message.clone()).unwrap();
+        assert_eq!(
+            returned, immediate[1],
+            "the response message is the exact persisted author row"
+        );
+        assert_eq!(immediate[0].seq, 0);
+        assert_eq!(immediate[0].kind, RoomMessageKind::ParticipantJoined);
+        assert_eq!(immediate[1].seq, 1);
+        assert_eq!(immediate[1].author_id, "john");
+        assert_eq!(immediate[1].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[2].seq, 2);
+        assert_eq!(immediate[2].author_id, "system");
+        assert_eq!(immediate[2].author_kind, RoomParticipantKind::System);
+        assert_eq!(immediate[2].kind, RoomMessageKind::System);
+        assert_eq!(
+            immediate[2].body,
+            "auto-convene: helper (on_mention: @helper mentioned)"
         );
 
         // The convened turn runs async; its reply lands as an Agent-authored
@@ -14306,6 +14811,10 @@ mod tests {
             reply.body.contains("OCEAN_FAKE_OK"),
             "reply should carry the (fake) provider output, got: {:?}",
             reply.body
+        );
+        assert!(
+            reply.seq > 2,
+            "the spawned turn reply must follow the synchronous audit row"
         );
 
         // A session was queued/registered for the deterministic room+agent id.
@@ -14529,6 +15038,7 @@ mod tests {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         let key = RoomKey::new("no-loop-room");
         with_rooms(&state, |reg| {
@@ -14568,6 +15078,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["message"]["seq"], 1);
+        assert_eq!(body.0["message"]["author_id"], "helper");
+        assert_eq!(body.0["message"]["author_kind"], "agent");
         let fired = body
             .0
             .get("triggers_fired")
@@ -14576,6 +15089,23 @@ mod tests {
         assert!(
             fired.is_empty(),
             "an agent-authored message must never fire a trigger (anti-loop guard)"
+        );
+        assert!(
+            matches!(
+                trigger_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "agent-authored rows must emit no room_trigger event"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert_eq!(transcript.len(), 2, "join + agent row, with no audit row");
+        assert_eq!(transcript[1].seq, 1);
+        assert_eq!(transcript[1].body, "done — cc @helper @other");
+        assert!(
+            transcript
+                .iter()
+                .all(|row| !row.body.starts_with("auto-convene:")),
+            "agent-authored rows must write no auto-convene audit footprint"
         );
 
         // Give any errant spawned turn a moment; assert no turn was registered.
@@ -15443,6 +15973,7 @@ mod tests {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         // Room whose only non-author participant is a HUMAN, plus an on_mention
         // policy. Mentioning the human must convene nobody.
@@ -15470,7 +16001,7 @@ mod tests {
             .unwrap();
         });
 
-        let (status, _body) = room_post_message(
+        let (status, body) = room_post_message(
             State(state.clone()),
             Path("no-agent-room".to_string()),
             Json(RoomMessageRequest {
@@ -15481,6 +16012,34 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["message"]["seq"], 1);
+        assert_eq!(body.0["message"]["author_id"], "john");
+        assert_eq!(
+            body.0["triggers_fired"],
+            json!([{
+                "should_convene": true,
+                "target_participant": "dana",
+                "reason": "on_mention: @dana mentioned",
+            }]),
+            "raw policy matches stay observable even without a runnable Agent"
+        );
+        assert!(
+            matches!(
+                trigger_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "an unresolved/non-Agent policy match emits no room_trigger event"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert_eq!(transcript.len(), 2, "join + author row, with no audit row");
+        assert_eq!(transcript[1].seq, 1);
+        assert_eq!(transcript[1].body, "@dana what did you think?");
+        assert!(
+            transcript
+                .iter()
+                .all(|row| !row.body.starts_with("auto-convene:")),
+            "a non-Agent match writes no false convene audit footprint"
+        );
 
         // Give any errant spawned turn a moment, then assert nothing was queued.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -15784,6 +16343,192 @@ mod tests {
         assert!(all["next_seq"].is_null());
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// Soft close intentionally creates an HTTP asymmetry: ordinary list/detail
+    /// hide the room, while transcript/snapshot/events retain a bounded audit
+    /// view. Freeze the daemon fallback's `limit=0` floor and cursor semantics,
+    /// not `ocean-store`'s underlying SQL implementation.
+    #[tokio::test]
+    async fn closed_persistent_room_preserves_audit_http_asymmetry() {
+        use ocean_store::RoomStore as _;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("closed-audit");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "Closed Audit", None, Utc::now())
+                .unwrap();
+            store
+                .add_participant(
+                    &key,
+                    RoomParticipant {
+                        id: "alice".into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "Alice".into(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            for body in ["first", "second"] {
+                store
+                    .append_message(
+                        &key,
+                        "alice",
+                        RoomParticipantKind::Human,
+                        RoomMessageKind::Message,
+                        body,
+                        Utc::now(),
+                    )
+                    .unwrap();
+            }
+            store.close(&key).unwrap();
+        });
+        let app = room_routes().with_state(state);
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list = persistent_room_http_json(&raw);
+        assert_eq!(list["rooms"], json!([]));
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "no room with key 'closed-audit'" })
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/transcript?limit=0",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let first_page = persistent_room_http_json(&raw);
+        assert_json_object_keys(&first_page, &["ok", "transcript", "next_seq", "has_more"]);
+        assert_eq!(first_page["transcript"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page["transcript"][0]["seq"], 0);
+        assert_eq!(first_page["transcript"][0]["kind"], "participant_joined");
+        assert_eq!(first_page["has_more"], true);
+        assert_eq!(first_page["next_seq"], 0);
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/transcript?after_seq=0&limit=100",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let remainder = persistent_room_http_json(&raw);
+        assert_eq!(
+            remainder["transcript"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(remainder["transcript"][0]["body"], "first");
+        assert_eq!(remainder["transcript"][1]["body"], "second");
+        assert_eq!(remainder["has_more"], false);
+        assert!(remainder["next_seq"].is_null());
+        let mut paged = first_page["transcript"].as_array().unwrap().clone();
+        paged.extend(remainder["transcript"].as_array().unwrap().iter().cloned());
+        assert_eq!(
+            paged
+                .iter()
+                .map(|row| row["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "closed fallback paging replays every row once in ascending order"
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/snapshot?limit=100",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let snapshot = persistent_room_http_json(&raw);
+        assert_json_object_keys(
+            &snapshot,
+            &[
+                "ok",
+                "room",
+                "participants",
+                "transcript",
+                "last_seq",
+                "next_seq",
+                "has_more",
+            ],
+        );
+        assert_eq!(snapshot["ok"], true);
+        assert_eq!(snapshot["room"]["id"], "closed-audit");
+        assert_eq!(snapshot["room"]["name"], "Closed Audit");
+        let expected_participants = json!([{
+            "id": "alice",
+            "kind": "human",
+            "display_name": "Alice",
+        }]);
+        assert_eq!(snapshot["participants"], expected_participants);
+        assert_eq!(
+            snapshot["room"]["participants"], expected_participants,
+            "top-level and nested frozen rosters stay identical"
+        );
+        assert_eq!(
+            snapshot["transcript"],
+            serde_json::Value::Array(paged.clone())
+        );
+        assert_eq!(snapshot["last_seq"], 2);
+        assert_eq!(snapshot["has_more"], false);
+        assert!(snapshot["next_seq"].is_null());
+
+        let (status, _, raw) = persistent_room_http_request(
+            app,
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/events?limit=100",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events = persistent_room_http_json(&raw);
+        assert_json_object_keys(
+            &events,
+            &["ok", "events", "last_seq", "next_seq", "has_more"],
+        );
+        assert_eq!(events["ok"], true);
+        assert_eq!(events["events"], serde_json::Value::Array(paged));
+        assert_eq!(events["events"], snapshot["transcript"]);
+        assert_eq!(events["last_seq"], 2);
+        assert_eq!(events["has_more"], false);
+        assert!(events["next_seq"].is_null());
     }
 
     // ---- OCEAN-250: list endpoints are bounded + pageable ------------------
