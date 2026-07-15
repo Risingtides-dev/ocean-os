@@ -1,7 +1,7 @@
 # Ocean Daemon Request Control Extraction Manifest
 
 **Date:** 2026-07-15
-**Status:** Characterization pending; production extraction and final review not started
+**Status:** Ready for publication; local characterization, intact extraction, dedicated-target validation, and independent review passed; hosted CI, merge, and deployment pending
 **Owner:** Ocean OS
 **Rollback point:** `4f8b6dd`
 
@@ -150,6 +150,7 @@ cargo test -p ocean-daemon attach_request_handle -- --nocapture
 cargo test -p ocean-daemon cancel_permission_waiter -- --nocapture
 cargo test -p ocean-daemon permission_result -- --nocapture
 cargo test -p ocean-daemon control_terminal_helpers -- --nocapture
+cargo test -p ocean-daemon finish_ -- --nocapture
 cargo test -p ocean-daemon decision_ -- --nocapture
 cargo test -p ocean-daemon gc_ -- --nocapture
 RUST_TEST_THREADS=1 cargo test -p ocean-daemon
@@ -168,6 +169,7 @@ cargo test -p ocean-daemon attach_request_handle -- --nocapture
 cargo test -p ocean-daemon cancel_permission_waiter -- --nocapture
 cargo test -p ocean-daemon permission_result -- --nocapture
 cargo test -p ocean-daemon control_terminal_helpers -- --nocapture
+cargo test -p ocean-daemon finish_ -- --nocapture
 cargo test -p ocean-daemon decision_ -- --nocapture
 cargo test -p ocean-daemon gc_ -- --nocapture
 cargo test -p ocean-runtime permission -- --nocapture
@@ -187,9 +189,19 @@ The serial full-daemon command is recorded because upstream baseline `2c326bd`/`
 
 A fresh security/concurrency reviewer must compare every moved definition against the characterization commit, inspect parent field access and visibility, verify secret exclusion plus lock/await ordering, and report any unresolved medium-or-higher issue.
 
+## Characterization result
+
+Characterization commit `133a18b` introduced the two behavior-neutral seams and direct coverage for status-only snapshots, secret exclusion, caller-supplied/generated identity, linked cancellation tokens, exact initial fields, live duplicate replacement without cancellation/abort, missing-ID task detachment, matching/mismatched waiter consumption, exact permission messages and timestamp advancement, terminal timestamp/sender rules, all finish branches, session merging, exact cancellation text, both final timestamps, and handle consumption. Existing permission policy, decision-token, active-turn, GC, and bounded shutdown tests remained authoritative.
+
+All 329 daemon tests passed serialized with the focused request, permission, finish, decision, and GC groups green. Formatting, documentation, and diff checks passed in the dedicated target directory. A fresh security/concurrency review found no unresolved medium-or-higher characterization issue after its first review drove stronger live-task, timestamp, finish-path, and exact-message coverage.
+
 ## Result
 
-Pending characterization, extraction, validation, review, publication, and deployment.
+Extraction commit `87c3599` moved the two registry aliases, two control records, terminal helpers, status-only snapshots, registration/handle mechanics, waiter cancellation, and permission/finish transitions into private `request_control.rs`. Automated reviewer comparison found each executable body identical to characterization commit `133a18b` after normalizing only `pub(super)`, module imports, and rustfmt's multiline signature. The module is 238 lines and has no visibility outside the daemon binary.
+
+`AppState`, cancellation and decision handlers, verifier-before-removal ordering, `DaemonPermissionPolicy`, event emission, HTTP mapping, active-turn projection, GC constants/scheduling/failure accounting, shutdown task draining, and turn execution remain in `main.rs`. Registry locks are still released before waiter signaling or task-handle awaits. Decision tokens still live only in private controls/waiters and are absent from status snapshots and SSE payloads.
+
+Focused request/permission/finish/decision/GC checks, two focused runtime-permission tests, all 122 runtime unit tests plus integrations, all 155 agent tests, five router contracts, all 329 daemon tests serialized, workspace-test compilation, both supported daemon feature checks, formatting, documentation, and diff checks passed in the dedicated target directory. Feature builds are warning-free. Fresh parity/security review found no unresolved medium-or-higher issue. Push, default-parallel hosted CI, merge, and clean-main deployment remain pending.
 
 ## Rollback
 
