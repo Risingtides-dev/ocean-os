@@ -1,7 +1,7 @@
 # Ocean Daemon Model Roles Extraction Manifest
 
 **Date:** 2026-07-15
-**Status:** Characterization complete and independently reviewed; production extraction pending
+**Status:** Complete; characterization, intact extraction, dedicated-target validation, independent review, and merge CI passed
 **Owner:** Ocean OS
 **Rollback point:** `2c326bd`
 
@@ -131,11 +131,13 @@ A fresh reviewer must compare the moved definitions against the characterization
 
 ## Characterization result
 
-A behavior-neutral `load_model_roles` helper now holds the exact startup match on post-rebase baseline `2c326bd`, with its call at the same startup position. Three new tests freeze missing/malformed/invalid-whole-config fail-open behavior, verbatim aliases and keys, exact/case-sensitive lookup, blank alias behavior, and explicit-model precedence; existing advisor and role-precedence tests remain authoritative. Two loader tests, two role-resolution tests, advisor precedence, ten `ocean-agent` config tests, all five router contracts, all 313 daemon tests, formatting, documentation, and diff checks pass in a dedicated target directory. Independent review found no unresolved medium-or-higher issue.
+A behavior-neutral `load_model_roles` helper now holds the exact startup match on post-rebase baseline `2c326bd`, with its call at the same startup position. Three new tests freeze missing/malformed/invalid-whole-config fail-open behavior, verbatim aliases and keys, exact/case-sensitive lookup, blank alias behavior, and explicit-model precedence; existing advisor and role-precedence tests remain authoritative. Two loader tests, two role-resolution tests, advisor precedence, ten `ocean-agent` config tests, all five router contracts, all 320 post-rebase daemon tests when serialized, formatting, documentation, and diff checks pass in a dedicated target directory. Independent review found no unresolved medium-or-higher issue.
 
 ## Result
 
-Pending extraction, completion validation, final review, publication, and deployment.
+Private `model_roles.rs` now owns the three characterized helpers. Their executable bodies match characterization commit `014226e` exactly after normalizing only `pub(super)`, imports/type qualification, and formatting. Startup order, config-dir resolution, `AppState.roles`, turn/advisor call sites, warning branches, provider behavior, and event emission remain unchanged; the pre-existing normalization documentation now correctly stays with `advisor_note_if_actionable` in composition.
+
+Focused loader/resolver/advisor checks, ten agent-config tests, all 155 agent tests, all five router contracts, workspace-test compilation, both supported-feature checks, formatting, documentation, and diff checks passed in the dedicated target directory. The full 320-test daemon suite passed serialized. Default-parallel local runs exposed the inherited `OCEAN_CONFIG_DIR` race between `permission_test_state` and the YOLO precedence test on upstream baseline `2c326bd`; this extraction adds no environment mutation and independent review found it neither introduced nor worsened the race. GitHub's default-parallel macOS and Ubuntu checks, Rust 1.88 MSRV lane, and cargo-deny all passed. Fresh behavior/architecture review found no unresolved medium-or-higher extraction issue.
 
 ## Rollback
 
