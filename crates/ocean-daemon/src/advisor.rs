@@ -11,6 +11,14 @@ pub(super) const ADVISOR_CONCURRENCY_LIMIT: usize = 2;
 pub(super) const ADVISOR_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) type AdvisorLimiter = Arc<tokio::sync::Semaphore>;
 
+pub(super) struct AdvisorInput {
+    pub(super) timeout: Duration,
+    pub(super) turn_id: AgentTurnId,
+    pub(super) advisor_alias: String,
+    pub(super) operator_prompt: String,
+    pub(super) assistant_response: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct AdvisorEmission {
     pub(super) turn_id: AgentTurnId,
@@ -107,17 +115,20 @@ fn advisor_severity(note: &str) -> &'static str {
 pub(super) async fn execute_advisor<F, Fut, E>(
     limiter: AdvisorLimiter,
     metrics: Arc<TurnMetrics>,
-    timeout: Duration,
-    turn_id: AgentTurnId,
-    advisor_alias: String,
-    operator_prompt: String,
-    assistant_response: String,
+    input: AdvisorInput,
     complete: F,
 ) -> AdvisorExecution
 where
     F: FnOnce(String, String, String) -> Fut,
     Fut: Future<Output = Result<(String, String), E>>,
 {
+    let AdvisorInput {
+        timeout,
+        turn_id,
+        advisor_alias,
+        operator_prompt,
+        assistant_response,
+    } = input;
     let started = std::time::Instant::now();
     let _permit = match limiter.try_acquire_owned() {
         Ok(permit) => permit,
@@ -189,6 +200,16 @@ mod tests {
         Arc::new(tokio::sync::Semaphore::new(cap))
     }
 
+    fn input(timeout: Duration) -> AdvisorInput {
+        AdvisorInput {
+            timeout,
+            turn_id: AgentTurnId::new_v4(),
+            advisor_alias: "advisor".into(),
+            operator_prompt: "operator".into(),
+            assistant_response: "assistant".into(),
+        }
+    }
+
     #[test]
     fn production_bounds_are_fixed() {
         assert_eq!(ADVISOR_CONCURRENCY_LIMIT, 2);
@@ -230,18 +251,12 @@ mod tests {
     async fn emitted_payload_attributes_originating_turn() {
         let turn_id = AgentTurnId::new_v4();
         let metrics = Arc::new(TurnMetrics::default());
-        let result = execute_advisor(
-            limiter(2),
-            metrics.clone(),
-            Duration::from_secs(1),
-            turn_id,
-            "advisor-alias".into(),
-            "operator".into(),
-            "assistant".into(),
-            |_, _, _| async {
-                Ok::<_, &'static str>(("A real concern".into(), "resolved-model".into()))
-            },
-        )
+        let mut input = input(Duration::from_secs(1));
+        input.turn_id = turn_id;
+        input.advisor_alias = "advisor-alias".into();
+        let result = execute_advisor(limiter(2), metrics.clone(), input, |_, _, _| async {
+            Ok::<_, &'static str>(("A real concern".into(), "resolved-model".into()))
+        })
         .await;
 
         let AdvisorExecution::Emitted(emission) = result else {
@@ -265,11 +280,7 @@ mod tests {
         let result = execute_advisor(
             limiter.clone(),
             metrics.clone(),
-            Duration::from_millis(10),
-            AgentTurnId::new_v4(),
-            "advisor".into(),
-            "operator".into(),
-            "assistant".into(),
+            input(Duration::from_millis(10)),
             |_, _, _| std::future::pending::<Result<(String, String), &'static str>>(),
         )
         .await;
@@ -293,11 +304,7 @@ mod tests {
         let running = tokio::spawn(execute_advisor(
             limiter.clone(),
             metrics.clone(),
-            Duration::from_secs(1),
-            AgentTurnId::new_v4(),
-            "advisor".into(),
-            "operator".into(),
-            "assistant".into(),
+            input(Duration::from_secs(1)),
             move |_, _, _| async move {
                 let _ = started_tx.send(());
                 let _ = release_rx.await;
@@ -312,11 +319,7 @@ mod tests {
         let saturated = execute_advisor(
             limiter.clone(),
             metrics.clone(),
-            Duration::from_secs(1),
-            AgentTurnId::new_v4(),
-            "advisor".into(),
-            "operator".into(),
-            "assistant".into(),
+            input(Duration::from_secs(1)),
             move |_, _, _| {
                 invoked_for_call.store(true, Ordering::SeqCst);
                 async { Ok::<_, &'static str>(("NOTHING".into(), "model".into())) }
@@ -357,11 +360,7 @@ mod tests {
         let result = execute_advisor(
             limiter(2),
             metrics.clone(),
-            Duration::from_secs(1),
-            AgentTurnId::new_v4(),
-            "advisor".into(),
-            "operator".into(),
-            "assistant".into(),
+            input(Duration::from_secs(1)),
             |_, _, _| async {
                 Err::<(String, String), _>(SecretProviderError {
                     _secret: "must-never-be-formatted-or-logged",

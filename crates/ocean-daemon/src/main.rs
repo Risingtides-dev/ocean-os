@@ -121,7 +121,8 @@ mod workspace_policy;
 /// Operator YOLO preference, effective permission posture, and settings adapters.
 mod yolo_settings;
 use advisor::{
-    execute_advisor, AdvisorExecution, AdvisorLimiter, ADVISOR_CONCURRENCY_LIMIT, ADVISOR_TIMEOUT,
+    execute_advisor, AdvisorExecution, AdvisorInput, AdvisorLimiter, ADVISOR_CONCURRENCY_LIMIT,
+    ADVISOR_TIMEOUT,
 };
 use browser_stream::{input as browser_input, screencast_stream as browser_screencast};
 use component_interaction::component_event;
@@ -7358,11 +7359,13 @@ async fn agent_turn(
                         let execution = execute_advisor(
                             advisor_limiter,
                             metrics,
-                            ADVISOR_TIMEOUT,
-                            turn_id,
-                            advisor_alias,
-                            operator_prompt,
-                            assistant_text,
+                            AdvisorInput {
+                                timeout: ADVISOR_TIMEOUT,
+                                turn_id,
+                                advisor_alias,
+                                operator_prompt,
+                                assistant_response: assistant_text,
+                            },
                             move |alias, system, user| async move {
                                 runtime.complete_once(&alias, &system, &user).await
                             },
