@@ -101,6 +101,8 @@ mod model_catalog;
 mod model_roles;
 /// Project registry CRUD, pagination, git enrichment, and session association adapters.
 mod project_registry;
+/// In-memory request and permission control records plus bounded lifecycle mutations.
+mod request_control;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
 mod slack_canvas_fulfillment;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
@@ -125,6 +127,11 @@ use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
     project_get, project_patch, projects_list,
 };
+use request_control::{
+    attach_request_handle, cancel_permission_waiter, pending_permissions_snapshot,
+    register_running_request, requests_snapshot, update_request_finished,
+    update_request_permission_result, PermissionRegistry, PermissionWaiter, RequestRegistry,
+};
 use slack_canvas_fulfillment::{
     canvas_fulfillment_get, canvas_fulfillment_post, gc_canvas_fulfillments, CanvasFulfillmentStore,
 };
@@ -146,6 +153,8 @@ use project_registry::{
     parse_discovered_worktree_list, parse_worktree_list, CreateProjectRequest, PatchProjectRequest,
     ProjectsListQuery,
 };
+#[cfg(test)]
+use request_control::RequestControl;
 #[cfg(test)]
 use slack_canvas_fulfillment::{
     canvas_fulfillment_key_for_op, fulfilled_result_from_bridge, CanvasFulfillment,
@@ -308,9 +317,6 @@ type RevokerHandle = Arc<ocean_longhouse::Revoker>;
 /// the guard is dropped before any `await`, so it never blocks the scheduler.
 type RecallRegistryHandle = Arc<Mutex<HashMap<Uuid, ocean_longhouse::RecallVote>>>;
 
-type RequestRegistry = Arc<RwLock<HashMap<RequestId, RequestControl>>>;
-type PermissionRegistry = Arc<RwLock<HashMap<PermissionId, PermissionWaiter>>>;
-
 // --- Turn-intake backpressure (OCEAN-304) -----------------------------------
 //
 // Both turn-intake paths (`POST /v1/agent/turns` and `POST /v1/requests`)
@@ -361,31 +367,6 @@ fn max_concurrent_turns() -> usize {
     }
 }
 
-struct RequestControl {
-    status: RequestStatus,
-    cancel: CancellationToken,
-    handle: Option<JoinHandle<()>>,
-    /// Per-turn secret bound to the submitter (OCEAN-185, P0). Set from the
-    /// turn's `decision_token`; the gating policy copies it into every
-    /// `PermissionWaiter` this turn raises, and the decision POST must present
-    /// it. `None` = the turn was submitted without binding (a legacy/internal
-    /// turn). Never serialized onto the public `/v1/events` SSE. Held here so the
-    /// turn record owns the secret; the enforcement read is on the waiter.
-    #[allow(dead_code)]
-    decision_token: Option<String>,
-}
-
-struct PermissionWaiter {
-    status: PermissionStatus,
-    sender: Option<oneshot::Sender<AgentPermissionDecision>>,
-    /// The turn's `decision_token` (OCEAN-185), copied from the owning
-    /// `RequestControl` when the waiter is registered. The decision handler
-    /// constant-time-compares the POSTed token against this; a missing/wrong
-    /// token is rejected 403. `None` = the gated turn was submitted unbound
-    /// (legacy client). NEVER placed in `status` or any SSE payload.
-    decision_token: Option<String>,
-}
-
 // --- Registry garbage collection (OCEAN-12) ---------------------------------
 //
 // `requests`/`permissions` are unbounded `HashMap`s that gain an entry per turn
@@ -401,35 +382,6 @@ const REGISTRY_TERMINAL_TTL: chrono::Duration = chrono::Duration::hours(1);
 /// Hard cap on entries per registry. On overflow, oldest-terminal entries are
 /// evicted first (then, if still over, oldest entries regardless of state).
 const REGISTRY_MAX_ENTRIES: usize = 10_000;
-
-impl RequestControl {
-    /// Whether this request has reached a terminal lifecycle state.
-    fn is_terminal(&self) -> bool {
-        self.status.state.is_terminal()
-    }
-
-    /// Best-effort "when did this become final" timestamp for age comparison.
-    fn terminal_at(&self) -> DateTime<Utc> {
-        self.status
-            .finished_at
-            .or(self.status.updated_at)
-            .or(self.status.started_at)
-            .unwrap_or_else(Utc::now)
-    }
-}
-
-impl PermissionWaiter {
-    /// A waiter whose decision channel has been consumed is effectively done —
-    /// it's normally removed on decision/cancel, so a lingering `None`-sender
-    /// entry is a leak. Pending waiters (`Some`) are never reaped by age.
-    fn is_terminal(&self) -> bool {
-        self.sender.is_none()
-    }
-
-    fn terminal_at(&self) -> DateTime<Utc> {
-        self.status.created_at
-    }
-}
 
 /// One GC sweep: drop terminal entries older than [`REGISTRY_TERMINAL_TTL`],
 /// then enforce [`REGISTRY_MAX_ENTRIES`] by evicting oldest-terminal first.
@@ -6313,131 +6265,6 @@ async fn requests(State(state): State<AppState>) -> Json<RequestsResponse> {
     })
 }
 
-async fn requests_snapshot(requests: &RequestRegistry) -> Vec<RequestStatus> {
-    let mut requests = requests
-        .read()
-        .await
-        .values()
-        .map(|control| control.status.clone())
-        .collect::<Vec<_>>();
-    requests.sort_by_key(|status| status.started_at);
-    requests.reverse();
-    requests
-}
-
-async fn pending_permissions_snapshot(permissions: &PermissionRegistry) -> Vec<PermissionStatus> {
-    let mut pending = permissions
-        .read()
-        .await
-        .values()
-        .map(|waiter| waiter.status.clone())
-        .collect::<Vec<_>>();
-    pending.sort_by_key(|status| status.created_at);
-    pending.reverse();
-    pending
-}
-
-async fn register_running_request(
-    requests: &RequestRegistry,
-    req: &mut PromptRequest,
-    message: impl Into<String>,
-    state_value: RequestState,
-) -> (RequestId, CancellationToken) {
-    let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
-    req.request_id = Some(request_id);
-    let cancel = CancellationToken::new();
-    let now = Utc::now();
-
-    requests.write().await.insert(
-        request_id,
-        RequestControl {
-            status: RequestStatus {
-                request_id,
-                session_id: req.session_id,
-                state: state_value,
-                permission_id: None,
-                message: Some(message.into()),
-                started_at: Some(now),
-                updated_at: Some(now),
-                finished_at: None,
-            },
-            cancel: cancel.clone(),
-            handle: None,
-            // OCEAN-185: bind the turn's permission gate to the submitter. The
-            // token rides the request body (authenticated submit path) and is
-            // copied into every PermissionWaiter; it is NEVER emitted on the
-            // public /v1/events SSE.
-            decision_token: req.decision_token.clone(),
-        },
-    );
-
-    (request_id, cancel)
-}
-
-async fn attach_request_handle(
-    requests: &RequestRegistry,
-    request_id: RequestId,
-    handle: JoinHandle<()>,
-) {
-    let mut requests = requests.write().await;
-    if let Some(control) = requests.get_mut(&request_id) {
-        control.handle = Some(handle);
-    }
-}
-
-async fn cancel_permission_waiter(
-    permissions: &PermissionRegistry,
-    permission_id: PermissionId,
-    request_id: RequestId,
-) {
-    let waiter = {
-        let mut permissions = permissions.write().await;
-        permissions.remove(&permission_id)
-    };
-
-    if let Some(mut waiter) = waiter {
-        if waiter.status.request_id != request_id {
-            return;
-        }
-        if let Some(sender) = waiter.sender.take() {
-            let _ = sender.send(AgentPermissionDecision::Deny {
-                reason: "request cancelled while waiting for permission".into(),
-            });
-        }
-    }
-}
-
-async fn update_request_permission_result(
-    requests: &RequestRegistry,
-    request_id: RequestId,
-    permission_id: PermissionId,
-    decision: AgentPermissionDecision,
-) {
-    let mut requests = requests.write().await;
-    let Some(control) = requests.get_mut(&request_id) else {
-        return;
-    };
-
-    if control.status.state.is_terminal()
-        || matches!(control.status.state, RequestState::Cancelling)
-    {
-        return;
-    }
-
-    control.status.state = RequestState::Running;
-    control.status.permission_id = None;
-    control.status.message = Some(match decision {
-        AgentPermissionDecision::Allow => format!("permission {permission_id} allowed"),
-        AgentPermissionDecision::AllowSession => {
-            format!("permission {permission_id} allowed for session")
-        }
-        AgentPermissionDecision::Deny { ref reason } => {
-            format!("permission {permission_id} denied: {reason}")
-        }
-    });
-    control.status.updated_at = Some(Utc::now());
-}
-
 fn emit_user_message(events: &EventBus, req: &PromptRequest, request_id: RequestId) {
     emit(
         events,
@@ -6536,47 +6363,6 @@ async fn record_prompt_result(
         }
         _ => {}
     }
-}
-
-async fn update_request_finished(
-    requests: &RequestRegistry,
-    request_id: RequestId,
-    session_id: Option<SessionId>,
-    desired_state: RequestState,
-    message: String,
-) -> Option<RequestState> {
-    let mut requests = requests.write().await;
-    let control = requests.get_mut(&request_id)?;
-    let status = &mut control.status;
-
-    if matches!(
-        status.state,
-        RequestState::Cancelling | RequestState::Cancelled
-    ) {
-        status.session_id = session_id.or(status.session_id);
-        status.state = RequestState::Cancelled;
-        status.message = Some(
-            "cancel requested; runtime completed after cancellation request and output was ignored"
-                .into(),
-        );
-        status.updated_at = Some(Utc::now());
-        status.finished_at = Some(Utc::now());
-        let _ = control.handle.take();
-        return Some(RequestState::Cancelled);
-    }
-
-    if status.state.is_terminal() {
-        let _ = control.handle.take();
-        return Some(status.state);
-    }
-
-    status.session_id = session_id.or(status.session_id);
-    status.state = desired_state;
-    status.message = Some(message);
-    status.updated_at = Some(Utc::now());
-    status.finished_at = Some(Utc::now());
-    let _ = control.handle.take();
-    Some(desired_state)
 }
 
 // ---------------------------------------------------------------------------
