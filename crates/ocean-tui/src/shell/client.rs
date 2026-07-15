@@ -21,6 +21,7 @@ use ocean_agent_sdk::{
 };
 use ocean_core::{
     EventEnvelope, HealthResponse, PermissionDecision, PermissionDecisionRequest, PermissionId,
+    PermissionMode, PermissionSettingsRequest, PermissionSettingsResponse,
 };
 use tokio::sync::mpsc;
 
@@ -344,6 +345,53 @@ impl DaemonClient {
             .and_then(|r| r.error_for_status())
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// Fetch the daemon-owned global approval policy for `/permissions`.
+    pub async fn permission_settings(&self) -> Result<PermissionSettingsResponse, String> {
+        let response = self
+            .http
+            .get(format!("{}/v1/settings/permissions", self.base))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json::<PermissionSettingsResponse>()
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.ok {
+            Ok(response)
+        } else {
+            Err(response
+                .error
+                .unwrap_or_else(|| "daemon rejected permission settings read".into()))
+        }
+    }
+
+    /// Persist a new daemon-owned approval policy. The response is authoritative
+    /// because `OCEAN_YOLO` may mask the saved choice.
+    pub async fn set_permission_mode(
+        &self,
+        mode: PermissionMode,
+    ) -> Result<PermissionSettingsResponse, String> {
+        let response = self
+            .http
+            .post(format!("{}/v1/settings/permissions", self.base))
+            .json(&PermissionSettingsRequest { mode })
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json::<PermissionSettingsResponse>()
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.ok {
+            Ok(response)
+        } else {
+            Err(response
+                .error
+                .unwrap_or_else(|| "daemon rejected permission mode save".into()))
+        }
     }
 }
 

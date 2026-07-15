@@ -202,15 +202,28 @@ impl AgentTool for GatedTool {
 struct ScriptedPolicy {
     decision: PermissionDecision,
     checks: Arc<AtomicUsize>,
+    check_all: bool,
 }
 
 impl ScriptedPolicy {
     fn new(decision: PermissionDecision) -> (Arc<Self>, Arc<AtomicUsize>) {
+        Self::with_check_all(decision, false)
+    }
+
+    fn always_check(decision: PermissionDecision) -> (Arc<Self>, Arc<AtomicUsize>) {
+        Self::with_check_all(decision, true)
+    }
+
+    fn with_check_all(
+        decision: PermissionDecision,
+        check_all: bool,
+    ) -> (Arc<Self>, Arc<AtomicUsize>) {
         let checks = Arc::new(AtomicUsize::new(0));
         (
             Arc::new(Self {
                 decision,
                 checks: checks.clone(),
+                check_all,
             }),
             checks,
         )
@@ -219,6 +232,15 @@ impl ScriptedPolicy {
 
 #[async_trait]
 impl PermissionPolicy for ScriptedPolicy {
+    fn should_check(
+        &self,
+        _tool_name: &str,
+        _args: &Value,
+        tool_requires_permission: bool,
+    ) -> bool {
+        self.check_all || tool_requires_permission
+    }
+
     async fn check(&self, _tool_name: &str, _args: &Value) -> PermissionDecision {
         self.checks.fetch_add(1, Ordering::SeqCst);
         self.decision.clone()
@@ -1234,4 +1256,31 @@ async fn allow_lets_gated_tool_run_normally() {
         )),
         "an allowed gated tool must emit a non-error ToolExecutionEnd"
     );
+}
+
+// ===========================================================================
+// Scenario 9 — Manual policy broadens approval to otherwise-safe tools.
+// ===========================================================================
+#[tokio::test]
+async fn manual_policy_can_check_every_tool_call() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (policy, checks) = ScriptedPolicy::always_check(PermissionDecision::Allow);
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call("call-safe", "echo", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("done")], StopReason::Stop)],
+    ]));
+
+    let cfg = base_config(provider)
+        .with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })])
+        .with_permission(policy);
+
+    ocean_runtime::run_agent(&cfg, user("call the safe tool"), None)
+        .await
+        .expect("manual approval of a safe tool must complete");
+
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
 }

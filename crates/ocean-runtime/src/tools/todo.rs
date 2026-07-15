@@ -1,5 +1,6 @@
-//! Lightweight in-memory todo list shared across one agent run. The model can
-//! `add`, `complete`, `list`, or `clear` items. Useful for long-horizon tasks.
+//! Lightweight in-memory todo list scoped to a bound session (or one unbound
+//! agent run). The model can `add`, `complete`, `list`, or `clear` items.
+//! Useful for long-horizon tasks.
 
 use std::sync::Mutex;
 
@@ -23,6 +24,17 @@ impl TodoTool {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Thread-safe emptiness check. Locks the internal mutex and returns
+    /// whether the list is empty. If the mutex is poisoned, conservatively
+    /// returns `false` (not empty) so the eviction scan never silently
+    /// drops a session that may hold real state behind the poisoned lock.
+    pub fn is_empty(&self) -> bool {
+        self.items
+            .lock()
+            .map(|items| items.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 #[async_trait]
@@ -31,7 +43,7 @@ impl AgentTool for TodoTool {
         "todo"
     }
     fn description(&self) -> &str {
-        "Track tasks across a single agent run. action ∈ {add, complete, list, clear}. add expects 'text'; complete expects 'index' (1-based)."
+        "Track tasks in memory for the bound session (or one unbound agent run). action ∈ {add, complete, list, clear}. add expects 'text'; complete expects 'index' (1-based)."
     }
     fn parameters(&self) -> Value {
         json!({

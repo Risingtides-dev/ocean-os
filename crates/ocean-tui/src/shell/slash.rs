@@ -107,6 +107,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         soon: false,
     },
     SlashCommand {
+        name: "/permissions",
+        desc: "choose when Ocean pauses for approval",
+        group: "workspace",
+        soon: false,
+    },
+    SlashCommand {
         name: "/image",
         desc: "view an image inline (/image [path]; bare = newest in chat)",
         group: "workspace",
@@ -412,6 +418,7 @@ mod tests {
     #[test]
     fn is_command_recognizes_registry_only() {
         assert!(is_command("/model"));
+        assert!(is_command("/permissions"));
         assert!(is_command("/compact"));
         assert!(!is_command("/home")); // a path, not a command
         assert!(!is_command("/nope"));

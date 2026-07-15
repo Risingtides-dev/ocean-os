@@ -3004,6 +3004,28 @@ Added three direct-handler tests for the home-sandboxed directory and file endpo
 _________________________________________________________________________________
 _________________________________________________________________________________
 
+time:      [current]
+agent:     [claude], [ocean-tui]
+worktree:  [main]
+type:      [feature]: truthful provider-reported context-window telemetry
+area:      [full-stack]: TUI session tray, daemon, runtime, core, SDK
+
+Introduced non-cumulative final-round context occupancy measurement across the full turn pipeline. Provider adapters (Anthropic, OpenAI/Codex/Google-compatible) normalize per-request prompt usage into `context_tokens` on `Usage` without double-counting cache semantics. Runtime captures the final round's total consumption via `latest_context_tokens` on `AgentRun`, separate from cumulative `usage.total_tokens`. Core's `TokenUsage` carries `context_tokens` and `context_window` for the effective model. Agent passthrough preserves both. SDK defines a typed `ContextUsage` payload with `used_tokens`, `context_window`, `source` (provenance), and `measured_at_ms` (daemon wall clock). Daemon constructs `ContextUsage` only when both authoritative values are present; unknown usage remains `None`. `AgentTurnResponse` and `TurnFinished` carry `context_usage` as an optional field. TUI tray renders a 3-line context block with an occupancy bar, compact token counts, percentage, and semantic thresholds (cyan/yellow/red at 75%/90%). Turn-start clears the measurement; the tray stays visible during a running turn. Pre-existing serde round-trip tests exercise the new field; new tray tests prove truthful final-round occupancy, absent-when-unknown behavior, and helper formatting/clamping.
+
+Verification:
+- `cargo check --workspace --tests` (clean)
+- `cargo test -p ocean-runtime --lib` (122 passed)
+- `cargo test -p ocean-agent-sdk --lib` (48 passed)
+- `cargo test -p ocean-acp` (3 passed)
+- `cargo test -p ocean-tui session_tray::tests` (13 passed)
+- `cargo test -p ocean-daemon` (304 passed; 1 pre-existing YOLO precedence failure unchanged)
+- `cargo fmt --all && git diff --check` (clean)
+- Existing `every_agent_turn_event_variant_round_trips_with_session_id` covers the new field
+
+Concurrent daemon refactor/extension characterization, ACP, agent/CLI/core/protocol/runtime work, and the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
 time:      [07:55pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3184,4 +3206,71 @@ type:      [refactor]: extract daemon request and permission control records int
 area:      [backend]: ocean-daemon Phase 2C control-plane registry
 
 Added direct characterization for status-only snapshots and token secrecy, exact identity/cancellation/timestamp initialization, live duplicate replacement, missing-handle detachment, matching and mismatched waiter consumption, exact permission/finish transitions, terminal helpers, session merging, and handle ownership. Then moved the two private registry aliases, request/permission records, terminal helpers, snapshots, registration/attachment mechanics, waiter cancellation, and status transitions into the 238-line private `src/request_control.rs`. `AppState`, permission policy and orchestration, decision-token verification, HTTP/event mapping, active-turn projection, GC scheduling/failure accounting, shutdown draining, and turn execution remain in composition with unchanged lock/await ordering. Focused request/permission/finish/decision/GC tests, all 122 runtime tests plus integrations, all 155 agent tests, five router contracts, all 329 daemon tests serialized, workspace-test compilation, both supported feature checks, formatting, docs, and diff gates passed in a dedicated target. Two fresh security/concurrency reviews found no unresolved medium-or-higher issue; the first strengthened characterization before commit, and the second verified moved bodies against `133a18b`. The dirty primary checkout remained untouched.
+time:      [current]
+agent:     [claude], [ocean-tui]
+worktree:  [main]
+type:      [refactor]: unify and refine Sessions and Files rails
+area:      [frontend]: ocean-tui side-rail hierarchy and interaction
+
+Extracted `shell/rail.rs` as the shared row grammar for Sessions and Files: focused/blurred/normal selection state, one-cell accent bars, full-row backgrounds, half-open body hit testing, scroll clamping, and Unicode-cell-safe centered empty states. Sessions now separates worktree/branch/session hierarchy with depth guides, keeps the live marker independent of selection, shows the new-session affordance only on the selected header with a matching mouse region, aligns age/count metadata by terminal cells, and exposes a compact action footer. Files applies the same hierarchy/focus grammar, bounds mouse hits horizontally and vertically, preserves/dims extensions when stems truncate, and adds a useful empty state/footer. Existing navigation and double-click-style selected-row activation remain intact.
+
+Verification:
+- `cargo test -p ocean-tui` (330 passed, 1 ignored before final added primitive tests)
+- focused rail matrix: 4 shared + 7 Sessions + 4 Files tests pass
+- narrow widths, focus transitions, horizontal/vertical mouse bounds, selected-header action regions, Unicode names, extensions, and resized rails covered
+- `cargo build -p ocean-tui --release`
+- `cargo xtask docs-check`
+- `cargo fmt --all && git diff --check`
+
+Concurrent daemon refactor/extension work and operator-owned deploy configuration remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [01:54am] [15-07-26]
+agent:     [pi], [gpt-5.4]
+worktree:  [main]
+type:      [feature]: add runtime-selectable permission modes to the TUI
+area:      [full-stack]: ocean-tui, daemon settings, runtime gate, shared protocol
+
+Added `/permissions` as a daemon-backed, keyboard/mouse-accessible three-row picker: Manually approve prompts for every known tool action, Automatically approve (the default) follows the runtime's safe-versus-permission-required classification, and Skip all approvals bypasses prompts. The command remains usable while a turn is blocked. A daemon-confirmed skip-all selection releases this submitter's already-pending and later same-request prompts through the existing decision-token-bound endpoint, scopes that bridge to request ids active at confirmation time, and clears authorization at terminal events so stale UI state cannot approve a new turn.
+
+Introduced stable `PermissionMode` settings DTOs and `GET/POST /v1/settings/permissions`, kept the legacy yolo endpoint and inert request-wire flag compatible, migrated old boolean preferences to automatic/skip-all, and made the three-state file authoritative with atomic writes and truthful failure responses. `OCEAN_YOLO=1` forces skip-all; `=0` prohibits skip-all without collapsing manual into automatic. Runtime `PermissionPolicy::should_check` owns the generic approval boundary, while daemon policy remains execution authority. Updated route manifests, operator docs, and owning crate contracts.
+
+Verification:
+- `cargo test -p ocean-daemon` (308 passed)
+- permission-mode core/runtime/daemon/TUI focused tests passed, including persistence failure, blocked-turn command access, request-scoped release, and later-request non-approval
+- `cargo build -p ocean-tui --release`
+- `cargo build -p ocean-daemon --release`
+- `cargo check --workspace --tests`
+- `cargo xtask docs-check`
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- fresh security/correctness re-review: PASS
+- installed TUI and daemon by atomic rename; strict codesign passed; TUI stayed alive in a 3-second real PTY smoke
+- restarted the unsupervised daemon by exact PID from neutral `$HOME`; live health and `GET /v1/settings/permissions` passed
+
+Known concurrent-tree issue: the full TUI suite reached 330 passed / 4 ignored with one unrelated pre-existing failure in `todo_events_reveal_session_tray_and_new_turn_reclaims_tree` from the concurrent Sessions/Files rail lane. Permission-focused TUI tests and the release build pass. Existing unrelated ACP, telemetry, rail, Herdr, and deploy-plist edits were preserved.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [03:39am] [15-07-26]
+agent:     [ocean-tui], [gpt-5.4], [orchestrator]
+worktree:  [main]
+type:      [workflow]: SDK-steered worker checkpoint for session-pinned todos
+area:      [full-stack]: ocean-runtime session tools and ocean-tui Files tray
+
+Completed the cross-turn todo pin through ordinary daemon-owned Ocean sessions steered over the `ocean-agent-sdk` HTTP/SSE contract rather than Longhouse quorum or a new core subagent runtime. A scoped implementer session made and reconciled the runtime/TUI edits; an independent verifier session ran the prescribed matrix; an independent read-only reviewer found the initial hard-LRU stale-projection risk, then accepted the remediated empty-only soft-bound design with no medium-or-higher findings. Bound sessions now share one in-memory `TodoTool` across turns, separate and unbound sessions remain isolated, and the Files tray preserves confirmed items across same-session turns while clearing on explicit todo clear, session switch/new session, daemon restart/event gap, or uncertainty invalidation. The session cache softly targets 1,024 entries, evicts only least-recently-used empty tools, retains non-empty state, fails closed on poisoned item state, and reclaims temporary overgrowth once empty entries become available.
+
+Verification:
+- `cargo test -p ocean-runtime` (180 total unit/integration tests passed)
+- `cargo test -p ocean-tui` (331 passed, 4 unrelated live-integration tests ignored)
+- `cargo test -p ocean-daemon` (323 passed)
+- `cargo check --workspace --tests`
+- `cargo xtask docs-check` (26 packages, 111 active Markdown files, 117 local links)
+- `cargo build -p ocean-tui --release`
+- `git diff --check`
+- independent SDK-steered reviewer: ACCEPT, no medium-or-higher findings
+
+Worker sessions were ordinary daemon sessions (`fd271f4b-13fd-4a63-9b85-2be61a94bf09`, `5bb719e3-6724-413d-aeb3-f377dd33e9ca`, and `ace7e2af-0101-42ae-86f9-ca2ecd8efeec`); no core task/spawn-worker/fleet scheduler was introduced.
 _________________________________________________________________________________

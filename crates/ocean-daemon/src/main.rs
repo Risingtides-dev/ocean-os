@@ -25,16 +25,17 @@ use ocean_agent_sdk::{
     AgentOwningProject, AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse,
     AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurn,
     AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
-    ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind, ProposalTally,
-    ToolCall, ToolCallId, ToolResult,
+    ContextUsage, ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind,
+    ProposalTally, ToolCall, ToolCallId, ToolResult,
 };
 use ocean_core::{
     evaluate_trigger_policy, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
-    PermissionStatus, PermissionsResponse, ProjectRef, PromptRequest, RequestControlResponse,
-    RequestCreateResponse, RequestId, RequestState, RequestStatus, RequestsResponse, RoomKey,
-    RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
-    SessionDetail, SessionId, SessionResponse, SessionRunState,
+    PermissionMode, PermissionStatus, PermissionsResponse, ProjectRef, PromptRequest,
+    RequestControlResponse, RequestCreateResponse, RequestId, RequestState, RequestStatus,
+    RequestsResponse, RoomKey, RoomMessageKind, RoomParticipant, RoomParticipantKind,
+    RoomTriggerEvent, RoomTriggerPolicy, SessionDetail, SessionId, SessionResponse,
+    SessionRunState,
 };
 use ocean_runtime::{AgentEvent, PermissionDecision as AgentPermissionDecision, PermissionPolicy};
 // Brings the `RoomStore` trait methods (create/get/list/append_message/…) into
@@ -136,7 +137,10 @@ use slack_canvas_fulfillment::{
     canvas_fulfillment_get, canvas_fulfillment_post, gc_canvas_fulfillments, CanvasFulfillmentStore,
 };
 use workspace_policy::{resolve_bound_cwd, session_detail_scope_check};
-use yolo_settings::{effective_yolo, resolve_request_yolo, yolo_setting_get, yolo_setting_set};
+use yolo_settings::{
+    effective_permission_mode, effective_yolo, permission_settings_get, permission_settings_set,
+    resolve_request_permission_mode, yolo_setting_get, yolo_setting_set,
+};
 
 #[cfg(test)]
 use axum::http::Method;
@@ -161,7 +165,7 @@ use slack_canvas_fulfillment::{
     CanvasFulfillmentQuery, CANVAS_FULFILLMENT_TTL,
 };
 #[cfg(test)]
-use yolo_settings::{yolo_enabled, YoloSetRequest};
+use yolo_settings::{resolve_request_yolo, yolo_enabled, YoloSetRequest};
 
 #[derive(Clone)]
 struct AppState {
@@ -484,7 +488,7 @@ fn permission_args_hash(args: &Value) -> u64 {
 }
 
 struct DaemonPermissionPolicy {
-    allow_mutating: bool,
+    mode: PermissionMode,
     request_id: RequestId,
     session_id: Option<SessionId>,
     events: EventBus,
@@ -631,6 +635,10 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route(
             "/v1/settings/yolo",
             get(yolo_setting_get).post(yolo_setting_set),
+        )
+        .route(
+            "/v1/settings/permissions",
+            get(permission_settings_get).post(permission_settings_set),
         )
         .route("/v1/component/event", post(component_event))
         // Longhouse + council convene routes (incl. the `/v1/council/convene`
@@ -1175,6 +1183,8 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/lsp",
         "GET /v1/settings/yolo",
         "POST /v1/settings/yolo",
+        "GET /v1/settings/permissions",
+        "POST /v1/settings/permissions",
         "POST /v1/component/event",
         "POST /v1/longhouse/demo",
         "POST /v1/longhouse/convene",
@@ -1530,11 +1540,11 @@ async fn prompt(
         RequestState::Running,
     )
     .await;
-    // OCEAN-160 (P0): do NOT trust the wire `yolo` flag to escalate. The posture
-    // is resolved purely from operator policy (env → persisted default → off),
-    // exactly like `POST /v1/agent/turns`; a client-supplied `yolo: true` is
-    // inert and can no longer bypass the permission gate on its own.
-    req.yolo = resolve_request_yolo(req.yolo);
+    // OCEAN-160 (P0): do NOT trust the wire `yolo` flag to escalate. Resolve
+    // the daemon-owned three-state posture; the legacy request bool remains an
+    // inert compatibility field and only reflects whether skip-all is effective.
+    let permission_mode = resolve_request_permission_mode(req.yolo);
+    req.yolo = permission_mode == PermissionMode::SkipAll;
     emit_user_message(&state.events, &req, request_id);
 
     // OCEAN-318: Longhouse pre-turn consult — same default-ON advisory prep as
@@ -1548,7 +1558,7 @@ async fn prompt(
         &state,
         request_id,
         req.session_id,
-        req.yolo,
+        permission_mode,
         cancel,
         req.decision_token.clone(),
     );
@@ -1608,17 +1618,16 @@ async fn create_request(
     )
     .await;
     let session_id = req.session_id;
-    // OCEAN-160 (P0): same wire-yolo bypass as `POST /v1/prompt` — this is its
-    // async sibling on the same `PromptRequest` wire type. Resolve from operator
-    // policy only (env → persisted default → off); the wire `yolo` flag is inert.
-    req.yolo = resolve_request_yolo(req.yolo);
+    // OCEAN-160 (P0): same inert wire-yolo contract as `POST /v1/prompt`.
+    let permission_mode = resolve_request_permission_mode(req.yolo);
+    req.yolo = permission_mode == PermissionMode::SkipAll;
     emit_user_message(&state.events, &req, request_id);
 
     let control = build_prompt_control(
         &state,
         request_id,
         session_id,
-        req.yolo,
+        permission_mode,
         cancel,
         req.decision_token.clone(),
     );
@@ -1845,43 +1854,42 @@ fn build_prompt_control(
     state: &AppState,
     request_id: RequestId,
     session_id: Option<SessionId>,
-    allow_mutating: bool,
+    mode: PermissionMode,
     cancel: CancellationToken,
     decision_token: Option<String>,
 ) -> PromptControl {
-    let control: Arc<dyn PermissionPolicy> = if allow_mutating {
-        Arc::new(DaemonPermissionPolicy {
-            allow_mutating: true,
-            request_id,
-            session_id,
-            events: state.events.clone(),
-            permissions: state.permissions.clone(),
-            requests: state.requests.clone(),
-            cancel: cancel.clone(),
-            seen_permissions: Arc::new(Mutex::new(HashMap::new())),
-            decision_token,
-        })
-    } else {
-        Arc::new(DaemonPermissionPolicy {
-            allow_mutating: false,
-            request_id,
-            session_id,
-            events: state.events.clone(),
-            permissions: state.permissions.clone(),
-            requests: state.requests.clone(),
-            cancel: cancel.clone(),
-            seen_permissions: Arc::new(Mutex::new(HashMap::new())),
-            decision_token,
-        })
-    };
+    let control: Arc<dyn PermissionPolicy> = Arc::new(DaemonPermissionPolicy {
+        mode,
+        request_id,
+        session_id,
+        events: state.events.clone(),
+        permissions: state.permissions.clone(),
+        requests: state.requests.clone(),
+        cancel: cancel.clone(),
+        seen_permissions: Arc::new(Mutex::new(HashMap::new())),
+        decision_token,
+    });
 
     PromptControl::new(control).with_cancel(cancel)
 }
 
 #[async_trait]
 impl PermissionPolicy for DaemonPermissionPolicy {
+    fn should_check(
+        &self,
+        _tool_name: &str,
+        _args: &Value,
+        tool_requires_permission: bool,
+    ) -> bool {
+        match self.mode {
+            PermissionMode::Manual => true,
+            PermissionMode::Automatic => tool_requires_permission,
+            PermissionMode::SkipAll => false,
+        }
+    }
+
     async fn check(&self, tool_name: &str, args: &Value) -> AgentPermissionDecision {
-        if self.allow_mutating {
+        if self.mode == PermissionMode::SkipAll {
             return AgentPermissionDecision::Allow;
         }
 
@@ -1977,7 +1985,16 @@ impl PermissionPolicy for DaemonPermissionPolicy {
             }
         }
 
-        decision
+        // Manual means every action, even if a client submitted the legacy
+        // allow-session choice. Keep later calls visible instead of teaching
+        // the runtime to suppress this tool name for the remainder of the run.
+        if self.mode == PermissionMode::Manual
+            && matches!(decision, AgentPermissionDecision::AllowSession)
+        {
+            AgentPermissionDecision::Allow
+        } else {
+            decision
+        }
     }
 }
 
@@ -3789,7 +3806,7 @@ impl ocean_call::TurnRunner for DaemonTurnRunner {
             &self.state,
             request_id,
             Some(session_id),
-            false,
+            PermissionMode::Manual,
             cancel,
             None,
         )
@@ -5827,8 +5844,9 @@ fn spawn_room_agent_turn(
 
         let request_id = Uuid::new_v4();
         // Auto-convene has no per-request flag, so the effective posture is the
-        // operator's resolved default: env → persisted setting → off.
-        let yolo = effective_yolo();
+        // operator's resolved global permission mode.
+        let permission_mode = effective_permission_mode();
+        let yolo = permission_mode == PermissionMode::SkipAll;
         let mut prompt_req = PromptRequest {
             prompt,
             images: None,
@@ -5859,7 +5877,7 @@ fn spawn_room_agent_turn(
             &state,
             request_id,
             Some(core_sid(session_id)),
-            yolo,
+            permission_mode,
             cancel,
             None,
         );
@@ -6469,6 +6487,7 @@ async fn agent_voice(
                 input_tokens: None,
                 cache_read_tokens: None,
                 tokens_per_second: None,
+                context_usage: None,
                 wall_ms: None,
             }),
         );
@@ -6662,6 +6681,7 @@ async fn agent_turn(
                     input_tokens: None,
                     cache_read_tokens: None,
                     tokens_per_second: None,
+                    context_usage: None,
                     wall_ms: None,
                 }),
             );
@@ -6692,6 +6712,7 @@ async fn agent_turn(
                     input_tokens: None,
                     cache_read_tokens: None,
                     tokens_per_second: None,
+                    context_usage: None,
                     wall_ms: None,
                 }),
             );
@@ -6774,6 +6795,7 @@ async fn agent_turn(
                     input_tokens: None,
                     cache_read_tokens: None,
                     tokens_per_second: None,
+                    context_usage: None,
                     wall_ms: None,
                 }),
             );
@@ -6810,14 +6832,10 @@ async fn agent_turn(
         },
     );
 
-    // OCEAN-51: permission gating is ON by default. Previously this path
-    // hardcoded `yolo: true`, auto-approving every tool call and making the
-    // entire per-tool permission machinery dead code for the shipped product
-    // surfaces. Now the mode is operator-controlled. `AgentTurnRequest` carries
-    // no per-request yolo flag, so the effective posture is the operator's
-    // resolved default: OCEAN_YOLO env → persisted setting (OCEAN-YOLO) → off.
-    // The bypass is opt-in, never the silent default.
-    let yolo = effective_yolo();
+    // Approval policy is daemon-owned and captured at turn start. The default
+    // is automatic (safe tools run; permission-requiring tools pause), while
+    // manual broadens prompts to every known tool and skip-all is explicit.
+    let permission_mode = effective_permission_mode();
 
     let guided_prompt = apply_turn_guidance(guidance.as_deref(), &prompt);
 
@@ -6902,7 +6920,7 @@ async fn agent_turn(
         // rather than silently forking a fresh transcript under the same id.
         create_if_missing: is_new_session,
         max_turns: None,
-        yolo,
+        yolo: permission_mode == PermissionMode::SkipAll,
         cwd,
         project_id,
         client_type,
@@ -7237,13 +7255,11 @@ async fn agent_turn(
         tracing::debug!(role = %r, "resolved model role → alias");
     }
 
-    // Same `yolo` flag drives the permission policy: `false` (default) builds a
-    // gating `DaemonPermissionPolicy`; `true` builds the auto-allow policy.
     let control = build_prompt_control(
         &state,
         request_id,
         Some(core_sid(session_id)),
-        yolo,
+        permission_mode,
         cancel,
         decision_token,
     )
@@ -7334,6 +7350,16 @@ async fn agent_turn(
         } else {
             None
         };
+        // This measurement is provider-reported for the final request/round.
+        // Never substitute the cumulative `usage.input`: multi-round turns resend
+        // prior context and summing those requests overstates current occupancy.
+        let context_usage =
+            (res.usage.context_tokens > 0 && res.usage.context_window > 0).then(|| ContextUsage {
+                used_tokens: res.usage.context_tokens,
+                context_window: res.usage.context_window,
+                source: "provider_reported_final_round".into(),
+                measured_at_ms: Utc::now().timestamp_millis(),
+            });
         // OCEAN-305: mark legacy completion announcements as agent mirrors — the
         // same content already streamed delta-by-delta on /v1/agent/events.
         record_prompt_result(
@@ -7377,6 +7403,7 @@ async fn agent_turn(
                     input_tokens,
                     cache_read_tokens,
                     tokens_per_second,
+                    context_usage: context_usage.clone(),
                 },
             );
         } else {
@@ -7394,6 +7421,7 @@ async fn agent_turn(
                     input_tokens,
                     cache_read_tokens,
                     tokens_per_second,
+                    context_usage: context_usage.clone(),
                 },
             );
         }
@@ -7475,6 +7503,7 @@ async fn agent_turn(
             input_tokens: None,
             cache_read_tokens: None,
             tokens_per_second: None,
+            context_usage: None,
             wall_ms: None,
         }),
     )
@@ -12564,19 +12593,33 @@ mod tests {
 
     // --- OCEAN-51: permission gating on by default, opt-in yolo --------------
 
-    fn gating_policy(allow_mutating: bool) -> DaemonPermissionPolicy {
-        gating_policy_with_token(allow_mutating, None)
+    fn gating_policy(skip_all: bool) -> DaemonPermissionPolicy {
+        gating_policy_with_token(skip_all, None)
     }
 
     /// Like [`gating_policy`] but binds the policy to a per-turn `decision_token`
     /// (OCEAN-185), so the waiter it mints carries the secret a decision POST
     /// must replay.
     fn gating_policy_with_token(
-        allow_mutating: bool,
+        skip_all: bool,
+        decision_token: Option<String>,
+    ) -> DaemonPermissionPolicy {
+        gating_policy_with_mode(
+            if skip_all {
+                PermissionMode::SkipAll
+            } else {
+                PermissionMode::Automatic
+            },
+            decision_token,
+        )
+    }
+
+    fn gating_policy_with_mode(
+        mode: PermissionMode,
         decision_token: Option<String>,
     ) -> DaemonPermissionPolicy {
         DaemonPermissionPolicy {
-            allow_mutating,
+            mode,
             request_id: RequestId::new_v4(),
             session_id: None,
             events: EventBus::new(16),
@@ -12588,7 +12631,7 @@ mod tests {
         }
     }
 
-    /// Default mode (allow_mutating = false): a tool call must NOT auto-allow.
+    /// Automatic mode: a permission-requiring tool must NOT auto-allow.
     /// `check` blocks waiting on an operator decision, so a bounded wait must
     /// time out rather than returning a decision. This proves the per-tool
     /// gating machinery is live (the bug was that it was dead — auto-allowed).
@@ -12612,8 +12655,24 @@ mod tests {
         );
     }
 
-    /// Opt-in yolo (allow_mutating = true) restores fire-and-forget: every tool
-    /// call resolves to Allow immediately, no waiter, no blocking.
+    #[test]
+    fn permission_modes_choose_the_runtime_check_boundary() {
+        let args = json!({"path": "src/lib.rs"});
+        let manual = gating_policy_with_mode(PermissionMode::Manual, None);
+        assert!(manual.should_check("read", &args, false));
+        assert!(manual.should_check("write", &args, true));
+
+        let automatic = gating_policy_with_mode(PermissionMode::Automatic, None);
+        assert!(!automatic.should_check("read", &args, false));
+        assert!(automatic.should_check("write", &args, true));
+
+        let skip = gating_policy_with_mode(PermissionMode::SkipAll, None);
+        assert!(!skip.should_check("read", &args, false));
+        assert!(!skip.should_check("write", &args, true));
+    }
+
+    /// Opt-in skip-all restores fire-and-forget: every tool call resolves to
+    /// Allow immediately, with no waiter and no blocking.
     #[tokio::test]
     async fn permission_yolo_opt_in_auto_allows() {
         let policy = gating_policy(true);
@@ -13449,6 +13508,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[tokio::test]
+    async fn permission_settings_roundtrip_all_three_modes_and_report_env_mask() {
+        let _guard = yolo_env_guard_async().await;
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let prior_yolo = env::var("OCEAN_YOLO").ok();
+        let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
+        let tmp =
+            std::env::temp_dir().join(format!("ocean-permission-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", &tmp);
+        env::remove_var("OCEAN_YOLO");
+
+        for mode in [
+            PermissionMode::Manual,
+            PermissionMode::Automatic,
+            PermissionMode::SkipAll,
+        ] {
+            let Json(body) =
+                permission_settings_set(Json(ocean_core::PermissionSettingsRequest { mode })).await;
+            assert_eq!(body.persisted, Some(mode));
+            assert_eq!(body.effective, mode);
+            assert_eq!(body.env_override, None);
+
+            let Json(read_back) = permission_settings_get().await;
+            assert_eq!(read_back, body);
+            assert_eq!(
+                ocean_agent::load_yolo_pref(&tmp),
+                Some(mode == PermissionMode::SkipAll),
+                "legacy yolo mirror must track skip-all only"
+            );
+        }
+
+        ocean_agent::persist_permission_mode(&tmp, PermissionMode::Manual).unwrap();
+        env::set_var("OCEAN_YOLO", "1");
+        let Json(forced_skip) = permission_settings_get().await;
+        assert_eq!(forced_skip.persisted, Some(PermissionMode::Manual));
+        assert_eq!(forced_skip.effective, PermissionMode::SkipAll);
+        assert_eq!(forced_skip.env_override, Some(PermissionMode::SkipAll));
+
+        ocean_agent::persist_permission_mode(&tmp, PermissionMode::SkipAll).unwrap();
+        env::set_var("OCEAN_YOLO", "0");
+        let Json(forced_safe) = permission_settings_get().await;
+        assert_eq!(forced_safe.persisted, Some(PermissionMode::SkipAll));
+        assert_eq!(forced_safe.effective, PermissionMode::Automatic);
+        assert_eq!(forced_safe.env_override, Some(PermissionMode::Automatic));
+
+        env::set_var("OCEAN_YOLO", "1");
+        let Json(same_as_saved) = permission_settings_get().await;
+        assert_eq!(same_as_saved.effective, PermissionMode::SkipAll);
+        assert_eq!(
+            same_as_saved.env_override, None,
+            "matching env and saved modes are not an override"
+        );
+
+        match prior_yolo {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+        match prior_cfg {
+            Some(v) => env::set_var("OCEAN_CONFIG_DIR", v),
+            None => env::remove_var("OCEAN_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn permission_settings_report_persistence_failure_instead_of_false_success() {
+        let _guard = yolo_env_guard_async().await;
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let prior_yolo = env::var("OCEAN_YOLO").ok();
+        let prior_cfg = env::var("OCEAN_CONFIG_DIR").ok();
+        let tmp = std::env::temp_dir().join(format!(
+            "ocean-permission-unwritable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&tmp, b"not a directory").unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", tmp.join("child"));
+        env::remove_var("OCEAN_YOLO");
+
+        let Json(body) = permission_settings_set(Json(ocean_core::PermissionSettingsRequest {
+            mode: PermissionMode::Manual,
+        }))
+        .await;
+        assert!(!body.ok, "an unwritable preference must not report success");
+        assert!(body.error.as_deref().is_some_and(|error| !error.is_empty()));
+        assert_ne!(body.persisted, Some(PermissionMode::Manual));
+
+        match prior_yolo {
+            Some(v) => env::set_var("OCEAN_YOLO", v),
+            None => env::remove_var("OCEAN_YOLO"),
+        }
+        match prior_cfg {
+            Some(v) => env::set_var("OCEAN_CONFIG_DIR", v),
+            None => env::remove_var("OCEAN_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     /// OCEAN-YOLO precedence: `effective_yolo()` resolves env → persisted → off.
     /// - persisted=true + no env ⇒ effective true (the personal default sticks);
     /// - `OCEAN_YOLO=0` overrides persisted=true ⇒ effective off (env wins);
@@ -13710,7 +13867,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("written.txt");
 
-        // Gating ON (allow_mutating = false) — the default-safe daemon policy.
+        // Automatic mode — the default-safe daemon policy.
         let policy = Arc::new(gating_policy(false));
         let permissions = policy.permissions.clone();
 
@@ -18645,7 +18802,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            72,
+            74,
             "route baseline changed; review the manifest"
         );
 

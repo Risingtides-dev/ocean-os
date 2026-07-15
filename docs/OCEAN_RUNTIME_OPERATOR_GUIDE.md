@@ -58,25 +58,21 @@ Keep `OCEAN_BIND` loopback-only unless the operator has explicitly approved remo
 The daemon is a local trust boundary. Two env vars control how strict it is.
 **Both default to the safe setting** — you only set them to loosen the daemon.
 
-#### `OCEAN_YOLO` — per-tool permission gating (OCEAN-51)
+#### Permission approval modes
 
-By default (`OCEAN_YOLO` unset), the product agent-turn path
-(`POST /v1/agent/turns` and the `POST /v1/agent/voice` wrapper) **gates every
-mutating tool call** through the permission machinery: the daemon emits a
-`permission_request` event and the turn blocks until an operator allows or denies
-it via `POST /v1/permissions/{id}/decision` (the TUI does this with `Ctrl-Y` /
-`Ctrl-N`).
+The daemon owns one persisted global approval mode, captured when each turn
+starts. In the TUI, run `/permissions` and choose:
 
-**Voice turns and permissions (OCEAN-224).** A spoken interface has no permission
-card to click, so a gated voice turn that nothing can answer would silently hang.
-`POST /v1/agent/voice` therefore enforces an explicit contract: a voice caller
-that can relay an approval mints a per-turn `decision_token` (OCEAN-185), sends it
-on the voice turn, and replays the same value on the decision POST — the gate is
-then approvable exactly like a text turn. A voice turn with **no** `decision_token`
-is accepted only when yolo is effective (every tool auto-approves, so no gate is
-ever raised). With no token **and** yolo off, the daemon rejects the turn up front
-with `400` and a clear, speakable message ("turn on yolo, or send a
-decision_token") instead of letting it stall on an un-answerable prompt.
+- **Manually approve** (`manual`) — pause for every known tool action.
+- **Automatically approve** (`automatic`, the default) — run safe/read-only
+  tools and pause for tools the runtime classifies as mutating or side-effecting.
+- **Skip all approvals** (`skip_all`) — never pause, even for unsafe actions.
+
+A mode is captured when a turn starts. If the TUI is already waiting on a
+permission and the daemon confirms `skip_all`, the TUI authorizes only the
+already-active request and releases its pending and later same-turn prompts
+through the normal token-bound decision endpoint. That bridge authorization is
+cleared when the request finishes and never applies to a new turn.
 
 The call active lane is stricter and independent of that wrapper: every
 `client_type: "call-voice"` turn uses the Voice harness profile, forces
@@ -85,55 +81,30 @@ loosen this posture, so a call answer cannot execute tools or raise a permission
 request.
 
 ```bash
-# Default: gated. Mutating tools require approval.
-(cd "$HOME" && "$OCEAN_DAEMON_BIN")
+# Read the saved and effective mode.
+curl -s http://127.0.0.1:4780/v1/settings/permissions
+# {"ok":true,"persisted":null,"effective":"automatic"}
 
-# Opt in to fire-and-forget for trusted automation. Every tool auto-approved.
-(cd "$HOME" && OCEAN_YOLO=1 "$OCEAN_DAEMON_BIN")
+# Persist a choice for subsequent turns.
+curl -s -X POST http://127.0.0.1:4780/v1/settings/permissions \
+  -H 'content-type: application/json' -d '{"mode":"manual"}'
 ```
 
-Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Falsey:
-`0`, `false`, `no`, `off`. Unrecognized/unset falls through to the persisted
-default (below).
+`persisted` is the saved choice (`null` before the first selection), `effective`
+is what a new turn will use, and `env_override` appears when `OCEAN_YOLO` masks
+the saved mode. Existing `yolo_pref=true/false` files migrate on read to
+`skip_all`/`automatic`. The legacy `GET/POST /v1/settings/yolo` boolean adapter
+remains available and writes the same underlying choice.
 
-##### Persisted YOLO default (OCEAN-YOLO)
+`OCEAN_YOLO=1` forces `skip_all`. `OCEAN_YOLO=0` prohibits `skip_all`, but keeps a
+saved distinction between `manual` and `automatic`; a saved `skip_all` becomes
+effectively `automatic`. The legacy `PromptRequest.yolo` wire flag is inert and
+cannot escalate daemon authority.
 
-YOLO is also a **persisted personal default** you set once, so it survives daemon
-restarts without needing the env var on every launch (mirrors the persisted
-model selection — a tiny `yolo_pref` file in `$OCEAN_CONFIG_DIR`).
-
-```bash
-# Read current persisted + effective posture.
-curl -s http://127.0.0.1:4780/v1/settings/yolo
-# {"ok":true,"persisted":null,"effective":false,"env_override":null}
-
-# Set your personal default ON (persists across restarts).
-curl -s -X POST http://127.0.0.1:4780/v1/settings/yolo \
-  -H 'content-type: application/json' -d '{"enabled":true}'
-# {"ok":true,"persisted":true,"effective":true,"env_override":null}
-```
-
-- `persisted` — your saved default (`null` on first run ⇒ off).
-- `effective` — what a turn actually uses right now (after env override).
-- `env_override` — non-null when `OCEAN_YOLO` is masking your persisted default.
-
-**Precedence (highest wins):** explicit per-request `yolo: true` on a turn →
-`OCEAN_YOLO` env (if set to a recognized value) → **persisted setting** → built-in
-default (**off**). So you set it once as your default, and env / per-request can
-still override for a session (e.g. `OCEAN_YOLO=0` forces gating even if your
-persisted default is on).
-
-Default stays **OFF** (gating on) — the persisted setting is opt-in and never
-silently flips. It only controls whether tools auto-approve; it does **not**
-weaken the permission decision-token binding (OCEAN-185).
-
-> ⚠️ **Behavior change.** Before this fix, `/v1/agent/turns` hardcoded yolo mode,
-> so the permission machinery was dead for every shipped surface. Now it is live
-> by default. A surface that issues mutating tools (write/edit/bash) but has no
-> approval UI will see those turns **stall waiting for a decision**. If a surface
-> isn't ready to handle approvals yet, run the daemon with `OCEAN_YOLO=1`
-> (trusted/local automation only) until that surface ships an approval flow.
-> Read-only turns are unaffected.
+Permission decisions remain bound to the submitting turn's `decision_token`
+(OCEAN-185). A voice turn without a token is accepted only in effective
+`skip_all` mode; otherwise the daemon rejects it up front rather than hanging on
+a prompt the spoken interface cannot answer.
 
 #### `OCEAN_ALLOWED_ORIGINS` — CORS whitelist (OCEAN-53)
 
@@ -536,8 +507,10 @@ GET    /v1/memory                         list retained long-term memories
 GET    /v1/lsp                            list language-server readiness for a workspace
 
 # Settings
-GET    /v1/settings/yolo                  read persisted + effective YOLO posture
-POST   /v1/settings/yolo                  set persisted YOLO default { enabled: bool }
+GET    /v1/settings/yolo                  legacy boolean approval posture
+POST   /v1/settings/yolo                  legacy adapter { enabled: bool }
+GET    /v1/settings/permissions           read saved + effective approval mode
+POST   /v1/settings/permissions           set approval mode { mode: manual|automatic|skip_all }
 
 # Surface components
 POST   /v1/component/event                surface component interaction event

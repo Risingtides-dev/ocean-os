@@ -13,6 +13,10 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 ## Local Contracts
 
 - Preserve session compatibility unless a migration is documented.
+- Permission-mode persistence atomically writes the authoritative three-state
+  file and reports write failures. Load old booleans as automatic/skip-all; the
+  legacy `yolo_pref` is a best-effort downgrade mirror, while current boolean
+  reads derive from the authoritative mode so the two cannot disagree live.
 - Project instruction discovery must respect the repo devlog chain: repo-root `AGENTS.md` is the root contract; `.ocean/AGENTS.md` is only a child doc for `.ocean/` runtime artifacts.
 - Do not add new instruction sources without tests proving ancestor/nested cwd behavior.
 - Turn persistence is incremental: save the accepted user message before provider execution, then save only at provider-valid round boundaries where every assistant tool call has its ordered tool result. Never persist an orphan tool-call batch.

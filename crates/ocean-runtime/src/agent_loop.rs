@@ -25,6 +25,9 @@ pub struct AgentRun {
     pub stopped_at_turn_limit: bool,
     /// Real provider token usage, summed across every round of the turn.
     /// `Usage::default()` (all zero) when the provider reported none.
+    /// Provider-reported total context consumption for the final provider round.
+    /// This is deliberately not a sum: each round's request includes prior rounds.
+    pub context_tokens: u64,
     pub usage: ocean_protocol::Usage,
 }
 
@@ -92,6 +95,7 @@ pub async fn run_agent_with_history(
     let mut turn: u32 = 0;
     let mut stopped_at_turn_limit = false;
     let mut total_usage = ocean_protocol::Usage::default();
+    let mut latest_context_tokens = 0;
     // Completed-round durability cursor. Checkpoints carry only the transcript
     // delta since the previous valid boundary, avoiding a full-history clone on
     // every browser/tool round while preserving provider ordering.
@@ -241,6 +245,7 @@ pub async fn run_agent_with_history(
                             total_usage.cache_read += message.usage.cache_read;
                             total_usage.cache_write += message.usage.cache_write;
                             total_usage.total_tokens += message.usage.total_tokens;
+                            latest_context_tokens = message.usage.total_tokens;
                             final_message = Some(message);
                             break;
                         }
@@ -419,7 +424,11 @@ pub async fn run_agent_with_history(
             let tool_obj = tool_index.get(&name).cloned();
             let needs_perm = tool_obj
                 .as_ref()
-                .map(|t| t.requires_permission())
+                .map(|tool| {
+                    config
+                        .permission
+                        .should_check(&name, &args, tool.requires_permission())
+                })
                 .unwrap_or(false)
                 && !session_allowed.contains(&name);
             if needs_perm {
@@ -666,6 +675,7 @@ pub async fn run_agent_with_history(
         messages,
         stopped_at_turn_limit,
         usage: total_usage,
+        context_tokens: latest_context_tokens,
     })
 }
 
@@ -1292,12 +1302,17 @@ mod tests {
             _options: &StreamOptions,
         ) -> ocean_protocol::Result<AssistantMessageEventStream> {
             let round = self.calls.fetch_add(1, Ordering::SeqCst);
-            let message = |content, stop| AssistantMessage {
+            let message = |content, stop, total_tokens: u64| AssistantMessage {
                 content,
                 api: "test".into(),
                 provider: "test".into(),
                 model: "test".into(),
-                usage: Usage::default(),
+                usage: Usage {
+                    input: total_tokens.saturating_sub(10),
+                    output: 10,
+                    total_tokens,
+                    ..Usage::default()
+                },
                 stop_reason: stop,
                 error_message: None,
                 timestamp: ocean_protocol::now_ms(),
@@ -1312,6 +1327,7 @@ mod tests {
                             arguments: serde_json::json!({}),
                         }],
                         StopReason::ToolUse,
+                        100,
                     ),
                 }]
             } else {
@@ -1320,6 +1336,7 @@ mod tests {
                     message: message(
                         vec![Content::text("final answer after tool result")],
                         StopReason::Stop,
+                        140,
                     ),
                 }]
             };
@@ -1341,6 +1358,12 @@ mod tests {
 
         assert!(matches!(run.messages.last(), Some(Message::Assistant(a))
             if a.content.iter().any(|c| c.as_text() == Some("final answer after tool result"))));
+
+        assert_eq!(
+            run.context_tokens, 140,
+            "context occupancy must be the final round, not the 240-token sum"
+        );
+        assert_eq!(run.usage.total_tokens, 240);
 
         let mut deltas = Vec::new();
         let mut checkpoints = Vec::new();

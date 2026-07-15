@@ -167,6 +167,7 @@ mod tests {
                     input_tokens: Some(2),
                     cache_read_tokens: Some(1),
                     tokens_per_second: Some(1.5),
+                    context_usage: None,
                 },
                 "turn_finished",
             ),
@@ -303,6 +304,7 @@ mod tests {
                 input_tokens: None,
                 cache_read_tokens: None,
                 tokens_per_second: None,
+                context_usage: None,
             }),
             Some(OceanEvent::TurnFinished {
                 ok: true,
@@ -320,6 +322,7 @@ mod tests {
                 input_tokens: None,
                 cache_read_tokens: None,
                 tokens_per_second: None,
+                context_usage: None,
             }),
             Some(OceanEvent::TurnFinished {
                 ok: false,

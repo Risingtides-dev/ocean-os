@@ -18,7 +18,7 @@
 //! ⌃⌥6 terminal · Tab cycles focus · Esc → back to chat (double-Esc leaves the
 //! terminal dock) · ⌃Q quits (⌃C passes to the PTY).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ use crossterm::event::{
     Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnRequest, ThinkingLevel};
-use ocean_core::RequestId;
+use ocean_core::{PermissionId, PermissionMode, PermissionSettingsResponse, RequestId};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -74,6 +74,35 @@ const MIN_TERM_H: u16 = 3;
 const MIN_CENTER_H: u16 = 5;
 const MIN_TREE_WITH_TRAY_H: u16 = 5;
 const MIN_TRAY_H: u16 = 6;
+
+const PERMISSION_OPTIONS: [(PermissionMode, &str, &str); 3] = [
+    (
+        PermissionMode::Manual,
+        "Manually approve",
+        "Ocean pauses so you can approve each action.",
+    ),
+    (
+        PermissionMode::Automatic,
+        "Automatically approve",
+        "Ocean runs on its own and pauses to ask if anything looks unsafe.",
+    ),
+    (
+        PermissionMode::SkipAll,
+        "Skip all approvals",
+        "Ocean never pauses, even for unsafe actions.",
+    ),
+];
+
+fn permission_mode_index(mode: PermissionMode) -> usize {
+    PERMISSION_OPTIONS
+        .iter()
+        .position(|(candidate, _, _)| *candidate == mode)
+        .unwrap_or(1)
+}
+
+fn permission_mode_label(mode: PermissionMode) -> &'static str {
+    PERMISSION_OPTIONS[permission_mode_index(mode)].1
+}
 
 /// Largest dock height that still leaves the main surface `MIN_CENTER_H` rows,
 /// given the center column's total height (crumb + surface + splitter + dock).
@@ -325,7 +354,14 @@ pub struct App {
     /// turn's first permission request (keyed by its request_id).
     pending_submit_token: Option<String>,
     decision_tokens: HashMap<RequestId, String>,
-    perm_request: HashMap<ocean_core::PermissionId, RequestId>,
+    perm_request: HashMap<PermissionId, RequestId>,
+    /// Permission requests still awaiting a daemon decision.
+    pending_permission_ids: HashSet<PermissionId>,
+    /// Requests that were already active when this TUI received a daemon-
+    /// confirmed effective skip-all save. Only these request ids may bridge
+    /// later same-turn prompts; never use a stale global cache to approve a new
+    /// turn after another client or daemon restart changes the policy.
+    skip_all_requests: HashSet<RequestId>,
     /// Pane rects from the last draw, for mouse routing.
     r_body: Rect,
     r_sessions: Rect,
@@ -419,6 +455,15 @@ pub struct App {
     /// `/settings` overlay: open flag + selected row.
     settings_open: bool,
     settings_sel: usize,
+    /// `/permissions` daemon-owned approval picker.
+    permissions_open: bool,
+    permissions_loading: bool,
+    permissions_saving: bool,
+    permissions_sel: usize,
+    permissions_persisted: Option<PermissionMode>,
+    permissions_effective: Option<PermissionMode>,
+    permissions_env_override: Option<PermissionMode>,
+    permissions_hit: Vec<(Rect, usize)>,
     /// `/providers` popup: auth-status list + inline API-key entry.
     providers_open: bool,
     providers_sel: usize,
@@ -484,6 +529,8 @@ impl App {
             pending_submit_token: None,
             decision_tokens: HashMap::new(),
             perm_request: HashMap::new(),
+            pending_permission_ids: HashSet::new(),
+            skip_all_requests: HashSet::new(),
             r_body: Rect::default(),
             r_sessions: Rect::default(),
             r_tree: Rect::default(),
@@ -538,6 +585,14 @@ impl App {
             git_status,
             settings_open: false,
             settings_sel: 0,
+            permissions_open: false,
+            permissions_loading: false,
+            permissions_saving: false,
+            permissions_sel: permission_mode_index(PermissionMode::Automatic),
+            permissions_persisted: None,
+            permissions_effective: None,
+            permissions_env_override: None,
+            permissions_hit: Vec::new(),
             providers_open: false,
             providers_sel: 0,
             providers_rows: Vec::new(),
@@ -862,6 +917,22 @@ impl App {
                 _ => {}
             }
             return;
+        }
+        // `/permissions` is a daemon-owned modal picker. No input leaks to the
+        // composer while the current mode is loading or a selection is saving.
+        if self.permissions_open {
+            match evt {
+                CrosstermEvent::Key(k) => {
+                    self.permissions_key(k);
+                    return;
+                }
+                CrosstermEvent::Mouse(m) => {
+                    self.permissions_mouse(m);
+                    return;
+                }
+                CrosstermEvent::Paste(_) => return,
+                _ => {}
+            }
         }
         // The `/models` picker is modal: keys and mouse both drive it while
         // open (clicking a row selects/applies, clicking outside closes).
@@ -1637,14 +1708,89 @@ impl App {
             // with the providers popup — opening one closes the other.
             Action::OpenSettings => {
                 self.providers_open = false;
+                self.permissions_open = false;
                 self.settings_open = true;
                 self.settings_sel = 0;
+            }
+            // `/permissions`: fetch the daemon-owned effective mode before
+            // showing a selected row. The app never invents local authority.
+            Action::OpenPermissions => {
+                self.settings_open = false;
+                self.providers_open = false;
+                self.permissions_open = true;
+                self.permissions_loading = true;
+                self.permissions_saving = false;
+                self.permissions_hit.clear();
+                let client = self.client.clone();
+                let tx = self.actions_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Action::PermissionSettingsLoaded(
+                        client.permission_settings().await,
+                    ));
+                });
+            }
+            Action::PermissionSettingsLoaded(result) => {
+                self.permissions_loading = false;
+                match result {
+                    Ok(settings) => self.accept_permission_settings(settings),
+                    Err(error) => self.set_notice(format!("permissions: {error}")),
+                }
+            }
+            Action::PermissionModeSaved(result) => {
+                self.permissions_saving = false;
+                match result {
+                    Ok(settings) => {
+                        self.accept_permission_settings(settings);
+                        self.permissions_open = false;
+                        let effective = permission_mode_label(settings.effective);
+                        if settings.env_override.is_some() {
+                            let saved = settings
+                                .persisted
+                                .map(permission_mode_label)
+                                .unwrap_or(effective);
+                            self.set_notice(format!(
+                                "saved {saved}; OCEAN_YOLO keeps {effective} effective"
+                            ));
+                        } else {
+                            self.set_notice(format!("permissions: {effective}"));
+                        }
+                        // A turn that was already waiting captured its prior
+                        // policy. Once the daemon confirms skip-all is truly
+                        // effective, release this submitter's pending calls with
+                        // their normal decision tokens instead of leaving the
+                        // TUI wedged until an extra Ctrl-Y.
+                        if settings.effective == PermissionMode::SkipAll {
+                            let pending: Vec<(PermissionId, RequestId)> = self
+                                .pending_permission_ids
+                                .iter()
+                                .filter_map(|permission_id| {
+                                    self.perm_request
+                                        .get(permission_id)
+                                        .copied()
+                                        .map(|request_id| (*permission_id, request_id))
+                                })
+                                .collect();
+                            self.skip_all_requests
+                                .extend(pending.iter().map(|(_, request_id)| *request_id));
+                            for (permission_id, _) in pending {
+                                let _ = self.actions_tx.send(Action::PermissionDecided {
+                                    permission_id,
+                                    allow: true,
+                                });
+                            }
+                        } else {
+                            self.skip_all_requests.clear();
+                        }
+                    }
+                    Err(error) => self.set_notice(format!("permissions: {error}")),
+                }
             }
             // `/providers` (or bare `/login`): open the provider auth popup.
             // Builds the status rows fresh from the auth file + process env so
             // the list reflects the live state every time it's opened.
             Action::OpenProviders => {
                 self.settings_open = false;
+                self.permissions_open = false;
                 self.providers_open = true;
                 self.providers_sel = 0;
                 self.providers_mode = ProvidersMode::List;
@@ -1662,12 +1808,13 @@ impl App {
                     let _ = tx.send(Action::Status(msg));
                 });
             }
-            Action::OceanEvent(env) => {
+            Action::OceanEvent(env) => match &env.event {
                 // OCEAN-185: the turn's first permission request claims the
                 // pending submit token; remember permission→request for the POST.
-                if let ocean_core::OceanEvent::PermissionRequest { .. } = &env.event {
+                ocean_core::OceanEvent::PermissionRequest { .. } => {
                     if let (Some(rid), Some(pid)) = (env.request_id, env.permission_id) {
                         self.perm_request.insert(pid, rid);
+                        self.pending_permission_ids.insert(pid);
                         if let std::collections::hash_map::Entry::Vacant(slot) =
                             self.decision_tokens.entry(rid)
                         {
@@ -1675,9 +1822,37 @@ impl App {
                                 slot.insert(token);
                             }
                         }
+                        // Only a request that was already active when skip-all
+                        // was confirmed may bridge later same-turn prompts.
+                        if self.skip_all_requests.contains(&rid) {
+                            let _ = self.actions_tx.send(Action::PermissionDecided {
+                                permission_id: pid,
+                                allow: true,
+                            });
+                        }
                     }
                 }
-            }
+                ocean_core::OceanEvent::PermissionDecision { .. } => {
+                    if let Some(pid) = env.permission_id {
+                        self.pending_permission_ids.remove(&pid);
+                        self.perm_request.remove(&pid);
+                    }
+                }
+                ocean_core::OceanEvent::TurnFinished { .. }
+                | ocean_core::OceanEvent::Cancelled { .. }
+                | ocean_core::OceanEvent::Error { .. } => {
+                    if let Some(request_id) = env.request_id {
+                        self.skip_all_requests.remove(&request_id);
+                        self.decision_tokens.remove(&request_id);
+                        self.pending_permission_ids.retain(|permission_id| {
+                            self.perm_request.get(permission_id) != Some(&request_id)
+                        });
+                        self.perm_request
+                            .retain(|_, mapped_request| *mapped_request != request_id);
+                    }
+                }
+                _ => {}
+            },
             Action::PermissionDecided {
                 permission_id,
                 allow,
@@ -1903,6 +2078,70 @@ impl App {
             id: AgentSessionId(id),
             path: session.path,
             cwd: session.cwd,
+        });
+    }
+
+    fn accept_permission_settings(&mut self, settings: &PermissionSettingsResponse) {
+        if settings.effective != PermissionMode::SkipAll {
+            self.skip_all_requests.clear();
+        }
+        self.permissions_persisted = settings.persisted;
+        self.permissions_effective = Some(settings.effective);
+        self.permissions_env_override = settings.env_override;
+        self.permissions_sel =
+            permission_mode_index(settings.persisted.unwrap_or(settings.effective));
+    }
+
+    fn permissions_key(&mut self, k: crossterm::event::KeyEvent) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.permissions_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.permissions_sel = self.permissions_sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.permissions_sel = (self.permissions_sel + 1).min(PERMISSION_OPTIONS.len() - 1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.permissions_apply(),
+            _ => {}
+        }
+    }
+
+    fn permissions_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.permissions_sel = self.permissions_sel.saturating_sub(1);
+            }
+            MouseEventKind::ScrollDown => {
+                self.permissions_sel = (self.permissions_sel + 1).min(PERMISSION_OPTIONS.len() - 1);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = (m.column, m.row);
+                if let Some(index) = self
+                    .permissions_hit
+                    .iter()
+                    .find(|(rect, _)| rect_has(*rect, pos))
+                    .map(|(_, index)| *index)
+                {
+                    self.permissions_sel = index;
+                    self.permissions_apply();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn permissions_apply(&mut self) {
+        if self.permissions_loading || self.permissions_saving {
+            return;
+        }
+        let mode = PERMISSION_OPTIONS[self.permissions_sel].0;
+        self.permissions_saving = true;
+        let client = self.client.clone();
+        let tx = self.actions_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Action::PermissionModeSaved(
+                client.set_permission_mode(mode).await,
+            ));
         });
     }
 
@@ -2653,6 +2892,101 @@ impl App {
             Rect::new(inner.x, footer_y, inner.width, 1),
         );
     }
+    fn draw_permissions(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::widgets::{Block, Borders, Clear, Wrap};
+
+        self.permissions_hit.clear();
+        let full = frame.area();
+        let width = 74u16.min(full.width.saturating_sub(4));
+        let height = 15u16.min(full.height.saturating_sub(2));
+        if width < 24 || height < 8 {
+            return;
+        }
+        let area = Rect::new(
+            full.x + (full.width.saturating_sub(width)) / 2,
+            full.y + (full.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        );
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
+            .style(Style::default().bg(theme::SLATE))
+            .title(Span::styled(
+                " PERMISSIONS ",
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        for (index, (mode, label, description)) in PERMISSION_OPTIONS.iter().enumerate() {
+            let y = inner.y + index as u16 * 3;
+            if y >= inner.bottom() {
+                break;
+            }
+            let row = Rect::new(inner.x, y, inner.width, 3.min(inner.bottom() - y));
+            self.permissions_hit.push((row, index));
+            let selected = index == self.permissions_sel;
+            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+            frame.render_widget(Block::default().style(Style::default().bg(bed)), row);
+
+            let marker = if selected { g("▎", ">") } else { " " };
+            let current = if self.permissions_effective == Some(*mode) {
+                "  current"
+            } else {
+                ""
+            };
+            let label =
+                truncate_cells(&format!(" {marker} {label}{current}"), inner.width as usize);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(if selected { theme::FG } else { theme::COMMENT })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ))
+                .style(Style::default().bg(bed)),
+                Rect::new(row.x, row.y, row.width, 1),
+            );
+            if row.height > 1 {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("    {description}"),
+                        Style::default().fg(theme::COMMENT),
+                    ))
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().bg(bed)),
+                    Rect::new(row.x, row.y + 1, row.width, row.height - 1),
+                );
+            }
+        }
+
+        let footer = if self.permissions_loading {
+            " loading current policy…"
+        } else if self.permissions_saving {
+            " saving…"
+        } else if self.permissions_env_override.is_some() {
+            " OCEAN_YOLO overrides the saved choice"
+        } else {
+            ""
+        };
+        if !footer.is_empty() && inner.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(footer, Style::default().fg(theme::CYAN)))
+                    .style(Style::default().bg(theme::SLATE)),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            );
+        }
+    }
+
     /// Build the `/providers` rows from the static [`PROVIDER_TABLE`], computing
     /// each row's status from the process env (first hit wins) then the Ocean
     /// auth file (oauth block presence/expiry, or `api_key`). Read from the
@@ -3506,6 +3840,9 @@ impl App {
         if self.settings_open {
             self.draw_settings(frame);
         }
+        if self.permissions_open {
+            self.draw_permissions(frame);
+        }
         if self.models_open {
             self.draw_models(frame);
         }
@@ -4156,7 +4493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn todo_events_reveal_session_tray_and_new_turn_reclaims_tree() {
+    async fn todo_events_reveal_session_tray_and_stay_pinned_across_turns() {
         let mut app = offline_app();
         app.show_tree = true;
         let sid = AgentSessionId(uuid::Uuid::from_u128(1));
@@ -4217,9 +4554,10 @@ mod tests {
             turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(4)),
             model: None,
         })));
-        render_app_to_string(&mut app, 100, 28);
-        assert_eq!(app.r_tray, Rect::default());
-        assert_eq!(app.r_split_tray, Rect::default());
+        let next_screen = render_app_to_string(&mut app, 100, 28);
+        assert!(next_screen.contains("tray task"));
+        assert_ne!(app.r_tray, Rect::default());
+        assert_ne!(app.r_split_tray, Rect::default());
     }
 
     #[tokio::test]
@@ -4625,6 +4963,97 @@ mod tests {
             !app.chat.wants_tab(),
             "paste must not leak beneath a modal overlay"
         );
+    }
+
+    #[test]
+    fn permissions_overlay_renders_all_modes_and_tracks_effective_policy() {
+        let mut app = offline_app();
+        app.permissions_open = true;
+        app.accept_permission_settings(&PermissionSettingsResponse {
+            ok: true,
+            error: None,
+            persisted: Some(PermissionMode::Automatic),
+            effective: PermissionMode::Automatic,
+            env_override: None,
+        });
+
+        let screen = render_app_to_string(&mut app, 90, 24);
+        assert!(screen.contains("PERMISSIONS"));
+        assert!(screen.contains("Manually approve"));
+        assert!(screen.contains("Automatically approve"));
+        assert!(screen.contains("Skip all approvals"));
+        assert!(screen.contains("approve each action"));
+        assert!(screen.contains("anything looks unsafe"));
+        assert!(screen.contains("even for unsafe actions"));
+        assert!(screen.contains("current"));
+        assert_eq!(app.permissions_hit.len(), 3);
+    }
+
+    #[test]
+    fn permission_picker_navigation_and_env_override_feedback_are_truthful() {
+        let mut app = offline_app();
+        app.permissions_open = true;
+        app.permissions_sel = permission_mode_index(PermissionMode::Automatic);
+        app.permissions_key(crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            PERMISSION_OPTIONS[app.permissions_sel].0,
+            PermissionMode::SkipAll
+        );
+        let pending = PermissionId::new_v4();
+        let request_id = RequestId::new_v4();
+        app.pending_permission_ids.insert(pending);
+        app.perm_request.insert(pending, request_id);
+        while app.actions_rx.try_recv().is_ok() {}
+        app.dispatch(Action::PermissionModeSaved(Ok(
+            PermissionSettingsResponse {
+                ok: true,
+                error: None,
+                persisted: Some(PermissionMode::Manual),
+                effective: PermissionMode::SkipAll,
+                env_override: Some(PermissionMode::SkipAll),
+            },
+        )));
+        assert!(!app.permissions_open);
+        assert!(app.status.contains("OCEAN_YOLO"));
+        assert!(app.status.contains("Skip all approvals"));
+        assert!(matches!(
+            app.actions_rx.try_recv(),
+            Ok(Action::PermissionDecided {
+                permission_id,
+                allow: true,
+            }) if permission_id == pending
+        ));
+        assert!(app.skip_all_requests.contains(&request_id));
+
+        let mut finished = ocean_core::EventEnvelope::new(ocean_core::OceanEvent::TurnFinished {
+            ok: true,
+            wall_ms: 1,
+        });
+        finished.request_id = Some(request_id);
+        app.dispatch(Action::OceanEvent(Box::new(finished)));
+        assert!(!app.skip_all_requests.contains(&request_id));
+
+        // The cached global display may still say skip-all, but a NEW request
+        // was not active when the save was confirmed and must never auto-allow.
+        let next_request = RequestId::new_v4();
+        let next_permission = PermissionId::new_v4();
+        let mut request =
+            ocean_core::EventEnvelope::new(ocean_core::OceanEvent::PermissionRequest {
+                tool: "write".into(),
+                reason: "permission required".into(),
+                args: serde_json::json!({}),
+            });
+        request.request_id = Some(next_request);
+        request.permission_id = Some(next_permission);
+        while app.actions_rx.try_recv().is_ok() {}
+        app.dispatch(Action::OceanEvent(Box::new(request)));
+        assert!(matches!(
+            app.actions_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
     }
 
     #[test]

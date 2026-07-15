@@ -25,6 +25,7 @@ mod mentions;
 mod offshore;
 mod panel;
 mod pty;
+mod rail;
 mod sessions;
 mod slash;
 mod spatial;

@@ -1,9 +1,11 @@
 //! SessionComponentTray — session-bound components that live beneath FILES.
 //!
 //! The tray is a shell-level host, not part of the file tree. Its first adapter
-//! projects confirmed `todo` tool effects for the current agent run. The source
-//! tool is intentionally run-local and non-durable, so the projection clears on
-//! every new turn/session and never claims context-window telemetry.
+//! projects confirmed `todo` tool effects for the currently bound session. The source
+//! tool is intentionally session-scoped and non-durable: confirmed items stay
+//! pinned across turns while the same session is bound, then clear on an
+//! explicit todo clear, session switch/new session, daemon restart, or gap
+//! invalidation.
 
 use std::collections::HashMap;
 
@@ -14,7 +16,7 @@ use crate::shell::{
     panel,
     theme::{self, g},
 };
-use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnId, ToolCallId};
+use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnId, ContextUsage, ToolCallId};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -24,7 +26,7 @@ use ratatui::{
 };
 
 const MIN_PANEL_H: u16 = 6;
-const MAX_PANEL_H: u16 = 12;
+const MAX_PANEL_H: u16 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TodoItem {
@@ -112,6 +114,7 @@ pub struct SessionComponentTray {
     /// call was todo or non-todo before deciding that an orphan implies a gap.
     observed_calls: HashMap<uuid::Uuid, bool>,
     continuity_uncertain: bool,
+    context_usage: Option<ContextUsage>,
 }
 
 impl SessionComponentTray {
@@ -122,19 +125,25 @@ impl SessionComponentTray {
             todo: TodoProjection::default(),
             observed_calls: HashMap::new(),
             continuity_uncertain: false,
+            context_usage: None,
         }
     }
 
     pub fn is_visible(&self) -> bool {
-        self.todo.is_visible()
+        self.todo.is_visible() || self.context_usage.is_some()
     }
 
     pub fn desired_height(&self) -> u16 {
         let status_rows = u16::from(!self.todo.pending.is_empty() || self.todo.uncertain);
-        let content_rows = 1u16
-            .saturating_add(self.todo.items.len().min(u16::MAX as usize) as u16)
-            .saturating_add(status_rows);
-        content_rows
+        let todo_rows = if self.todo.is_visible() {
+            1u16.saturating_add(self.todo.items.len().min(u16::MAX as usize) as u16)
+                .saturating_add(status_rows)
+        } else {
+            0
+        };
+        let context_rows = if self.context_usage.is_some() { 3 } else { 0 };
+        todo_rows
+            .saturating_add(context_rows)
             .saturating_add(3)
             .clamp(MIN_PANEL_H, MAX_PANEL_H)
     }
@@ -146,6 +155,7 @@ impl SessionComponentTray {
             self.todo.clear();
             self.observed_calls.clear();
             self.continuity_uncertain = false;
+            self.context_usage = None;
         }
     }
 
@@ -154,9 +164,17 @@ impl SessionComponentTray {
             return;
         }
         self.turn_id = Some(turn_id);
-        self.todo.clear();
+        // Confirmed todo items are session-scoped. Preserve them across turns,
+        // but discard unresolved calls from the prior turn and clear an
+        // uncertainty marker once a fresh authoritative boundary arrives.
+        self.todo.pending.clear();
+        self.todo.uncertain = false;
         self.observed_calls.clear();
         self.continuity_uncertain = false;
+        // Keep the last completed measurement visible while the next turn runs.
+        // It is timestamped and explicitly final-round provenance, so it cannot be
+        // mistaken for a live estimate; replacing it only on a finished event also
+        // avoids a distracting panel collapse/reopen cycle.
     }
 
     fn apply_event(&mut self, event: &AgentTurnEvent) {
@@ -222,12 +240,17 @@ impl SessionComponentTray {
                     }
                 }
             }
-            AgentTurnEvent::TurnFinished { turn_id, .. }
-                if self.turn_id == Some(*turn_id) && !self.todo.pending.is_empty() =>
-            {
-                self.todo.pending.clear();
-                self.todo.uncertain = true;
-                self.observed_calls.clear();
+            AgentTurnEvent::TurnFinished {
+                turn_id,
+                context_usage,
+                ..
+            } if self.turn_id == Some(*turn_id) => {
+                self.context_usage.clone_from(context_usage);
+                if !self.todo.pending.is_empty() {
+                    self.todo.pending.clear();
+                    self.todo.uncertain = true;
+                    self.observed_calls.clear();
+                }
             }
             _ => {}
         }
@@ -268,12 +291,44 @@ impl Component for SessionComponentTray {
         );
 
         let mut lines = Vec::with_capacity(body.height as usize);
-        lines.push(Line::from(Span::styled(
-            fit_cells(" TODOS", body.width as usize),
-            Style::default()
-                .fg(theme::BLUE)
-                .add_modifier(Modifier::BOLD),
-        )));
+        if let Some(usage) = &self.context_usage {
+            let used = usage.used_tokens.min(usage.context_window);
+            let pct = used
+                .saturating_mul(100)
+                .checked_div(usage.context_window)
+                .unwrap_or(0);
+            lines.push(Line::from(Span::styled(
+                fit_cells(" CONTEXT", body.width as usize),
+                Style::default()
+                    .fg(theme::BLUE)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                fit_cells(
+                    &format!(
+                        " {}  {}/{}",
+                        context_bar(pct, 10),
+                        compact_tokens(usage.used_tokens),
+                        compact_tokens(usage.context_window)
+                    ),
+                    body.width as usize,
+                ),
+                Style::default().fg(context_color(pct)),
+            )));
+            lines.push(Line::from(Span::styled(
+                fit_cells(&format!(" {pct}% · provider measured"), body.width as usize),
+                Style::default().fg(theme::COMMENT),
+            )));
+        }
+
+        if self.todo.is_visible() && lines.len() < body.height as usize {
+            lines.push(Line::from(Span::styled(
+                fit_cells(" TODOS", body.width as usize),
+                Style::default()
+                    .fg(theme::BLUE)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         let status = if self.todo.uncertain {
             Some((" state incomplete", theme::YELLOW))
         } else if !self.todo.pending.is_empty() {
@@ -281,7 +336,8 @@ impl Component for SessionComponentTray {
         } else {
             None
         };
-        let remaining = body.height.saturating_sub(1) as usize;
+        let used_body_rows = lines.len();
+        let remaining = (body.height as usize).saturating_sub(used_body_rows);
         let mut item_rows = remaining.saturating_sub(usize::from(status.is_some()));
         let overflow = self.todo.items.len() > item_rows;
         if overflow {
@@ -313,7 +369,36 @@ impl Component for SessionComponentTray {
             Paragraph::new(lines).style(Style::default().bg(theme::SLATE)),
             body,
         );
-        panel::footer(frame, area, " run-local");
+        panel::footer(frame, area, " session-scoped");
+    }
+}
+
+fn context_bar(pct: u64, width: usize) -> String {
+    let filled = ((pct.min(100) as usize) * width).div_ceil(100);
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(width.saturating_sub(filled))
+    )
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn context_color(pct: u64) -> ratatui::style::Color {
+    if pct >= 90 {
+        theme::RED
+    } else if pct >= 75 {
+        theme::YELLOW
+    } else {
+        theme::CYAN
     }
 }
 
@@ -384,6 +469,26 @@ mod tests {
         }))
     }
 
+    fn turn_finished(
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+        context_usage: Option<ContextUsage>,
+        status: AgentTurnStatus,
+    ) -> Action {
+        Action::AgentEvent(Box::new(AgentTurnEvent::TurnFinished {
+            session_id,
+            turn_id,
+            status,
+            error: None,
+            wall_ms: Some(10),
+            output_tokens: Some(5),
+            input_tokens: Some(100),
+            cache_read_tokens: None,
+            tokens_per_second: Some(500.0),
+            context_usage,
+        }))
+    }
+
     fn render(tray: &mut SessionComponentTray) -> String {
         let backend = ratatui::backend::TestBackend::new(30, MAX_PANEL_H);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -399,6 +504,53 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn context_usage_is_truthful_and_absent_when_unknown() {
+        let mut tray = SessionComponentTray::new();
+        let sid = session(1);
+        let tid = turn(2);
+        tray.update(&Action::SessionBound(sid));
+        tray.update(&begin(sid, tid));
+        tray.update(&turn_finished(
+            sid,
+            tid,
+            Some(ContextUsage {
+                used_tokens: 150_000,
+                context_window: 200_000,
+                source: "provider_reported_final_round".into(),
+                measured_at_ms: 123,
+            }),
+            AgentTurnStatus::Completed,
+        ));
+        let screen = render(&mut tray);
+        assert!(screen.contains("CONTEXT"));
+        assert!(screen.contains("150k/200k"));
+        assert!(screen.contains("75% · provider measured"));
+
+        tray.update(&begin(sid, turn(3)));
+        tray.update(&turn_finished(
+            sid,
+            turn(3),
+            None,
+            AgentTurnStatus::Completed,
+        ));
+        assert!(
+            !tray.is_visible(),
+            "unknown measurement renders no estimate"
+        );
+    }
+
+    #[test]
+    fn context_helpers_clamp_and_use_semantic_thresholds() {
+        assert_eq!(context_bar(0, 5), "░░░░░");
+        assert_eq!(context_bar(101, 5), "█████");
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(128_000), "128k");
+        assert_eq!(context_color(74), theme::CYAN);
+        assert_eq!(context_color(75), theme::YELLOW);
+        assert_eq!(context_color(90), theme::RED);
     }
 
     #[test]
@@ -447,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn new_turn_and_session_switch_clear_ephemeral_state() {
+    fn new_turn_keeps_confirmed_todos_and_session_switch_clears_them() {
         let mut tray = SessionComponentTray::new();
         let sid = session(1);
         tray.update(&Action::SessionBound(sid));
@@ -463,7 +615,15 @@ mod tests {
             turn_id: turn(3),
             model: None,
         })));
-        assert!(!tray.is_visible());
+        assert_eq!(
+            tray.todo.items,
+            vec![TodoItem {
+                text: "old".into(),
+                done: false,
+            }],
+            "confirmed todo remains pinned for the bound session"
+        );
+        assert!(tray.is_visible());
 
         tray.update(&started(
             sid,
@@ -473,6 +633,20 @@ mod tests {
         ));
         tray.update(&finished(sid, turn(3), call(2), true));
         tray.update(&Action::SessionBound(session(9)));
+        assert!(!tray.is_visible());
+        assert_eq!(
+            tray.todo.items,
+            vec![],
+            "session switch clears the projection"
+        );
+
+        // Switch back to session 1: the tray is a live projection, not
+        // reconstructed history, so it must remain empty after re-bind.
+        tray.update(&Action::SessionBound(sid));
+        assert!(
+            tray.todo.items.is_empty(),
+            "re-binding session 1 must not reconstruct old todo state"
+        );
         assert!(!tray.is_visible());
     }
 
@@ -512,6 +686,7 @@ mod tests {
                 input_tokens: None,
                 cache_read_tokens: None,
                 tokens_per_second: None,
+                context_usage: None,
             },
         )));
         assert!(tray.todo.uncertain);

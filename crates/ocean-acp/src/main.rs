@@ -1593,6 +1593,7 @@ mod tests {
                 input_tokens: None,
                 cache_read_tokens: None,
                 tokens_per_second: None,
+                context_usage: None,
             },
         ];
         for ev in cases {

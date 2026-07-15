@@ -15,6 +15,9 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 - Treat public type changes as cross-crate contract changes.
 - Preserve serde compatibility unless the breaking change is intentional and documented.
 - Keep protocol types free of daemon/runtime implementation details.
+- `PermissionMode` wire names are stable (`manual`, `automatic`, `skip_all`);
+  clients display daemon-reported saved/effective settings rather than deriving
+  policy locally.
 - The closed Track-0 `RoomId` projection family is retired. Durable room contracts use the open `RoomKey` model; do not recreate projection DTOs without a new audited API design.
 
 ## Work Guidance

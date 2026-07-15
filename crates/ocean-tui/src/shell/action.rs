@@ -102,6 +102,12 @@ pub enum Action {
     /// `/settings` — open the app's settings overlay (panel toggles, dock
     /// height, live session info).
     OpenSettings,
+    /// `/permissions` — open the daemon-owned three-state approval picker.
+    OpenPermissions,
+    /// Initial GET for the permission picker completed.
+    PermissionSettingsLoaded(Result<ocean_core::PermissionSettingsResponse, String>),
+    /// POST after selecting a permission mode completed.
+    PermissionModeSaved(Result<ocean_core::PermissionSettingsResponse, String>),
     /// `/providers` (or bare `/login`) — open the provider auth popup. Lists
     /// every provider with its live auth status; Enter triggers OAuth login
     /// (Claude/Codex) or inline API-key entry (GLM, DeepSeek, Kimi, …).

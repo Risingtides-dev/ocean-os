@@ -16,8 +16,15 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - Restart the daemon only by specific PID; do not use blind `pkill` sweeps.
 - HTTP turn routes must resolve effective cwd from client cwd/project metadata and must never fall back to daemon process cwd.
 - Do not bypass runtime permission gates from daemon route code.
-- `call-voice` turns are always `HarnessProfile::Voice`, `yolo: false`, and `PromptControl::without_tools()`, regardless of global or persisted YOLO.
-- Realtime `purpose: "planner"` is pre-session and propose-only: validate the registered project plus canonical live worktree before credential resolution, advertise only `propose_handoff`, and mutate only through the existing session/message/turn routes after an explicit Surface click.
+- Global approval policy is exposed at `GET/POST /v1/settings/permissions` with
+  manual, automatic (default), and skip-all modes; the legacy yolo endpoint
+  remains a compatibility adapter and request-wire `yolo` remains inert.
+- `call-voice` turns are always `HarnessProfile::Voice`, `yolo: false`, and
+  `PromptControl::without_tools()`, regardless of global or persisted YOLO.
+- Realtime `purpose: "planner"` is pre-session and propose-only: validate the
+  registered project plus canonical live worktree before credential resolution,
+  advertise only `propose_handoff`, and mutate only through the existing
+  session/message/turn routes after an explicit Surface click.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
 - Subagent roles, dispatch, lifecycle, and orchestration are extension-owned. Do not add daemon-native `task`/`spawn_worker`/fleet machinery. The daemon may expose generic permission-gated turn, cancellation, capability-provider, and extension event/tool seams; current `/v1/subagents/spec` and folder-agent subagent metadata remain compatibility surfaces until a separately approved extension migration.
 - Slack Socket Mode, API/credential access, reconnects, replies, files, and real Canvas delivery are `ocean-slack` extension concerns. Private `slack_canvas_fulfillment.rs` is only the temporary typed host ingress/readback, runtime lookup, scoped-event, and lifecycle-enforcement compatibility seam; do not grow it into a second Slack transport authority.

@@ -113,6 +113,20 @@ pub enum PermissionDecision {
 /// consult a static allow-list.
 #[async_trait]
 pub trait PermissionPolicy: Send + Sync {
+    /// Decide whether this call should enter the approval path. The runtime
+    /// supplies the tool's conservative `requires_permission` classification;
+    /// interactive policies may broaden it (manual/always-ask) or narrow it
+    /// only under an explicit operator bypass. Keeping this on the policy makes
+    /// approval mode daemon-owned instead of a client-side event race.
+    fn should_check(
+        &self,
+        _tool_name: &str,
+        _args: &Value,
+        tool_requires_permission: bool,
+    ) -> bool {
+        tool_requires_permission
+    }
+
     async fn check(&self, tool_name: &str, args: &Value) -> PermissionDecision;
 }
 

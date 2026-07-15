@@ -29,6 +29,55 @@ use crate::types::{AgentTool, AgentToolResult};
 /// around; cloning is a cheap `Arc` bump.
 pub type SharedTool = Arc<dyn AgentTool>;
 
+const MAX_SESSION_TODOS: usize = 1_024;
+
+/// In-memory todo-tool cache keyed by bound session id, with a soft bound at
+/// [`MAX_SESSION_TODOS`] entries. When the map is at or above the bound and a
+/// new session is requested, the least-recently-touched **empty** entry is
+/// evicted — a session that still holds confirmed todo items is never silently
+/// dropped. If every resident entry is non-empty the map grows temporarily;
+/// once empty entries become available, the next insert reclaims them. This
+/// guarantees the TUI tray cannot display a non-empty projection while the
+/// corresponding daemon tool has been evicted.
+#[derive(Default)]
+struct SessionTodos {
+    next_touch: u64,
+    tools: std::collections::HashMap<String, (u64, Arc<crate::tools::todo::TodoTool>)>,
+}
+
+impl SessionTodos {
+    fn get_or_insert(&mut self, session_id: &str) -> Arc<crate::tools::todo::TodoTool> {
+        let touch = self.next_touch;
+        self.next_touch = self.next_touch.wrapping_add(1);
+        if let Some((last_touch, tool)) = self.tools.get_mut(session_id) {
+            *last_touch = touch;
+            return tool.clone();
+        }
+        // Soft bound: repeatedly evict the least-recently-touched *empty*
+        // tools until we're under the bound or no empty candidate remains.
+        // Non-empty entries are pinned; if all are non-empty the map can
+        // grow temporarily.
+        while self.tools.len() >= MAX_SESSION_TODOS {
+            let candidate = self
+                .tools
+                .iter()
+                .filter(|(_, (_, tool))| tool.is_empty())
+                .min_by_key(|(_, (last_touch, _))| *last_touch)
+                .map(|(id, _)| id.clone());
+            match candidate {
+                Some(oldest) => {
+                    self.tools.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        let tool: Arc<crate::tools::todo::TodoTool> = Arc::new(crate::tools::todo::TodoTool::new());
+        self.tools
+            .insert(session_id.to_string(), (touch, tool.clone()));
+        tool
+    }
+}
+
 /// Per-turn context a provider may use to decide which tools to offer.
 ///
 /// `AgentTool::execute` itself takes no context (tools resolve cwd from the
@@ -108,8 +157,8 @@ pub trait CapabilityProvider: Send + Sync {
 /// The built-in toolset, wrapped as a [`CapabilityProvider`].
 ///
 /// Constructs the built-in tool templates once via [`default_tools`] and clones
-/// them on each `tools()` call. Run-local stateful tools are rebuilt from those
-/// templates so separate agent runs cannot observe one another's memory.
+/// them on each `tools()` call. Stateful tools are rebound to their declared
+/// scope so separate sessions cannot observe one another's memory.
 pub struct BuiltinProvider {
     tools: Vec<SharedTool>,
     /// Session-scoped hashline snapshot stores, keyed by session id. Lives on
@@ -129,6 +178,10 @@ pub struct BuiltinProvider {
     noop_guards: std::sync::Mutex<
         std::collections::HashMap<String, crate::tools::hashline_edit::SharedNoopGuard>,
     >,
+    /// In-memory todo tools keyed by bound session. The Files tray projects the
+    /// same tool effects, so retaining this handle makes cross-turn pinning real
+    /// instead of displaying items the next turn cannot complete.
+    todos: std::sync::Mutex<SessionTodos>,
 }
 
 impl BuiltinProvider {
@@ -138,6 +191,7 @@ impl BuiltinProvider {
             snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             artifacts: std::sync::Mutex::new(std::collections::HashMap::new()),
             noop_guards: std::sync::Mutex::new(std::collections::HashMap::new()),
+            todos: std::sync::Mutex::new(SessionTodos::default()),
         }
     }
 
@@ -173,6 +227,16 @@ impl BuiltinProvider {
             })
             .clone()
     }
+
+    /// Get-or-create the todo tool for one bound session. Returns a typed
+    /// Arc<TodoTool> so the soft-eviction scanner can call is_empty() without
+    /// an extra downcast. The caller coerces to SharedTool as needed.
+    fn todo_for(&self, session_id: &str) -> Arc<crate::tools::todo::TodoTool> {
+        self.todos
+            .lock()
+            .expect("todo tools map poisoned")
+            .get_or_insert(session_id)
+    }
 }
 
 impl Default for BuiltinProvider {
@@ -195,12 +259,15 @@ impl CapabilityProvider for BuiltinProvider {
 
     async fn tools(&self, ctx: &SessionContext) -> Vec<SharedTool> {
         let mut tools = self.tools.clone();
-        // `todo` promises one agent run of in-memory state. The provider lives
-        // for the daemon lifetime, so cloning its Arc here would otherwise leak
-        // one list across turns and sessions. Rebuild it for every tool query.
+        // A bound session gets one in-memory todo list across its turns so the
+        // Files-sidebar pin and the executable tool share the same state.
+        // Unbound/ad-hoc runs keep isolated fresh lists.
         for tool in &mut tools {
             if tool.name() == "todo" {
-                *tool = Arc::new(crate::tools::todo::TodoTool::new());
+                *tool = ctx.session_id.as_deref().map_or_else(
+                    || Arc::new(crate::tools::todo::TodoTool::new()) as SharedTool,
+                    |session_id| self.todo_for(session_id) as SharedTool,
+                );
             }
         }
         // Session-scoped rebinds: a few built-ins must key shared daemon state on
@@ -543,22 +610,223 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_provider_rebuilds_todo_for_each_agent_run() {
+    async fn builtin_provider_keeps_todo_per_session_and_isolates_sessions() {
         let provider = BuiltinProvider::new();
         let first = provider.tools(&ctx()).await;
         let todo = first
             .iter()
             .find(|tool| tool.name() == "todo")
             .expect("todo present");
-        todo.execute("add", json!({"action": "add", "text": "first run"}))
+        todo.execute("add", json!({"action": "add", "text": "pinned"}))
             .await
             .expect("add succeeds");
 
-        let second = provider.tools(&ctx()).await;
-        let todo = second
+        let same_session = provider.tools(&ctx()).await;
+        let listed = same_session
             .iter()
             .find(|tool| tool.name() == "todo")
-            .expect("todo present");
+            .expect("todo present")
+            .execute("list", json!({"action": "list"}))
+            .await
+            .expect("list succeeds");
+        assert!(matches!(
+            listed.content.as_slice(),
+            [ocean_protocol::Content::Text { text }] if text.contains("pinned")
+        ));
+
+        let mut other = ctx();
+        other.session_id = Some("other-session".into());
+        let isolated = provider.tools(&other).await;
+        let listed = isolated
+            .iter()
+            .find(|tool| tool.name() == "todo")
+            .expect("todo present")
+            .execute("list", json!({"action": "list"}))
+            .await
+            .expect("list succeeds");
+        assert!(matches!(
+            listed.content.as_slice(),
+            [ocean_protocol::Content::Text { text }] if text == "(empty)"
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_todos_evicts_oldest_empty_and_keeps_recently_touched() {
+        let provider = BuiltinProvider::new();
+        // Fill to cap with empty sessions.
+        for i in 0..MAX_SESSION_TODOS {
+            let mut ctx = ctx();
+            ctx.session_id = Some(format!("ev-{i}"));
+            provider.tools(&ctx).await;
+        }
+        // Re-touch ev-0 so it is no longer the oldest.
+        let mut ctx = ctx();
+        ctx.session_id = Some("ev-0".into());
+        provider.tools(&ctx).await;
+        // One more distinct session forces an eviction of the oldest empty.
+        ctx.session_id = Some("ev-overflow".into());
+        provider.tools(&ctx).await;
+
+        let guard = provider.todos.lock().expect("lock");
+        assert!(
+            guard.tools.contains_key("ev-0"),
+            "recently-touched ev-0 must survive"
+        );
+        assert!(
+            !guard.tools.contains_key("ev-1"),
+            "oldest untouched empty ev-1 must be evicted"
+        );
+        assert!(
+            guard.tools.contains_key("ev-overflow"),
+            "new session must be present"
+        );
+        assert!(
+            guard.tools.len() <= MAX_SESSION_TODOS,
+            "map len {} reclaimed toward bound",
+            guard.tools.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn session_todos_survives_non_empty_oldest_under_pressure() {
+        let provider = BuiltinProvider::new();
+        // Insert a non-empty session first so it is the oldest touch.
+        let mut non_empty_ctx = ctx();
+        non_empty_ctx.session_id = Some("keeper".into());
+        let tools = provider.tools(&non_empty_ctx).await;
+        let keeper = tools
+            .iter()
+            .find(|t| t.name() == "todo")
+            .expect("todo present")
+            .clone();
+        keeper
+            .execute("add", json!({"action": "add", "text": "pinned"}))
+            .await
+            .expect("add succeeds");
+        drop(keeper);
+        drop(tools);
+
+        // Fill the rest of the map with empty sessions up to the soft bound.
+        for i in 0..(MAX_SESSION_TODOS - 1) {
+            let mut ctx = ctx();
+            ctx.session_id = Some(format!("fill-{i}"));
+            provider.tools(&ctx).await;
+        }
+
+        // Now at the bound. "keeper" is non-empty; all others are empty.
+        // One more distinct session: the oldest empty must be evicted, not keeper.
+        let mut ctx = ctx();
+        ctx.session_id = Some("overflow".into());
+        provider.tools(&ctx).await;
+
+        let guard = provider.todos.lock().expect("lock");
+        assert!(
+            guard.tools.contains_key("keeper"),
+            "non-empty oldest must survive despite pressure"
+        );
+        assert!(
+            guard.tools.contains_key("overflow"),
+            "new session must be present"
+        );
+        assert!(
+            guard.tools.len() <= MAX_SESSION_TODOS,
+            "map len {} reclaimed toward bound",
+            guard.tools.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn session_todos_shrinks_back_after_overgrowth_when_entries_cleared() {
+        let provider = BuiltinProvider::new();
+        // Create overgrowth: fill the map with 1_034 non-empty sessions
+        // (cap + 10). All are non-empty so nothing can be evicted; the map
+        // grows past MAX_SESSION_TODOS.
+        for i in 0..(MAX_SESSION_TODOS + 10) {
+            let mut ctx = ctx();
+            ctx.session_id = Some(format!("keep-{i}"));
+            let tools = provider.tools(&ctx).await;
+            let todo = tools
+                .iter()
+                .find(|t| t.name() == "todo")
+                .expect("todo present");
+            todo.execute("add", json!({"action": "add", "text": format!("item-{i}")}))
+                .await
+                .expect("add succeeds");
+        }
+        // Verify overgrowth: map exceeds the soft bound.
+        {
+            let guard = provider.todos.lock().expect("lock");
+            assert!(
+                guard.tools.len() > MAX_SESSION_TODOS,
+                "overgrowth must exceed soft bound, got {}",
+                guard.tools.len(),
+            );
+        }
+
+        // Now clear the first 50 entries to create empty reclaimable slots,
+        // leaving non-empty keep-50..keep-1033 intact.
+        for i in 0..50 {
+            let mut ctx = ctx();
+            ctx.session_id = Some(format!("keep-{i}"));
+            let tools = provider.tools(&ctx).await;
+            let todo = tools
+                .iter()
+                .find(|t| t.name() == "todo")
+                .expect("todo present");
+            todo.execute("clear", json!({"action": "clear"}))
+                .await
+                .expect("clear succeeds");
+        }
+        // Insert one new session to trigger the eviction loop.
+        let mut ctx = ctx();
+        ctx.session_id = Some("fresh".into());
+        provider.tools(&ctx).await;
+
+        let guard = provider.todos.lock().expect("lock");
+        // After the loop drain, the map must have shrunk to <= MAX_SESSION_TODOS.
+        assert!(
+            guard.tools.len() <= MAX_SESSION_TODOS,
+            "after clearing 50 and inserting fresh, map len {} must shrink to ≤ {MAX_SESSION_TODOS}",
+            guard.tools.len(),
+        );
+        // fresh must be present.
+        assert!(guard.tools.contains_key("fresh"));
+        // A non-empty survivor from the uncleared range must still be present.
+        assert!(
+            guard.tools.contains_key("keep-100"),
+            "non-empty keep-100 must survive the shrink"
+        );
+        // At least some cleared entries must be gone (we cleared 50; the loop
+        // should drain the overflow + leave room for fresh).
+        let still_present_cleared = (0..50)
+            .filter(|i| guard.tools.contains_key(&format!("keep-{i}")))
+            .count();
+        assert!(
+            still_present_cleared < 50,
+            "some cleared entries must be evicted; {still_present_cleared} still present"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_todos_evicts_cleared_entry() {
+        let provider = BuiltinProvider::new();
+        // Create a non-empty session, then clear it so it becomes empty.
+        let mut clear_ctx = ctx();
+        clear_ctx.session_id = Some("clear-me".into());
+        let tools = provider.tools(&clear_ctx).await;
+        let todo = tools
+            .iter()
+            .find(|t| t.name() == "todo")
+            .expect("todo present")
+            .clone();
+        todo.execute("add", json!({"action": "add", "text": "transient"}))
+            .await
+            .expect("add succeeds");
+        // Clear → becomes empty, making it evictable.
+        todo.execute("clear", json!({"action": "clear"}))
+            .await
+            .expect("clear succeeds");
+        // Verify the tool reports empty state.
         let listed = todo
             .execute("list", json!({"action": "list"}))
             .await
@@ -567,6 +835,30 @@ mod tests {
             listed.content.as_slice(),
             [ocean_protocol::Content::Text { text }] if text == "(empty)"
         ));
+        drop(todo);
+        drop(tools);
+
+        // Fill up to the soft bound with other empty sessions.
+        for i in 1..MAX_SESSION_TODOS {
+            let mut ctx = ctx();
+            ctx.session_id = Some(format!("fill-{i}"));
+            provider.tools(&ctx).await;
+        }
+
+        // One more forces eviction of the oldest empty — "clear-me".
+        let mut ctx = ctx();
+        ctx.session_id = Some("overflow".into());
+        provider.tools(&ctx).await;
+
+        let guard = provider.todos.lock().expect("lock");
+        assert!(
+            !guard.tools.contains_key("clear-me"),
+            "cleared entry must be evicted as oldest empty"
+        );
+        assert!(
+            guard.tools.contains_key("overflow"),
+            "new session must be present"
+        );
     }
 
     #[tokio::test]

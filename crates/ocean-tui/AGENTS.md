@@ -69,17 +69,18 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   reverse-video highlight and the copied text share one bounded-span geometry
   (`bounded_span`, app.rs) so highlight == copy and a selection never crosses
   into a sibling lane.
-- Metrics are truthful or absent: tok/s renders only as the daemon reported it
-  for the LAST finished turn (cleared on `TurnStarted`); the model row falls
-  back to the startup `/v1/models` fetch before the first turn; there is NO
-  context-window display until the daemon exposes real occupancy
-  (`ModelSelection.context_window` + usage provenance are the pending daemon
-  follow-ups — never estimate from cumulative turn usage).
+- Metrics are truthful or absent: tok/s and context occupancy render only from
+  daemon-reported values for the LAST finished turn (both clear on
+  `TurnStarted`). Context occupancy uses the provider-reported final request,
+  never cumulative multi-round usage; unknown values remain absent. The model
+  row falls back to the startup `/v1/models` fetch before the first turn.
 - The lower Files rail is a separate session-component tray, never part of
-  `FileTreeComponent`. Its todo adapter applies only successful correlated
-  tool finishes, clears on a new turn/session, labels the view run-local, and
-  invalidates to `state incomplete` on SSE gaps/orphan finishes. It never parses
-  human-formatted todo output into invented durable state. Empty
+  `FileTreeComponent`. Its todo adapter applies only successful correlated tool
+  finishes and keeps confirmed items pinned while the same session remains
+  bound. The runtime's in-memory todo tool uses that same session scope, so the
+  display never outlives executable todo state. Explicit todo clear, session
+  switch/new session, daemon restart, or SSE-gap invalidation removes the pin.
+  It never parses human-formatted todo output into invented durable state. Empty
   or short layouts return the full rail to the file tree; tray selection and
   mouse routing remain pane-bounded.
 - Tool drawers (`shell/components/chat.rs`): one per call, independently
@@ -93,10 +94,23 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
   and scroll use Unicode cell width and follow the cursor row, never the final
   input row.
+- `/permissions` is a daemon-backed three-state picker, not a client-side
+  approval bypass: manual prompts for every known tool, automatic prompts only
+  for runtime-classified unsafe tools, and skip-all suppresses prompts. Render
+  the daemon's effective mode and any `OCEAN_YOLO` override truthfully. After
+  the daemon confirms effective skip-all, authorize only the request ids already
+  pending at that moment and release their pending/later same-turn prompts
+  through the normal token-bound decision POST. Clear that authorization at
+  request completion; a stale global display must never approve a new turn.
 - Prefer clear status/error presentation over hidden failures (see
   `ModelRerouted` — resilience must never silently lie to the operator).
 - Keep the launch cwd as the active surface root; auto-resume must not overwrite it with a stored session root.
 - Side-rail widths are operator-resizable but must clamp against the body width, the minimum center workspace, and only the currently visible opposite rail; a hidden rail's stored width consumes no layout budget.
+- Sessions and Files share `shell/rail.rs` for row selection, focus/blur styling,
+  bounded mouse geometry, scroll clamping, and empty states. Preserve one-cell
+  accent bars, Unicode-cell fitting, visible hierarchy guides, selected-only
+  row actions, and extension identity at narrow widths; do not fork the visual
+  grammar between rails.
 - Editor viewport behavior is content-aware: prose extensions soft-wrap vertically, source code scrolls horizontally, mouse-wheel scrolling stays independent until the next keyboard edit/navigation, and rendered text/cursor geometry share terminal sanitization plus Unicode cell widths.
 - Coordinate API/event changes with `ocean-daemon` and `ocean-core`.
 - The model registry lives in `ocean-providers` (`known_models` + resolver

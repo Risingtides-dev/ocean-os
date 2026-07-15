@@ -26,7 +26,7 @@
        (Mirrors the OCEAN-161 proxy plist, which points at its deploy/*.sh.) -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/risingtidesdev/dev/ocean-os/deploy/ocean-daemon.sh</string>
+    <string>/Users/smathdaddy-macbook/ocean-os/deploy/ocean-daemon.sh</string>
   </array>
 
   <!-- Neutral cwd ($HOME), NOT the repo. The daemon is workspace-agnostic
@@ -35,7 +35,7 @@
        (see main.rs, OCEAN_ALLOW_REPO_CWD). deploy/ocean-daemon.sh also cd's
        here. BIN is resolved absolutely, so repo-cwd isn't needed. -->
   <key>WorkingDirectory</key>
-  <string>/Users/risingtidesdev</string>
+  <string>/Users/smathdaddy-macbook</string>
 
   <!-- Respawn on crash/exit. launchd's KeepAlive can't natively curl /health;
        respawn-on-exit is the right primitive — a daemon that exits (crash, OOM,
@@ -82,7 +82,7 @@
     <!-- launchd starts with a minimal PATH; give the launcher + daemon a sane
          one (the daemon shells out to git/ripgrep/etc for tool calls). -->
     <key>PATH</key>
-    <string>/Users/risingtidesdev/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/Users/risingtidesdev/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/smathdaddy-macbook/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/Users/smathdaddy-macbook/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <!-- OCEAN_BIND is intentionally unset: the binary defaults to
          127.0.0.1:4780, which is exactly what the hand-launched daemon used.
          OCEAN_ASSISTANTS_DIR is likewise unset (defaults to

@@ -152,6 +152,7 @@ async fn agent_turn(
                 input_tokens: None,
                 cache_read_tokens: None,
                 tokens_per_second: None,
+                context_usage: None,
             });
             return Json(AgentTurnResponse {
                 ok: false,
@@ -164,6 +165,7 @@ async fn agent_turn(
                 input_tokens: None,
                 cache_read_tokens: None,
                 tokens_per_second: None,
+                context_usage: None,
                 wall_ms: None,
             });
         }
@@ -180,6 +182,7 @@ async fn agent_turn(
         input_tokens: None,
         cache_read_tokens: None,
         tokens_per_second: None,
+        context_usage: None,
     });
     Json(AgentTurnResponse {
         ok: allowed,
@@ -192,6 +195,7 @@ async fn agent_turn(
         input_tokens: None,
         cache_read_tokens: None,
         tokens_per_second: None,
+        context_usage: None,
         wall_ms: None,
     })
 }

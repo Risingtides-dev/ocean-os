@@ -21,16 +21,18 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ocean_agent_sdk::AgentSessionId;
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
     Frame,
 };
+
+use unicode_width::UnicodeWidthStr;
 
 use crate::shell::{
     action::Action,
     component::Component,
     panel,
+    rail::{self, RowState},
     sessions::{ago, discover, Session},
     theme::{self, g},
 };
@@ -83,9 +85,9 @@ enum Row {
     Session(usize, usize, usize),
 }
 
-/// Width of the clickable "＋ (n)" button zone at the right edge of a header
-/// row — a left-click landing here starts a new session in that dir/branch.
-/// Covers "＋ (999)" comfortably.
+/// Width of the clickable `＋ count` zone at the right edge of a selected
+/// header row. A left-click here starts a new session in that dir/branch.
+/// Covers `＋ 999` comfortably.
 const PLUS_ZONE: u16 = 8;
 
 pub struct SessionRailComponent {
@@ -151,7 +153,7 @@ impl SessionRailComponent {
     /// Which visible row a screen position lands on (rows are 1 line each now).
     fn row_at(&self, pos: (u16, u16)) -> Option<usize> {
         let body = self.body_rect;
-        if body.width == 0 || pos.1 < body.y || pos.1 >= body.y + body.height {
+        if !rail::contains(body, pos.0, pos.1) {
             return None;
         }
         let i = self.scroll + (pos.1 - body.y) as usize;
@@ -255,14 +257,7 @@ impl SessionRailComponent {
     }
 
     fn clamp_scroll(&mut self, view_h: usize) {
-        if view_h == 0 {
-            return;
-        }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + view_h {
-            self.scroll = self.selected + 1 - view_h;
-        }
+        rail::clamp_scroll(self.selected, &mut self.scroll, view_h);
     }
 }
 
@@ -306,14 +301,16 @@ impl Component for SessionRailComponent {
             MouseEventKind::Down(MouseButton::Left) => {
                 let i = self.row_at((mouse.column, mouse.row))?;
                 let row = self.rows().get(i).copied();
-                // Click on the rightmost "＋" zone of a header = new session in
-                // that dir/branch (the button John wants), regardless of
-                // selection.
-                if let Some(r @ (Row::Dir(_) | Row::Branch(..))) = row {
-                    let plus_x = self.body_rect.x + self.body_rect.width.saturating_sub(PLUS_ZONE);
-                    if mouse.column >= plus_x {
-                        self.selected = i;
-                        return self.new_session_in(r);
+                // The new-session affordance is only visible on the selected
+                // header, so its mouse target follows the same rule. First click
+                // selects; a second click in the revealed zone activates it.
+                if i == self.selected {
+                    if let Some(r @ (Row::Dir(_) | Row::Branch(..))) = row {
+                        let plus_x =
+                            self.body_rect.x + self.body_rect.width.saturating_sub(PLUS_ZONE);
+                        if mouse.column >= plus_x {
+                            return self.new_session_in(r);
+                        }
                     }
                 }
                 if i == self.selected {
@@ -336,15 +333,8 @@ impl Component for SessionRailComponent {
         self.body_rect = body;
 
         if self.groups.is_empty() {
-            let msg = "no ocean sessions for this project";
-            let y = body.y + body.height / 2;
-            let x = body.x + (body.width.saturating_sub(msg.len() as u16)) / 2;
-            frame.render_widget(
-                Paragraph::new(Span::styled(msg, Style::default().fg(theme::COMMENT)))
-                    .style(Style::default().bg(theme::SLATE)),
-                Rect::new(x.min(body.x + body.width), y, msg.len() as u16, 1),
-            );
-            panel::footer(frame, area, "");
+            rail::draw_empty(frame, body, "No sessions in this workspace");
+            panel::footer(frame, area, " n  new session");
             return;
         }
 
@@ -354,8 +344,8 @@ impl Component for SessionRailComponent {
         let inner = body.width.saturating_sub(1) as usize; // width after the accent bar
         let bottom = body.y + body.height;
 
-        // Header line shared by dir + branch rows: `indent caret label … ＋ (n)`.
-        // The label truncates to fit; ＋ and count keep their own colors.
+        // Header line shared by dir + branch rows: `indent caret label … [＋] count`.
+        // The action appears only on the selected header; metadata stays dim.
         let header_line = |indent: &str,
                            expanded: bool,
                            label: &str,
@@ -367,28 +357,31 @@ impl Component for SessionRailComponent {
             } else {
                 g("▸ ", "> ")
             };
-            let count = format!("({count})");
-            let plus = g("＋", "+");
+            let count = format!("{count}");
+            let plus = if selected { g("＋", "+") } else { "" };
             let text = format!("{indent}{caret}{label}");
-            let right_w = plus.chars().count() + 1 + count.chars().count();
-            let left = truncate(&text, inner.saturating_sub(right_w + 1));
-            let pad = inner.saturating_sub(left.chars().count() + right_w);
-            let label_style = Style::default().fg(color).add_modifier(if selected {
-                Modifier::BOLD
+            let right = if selected {
+                format!("{plus}  {count}")
             } else {
-                Modifier::empty()
-            });
+                count
+            };
+            let right_w = UnicodeWidthStr::width(right.as_str());
+            let left = panel::fit_cells(&text, inner.saturating_sub(right_w + 1));
+            let pad = inner.saturating_sub(UnicodeWidthStr::width(left.as_str()) + right_w);
+            let label_style = Style::default()
+                .fg(color)
+                .add_modifier(RowState::new(selected, self.focused).text_modifier());
             Line::from(vec![
                 Span::styled(left, label_style),
                 Span::raw(" ".repeat(pad)),
                 Span::styled(
-                    plus,
-                    Style::default()
-                        .fg(theme::GREEN)
-                        .add_modifier(Modifier::BOLD),
+                    right,
+                    Style::default().fg(if selected {
+                        theme::GREEN
+                    } else {
+                        theme::COMMENT
+                    }),
                 ),
-                Span::raw(" "),
-                Span::styled(count, Style::default().fg(theme::COMMENT)),
             ])
         };
 
@@ -398,17 +391,7 @@ impl Component for SessionRailComponent {
                 break;
             }
             let selected = i == self.selected;
-            let row_bg = if selected { theme::BG_HL } else { theme::SLATE };
-
-            // accent bar (1 col): cyan bar on the selected row.
-            let bar = if selected { g("▎", "|") } else { " " };
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    bar,
-                    Style::default().fg(theme::CYAN).bg(row_bg),
-                )),
-                Rect::new(body.x, y, 1, 1),
-            );
+            let row_state = RowState::new(selected, self.focused);
 
             let line = match *row {
                 Row::Dir(di) => {
@@ -425,7 +408,7 @@ impl Component for SessionRailComponent {
                 Row::Branch(di, bi) => {
                     let branch = &self.groups[di].branches[bi];
                     header_line(
-                        "  ",
+                        g("│ ", "| "),
                         branch.expanded,
                         &branch.label,
                         branch.sessions.len(),
@@ -447,18 +430,21 @@ impl Component for SessionRailComponent {
                     };
                     // budget: indent(4) + dot(2) + title + sp + ago
                     let left_cols = 4 + 2;
-                    let title_max = inner.saturating_sub(left_cols + 1 + ago_s.chars().count());
-                    let title = truncate(&s.title, title_max);
-                    let title_style = Style::default().fg(theme::FG).add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    });
-                    // Build: "    " indent, dot, title … right-justified ago.
-                    let used = left_cols + title.chars().count();
-                    let pad = inner.saturating_sub(used + ago_s.chars().count());
+                    let age_w = UnicodeWidthStr::width(ago_s.as_str());
+                    let title_max = inner.saturating_sub(left_cols + 1 + age_w);
+                    let title = panel::fit_cells(&s.title, title_max);
+                    let title_style = Style::default()
+                        .fg(theme::FG)
+                        .add_modifier(row_state.text_modifier());
+                    // Build: two depth guides, live marker, title, right-aligned age.
+                    let first_guide = g("│ ", "| ");
+                    let second_guide = g("└ ", "` ");
+                    let guide_style = Style::default().fg(theme::BG_HL);
+                    let used = left_cols + UnicodeWidthStr::width(title.as_str());
+                    let pad = inner.saturating_sub(used + age_w);
                     Line::from(vec![
-                        Span::styled("    ", Style::default()),
+                        Span::styled(first_guide, guide_style),
+                        Span::styled(second_guide, guide_style),
                         Span::styled(dot, dot_style),
                         Span::styled(title, title_style),
                         Span::raw(" ".repeat(pad)),
@@ -467,13 +453,10 @@ impl Component for SessionRailComponent {
                 }
             };
 
-            frame.render_widget(
-                Paragraph::new(line).style(Style::default().bg(row_bg)),
-                Rect::new(body.x + 1, y, body.width.saturating_sub(1), 1),
-            );
+            rail::draw_row(frame, body.x, y, body.width, row_state, line);
         }
 
-        panel::footer(frame, area, "");
+        panel::footer(frame, area, " ↵ open/toggle  n new  r refresh");
     }
 }
 
@@ -589,19 +572,6 @@ fn display_worktree(worktree: &str) -> &str {
         .unwrap_or(worktree)
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max == 0 {
-        String::new()
-    } else {
-        format!(
-            "{}…",
-            s.chars().take(max.saturating_sub(1)).collect::<String>()
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +586,91 @@ mod tests {
             mtime,
             path: PathBuf::from(format!("/tmp/{id}.json")),
         }
+    }
+
+    fn component(sessions: Vec<Session>) -> SessionRailComponent {
+        let root = PathBuf::from("/repo");
+        SessionRailComponent {
+            groups: build_groups(&root, sessions),
+            root,
+            selected: 0,
+            scroll: 0,
+            live_id: None,
+            focused: true,
+            body_rect: Rect::default(),
+        }
+    }
+
+    fn render(rail: &mut SessionRailComponent, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| rail.draw(frame, frame.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in buf.area.top()..buf.area.bottom() {
+            for x in buf.area.left()..buf.area.right() {
+                out.push_str(buf.cell((x, y)).unwrap().symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn selected_header_owns_plus_hit_region() {
+        let mut rail = component(vec![sess("a", Some("main"), "main", "/repo", 100)]);
+        render(&mut rail, 30, 9);
+        let right = rail.body_rect.x + rail.body_rect.width - 1;
+        let branch_y = rail.body_rect.y + 1;
+
+        // The branch is not selected yet: first click only selects it.
+        assert!(rail.handle_mouse(click(right, branch_y)).is_none());
+        assert_eq!(rail.selected, 1);
+        // The action is now visible and the same region activates it.
+        assert!(matches!(
+            rail.handle_mouse(click(right, branch_y)),
+            Some(Action::NewSessionInProject { cwd }) if cwd == *"/repo"
+        ));
+    }
+
+    #[test]
+    fn live_marker_is_independent_of_selection_and_action_hides_on_session() {
+        let mut rail = component(vec![sess("a", Some("main"), "main", "/repo", 100)]);
+        rail.live_id = Some("a".into());
+        rail.selected = 2; // session row, not a header
+        let screen = render(&mut rail, 30, 9);
+        assert!(screen.contains('●'));
+        assert!(
+            !screen.contains('＋'),
+            "session selection has no header action"
+        );
+    }
+
+    #[test]
+    fn unicode_names_render_in_narrow_and_resized_rails() {
+        let mut s = sess("a", Some("修正/界面"), "main", "/repo", 100);
+        s.title = "👩‍💻 修复终端界面".into();
+        let mut rail = component(vec![s]);
+        let narrow = render(&mut rail, 12, 8);
+        assert!(narrow.contains("SESSIONS"));
+        let resized = render(&mut rail, 38, 10);
+        let compact: String = resized.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("修正/界面"),
+            "unicode branch missing from:\n{resized}"
+        );
+        assert!(compact.contains("👩‍💻"));
     }
 
     #[test]

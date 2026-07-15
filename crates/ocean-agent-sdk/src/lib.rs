@@ -28,6 +28,20 @@ use uuid::Uuid;
 /// crate directly.
 pub use ocean_protocol::ThinkingLevel;
 
+/// Truthful context-window occupancy measured at one provider request boundary.
+/// `used_tokens` is the provider-reported total token consumption for the final
+/// round, not cumulative turn usage or a local estimate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub used_tokens: u64,
+    pub context_window: u64,
+    /// Stable provenance label. Currently `provider_reported_final_round`.
+    pub source: String,
+    /// Daemon wall-clock timestamp (Unix milliseconds) when the completed turn's
+    /// provider measurement was published.
+    pub measured_at_ms: i64,
+}
+
 /// Surface patch protocol — the shared agent-native canvas mutation contract
 /// (GPUI Masterbuild Slice 1). See [`surface`] for the wire types.
 pub mod surface;
@@ -399,6 +413,9 @@ pub struct AgentTurnResponse {
     /// `None` on pre-turn error paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_ms: Option<u64>,
+    /// Final-round provider context measurement for the effective model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
 }
 
 /// Request payload for `POST /v1/agent/sessions`.
@@ -599,6 +616,10 @@ pub enum AgentTurnEvent {
         /// Output tokens per second (output_tokens / wall time).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_per_second: Option<f64>,
+        /// Final-round provider context measurement. `None` means unknown; clients
+        /// must not substitute cumulative input usage or a local estimate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_usage: Option<ContextUsage>,
     },
     /// A session was created as a side-effect of submitting a turn with
     /// `session_id: null`.
@@ -1201,6 +1222,7 @@ mod tests {
                 input_tokens: Some(100),
                 cache_read_tokens: Some(10),
                 tokens_per_second: Some(33.5),
+                context_usage: None,
             },
             AgentTurnEvent::SessionCreated {
                 session_id: sid,

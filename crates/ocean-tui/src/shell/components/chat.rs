@@ -1801,6 +1801,7 @@ impl ChatComponent {
             "/graph" => Some(Action::Navigate(Nav::Graph)),
             "/terminal" => Some(Action::Navigate(Nav::Terminal)),
             "/settings" => Some(Action::OpenSettings),
+            "/permissions" => Some(Action::OpenPermissions),
             // Roadmap commands: present in the palette as a discoverability map,
             // but honest that the backend isn't on this branch yet.
             _ => {
@@ -3902,6 +3903,17 @@ mod tests {
     }
 
     #[test]
+    fn slash_permissions_opens_picker_even_while_a_turn_is_blocked() {
+        let mut chat = chat_with("/permissions");
+        chat.busy = true;
+
+        let act = chat.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(act, Some(Action::OpenPermissions)));
+        assert!(chat.busy, "opening policy must not falsify turn lifecycle");
+    }
+
+    #[test]
     fn slash_copy_uses_last_reply() {
         let mut chat = ChatComponent::default();
         assert!(matches!(
@@ -4686,6 +4698,7 @@ mod tests {
             input_tokens: None,
             cache_read_tokens: None,
             tokens_per_second: None,
+            context_usage: None,
         }))
     }
 

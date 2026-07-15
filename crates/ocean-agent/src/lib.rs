@@ -8,8 +8,8 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use ocean_core::{
-    ImageMeta, Project, ProjectId, PromptImage, PromptRequest, PromptResponse, RequestId,
-    SessionDetail, SessionId, SessionRunState, SessionSummary, SessionToolContext,
+    ImageMeta, PermissionMode, Project, ProjectId, PromptImage, PromptRequest, PromptResponse,
+    RequestId, SessionDetail, SessionId, SessionRunState, SessionSummary, SessionToolContext,
     SessionTranscriptEntry, TokenUsage,
 };
 use ocean_protocol::{AssistantMessage, Content, Message, Model, StopReason, Usage};
@@ -1634,6 +1634,8 @@ impl AgentRuntime {
             cache_read: run.usage.cache_read,
             cache_write: run.usage.cache_write,
             total_tokens: run.usage.total_tokens,
+            context_tokens: run.context_tokens,
+            context_window: u64::from(snapshot.model.context_window),
         };
 
         Ok((session.id, stdout, stderr, usage))
@@ -2514,31 +2516,86 @@ fn load_last_model(config_dir: &std::path::Path) -> Option<String> {
 /// [`LAST_MODEL_FILE`]: a tiny plaintext file holding `true`/`false`.
 const YOLO_PREF_FILE: &str = "yolo_pref";
 
-/// Persist the operator's YOLO preference (best-effort; a write failure is
-/// logged, never fatal — losing the hint just falls back to the safe default
-/// of gated/off). Mirrors [`persist_last_model`].
-pub fn persist_yolo_pref(config_dir: &std::path::Path, enabled: bool) {
-    let path = config_dir.join(YOLO_PREF_FILE);
+fn write_pref_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    if let Err(e) = std::fs::write(&path, if enabled { "true" } else { "false" }) {
-        tracing::warn!(path = %path.display(), error = %e, "failed to persist yolo preference");
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&tmp, value)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
+    Ok(())
 }
 
-/// Read the persisted YOLO preference, if any. `None` on first run / unreadable
-/// / unrecognized content — the caller treats `None` as "no persisted default"
-/// and falls through to the built-in safe default (off). Mirrors
-/// [`load_last_model`]; accepts the same truthy/falsey spellings as the
-/// `OCEAN_YOLO` env parse so the two sources stay consistent.
-pub fn load_yolo_pref(config_dir: &std::path::Path) -> Option<bool> {
+fn load_legacy_yolo_pref(config_dir: &std::path::Path) -> Option<bool> {
     let raw = std::fs::read_to_string(config_dir.join(YOLO_PREF_FILE)).ok()?;
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// Three-state successor to [`YOLO_PREF_FILE`]. The old boolean file remains a
+/// best-effort downgrade mirror; current binaries treat this file as authority.
+const PERMISSION_MODE_PREF_FILE: &str = "permission_mode_pref";
+
+fn load_permission_mode_file(config_dir: &std::path::Path) -> Option<PermissionMode> {
+    let raw = std::fs::read_to_string(config_dir.join(PERMISSION_MODE_PREF_FILE)).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "manual" | "always_ask" | "always-ask" => Some(PermissionMode::Manual),
+        "automatic" | "auto" | "write" => Some(PermissionMode::Automatic),
+        "skip_all" | "skip-all" | "yolo" => Some(PermissionMode::SkipAll),
+        _ => None,
+    }
+}
+
+/// Persist the legacy boolean preference for compatibility callers.
+pub fn persist_yolo_pref(config_dir: &std::path::Path, enabled: bool) {
+    let path = config_dir.join(YOLO_PREF_FILE);
+    if let Err(error) = write_pref_atomic(&path, if enabled { "true" } else { "false" }) {
+        tracing::warn!(path = %path.display(), %error, "failed to persist yolo preference");
+    }
+}
+
+/// Read the boolean compatibility view. Once a three-state preference exists,
+/// derive the bool from that authoritative file so a failed/stale downgrade
+/// mirror can never contradict the live daemon setting.
+pub fn load_yolo_pref(config_dir: &std::path::Path) -> Option<bool> {
+    load_permission_mode_file(config_dir)
+        .map(|mode| mode == PermissionMode::SkipAll)
+        .or_else(|| load_legacy_yolo_pref(config_dir))
+}
+
+/// Persist the daemon's authoritative global approval mode atomically. A write
+/// error is returned to the settings endpoint instead of being reported as a
+/// successful save. The legacy boolean file is a best-effort downgrade mirror;
+/// current readers derive their boolean view from this authoritative mode file.
+pub fn persist_permission_mode(
+    config_dir: &std::path::Path,
+    mode: PermissionMode,
+) -> std::io::Result<()> {
+    let path = config_dir.join(PERMISSION_MODE_PREF_FILE);
+    write_pref_atomic(&path, mode.as_str())?;
+    persist_yolo_pref(config_dir, mode == PermissionMode::SkipAll);
+    Ok(())
+}
+
+/// Read the saved three-state approval mode. A pre-upgrade `yolo_pref` is
+/// migrated logically on read without rewriting it: `true` becomes `SkipAll`,
+/// `false` becomes `Automatic`. No files means no explicit saved choice.
+pub fn load_permission_mode(config_dir: &std::path::Path) -> Option<PermissionMode> {
+    load_permission_mode_file(config_dir).or_else(|| {
+        load_legacy_yolo_pref(config_dir).map(|enabled| {
+            if enabled {
+                PermissionMode::SkipAll
+            } else {
+                PermissionMode::Automatic
+            }
+        })
+    })
 }
 
 /// The directory the daemon uses for its on-disk state (sessions, projects, and

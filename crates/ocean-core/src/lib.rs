@@ -236,6 +236,13 @@ pub struct TokenUsage {
     pub cache_write: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    /// Provider-reported total token consumption for the final provider request/round.
+    /// This is not cumulative turn usage; zero means no authoritative measurement.
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// Context-window capacity of the effective model for this turn.
+    #[serde(default)]
+    pub context_window: u64,
 }
 
 /// Summary item returned by `GET /v1/sessions`.
@@ -707,6 +714,55 @@ pub struct PermissionsResponse {
     pub error: Option<String>,
 }
 
+/// Operator policy for tool-call approvals.
+///
+/// This is a daemon-owned global default applied when a turn starts. `Manual`
+/// prompts for every known tool call, `Automatic` prompts only for tools the
+/// runtime classifies as permission-requiring, and `SkipAll` never prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    Manual,
+    #[default]
+    Automatic,
+    SkipAll,
+}
+
+impl PermissionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Automatic => "automatic",
+            Self::SkipAll => "skip_all",
+        }
+    }
+}
+
+/// Body for `POST /v1/settings/permissions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionSettingsRequest {
+    pub mode: PermissionMode,
+}
+
+/// Response for `GET` and `POST /v1/settings/permissions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionSettingsResponse {
+    pub ok: bool,
+    /// Present only when a settings read/write failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Saved operator choice, or `None` before the first explicit selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persisted: Option<PermissionMode>,
+    /// Mode a newly-started turn will actually use.
+    pub effective: PermissionMode,
+    /// Effective mode forced by `OCEAN_YOLO`, when that env value changes the
+    /// saved/default mode. `OCEAN_YOLO=1` forces `skip_all`; `=0` only prevents
+    /// a saved `skip_all` and otherwise leaves manual/automatic intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_override: Option<PermissionMode>,
+}
+
 /// A client decision for a permission request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -1019,6 +1075,27 @@ mod tests {
             serde_json::from_str(r#"{"id":"550e8400-e29b-41d4-a716-446655440000","at":"2026-01-01T00:00:00Z","type":"assistant_delta","text":"old"}"#)
                 .unwrap();
         assert!(!legacy.is_agent_mirror());
+    }
+
+    #[test]
+    fn permission_settings_roundtrip_uses_stable_mode_names() {
+        let settings = PermissionSettingsResponse {
+            ok: true,
+            error: None,
+            persisted: Some(PermissionMode::Manual),
+            effective: PermissionMode::SkipAll,
+            env_override: Some(PermissionMode::SkipAll),
+        };
+
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["persisted"], "manual");
+        assert_eq!(json["effective"], "skip_all");
+        assert_eq!(json["env_override"], "skip_all");
+        assert_eq!(
+            serde_json::from_value::<PermissionSettingsResponse>(json).unwrap(),
+            settings
+        );
+        assert_eq!(PermissionMode::default(), PermissionMode::Automatic);
     }
 
     #[test]
