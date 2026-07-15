@@ -3009,3 +3009,13 @@ area:      [backend]: ocean-daemon Phase 2C project foundation
 Added five direct-handler tests covering the project list, create, get, patch, and delete adapters before ownership moves. They freeze sequential git enrichment and failure fallbacks, persistence-error list shape, exact workspace-session association and fail-open session listing, un-enriched detail, partial-update identity/root/config/created-time preservation with runtime-stamped updates, delete-without-session-deletion, tilde/canonical create payloads with equal initial timestamps, and success/not-found/path/persistence response contracts. Existing pagination, create-path, and worktree-parser coverage remains intact. Focused project tests, all five router contracts, all 302 daemon tests, formatting, docs, and diff checks pass from isolated clean main; runtime persistence, cwd/project turn resolution, filesystem policy, concurrent ACP and agent/CLI/core/protocol/runtime work, and the operator deploy plist remain unchanged.
 _________________________________________________________________________________
 _________________________________________________________________________________
+
+time:      [08:15pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [refactor]: extract daemon project registry adapters intact
+area:      [backend]: ocean-daemon Phase 2C project leaf
+
+Moved project create/patch/list request types, all five CRUD/list handlers, live git enrichment, and worktree parsing into private `src/project_registry.rs`. All ten definitions remain byte-identical to characterization commit `cec944e` after normalizing only minimal parent visibility. Runtime-owned persistence, atomic writes, order/pagination, timestamps, workspace association, and sessions remain authoritative; sequential HEAD/status/worktree enrichment, timeout/fallbacks, create path semantics, exact responses/statuses, fail-open detail session listing, partial PATCH preservation, and delete-without-session-deletion remain unchanged. Router/banner/middleware, turn cwd/project resolution, filesystem policy, AppState, and tests stay in composition. Focused project, agent, router, full 302-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed from isolated clean main; fresh review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________

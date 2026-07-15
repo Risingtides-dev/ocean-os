@@ -1,7 +1,7 @@
 # Ocean Daemon Project Registry Extraction Manifest
 
 **Date:** 2026-07-14
-**Status:** Characterization complete; extraction, full validation, and review pending
+**Status:** Complete; characterization, focused/full/feature validation, and independent review passed
 **Owner:** Ocean OS
 **Rollback point:** `0fce6cc`
 
@@ -144,9 +144,9 @@ An independent reviewer must compare every moved definition against the characte
 
 Five direct-handler tests now freeze list enrichment and persistence fallbacks, exact project/workspace session association and fail-open session listing, partial PATCH identity/timestamp behavior, DELETE session retention, create payload/tilde/timestamp behavior, and success/not-found/persistence/path-error response contracts. Existing pagination, create-path, and worktree-parser tests remain green. Focused project tests, all five router contracts, all 302 daemon tests, formatting, documentation, and diff checks pass at the characterization point.
 
-## Planned result
+## Result
 
-A private `project_registry.rs` owns only project HTTP request/query types, CRUD/list adapters, response-time git enrichment, and worktree parsing. Parent composition retains router registration, turn/session/cwd integration, state assembly, and all characterization/integration tests.
+A private `project_registry.rs` now owns only project HTTP request/query types, CRUD/list adapters, response-time git enrichment, and worktree parsing. All 10 moved definitions are unchanged from characterization commit `cec944e` except for minimal `pub(super)` visibility. Parent composition retains router registration, turn/session/cwd integration, state assembly, and all characterization/integration tests; `ocean-agent` retains persistence, pagination, ordering, timestamp, workspace association, and session authority. Focused project tests, 150 agent tests, all five router contracts, all 302 daemon tests, workspace-test compilation, both supported-feature checks, formatting, documentation, and diff checks passed from isolated clean main. Fresh review found no unresolved medium-or-higher issue.
 
 ## Rollback
 
