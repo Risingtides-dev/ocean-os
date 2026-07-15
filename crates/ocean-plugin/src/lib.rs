@@ -83,4 +83,4 @@ pub use provider::PluginProvider;
 
 pub use manifest::{ManifestError, PluginManifest, ToolDecl};
 pub use plugin::{Plugin, PluginError, PluginTool};
-pub use subprocess::SubprocessPlugin;
+pub use subprocess::{LaunchOptions, SubprocessPlugin};

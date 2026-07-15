@@ -110,12 +110,13 @@ pub struct SubprocessCapability {
     /// Arguments passed to `command`.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Working directory for the child, resolved against the agent folder when
-    /// relative. `None` = inherit the launcher's cwd.
+    /// Real working directory for the child, resolved against the canonical
+    /// agent folder when relative. `None` defaults to the agent folder. A
+    /// declared path must canonicalize to an existing directory.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Extra environment variables injected into the child, on top of the
-    /// launcher's environment.
+    /// Explicit environment variables injected into the child. The child does
+    /// not inherit the launcher's ambient environment.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
 }

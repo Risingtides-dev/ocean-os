@@ -53,7 +53,7 @@ the document and verify source before using one as a work order.
 
 Active plans:
 
-- [`specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md) — approved extension architecture, ownership boundaries, accepted Phase 0 evidence, and staged migration gates; Phase 1 is next.
+- [`specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md) — approved extension architecture, ownership boundaries, accepted Phase 0 evidence, and staged migration gates; the Phase 1 schema/tool-lane checkpoint is implemented but not accepted, while state separation and inspect/doctor remain pending.
 
 Completed extraction manifests are retained evidence, not independent work orders. The broader behavior-neutral daemon refactor remains active under `DAEMON_REFACTOR_MISSION.md`; consult its progress section and the current code-health plan before selecting the next checkpoint.
 

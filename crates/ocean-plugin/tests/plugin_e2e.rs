@@ -7,15 +7,17 @@
 //!    for real (no mocks, no in-process shortcut).
 //! 3. `subprocess_rpc_error_surfaces` — an unknown tool maps the plugin's
 //!    JSON-RPC error object onto [`PluginError::Rpc`].
-//! 4. Phase 0 process-boundary characterization — current insecure inheritance of
-//!    environment and real cwd, plus the first initialization request on the wire.
+//! 4. Hardened process-boundary contract — explicit environment and canonical
+//!    cwd isolation, plus the first initialization request on the wire.
 
 use std::{
     io::{BufRead, Write},
     sync::OnceLock,
 };
 
-use ocean_plugin::{Plugin, PluginError, PluginManifest, PluginProvider, SubprocessPlugin};
+use ocean_plugin::{
+    LaunchOptions, Plugin, PluginError, PluginManifest, PluginProvider, SubprocessPlugin,
+};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -24,11 +26,14 @@ fn echo_plugin_bin() -> String {
     env!("CARGO_BIN_EXE_echo_plugin").to_string()
 }
 
-const PROCESS_PROBE_ENV: &str = "OCEAN_PLUGIN_PHASE0_PROCESS_PROBE";
-const PROCESS_PROBE_TEST: &str = "phase0_process_probe_child";
-const FIRST_REQUEST_PATH_ENV: &str = "OCEAN_PLUGIN_PHASE0_FIRST_REQUEST_PATH";
+const PROCESS_PROBE_ENV: &str = "OCEAN_PLUGIN_PROCESS_PROBE";
+const PROCESS_PROBE_TEST: &str = "process_probe_child";
+const FIRST_REQUEST_PATH_ENV: &str = "OCEAN_PLUGIN_FIRST_REQUEST_PATH";
 
-fn launch_process_probe(extra_env: &[(String, String)]) -> SubprocessPlugin {
+fn launch_process_probe(
+    current_dir: &std::path::Path,
+    extra_env: &[(String, String)],
+) -> SubprocessPlugin {
     let command = std::env::current_exe()
         .expect("resolve integration test executable")
         .to_string_lossy()
@@ -42,7 +47,8 @@ fn launch_process_probe(extra_env: &[(String, String)]) -> SubprocessPlugin {
     let mut env = vec![(PROCESS_PROBE_ENV.to_string(), "1".to_string())];
     env.extend_from_slice(extra_env);
 
-    SubprocessPlugin::launch_command("probe", "0.0.0", &command, &args, &env)
+    let options = LaunchOptions::new(current_dir).with_env(&env);
+    SubprocessPlugin::launch_command_with_options("probe", "0.0.0", &command, &args, &options)
         .expect("launch test-only process probe")
 }
 
@@ -102,8 +108,41 @@ impl Drop for TempFile {
     }
 }
 
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn unique(name: &str) -> Self {
+        let path = TempFile::unique(name).0.clone();
+        std::fs::create_dir(&path).expect("create temporary directory");
+        Self(path)
+    }
+
+    fn unique_relative(name: &str) -> Self {
+        let path = std::path::PathBuf::from(format!(
+            ".ocean-plugin-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).expect("create relative temporary directory");
+        Self(path)
+    }
+
+    fn canonical(&self) -> std::path::PathBuf {
+        std::fs::canonicalize(&self.0).expect("canonicalize temporary directory")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
-fn phase0_process_probe_child() {
+fn process_probe_child() {
     if std::env::var_os(PROCESS_PROBE_ENV).is_none() {
         return;
     }
@@ -145,7 +184,8 @@ fn phase0_process_probe_child() {
                             "env": std::env::var(env_key).ok(),
                             "cwd": std::env::current_dir()
                                 .expect("read probe cwd")
-                                .to_string_lossy()
+                                .to_string_lossy(),
+                            "pwd": std::env::var("PWD").ok()
                         }
                     }),
                     true,
@@ -227,37 +267,78 @@ async fn subprocess_round_trip() {
 }
 
 #[tokio::test]
-async fn child_currently_inherits_ambient_env_while_explicit_env_overlays_it() {
-    const ENV_KEY: &str = "OCEAN_PLUGIN_PHASE0_UNIQUE_PARENT_ENV";
+async fn child_excludes_ambient_env_and_includes_explicit_env() {
+    const ENV_KEY: &str = "OCEAN_PLUGIN_UNIQUE_PARENT_ENV";
     let _lock = env_lock().lock().await;
     let _env = EnvVarGuard::set(ENV_KEY, "parent-value");
+    let cwd = TempDir::unique("environment");
 
-    let inherited = launch_process_probe(&[]);
-    assert_eq!(
-        process_context(&inherited, ENV_KEY).await["env"],
-        "parent-value",
-        "current insecure behavior: the plugin child inherits ambient parent environment"
+    let isolated = launch_process_probe(&cwd.0, &[]);
+    assert!(
+        process_context(&isolated, ENV_KEY).await["env"].is_null(),
+        "arbitrary ambient parent environment must be absent from the plugin child"
     );
 
     let overlay = vec![(ENV_KEY.to_string(), "explicit-value".to_string())];
-    let overlaid = launch_process_probe(&overlay);
+    let explicit = launch_process_probe(&cwd.0, &overlay);
     assert_eq!(
-        process_context(&overlaid, ENV_KEY).await["env"],
+        process_context(&explicit, ENV_KEY).await["env"],
         "explicit-value",
-        "current behavior: explicit plugin env overlays the inherited ambient value"
+        "explicit plugin environment must reach the child"
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn launch_command_currently_inherits_ambient_real_cwd() {
-    let parent_cwd = std::env::current_dir().expect("read parent cwd");
-    let plugin = launch_process_probe(&[]);
+async fn explicit_canonical_cwd_sets_real_cwd_and_pwd() {
+    let cwd = TempDir::unique("cwd");
+    let canonical_cwd = cwd.canonical();
+    let plugin = launch_process_probe(&cwd.0, &[]);
 
     let context = process_context(&plugin, "OCEAN_PLUGIN_UNUSED_ENV").await;
+    assert_eq!(context["cwd"], canonical_cwd.to_string_lossy().as_ref());
+    assert_eq!(context["pwd"], canonical_cwd.to_string_lossy().as_ref());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manifest_launch_resolves_relative_base_once_and_uses_canonical_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base_dir = TempDir::unique_relative("relative-base");
+    let canonical_base_dir = base_dir.canonical();
+    let entry = base_dir.0.join("cwd-probe.sh");
+    std::fs::write(
+        &entry,
+        r#"#!/bin/sh
+IFS= read -r request
+printf '{"jsonrpc":"2.0","id":1,"result":{"cwd":"%s"}}\n' "$(pwd -P)"
+"#,
+    )
+    .expect("write relative-base plugin entry");
+    let mut permissions = std::fs::metadata(&entry)
+        .expect("read plugin entry metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&entry, permissions).expect("make plugin entry executable");
+
+    let manifest = PluginManifest {
+        name: "relative-base".to_string(),
+        version: "0.0.0".to_string(),
+        entry: "cwd-probe.sh".to_string(),
+        tools: Vec::new(),
+    };
+    let plugin = SubprocessPlugin::launch(&manifest, &base_dir.0)
+        .expect("launch plugin from relative base directory");
+
+    let result = plugin
+        .invoke_tool("cwd", json!({}))
+        .await
+        .expect("relative-base plugin responds");
     assert_eq!(
-        context["cwd"],
-        parent_cwd.to_string_lossy().as_ref(),
-        "current insecure behavior: launch_command inherits the parent's ambient real cwd"
+        result["cwd"],
+        canonical_base_dir.to_string_lossy().as_ref(),
+        "child real cwd must be the canonical plugin base directory"
     );
 }
 
@@ -268,7 +349,8 @@ async fn provider_connect_first_request_is_list_tools_id_one_without_params() {
         FIRST_REQUEST_PATH_ENV.to_string(),
         first_request.0.to_string_lossy().into_owned(),
     )];
-    let plugin = std::sync::Arc::new(launch_process_probe(&env));
+    let cwd = TempDir::unique("first-request-cwd");
+    let plugin = std::sync::Arc::new(launch_process_probe(&cwd.0, &env));
 
     let _provider = PluginProvider::connect(plugin.clone()).await;
     let wire: Value = serde_json::from_slice(

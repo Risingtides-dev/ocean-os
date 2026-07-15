@@ -2159,6 +2159,18 @@ async fn build_agent_capability_providers(
     caps: &[agentdir::SubprocessCapability],
     agent_root: &Path,
 ) -> Vec<Arc<dyn CapabilityProvider>> {
+    let canonical_agent_root = match std::fs::canonicalize(agent_root) {
+        Ok(root) if root.is_dir() => root,
+        Ok(root) => {
+            tracing::warn!(agent_root = %root.display(), "skipping agent subprocess capabilities: agent root is not a directory");
+            return Vec::new();
+        }
+        Err(error) => {
+            tracing::warn!(agent_root = %agent_root.display(), %error, "skipping agent subprocess capabilities: could not canonicalize agent root");
+            return Vec::new();
+        }
+    };
+
     let mut providers: Vec<Arc<dyn CapabilityProvider>> = Vec::new();
     for cap in caps {
         let name = cap.effective_name();
@@ -2179,31 +2191,44 @@ async fn build_agent_capability_providers(
             if p.is_absolute() {
                 cap.command.clone()
             } else {
-                agent_root.join(p).to_string_lossy().into_owned()
+                canonical_agent_root.join(p).to_string_lossy().into_owned()
             }
         };
-        let mut env: Vec<(String, String)> = cap
+        let requested_cwd = match cap.cwd.as_deref() {
+            Some(cwd) if cwd.trim().is_empty() => {
+                tracing::warn!(capability = %name, "skipping agent subprocess capability: empty cwd");
+                continue;
+            }
+            Some(cwd) => {
+                let path = Path::new(cwd);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    canonical_agent_root.join(path)
+                }
+            }
+            None => canonical_agent_root.clone(),
+        };
+        let current_dir = match std::fs::canonicalize(&requested_cwd) {
+            Ok(path) if path.is_dir() => path,
+            Ok(path) => {
+                tracing::warn!(capability = %name, cwd = %path.display(), "skipping agent subprocess capability: cwd is not a directory");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(capability = %name, cwd = %requested_cwd.display(), %error, "skipping agent subprocess capability: invalid cwd");
+                continue;
+            }
+        };
+        let env: Vec<(String, String)> = cap
             .env
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        if let Some(cwd) = cap.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
-            // ocean-plugin's StdioTransport spawns from the launcher's cwd; pass a
-            // resolved working directory via the child's PWD so a capability that
-            // honors it lands in the right place without changing the launcher.
-            let resolved = {
-                let c = Path::new(cwd);
-                if c.is_absolute() {
-                    c.to_path_buf()
-                } else {
-                    agent_root.join(c)
-                }
-            };
-            env.push(("PWD".to_string(), resolved.to_string_lossy().into_owned()));
-        }
+        let options = ocean_plugin::LaunchOptions::new(current_dir).with_env(&env);
 
-        let plugin = match ocean_plugin::SubprocessPlugin::launch_command(
-            &name, "0.0.0", &command, &cap.args, &env,
+        let plugin = match ocean_plugin::SubprocessPlugin::launch_command_with_options(
+            &name, "0.0.0", &command, &cap.args, &options,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -3110,17 +3135,19 @@ mod tests {
     fn agent_capability_process_probe_child() {
         use std::io::{BufRead, Write};
 
-        if std::env::var_os("OCEAN_AGENT_PHASE0_PROBE").is_none() {
+        if std::env::var_os("OCEAN_AGENT_PROCESS_PROBE").is_none() {
             return;
         }
 
         let observation_path =
-            std::env::var_os("OCEAN_AGENT_PHASE0_OBSERVATION").expect("probe observation path");
+            std::env::var_os("OCEAN_AGENT_PROCESS_OBSERVATION").expect("probe observation path");
         let observation = serde_json::json!({
             "pwd": std::env::var("PWD").ok(),
             "cwd": std::env::current_dir()
                 .expect("probe current dir")
                 .to_string_lossy(),
+            "explicit_env": std::env::var("OCEAN_AGENT_EXPLICIT_ENV").ok(),
+            "ambient_home": std::env::var("HOME").ok(),
         });
         std::fs::write(observation_path, serde_json::to_vec(&observation).unwrap()).unwrap();
 
@@ -3138,20 +3165,21 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn agent_subprocess_declared_cwd_changes_pwd_not_real_cwd() {
-        let agent_root = temp_config_dir("agent-cap-cwd");
-        let declared_cwd = agent_root.join("declared-cwd");
-        std::fs::create_dir_all(&declared_cwd).unwrap();
-        let observation = agent_root.join("observation.json");
-        let parent_cwd = std::env::current_dir().unwrap();
+    fn process_probe_capability(
+        observation: &Path,
+        cwd: Option<&str>,
+    ) -> agentdir::SubprocessCapability {
         let mut env = std::collections::BTreeMap::new();
-        env.insert("OCEAN_AGENT_PHASE0_PROBE".to_string(), "1".to_string());
+        env.insert("OCEAN_AGENT_PROCESS_PROBE".to_string(), "1".to_string());
         env.insert(
-            "OCEAN_AGENT_PHASE0_OBSERVATION".to_string(),
+            "OCEAN_AGENT_PROCESS_OBSERVATION".to_string(),
             observation.to_string_lossy().into_owned(),
         );
-        let cap = agentdir::SubprocessCapability {
+        env.insert(
+            "OCEAN_AGENT_EXPLICIT_ENV".to_string(),
+            "explicit-value".to_string(),
+        );
+        agentdir::SubprocessCapability {
             name: Some("cwd-probe".to_string()),
             command: std::env::current_exe()
                 .unwrap()
@@ -3163,22 +3191,68 @@ mod tests {
                 "--nocapture".to_string(),
                 "--test-threads=1".to_string(),
             ],
-            cwd: Some("declared-cwd".to_string()),
+            cwd: cwd.map(str::to_string),
             env,
-        };
+        }
+    }
 
-        let providers = build_agent_capability_providers(&[cap], &agent_root).await;
+    #[cfg(unix)]
+    async fn assert_agent_process_context(agent_root: &Path, cwd: Option<&str>, expected: &Path) {
+        assert!(
+            std::env::var_os("HOME").is_some(),
+            "test requires an ambient parent variable"
+        );
+        let observation = agent_root.join("observation.json");
+        let cap = process_probe_capability(&observation, cwd);
+
+        let providers = build_agent_capability_providers(&[cap], agent_root).await;
         assert_eq!(providers.len(), 1, "probe capability must bind");
         let observed: Value =
             serde_json::from_slice(&std::fs::read(&observation).unwrap()).unwrap();
-        assert_eq!(observed["pwd"], declared_cwd.to_string_lossy().as_ref());
-        assert_eq!(
-            observed["cwd"],
-            parent_cwd.to_string_lossy().as_ref(),
-            "declared cwd currently changes PWD input without changing getcwd()"
+        let expected = std::fs::canonicalize(expected).unwrap();
+        assert_eq!(observed["pwd"], expected.to_string_lossy().as_ref());
+        assert_eq!(observed["cwd"], expected.to_string_lossy().as_ref());
+        assert_eq!(observed["explicit_env"], "explicit-value");
+        assert!(
+            observed["ambient_home"].is_null(),
+            "arbitrary ambient parent environment must not reach the child"
         );
-
         drop(providers);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_subprocess_omitted_cwd_uses_canonical_agent_root() {
+        let agent_root = temp_config_dir("agent-cap-default-cwd");
+        std::fs::create_dir_all(&agent_root).unwrap();
+        assert_agent_process_context(&agent_root, None, &agent_root).await;
+        let _ = std::fs::remove_dir_all(agent_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_subprocess_relative_cwd_changes_real_cwd_and_pwd() {
+        let agent_root = temp_config_dir("agent-cap-relative-cwd");
+        let declared_cwd = agent_root.join("declared-cwd");
+        std::fs::create_dir_all(&declared_cwd).unwrap();
+        assert_agent_process_context(&agent_root, Some("declared-cwd"), &declared_cwd).await;
+        let _ = std::fs::remove_dir_all(agent_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_subprocess_invalid_cwd_is_skipped_fail_soft() {
+        let agent_root = temp_config_dir("agent-cap-invalid-cwd");
+        std::fs::create_dir_all(&agent_root).unwrap();
+        let observation = agent_root.join("observation.json");
+        let cap = process_probe_capability(&observation, Some("missing"));
+
+        let providers = build_agent_capability_providers(&[cap], &agent_root).await;
+        assert!(providers.is_empty());
+        assert!(
+            !observation.exists(),
+            "invalid cwd must not launch the child"
+        );
         let _ = std::fs::remove_dir_all(agent_root);
     }
 

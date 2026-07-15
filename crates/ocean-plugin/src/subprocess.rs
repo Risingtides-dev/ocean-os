@@ -20,6 +20,7 @@
 //! by the request `id` we sent.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -47,6 +48,45 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 type ResponseSlot = oneshot::Sender<Result<Value, PluginError>>;
 type Pending = Arc<Mutex<HashMap<u64, ResponseSlot>>>;
 
+/// Explicit process context for a subprocess plugin launch.
+///
+/// The child receives a minimal platform process-resolution baseline plus these
+/// caller-provided variables. It never inherits the host environment wholesale.
+/// `PWD` is reserved and always set to the canonical `current_dir` on Unix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchOptions {
+    current_dir: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+impl LaunchOptions {
+    /// Create launch options rooted at `current_dir`. The directory is
+    /// canonicalized and checked when the process is spawned.
+    pub fn new(current_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            current_dir: current_dir.into(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Replace the explicit caller environment entries.
+    #[must_use]
+    pub fn with_env(mut self, env: &[(String, String)]) -> Self {
+        self.env = env.to_vec();
+        self
+    }
+
+    /// Requested real working directory for the child.
+    pub fn current_dir(&self) -> &Path {
+        &self.current_dir
+    }
+
+    /// Explicit caller environment entries.
+    pub fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+}
+
 /// A plugin running as a child process.
 pub struct SubprocessPlugin {
     name: String,
@@ -68,20 +108,42 @@ impl SubprocessPlugin {
         manifest: &PluginManifest,
         base_dir: impl AsRef<std::path::Path>,
     ) -> Result<Self, PluginError> {
-        let entry_path = {
-            let p = std::path::Path::new(&manifest.entry);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                base_dir.as_ref().join(p)
-            }
+        let requested_base_dir = base_dir.as_ref();
+        let canonical_base_dir =
+            std::fs::canonicalize(requested_base_dir).map_err(|error| PluginError::Spawn {
+                entry: manifest.entry.clone(),
+                reason: format!(
+                    "canonicalize plugin base directory `{}`: {error}",
+                    requested_base_dir.display()
+                ),
+            })?;
+        if !canonical_base_dir.is_dir() {
+            return Err(PluginError::Spawn {
+                entry: manifest.entry.clone(),
+                reason: format!(
+                    "plugin base directory `{}` is not a directory",
+                    canonical_base_dir.display()
+                ),
+            });
+        }
+
+        let declared_entry = std::path::Path::new(&manifest.entry);
+        let entry_path = if declared_entry.is_absolute() {
+            declared_entry.to_path_buf()
+        } else {
+            canonical_base_dir.join(declared_entry)
         };
         let entry = entry_path.to_string_lossy().into_owned();
-        Self::launch_command(&manifest.name, &manifest.version, &entry, &[], &[])
+        let options = LaunchOptions::new(canonical_base_dir);
+        Self::launch_command_with_options(&manifest.name, &manifest.version, &entry, &[], &options)
     }
 
-    /// Launch a plugin by spawning `command` directly. The lower-level entry
-    /// point; [`launch`](Self::launch) resolves a manifest down to this.
+    /// Launch a plugin by spawning `command` directly.
+    ///
+    /// Compatibility wrapper for existing callers: it uses the canonical host
+    /// current directory as an explicit child cwd and applies `env` as the only
+    /// caller-provided environment. Prefer [`launch_command_with_options`](Self::launch_command_with_options)
+    /// when the declaring resource has its own root.
     pub fn launch_command(
         name: &str,
         version: &str,
@@ -89,8 +151,24 @@ impl SubprocessPlugin {
         args: &[String],
         env: &[(String, String)],
     ) -> Result<Self, PluginError> {
+        let cwd = std::env::current_dir().map_err(|error| PluginError::Spawn {
+            entry: command.to_string(),
+            reason: format!("resolve launch cwd: {error}"),
+        })?;
+        let options = LaunchOptions::new(cwd).with_env(env);
+        Self::launch_command_with_options(name, version, command, args, &options)
+    }
+
+    /// Launch with an explicit working directory and environment allowlist.
+    pub fn launch_command_with_options(
+        name: &str,
+        version: &str,
+        command: &str,
+        args: &[String],
+        options: &LaunchOptions,
+    ) -> Result<Self, PluginError> {
         let transport =
-            StdioTransport::spawn(command, args, env).map_err(|e| PluginError::Spawn {
+            StdioTransport::spawn(command, args, options).map_err(|e| PluginError::Spawn {
                 entry: command.to_string(),
                 reason: e.to_string(),
             })?;

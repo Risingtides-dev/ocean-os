@@ -12,6 +12,8 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
+use crate::LaunchOptions;
+
 /// Hard ceiling on a single plugin message (one JSON line). Plugins are
 /// third-party executables; without this bound a buggy or hostile plugin could
 /// emit one newline-less multi-gigabyte line and exhaust memory. A message past
@@ -67,6 +69,20 @@ fn try_take_line(pending: &mut Vec<u8>) -> Option<Result<String>> {
 /// `exec` races and fails with `ETXTBSY`. The fd is closed promptly, so a short
 /// backoff clears it. Any other spawn error (or exhausting retries) is returned
 /// as-is, so a genuinely broken plugin still fails fast and gets skipped.
+fn inject_platform_baseline(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+
+    #[cfg(windows)]
+    for name in ["PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+}
+
 fn spawn_with_etxtbsy_retry(cmd: &mut tokio::process::Command) -> std::io::Result<Child> {
     const MAX_ATTEMPTS: u32 = 3;
     const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
@@ -84,17 +100,36 @@ fn spawn_with_etxtbsy_retry(cmd: &mut tokio::process::Command) -> std::io::Resul
 }
 
 impl StdioTransport {
-    /// Spawn `command` with `args` and `env` (each `(name, value)` set on the
-    /// child only). The parent environment is inherited so the plugin can see
-    /// PATH etc.; the explicit `env` entries are extra variables the host injects.
-    pub fn spawn(command: &str, args: &[String], env: &[(String, String)]) -> Result<Self> {
+    /// Spawn with an explicit real cwd and a minimal environment. The only
+    /// inherited values are the documented platform process-resolution baseline:
+    /// `PATH` on Unix; `PATH`, `SystemRoot`, `WINDIR`, `COMSPEC`, and `PATHEXT` on
+    /// Windows when present. Caller entries are then injected explicitly.
+    pub fn spawn(command: &str, args: &[String], options: &LaunchOptions) -> Result<Self> {
+        let cwd = std::fs::canonicalize(options.current_dir()).with_context(|| {
+            format!(
+                "canonicalize plugin current directory `{}`",
+                options.current_dir().display()
+            )
+        })?;
+        if !cwd.is_dir() {
+            bail!(
+                "plugin current directory `{}` is not a directory",
+                cwd.display()
+            );
+        }
+
         let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        cmd.args(args).env_clear();
+        inject_platform_baseline(&mut cmd);
+        cmd.envs(options.env().iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+
+        #[cfg(unix)]
+        cmd.env("PWD", &cwd);
 
         let mut child = spawn_with_etxtbsy_retry(&mut cmd)
             .with_context(|| format!("spawn plugin `{command}`"))?;
