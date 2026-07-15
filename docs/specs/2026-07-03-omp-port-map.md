@@ -1,6 +1,6 @@
 # OMP → Ocean Port Map
 
-**Date:** 2026-07-03 · **Status:** Research complete (all 5 slices) · **Owner:** Smaths / Ocean
+**Date:** 2026-07-03 · **Status:** Research complete; implementation audit refreshed 2026-07-15 · **Owner:** Smaths / Ocean
 **Source:** deep source inspection of [oh-my-pi](https://github.com/can1357/oh-my-pi) (MIT, ~15.7k★) by 5 parallel research agents reading actual `.rs`/`.ts` files — not docs. This is the standing backlog: every feature worth reverse-engineering into Ocean, mapped to a destination crate, so features never need to be re-named one by one.
 
 > **Ownership update (2026-07-13):** backlog entries that place subagent definitions, `task`/spawn, lifecycle, or orchestration in core are superseded. Those capabilities must ship as extensions over generic permission-gated execution/capability seams; do not port their original core placement.
@@ -359,45 +359,46 @@ fails loud. Snapshot store: LRU 30 paths × 4 versions, realpath-keyed, records 
 (edits into unread regions rejected). Their test suite (`packages/hashline/test/`) is the
 port contract. ~61% output-token reduction claimed. → `ocean-hashline`, profile: tui/acp.
 
-## Implementation status audit (2026-07-05, 4-agent evidence sweep)
+## Implementation status audit (2026-07-15, source + live-composition sweep)
 
-Ground truth as of this date — what is actually in `crates/*/src`, not the plan. Verified by
-four parallel read-only agents citing `crate::file:sym`. Key correction to the earlier
-"we only reimplemented hashline" read: a large slice of the OMP *harness* is already carried
-out under Ocean's own crate names — but the four **lift-as-is Rust crates** (walker, iso,
-uu-grep, minimizer) are confirmed absent.
+This is the current checkpoint against the original map, not a claim that every Ocean feature
+originated in OMP. Source symbols and the canonical package index are authoritative; this dated
+summary exists to keep the backlog honest.
 
-**BUILT (wired, working):**
-- Artifact spill / output-meta — `ocean-runtime::capability.rs:SpillingTool` + `artifacts.rs:ArtifactStore` (24 KB → head cut + `artifact://` spill; wraps every tool incl. MCP).
-- Hashline edits — `ocean-hashline` wired end-to-end via `capability.rs:206` / `read.rs:178` / `hashline_edit.rs`; gated by profile.
-- Harness profile seam — `ocean-daemon::harness_profile.rs` resolves per-turn from `client_type`. **Gates only 2 of its 7 flags today** (`hashline_edits`, `artifacts`); `lsp/stream_rules/rich_context/memory/minimizer` are declared + logged but wire to nothing.
-- Provider layer — `ocean-providers::lib.rs` 7 providers, 2-tier auth cascade (env → `auth.json`), retry+backoff (`ocean-protocol::retry.rs`), model fallback chains (`fallback_candidates`, OCEAN-275). Gaps: no OAuth *refresh*, no timed cooldown.
-- Advisor observer (roles v1 delta) — `ocean-daemon::main.rs:9313` post-turn fire-and-forget on `roles["advisor"]`.
-- AST read-time summary — `ocean-ast` (reimplemented from pi-ast, not lifted).
-- PTY — `ocean-tui::shell/pty.rs` (portable-pty, harvested from CTRL). Glob tool — `ocean-runtime::tools/glob_tool.rs` (basic). `artifact://` URI — `read.rs:19`.
+| Wave | Status | Current evidence | Remaining gap |
+|---|---|---|---|
+| W0 — profile seam | **Partial** | `ocean-daemon::harness_profile` resolves per turn and defines all bundles. `PromptControl::with_hashline_edits` and `with_artifact_spill` carry two gates into runtime composition. | LSP and memory are registered as universal providers rather than controlled through the profile seam; stream rules, rich context, and minimizer remain declarative. ACP is not selected by `client_type`. |
+| W1 — edit reliability | **Built** | `ocean-hashline`, session snapshots, `HashlineEditTool`, `NoopLoopGuard`, `SpillingTool`, and `artifact://` retrieval are live. | Output metadata is thinner than OMP's complete directional/range protocol, and the broader hashline dialect remains out of scope. |
+| W2 — TUI streaming | **Strong partial** | `shell/markdown.rs` implements prefix-freeze; `shell/diff.rs` has word-level inverse diffs; the composer has persisted history, Ctrl-R, a kill ring, mentions, and a fuzzy slash palette; tool drawers and a basic Kitty image viewer are live. | No append-only native-scrollback architecture, OMP theme-token/80-theme compatibility, full image protocol ladder/ImageBudget, or complete composer integration set. |
+| W3 — context economy | **Partial** | Artifact spill is live. `ocean-agent::compact_history` deterministically elides older tool bodies and `ocean-runtime::trim_to_context_window` provides the hard suffix bound. `ocean-ast` implements structural summaries as a standalone crate. | No BM25 tool discovery, command minimizer, promote/prune/shake/summarize pipeline, protection matchers, live general AST-read wiring, or conversational checkpoint/rewind. |
+| W4 — roles/catalog | **Partial** | Flat `[roles]`, per-turn model/advisor control, provider readiness, OAuth/API-key routing, retry, and cross-provider fallback are live. | No cycle-safe role aliases, thinking suffix grammar, per-role fallback, `tiny` role, path policy, configurable rich catalog, promotion target, or timed fallback cooldown/revert. |
+| W5 — code intelligence | **Substantial partial** | `ocean-lsp::LspProvider` is live with diagnostics, definition, references, hover, symbols, rename, and reload. Built-in grep supports Rust regex with literal fallback. | No shared walker/search engine, cross-line typed/mtime-ranked search, `ast_edit`, generic preview/resolve, rename-file/code-actions/raw request, or mutation-counter write-through diagnostics. |
+| W6 — rules/TTSR | **Absent** | The profile names `stream_rules`; no runtime engine is wired. | Typed rule capability taxonomy, `rule://`, three-tier delivery, abort/rewind/inject, and a builtin pack remain unimplemented. |
+| W7 — orchestration | **Superseded in core** | Session-scoped todo plus `retain`/`recall` are live Ocean-shaped mechanisms. | General task/spawn/IRC/typed-yield orchestration is extension-owned under the current architecture. CoW isolation, reflect/hindsight, and plan mode need separately approved extension-facing designs rather than the original core placement. |
 
-**PARTIAL (thin or scaffolded):**
-- Grep — `ocean-runtime::tools/grep.rs` is fixed-**substring** (no regex/cross-line/mtime-sort); no ripgrep libs.
-- Compaction — `ocean-runtime::agent_loop.rs:729 trim_to_context_window` is single-tier drop-oldest; no promote/prune/shake/summarize, no protection matchers.
-- Context assembler — `ocean-agent::lib.rs:5536 load_project_prompt` walks AGENTS.md/CLAUDE.md ancestors; no `@`-imports, no skills/tree/rule-index in the prompt (skills live in a separate Longhouse `/v1/skills/query`).
-- Capability registry — `ocean-runtime::capability.rs:264` is a prioritized **tool-source** seam only; no typed rules/context/skills taxonomy, no 3-tier rule delivery.
-- Memory — `ocean-memory` = store (`put/get/list/delete`) + deterministic OKF ingest only; **no retain/recall/reflect verbs, no BM25 recall, no LLM reflect (`ingest.rs:158 NoResidue`), not wired into the daemon**.
-- Models catalog — `ocean-providers::lib.rs:457 known_models` is hardcoded id/provider/label; no cost/contextWindow/compat/discovery, no `[models]` in `DaemonConfig`.
-- Role grammar — `ocean-agent::config.rs:48 roles` is a flat `role→provider/model` map; no role-to-role, no `:low/:high` suffix, no per-role fallback, no path-scoped `enabledModels`.
-- Loop guards — `ocean-hashline::guard.rs:NoopLoopGuard` built + exported but **has zero call sites (dead)**; auto-generated + plan-mode guards absent.
-- ANSI-aware text util (`unicode-width` used in spots, no dedicated truncate); semantic syntax highlight (syntect present, no 11-category mapping).
+### Corrections to the 2026-07-05 snapshot
 
-**ABSENT (not started):**
-- Parallel FS **walker** engine (pi-walker) — only ad-hoc `ignore`/`walkdir`/`read_dir`, no scan cache/ranked-N/cancel.
-- In-process **regex grep** / typed search (pi-uu-grep). **Minimizer** / per-command output filters (pi-shell) — `bash.rs` raw passthrough, `minimizer` flag unwired.
-- **CoW isolation** (pi-iso) — no clonefile/reflink/worktree-CoW; subagent path assembles a spec only.
-- **BM25 tool discovery**, **resolve/preview-accept**, **TTSR/stream-rules engine**, **checkpoint/rewind**, **plan mode**, **contextPromotionTarget**.
-- Token counting (tiktoken — only a `len/4` heuristic), **sixel/kitty** image render, `rule://`/`skill://`/`local://` URI schemes.
+- `NoopLoopGuard` is wired into `hashline_edit`; it is no longer dead code.
+- Grep is regex-first with explicit literal fallback; it is still not the planned typed search engine.
+- `ocean-lsp` is a live capability provider rather than a dormant profile flag.
+- `retain` and `recall` are live over the typed SQLite memory store; BM25 and `reflect` remain open.
+- W2 advanced materially: prefix-freeze, inverse diff cards, composer history/search/kill ring,
+  slash discovery, expandable tool drawers, and basic Kitty image display are implemented.
+- Compaction is no longer only drop-oldest: old tool-result bodies are elided deterministically
+  before the runtime's hard context-window trim. The richer OMP tiers remain absent.
+- The original W7 core destination is invalid. General orchestration must ship through extensions
+  over generic permission-gated execution, cancellation, capability, and event/tool seams.
 
-**Cheapest wins (already 80% there, just disconnected):** wire the 5 dormant harness-profile
-flags; wire `NoopLoopGuard` into `hashline_edit`; wire `ocean-memory` into the daemon +
-add recall. Highest-leverage fresh lifts: `pi-walker` and `pi-iso` (drop-in Rust, MIT, at
-`/tmp/oh-my-pi/crates`).
+### Next high-leverage sequence
+
+1. Reconcile which capabilities are truly surface-scoped and carry that policy through one runtime
+   composition seam rather than logging unused booleans.
+2. Add advisor attribution, time/concurrency bounds, and observable status before increasing the
+   context it reviews.
+3. Make the default-on Longhouse consult inspectable and tune relevance without granting it
+   execution authority.
+4. Build the command minimizer, then the shared walker/search substrate.
+5. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
 
 ## Scoping principle (John, 2026-07-03)
 
@@ -409,39 +410,33 @@ Same rule everywhere: minimizer filters for our commands (cargo/git/gh/npm/pytes
 for our languages, web-search providers we'd use. The mechanism must make adding an
 integration a config entry, never a code change.
 
-**Committed TUI gap (John):** ocean-tui's shell has NO slash-command menu. A real `/` command
-palette (fuzzy menu on `/` in the composer, ↑↓ + Enter, extensible registry) is pulled
-forward out of W2 — it's the discoverability surface every other feature hangs off.
+**Closed TUI gap:** ocean-tui now has the fuzzy `/` command palette, keyboard/mouse navigation,
+and an extensible registry. Continue using that palette as the discoverability surface for later
+harness mechanisms rather than adding hidden commands.
 
-## Build waves (final)
+## Original build waves and current disposition
 
-0. **W0 — profile seam** (small, first): `HarnessProfile` resolved from `client_type` in
-   ocean-daemon. Every wave below attaches capabilities to a profile in one line. This is the
-   architectural decision that keeps IDE machinery out of web/voice surfaces.
-1. **W1 — edit reliability**: `ocean-hashline` (tags + snapshot store + recovery, contract =
-   their test suite) · output-meta + artifact spill · no-op loop guard. *Makes every model
-   behind Ocean edit reliably; compounds with roles.*
-2. **W2 — TUI streaming lock-in**: prefix-freeze markdown · diff cards w/ word-level inverse ·
-   composer stack (autocomplete trait, ctrl+r history, kill ring) · theme token schema
-   (80-theme compat) · tool cards w/ ctrl+o expand.
-3. **W3 — context economy**: BM25 tool discovery · `ocean-minimizer` (vendor filters) ·
-   read-time summarization (`ocean-ast` summary) · prune/shake compaction tiers +
-   promote-before-compact · checkpoint/rewind (needs session branch links).
-4. **W4 — roles v2 + models catalog**: role grammar (role→role aliases, thinking suffixes) ·
-   models catalog in ocean.toml (compat blocks, cost quads, discovery) · path-scoped policy ·
-   retry/fallback chains · `tiny` role for background jobs (titles, memory extraction).
-5. **W5 — code intelligence**: LSP tool (multiplexed servers, rename w/ import rewrite,
-   deferred diagnostics w/ mutation counters) · ast_edit + resolve preview protocol ·
-   `ocean-walker` + `ocean-search` (lift pi-walker/pi-uu-grep).
-6. **W6 — rules + TTSR**: capability registry w/ three-tier rule delivery (inline / indexed
-   `rule://` / TTSR-enforced) · StreamRuleEngine w/ abort-rewind-inject · builtin rule pack.
-7. **W7 — orchestration**: task tool w/ `ocean-iso` CoW isolation + typed yields · IRC-as-bus-
-   topics · todo (verbatim-content addressing) · hindsight verbs over ocean-context/OKF ·
-   plan mode enforcement.
+0. **W0 — profile seam: partial.** Resolve the remaining policy mismatch before adding more flags.
+1. **W1 — edit reliability: built.** Preserve the tests and profile-gated runtime wiring.
+2. **W2 — TUI streaming lock-in: strong partial.** Finish only the missing mechanisms that fit
+   the current terminal workbench; do not replace it to imitate OMP.
+3. **W3 — context economy: partial.** Minimizer and shared search are the next independent wins;
+   richer compaction/checkpoint behavior needs explicit session and cache contracts.
+4. **W4 — roles v2 + models catalog: partial.** Current flat roles and provider catalog are stable
+   compatibility surfaces; extend them additively rather than replacing them wholesale.
+5. **W5 — code intelligence: substantial partial.** Build on `ocean-lsp`; do not create a second
+   LSP authority.
+6. **W6 — rules + TTSR: absent.** Requires a separate design for streaming rewind, persistence,
+   prompt-cache behavior, and rule trust.
+7. **W7 — orchestration: original placement superseded.** Extensions own definitions, dispatch,
+   lifecycle, budgets, joins, and policy. Core may add only generic permission-gated seams that an
+   approved extension design requires.
 
-## What Ocean already has (don't rebuild)
+## What Ocean already has (do not rebuild)
 
-Roles v1 + advisor observer (this branch) · ACP crate (extend per Slice 5 notes) · browser
-direction is CEF-embed, steal only the observe/ref control surface · OKF/ocean-context is the
-memory substrate (port verbs, not storage) · folder-as-agent ≈ their .md agent roster
-(converge, don't duplicate) · events ledger/factory discipline replaces nothing here.
+Hashline edits and artifact spill · an Ocean-native TUI workbench and slash registry · flat model
+roles plus runtime advisor control · a live LSP provider · provider readiness/OAuth/fallback ·
+typed memory with `retain`/`recall` · Ocean's own browser direction · OKF/ocean-context as the
+memory/handoff substrate · folder-as-agent content and capability binding · daemon-owned sessions,
+permissions, cancellation, and event transport. Extend these owners; do not create parallel OMP
+subsystems beside them.

@@ -55,6 +55,10 @@ Active plans:
 
 - [`specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md) — approved extension architecture, ownership boundaries, accepted Phase 0 evidence, and staged migration gates; the Phase 1 schema/tool-lane checkpoint is implemented but not accepted, while state separation and inspect/doctor remain pending.
 
+Active implementation reference:
+
+- [`specs/2026-07-03-omp-port-map.md`](specs/2026-07-03-omp-port-map.md) — source-researched OMP-to-Ocean mechanism map plus the dated current implementation audit. It is a prioritized reference, not current architecture; open checkpoints are routed through [`../ROADMAP.md`](../ROADMAP.md), and its original core-orchestration placement is superseded by the extension architecture.
+
 Completed extraction manifests are retained evidence, not independent work orders. The broader behavior-neutral daemon refactor remains active under `DAEMON_REFACTOR_MISSION.md`; consult its progress section and the current code-health plan before selecting the next checkpoint.
 
 ## Historical archive
