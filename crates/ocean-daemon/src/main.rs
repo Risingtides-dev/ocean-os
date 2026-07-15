@@ -690,6 +690,31 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .layer(TraceLayer::new_for_http())
 }
 
+// Model roles (oh-my-pi-style indirection) loaded once from `ocean.toml`'s
+// `[roles]` table. A malformed config here is non-fatal for roles — the
+// daemon already validated + loaded the same file for MCP/hooks at runtime
+// construction, so a parse error would have surfaced there; if it somehow
+// doesn't parse now we log and fall back to an empty table (roles + advisor
+// simply off), never blocking startup.
+fn load_model_roles(config_dir: &std::path::Path) -> HashMap<String, String> {
+    match ocean_agent::DaemonConfig::load(config_dir) {
+        Ok(cfg) => {
+            if !cfg.roles.is_empty() {
+                tracing::info!(
+                    role_count = cfg.roles.len(),
+                    advisor = cfg.advisor_model().is_some(),
+                    "loaded model roles from ocean.toml [roles]"
+                );
+            }
+            cfg.roles
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load [roles] from ocean.toml; roles disabled");
+            HashMap::new()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // OCEAN-274: render per-turn span context so concurrent turns are
@@ -812,28 +837,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening titles DB at {}", titles_db_path.display()))?;
     tracing::info!(path = %titles_db_path.display(), "persisted longhouse title registry ready");
 
-    // Model roles (oh-my-pi-style indirection) loaded once from `ocean.toml`'s
-    // `[roles]` table. A malformed config here is non-fatal for roles — the
-    // daemon already validated + loaded the same file for MCP/hooks at runtime
-    // construction, so a parse error would have surfaced there; if it somehow
-    // doesn't parse now we log and fall back to an empty table (roles + advisor
-    // simply off), never blocking startup.
-    let roles = match ocean_agent::DaemonConfig::load(&ocean_agent::config_dir_from_env()) {
-        Ok(cfg) => {
-            if !cfg.roles.is_empty() {
-                tracing::info!(
-                    role_count = cfg.roles.len(),
-                    advisor = cfg.advisor_model().is_some(),
-                    "loaded model roles from ocean.toml [roles]"
-                );
-            }
-            cfg.roles
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load [roles] from ocean.toml; roles disabled");
-            std::collections::HashMap::new()
-        }
-    };
+    let roles = load_model_roles(&ocean_agent::config_dir_from_env());
 
     let state = AppState {
         runtime,
@@ -9299,7 +9303,102 @@ mod tests {
         );
     }
 
-    // ── Advisor observer pure helpers ───────────────────────────────────────
+    // ── Model roles and advisor resolution ──────────────────────────────────
+
+    #[test]
+    fn model_roles_load_missing_and_malformed_config_fail_open() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(load_model_roles(dir.path()).is_empty());
+
+        std::fs::write(dir.path().join("ocean.toml"), "[roles\nfast = 'model'").unwrap();
+        assert!(load_model_roles(dir.path()).is_empty());
+
+        std::fs::write(
+            dir.path().join("ocean.toml"),
+            r#"
+                [roles]
+                fast = "deepseek/deepseek-chat"
+
+                [offshore]
+                remote_url = "ssh://not-http"
+                ssh_host = "host"
+            "#,
+        )
+        .unwrap();
+        assert!(load_model_roles(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn model_roles_load_preserves_aliases_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ocean.toml"),
+            r#"
+                [roles]
+                fast = "deepseek/deepseek-chat"
+                advisor = "anthropic/claude-sonnet-4"
+                blank = ""
+                " Mixed Role " = "  spaced alias  "
+            "#,
+        )
+        .unwrap();
+
+        let roles = load_model_roles(dir.path());
+        assert_eq!(roles.len(), 4);
+        assert_eq!(
+            roles.get("fast").map(String::as_str),
+            Some("deepseek/deepseek-chat")
+        );
+        assert_eq!(
+            roles.get("advisor").map(String::as_str),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(roles.get("blank").map(String::as_str), Some(""));
+        assert_eq!(
+            roles.get(" Mixed Role ").map(String::as_str),
+            Some("  spaced alias  ")
+        );
+    }
+
+    #[test]
+    fn model_role_resolution_is_exact_and_does_not_trim_inputs() {
+        use ocean_agent_sdk::AdvisorControl;
+
+        let roles = HashMap::from([
+            ("Fast".to_string(), "  spaced alias  ".to_string()),
+            ("blank".to_string(), String::new()),
+            ("advisor".to_string(), String::new()),
+        ]);
+
+        assert_eq!(
+            resolve_effective_model_id(None, Some("Fast"), &roles),
+            (Some("  spaced alias  ".to_string()), false)
+        );
+        assert_eq!(
+            resolve_effective_model_id(None, Some("fast"), &roles),
+            (None, true)
+        );
+        assert_eq!(
+            resolve_effective_model_id(None, Some("blank"), &roles),
+            (Some(String::new()), false)
+        );
+        assert_eq!(
+            resolve_effective_model_id(Some("  "), Some("Fast"), &roles),
+            (Some("  ".to_string()), false)
+        );
+        assert_eq!(resolve_advisor_alias(None, &roles), Some(String::new()));
+        assert_eq!(
+            resolve_advisor_alias(
+                Some(&AdvisorControl {
+                    enabled: true,
+                    model: Some("  ".to_string()),
+                }),
+                &roles,
+            ),
+            Some(String::new())
+        );
+    }
 
     #[test]
     fn resolve_advisor_alias_precedence() {
