@@ -102,6 +102,8 @@ mod model_catalog;
 mod model_roles;
 /// Project registry CRUD, pagination, git enrichment, and session association adapters.
 mod project_registry;
+/// In-memory quorum-of-recall tally storage and bounded synchronous mutations.
+mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
 mod request_control;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
@@ -127,6 +129,9 @@ use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_mod
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
     project_get, project_patch, projects_list,
+};
+use recall_registry::{
+    cast_recall_vote, new_recall_registry, remove_recall_tally, RecallRegistryHandle,
 };
 use request_control::{
     attach_request_handle, cancel_permission_waiter, pending_permissions_snapshot,
@@ -314,51 +319,6 @@ type TitleRegistryHandle = Arc<Mutex<ocean_longhouse::SqliteTitleRegistry>>;
 /// `Arc` (no `Mutex`: `Revoker` is immutable — it mutates the registry it is
 /// handed, under that registry's own lock).
 type RevokerHandle = Arc<ocean_longhouse::Revoker>;
-/// Open quorum-of-recall tallies keyed by the firekeeper `title_id` under recall
-/// (OCEAN-302). Each value is the pure [`ocean_longhouse::RecallVote`] counting
-/// distinct credentialed no-confidence votes. Held behind a std `Mutex` like the
-/// other longhouse stores: every access is a quick synchronous read/insert and
-/// the guard is dropped before any `await`, so it never blocks the scheduler.
-type RecallRegistryHandle = Arc<Mutex<HashMap<Uuid, ocean_longhouse::RecallVote>>>;
-
-fn new_recall_registry() -> RecallRegistryHandle {
-    Arc::new(Mutex::new(HashMap::new()))
-}
-
-/// Run a closure with the locked recall registry, recovering a poisoned lock the
-/// same way the other longhouse handlers do. Synchronous: the guard drops before
-/// this returns, so no `await` is held across it.
-fn with_recalls<T>(
-    recalls: &RecallRegistryHandle,
-    f: impl FnOnce(&mut HashMap<Uuid, ocean_longhouse::RecallVote>) -> T,
-) -> T {
-    let mut guard = match recalls.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    f(&mut guard)
-}
-
-fn cast_recall_vote(
-    recalls: &RecallRegistryHandle,
-    title_id: Uuid,
-    voter_id: Uuid,
-    threshold: usize,
-) -> ocean_longhouse::RecallOutcome {
-    with_recalls(recalls, |recalls| {
-        let recall = recalls
-            .entry(title_id)
-            .or_insert_with(|| ocean_longhouse::RecallVote::new(title_id, threshold));
-        recall.cast(voter_id)
-    })
-}
-
-fn remove_recall_tally(recalls: &RecallRegistryHandle, title_id: Uuid) {
-    with_recalls(recalls, |recalls| {
-        recalls.remove(&title_id);
-    });
-}
-
 // --- Turn-intake backpressure (OCEAN-304) -----------------------------------
 //
 // Both turn-intake paths (`POST /v1/agent/turns` and `POST /v1/requests`)
@@ -14716,6 +14676,13 @@ mod tests {
         Uuid::from_bytes(b)
     }
 
+    fn recall_tally_ids(recalls: &RecallRegistryHandle) -> Vec<Uuid> {
+        let tallies = recalls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tallies.keys().copied().collect()
+    }
+
     /// Build an `AppState` whose persisted title registry lives at a real on-disk
     /// `titles.db` under `dir` (so a reopen test can prove durability), with an
     /// in-memory rooms store and fake runtime. Returns the state.
@@ -14830,11 +14797,10 @@ mod tests {
 
         remove_recall_tally(&recalls, title_a);
 
-        with_recalls(&recalls, |tallies| {
-            assert!(!tallies.contains_key(&title_a));
-            assert!(tallies.contains_key(&title_b));
-            assert_eq!(tallies.len(), 1);
-        });
+        let tally_ids = recall_tally_ids(&recalls);
+        assert!(!tally_ids.contains(&title_a));
+        assert!(tally_ids.contains(&title_b));
+        assert_eq!(tally_ids.len(), 1);
     }
 
     #[test]
@@ -14856,7 +14822,7 @@ mod tests {
             }
         );
         remove_recall_tally(&recalls, title_id);
-        with_recalls(&recalls, |tallies| assert!(tallies.is_empty()));
+        assert!(recall_tally_ids(&recalls).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14908,7 +14874,7 @@ mod tests {
                 ),
             })
         );
-        with_recalls(&state.recalls, |tallies| assert!(tallies.is_empty()));
+        assert!(recall_tally_ids(&state.recalls).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14975,7 +14941,7 @@ mod tests {
                 "reason": "hard recall: quorum-of-recall: 2 no-confidence votes",
             })
         );
-        with_recalls(&state.recalls, |tallies| assert!(tallies.is_empty()));
+        assert!(recall_tally_ids(&state.recalls).is_empty());
         assert_eq!(
             with_titles(&state, |titles| titles
                 .lookup(title_id)
@@ -14988,7 +14954,7 @@ mod tests {
         let (closed_status, _) =
             post_json(app, "/v1/longhouse/recall", recall_body(esc_uid(102), 1)).await;
         assert_eq!(closed_status, StatusCode::NOT_FOUND);
-        with_recalls(&state.recalls, |tallies| assert!(tallies.is_empty()));
+        assert!(recall_tally_ids(&state.recalls).is_empty());
     }
 
     // THE CORE OCEAN-272 PROPERTY, through the daemon: a firekeeper title minted +
