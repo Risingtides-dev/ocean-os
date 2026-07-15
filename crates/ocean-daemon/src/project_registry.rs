@@ -40,6 +40,15 @@ pub(super) struct ProjectsListQuery {
     pub(super) cursor: Option<String>,
 }
 
+/// Internal Git worktree discovery record. `prunable` is authorization-relevant
+/// but deliberately omitted from the public `WorktreeInfo` response shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiscoveredWorktree {
+    pub(super) path: String,
+    pub(super) branch: Option<String>,
+    pub(super) prunable: bool,
+}
+
 /// `GET /v1/projects?limit=&cursor=` — list registered projects, one bounded
 /// page at a time (OCEAN-250). Projects are ordered newest-first; the `projects`
 /// array shape is unchanged except for additive git fields (`git_branch`,
@@ -189,23 +198,16 @@ async fn enriched_project_json(project: &Project) -> serde_json::Value {
 
     // -- worktrees (subprocess) ------------------------------------------
     let worktrees: Vec<ocean_agent::WorktreeInfo> = if is_repo && !proj_root.is_empty() {
-        match tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(proj_root)
-            .arg("worktree")
-            .arg("list")
-            .arg("--porcelain")
-            .output()
+        discover_project_worktrees(proj_root)
             .await
-        {
-            Ok(out) if out.status.success() => {
-                parse_worktree_list(&String::from_utf8_lossy(&out.stdout))
-                    .into_iter()
-                    .filter(|wt| &wt.path != proj_root)
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|wt| !wt.prunable && &wt.path != proj_root)
+            .map(|wt| ocean_agent::WorktreeInfo {
+                path: wt.path,
+                branch: wt.branch,
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -216,7 +218,7 @@ async fn enriched_project_json(project: &Project) -> serde_json::Value {
 
 pub(super) async fn discover_project_worktrees(
     project_root: &str,
-) -> Result<Vec<ocean_agent::WorktreeInfo>, String> {
+) -> Result<Vec<DiscoveredWorktree>, String> {
     let out = tokio::process::Command::new("git")
         .arg("-C")
         .arg(project_root)
@@ -229,25 +231,66 @@ pub(super) async fn discover_project_worktrees(
     if !out.status.success() {
         return Err("git worktree discovery failed".into());
     }
-    Ok(parse_worktree_list(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_discovered_worktree_list(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
 }
 
-/// Parse `git worktree list --porcelain` output into WorktreeInfo entries.
-/// Strips `refs/heads/` from branch refs.
-pub(super) fn parse_worktree_list(raw: &str) -> Vec<ocean_agent::WorktreeInfo> {
+/// Resolve a checkout's canonical Git common directory. Linked worktrees and
+/// the registered main checkout must resolve to the same directory.
+pub(super) async fn canonical_git_common_dir(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .await
+        .map_err(|e| format!("git common-dir lookup failed: {e}"))?;
+    if !out.status.success() {
+        return Err("workspace_root is not a live Git checkout".into());
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let common = raw.trim();
+    if common.is_empty() {
+        return Err("git common-dir lookup returned no path".into());
+    }
+    std::fs::canonicalize(common)
+        .map_err(|_| "git common-dir is missing or inaccessible".to_string())
+}
+
+/// Parse `git worktree list --porcelain`, retaining Git's prunable marker for
+/// authorization decisions.
+pub(super) fn parse_discovered_worktree_list(raw: &str) -> Vec<DiscoveredWorktree> {
     let mut out = Vec::new();
     let mut current_path: Option<String> = None;
     let mut current_branch: Option<String> = None;
+    let mut current_prunable = false;
+
+    let flush = |out: &mut Vec<DiscoveredWorktree>,
+                 path: &mut Option<String>,
+                 branch: &mut Option<String>,
+                 prunable: &mut bool| {
+        if let Some(path) = path.take() {
+            out.push(DiscoveredWorktree {
+                path,
+                branch: branch.take(),
+                prunable: *prunable,
+            });
+        }
+        *prunable = false;
+    };
 
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            if let Some(path) = current_path.take() {
-                out.push(ocean_agent::WorktreeInfo {
-                    path,
-                    branch: current_branch.take(),
-                });
-            }
+            flush(
+                &mut out,
+                &mut current_path,
+                &mut current_branch,
+                &mut current_prunable,
+            );
             continue;
         }
         if let Some(path) = trimmed.strip_prefix("worktree ") {
@@ -255,16 +298,30 @@ pub(super) fn parse_worktree_list(raw: &str) -> Vec<ocean_agent::WorktreeInfo> {
         } else if let Some(branch) = trimmed.strip_prefix("branch ") {
             let b = branch.trim();
             current_branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if trimmed == "prunable" || trimmed.starts_with("prunable ") {
+            current_prunable = true;
         }
     }
-    // Flush last entry if no trailing blank line.
-    if let Some(path) = current_path {
-        out.push(ocean_agent::WorktreeInfo {
-            path,
-            branch: current_branch,
-        });
-    }
+    flush(
+        &mut out,
+        &mut current_path,
+        &mut current_branch,
+        &mut current_prunable,
+    );
     out
+}
+
+/// Public project response shape: path + branch only. Authorization callers use
+/// `parse_discovered_worktree_list` instead.
+#[cfg(test)]
+pub(super) fn parse_worktree_list(raw: &str) -> Vec<ocean_agent::WorktreeInfo> {
+    parse_discovered_worktree_list(raw)
+        .into_iter()
+        .map(|wt| ocean_agent::WorktreeInfo {
+            path: wt.path,
+            branch: wt.branch,
+        })
+        .collect()
 }
 
 /// `GET /v1/projects/{id}` — one project plus its sessions (the sessions in the

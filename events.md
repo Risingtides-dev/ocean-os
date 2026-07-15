@@ -3157,3 +3157,12 @@ type:      [bug report]
 area:      [backend]: OpenAI Realtime planner mint compatibility
 
 Removed the unsupported function-level `strict` property from the planner Realtime client-secret body after live OpenAI testing returned HTTP 400 `unknown_parameter` for `session.tools[0].strict`. The one-tool proposal contract remains closed and bounded under `parameters`, and its exact wire shape is covered by regression testing; Surface validation and mutation boundaries are unchanged.
+
+_________________________________________________________________________________
+time:      [02:20am] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  /tmp/ocean-os-voice-planner-integrate-20260715
+type:      [integration fix]
+area:      [backend]: planner worktree authorization on current main
+
+Rebased Voice Planner onto the extracted project registry without widening the public WorktreeInfo contract. Internal discovery now retains Git's prunable marker for authorization, public project enrichment omits stale worktrees, and linked-worktree validation compares canonical Git common directories. Focused worktree tests, 155 agent tests, 317 serialized daemon tests, daemon check, formatting, docs, and diff gates pass; the original dirty checkout remains untouched.

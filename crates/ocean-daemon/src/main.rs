@@ -118,7 +118,10 @@ use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
-use project_registry::{project_create, project_delete, project_get, project_patch, projects_list};
+use project_registry::{
+    canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
+    project_get, project_patch, projects_list,
+};
 use slack_canvas_fulfillment::{
     canvas_fulfillment_get, canvas_fulfillment_post, gc_canvas_fulfillments, CanvasFulfillmentStore,
 };
@@ -137,7 +140,8 @@ use model_catalog::ModelSetRequest;
 use ocean_core::{Project, ProjectConfig};
 #[cfg(test)]
 use project_registry::{
-    parse_worktree_list, CreateProjectRequest, PatchProjectRequest, ProjectsListQuery,
+    parse_discovered_worktree_list, parse_worktree_list, CreateProjectRequest, PatchProjectRequest,
+    ProjectsListQuery,
 };
 #[cfg(test)]
 use slack_canvas_fulfillment::{
@@ -19593,15 +19597,17 @@ prunable gitdir file points to non-existent location
 
         assert_eq!(wts[0].path, "/Users/x/project/main");
         assert!(wts[0].branch.is_none());
-        assert!(!wts[0].prunable);
 
         assert_eq!(wts[1].path, "/Users/x/project/feat-branch");
         assert_eq!(wts[1].branch.as_deref(), Some("feat-x"));
-        assert!(!wts[1].prunable);
 
         assert_eq!(wts[2].path, "/Users/x/project/bugfix");
         assert_eq!(wts[2].branch.as_deref(), Some("bug-fix"));
-        assert!(wts[2].prunable);
+
+        let discovered = parse_discovered_worktree_list(raw);
+        assert!(!discovered[0].prunable);
+        assert!(!discovered[1].prunable);
+        assert!(discovered[2].prunable);
     }
 
     #[test]
@@ -19617,7 +19623,7 @@ prunable gitdir file points to non-existent location
         assert_eq!(wts.len(), 1);
         assert_eq!(wts[0].path, "/a/path");
         assert_eq!(wts[0].branch.as_deref(), Some("main"));
-        assert!(!wts[0].prunable);
+        assert!(!parse_discovered_worktree_list(raw)[0].prunable);
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
