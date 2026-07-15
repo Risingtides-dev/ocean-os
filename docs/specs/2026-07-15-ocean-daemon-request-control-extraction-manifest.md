@@ -1,7 +1,7 @@
 # Ocean Daemon Request Control Extraction Manifest
 
 **Date:** 2026-07-15
-**Status:** Ready for publication; local characterization, intact extraction, dedicated-target validation, and independent review passed; hosted CI, merge, and deployment pending
+**Status:** Published via PR #286; characterization, intact extraction, dedicated-target validation, independent review, hosted CI, and merge passed; live deployment is owned by the concurrent operator workstream
 **Owner:** Ocean OS
 **Rollback point:** `4f8b6dd`
 
@@ -201,7 +201,7 @@ Extraction commit `87c3599` moved the two registry aliases, two control records,
 
 `AppState`, cancellation and decision handlers, verifier-before-removal ordering, `DaemonPermissionPolicy`, event emission, HTTP mapping, active-turn projection, GC constants/scheduling/failure accounting, shutdown task draining, and turn execution remain in `main.rs`. Registry locks are still released before waiter signaling or task-handle awaits. Decision tokens still live only in private controls/waiters and are absent from status snapshots and SSE payloads.
 
-Focused request/permission/finish/decision/GC checks, two focused runtime-permission tests, all 122 runtime unit tests plus integrations, all 155 agent tests, five router contracts, all 329 daemon tests serialized, workspace-test compilation, both supported daemon feature checks, formatting, documentation, and diff checks passed in the dedicated target directory. Feature builds are warning-free. Fresh parity/security review found no unresolved medium-or-higher issue. Push, default-parallel hosted CI, merge, and clean-main deployment remain pending.
+Focused request/permission/finish/decision/GC checks, two focused runtime-permission tests, all 122 runtime unit tests plus integrations, all 155 agent tests, five router contracts, all 329 daemon tests serialized, workspace-test compilation, both supported daemon feature checks, formatting, documentation, and diff checks passed in the dedicated target directory. Feature builds are warning-free. Fresh parity/security review found no unresolved medium-or-higher issue. PR #286 passed default-parallel hosted CI and merged as `ee3860a`. Live daemon deployment/supervision is owned by the concurrent operator workstream and is not changed by this documentation closeout.
 
 ## Rollback
 
