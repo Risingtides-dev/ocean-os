@@ -3166,3 +3166,13 @@ type:      [integration fix]
 area:      [backend]: planner worktree authorization on current main
 
 Rebased Voice Planner onto the extracted project registry without widening the public WorktreeInfo contract. Internal discovery now retains Git's prunable marker for authorization, public project enrichment omits stale worktrees, and linked-worktree validation compares canonical Git common directories. Focused worktree tests, 155 agent tests, 317 serialized daemon tests, daemon check, formatting, docs, and diff gates pass; the original dirty checkout remains untouched.
+
+_________________________________________________________________________________
+time:      [01:56am] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  /tmp/ocean-daemon-model-roles
+type:      [refactor]: extract immutable daemon model-role control plane
+area:      [backend]: ocean-daemon Phase 2C control-plane leaf
+
+Introduced and characterized a behavior-neutral startup helper, then moved once-at-startup fail-open `[roles]` loading plus pure turn/advisor role resolution into private `src/model_roles.rs`. Missing, malformed, and whole-config-invalid fallbacks, exact/case-sensitive keys, verbatim and blank aliases, explicit-model precedence, unknown-role warning signals, and advisor override/global precedence remain fixed. `AppState`, startup/caller order, warnings, provider routing/readiness, persisted selection, advisor execution, and event emission stay in composition or their existing owners. Focused role checks, ten agent-config tests, all 155 agent tests, five router contracts, workspace-test compilation, both feature checks, formatting, docs, and diff gates passed; all 320 daemon tests passed serialized. Default-parallel local runs exposed the inherited upstream `OCEAN_CONFIG_DIR` test race between permission fixtures and YOLO precedence; this change adds no environment mutation, and fresh review found no unresolved medium-or-higher extraction issue. The dirty primary checkout remained untouched.
+_________________________________________________________________________________

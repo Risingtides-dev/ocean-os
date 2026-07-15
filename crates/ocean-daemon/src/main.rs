@@ -97,6 +97,8 @@ mod filesystem;
 mod metrics;
 /// Model catalog, current-selection, and persisted-selection HTTP adapters.
 mod model_catalog;
+/// Immutable startup model-role loading and pure turn/advisor role resolution.
+mod model_roles;
 /// Project registry CRUD, pagination, git enrichment, and session association adapters.
 mod project_registry;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
@@ -118,6 +120,7 @@ use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
+use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
     project_get, project_patch, projects_list,
@@ -812,28 +815,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening titles DB at {}", titles_db_path.display()))?;
     tracing::info!(path = %titles_db_path.display(), "persisted longhouse title registry ready");
 
-    // Model roles (oh-my-pi-style indirection) loaded once from `ocean.toml`'s
-    // `[roles]` table. A malformed config here is non-fatal for roles — the
-    // daemon already validated + loaded the same file for MCP/hooks at runtime
-    // construction, so a parse error would have surfaced there; if it somehow
-    // doesn't parse now we log and fall back to an empty table (roles + advisor
-    // simply off), never blocking startup.
-    let roles = match ocean_agent::DaemonConfig::load(&ocean_agent::config_dir_from_env()) {
-        Ok(cfg) => {
-            if !cfg.roles.is_empty() {
-                tracing::info!(
-                    role_count = cfg.roles.len(),
-                    advisor = cfg.advisor_model().is_some(),
-                    "loaded model roles from ocean.toml [roles]"
-                );
-            }
-            cfg.roles
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load [roles] from ocean.toml; roles disabled");
-            std::collections::HashMap::new()
-        }
-    };
+    let roles = load_model_roles(&ocean_agent::config_dir_from_env());
 
     let state = AppState {
         runtime,
@@ -6781,30 +6763,6 @@ fn advisor_user_prompt(operator_prompt: &str, assistant_response: &str) -> Strin
 /// the empty string and the sentinel "NOTHING" (case-insensitive, ignoring
 /// surrounding punctuation/whitespace) so a "nothing wrong" verdict emits no
 /// event. Returns the trimmed note when there is genuine content.
-/// Decide which model alias the post-turn advisor runs on, given the per-turn
-/// override and the global `[roles]` table. Precedence:
-///
-/// - override `enabled:false` → `None` (suppress even a configured global role)
-/// - override `enabled:true`  → the override's `model`, else the global
-///   `advisor` role; `None` when neither exists (nothing to run on)
-/// - no override → the global `advisor` role (today's behavior)
-///
-/// Pure so the precedence is unit-testable without a full turn.
-fn resolve_advisor_alias(
-    override_ctl: Option<&ocean_agent_sdk::AdvisorControl>,
-    roles: &std::collections::HashMap<String, String>,
-) -> Option<String> {
-    match override_ctl {
-        Some(ctl) if !ctl.enabled => None,
-        Some(ctl) => ctl
-            .model
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .or_else(|| roles.get("advisor").cloned()),
-        None => roles.get("advisor").cloned(),
-    }
-}
-
 fn advisor_note_if_actionable(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -6849,32 +6807,6 @@ fn advisor_severity(note: &str) -> &'static str {
         "info"
     } else {
         "concern"
-    }
-}
-
-/// Resolve the EFFECTIVE per-turn model from an explicit `model_id`, an optional
-/// symbolic `role`, and the loaded `[roles]` table. Pure so the precedence rules
-/// are unit-testable without a full turn:
-///
-/// - An explicit `model_id` ALWAYS wins (role is ignored entirely).
-/// - Otherwise a known `role` resolves to its configured alias.
-/// - An unknown role (or no role) yields `None` → the runtime's global model.
-///
-/// The `bool` is `true` when a role was given but did NOT resolve — the caller
-/// logs a warning for that case (a typo'd role silently using the global model
-/// would be surprising).
-fn resolve_effective_model_id(
-    model_id: Option<&str>,
-    role: Option<&str>,
-    roles: &std::collections::HashMap<String, String>,
-) -> (Option<String>, bool) {
-    match (model_id, role) {
-        (Some(m), _) => (Some(m.to_string()), false),
-        (None, Some(r)) => match roles.get(r) {
-            Some(alias) => (Some(alias.clone()), false),
-            None => (None, true),
-        },
-        (None, None) => (None, false),
     }
 }
 
@@ -9299,7 +9231,102 @@ mod tests {
         );
     }
 
-    // ── Advisor observer pure helpers ───────────────────────────────────────
+    // ── Model roles and advisor resolution ──────────────────────────────────
+
+    #[test]
+    fn model_roles_load_missing_and_malformed_config_fail_open() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(load_model_roles(dir.path()).is_empty());
+
+        std::fs::write(dir.path().join("ocean.toml"), "[roles\nfast = 'model'").unwrap();
+        assert!(load_model_roles(dir.path()).is_empty());
+
+        std::fs::write(
+            dir.path().join("ocean.toml"),
+            r#"
+                [roles]
+                fast = "deepseek/deepseek-chat"
+
+                [offshore]
+                remote_url = "ssh://not-http"
+                ssh_host = "host"
+            "#,
+        )
+        .unwrap();
+        assert!(load_model_roles(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn model_roles_load_preserves_aliases_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ocean.toml"),
+            r#"
+                [roles]
+                fast = "deepseek/deepseek-chat"
+                advisor = "anthropic/claude-sonnet-4"
+                blank = ""
+                " Mixed Role " = "  spaced alias  "
+            "#,
+        )
+        .unwrap();
+
+        let roles = load_model_roles(dir.path());
+        assert_eq!(roles.len(), 4);
+        assert_eq!(
+            roles.get("fast").map(String::as_str),
+            Some("deepseek/deepseek-chat")
+        );
+        assert_eq!(
+            roles.get("advisor").map(String::as_str),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(roles.get("blank").map(String::as_str), Some(""));
+        assert_eq!(
+            roles.get(" Mixed Role ").map(String::as_str),
+            Some("  spaced alias  ")
+        );
+    }
+
+    #[test]
+    fn model_role_resolution_is_exact_and_does_not_trim_inputs() {
+        use ocean_agent_sdk::AdvisorControl;
+
+        let roles = HashMap::from([
+            ("Fast".to_string(), "  spaced alias  ".to_string()),
+            ("blank".to_string(), String::new()),
+            ("advisor".to_string(), String::new()),
+        ]);
+
+        assert_eq!(
+            resolve_effective_model_id(None, Some("Fast"), &roles),
+            (Some("  spaced alias  ".to_string()), false)
+        );
+        assert_eq!(
+            resolve_effective_model_id(None, Some("fast"), &roles),
+            (None, true)
+        );
+        assert_eq!(
+            resolve_effective_model_id(None, Some("blank"), &roles),
+            (Some(String::new()), false)
+        );
+        assert_eq!(
+            resolve_effective_model_id(Some("  "), Some("Fast"), &roles),
+            (Some("  ".to_string()), false)
+        );
+        assert_eq!(resolve_advisor_alias(None, &roles), Some(String::new()));
+        assert_eq!(
+            resolve_advisor_alias(
+                Some(&AdvisorControl {
+                    enabled: true,
+                    model: Some("  ".to_string()),
+                }),
+                &roles,
+            ),
+            Some(String::new())
+        );
+    }
 
     #[test]
     fn resolve_advisor_alias_precedence() {
