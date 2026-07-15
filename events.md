@@ -3093,3 +3093,12 @@ area:  [backend]
 
 Implemented the Phase 1 extension schema/tool-lane checkpoint; it is not accepted yet. Schema v1 now parses supported discriminator kinds fail-closed, validates typed host-resolvable secret references instead of retaining raw secret strings in validated manifests, confines declared resources, and preserves the no-execution boundary. The plugin and folder-agent subprocess lane uses explicit minimal environment and canonical cwd/PWD. Installed/trusted/enabled state separation and extension inspect/doctor remain pending. Completed validation: cargo fmt --all; ocean-extension, ocean-plugin, and ocean-agent tests; workspace test compilation; strict all-target Clippy for those three packages; cargo xtask docs-check; git diff --check; and the full cargo xtask ci local gate.
 _________________________________________________________________________________
+
+time:  [23:28] [14-07-26]
+agent: [pi] [gpt-5.2-pro]
+worktree: [pi/longhouse-bounds-doc-fix-20260714]
+type:  [bug report]: Correct Longhouse shipped-versus-target claims
+area:  [writing]: Source-backed orchestration boundary and historical archive
+
+A late semantic review of merged PR #278 found that active Longhouse docs still described planned controls as shipped, including a hard deadline timer, aggregate token ceiling, domain/subsidiarity routing, validator veto, session rebinding, and revoke-driven cancellation. Replaced the stale orchestration design with a concise source-backed current reference, retained the former design under the opt-in archive, corrected HTTP/capability/standalone model behavior and skill ranking, and preserved extension-owned general subagent orchestration. `cargo test -p ocean-longhouse` passed with 113 tests and one ignored; `cargo xtask docs-check`, `git diff --check`, and fresh semantic review passed.
+_________________________________________________________________________________
