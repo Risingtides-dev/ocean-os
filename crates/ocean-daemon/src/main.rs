@@ -470,6 +470,40 @@ fn record_gc_failure(gc_failures: &std::sync::atomic::AtomicU64, error: &dyn std
     );
 }
 
+/// Sweep both halves of the fulfilled-canvas bridge on the same injected clock
+/// and cap: the daemon-owned raw query store, then the runtime-owned typed lookup
+/// registry. Synchronous by design so no await can split the coupled lifecycle.
+fn gc_canvas_fulfillments(
+    canvas_fulfillments: &CanvasFulfillmentStore,
+    now: DateTime<Utc>,
+    max_entries: usize,
+) {
+    // OCEAN-273: bound the bridge-fulfillment query store. A fulfillment has no
+    // terminal state (a `GET`/SSE read never removes it), so every entry is
+    // evictable purely by age — drop anything older than `CANVAS_FULFILLMENT_TTL`,
+    // then enforce the injected cap as a burst backstop. For the cap, every entry
+    // is treated as "terminal" (`is_terminal = true`) so `evict_overflow` simply
+    // removes the oldest by `received_at`.
+    {
+        let mut store = canvas_fulfillments
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let cttl = CANVAS_FULFILLMENT_TTL;
+        store.retain(|_, f| (now - f.received_at) <= cttl);
+        if store.len() > max_entries {
+            evict_overflow(&mut store, |_| true, |f| f.received_at, max_entries);
+        }
+    }
+    // OCEAN-273: bound the runtime-owned lookup registry (OCEAN-271) the same way.
+    // The daemon writes both halves of each fulfillment in lock-step, so they
+    // share a scheduler tick, injected clock, TTL contract, and cap.
+    ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY.gc(
+        now,
+        ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL,
+        max_entries,
+    );
+}
+
 async fn gc_registries(
     requests: &RequestRegistry,
     permissions: &PermissionRegistry,
@@ -481,55 +515,46 @@ async fn gc_registries(
         let mut reqs = requests.write().await;
         reqs.retain(|_, ctl| !(ctl.is_terminal() && (now - ctl.terminal_at()) > ttl));
         if reqs.len() > REGISTRY_MAX_ENTRIES {
-            evict_overflow(&mut reqs, |c| c.is_terminal(), |c| c.terminal_at());
+            evict_overflow(
+                &mut reqs,
+                |c| c.is_terminal(),
+                |c| c.terminal_at(),
+                REGISTRY_MAX_ENTRIES,
+            );
         }
     }
     {
         let mut perms = permissions.write().await;
         perms.retain(|_, w| !(w.is_terminal() && (now - w.terminal_at()) > ttl));
         if perms.len() > REGISTRY_MAX_ENTRIES {
-            evict_overflow(&mut perms, |w| w.is_terminal(), |w| w.terminal_at());
+            evict_overflow(
+                &mut perms,
+                |w| w.is_terminal(),
+                |w| w.terminal_at(),
+                REGISTRY_MAX_ENTRIES,
+            );
         }
     }
-    // OCEAN-273: bound the bridge-fulfillment query store. A fulfillment has no
-    // terminal state (a `GET`/SSE read never removes it), so every entry is
-    // evictable purely by age — drop anything older than `CANVAS_FULFILLMENT_TTL`,
-    // then enforce `REGISTRY_MAX_ENTRIES` as a burst backstop. For the cap, every
-    // entry is treated as "terminal" (`is_terminal = true`) so `evict_overflow`
-    // simply removes the oldest by `received_at`.
-    {
-        let mut store = canvas_fulfillments
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let cttl = CANVAS_FULFILLMENT_TTL;
-        store.retain(|_, f| (now - f.received_at) <= cttl);
-        if store.len() > REGISTRY_MAX_ENTRIES {
-            evict_overflow(&mut store, |_| true, |f| f.received_at);
-        }
-    }
-    // OCEAN-273: bound the runtime-owned lookup registry (OCEAN-271) the same way.
-    // The daemon writes both halves of each fulfillment in lock-step, so they
-    // share a TTL + cap and expire together.
-    ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY.gc(
-        now,
-        ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL,
-        ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_MAX_ENTRIES,
-    );
+    gc_canvas_fulfillments(canvas_fulfillments, now, REGISTRY_MAX_ENTRIES);
 }
 
-/// Trim `map` down to [`REGISTRY_MAX_ENTRIES`]. Removes oldest-terminal entries
-/// first; if still over the cap (all remaining are live), removes the oldest
-/// entries regardless of state. Generic over the registry value type.
-fn evict_overflow<K, V, FTerm, FAt>(map: &mut HashMap<K, V>, is_terminal: FTerm, terminal_at: FAt)
-where
+/// Trim `map` down to `max_entries`. Removes oldest-terminal entries first; if
+/// still over the cap (all remaining are live), removes the oldest entries
+/// regardless of state. Generic over the registry value type.
+fn evict_overflow<K, V, FTerm, FAt>(
+    map: &mut HashMap<K, V>,
+    is_terminal: FTerm,
+    terminal_at: FAt,
+    max_entries: usize,
+) where
     K: std::hash::Hash + Eq + Clone,
     FTerm: Fn(&V) -> bool,
     FAt: Fn(&V) -> DateTime<Utc>,
 {
-    if map.len() <= REGISTRY_MAX_ENTRIES {
+    if map.len() <= max_entries {
         return;
     }
-    let overflow = map.len() - REGISTRY_MAX_ENTRIES;
+    let overflow = map.len() - max_entries;
     // Rank candidates: terminal entries before live ones, oldest first within
     // each group. Take exactly `overflow` keys to remove.
     let mut ranked: Vec<(K, bool, DateTime<Utc>)> = map
@@ -10279,6 +10304,12 @@ mod tests {
 
     // ---- OCEAN-262: slack_canvas bridge fulfillment seam -------------------
 
+    /// Serializes daemon tests that inspect the process-global runtime canvas
+    /// registry across multiple operations. Ordinary POST-only tests use unique
+    /// keys and do not need this guard.
+    static CANVAS_RUNTIME_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     /// The store key is the real `canvas_id` for the canvas-targeted ops and a
     /// stable synthetic key for `list`/`create`, so a fulfillment is addressable
     /// for every op shape.
@@ -10330,6 +10361,45 @@ mod tests {
             }),
             "create:"
         );
+    }
+
+    #[test]
+    fn canvas_fulfillment_key_matches_runtime_for_every_op() {
+        use ocean_agent_sdk::slack_canvas::{
+            CanvasEditMode, SlackCanvasId, SlackCanvasOp, SlackChannelId,
+        };
+
+        let ops = vec![
+            SlackCanvasOp::Read {
+                canvas_id: SlackCanvasId::new("F_READ"),
+            },
+            SlackCanvasOp::Update {
+                canvas_id: SlackCanvasId::new("F_UPDATE"),
+                markdown: "replace".into(),
+                mode: CanvasEditMode::Replace,
+            },
+            SlackCanvasOp::Append {
+                canvas_id: SlackCanvasId::new("F_APPEND"),
+                markdown: "append".into(),
+            },
+            SlackCanvasOp::List {
+                channel_id: SlackChannelId::new("C_LIST"),
+            },
+            SlackCanvasOp::Create {
+                title: Some("Parity".into()),
+                markdown: None,
+                channel_id: None,
+            },
+        ];
+
+        for op in ops {
+            assert_eq!(
+                canvas_fulfillment_key_for_op(&op),
+                ocean_runtime::tools::slack_canvas::canvas_fulfillment_key_for_op(&op),
+                "daemon/runtime fulfillment keys must match for {}",
+                op.op_name()
+            );
+        }
     }
 
     /// A `read` the bridge fetched (ok + contents) maps to a *fulfilled* result:
@@ -10472,6 +10542,8 @@ mod tests {
     #[tokio::test]
     async fn fulfillment_post_makes_runtime_tool_read_return_real_content() {
         use ocean_runtime::tools::slack_canvas::SlackCanvasTool;
+
+        let _registry_guard = CANVAS_RUNTIME_REGISTRY_TEST_LOCK.lock().await;
         use ocean_runtime::types::AgentTool;
 
         let state = permission_test_state();
@@ -15588,6 +15660,120 @@ mod tests {
             result: json!({ "ok": true, "bridged": true }),
             received_at,
         }
+    }
+
+    #[tokio::test]
+    async fn gc_canvas_fulfillments_honors_injected_cap() {
+        let _registry_guard = CANVAS_RUNTIME_REGISTRY_TEST_LOCK.lock().await;
+        assert_eq!(
+            REGISTRY_MAX_ENTRIES,
+            ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_MAX_ENTRIES,
+            "production composition injects the existing shared 10k cap"
+        );
+
+        let now = Utc::now();
+        let sess = AgentSessionId::new_v4();
+        let oldest = (sess, "F_CAP_OLD".to_string());
+        let store: CanvasFulfillmentStore = Arc::new(Mutex::new(HashMap::from([
+            (
+                oldest.clone(),
+                canvas_fulfillment_at(now - chrono::Duration::seconds(3)),
+            ),
+            (
+                (sess, "F_CAP_MID".to_string()),
+                canvas_fulfillment_at(now - chrono::Duration::seconds(2)),
+            ),
+            (
+                (sess, "F_CAP_NEW".to_string()),
+                canvas_fulfillment_at(now - chrono::Duration::seconds(1)),
+            ),
+        ])));
+
+        gc_canvas_fulfillments(&store, now, 2);
+
+        let store = store.lock().unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(
+            !store.contains_key(&oldest),
+            "the injected cap evicts the oldest local fulfillment first"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_canvas_fulfillments_sweeps_daemon_and_runtime_registries_together() {
+        use ocean_agent_sdk::slack_canvas::{SlackCanvasId, SlackCanvasResult};
+
+        let _registry_guard = CANVAS_RUNTIME_REGISTRY_TEST_LOCK.lock().await;
+        assert_eq!(
+            CANVAS_FULFILLMENT_TTL,
+            ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL,
+            "both canvas stores must retain the same TTL contract"
+        );
+
+        // Use a future injected clock so unrelated GC tests running in parallel
+        // with their real current clocks cannot age out this exact-TTL fixture.
+        let now = Utc::now() + chrono::Duration::days(1);
+        let sess = AgentSessionId::new_v4();
+        let session_key = sess.to_string();
+        let stale_canvas = format!("F_GC_STALE_{}", uuid::Uuid::new_v4());
+        let boundary_canvas = format!("F_GC_BOUNDARY_{}", uuid::Uuid::new_v4());
+        let stale_key = (sess, stale_canvas.clone());
+        let boundary_key = (sess, boundary_canvas.clone());
+        let store: CanvasFulfillmentStore = Arc::new(Mutex::new(HashMap::from([
+            (
+                stale_key.clone(),
+                canvas_fulfillment_at(now - CANVAS_FULFILLMENT_TTL - chrono::Duration::seconds(1)),
+            ),
+            (
+                boundary_key.clone(),
+                canvas_fulfillment_at(now - CANVAS_FULFILLMENT_TTL),
+            ),
+        ])));
+
+        let stale_result = SlackCanvasResult::fulfilled_read(
+            SlackCanvasId::new(&stale_canvas),
+            "stale",
+            serde_json::Value::Null,
+        );
+        let boundary_result = SlackCanvasResult::fulfilled_read(
+            SlackCanvasId::new(&boundary_canvas),
+            "boundary",
+            serde_json::Value::Null,
+        );
+        ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY.put_at(
+            session_key.clone(),
+            stale_canvas.clone(),
+            stale_result,
+            now - ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL
+                - chrono::Duration::seconds(1),
+        );
+        ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY.put_at(
+            session_key.clone(),
+            boundary_canvas.clone(),
+            boundary_result,
+            now - ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_TTL,
+        );
+
+        gc_canvas_fulfillments(&store, now, REGISTRY_MAX_ENTRIES);
+
+        let store = store.lock().unwrap();
+        assert!(!store.contains_key(&stale_key));
+        assert!(
+            store.contains_key(&boundary_key),
+            "an entry exactly at the TTL boundary survives"
+        );
+        drop(store);
+        assert!(
+            ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY
+                .get(&session_key, &stale_canvas)
+                .is_none()
+        );
+        assert!(
+            ocean_runtime::tools::slack_canvas::CANVAS_FULFILLMENT_REGISTRY
+                .get(&session_key, &boundary_canvas)
+                .is_some(),
+            "the runtime half keeps the exact-TTL boundary too"
+        );
     }
 
     #[tokio::test]

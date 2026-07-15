@@ -3057,3 +3057,13 @@ Verification:
 - `cargo xtask docs-check`
 - `git diff --check`
 _________________________________________________________________________________
+
+time:      [08:48pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [main]
+type:      [test]: characterize daemon canvas bridge lifecycle before extraction
+area:      [backend]: ocean-daemon Phase 2C canvas foundation
+
+Added all-op daemon/runtime canvas-key parity, injected-cap oldest-first eviction, and coupled daemon/runtime GC tests with exact-TTL retention. Introduced the required behavior-neutral GC seam in composition: generic overflow now receives an explicit cap while every production caller still passes 10,000, and the existing canvas-local plus runtime sweep blocks now run through one synchronous helper at the same post-permission-GC position with one injected clock/cap. Store order, TTL comparison, poison recovery, scheduler/failure behavior, routes, pending/fulfilled event rails, and responses remain unchanged. Eleven fulfillment, two pending-relay, ten GC, 25 runtime-canvas, five router, and all 305 daemon tests plus formatting/docs/diff checks pass from isolated clean main; independent seam review found no medium-or-higher issue. Concurrent root/TUI/integration and ACP/agent/CLI/core/protocol/runtime work plus the operator deploy plist remained excluded.
+_________________________________________________________________________________
+_________________________________________________________________________________
