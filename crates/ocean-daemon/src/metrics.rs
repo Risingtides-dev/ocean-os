@@ -12,6 +12,47 @@ const TURN_LATENCY_BUCKETS_MS: [u64; 11] = [
     50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000,
 ];
 
+const ADVISOR_LATENCY_BUCKETS_MS: [u64; 8] = [10, 50, 100, 250, 500, 1_000, 5_000, 30_000];
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AdvisorOutcome {
+    Emitted,
+    Suppressed,
+    ProviderError,
+    Timeout,
+    Saturated,
+}
+
+impl AdvisorOutcome {
+    const ALL: [Self; 5] = [
+        Self::Emitted,
+        Self::Suppressed,
+        Self::ProviderError,
+        Self::Timeout,
+        Self::Saturated,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Emitted => 0,
+            Self::Suppressed => 1,
+            Self::ProviderError => 2,
+            Self::Timeout => 3,
+            Self::Saturated => 4,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Emitted => "emitted",
+            Self::Suppressed => "suppressed",
+            Self::ProviderError => "provider_error",
+            Self::Timeout => "timeout",
+            Self::Saturated => "saturated",
+        }
+    }
+}
+
 /// Daemon-wide turn metrics (OCEAN-303). Every field is a relaxed `AtomicU64`;
 /// reads (the `/metrics` render) and writes (the turn hot path) are all
 /// `Ordering::Relaxed` because these are independent monotonic counters / a
@@ -43,6 +84,14 @@ pub(super) struct TurnMetrics {
     /// companion of a Prometheus histogram; with the `+Inf` count it yields the
     /// average turn latency.
     latency_sum_ms: std::sync::atomic::AtomicU64,
+    /// Advisor provider calls currently executing. Independent of turn in-flight.
+    advisor_in_flight: std::sync::atomic::AtomicU64,
+    /// Fixed-cardinality advisor terminal outcomes. The index is owned by
+    /// [`AdvisorOutcome`]; no request, session, model, or content is a label.
+    advisor_outcomes: [std::sync::atomic::AtomicU64; AdvisorOutcome::ALL.len()],
+    /// Cumulative advisor attempt latency, including immediate saturation.
+    advisor_latency_buckets: [std::sync::atomic::AtomicU64; ADVISOR_LATENCY_BUCKETS_MS.len()],
+    advisor_latency_sum_ms: std::sync::atomic::AtomicU64,
 }
 
 impl TurnMetrics {
@@ -68,6 +117,21 @@ impl TurnMetrics {
         }
     }
 
+    pub(super) fn record_advisor(&self, outcome: AdvisorOutcome, elapsed: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.advisor_outcomes[outcome.index()].fetch_add(1, Relaxed);
+        self.advisor_latency_sum_ms.fetch_add(elapsed_ms, Relaxed);
+        for (bound, bucket) in ADVISOR_LATENCY_BUCKETS_MS
+            .iter()
+            .zip(self.advisor_latency_buckets.iter())
+        {
+            if elapsed_ms <= *bound {
+                bucket.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
     /// Render the full Prometheus text-format exposition (v0.0.4) for this set of
     /// counters plus the externally-owned `persist_failures`, `gc_failures`, and
     /// SSE-lag gauges. Read-only over relaxed atomics, so scraping never perturbs
@@ -88,8 +152,14 @@ impl TurnMetrics {
         let total = ok + error;
         let sum_ms = self.latency_sum_ms.load(Relaxed);
         let in_flight = self.in_flight.load(Relaxed);
+        let advisor_in_flight = self.advisor_in_flight.load(Relaxed);
+        let advisor_total = self
+            .advisor_outcomes
+            .iter()
+            .map(|counter| counter.load(Relaxed))
+            .sum::<u64>();
 
-        let mut out = String::with_capacity(1024);
+        let mut out = String::with_capacity(2048);
 
         // Turn count by outcome (labelled counter).
         out.push_str("# HELP ocean_turns_total Total agent turns finished, by outcome.\n");
@@ -127,6 +197,49 @@ impl TurnMetrics {
         let sum_seconds = (sum_ms as f64) / 1000.0;
         let _ = writeln!(out, "ocean_turn_duration_seconds_sum {sum_seconds}");
         let _ = writeln!(out, "ocean_turn_duration_seconds_count {total}");
+
+        out.push_str(
+            "# HELP ocean_advisor_in_flight Advisor provider calls currently executing.\n",
+        );
+        out.push_str("# TYPE ocean_advisor_in_flight gauge\n");
+        let _ = writeln!(out, "ocean_advisor_in_flight {advisor_in_flight}");
+
+        out.push_str(
+            "# HELP ocean_advisor_outcomes_total Post-turn advisor attempts by terminal outcome.\n",
+        );
+        out.push_str("# TYPE ocean_advisor_outcomes_total counter\n");
+        for outcome in AdvisorOutcome::ALL {
+            let count = self.advisor_outcomes[outcome.index()].load(Relaxed);
+            let _ = writeln!(
+                out,
+                "ocean_advisor_outcomes_total{{outcome=\"{}\"}} {count}",
+                outcome.label()
+            );
+        }
+
+        out.push_str("# HELP ocean_advisor_duration_seconds Post-turn advisor attempt duration in seconds.\n");
+        out.push_str("# TYPE ocean_advisor_duration_seconds histogram\n");
+        for (bound_ms, bucket) in ADVISOR_LATENCY_BUCKETS_MS
+            .iter()
+            .zip(self.advisor_latency_buckets.iter())
+        {
+            let count = bucket.load(Relaxed);
+            let le_seconds = (*bound_ms as f64) / 1000.0;
+            let _ = writeln!(
+                out,
+                "ocean_advisor_duration_seconds_bucket{{le=\"{le_seconds}\"}} {count}"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "ocean_advisor_duration_seconds_bucket{{le=\"+Inf\"}} {advisor_total}"
+        );
+        let advisor_sum_seconds = (self.advisor_latency_sum_ms.load(Relaxed) as f64) / 1000.0;
+        let _ = writeln!(
+            out,
+            "ocean_advisor_duration_seconds_sum {advisor_sum_seconds}"
+        );
+        let _ = writeln!(out, "ocean_advisor_duration_seconds_count {advisor_total}");
 
         // Dropped-transcript-write count (OCEAN-255), read from the single source
         // of truth on `AppState`. Mirrors what `GET /health` reports.
@@ -203,6 +316,38 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// RAII guard balancing the advisor provider-call in-flight gauge.
+pub(super) struct AdvisorInFlightGuard {
+    metrics: Arc<TurnMetrics>,
+}
+
+impl AdvisorInFlightGuard {
+    pub(super) fn enter(metrics: Arc<TurnMetrics>) -> Self {
+        metrics
+            .advisor_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for AdvisorInFlightGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut current = self.metrics.advisor_in_flight.load(Relaxed);
+        loop {
+            match self.metrics.advisor_in_flight.compare_exchange_weak(
+                current,
+                current.saturating_sub(1),
+                Relaxed,
+                Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 /// Pull the integer value of a single non-labelled metric line (e.g.
 /// `ocean_turns_in_flight 3`) out of a Prometheus exposition body. Returns
 /// `None` if the metric isn't present. Test helper only.
@@ -249,6 +394,9 @@ mod tests {
             "ocean_turns_total",
             "ocean_turns_in_flight",
             "ocean_turn_duration_seconds",
+            "ocean_advisor_in_flight",
+            "ocean_advisor_outcomes_total",
+            "ocean_advisor_duration_seconds",
             "ocean_persist_failures_total",
             "ocean_sse_lag_events_total",
             "ocean_sse_events_dropped_total",
@@ -276,6 +424,23 @@ mod tests {
             Some(0)
         );
         assert_eq!(metric_value(&body, "ocean_turns_in_flight"), Some(0));
+        assert_eq!(metric_value(&body, "ocean_advisor_in_flight"), Some(0));
+        for outcome in AdvisorOutcome::ALL {
+            assert_eq!(
+                labelled_value(
+                    &body,
+                    &format!(
+                        "ocean_advisor_outcomes_total{{outcome=\"{}\"}}",
+                        outcome.label()
+                    )
+                ),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            metric_value(&body, "ocean_advisor_duration_seconds_count"),
+            Some(0)
+        );
         assert_eq!(
             metric_value(&body, "ocean_turn_duration_seconds_count"),
             Some(0)
@@ -359,6 +524,65 @@ mod tests {
             body.contains("ocean_turn_duration_seconds_sum 0.425"),
             "expected sum 0.425s\n{body}"
         );
+    }
+
+    #[test]
+    fn metrics_record_advisor_outcomes_and_latency_without_high_cardinality_labels() {
+        let m = TurnMetrics::default();
+        m.record_advisor(
+            AdvisorOutcome::Emitted,
+            std::time::Duration::from_millis(40),
+        );
+        m.record_advisor(
+            AdvisorOutcome::ProviderError,
+            std::time::Duration::from_millis(120),
+        );
+        m.record_advisor(AdvisorOutcome::Saturated, std::time::Duration::ZERO);
+
+        let body = m.render_prometheus(0, 0, 0, 0);
+        assert_eq!(
+            labelled_value(&body, "ocean_advisor_outcomes_total{outcome=\"emitted\"}"),
+            Some(1)
+        );
+        assert_eq!(
+            labelled_value(
+                &body,
+                "ocean_advisor_outcomes_total{outcome=\"provider_error\"}"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_advisor_outcomes_total{outcome=\"saturated\"}"),
+            Some(1)
+        );
+        assert_eq!(
+            metric_value(&body, "ocean_advisor_duration_seconds_count"),
+            Some(3)
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_advisor_duration_seconds_bucket{le=\"0.01\"}"),
+            Some(1),
+            "only the zero-duration saturation is <= 10ms\n{body}"
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_advisor_duration_seconds_bucket{le=\"0.05\"}"),
+            Some(2),
+            "zero + 40ms attempts are <= 50ms\n{body}"
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_advisor_duration_seconds_bucket{le=\"0.25\"}"),
+            Some(3),
+            "all attempts are <= 250ms\n{body}"
+        );
+        assert_eq!(
+            labelled_value(&body, "ocean_advisor_duration_seconds_bucket{le=\"+Inf\"}"),
+            metric_value(&body, "ocean_advisor_duration_seconds_count"),
+            "+Inf must equal the histogram count\n{body}"
+        );
+        assert!(body.contains("ocean_advisor_duration_seconds_sum 0.16"));
+        assert!(!body.contains("turn_id="));
+        assert!(!body.contains("session_id="));
+        assert!(!body.contains("model="));
     }
 
     /// The in-flight gauge rises while an [`InFlightGuard`] is alive and falls
