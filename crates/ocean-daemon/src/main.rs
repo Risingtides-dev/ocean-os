@@ -1571,8 +1571,13 @@ async fn prompt(
         }
     };
 
-    let (request_id, cancel) =
-        register_running_request(&state, &mut req, "prompt running", RequestState::Running).await;
+    let (request_id, cancel) = register_running_request(
+        &state.requests,
+        &mut req,
+        "prompt running",
+        RequestState::Running,
+    )
+    .await;
     // OCEAN-160 (P0): do NOT trust the wire `yolo` flag to escalate. The posture
     // is resolved purely from operator policy (env → persisted default → off),
     // exactly like `POST /v1/agent/turns`; a client-supplied `yolo: true` is
@@ -1644,7 +1649,7 @@ async fn create_request(
     };
 
     let (request_id, cancel) = register_running_request(
-        &state,
+        &state.requests,
         &mut req,
         "request accepted; prompt running",
         RequestState::Running,
@@ -5891,7 +5896,7 @@ fn spawn_room_agent_turn(
         };
 
         let (_request_id, cancel) = register_running_request(
-            &state,
+            &state.requests,
             &mut prompt_req,
             format!("auto-convene: {} in room {}", agent.id, room.as_str()),
             RequestState::Running,
@@ -6301,8 +6306,15 @@ async fn permissions(State(state): State<AppState>) -> Json<PermissionsResponse>
 }
 
 async fn requests(State(state): State<AppState>) -> Json<RequestsResponse> {
-    let mut requests = state
-        .requests
+    Json(RequestsResponse {
+        ok: true,
+        requests: requests_snapshot(&state.requests).await,
+        error: None,
+    })
+}
+
+async fn requests_snapshot(requests: &RequestRegistry) -> Vec<RequestStatus> {
+    let mut requests = requests
         .read()
         .await
         .values()
@@ -6310,11 +6322,7 @@ async fn requests(State(state): State<AppState>) -> Json<RequestsResponse> {
         .collect::<Vec<_>>();
     requests.sort_by_key(|status| status.started_at);
     requests.reverse();
-    Json(RequestsResponse {
-        ok: true,
-        requests,
-        error: None,
-    })
+    requests
 }
 
 async fn pending_permissions_snapshot(permissions: &PermissionRegistry) -> Vec<PermissionStatus> {
@@ -6330,7 +6338,7 @@ async fn pending_permissions_snapshot(permissions: &PermissionRegistry) -> Vec<P
 }
 
 async fn register_running_request(
-    state: &AppState,
+    requests: &RequestRegistry,
     req: &mut PromptRequest,
     message: impl Into<String>,
     state_value: RequestState,
@@ -6340,7 +6348,7 @@ async fn register_running_request(
     let cancel = CancellationToken::new();
     let now = Utc::now();
 
-    state.requests.write().await.insert(
+    requests.write().await.insert(
         request_id,
         RequestControl {
             status: RequestStatus {
@@ -7122,7 +7130,7 @@ async fn agent_turn(
     // returned token is threaded into PromptControl below; the agent loop polls
     // it, so a halt from the client actually stops the turn mid-flight.
     let (_request_id, cancel) = register_running_request(
-        &state,
+        &state.requests,
         &mut prompt_req,
         "agent turn running",
         RequestState::Running,
@@ -9640,6 +9648,26 @@ mod tests {
         }
     }
 
+    fn control_prompt_request(
+        request_id: Option<RequestId>,
+        session_id: Option<SessionId>,
+        decision_token: Option<&str>,
+    ) -> PromptRequest {
+        PromptRequest {
+            prompt: "request-control test".into(),
+            images: None,
+            request_id,
+            session_id,
+            create_if_missing: false,
+            max_turns: None,
+            yolo: false,
+            cwd: "/tmp".into(),
+            project_id: None,
+            client_type: Some("test".into()),
+            decision_token: decision_token.map(str::to_string),
+        }
+    }
+
     /// Build a `RequestControl` with an explicit `finished_at` so the GC sweep's
     /// age comparison (`terminal_at()` reads `finished_at` first) is deterministic.
     fn request_control_at(state: RequestState, finished_at: DateTime<Utc>) -> RequestControl {
@@ -10608,17 +10636,345 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_snapshots_sort_newest_first_and_exclude_controls() {
+        let old_id = RequestId::new_v4();
+        let new_id = RequestId::new_v4();
+        let none_id = RequestId::new_v4();
+        let old_at = Utc::now() - chrono::Duration::minutes(2);
+        let new_at = Utc::now() - chrono::Duration::minutes(1);
+
+        let mut old = status(old_id, RequestState::Completed);
+        old.status.started_at = Some(old_at);
+        old.decision_token = Some("old-secret-token".into());
+        let mut new = status(new_id, RequestState::Running);
+        new.status.started_at = Some(new_at);
+        new.decision_token = Some("new-secret-token".into());
+        let mut no_started_at = status(none_id, RequestState::Queued);
+        no_started_at.status.started_at = None;
+        no_started_at.decision_token = Some("none-secret-token".into());
+
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([
+            (old_id, old),
+            (new_id, new),
+            (none_id, no_started_at),
+        ])));
+
+        let snapshot = requests_snapshot(&requests).await;
+        assert_eq!(
+            snapshot.iter().map(|s| s.request_id).collect::<Vec<_>>(),
+            vec![new_id, old_id, none_id]
+        );
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("secret-token"));
+        assert!(!wire.contains("handle"));
+        assert!(!wire.contains("cancel"));
+    }
+
+    #[tokio::test]
+    async fn permission_snapshots_sort_newest_first_and_exclude_secrets() {
+        let request_id = RequestId::new_v4();
+        let old_id = PermissionId::new_v4();
+        let new_id = PermissionId::new_v4();
+        let mut old_status = permission_status(old_id, request_id);
+        old_status.created_at = Utc::now() - chrono::Duration::minutes(2);
+        let mut new_status = permission_status(new_id, request_id);
+        new_status.created_at = Utc::now() - chrono::Duration::minutes(1);
+        let (tx, _rx) = oneshot::channel();
+
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::from([
+            (
+                old_id,
+                PermissionWaiter {
+                    status: old_status,
+                    sender: None,
+                    decision_token: Some("old-secret-token".into()),
+                },
+            ),
+            (
+                new_id,
+                PermissionWaiter {
+                    status: new_status,
+                    sender: Some(tx),
+                    decision_token: Some("new-secret-token".into()),
+                },
+            ),
+        ])));
+
+        let snapshot = pending_permissions_snapshot(&permissions).await;
+        assert_eq!(
+            snapshot.iter().map(|s| s.permission_id).collect::<Vec<_>>(),
+            vec![new_id, old_id]
+        );
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("secret-token"));
+        assert!(!wire.contains("sender"));
+    }
+
+    #[tokio::test]
+    async fn register_running_request_preserves_identity_token_and_exact_initial_state() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let request_id = RequestId::new_v4();
+        let session_id = SessionId::new_v4();
+        let mut supplied =
+            control_prompt_request(Some(request_id), Some(session_id), Some("submitter-secret"));
+
+        let (returned_id, cancel) = register_running_request(
+            &requests,
+            &mut supplied,
+            "accepted exactly",
+            RequestState::Queued,
+        )
+        .await;
+
+        assert_eq!(returned_id, request_id);
+        assert_eq!(supplied.request_id, Some(request_id));
+        let registry = requests.read().await;
+        let control = registry.get(&request_id).unwrap();
+        assert_eq!(control.status.request_id, request_id);
+        assert_eq!(control.status.session_id, Some(session_id));
+        assert_eq!(control.status.state, RequestState::Queued);
+        assert_eq!(control.status.permission_id, None);
+        assert_eq!(control.status.message.as_deref(), Some("accepted exactly"));
+        assert_eq!(control.status.started_at, control.status.updated_at);
+        assert!(control.status.started_at.is_some());
+        assert_eq!(control.status.finished_at, None);
+        assert_eq!(control.decision_token.as_deref(), Some("submitter-secret"));
+        assert!(control.handle.is_none());
+        cancel.cancel();
+        assert!(control.cancel.is_cancelled());
+        drop(registry);
+
+        let mut generated = control_prompt_request(None, None, None);
+        let (generated_id, _) = register_running_request(
+            &requests,
+            &mut generated,
+            "generated",
+            RequestState::Running,
+        )
+        .await;
+        assert_eq!(generated.request_id, Some(generated_id));
+        assert!(requests.read().await.contains_key(&generated_id));
+    }
+
+    #[tokio::test]
+    async fn register_running_request_duplicate_id_replaces_control() {
+        let request_id = RequestId::new_v4();
+        let previous_cancel = CancellationToken::new();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let previous_handle = tokio::spawn(async move {
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+        });
+        let mut previous = status(request_id, RequestState::Running);
+        previous.status.message = Some("previous".into());
+        previous.cancel = previous_cancel.clone();
+        previous.handle = Some(previous_handle);
+        previous.decision_token = Some("previous-secret".into());
+        let requests: RequestRegistry =
+            Arc::new(RwLock::new(HashMap::from([(request_id, previous)])));
+        let mut replacement =
+            control_prompt_request(Some(request_id), None, Some("replacement-secret"));
+
+        let (_, returned_cancel) = register_running_request(
+            &requests,
+            &mut replacement,
+            "replacement",
+            RequestState::Running,
+        )
+        .await;
+
+        assert!(
+            !previous_cancel.is_cancelled(),
+            "replacement must not cancel the previous token"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .expect("the replaced JoinHandle must detach rather than abort")
+            .expect("the detached previous task must still complete");
+
+        let registry = requests.read().await;
+        assert_eq!(registry.len(), 1);
+        let control = registry.get(&request_id).unwrap();
+        assert_eq!(control.status.state, RequestState::Running);
+        assert_eq!(control.status.message.as_deref(), Some("replacement"));
+        assert_eq!(
+            control.decision_token.as_deref(),
+            Some("replacement-secret")
+        );
+        assert!(!control.cancel.is_cancelled());
+        assert!(!returned_cancel.is_cancelled());
+        assert!(control.handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_request_handle_unknown_id_detaches_task_without_registry_entry() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let (done_tx, done_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = done_tx.send(());
+        });
+
+        attach_request_handle(&requests, RequestId::new_v4(), handle).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .expect("dropping an unattached JoinHandle must detach, not abort")
+            .expect("detached task must still complete");
+        assert!(requests.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_permission_waiter_mismatch_consumes_without_signalling() {
+        let owner_request = RequestId::new_v4();
+        let mismatched_request = RequestId::new_v4();
+        let permission_id = PermissionId::new_v4();
+        let (tx, rx) = oneshot::channel();
+        let permissions: PermissionRegistry = Arc::new(RwLock::new(HashMap::from([(
+            permission_id,
+            PermissionWaiter {
+                status: permission_status(permission_id, owner_request),
+                sender: Some(tx),
+                decision_token: Some("private".into()),
+            },
+        )])));
+
+        cancel_permission_waiter(&permissions, permission_id, mismatched_request).await;
+
+        assert!(permissions.read().await.is_empty());
+        assert!(
+            rx.await.is_err(),
+            "mismatched removal drops the sender without delivering a decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_result_variants_preserve_exact_messages_and_live_reset() {
+        let permission_id = PermissionId::new_v4();
+        let allow = RequestId::new_v4();
+        let allow_session = RequestId::new_v4();
+        let deny = RequestId::new_v4();
+        let previous_update = Utc::now() - chrono::Duration::minutes(1);
+        let mut allow_ctl = status(allow, RequestState::Queued);
+        allow_ctl.status.permission_id = Some(permission_id);
+        allow_ctl.status.updated_at = Some(previous_update);
+        let mut session_ctl = status(allow_session, RequestState::Running);
+        session_ctl.status.permission_id = Some(permission_id);
+        session_ctl.status.updated_at = Some(previous_update);
+        let mut deny_ctl = status(deny, RequestState::WaitingForPermission);
+        deny_ctl.status.permission_id = Some(permission_id);
+        deny_ctl.status.updated_at = Some(previous_update);
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([
+            (allow, allow_ctl),
+            (allow_session, session_ctl),
+            (deny, deny_ctl),
+        ])));
+
+        update_request_permission_result(
+            &requests,
+            allow,
+            permission_id,
+            AgentPermissionDecision::Allow,
+        )
+        .await;
+        update_request_permission_result(
+            &requests,
+            allow_session,
+            permission_id,
+            AgentPermissionDecision::AllowSession,
+        )
+        .await;
+        update_request_permission_result(
+            &requests,
+            deny,
+            permission_id,
+            AgentPermissionDecision::Deny {
+                reason: "operator said no".into(),
+            },
+        )
+        .await;
+
+        let registry = requests.read().await;
+        for id in [allow, allow_session, deny] {
+            assert_eq!(registry[&id].status.state, RequestState::Running);
+            assert_eq!(registry[&id].status.permission_id, None);
+            assert!(registry[&id].status.updated_at.unwrap() > previous_update);
+        }
+        let allow_message = format!("permission {permission_id} allowed");
+        let session_message = format!("permission {permission_id} allowed for session");
+        let deny_message = format!("permission {permission_id} denied: operator said no");
+        assert_eq!(
+            registry[&allow].status.message.as_deref(),
+            Some(allow_message.as_str())
+        );
+        assert_eq!(
+            registry[&allow_session].status.message.as_deref(),
+            Some(session_message.as_str())
+        );
+        assert_eq!(
+            registry[&deny].status.message.as_deref(),
+            Some(deny_message.as_str())
+        );
+    }
+
+    #[test]
+    fn control_terminal_helpers_preserve_timestamp_and_sender_semantics() {
+        let request_id = RequestId::new_v4();
+        let started = Utc::now() - chrono::Duration::minutes(3);
+        let updated = Utc::now() - chrono::Duration::minutes(2);
+        let finished = Utc::now() - chrono::Duration::minutes(1);
+        let mut request = status(request_id, RequestState::Completed);
+        request.status.started_at = Some(started);
+        request.status.updated_at = Some(updated);
+        request.status.finished_at = Some(finished);
+        assert!(request.is_terminal());
+        assert_eq!(request.terminal_at(), finished);
+        request.status.finished_at = None;
+        assert_eq!(request.terminal_at(), updated);
+        request.status.updated_at = None;
+        assert_eq!(request.terminal_at(), started);
+        request.status.state = RequestState::Running;
+        assert!(!request.is_terminal());
+
+        let permission_id = PermissionId::new_v4();
+        let created_at = Utc::now() - chrono::Duration::minutes(4);
+        let mut waiter_status = permission_status(permission_id, request_id);
+        waiter_status.created_at = created_at;
+        let (tx, _rx) = oneshot::channel();
+        let mut waiter = PermissionWaiter {
+            status: waiter_status,
+            sender: Some(tx),
+            decision_token: None,
+        };
+        assert!(!waiter.is_terminal());
+        assert_eq!(waiter.terminal_at(), created_at);
+        let _ = waiter.sender.take();
+        assert!(waiter.is_terminal());
+    }
+
+    #[tokio::test]
     async fn finish_does_not_overwrite_terminal_state() {
         let request_id = RequestId::new_v4();
-        let requests = Arc::new(RwLock::new(HashMap::from([(
-            request_id,
-            status(request_id, RequestState::Completed),
-        )])));
+        let original_session = SessionId::new_v4();
+        let replacement_session = SessionId::new_v4();
+        let started_at = Utc::now() - chrono::Duration::minutes(3);
+        let updated_at = Utc::now() - chrono::Duration::minutes(2);
+        let finished_at = Utc::now() - chrono::Duration::minutes(1);
+        let mut control = status(request_id, RequestState::Completed);
+        control.status.session_id = Some(original_session);
+        control.status.message = Some("original terminal message".into());
+        control.status.started_at = Some(started_at);
+        control.status.updated_at = Some(updated_at);
+        control.status.finished_at = Some(finished_at);
+        control.handle = Some(tokio::spawn(async {}));
+        let requests = Arc::new(RwLock::new(HashMap::from([(request_id, control)])));
 
         let state = update_request_finished(
             &requests,
             request_id,
-            None,
+            Some(replacement_session),
             RequestState::Errored,
             "late error".into(),
         )
@@ -10626,23 +10982,35 @@ mod tests {
 
         assert_eq!(state, Some(RequestState::Completed));
         let requests = requests.read().await;
-        let status = requests.get(&request_id).unwrap();
-        assert_eq!(status.status.state, RequestState::Completed);
-        assert_eq!(status.status.message, None);
+        let control = requests.get(&request_id).unwrap();
+        assert_eq!(control.status.state, RequestState::Completed);
+        assert_eq!(control.status.session_id, Some(original_session));
+        assert_eq!(
+            control.status.message.as_deref(),
+            Some("original terminal message")
+        );
+        assert_eq!(control.status.started_at, Some(started_at));
+        assert_eq!(control.status.updated_at, Some(updated_at));
+        assert_eq!(control.status.finished_at, Some(finished_at));
+        assert!(control.handle.is_none());
     }
 
     #[tokio::test]
     async fn finish_converts_cancelling_to_cancelled() {
         let request_id = RequestId::new_v4();
-        let requests = Arc::new(RwLock::new(HashMap::from([(
-            request_id,
-            status(request_id, RequestState::Cancelling),
-        )])));
+        let original_session = SessionId::new_v4();
+        let replacement_session = SessionId::new_v4();
+        let previous_update = Utc::now() - chrono::Duration::minutes(1);
+        let mut control = status(request_id, RequestState::Cancelling);
+        control.status.session_id = Some(original_session);
+        control.status.updated_at = Some(previous_update);
+        control.handle = Some(tokio::spawn(async {}));
+        let requests = Arc::new(RwLock::new(HashMap::from([(request_id, control)])));
 
         let state = update_request_finished(
             &requests,
             request_id,
-            None,
+            Some(replacement_session),
             RequestState::Completed,
             "late completion".into(),
         )
@@ -10650,15 +11018,93 @@ mod tests {
 
         assert_eq!(state, Some(RequestState::Cancelled));
         let requests = requests.read().await;
-        let status = requests.get(&request_id).unwrap();
-        assert_eq!(status.status.state, RequestState::Cancelled);
-        assert!(status.status.finished_at.is_some());
-        assert!(status
-            .status
-            .message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("cancel requested"));
+        let control = requests.get(&request_id).unwrap();
+        assert_eq!(control.status.state, RequestState::Cancelled);
+        assert_eq!(control.status.session_id, Some(replacement_session));
+        assert_eq!(
+            control.status.message.as_deref(),
+            Some("cancel requested; runtime completed after cancellation request and output was ignored")
+        );
+        assert!(control.status.updated_at.unwrap() > previous_update);
+        assert!(control.status.finished_at.unwrap() > previous_update);
+        assert!(control.status.updated_at <= control.status.finished_at);
+        assert!(control.handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_missing_and_ordinary_paths_preserve_exact_state_session_and_timestamps() {
+        let completed_id = RequestId::new_v4();
+        let errored_id = RequestId::new_v4();
+        let completed_session = SessionId::new_v4();
+        let original_error_session = SessionId::new_v4();
+        let replacement_error_session = SessionId::new_v4();
+        let previous_update = Utc::now() - chrono::Duration::minutes(1);
+        let mut completed = status(completed_id, RequestState::Running);
+        completed.status.updated_at = Some(previous_update);
+        completed.handle = Some(tokio::spawn(async {}));
+        let mut errored = status(errored_id, RequestState::WaitingForPermission);
+        errored.status.session_id = Some(original_error_session);
+        errored.status.updated_at = Some(previous_update);
+        errored.handle = Some(tokio::spawn(async {}));
+        let requests = Arc::new(RwLock::new(HashMap::from([
+            (completed_id, completed),
+            (errored_id, errored),
+        ])));
+
+        assert_eq!(
+            update_request_finished(
+                &requests,
+                RequestId::new_v4(),
+                None,
+                RequestState::Errored,
+                "missing".into(),
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            update_request_finished(
+                &requests,
+                completed_id,
+                Some(completed_session),
+                RequestState::Completed,
+                "completed exactly".into(),
+            )
+            .await,
+            Some(RequestState::Completed)
+        );
+        assert_eq!(
+            update_request_finished(
+                &requests,
+                errored_id,
+                Some(replacement_error_session),
+                RequestState::Errored,
+                "errored exactly".into(),
+            )
+            .await,
+            Some(RequestState::Errored)
+        );
+
+        let registry = requests.read().await;
+        let completed = &registry[&completed_id];
+        assert_eq!(completed.status.state, RequestState::Completed);
+        assert_eq!(completed.status.session_id, Some(completed_session));
+        assert_eq!(
+            completed.status.message.as_deref(),
+            Some("completed exactly")
+        );
+        assert!(completed.status.updated_at.unwrap() > previous_update);
+        assert!(completed.status.finished_at.unwrap() > previous_update);
+        assert!(completed.status.updated_at <= completed.status.finished_at);
+        assert!(completed.handle.is_none());
+        let errored = &registry[&errored_id];
+        assert_eq!(errored.status.state, RequestState::Errored);
+        assert_eq!(errored.status.session_id, Some(replacement_error_session));
+        assert_eq!(errored.status.message.as_deref(), Some("errored exactly"));
+        assert!(errored.status.updated_at.unwrap() > previous_update);
+        assert!(errored.status.finished_at.unwrap() > previous_update);
+        assert!(errored.status.updated_at <= errored.status.finished_at);
+        assert!(errored.handle.is_none());
     }
     #[tokio::test]
     async fn permission_result_records_decision_on_waiting_request() {
@@ -10797,7 +11243,12 @@ mod tests {
         cancel_permission_waiter(&permissions, permission_id, request_id).await;
 
         let decision = rx.await.unwrap();
-        assert!(matches!(decision, AgentPermissionDecision::Deny { .. }));
+        assert_eq!(
+            decision,
+            AgentPermissionDecision::Deny {
+                reason: "request cancelled while waiting for permission".into(),
+            }
+        );
         assert!(permissions.read().await.get(&permission_id).is_none());
     }
 
