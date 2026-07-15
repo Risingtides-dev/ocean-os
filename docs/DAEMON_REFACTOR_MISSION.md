@@ -1,8 +1,8 @@
 # Ocean Daemon Refactor: Mission, Progress, and Target
 
 **Status:** Active, green, and shipping in bounded checkpoints
-**Updated:** 2026-07-14
-**Published implementation:** `fae9feb`
+**Updated:** 2026-07-15
+**Published implementation:** `f86c983`
 **Scope:** `crates/ocean-daemon`
 
 ## Mission
@@ -69,10 +69,11 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Filesystem sandbox | Complete | Private `src/filesystem.rs`; canonical HOME containment, symlink-escape rejection, statuses, response envelopes, caps, binary sniffing, sorting, and git fields preserved |
 | Project registry | Complete | Private `src/project_registry.rs`; runtime persistence/pagination/timestamps, session association, git/worktree enrichment, create-path semantics, and CRUD response contracts preserved |
 | Slack Canvas host fulfillment | Complete | Private `src/slack_canvas_fulfillment.rs`; host ingress/query store, runtime lookup, fulfilled SSE re-emit, TTL/cap, and coupled GC moved together; external Slack transport remains extension-owned |
+| Component interaction fulfillment | Complete | Private `src/component_interaction.rs`; exact HTTP validation, scoped runtime-registry lookup, remove-before-send delivery, and 200/400/404/410/500 envelopes frozen by five direct tests |
 | Persistent rooms, Longhouse, calls, registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
-At this checkpoint, `main.rs` is approximately 19.3k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model-catalog HTTP adapters, security-sensitive YOLO settings policy, the home-sandboxed filesystem surface, project-registry adapters, and the Slack Canvas host-fulfillment lifecycle now independently owned. The external Slack transport/API remains assigned to the extension program; this daemon module is only the typed session/permission/runtime/event compatibility seam retained during parity migration. Characterization continues to add checked contracts before ownership moves, so raw line count alone understates progress.
+At this checkpoint, `main.rs` is approximately 19.4k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model-catalog HTTP adapters, security-sensitive YOLO settings policy, the home-sandboxed filesystem surface, project-registry adapters, Slack Canvas host fulfillment, and component-interaction fulfillment now independently owned. The component checkpoint added five direct response/lifecycle tests before moving a 72-line leaf, so the temporary line-count increase is deliberate checked-contract growth rather than production coupling. External Slack transport remains extension-owned, while runtime component waits remain runtime-owned.
 
 ## Course from here
 
@@ -109,5 +110,6 @@ A wave is complete only when:
 - [Filesystem extraction manifest](specs/2026-07-14-ocean-daemon-filesystem-extraction-manifest.md)
 - [Project-registry extraction manifest](specs/2026-07-14-ocean-daemon-project-registry-extraction-manifest.md)
 - [Slack Canvas host-fulfillment extraction manifest](specs/2026-07-14-ocean-daemon-canvas-bridge-extraction-manifest.md)
+- [Component-interaction extraction manifest](specs/2026-07-15-ocean-daemon-component-interaction-extraction-manifest.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)
