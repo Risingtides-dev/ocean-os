@@ -640,7 +640,8 @@ mod tests {
         // The action is now visible and the same region activates it.
         assert!(matches!(
             rail.handle_mouse(click(right, branch_y)),
-            Some(Action::NewSessionInProject { cwd }) if cwd == *"/repo"
+            Some(Action::NewSessionInProject { cwd })
+                if cwd.as_path() == std::path::Path::new("/repo")
         ));
     }
 

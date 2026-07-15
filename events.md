@@ -3296,3 +3296,20 @@ Verification:
 
 Implementation commits: `aea7044`, `df09399`. Hosted CI and merge remain; live daemon deployment/supervision is left to the concurrent operator workstream.
 _________________________________________________________________________________
+
+time:      [06:28pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [pi/daemon-phase2c-next-20260715]
+type:      [bug report]: restore Rust 1.88 compatibility in session-rail test
+area:      [testing]: ocean-tui MSRV gate
+
+PR #287's hosted Rust 1.88 lane exposed a pre-existing test-only incompatibility from upstream `827b65b`: `PathBuf == *\"/repo\"` relies on a comparison accepted by the current toolchain but unavailable at the declared MSRV. Replaced it with the behavior-equivalent explicit `cwd.as_path() == Path::new(\"/repo\")`; production TUI behavior is unchanged.
+
+Verification:
+- focused session-rail test passed under Rust 1.88 and the current toolchain
+- full `cargo xtask ci --msrv` passed under Rust 1.88, including workspace all-target, `livekit-tap`, and `deepgram-stt`
+- `cargo build -p ocean-tui --release`
+- `cargo xtask docs-check`
+- `cargo fmt --all -- --check`
+- `git diff --check`
+_________________________________________________________________________________
