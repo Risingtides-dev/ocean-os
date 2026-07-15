@@ -79,3 +79,4 @@ CI consumes the repository and compatibility manifests on macOS and Ubuntu, runs
 - `.ocean/` — Ocean runtime artifacts, config, and session data → `.ocean/AGENTS.md`
 - `crates/` — canonical Rust workspace ownership/entry/test index and crate contracts → `crates/AGENTS.md`
 - `docs/` — architecture, operator documentation, active plans, and historical archive policy → `docs/AGENTS.md`
+- `integrations/` — distributable adapters for external host extension surfaces → `integrations/AGENTS.md`

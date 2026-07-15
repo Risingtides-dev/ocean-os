@@ -52,7 +52,9 @@ use super::{
     },
     daemon_boot, errfmt,
     event::{Event, EventHandler},
-    git, kitty,
+    git,
+    herdr::Reporter as HerdrReporter,
+    kitty,
     status::{self, StatusData, Tone},
     theme::{self, g},
     tui,
@@ -291,6 +293,9 @@ pub struct App {
     center: Center,
     focus: Focus,
     session_id: Option<AgentSessionId>,
+    /// Best-effort projection of the authoritative TUI lifecycle into a
+    /// surrounding Herdr pane. Disabled automatically outside Herdr.
+    herdr: HerdrReporter,
     /// `/model <id>` override applied to subsequent turns (None → daemon default).
     model_override: Option<String>,
     /// The live SSE subscription for `session_id`. Held so a session switch
@@ -465,6 +470,7 @@ impl App {
             center: Center::Chat,
             focus: Focus::Center,
             session_id: None,
+            herdr: HerdrReporter::from_env(),
             model_override: None,
             stream_task: None,
             health_task: None,
@@ -1286,6 +1292,7 @@ impl App {
     fn dispatch(&mut self, action: Action) {
         match &action {
             Action::Quit => {
+                self.herdr.release();
                 self.should_quit = true;
                 return;
             }
@@ -1691,6 +1698,9 @@ impl App {
             }
             _ => {}
         }
+        // Project lifecycle only after the app has filtered stale session
+        // events and applied the same authoritative transition the UI uses.
+        self.herdr.observe(&action, self.session_id);
         if let Some(next) = self.chat.update(&action) {
             self.dispatch(next);
         }

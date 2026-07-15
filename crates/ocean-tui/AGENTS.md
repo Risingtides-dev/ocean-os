@@ -139,6 +139,14 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   explicit `--session` remains direct opt-in. Resume is a nested, current-
   workspace picker with keyboard/mouse parity, selection-relative scrolling,
   terminal-safe labels, and off-thread session discovery through `Action`.
+- Herdr lifecycle projection (`shell/herdr.rs`) is a fail-soft client adapter,
+  not session/runtime authority. It activates only in a Herdr pane, derives
+  `idle`/`working`/`blocked` from already-accepted Elm actions, ignores
+  permission traffic for other sessions, and emits no prompt/tool/token
+  content. State reports never block the event loop; shutdown release waits at
+  most 300 ms before relinquishing its custom `ocean:tui` authority. The
+  distributable launcher manifest lives under
+  `../../integrations/herdr/`.
 
 ## Verification
 

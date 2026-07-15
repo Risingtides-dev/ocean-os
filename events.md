@@ -2866,6 +2866,20 @@ Added a separate SESSION COMPONENT tray beneath the file tree rather than coupli
 _________________________________________________________________________________
 _________________________________________________________________________________
 
+time:      [06:23am] [14-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [documentation]: synchronize ocean-acp capabilities and limitations
+area:      [backend]: ACP editor bridge
+
+Updated the ocean-acp guide to match the current bridge: daemon-owned session creation and resume, session listing, per-session model modes, reasoning metadata, live permission forwarding with decision tokens, and per-turn cancellation. Removed obsolete claims that permissions and cancellation were inert, and documented the remaining binary-content, authentication, and offline-session fallback boundaries.
+
+Verification:
+- `cargo xtask docs-check`
+- `git diff --check`
+_________________________________________________________________________________
+_________________________________________________________________________________
+
 time:      [06:24am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3018,4 +3032,28 @@ area:      [backend]: ocean-daemon Phase 2C project leaf
 
 Moved project create/patch/list request types, all five CRUD/list handlers, live git enrichment, and worktree parsing into private `src/project_registry.rs`. All ten definitions remain byte-identical to characterization commit `cec944e` after normalizing only minimal parent visibility. Runtime-owned persistence, atomic writes, order/pagination, timestamps, workspace association, and sessions remain authoritative; sequential HEAD/status/worktree enrichment, timeout/fallbacks, create path semantics, exact responses/statuses, fail-open detail session listing, partial PATCH preservation, and delete-without-session-deletion remain unchanged. Router/banner/middleware, turn cwd/project resolution, filesystem policy, AppState, and tests stay in composition. Focused project, agent, router, full 302-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed from isolated clean main; fresh review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [08:37pm] [14-07-26]
+agent:     [pi], [gpt-5.6-sol]
+worktree:  [main]
+type:      [feature-request]: ship Ocean as a lifecycle-aware Herdr plugin
+area:      [frontend]: ocean-tui external host integration
+
+Added a distributable Herdr v1 workflow plugin that opens Ocean in a managed workspace tab and a fail-soft TUI lifecycle projection that reports the custom `ocean` agent as idle, working, or blocked from already-authoritative Elm actions. Reports are current-session scoped, sequence ordered, content-free, and off the terminal event loop; shutdown release is synchronously capped at 300 ms. Checked the active ocean-surface worktree first: its ACP client remains a useful host-adapter reference, but runtime ownership belongs in ocean-os and its concurrent Island/search/SSE work was left untouched. Fresh review found and drove fixes for stale unbound agent events, unreliable detached-thread release, malformed plugin context, and workspace-cwd launcher resolution, then approved the result.
+
+Verification:
+- isolated clean worktree: `cargo test -p ocean-tui` (314 passed, 4 ignored)
+- isolated clean worktree: `cargo test -p ocean-tui herdr::tests` (5 passed)
+- isolated clean worktree: `cargo clippy -p ocean-tui --all-targets -- -D warnings`
+- isolated clean worktree: `cargo build -p ocean-tui --release`
+- `python3 -m unittest integrations/herdr/test_start.py` (4 passed)
+- `sh -n integrations/herdr/run-ocean.sh`
+- Herdr 0.7.3 local manifest link/list/unlink smoke
+- Herdr 0.7.3 managed-pane env/cwd smoke
+- Herdr 0.7.3 live `ocean` agent idle-state smoke
+- Herdr 0.7.3 `Start Ocean` action smoke (succeeded; workspace cwd preserved)
+- installed `~/.cargo/bin/ocean-tui` via atomic rename; strict codesign + 3-second managed PTY smoke
+- `cargo xtask docs-check`
+- `git diff --check`
 _________________________________________________________________________________

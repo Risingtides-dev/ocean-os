@@ -16,6 +16,7 @@ mod errfmt;
 mod event;
 mod git;
 mod graph;
+mod herdr;
 mod highlight;
 mod history;
 mod kitty;

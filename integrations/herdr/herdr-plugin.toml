@@ -1,0 +1,18 @@
+id = "risingtides.ocean"
+name = "Ocean"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Launch Ocean as a lifecycle-aware Herdr agent pane"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "start"
+title = "Start Ocean"
+contexts = ["workspace"]
+command = ["python3", "start.py"]
+
+[[panes]]
+id = "ocean"
+title = "Ocean"
+placement = "tab"
+command = ["sh", "-c", "exec sh \"$HERDR_PLUGIN_ROOT/run-ocean.sh\""]

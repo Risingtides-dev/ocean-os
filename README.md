@@ -76,6 +76,7 @@ Start at [`docs/README.md`](docs/README.md).
 | Detailed runtime/API operator reference | [`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`](docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md) |
 | Four-repository routing and contracts | [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md) |
 | Package ownership and narrow tests | [`crates/AGENTS.md`](crates/AGENTS.md) |
+| External host adapters, including Herdr | [`integrations/AGENTS.md`](integrations/AGENTS.md) |
 | Open work only | [`ROADMAP.md`](ROADMAP.md) |
 | Historical chronology | [`events.md`](events.md) |
 

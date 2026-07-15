@@ -9,11 +9,11 @@ first-class agent.
 ```
 
 The bridge holds **no agent logic and no sessions of its own**. It translates
-ACP requests into calls against the daemon's existing API
-(`POST /v1/agent/turns`, `GET /v1/agent/events`) and streams the daemon's
-events back as ACP `session/update` notifications. All authority — the agent
-loop, tools, sessions, the transcript — stays in the daemon, exactly like the
-TUI and ocean-surface clients.
+ACP requests into calls against the daemon's existing session, model, turn,
+permission, cancellation, and SSE APIs, then streams daemon events back as ACP
+`session/update` notifications. All authority — the agent loop, tools, sessions,
+the transcript — stays in the daemon, exactly like the TUI and ocean-surface
+clients.
 
 This is the inverse of `ocean-mcp` (which makes Ocean an MCP *client*); here
 Ocean is an ACP *agent/server*.
@@ -22,10 +22,17 @@ Ocean is an ACP *agent/server*.
 
 | ACP method | Mapped to |
 |---|---|
-| `initialize` | Advertises protocol **v1** + `loadSession` capability |
-| `session/new` | Mints an ACP session id, remembers `cwd` |
-| `session/prompt` | `POST /v1/agent/turns`, pumps SSE → `session/update`, returns `stopReason` |
-| `session/cancel` & others | Acknowledged (no per-turn cancel wired yet) |
+| `initialize` | Negotiates the requested protocol version and advertises session load/list capabilities |
+| `session/new` | Creates a daemon session up front, returns its id as the ACP id, remembers the daemon-bound `cwd`, and advertises the live model roster as ACP modes |
+| `session/load` | Looks up the daemon session, restores its authoritative `cwd`, rebinds the persisted transcript, and refreshes model modes |
+| `session/list` | Lists daemon-owned sessions with optional `cwd` filtering and cursor pagination |
+| `session/set_mode` | Pins an Ocean model to that ACP session and sends it as a per-turn override, without mutating the daemon's global model |
+| `session/prompt` | Submits `POST /v1/agent/turns`, pumps SSE to `session/update`, bridges permission requests, and returns the mapped `stopReason` |
+| `session/cancel` | Cancels the active daemon turn through `POST /v1/requests/{turn_id}/cancel` |
+
+Ocean also accepts an optional per-prompt reasoning override in
+`_meta.ocean.thinking_level`. Without it, the daemon's configured reasoning
+level remains authoritative.
 
 Daemon `AgentTurnEvent`s map to ACP updates like so:
 
@@ -40,17 +47,25 @@ Daemon `AgentTurnEvent`s map to ACP updates like so:
 
 ### Session id mapping (why it matters)
 
-ACP needs a `sessionId` returned at `session/new`, *before* any turn. But the
-daemon mints its real session id **lazily on the first turn** and rejects
-client-invented ids on resume. So the bridge keeps a small map:
+ACP needs a `sessionId` returned at `session/new`, before any turn. Ocean now
+creates the daemon session at that point with `POST /v1/agent/sessions` and
+returns the daemon's id directly as the ACP id. The editor therefore persists
+the same identifier the daemon owns:
 
-- `session/new` → return our own ACP id, `daemon_id = None`.
-- First `session/prompt` → submit with `session_id: null`; the daemon mints the
-  real id (returned in the response); we store it.
-- Later prompts → resume against that stored daemon id.
+- `session/new` creates and binds the daemon session to the requested workspace.
+- The first and later `session/prompt` calls submit that id, so every turn uses
+  the same daemon-owned transcript.
+- `session/load` validates the id against the daemon, restores the daemon-bound
+  `cwd`, and resumes the persisted transcript even after `ocean-acp` restarts.
+- `session/list` exposes the daemon's persisted roster rather than an
+  in-process-only bridge list.
 
-This is verified end-to-end: a second turn correctly recalls context from the
-first (the transcript persists daemon-side across turns).
+If the daemon cannot create a session during `session/new`, the bridge remains
+available by falling back to a local ACP id. On that legacy fallback path it
+learns the daemon id from the first turn's event stream, but the in-memory
+mapping cannot survive a bridge restart. If a later `session/load` cannot find
+the session in the daemon, the bridge restores a usable `cwd` and starts a fresh
+daemon session instead of pretending the old transcript was resumed.
 
 ## Build
 
@@ -128,20 +143,34 @@ printf '%s\n%s\n' \
 You should get back an `initialize` result (`"protocolVersion":1`) and a
 `session/new` result with a `sessionId`.
 
+## Permissions and cancellation
+
+ACP turns use the daemon's normal permission policy. With the default gated
+configuration, the bridge subscribes to the daemon control stream before turn
+submission, forwards each turn-scoped `PermissionRequest` to the editor as
+`session/request_permission`, and posts the editor's allow/deny decision to
+`POST /v1/permissions/{id}/decision`. Each turn carries a private decision token
+so a permission decision is bound to the submitting bridge. If the editor
+cancels or the permission round-trip fails, the bridge denies the request so the
+daemon waiter is released.
+
+`session/cancel` is also live. The bridge learns the active daemon `turn_id` from
+`TurnStarted` and forwards cancellation to
+`POST /v1/requests/{turn_id}/cancel` without blocking the ACP dispatch loop.
+
+If the daemon operator explicitly enables global yolo mode, tool gates are
+bypassed and no permission request is emitted.
+
 ## Limitations / next steps
 
-- **Permissions — wired but inert.** The per-turn permission bridge IS built:
-  `spawn_permission_bridge` subscribes to the daemon control stream, forwards any
-  `PermissionRequest` scoped to the current turn to the editor as
-  `session/request_permission`, waits for Zed's allow/deny, and POSTs the result
-  to `POST /v1/permissions/{id}/decision`. It is **inert today** because the
-  daemon submits ACP turns with `yolo: true`, so the gate auto-allows and no
-  `PermissionRequest` is ever raised. The forwarding activates the moment ACP
-  turns run non-yolo (a daemon-side change); the bridge is correct and waiting
-  (OCEAN-51 / #54). See `docs/ARCHITECTURE.md` § "Built, pending daemon integration".
-- **Cancel**: `session/cancel` is acknowledged but not wired to a per-turn
-  daemon cancel (`POST /v1/requests/{id}/cancel` exists for this).
 - **Components**: rendered as Markdown summaries. Rich/interactive rendering has
-  no ACP equivalent; the Markdown fallback ensures nothing is lost.
-- **`session/load`**: capability is advertised, but cwd repopulation on load
-  falls back to the process cwd. Fine for Zed's typical new-thread flow.
+  no ACP equivalent; the Markdown fallback ensures the content is still shown.
+- **Binary prompt content**: text blocks are forwarded directly, but images,
+  audio, and embedded resources are currently represented by textual
+  placeholders because the daemon turn request does not yet carry ACP binary
+  content.
+- **Offline session creation**: the local-id fallback keeps `session/new`
+  responsive while the daemon is unavailable, but that fallback mapping cannot
+  provide cross-restart transcript resume.
+- **Authentication**: ACP authentication methods are not implemented; provider
+  credentials and daemon access are configured outside the bridge.
