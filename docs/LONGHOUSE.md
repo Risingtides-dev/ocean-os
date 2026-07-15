@@ -86,6 +86,7 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
   id. Returns `{ "ok": true, "topic": {...} }`; `400` with a typed `{ ok, error }`
   body when `topic_id` is not a valid UUID, `404` when the id is unknown — never
   a panic.
+- `POST /v1/longhouse/prepare` — read-only pre-turn skill/SOP preparation.
 - `POST /v1/longhouse/claim` — daemon-held `claim_outcome` gate (OCEAN-272).
 - `POST /v1/longhouse/board` — `board_post` append note/evidence (OCEAN-272).
 - `POST /v1/longhouse/revoke` — hard recall of a persisted title (OCEAN-272).
@@ -104,7 +105,9 @@ Local/remote service shape now starts with:
   (see the embedded route list above); a standalone Longhouse service should
   expose the same path so clients can target either deployment unchanged.
 
-Keep the daemon-side embedded routes working while adding the standalone service; clients and daemons can bridge versions during migration.
+The standalone `ocean-longhouse serve` binary currently exposes only `/health`
+and `/v1/council/convene`. Keep the embedded routes stable if that standalone
+surface expands; the two deployment modes are not yet API-equivalent.
 
 ## First safe integration slice
 
@@ -134,10 +137,11 @@ Longhouse indexes and queries (implemented — `ocean-longhouse/src/prepare.rs`)
 
 Selection path:
 
-1. Deterministic prefilter from task/session brief.
-2. Cheap fast model reranker.
-3. Return 3–7 compact skill briefs.
-4. Daemon injects those briefs into the main Ocean agent.
+1. Deterministically index and rank local skill metadata/content against the task brief.
+2. Apply the relevance floor and return up to `top_n` compact briefs (default: five).
+3. Daemon injects those briefs into the main Ocean agent.
+
+Model-based reranking is future work; the shipped preparation path makes no LLM call.
 
 ## Extension-owned subagent boundary
 
@@ -154,32 +158,39 @@ Core remains responsible only for generic permission-gated turns, cancellation, 
 - real council flow in `convene.rs`,
 - replay/tuning support in `replay.rs` and `lh-tune`.
 
-`ocean-daemon` currently embeds Longhouse routes for demo and convene flows. The next step is to let `ocean-longhouse` also run as a local service on `127.0.0.1:4781`, then teach the daemon to consult it dynamically in read-only preparation mode.
+`ocean-daemon` mounts the full `longhouse_routes` group and registers the
+permission-gated `LonghouseProvider`. The separate `ocean-longhouse serve`
+binary already runs a minimal local service on `127.0.0.1:4781` by default.
 
-### Council model-selection convention
+### Council model-selection behavior
 
-Before convening a model-staffed council, the caller **must fetch the daemon's
-live `GET /v1/models` registry** and choose only IDs whose `ready` field is
-`true`. Model labels, provider marketing names, remembered aliases, and model
-names invented in conversation are not valid worker IDs. The convene route
-re-validates every requested ID against the same ready registry and rejects the
-whole request with `invalid_models` rather than silently substituting a model or
-starting a partial council. This keeps the recorded council roster truthful and
-makes model choice reproducible from the active daemon configuration.
+For embedded HTTP `POST /v1/longhouse/convene`, a non-empty explicit `models`
+array must contain ready IDs from the daemon's live `GET /v1/models` registry.
+The handler rejects the whole explicit roster with `invalid_models` when any ID
+is not ready; it does not silently substitute a model.
 
-## Built vs unbuilt — quorum steps 1–5 are real, steps 6+ are not
+That rejection rule is not universal. An omitted/empty HTTP roster uses
+`ConveneRequest` defaults. The `longhouse__convene` capability tool and the
+standalone service also pass aliases directly into `convene`. In those paths,
+aliases that fail resolution or lack credentials are warned and skipped, so a
+partial council can run. See `LONGHOUSE_ORCHESTRATION.md` for the exact entry-path
+boundary.
 
-Per the build order in `docs/LONGHOUSE_ORCHESTRATION.md` § 8, the `QuorumEngine`
-is shipped through **step 5** and unit-tested (11 passing tests): credential-weighted
-endorse−inhibit tallies, time-decay, cross-inhibition, configurable threshold,
-margin-gated convergence, seeded tie-break, and the termination guardrails
-(deadline timer, token ceiling) that make a topic provably terminate. `convene.rs`
-staffs a real mixed-model council, grants a firekeeper to the winning proposer,
-and emits `Converged`/`Aborted`.
+## Built vs unbuilt — current quorum and governance status
 
-**Steps 6 and beyond are future / unbuilt.** Treat the following as not-yet-real:
+The `QuorumEngine` and real council path are shipped and unit-tested:
+per-worker-deduplicated endorse−inhibit tallies, time-decay, cross-inhibition,
+configurable threshold, margin-gated convergence, and seeded tie-break. Shipped
+execution bounds are the council deadline, maximum deliberation rounds, a
+45-second timeout per model call, and a 512-token output cap per model call.
+There is no aggregate per-topic token accounting or token ceiling yet.
+`convene.rs` staffs a real mixed-model council, grants a firekeeper to the
+winning proposer, and emits `Converged`/`Aborted`.
 
-- **Unforgeable `claim_outcome` gate (step 6).** BUILT (OCEAN-229). When
+Later governance work is mixed. Use the explicit **BUILT** and unbuilt labels
+below:
+
+- **Unforgeable `claim_outcome` gate.** BUILT (OCEAN-229). When
   `convene` seats the firekeeper on the winning proposer it mints a
   [`FirekeeperTitle`](../crates/ocean-longhouse/src/convene.rs): the public
   `agent_id` paired with a **secret token** drawn server-side from the OCEAN-185
@@ -196,9 +207,9 @@ and emits `Converged`/`Aborted`.
   `WrongDecision` otherwise). This is the same trust-boundary discipline as
   OCEAN-185 (public id, secret token) and OCEAN-220 (the right is server-decided
   and minted, not claimant-asserted).
-- **Escrow trio (step 6).** BUILT (OCEAN-246), in
-  [`escrow.rs`](../crates/ocean-longhouse/src/escrow.rs). The three principals of
-  §2.3 now exist as durable, daemon-held code:
+- **Escrow trio.** BUILT (OCEAN-246), in
+  [`escrow.rs`](../crates/ocean-longhouse/src/escrow.rs). The
+  grant/exercise/revoke principals now exist as durable, daemon-held code:
   - **`SqliteTitleRegistry` — authority at rest.** A `rusqlite`-backed store
     (the same bundled-SQLite pattern as `ocean-store`'s `SqliteRoomStore`) that
     issues/holds/reclaims titles. Crucially the title now **survives across
@@ -225,17 +236,21 @@ and emits `Converged`/`Aborted`.
     titles) **then** the engine's agreement, then releases escrow.
 
   **Scope-noted follow-ups (deliberately not in OCEAN-246):** (1) *daemon wiring*
-  — completed in OCEAN-272 (commit 668aa70): `SqliteTitleRegistry` is now wired
-  into `AppState` (main.rs line 98, 448, 1498–1510), and `claim_outcome`/`board_post`
-  and the full governance route set are live embedded daemon routes (see the
-  embedded route list above). (2) *staking economics* —
+  — completed in OCEAN-272 (commit 668aa70): `SqliteTitleRegistry` is wired
+  through the `AppState::titles` field, while `longhouse_routes`,
+  `longhouse_claim`, `longhouse_board_post`, and the rest of the governance
+  route set are live embedded daemon handlers (see the route list above).
+  (2) *staking economics* —
   the escrow data structure + release/forfeit hooks are built, but where bond
   amounts come from, slashing curves, and sybil-cost calibration are policy and
   remain future work.
 - **Validator process-veto** and the **subsidiarity escalation predicate** (most
   things should never convene a council at all) — still stubbed.
-- **Sybil hardening (step 7).** Credential conservation when an extension spawns workers, exposed through a generic issuance seam, plus self-renewal block and validator veto — not built. Longhouse does not own the worker spawn.
+- **Sybil hardening.** Credential conservation for extension-owned workers,
+  generalized self-renewal prevention, and validator veto are not built.
+  Longhouse does not own worker spawning.
 
-The convergence engine, the unforgeable `claim_outcome` gate (OCEAN-229), and now
+The convergence engine, the unforgeable `claim_outcome` gate (OCEAN-229), and
 the persisted escrow trio (OCEAN-246) are real code. The remaining anti-capture
-predicates and the daemon wiring are the documented follow-ups.
+predicates, staking economics, and aggregate per-topic token accounting are
+follow-ups; the embedded daemon wiring described above is live.
