@@ -3,7 +3,7 @@
 **Date:** 2026-07-15
 **Status:** Characterization complete and independently reviewed; extraction authorized
 **Owner:** Ocean OS
-**Rollback point:** characterization commit `6f2fc9b`
+**Rollback point:** characterization commit `a3265d2`
 
 ## Purpose
 
@@ -252,7 +252,7 @@ A fresh characterization reviewer must assess HTTP/extractor coverage, closed-au
 
 ## Characterization result
 
-Commit `6f2fc9b` added the approved daemon-only characterization without moving a production persistent-room body or changing `ocean-store`. The real `room_routes()` lifecycle freezes exact create/list/detail/join/message/leave success values, top-level keys, identity/attribution, serde defaults, key/workspace normalization, and transcript ordering. The error matrix freezes custom JSON errors separately from exact Axum JSON/query rejection text, and the mapper table covers every `RoomStoreError` variant. Resolved, unresolved, and agent-authored mention paths now freeze exact returned-row persistence, extension payload/scope, no-false-footprint behavior, and persisted-author → event → audit → spawn source order. Closed-room coverage recombines bounded pages and proves exact equality with snapshot/events plus frozen metadata and roster. One deliberately poisoned shared handle recovers through both lock adapters. Existing paging, restart, call persistence/read-after-close, LiveKit, route-retirement, and static/dynamic precedence coverage remains green.
+Commit `a3265d2` added the approved daemon-only characterization without moving a production persistent-room body or changing `ocean-store`. The real `room_routes()` lifecycle freezes exact create/list/detail/join/message/leave success values, top-level keys, identity/attribution, serde defaults, key/workspace normalization, and transcript ordering. The error matrix freezes custom JSON errors separately from exact Axum JSON/query rejection text, and the mapper table covers every `RoomStoreError` variant. Resolved, unresolved, and agent-authored mention paths now freeze exact returned-row persistence, extension payload/scope, no-false-footprint behavior, and persisted-author → event → audit → spawn source order. Closed-room coverage recombines bounded pages and proves exact equality with snapshot/events plus frozen metadata and roster. One deliberately poisoned shared handle recovers through both lock adapters. Existing paging, restart, call persistence/read-after-close, LiveKit, route-retirement, and static/dynamic precedence coverage remains green.
 
 All 343 daemon tests passed serialized in dedicated target `/tmp/ocean-target-persistent-rooms`; all 38 `ocean-store` tests passed. Focused room HTTP, trigger, poison, paging, and route groups, formatting, docs/index validation, and diff checks passed. Two fresh boundary/characterization re-reviews reported PASS with no unresolved medium-or-higher issue. The accepted low residuals are deliberate snapshot brittleness in exact Axum/rusqlite text and the source-order test's required `include_str!` redirection to `persistent_rooms.rs` during the mechanical move.
 
