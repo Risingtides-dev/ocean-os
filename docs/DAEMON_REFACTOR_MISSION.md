@@ -2,7 +2,7 @@
 
 **Status:** Active, green, and shipping in bounded checkpoints
 **Updated:** 2026-07-14
-**Published implementation:** `8be5311`
+**Published implementation:** `fae9feb`
 **Scope:** `crates/ocean-daemon`
 
 ## Mission
@@ -68,17 +68,17 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | YOLO settings | Complete | Private `src/yolo_settings.rs`; env → persisted → safe-off precedence, inert wire flag, exact GET/POST shapes, persistence timing, permission authority, voice fail-fast, and shared test-lock order remain exact |
 | Filesystem sandbox | Complete | Private `src/filesystem.rs`; canonical HOME containment, symlink-escape rejection, statuses, response envelopes, caps, binary sniffing, sorting, and git fields preserved |
 | Project registry | Complete | Private `src/project_registry.rs`; runtime persistence/pagination/timestamps, session association, git/worktree enrichment, create-path semantics, and CRUD response contracts preserved |
-| Canvas bridge | Queued, higher coupling | Store, runtime registry, SSE re-emit, TTL, cap, and GC must move together or remain together |
+| Slack Canvas host fulfillment | Complete | Private `src/slack_canvas_fulfillment.rs`; host ingress/query store, runtime lookup, fulfilled SSE re-emit, TTL/cap, and coupled GC moved together; external Slack transport remains extension-owned |
 | Persistent rooms, Longhouse, calls, registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
-At this checkpoint, `main.rs` is approximately 19.5k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model-catalog HTTP adapters, security-sensitive YOLO settings policy, the home-sandboxed filesystem surface, and project-registry HTTP adapters now independently owned. Catalog, settings, filesystem, and project characterization added fourteen direct-handler tests before their moves, so raw line count alone understates progress. The important movement is ownership: behavior now has a checked boundary before it leaves the monolith.
+At this checkpoint, `main.rs` is approximately 19.3k lines, with CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model-catalog HTTP adapters, security-sensitive YOLO settings policy, the home-sandboxed filesystem surface, project-registry adapters, and the Slack Canvas host-fulfillment lifecycle now independently owned. The external Slack transport/API remains assigned to the extension program; this daemon module is only the typed session/permission/runtime/event compatibility seam retained during parity migration. Characterization continues to add checked contracts before ownership moves, so raw line count alone understates progress.
 
 ## Course from here
 
-1. Move canvas and other stateful domains only with explicit lifecycle/GC manifests.
-2. Keep filesystem/project policy, permission authority, settings policy, and call-site orchestration fixed while domain boundaries move.
-3. Move one state registry or control-plane domain at a time before turn/SSE orchestration.
+1. Move one state registry or control-plane domain at a time before turn/SSE orchestration.
+2. Keep filesystem/project policy, permission authority, settings policy, host/extension ownership, and call-site orchestration fixed while domain boundaries move.
+3. Move persistent rooms, Longhouse, and calls only with explicit lifecycle/persistence manifests.
 4. Move turn/SSE orchestration last.
 5. Request separate Phase 3 approval before splitting `AppState`, generating route metadata, creating a daemon library, or redesigning internal service boundaries.
 
@@ -108,5 +108,6 @@ A wave is complete only when:
 - [YOLO-settings extraction manifest](specs/2026-07-14-ocean-daemon-yolo-settings-extraction-manifest.md)
 - [Filesystem extraction manifest](specs/2026-07-14-ocean-daemon-filesystem-extraction-manifest.md)
 - [Project-registry extraction manifest](specs/2026-07-14-ocean-daemon-project-registry-extraction-manifest.md)
+- [Slack Canvas host-fulfillment extraction manifest](specs/2026-07-14-ocean-daemon-canvas-bridge-extraction-manifest.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)
