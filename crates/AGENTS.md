@@ -23,6 +23,8 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 ## Workspace Package Index
 
+The workspace currently contains 26 Rust packages.
+
 | Package | Owns | Does not own | Primary entry | Local contract | Narrow validation |
 |---|---|---|---|---|---|
 | `ocean-acp` | ACP stdio bridge for Zed/editors | Runtime/session authority | `ocean-acp/src/main.rs`, `daemon.rs` | — | `cargo test -p ocean-acp` |
@@ -35,6 +37,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 | `ocean-context` | Evidence-bearing handoff claims, extraction, replay, reverification | Agent sessions; hashline edits; general AST summaries | `ocean-context/src/lib.rs`, `extract.rs` | — | `cargo test -p ocean-context` |
 | `ocean-core` | Low-level daemon request/response/event/session protocol types | Product-facing agent SDK behavior | `ocean-core/src/lib.rs` | `ocean-core/AGENTS.md` | `cargo test -p ocean-core` |
 | `ocean-daemon` | HTTP/SSE service, runtime composition, execution authority | Provider implementation; client-owned state | `ocean-daemon/src/main.rs` | `ocean-daemon/AGENTS.md` | `cargo test -p ocean-daemon` |
+| `ocean-extension` | Schema-v1 extension package parsing, SemVer compatibility, and confined resource validation | Install/trust/enable state; routes; execution | `ocean-extension/src/lib.rs` | `ocean-extension/AGENTS.md` | `cargo test -p ocean-extension` |
 | `ocean-hashline` | File-hash-anchored surgical edits and stale recovery | General AST summarization or session persistence | `ocean-hashline/src/lib.rs`, `patcher.rs` | — | `cargo test -p ocean-hashline` |
 | `ocean-heartbeat` | Scheduled/routine CLI that calls the daemon | In-daemon scheduling authority | `ocean-heartbeat/src/main.rs` | — | `cargo test -p ocean-heartbeat` |
 | `ocean-hooks` | Plugin-agnostic subprocess lifecycle hooks | Plugin/MCP tool protocols | `ocean-hooks/src/lib.rs` | — | `cargo test -p ocean-hooks` |
@@ -89,6 +92,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 - `ocean-agent/` — session/history layer and system prompt loading → `ocean-agent/AGENTS.md`
 - `ocean-core/` — shared protocol types → `ocean-core/AGENTS.md`
 - `ocean-daemon/` — long-running HTTP daemon and API surface → `ocean-daemon/AGENTS.md`
+- `ocean-extension/` — non-executing extension package schema validation → `ocean-extension/AGENTS.md`
 - `ocean-lsp/` — code intelligence over workspace language servers → `ocean-lsp/AGENTS.md`
 - `ocean-oauth/` — browser OAuth + PKCE provider login → `ocean-oauth/AGENTS.md`
 - `ocean-protocol/` — multi-provider LLM wire protocol → `ocean-protocol/AGENTS.md`

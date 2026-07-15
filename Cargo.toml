@@ -18,6 +18,7 @@ members = [
   "crates/ocean-browser",
   "crates/ocean-call",
   "crates/ocean-store",
+  "crates/ocean-extension",
   "crates/ocean-plugin",
   "crates/ocean-hooks",
   "crates/ocean-context",
@@ -49,6 +50,7 @@ default-members = [
   "crates/ocean-browser",
   "crates/ocean-call",
   "crates/ocean-store",
+  "crates/ocean-extension",
   "crates/ocean-plugin",
   "crates/ocean-hooks",
   "crates/ocean-context",
@@ -89,6 +91,7 @@ ocean-protocol = { path = "crates/ocean-protocol" }
 ocean-runtime = { path = "crates/ocean-runtime" }
 ocean-mcp = { path = "crates/ocean-mcp" }
 toml = "0.8"
+semver = "1"
 ocean-agent-sdk = { path = "crates/ocean-agent-sdk" }
 ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }
@@ -104,6 +107,7 @@ ocean-store = { path = "crates/ocean-store" }
 # Bundled SQLite (no system libsqlite3 dependency). Sync, no async-runtime
 # coupling — matches the daemon's std::sync::Mutex room registry style.
 rusqlite = { version = "0.32", features = ["bundled"] }
+ocean-extension = { path = "crates/ocean-extension" }
 ocean-plugin = { path = "crates/ocean-plugin" }
 ocean-hooks = { path = "crates/ocean-hooks" }
 regex = "1"

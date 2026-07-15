@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-14
 **Type:** cross-repo architecture and staged extraction manifest
-**Status:** Approved direction; Phase 0 accepted, Phase 1 next
+**Status:** Approved direction; Phase 0 accepted, Phase 1 schema/tool-lane checkpoint implemented but not accepted
 **Owner:** Smaths / Ocean
 **Authoring baseline:** `ocean-os` `3fe699924811`
 **Current ratification:** `ocean-os` `529e0ed1de2fb9b3b04b8c44979db8e8406f1ca1`; subagent ownership decision `c5740fd428d3d23f8aea57881c8f6b0c40f4a9ee`
@@ -174,7 +174,7 @@ The outer manifest indexes package resources. Existing specialized inner contrac
 
 ## 6. Draft `ocean-extension.toml` contract
 
-This is schema draft 0. It is specific enough to build fixtures against, but it is not a stable public API until Phase 1 validation lands in `ocean-os`.
+Schema v1 parsing and non-executing validation now live in `ocean-extension`. The contract remains a pre-acceptance API until the full Phase 1 gate passes.
 
 ```toml
 schema_version = 1
@@ -257,13 +257,15 @@ path = "profiles/TUI"
 - Duplicate resource IDs are invalid.
 - Declared resources do not imply activation; the host records enablement separately.
 - Requested capabilities are review input, not self-granted permissions.
-- Raw credentials are forbidden. Manifests name environment variables or secret references only.
+- Raw credentials are forbidden. Manifests name environment variables or host-resolvable secret references only.
+- Schema-v1 secret references use `<scheme>:<key>`. The scheme is lowercase ASCII alphanumeric with hyphens only between alphanumeric characters. The nonempty key permits only ASCII alphanumeric characters plus `_`, `-`, `.`, and `/`; whitespace/control characters, `=`, URL `://` forms, absolute paths, and parent traversal are invalid. This syntax keeps raw credentials outside the declared contract but cannot prevent a malicious publisher from mislabeling a value.
+- Schema-v1 discriminator values fail closed: external host kind `herdr`, service health kind `process`, and optional restart policy `on-failure` are the currently supported values.
 - Unknown required resource kinds fail closed. Unknown optional metadata may be retained and ignored according to the schema-version policy.
 - Installation never runs package code. Build steps, if introduced later, require a separate explicit trust action.
 
 ## 7. Trust and security contract
 
-The existing plugin lane is not a sandbox merely because each advertised model tool requires permission. Today a plugin subprocess launches as the local user, inherits the daemon environment, and can act before a tool call is approved.
+The existing plugin lane is not a sandbox merely because each advertised model tool requires permission. Phase 0 evidence showed that legacy plugin subprocesses launched as the local user, inherited the daemon environment, and could act before a tool call was approved. The implemented-but-not-accepted Phase 1 schema/tool-lane checkpoint now supplies an explicit minimal child environment and canonical real cwd/PWD; process isolation and the remaining Phase 1 protections are still pending.
 
 Broad third-party installation is blocked until the following host protections exist:
 
@@ -487,7 +489,7 @@ Phase 0 fixes the local state layout under the exact `ocean_agent::config_dir_fr
 
 Evidence recorded on 2026-07-14:
 
-- Global plugin discovery scans immediate directories under `OCEAN_PLUGINS_DIR` or `<config_dir>/plugins` in unsorted filesystem order, launches sequentially during capability-registry assembly, and treats a live `list_tools` call as readiness. Folder-agent subprocess capabilities launch sequentially per applicable turn. Both launch paths execute before model-tool permission and inherit the daemon environment and real cwd; a declared folder-agent `cwd` currently changes only `PWD`. Shutdown is implicit reference-counted stdin closure/direct-child kill without a protocol shutdown, graceful wait, or proven descendant cleanup.
+- At the Phase 0 baseline, global plugin discovery scanned immediate directories under `OCEAN_PLUGINS_DIR` or `<config_dir>/plugins` in unsorted filesystem order, launched sequentially during capability-registry assembly, and treated a live `list_tools` call as readiness. Folder-agent subprocess capabilities launched sequentially per applicable turn. Both legacy launch paths executed before model-tool permission and inherited the daemon environment and real cwd; a declared folder-agent `cwd` changed only `PWD`. The implemented Phase 1 schema/tool-lane checkpoint supersedes the environment/cwd behavior as described below, while shutdown remains implicit reference-counted stdin closure/direct-child kill without a protocol shutdown, graceful wait, or proven descendant cleanup.
 - Current plugin names are flattened as `plugin__<plugin>__<tool>` without component grammar or delimiter escaping; ordered registry composition is first-wins. Built-ins remain unshadowable, but duplicate plugin identities, separator ambiguity, manifest/live-tool mismatch, and filesystem-dependent global collision winners remain characterized migration debt.
 - `ocean-hooks` is loaded and validated only as daemon configuration. No live turn path calls `run_hooks`; the current Stop subprocess primitive is therefore unreachable from production turns. When called directly it is sequential and fail-open, inherits daemon environment, and lacks explicit timeout/cancellation process-tree cleanup.
 - Slack parity remains a cross-repository snapshot, not a completed extraction: preserve Socket Mode acknowledgement/reconnect/dedupe, stable thread-to-session identity, scoped daemon turns, threaded replies, uploads, Canvas operations/fulfillment, slash intake, token/rate-limit behavior, and content-agent-specific overrides. Direct transport/reply tests and a live Slack smoke remain missing; the live chat path currently reduces daemon output to text, so documented structured Canvas/file output parity is not yet proven.
@@ -504,6 +506,8 @@ Evidence recorded on 2026-07-14:
 4. Make plugin child environment explicit and minimal.
 5. Add extension inspect/doctor read paths before install automation.
 6. Preserve existing `plugin.toml` loading compatibility during migration.
+
+**Checkpoint status (2026-07-14):** implemented but not accepted. `ocean-extension` provides fail-closed schema-v1 parsing, SemVer compatibility, canonical confined resource validation, and no-execution tests. The plugin and folder-agent subprocess lane now uses explicit minimal environment and canonical real cwd/PWD while preserving existing `plugin.toml` loading and permission/namespacing behavior. Installed/trusted/enabled state separation and extension inspect/doctor read paths remain pending; no state persistence or routes were added.
 
 **Gate:** malformed/path-escape/duplicate/compatibility/security tests; plugin E2E; workspace tests; fresh security review.
 

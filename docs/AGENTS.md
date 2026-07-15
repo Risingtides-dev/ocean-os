@@ -20,7 +20,7 @@ This child contract governs current architecture, operations, cross-repository r
 - `ARCHITECTURE.md` describes implemented composition and state authority; package inventory belongs only in `../crates/AGENTS.md`.
 - `OPERATIONS.md` is the concise runbook. The extended runtime operator guide is reference material and remains subordinate to source and current scripts.
 - `DAEMON_REFACTOR_MISSION.md` is the living authority for the active behavior-neutral daemon extraction program. Its completed extraction manifests are retained evidence; do not mistake an individual completed checkpoint for completion of the mission.
-- `specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md` governs the approved extension architecture and staged migration. Phase 0 is accepted; Phase 1 package-schema and tool-lane hardening is next.
+- `specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md` governs the approved extension architecture and staged migration. Phase 0 is accepted; the Phase 1 schema/tool-lane checkpoint is implemented but not accepted, with state separation and inspect/doctor still pending.
 - `ocean-daemon` owns HTTP/SSE composition and local execution authority; `ocean-agent` owns product sessions/history, and `ocean-runtime` owns tool execution and permission gates.
 - `ocean-longhouse` owns advisory preparation, SOP/workflow coordination, and quorum/council behavior without bypassing daemon authority. Local typed memory belongs to `ocean-memory`; shared knowledge belongs to Ocean Bedrock.
 - Subagent definitions, dispatch, lifecycle, and orchestration policy belong to extensions, not core crates. Existing core subagent-shaped APIs and metadata are compatibility surfaces pending a separately approved migration.

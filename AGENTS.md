@@ -32,12 +32,12 @@ clients (TUI / CLI / ACP / surface)
   -> ocean-protocol + ocean-providers (wire encoding + model/auth routing)
 ```
 
-Use `crates/AGENTS.md` for all 25 workspace packages, ownership exclusions, entry points, local contracts, and narrow validation commands.
+Use `crates/AGENTS.md` for all 26 current workspace packages, ownership exclusions, entry points, local contracts, and narrow validation commands.
 
 ## Work Guidance
 
 - Current architecture and operations live in `docs/ARCHITECTURE.md` and `docs/OPERATIONS.md`; open work lives in `ROADMAP.md`.
-- The active extension architecture and staged migration program is governed by `docs/specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`; Phase 0 is accepted and Phase 1 is the next implementation gate.
+- The active extension architecture and staged migration program is governed by `docs/specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`; Phase 0 is accepted, and the Phase 1 schema/tool-lane checkpoint is implemented but not accepted. Installed/trusted/enabled state and inspect/doctor remain pending.
 - The active behavior-neutral daemon refactor is governed by `docs/DAEMON_REFACTOR_MISSION.md` and the supporting code-health plan under `docs/specs/`.
 - Optimize for cold-agent discoverability: ownership, entry point, critical invariant, and narrow validation must remain findable from the root, `docs/README.md`, and `crates/AGENTS.md`.
 - Behavior-neutral extraction requires a written extraction manifest and must not bundle redesign, protocol changes, renames, or opportunistic fixes.
