@@ -3274,3 +3274,25 @@ Verification:
 
 Worker sessions were ordinary daemon sessions (`fd271f4b-13fd-4a63-9b85-2be61a94bf09`, `5bb719e3-6724-413d-aeb3-f377dd33e9ca`, and `ace7e2af-0101-42ae-86f9-ca2ecd8efeec`); no core task/spawn-worker/fleet scheduler was introduced.
 _________________________________________________________________________________
+
+time:      [06:01pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [pi/daemon-phase2c-next-20260715]
+type:      [refactor]: characterize and extract daemon recall tally registry
+area:      [backend]: ocean-daemon Phase 2C control-plane registry
+
+Fetched current `origin/main` at `827b65b`, reread the root/crates/daemon/docs contracts, and reconciled the concurrent three-state permission-mode changes before touching the recall seam. Added direct characterization for first-threshold ownership, distinct-voter idempotence, zero-threshold clamping, carried latching, named removal, poison recovery, malformed/unknown HTTP responses, persisted title revocation, and successful-only spent-tally cleanup. Then moved the private handle, constructor, lock helper, cast, and removal into the 52-line private `src/recall_registry.rs`. UUID/live-title validation, persisted title and daemon-held Revoker authority, carried execution, HTTP mapping, and cleanup call ordering remain in composition; abandoned tallies retain their existing memory-only unbounded behavior.
+
+Verification:
+- focused recall-registry/route, claim/revoke, Longhouse recall/escrow, and five router-contract groups passed
+- all 338 daemon tests passed serialized
+- `cargo check --workspace --tests`
+- `cargo check -p ocean-daemon --features livekit-tap`
+- `cargo check -p ocean-daemon --features deepgram-stt`
+- `cargo fmt --all -- --check`
+- `cargo xtask docs-check`
+- `git diff --check`
+- two fresh security/concurrency reviews: PASS, no unresolved medium-or-higher issue; extraction bodies mechanically equal to characterization commit `aea7044`
+
+Implementation commits: `aea7044`, `df09399`. Hosted CI and merge remain; live daemon deployment/supervision is left to the concurrent operator workstream.
+_________________________________________________________________________________

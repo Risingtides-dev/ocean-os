@@ -1,9 +1,9 @@
 # Ocean Daemon Recall Registry Extraction Manifest
 
 **Date:** 2026-07-15
-**Status:** Characterized on current `origin/main`; extraction pending
+**Status:** Ready for publication; characterization, extraction, dedicated-target validation, and independent review passed; hosted CI and merge pending
 **Owner:** Ocean OS
-**Rollback point:** `827b65b`
+**Rollback point:** `aea7044` (characterization commit)
 
 ## Purpose
 
@@ -165,7 +165,13 @@ The focused recall-registry, recall-route, claim-route, revoke-route, and five r
 
 ## Result
 
-Extraction pending.
+Extraction commit `df09399` moved the private recall handle, constructor, poison-recovering lock helper, first-cast tally construction/cast, and named removal into the 52-line private `recall_registry.rs`. Automated normalized comparison against characterization commit `aea7044` found the moved production bodies mechanically identical after only module imports, type qualification, and required `pub(super)` visibility. Parent tests replaced direct access to the now-module-private lock helper with a test-only tally-ID snapshot; production call ordering is unchanged.
+
+`AppState`, UUID parsing, live-title lookup, persisted title storage, daemon-held Revoker/key, `recall_to_revocation`, HTTP response mapping, routes, and logging remain in `main.rs`. The route still casts only after live-title resolution, returns pending without cleanup, executes carried outcomes through the persisted title registry, and removes the named tally only inside `Ok(revocation)`. Error arms retain the tally. The new module has no Axum, `AppState`, persistence, Revoker, secret, async, room, request, event, SSE, GC, or shutdown dependency.
+
+Focused recall-registry, recall-route, claim-route, revoke-route, Longhouse recall, Longhouse escrow, and five router-contract groups passed. All 338 daemon tests passed serialized. Workspace test compilation, `livekit-tap`, `deepgram-stt`, formatting, documentation, and diff checks passed in dedicated target `/tmp/ocean-target-recall-registry`. Both fresh security/concurrency reviews found no unresolved medium-or-higher issue; the extraction review reported normalized mechanical equality. The inherited low residual remains explicit: no deterministic route injection forces a post-carry revocation execution error, while unchanged branch placement visibly retains the tally on every failure arm.
+
+Hosted default-parallel CI and merge remain pending. Live daemon deployment/supervision belongs to the concurrent operator workstream and is not performed by this checkpoint.
 
 ## Rollback
 
