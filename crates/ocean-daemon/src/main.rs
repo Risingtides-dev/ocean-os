@@ -2632,6 +2632,10 @@ async fn longhouse_convene(
     tracing::info!(
         topic = %outcome.topic_id,
         converged = outcome.decision.is_some(),
+        convergence_basis = outcome
+            .convergence_basis
+            .map(|basis| basis.as_str())
+            .unwrap_or("none"),
         proposals = outcome.proposals.len(),
         "longhouse council finished"
     );
@@ -2646,6 +2650,7 @@ async fn longhouse_convene(
         "federation": format!("{federation:?}").to_lowercase(),
         "streaming_on": "/v1/agent/events",
         "converged": grant_result.is_some(),
+        "convergence_basis": outcome.convergence_basis.map(|basis| basis.as_str()),
     });
     if let Some((title_id, token)) = grant_result {
         resp["title_id"] = json!(title_id.to_string());
@@ -14363,11 +14368,11 @@ mod tests {
     }
 
     // OCEAN-339: the `POST /v1/longhouse/convene` route now includes a
-    // `converged` boolean in its response body. When models do not resolve (CI /
-    // no credentials) the council aborts → `converged: false`. When the council
-    // does converge (real LLMs), `converged: true` and `title_id` + `token` are
-    // also present. This test covers the non-converging path (the only path
-    // testable without real credentials) to pin the response shape.
+    // `converged` boolean and convergence basis in its response body. When
+    // models do not resolve (CI / no credentials) the council aborts, so both
+    // remain false/null. When the council does converge (real LLMs), the basis
+    // names the daemon stopping rule and `title_id` + `token` are also present.
+    // This test covers the keyless non-converging path to pin the response shape.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn convene_route_response_includes_converged_flag() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
@@ -14402,6 +14407,11 @@ mod tests {
         assert!(
             body.get("converged").is_some(),
             "response must include `converged` field (OCEAN-339); body: {body}"
+        );
+        assert_eq!(
+            body.get("convergence_basis"),
+            Some(&serde_json::Value::Null),
+            "aborted response must include a null convergence basis; body: {body}"
         );
         // Without real credentials the council aborts → not converged, so
         // title_id and token must NOT be present.

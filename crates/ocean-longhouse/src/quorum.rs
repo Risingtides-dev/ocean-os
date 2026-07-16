@@ -2,13 +2,13 @@
 //!
 //! This module is **pure Rust and contains no LLM logic whatsoever**. LLM
 //! agents only ever *produce* marks (proposals, endorsements, inhibitions); the
-//! engine *counts* them. That separation is the entire point: convergence is a
-//! deterministic, fully-testable arithmetic over a credential-weighted,
-//! time-decaying signal field — never a model's say-so.
+//! engine *evaluates* them. That separation is the entire point: convergence is
+//! deterministic, fully-testable arithmetic over a correlation-aware,
+//! time-decaying evidence field — never a model's say-so.
 //!
 //! Properties it implements, all from `docs/LONGHOUSE_ORCHESTRATION.md` §5:
 //!
-//! * **Credential-weighted tallies (C1).** Each real agent contributes *one*
+//! * **Credential-weighted stances (C1).** Each real agent contributes *one*
 //!   weight across the *whole field* — one live stance per agent, latest wins.
 //!   A chatty agent that posts 100 endorsements still counts as one credential,
 //!   and an agent that endorses A then switches to B no longer counts toward A:
@@ -18,10 +18,11 @@
 //!   symmetric split cannot silently "win".
 //! * **Time-decay (T3).** A mark's effective weight decays toward zero as
 //!   `weight * 2^(-Δt / ttl_ms)`, so a stale signal nobody re-asserts fades out.
-//! * **Quorum threshold (T4).** Convergence fires when the leader's net weight
-//!   crosses a configurable cutoff (a sigmoid response, or a plain net cutoff).
-//! * **Deadline / tie handling (T1).** On a forced deadline, a clear leader
-//!   converges; a true tie aborts with `Split` (or a seeded tie-break).
+//! * **Sequential evidence (T4).** Reliability priors become log-likelihood
+//!   ratios, correlated reviewers share a capped evidence budget, and stopping
+//!   uses either a posterior error target or a value-of-information bound.
+//! * **Deadline / tie handling (T1).** Evidence mode aborts rather than invent a
+//!   low-confidence decision. Legacy net-weight mode retains forced resolution.
 //!
 //! The engine takes time as an explicit `now_ms` argument on every call, so
 //! tests are deterministic and never touch the wall clock.
@@ -31,6 +32,11 @@ use std::collections::HashMap;
 use ocean_agent_sdk::{AbortReason, ProposalTally};
 use uuid::Uuid;
 
+use crate::evidence::{
+    evaluate_field, ConvergenceBasis, EvidenceContribution, EvidenceSnapshot, ReviewerCredential,
+    SequentialEvidenceConfig,
+};
+
 /// How the engine decides a proposal has crossed quorum.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QuorumRule {
@@ -38,52 +44,18 @@ pub enum QuorumRule {
     /// the runner-up by at least `margin`. The margin is what makes
     /// cross-inhibition bite: two near-equal rivals never satisfy it.
     NetWeight { cutoff: f32, margin: f32 },
-    /// Converge when a steep logistic response over the leader's net weight
-    /// crosses `0.5` confidence — i.e. net weight exceeds `midpoint`, sharpened
-    /// by `steepness` (Couzin's quorum response). Still requires `margin` over
-    /// the runner-up so a tie can't trip it.
-    Sigmoid {
-        midpoint: f32,
-        steepness: f32,
-        margin: f32,
-    },
+    /// Correlation-aware sequential evidence with cost-sensitive stopping.
+    /// This is the production default; unlike a sigmoid tested at its midpoint,
+    /// every parameter changes runtime behavior.
+    SequentialEvidence(SequentialEvidenceConfig),
 }
 
 impl QuorumRule {
-    /// 0.0–1.0 confidence that `leader_net` has crossed quorum, ignoring the
-    /// margin requirement (the margin is a separate gate in [`QuorumEngine`]).
-    fn confidence(&self, leader_net: f32) -> f32 {
-        match *self {
-            QuorumRule::NetWeight { cutoff, .. } => {
-                if cutoff <= 0.0 {
-                    return if leader_net > 0.0 { 1.0 } else { 0.0 };
-                }
-                (leader_net / cutoff).clamp(0.0, 1.0)
-            }
-            QuorumRule::Sigmoid {
-                midpoint,
-                steepness,
-                ..
-            } => {
-                let x = steepness * (leader_net - midpoint);
-                1.0 / (1.0 + (-x).exp())
-            }
-        }
-    }
-
-    fn margin(&self) -> f32 {
-        match *self {
-            QuorumRule::NetWeight { margin, .. } => margin,
-            QuorumRule::Sigmoid { margin, .. } => margin,
-        }
-    }
-
-    /// Does `leader_net` (already net of inhibition) satisfy the raw threshold,
-    /// before the margin check?
-    fn crosses(&self, leader_net: f32) -> bool {
-        match *self {
-            QuorumRule::NetWeight { cutoff, .. } => leader_net >= cutoff && leader_net > 0.0,
-            QuorumRule::Sigmoid { .. } => self.confidence(leader_net) >= 0.5,
+    /// Evidence policy, when this is the sequential production rule.
+    pub fn evidence_config(self) -> Option<SequentialEvidenceConfig> {
+        match self {
+            Self::SequentialEvidence(config) => Some(config),
+            Self::NetWeight { .. } => None,
         }
     }
 }
@@ -103,10 +75,7 @@ pub struct QuorumConfig {
 impl Default for QuorumConfig {
     fn default() -> Self {
         Self {
-            rule: QuorumRule::NetWeight {
-                cutoff: 2.0,
-                margin: 1.0,
-            },
+            rule: QuorumRule::SequentialEvidence(SequentialEvidenceConfig::default()),
             mark_ttl_ms: 60_000,
             tie_break_seed: 0xC0FFEE,
         }
@@ -171,6 +140,8 @@ pub enum QuorumOutcome {
     Converged {
         decision: Uuid,
         tallies: Vec<ProposalTally>,
+        /// The auditable stopping condition that latched this decision.
+        basis: ConvergenceBasis,
     },
 }
 
@@ -183,9 +154,10 @@ pub enum QuorumOutcome {
 pub struct QuorumEngine {
     config: QuorumConfig,
     proposals: HashMap<Uuid, ProposalState>,
+    reviewers: HashMap<Uuid, ReviewerCredential>,
     /// Monotonic counter so ties break by proposal *order*, deterministically.
     next_seq: u64,
-    converged: Option<Uuid>,
+    converged: Option<(Uuid, ConvergenceBasis)>,
 }
 
 impl QuorumEngine {
@@ -193,6 +165,7 @@ impl QuorumEngine {
         Self {
             config,
             proposals: HashMap::new(),
+            reviewers: HashMap::new(),
             next_seq: 0,
             converged: None,
         }
@@ -200,6 +173,22 @@ impl QuorumEngine {
 
     pub fn with_defaults() -> Self {
         Self::new(QuorumConfig::default())
+    }
+
+    /// Register the daemon-owned evidence credential for a seated reviewer.
+    /// Re-registering the same agent replaces its prior metadata. Live councils
+    /// do this before posting any marks; old recordings without credentials are
+    /// replayed as independent reviewers for backward compatibility.
+    pub fn register_reviewer(
+        &mut self,
+        credential: ReviewerCredential,
+    ) -> Option<ReviewerCredential> {
+        self.reviewers.insert(credential.agent_id(), credential)
+    }
+
+    /// Current reviewer credentials, primarily for recording/audit surfaces.
+    pub fn reviewers(&self) -> impl Iterator<Item = &ReviewerCredential> {
+        self.reviewers.values()
     }
 
     /// Register a proposal. The proposer implicitly endorses their own proposal
@@ -263,6 +252,9 @@ impl QuorumEngine {
     }
 
     fn set_stance(&mut self, proposal: Uuid, author: Uuid, signed_weight: f32, now_ms: i64) {
+        if !signed_weight.is_finite() {
+            return;
+        }
         let seq = self.next_seq;
         // A stance can arrive for a proposal we haven't seen a `propose` for yet
         // (out-of-order marks). Create a placeholder so the signal still counts.
@@ -328,6 +320,12 @@ impl QuorumEngine {
     /// The current front-runner (highest net weight), if any proposal has
     /// strictly positive net weight.
     pub fn leader(&self, now_ms: i64) -> Option<Uuid> {
+        if matches!(self.config.rule, QuorumRule::SequentialEvidence(_)) {
+            return self
+                .evidence_snapshot(now_ms)
+                .and_then(|snapshot| snapshot.unique_leader())
+                .map(|leader| leader.proposal);
+        }
         let tallies = self.tallies(now_ms);
         tallies
             .into_iter()
@@ -335,40 +333,118 @@ impl QuorumEngine {
             .map(|t| t.proposal)
     }
 
+    /// Correlation-capped posterior state for the sequential rule.
+    ///
+    /// Returns `None` in legacy [`QuorumRule::NetWeight`] mode.
+    pub fn evidence_snapshot(&self, now_ms: i64) -> Option<EvidenceSnapshot> {
+        let config = self.config.rule.evidence_config()?;
+        Some(self.build_evidence_snapshot(config, now_ms))
+    }
+
+    fn build_evidence_snapshot(
+        &self,
+        config: SequentialEvidenceConfig,
+        now_ms: i64,
+    ) -> EvidenceSnapshot {
+        let proposals: Vec<(Uuid, u64)> = self
+            .proposals
+            .iter()
+            .map(|(proposal, state)| (*proposal, state.seq))
+            .collect();
+        let contributions: Vec<EvidenceContribution> = self
+            .proposals
+            .iter()
+            .flat_map(|(proposal, state)| {
+                state.stances.iter().filter_map(move |(author, stance)| {
+                    let signed_weight = stance.effective(now_ms, self.config.mark_ttl_ms) as f64;
+                    signed_weight.is_finite().then_some(EvidenceContribution {
+                        proposal: *proposal,
+                        author: *author,
+                        signed_weight,
+                    })
+                })
+            })
+            .collect();
+        evaluate_field(config, &proposals, &contributions, &self.reviewers)
+    }
+
     /// Evaluate the current field. Returns `Converged` once (and stays
     /// converged), else `Pending` with live tallies + distance to quorum.
     pub fn evaluate(&mut self, now_ms: i64) -> QuorumOutcome {
         let tallies = self.tallies(now_ms);
 
-        if let Some(decision) = self.converged {
-            return QuorumOutcome::Converged { decision, tallies };
+        if let Some((decision, basis)) = self.converged {
+            return QuorumOutcome::Converged {
+                decision,
+                tallies,
+                basis,
+            };
         }
 
-        let leader_net = tallies.first().map(|t| t.net_weight).unwrap_or(0.0);
-        let runner_up = tallies.get(1).map(|t| t.net_weight).unwrap_or(0.0);
-        let leader_id = tallies.first().map(|t| t.proposal);
+        match self.config.rule {
+            QuorumRule::NetWeight { cutoff, margin } => {
+                let leader_net = tallies.first().map(|t| t.net_weight).unwrap_or(0.0);
+                let runner_up = tallies.get(1).map(|t| t.net_weight).unwrap_or(0.0);
+                let leader_id = tallies.first().map(|t| t.proposal);
+                let progress = if cutoff <= 0.0 {
+                    if leader_net > 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (leader_net / cutoff).clamp(0.0, 1.0)
+                };
+                let crosses =
+                    leader_net >= cutoff && leader_net > 0.0 && (leader_net - runner_up) >= margin;
 
-        let confidence = self.config.rule.confidence(leader_net);
-        let margin_ok = (leader_net - runner_up) >= self.config.rule.margin();
-        let crosses = self.config.rule.crosses(leader_net) && margin_ok;
+                if crosses {
+                    if let Some(decision) = leader_id {
+                        let basis = ConvergenceBasis::NetWeight;
+                        self.converged = Some((decision, basis));
+                        return QuorumOutcome::Converged {
+                            decision,
+                            tallies,
+                            basis,
+                        };
+                    }
+                }
 
-        if crosses {
-            if let Some(decision) = leader_id {
-                self.converged = Some(decision);
-                return QuorumOutcome::Converged { decision, tallies };
+                QuorumOutcome::Pending {
+                    leader: leader_id.filter(|_| leader_net > 0.0),
+                    distance_to_quorum: progress,
+                    tallies,
+                }
             }
-        }
+            QuorumRule::SequentialEvidence(config) => {
+                let snapshot = self.build_evidence_snapshot(config, now_ms);
+                let leader = snapshot.unique_leader().map(|item| item.proposal);
+                if let (Some(decision), Some(basis)) = (leader, snapshot.convergence_basis()) {
+                    self.converged = Some((decision, basis));
+                    return QuorumOutcome::Converged {
+                        decision,
+                        tallies,
+                        basis,
+                    };
+                }
 
-        QuorumOutcome::Pending {
-            leader: leader_id.filter(|_| leader_net > 0.0),
-            distance_to_quorum: confidence.clamp(0.0, 1.0),
-            tallies,
+                QuorumOutcome::Pending {
+                    leader,
+                    distance_to_quorum: snapshot.progress() as f32,
+                    tallies,
+                }
+            }
         }
     }
 
     /// Has this topic already converged?
     pub fn is_converged(&self) -> bool {
         self.converged.is_some()
+    }
+
+    /// The stopping condition that latched this topic, if it has converged.
+    pub fn convergence_basis(&self) -> Option<ConvergenceBasis> {
+        self.converged.map(|(_, basis)| basis)
     }
 
     /// The author that originally proposed `proposal`, if tracked. Used by the
@@ -389,9 +465,18 @@ impl QuorumEngine {
         reason: AbortReason,
         tie_break: bool,
     ) -> Result<Uuid, AbortReason> {
-        if let Some(decision) = self.converged {
+        if let Some((decision, _)) = self.converged {
             return Ok(decision);
         }
+        let margin = match self.config.rule {
+            QuorumRule::NetWeight { margin, .. } => margin,
+            QuorumRule::SequentialEvidence(_) => {
+                // A deadline is a stopping condition, not evidence. Sequential
+                // mode therefore terminates honestly with an abort instead of
+                // using a seeded coin flip to manufacture a supported answer.
+                return Err(reason);
+            }
+        };
         let tallies = self.tallies(now_ms);
         let Some(top) = tallies.first().cloned() else {
             // No proposals at all.
@@ -406,10 +491,10 @@ impl QuorumEngine {
             });
         }
         let runner_up = tallies.get(1).map(|t| t.net_weight).unwrap_or(0.0);
-        let is_tie = (top.net_weight - runner_up).abs() < self.config.rule.margin();
+        let is_tie = (top.net_weight - runner_up).abs() < margin;
 
         if !is_tie {
-            self.converged = Some(top.proposal);
+            self.converged = Some((top.proposal, ConvergenceBasis::ForcedDeadline));
             return Ok(top.proposal);
         }
 
@@ -422,11 +507,11 @@ impl QuorumEngine {
         // top within the margin, choosing by a hash of (seed, proposal bytes).
         let leaders: Vec<Uuid> = tallies
             .iter()
-            .filter(|t| (top.net_weight - t.net_weight).abs() < self.config.rule.margin())
+            .filter(|t| (top.net_weight - t.net_weight).abs() < margin)
             .map(|t| t.proposal)
             .collect();
         let winner = seeded_pick(&leaders, self.config.tie_break_seed);
-        self.converged = Some(winner);
+        self.converged = Some((winner, ConvergenceBasis::ForcedDeadline));
         Ok(winner)
     }
 }
@@ -615,7 +700,11 @@ mod tests {
 
         eng.endorse(p, c, None, t0); // net 3.0 -> crosses cutoff, margin (no rival) ok
         match eng.evaluate(t0) {
-            QuorumOutcome::Converged { decision, .. } => assert_eq!(decision, p),
+            QuorumOutcome::Converged {
+                decision,
+                basis: ConvergenceBasis::NetWeight,
+                ..
+            } => assert_eq!(decision, p),
             other => panic!("expected convergence, got {other:?}"),
         }
         // Stays converged.
@@ -900,25 +989,121 @@ mod tests {
         assert!(matches!(eng.evaluate(0), QuorumOutcome::Pending { .. }));
         let winner = eng.force_resolve(0, AbortReason::Timeout, true).unwrap();
         assert_eq!(winner, pa);
+        assert_eq!(
+            eng.convergence_basis(),
+            Some(ConvergenceBasis::ForcedDeadline)
+        );
     }
 
     #[test]
-    fn sigmoid_rule_crosses_at_midpoint() {
-        let mut eng = QuorumEngine::new(QuorumConfig {
-            rule: QuorumRule::Sigmoid {
-                midpoint: 2.0,
-                steepness: 4.0,
-                margin: 1.0,
-            },
-            mark_ttl_ms: 60_000,
-            tie_break_seed: 1,
-        });
-        let p = uid(1);
-        eng.propose(p, uid(10), 0); // net 1.0, below midpoint
+    fn default_rule_is_sequential_evidence_not_a_relabelled_threshold() {
+        assert!(matches!(
+            QuorumConfig::default().rule,
+            QuorumRule::SequentialEvidence(_)
+        ));
+    }
+
+    #[test]
+    fn correlated_replicas_cannot_manufacture_independent_evidence() {
+        let config = SequentialEvidenceConfig::default();
+        let mut eng = QuorumEngine::with_defaults();
+        let (pa, pb) = (uid(1), uid(2));
+        let (a1, a2, b1) = (uid(10), uid(11), uid(20));
+        for agent in [a1, a2] {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(agent, "same-model", config).unwrap(),
+            );
+        }
+        eng.register_reviewer(
+            ReviewerCredential::with_default_prior(b1, "independent-model", config).unwrap(),
+        );
+
+        eng.propose(pa, a1, 0);
+        eng.propose(pb, b1, 0);
+        eng.endorse(pa, a2, None, 0);
+
+        let snapshot = eng.evidence_snapshot(0).unwrap();
+        assert_eq!(snapshot.convergence_basis(), None);
+        assert_eq!(snapshot.unique_leader(), None);
         assert!(matches!(eng.evaluate(0), QuorumOutcome::Pending { .. }));
-        eng.endorse(p, uid(11), None, 0); // net 2.0 == midpoint -> confidence 0.5
-        eng.endorse(p, uid(12), None, 0); // net 3.0 > midpoint -> crosses
-        assert!(matches!(eng.evaluate(0), QuorumOutcome::Converged { .. }));
+    }
+
+    #[test]
+    fn independent_evidence_reaches_the_configured_error_bound() {
+        let config = SequentialEvidenceConfig::default();
+        let mut eng = QuorumEngine::with_defaults();
+        let (pa, pb) = (uid(1), uid(2));
+        let authors = [uid(10), uid(11), uid(12), uid(13), uid(20)];
+        for (index, author) in authors.into_iter().enumerate() {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(
+                    author,
+                    format!("independent-{index}"),
+                    config,
+                )
+                .unwrap(),
+            );
+        }
+
+        eng.propose(pa, uid(10), 0);
+        eng.propose(pb, uid(20), 0);
+        eng.endorse(pa, uid(11), None, 0);
+        eng.endorse(pa, uid(12), None, 0);
+        eng.endorse(pa, uid(13), None, 0);
+
+        assert!(matches!(
+            eng.evaluate(0),
+            QuorumOutcome::Converged {
+                decision,
+                basis: ConvergenceBasis::EvidenceBound,
+                ..
+            } if decision == pa
+        ));
+    }
+
+    #[test]
+    fn default_three_seat_two_group_roster_can_converge() {
+        let config = SequentialEvidenceConfig::default();
+        let mut eng = QuorumEngine::with_defaults();
+        let (deep_a, kimi, deep_b) = (uid(10), uid(20), uid(11));
+        for agent in [deep_a, deep_b] {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(agent, "deepseek:model", config).unwrap(),
+            );
+        }
+        eng.register_reviewer(
+            ReviewerCredential::with_default_prior(kimi, "kimi:model", config).unwrap(),
+        );
+        let (proposal_a, winner, proposal_b) = (uid(1), uid(2), uid(3));
+        eng.propose(proposal_a, deep_a, 0);
+        eng.propose(winner, kimi, 0);
+        eng.propose(proposal_b, deep_b, 0);
+
+        eng.endorse(winner, deep_a, None, 1);
+        eng.endorse(winner, kimi, None, 1);
+        eng.endorse(winner, deep_b, None, 1);
+
+        assert!(matches!(
+            eng.evaluate(1),
+            QuorumOutcome::Converged {
+                decision,
+                basis: ConvergenceBasis::EvidenceBound,
+                ..
+            } if decision == winner
+        ));
+    }
+
+    #[test]
+    fn sequential_deadline_aborts_instead_of_inventing_a_winner() {
+        let mut eng = QuorumEngine::with_defaults();
+        eng.propose(uid(1), uid(10), 0);
+        eng.propose(uid(2), uid(20), 0);
+
+        assert_eq!(
+            eng.force_resolve(1_000, AbortReason::Timeout, true),
+            Err(AbortReason::Timeout)
+        );
+        assert!(!eng.is_converged());
     }
 
     // ---- RecallVote (OCEAN-302): quorum-of-recall, unforgeable --------------

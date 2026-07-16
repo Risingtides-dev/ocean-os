@@ -9,17 +9,18 @@
 //!    `proposal` mark (a candidate answer).
 //! 2. **Rounds 2..N — endorse / inhibit re-assertion.** Each worker sees the
 //!    current bounded proposal projection and posts an `endorse` or `inhibit`
-//!    mark. The loop stops on quorum, `max_rounds`, or deadline.
+//!    mark. Reviewers are queried sequentially, independent groups first, so
+//!    an evidence or cost bound can avoid spending the next provider call.
 //!
 //! After **every** mark the daemon-side [`QuorumEngine`] re-tallies, and we emit
-//! a `QuorumUpdated`. When the engine reports convergence (or we hit the
-//! deadline) we emit the single binding `Converged` (or `Aborted`), then
+//! a `QuorumUpdated`. When the engine reports convergence (or we hit a stopping
+//! bound/deadline) we emit the single binding `Converged` (or `Aborted`), then
 //! `TopicClosed`. The engine — never an LLM — decides when quorum is met.
 //!
 //! Every step emits the **existing** `LonghouseEvent`s from `ocean-agent-sdk`,
 //! so the deck renders a real council with zero deck changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ocean_agent_sdk::{
     AbortReason, AgentRole, ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark,
@@ -34,8 +35,9 @@ use ocean_core::{decision_token_matches, mint_decision_token};
 use uuid::Uuid;
 
 use crate::agent::ModelHandle;
+use crate::evidence::{ConvergenceBasis, ReviewerCredential};
 use crate::quorum::{QuorumConfig, QuorumEngine, QuorumOutcome};
-use crate::replay::{RecordedMark, RecordedMarkKind, Recording};
+use crate::replay::{RecordedMark, RecordedMarkKind, RecordedReviewer, Recording};
 
 /// A request to convene a council on a question.
 #[derive(Debug, Clone)]
@@ -50,10 +52,10 @@ pub struct ConveneRequest {
     /// across providers so the council is genuinely multi-model. Resolved via
     /// the standard auth.json.
     pub models: Vec<String>,
-    /// Quorum tuning. Sensible default is a low, fast-resolving quorum.
+    /// Quorum tuning. The default is correlation-aware sequential evidence.
     pub quorum: QuorumConfig,
-    /// Hard deadline budget in ms from convening. On expiry the engine force-
-    /// resolves (clear leader → converge; tie → seeded tie-break).
+    /// Hard deadline budget in ms from convening. Sequential evidence aborts if
+    /// its stopping rule has not fired; legacy net-weight mode may force-resolve.
     pub deadline_ms_from_now: i64,
     /// Maximum deliberation rounds, including the proposal round. Round 1 proposes;
     /// rounds 2..N are endorse/inhibit re-assertion rounds. This bounds open-ended
@@ -88,6 +90,8 @@ pub struct ConveneOutcome {
     pub board_id: Uuid,
     /// `Some(proposal_id)` if the council converged, `None` if it aborted.
     pub decision: Option<Uuid>,
+    /// Auditable daemon stopping condition for `decision`.
+    pub convergence_basis: Option<ConvergenceBasis>,
     /// Final tallies for logging / the decision record.
     pub tallies: Vec<ProposalTally>,
     /// The proposal text for each proposal id (so callers can show the answer).
@@ -249,6 +253,25 @@ where
     });
 
     let mut engine = QuorumEngine::new(req.quorum);
+    let mut recorded_reviewers: Vec<RecordedReviewer> = Vec::new();
+    let evidence_config = req.quorum.rule.evidence_config().unwrap_or_default();
+    for worker in &workers {
+        match ReviewerCredential::with_default_prior(
+            worker.agent_id,
+            worker.handle.correlation_group(),
+            evidence_config,
+        ) {
+            Ok(credential) => {
+                recorded_reviewers.push(RecordedReviewer::from(&credential));
+                engine.register_reviewer(credential);
+            }
+            Err(error) => tracing::warn!(
+                agent = %worker.agent_id,
+                error = %error,
+                "invalid Longhouse reviewer credential; using independent fallback"
+            ),
+        }
+    }
     let mut proposals: HashMap<Uuid, String> = HashMap::new();
     // proposal_id -> author agent_id, so endorse/inhibit can target by proposal.
     let mut proposal_by_author: HashMap<Uuid, Uuid> = HashMap::new();
@@ -267,10 +290,12 @@ where
             topic_id,
             board_id,
             decision: None,
+            convergence_basis: None,
             tallies: vec![],
             proposals,
             recording: Recording {
                 question: req.question.clone(),
+                reviewers: recorded_reviewers.clone(),
                 marks: recorded.clone(),
             },
         };
@@ -331,10 +356,12 @@ where
             topic_id,
             board_id,
             decision: None,
+            convergence_basis: None,
             tallies: engine.tallies(clock.now_ms()),
             proposals,
             recording: Recording {
                 question: req.question.clone(),
+                reviewers: recorded_reviewers.clone(),
                 marks: recorded.clone(),
             },
         };
@@ -351,10 +378,13 @@ where
         let projection = projection_text(&proposals);
         let proposal_ids: Vec<Uuid> = proposals.keys().copied().collect();
 
-        let vote_prompts: Vec<(usize, String)> = workers
-            .iter()
-            .enumerate()
-            .map(|(idx, w)| {
+        // Query one reviewer at a time so the evidence engine can stop before
+        // the next provider call is spent. Distinct correlation groups go
+        // first; replicas of a provider/model are deferred until the end.
+        let vote_prompts: Vec<(usize, String)> = independence_first_order(&workers)
+            .into_iter()
+            .map(|idx| {
+                let w = &workers[idx];
                 let own = proposal_by_author.get(&w.agent_id).copied();
                 (
                     idx,
@@ -363,13 +393,13 @@ where
             })
             .collect();
 
-        let vote_results = run_round(&workers, vote_prompts, ROUND2_SYSTEM).await;
         let mut contributed = false;
 
-        for (idx, answer) in vote_results {
+        for (idx, prompt) in vote_prompts {
             if engine.is_converged() || clock.now_ms() >= deadline_ms {
                 break;
             }
+            let answer = workers[idx].handle.ask(ROUND2_SYSTEM, &prompt).await;
             let Some(answer) = answer else { continue };
             let w = &workers[idx];
             let now = clock.now_ms();
@@ -421,9 +451,9 @@ where
     let decision = match engine.evaluate(now) {
         QuorumOutcome::Converged { decision, .. } => Some(decision),
         QuorumOutcome::Pending { .. } => {
-            // Deadline behavior: if we've blown the deadline, force-resolve;
-            // otherwise still force a resolution now (the council had its rounds)
-            // with a seeded tie-break so a topic always terminates.
+            // The topic always terminates, but only legacy net-weight mode may
+            // manufacture a deadline winner. Sequential evidence returns the
+            // honest Timeout/Split abort when neither stopping bound fired.
             let reason = if now >= deadline_ms {
                 AbortReason::Timeout
             } else {
@@ -512,10 +542,12 @@ where
         topic_id,
         board_id,
         decision,
+        convergence_basis: engine.convergence_basis(),
         tallies: engine.tallies(now),
         proposals,
         recording: Recording {
             question: req.question.clone(),
+            reviewers: recorded_reviewers,
             marks: recorded,
         },
     }
@@ -651,7 +683,9 @@ where
             leader,
             distance_to_quorum,
         } => (tallies, leader, distance_to_quorum),
-        QuorumOutcome::Converged { decision, tallies } => (tallies, Some(decision), 1.0),
+        QuorumOutcome::Converged {
+            decision, tallies, ..
+        } => (tallies, Some(decision), 1.0),
     };
     emit(LonghouseEvent::QuorumUpdated {
         topic_id,
@@ -661,9 +695,9 @@ where
     });
 }
 
-/// Run a round of independent LLM calls concurrently, returning each worker's
-/// (index, optional answer). A `None` answer means that worker didn't
-/// contribute (error/timeout) — the council carries on without it.
+/// Run the proposal round concurrently. Candidate generation precedes
+/// sequential evidence evaluation, so there is no stopping decision to save
+/// these calls. A `None` answer means that worker did not contribute.
 async fn run_round(
     workers: &[Worker],
     prompts: Vec<(usize, String)>,
@@ -678,6 +712,26 @@ async fn run_round(
         }
     });
     futures::future::join_all(futures).await
+}
+
+/// Stable reviewer order with one representative from every distinct
+/// provider/model group before any correlated replica. This does not pretend
+/// to estimate full information gain or that different groups are perfectly
+/// independent; it is a deterministic proxy that avoids asking an exact
+/// replica before every distinct group has had the same opportunity.
+fn independence_first_order(workers: &[Worker]) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut independent = Vec::with_capacity(workers.len());
+    let mut replicas = Vec::new();
+    for (index, worker) in workers.iter().enumerate() {
+        if seen.insert(worker.handle.correlation_group()) {
+            independent.push(index);
+        } else {
+            replicas.push(index);
+        }
+    }
+    independent.extend(replicas);
+    independent
 }
 
 const ROUND1_SYSTEM: &str =

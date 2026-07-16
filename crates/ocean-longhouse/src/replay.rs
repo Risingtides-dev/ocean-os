@@ -12,7 +12,8 @@
 //! [`QuorumConfig`] — instantly, for free, and identically every time.
 //!
 //! That turns "tune by watching 30-second councils" into "scrub a grid of
-//! configs over a fixed recording in milliseconds." The deck stays the *watch*
+//! configs over a fixed recording in milliseconds." Reviewer credentials are
+//! captured too, so correlation caps replay exactly. The deck stays the *watch*
 //! surface for live feel; this is the *tune* surface.
 //!
 //! ```
@@ -23,6 +24,7 @@
 //! let (pa, a, b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
 //! let rec = Recording {
 //!     question: "demo".into(),
+//!     reviewers: vec![],
 //!     marks: vec![
 //!         RecordedMark { at_ms: 0, author: a, kind: RecordedMarkKind::Propose { proposal: pa } },
 //!         RecordedMark { at_ms: 10, author: b, kind: RecordedMarkKind::Endorse { proposal: pa } },
@@ -36,6 +38,8 @@ use ocean_agent_sdk::AbortReason;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::evidence::ConvergenceBasis;
+use crate::evidence::ReviewerCredential;
 use crate::quorum::{QuorumConfig, QuorumEngine, QuorumOutcome};
 
 /// What a recorded mark did to the blackboard. Mirrors the three engine inputs.
@@ -73,12 +77,36 @@ pub struct RecordedMark {
     pub kind: RecordedMarkKind,
 }
 
+/// Reviewer metadata required to replay correlation-aware evidence exactly.
+/// Older recordings omit this list and remain backward compatible: their
+/// authors are treated as independent reviewers with the configured prior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordedReviewer {
+    pub agent_id: Uuid,
+    pub correlation_group: String,
+    pub reliability_prior: f64,
+}
+
+impl From<&ReviewerCredential> for RecordedReviewer {
+    fn from(credential: &ReviewerCredential) -> Self {
+        Self {
+            agent_id: credential.agent_id(),
+            correlation_group: credential.correlation_group().to_string(),
+            reliability_prior: credential.reliability_prior(),
+        }
+    }
+}
+
 /// A captured council: the question plus its full ordered mark-stream. This is
 /// the unit you record once and replay many times under different configs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recording {
     /// The deliberated question (for labeling; not fed to the engine).
     pub question: String,
+    /// Daemon-owned correlation groups and reliability priors for reproducible
+    /// sequential evidence. Missing in legacy recordings by design.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<RecordedReviewer>,
     /// Marks in the exact order the live council fed them to the engine.
     pub marks: Vec<RecordedMark>,
 }
@@ -104,14 +132,16 @@ pub struct ReplayResult {
     /// `None` if it stayed pending through the whole recording (the live flow
     /// would then force-resolve at the deadline — see [`force_resolved`]).
     pub converged_on: Option<Uuid>,
+    /// Why the live or compatibility deadline path selected its decision.
+    pub convergence_basis: Option<ConvergenceBasis>,
     /// How many marks had been fed when convergence fired (`None` if it never
     /// converged mid-stream). Lower = converges faster / more eagerly.
     pub converged_after_marks: Option<usize>,
     /// Total marks replayed.
     pub replayed_marks: usize,
     /// What a deadline force-resolve would pick if the stream didn't converge
-    /// on its own — the seeded tie-break path the live council uses. `None`
-    /// means even force-resolve found no positive-support leader (a true Split).
+    /// on its own. This is populated only by legacy net-weight rules;
+    /// sequential evidence aborts rather than treating the deadline as support.
     pub force_resolved: Option<Uuid>,
     /// Final net weight of every proposal, sorted desc — the field at the end.
     pub final_tally: Vec<(Uuid, f32)>,
@@ -124,7 +154,17 @@ pub struct ReplayResult {
 /// Pure and deterministic: same `(recording, config)` ⇒ same `ReplayResult`.
 pub fn replay(recording: &Recording, config: QuorumConfig) -> ReplayResult {
     let mut engine = QuorumEngine::new(config);
+    for reviewer in &recording.reviewers {
+        if let Ok(credential) = ReviewerCredential::new(
+            reviewer.agent_id,
+            reviewer.correlation_group.clone(),
+            reviewer.reliability_prior,
+        ) {
+            engine.register_reviewer(credential);
+        }
+    }
     let mut converged_on = None;
+    let mut convergence_basis = None;
     let mut converged_after_marks = None;
 
     for (i, m) in recording.marks.iter().enumerate() {
@@ -140,8 +180,12 @@ pub fn replay(recording: &Recording, config: QuorumConfig) -> ReplayResult {
         // Evaluate at this mark's own timestamp so decay is honored exactly as
         // the live council would have seen it.
         if converged_on.is_none() {
-            if let QuorumOutcome::Converged { decision, .. } = engine.evaluate(m.at_ms) {
+            if let QuorumOutcome::Converged {
+                decision, basis, ..
+            } = engine.evaluate(m.at_ms)
+            {
                 converged_on = Some(decision);
+                convergence_basis = Some(basis);
                 converged_after_marks = Some(i + 1);
             }
         }
@@ -151,10 +195,13 @@ pub fn replay(recording: &Recording, config: QuorumConfig) -> ReplayResult {
     let end_ms = recording.marks.last().map(|m| m.at_ms).unwrap_or(0);
 
     // What would the live deadline path pick? Clone so we don't mutate the
-    // reported engine state; force-resolve with tie-break, matching convene().
-    let force_resolved = {
+    // reported engine state. Sequential evidence intentionally returns None.
+    let (force_resolved, forced_basis) = if converged_on.is_some() {
+        (None, None)
+    } else {
         let mut e = engine.clone();
-        e.force_resolve(end_ms, AbortReason::Timeout, true).ok()
+        let decision = e.force_resolve(end_ms, AbortReason::Timeout, true).ok();
+        (decision, e.convergence_basis())
     };
 
     let final_tally = engine
@@ -165,6 +212,7 @@ pub fn replay(recording: &Recording, config: QuorumConfig) -> ReplayResult {
 
     ReplayResult {
         converged_on,
+        convergence_basis: convergence_basis.or(forced_basis),
         converged_after_marks,
         replayed_marks: recording.marks.len(),
         force_resolved,
@@ -174,7 +222,8 @@ pub fn replay(recording: &Recording, config: QuorumConfig) -> ReplayResult {
 
 /// Replay one recording across a whole grid of configs, returning each config's
 /// result paired with the config that produced it. The caller supplies the grid
-/// (e.g. a sweep of cutoffs × margins × ttls) and prints/inspects the table.
+/// (e.g. evidence targets × correlation caps × query costs × ttls) and
+/// prints/inspects the table.
 pub fn sweep(recording: &Recording, configs: &[QuorumConfig]) -> Vec<(QuorumConfig, ReplayResult)> {
     configs
         .iter()
@@ -221,18 +270,29 @@ mod tests {
         }
     }
 
+    fn legacy_config() -> QuorumConfig {
+        QuorumConfig {
+            rule: QuorumRule::NetWeight {
+                cutoff: 2.0,
+                margin: 1.0,
+            },
+            ..QuorumConfig::default()
+        }
+    }
+
     // A clean climb converges mid-stream, and replay reports when.
     #[test]
     fn replay_reports_convergence_point() {
         let rec = Recording {
             question: "q".into(),
+            reviewers: vec![],
             marks: vec![
                 propose(0, 10, 1), // net 1.0
                 endorse(0, 11, 1), // net 2.0
                 endorse(0, 12, 1), // net 3.0 -> crosses default cutoff 2.0, margin ok
             ],
         };
-        let r = replay(&rec, QuorumConfig::default());
+        let r = replay(&rec, legacy_config());
         assert_eq!(r.converged_on, Some(uid(1)));
         // Default cutoff 2.0, margin 1.0: net 2.0 at mark 2 leads by 2.0 -> crosses.
         assert_eq!(r.converged_after_marks, Some(2));
@@ -245,6 +305,7 @@ mod tests {
     fn sweep_distinguishes_configs() {
         let rec = Recording {
             question: "q".into(),
+            reviewers: vec![],
             marks: vec![
                 propose(0, 10, 1),
                 endorse(0, 11, 1),
@@ -280,6 +341,7 @@ mod tests {
     fn fast_decay_prevents_convergence() {
         let rec = Recording {
             question: "q".into(),
+            reviewers: vec![],
             marks: vec![
                 propose(0, 10, 1),
                 endorse(2_000, 11, 1), // 2s later
@@ -332,6 +394,7 @@ mod tests {
         };
         let rec = Recording {
             question: "q".into(),
+            reviewers: vec![],
             marks: vec![
                 propose(0, 10, 1),
                 propose(0, 20, 2),
@@ -359,6 +422,7 @@ mod tests {
     fn mark_order_changes_outcome() {
         let endorse_first = Recording {
             question: "q".into(),
+            reviewers: vec![],
             marks: vec![
                 propose(0, 10, 1),
                 propose(0, 20, 2),
@@ -368,7 +432,7 @@ mod tests {
                 inhibit(0, 11, 2),
             ],
         };
-        let r = replay(&endorse_first, QuorumConfig::default());
+        let r = replay(&endorse_first, legacy_config());
         assert_eq!(
             r.converged_on,
             Some(uid(1)),
@@ -380,11 +444,47 @@ mod tests {
     fn recording_round_trips_through_json() {
         let rec = Recording {
             question: "hooks?".into(),
+            reviewers: vec![RecordedReviewer {
+                agent_id: uid(10),
+                correlation_group: "provider:model".into(),
+                reliability_prior: 0.75,
+            }],
             marks: vec![propose(0, 10, 1), endorse(12, 11, 1), inhibit(30, 20, 1)],
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: Recording = serde_json::from_str(&json).unwrap();
         assert_eq!(back.marks, rec.marks);
+        assert_eq!(back.reviewers, rec.reviewers);
         assert_eq!(back.question, rec.question);
+    }
+
+    #[test]
+    fn sequential_replay_reports_the_stopping_basis() {
+        let reviewers = [10, 11, 12, 20]
+            .into_iter()
+            .map(|agent| RecordedReviewer {
+                agent_id: uid(agent),
+                correlation_group: format!("independent-{agent}"),
+                reliability_prior: 0.75,
+            })
+            .collect();
+        let rec = Recording {
+            question: "q".into(),
+            reviewers,
+            marks: vec![
+                propose(0, 10, 1),
+                propose(0, 20, 2),
+                endorse(0, 11, 1),
+                endorse(0, 12, 1),
+            ],
+        };
+
+        let result = replay(&rec, QuorumConfig::default());
+        assert_eq!(result.converged_on, Some(uid(1)));
+        assert_eq!(
+            result.convergence_basis,
+            Some(ConvergenceBasis::EvidenceBound)
+        );
+        assert_eq!(result.force_resolved, None);
     }
 }

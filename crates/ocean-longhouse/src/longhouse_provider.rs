@@ -266,6 +266,7 @@ impl AgentTool for ConveneTool {
             "board_id": outcome.board_id,
             "converged": outcome.decision.is_some(),
             "decision": outcome.decision,
+            "convergence_basis": outcome.convergence_basis.map(|basis| basis.as_str()),
             "tallies": outcome.tallies,
             "proposals": proposals,
         });

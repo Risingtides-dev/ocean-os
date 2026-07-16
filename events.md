@@ -3553,6 +3553,22 @@ type:      [gh actions]: publish Longhouse turn preparation extraction
 area:      [backend]: ocean-daemon Phase 2C advisory turn seam
 
 PR #299 merged the reviewed Longhouse turn-preparation extraction as `9095d5a` after hosted run `29475103379` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, corrected the final rustfmt-expanded module size from the pre-format 239-line estimate to the actual 246 lines, and advanced the next bounded wave to separately manifested Longhouse governance. Delegated loader path logs, unsanitized advisory text, uncancelled timed-out work/cache-lock amplification, and the librarian symlink-retarget finding remain separate; live daemon deployment/supervision remains outside this workstream.
+time:      [00:14] [16-07-26]
+agent:     [codex], [gpt-5], [primary]
+worktree:  [main]
+type:      [feature-request]: replace redundant sigmoid quorum with sequential evidence
+area:      [backend]: ocean-longhouse convergence and council spending
+
+Replaced the algebraically redundant sigmoid quorum path with validated correlation-aware sequential evidence as the Longhouse default. Daemon-owned reviewer reliability priors become log-likelihood evidence, exact provider/model replicas share a capped group budget, and convergence now records an evidence-error or value-of-information cost basis. Later-round reviewers are queried sequentially with distinct model groups first so stopping avoids the next provider call; unresolved sequential topics abort at the deadline instead of manufacturing a winner. Legacy net-weight quorum remains explicit compatibility behavior. Replay recordings and `lh-tune` now preserve and sweep reviewer correlation metadata, and the source-backed Longhouse docs and crate ownership index describe the shipped contract.
+_________________________________________________________________________________
+
+time:      [00:24] [16-07-26]
+agent:     [codex], [gpt-5], [primary]
+worktree:  [main]
+type:      [test]: verify sequential-evidence Longhouse integration
+area:      [testing]: quorum math, daemon response, workspace, and docs gates
+
+Semantic review found and corrected a default reachability edge: with three proposals and two independent model groups, a `1.0` cap could not reach the `0.80` posterior target. The default cap now exactly matches one `0.75` reviewer's `ln(3)` evidence, and regressions prove both duplicate-family conservation and convergence for the real three-seat/two-group roster shape. `cargo test -p ocean-longhouse` passed with 124 tests and one ignored, all 320 daemon tests passed, the replay tuner demo converged with an explicit `evidence_bound` basis, workspace test compilation passed, and formatting, docs, and diff checks passed.
 _________________________________________________________________________________
 time:      [05:38am 15-07-26]
 agent:     [api worker], [gpt-5]

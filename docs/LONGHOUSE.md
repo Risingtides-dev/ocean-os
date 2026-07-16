@@ -32,7 +32,7 @@ Longhouse is the canonical place for:
 4. **Skills** — compact, task-specific capability briefs that can be injected into the main Ocean agent.
 5. **Data/memory coordination** — discovers and stages relevant local `ocean-memory` and shared Bedrock knowledge without taking storage ownership.
 6. **Advisory preparation/spec assembly** — compact recommendations that extensions may consume; Longhouse does not spawn or manage general subagents.
-7. **Quorum/council workflows** — bounded multi-model propose → endorse/inhibit → converge flows with deterministic quorum arithmetic.
+7. **Quorum/council workflows** — bounded multi-model propose → endorse/inhibit flows with correlation-capped sequential evidence and cost-sensitive stopping.
 
 ## Deployment modes
 
@@ -174,7 +174,8 @@ Core remains responsible only for generic permission-gated turns, cancellation, 
 
 `crates/ocean-longhouse` is a Rust crate. It already contains:
 
-- deterministic quorum logic in `quorum.rs`,
+- deterministic stance/latching logic in `quorum.rs`,
+- validated correlation-aware sequential evidence in `evidence.rs`,
 - cheap-model single-turn workers using the existing Ocean provider stack in `agent.rs`,
 - real council flow in `convene.rs`,
 - replay/tuning support in `replay.rs` and `lh-tune`.
@@ -199,14 +200,26 @@ boundary.
 
 ## Built vs unbuilt — current quorum and governance status
 
-The `QuorumEngine` and real council path are shipped and unit-tested:
-per-worker-deduplicated endorse−inhibit tallies, time-decay, cross-inhibition,
-configurable threshold, margin-gated convergence, and seeded tie-break. Shipped
-execution bounds are the council deadline, maximum deliberation rounds, a
-45-second timeout per model call, and a 512-token output cap per model call.
-There is no aggregate per-topic token accounting or token ceiling yet.
-`convene.rs` staffs a real mixed-model council, grants a firekeeper to the
-winning proposer, and emits `Converged`/`Aborted`.
+The `QuorumEngine` and real council path are shipped and unit-tested. The default
+rule converts daemon-owned reviewer reliability priors into log-likelihood evidence,
+caps total evidence by resolved `provider:model` correlation group, normalizes the
+proposal field, and stops on either a configured posterior-error target or a
+cost-sensitive value-of-information bound. Exact model replicas therefore cannot
+multiply their evidence merely by occupying more seats. Model self-confidence is not
+used, and the posterior is conditional on configured priors rather than claimed as
+empirically calibrated. Per-worker stance deduplication, time-decay, and
+cross-inhibition remain active;
+raw net-weight threshold/margin/seeded-deadline behavior remains an explicit legacy
+compatibility rule.
+
+Later-round calls are issued sequentially, independent groups first, and the engine is
+evaluated after every returned mark so a stopping decision avoids the next provider
+call. An unresolved sequential topic aborts at its deadline instead of forcing a winner.
+Shipped execution bounds also include maximum deliberation rounds, a 45-second timeout
+per model call, and a 512-token output cap per model call. There is no aggregate
+per-topic token accounting or token ceiling yet. `convene.rs` grants a firekeeper only
+after the engine has a decision and emits `Converged`/`Aborted`. Replay recordings now
+carry reviewer correlation metadata so the evidence path is reproducible offline.
 
 Later governance work is mixed. Use the explicit **BUILT** and unbuilt labels
 below:
@@ -267,9 +280,11 @@ below:
   remain future work.
 - **Validator process-veto** and the **subsidiarity escalation predicate** (most
   things should never convene a council at all) — still stubbed.
-- **Sybil hardening.** Credential conservation for extension-owned workers,
-  generalized self-renewal prevention, and validator veto are not built.
-  Longhouse does not own worker spawning.
+- **Sybil hardening.** Exact resolved provider/model replicas are now
+  correlation-capped inside live councils. Conserved credentials for
+  extension-owned workers, learned cross-model correlation, generalized
+  self-renewal prevention, and validator veto are not built. Longhouse does not
+  own worker spawning.
 
 The convergence engine, the unforgeable `claim_outcome` gate (OCEAN-229), and
 the persisted escrow trio (OCEAN-246) are real code. The remaining anti-capture

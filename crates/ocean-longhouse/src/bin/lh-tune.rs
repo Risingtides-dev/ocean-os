@@ -4,8 +4,8 @@
 //! A recording is the JSON mark-stream captured from a real council
 //! (`ConveneOutcome::recording`, serialized). Replaying it under many configs is
 //! instant and free — no LLM calls, fully deterministic — so you can see at a
-//! glance which threshold / margin / decay makes the SAME council converge
-//! eagerly, deadlock, or split.
+//! glance which evidence target / correlation cap / query cost / decay makes
+//! the SAME council converge, continue, or split.
 //!
 //! Usage:
 //!   lh-tune <recording.json>           # sweep the built-in grid
@@ -19,7 +19,10 @@
 use std::process::ExitCode;
 
 use ocean_longhouse::quorum::{QuorumConfig, QuorumRule};
-use ocean_longhouse::replay::{replay, RecordedMark, RecordedMarkKind, Recording, ReplayResult};
+use ocean_longhouse::replay::{
+    replay, RecordedMark, RecordedMarkKind, RecordedReviewer, Recording, ReplayResult,
+};
+use ocean_longhouse::SequentialEvidenceConfig;
 use uuid::Uuid;
 
 fn main() -> ExitCode {
@@ -76,15 +79,16 @@ fn print_header(rec: &Recording) {
     );
     let span = rec.marks.last().map(|m| m.at_ms).unwrap_or(0);
     println!("  span:    {span} ms");
+    println!("  reviewer credentials: {}", rec.reviewers.len());
     println!();
 }
 
 fn print_table(rows: &[(QuorumConfig, ReplayResult)]) {
     println!(
-        "  {:<26} {:>8} {:>9} {:>10}  outcome",
-        "config", "conv@", "winner", "lead net"
+        "  {:<26} {:>8} {:>9} {:>10} {:>16}  outcome",
+        "config", "conv@", "winner", "lead net", "basis"
     );
-    println!("  {}", "─".repeat(72));
+    println!("  {}", "─".repeat(90));
     for (cfg, res) in rows {
         let conv = res
             .converged_after_marks
@@ -105,12 +109,17 @@ fn print_table(rows: &[(QuorumConfig, ReplayResult)]) {
             (None, Some(_)) => "deadline-resolved",
             (None, None) => "SPLIT",
         };
+        let basis = res
+            .convergence_basis
+            .map(|basis| basis.as_str())
+            .unwrap_or("—");
         println!(
-            "  {:<26} {:>8} {:>9} {:>10}  {}",
+            "  {:<26} {:>8} {:>9} {:>10} {:>16}  {}",
             describe_config(cfg),
             conv,
             winner,
             lead,
+            basis,
             outcome
         );
     }
@@ -120,47 +129,50 @@ fn print_table(rows: &[(QuorumConfig, ReplayResult)]) {
 fn print_legend() {
     println!("  conv@   = first mark that crossed quorum mid-stream (— = never)");
     println!("  winner  = converged proposal, or the deadline force-resolve pick");
+    println!("  basis   = exact daemon stopping condition");
     println!("  outcome = converged (mid-stream) / deadline-resolved / SPLIT (no leader)");
     println!();
     println!("  Tuning read:");
-    println!("   • lots of 'mark 1-2' converges → cutoff too LOW (converges on noise)");
-    println!("   • lots of '—' / SPLIT          → cutoff too HIGH (deadlocks)");
-    println!("   • the sweet spot converges mid-stream but only after real support forms");
+    println!("   - lots of 'mark 1-2' converges -> evidence/cost bound too loose");
+    println!("   - lots of '—' / SPLIT          -> evidence/cost bound too strict");
+    println!("   - compare correlated recordings; duplicate models must not add mass");
     println!();
 }
 
-/// The starting tuning grid: cutoff × margin × decay, plus a couple sigmoids.
-/// This is the knob-space — edit freely to explore a specific recording.
+/// The starting tuning grid: evidence error × group cap × query cost × decay,
+/// plus a small legacy net-weight baseline for comparison.
 fn build_grid() -> Vec<QuorumConfig> {
     let mut grid = Vec::new();
-    let cutoffs = [1.5f32, 2.0, 2.5, 3.0, 4.0];
-    let margins = [0.5f32, 1.0, 1.5];
     let ttls = [30_000i64, 60_000, 120_000];
+    let default_cap = SequentialEvidenceConfig::default().correlation_cap();
 
-    for &cutoff in &cutoffs {
-        for &margin in &margins {
-            for &ttl in &ttls {
-                grid.push(QuorumConfig {
-                    rule: QuorumRule::NetWeight { cutoff, margin },
-                    mark_ttl_ms: ttl,
-                    tie_break_seed: 0xC0FFEE,
-                });
+    for &target_error in &[0.10, 0.20] {
+        for &correlation_cap in &[0.80, default_cap] {
+            for &query_cost in &[0.0, 0.02, 0.10] {
+                for &ttl in &ttls {
+                    if let Ok(evidence) = SequentialEvidenceConfig::new(
+                        target_error,
+                        0.75,
+                        correlation_cap,
+                        query_cost,
+                        1.0,
+                    ) {
+                        grid.push(QuorumConfig {
+                            rule: QuorumRule::SequentialEvidence(evidence),
+                            mark_ttl_ms: ttl,
+                            tie_break_seed: 0xC0FFEE,
+                        });
+                    }
+                }
             }
         }
     }
-    // A few sigmoid responses for comparison.
-    for &steepness in &[2.0f32, 4.0] {
-        for &midpoint in &[2.0f32, 3.0] {
-            grid.push(QuorumConfig {
-                rule: QuorumRule::Sigmoid {
-                    midpoint,
-                    steepness,
-                    margin: 1.0,
-                },
-                mark_ttl_ms: 60_000,
-                tie_break_seed: 0xC0FFEE,
-            });
-        }
+    for &(cutoff, margin) in &[(2.0, 1.0), (3.0, 1.0)] {
+        grid.push(QuorumConfig {
+            rule: QuorumRule::NetWeight { cutoff, margin },
+            mark_ttl_ms: 60_000,
+            tie_break_seed: 0xC0FFEE,
+        });
     }
     grid
 }
@@ -170,11 +182,12 @@ fn describe_config(cfg: &QuorumConfig) -> String {
         QuorumRule::NetWeight { cutoff, margin } => {
             format!("net c={cutoff:.1} m={margin:.1}")
         }
-        QuorumRule::Sigmoid {
-            midpoint,
-            steepness,
-            margin,
-        } => format!("sig μ={midpoint:.1} k={steepness:.0} m={margin:.1}"),
+        QuorumRule::SequentialEvidence(evidence) => format!(
+            "seq e={:.2} cap={:.2} c={:.2}",
+            evidence.target_error(),
+            evidence.correlation_cap(),
+            evidence.query_cost()
+        ),
     };
     format!("{rule} ttl={}s", cfg.mark_ttl_ms / 1000)
 }
@@ -207,6 +220,33 @@ fn demo_recording() -> Recording {
     let (a1, a2, a3, b1, b2) = (uid(10), uid(11), uid(12), uid(20), uid(21));
     Recording {
         question: "What 3 TikTok hooks to test for an indie-pop launch?".into(),
+        reviewers: vec![
+            RecordedReviewer {
+                agent_id: a1,
+                correlation_group: "provider:model-a".into(),
+                reliability_prior: 0.75,
+            },
+            RecordedReviewer {
+                agent_id: a2,
+                correlation_group: "provider:model-b".into(),
+                reliability_prior: 0.75,
+            },
+            RecordedReviewer {
+                agent_id: a3,
+                correlation_group: "provider:model-d".into(),
+                reliability_prior: 0.75,
+            },
+            RecordedReviewer {
+                agent_id: b1,
+                correlation_group: "provider:model-c".into(),
+                reliability_prior: 0.75,
+            },
+            RecordedReviewer {
+                agent_id: b2,
+                correlation_group: "provider:model-c".into(),
+                reliability_prior: 0.75,
+            },
+        ],
         marks: vec![
             RecordedMark {
                 at_ms: 0,

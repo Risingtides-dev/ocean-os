@@ -2,7 +2,7 @@
 
 **Status:** Current implementation reference plus explicitly labeled target boundaries
 
-**Updated:** 2026-07-14
+**Updated:** 2026-07-15
 
 **Primary code:** `crates/ocean-longhouse`, `crates/ocean-daemon/src/main.rs`
 
@@ -22,7 +22,7 @@ guide for the current HTTP quick reference.
 
 | Layer | Shipped responsibility |
 | --- | --- |
-| `ocean-longhouse` | Council model calls, quorum arithmetic, in-memory topic projection, replay/tuning, advisory preparation, title/escrow primitives, and two permission-gated capability tools |
+| `ocean-longhouse` | Council model calls, correlation-aware sequential evidence, legacy net-weight quorum, in-memory topic projection, replay/tuning, advisory preparation, title/escrow primitives, and two permission-gated capability tools |
 | `ocean-daemon` | HTTP composition, event-bus publication, shared Longhouse registry, persisted title storage, board/claim/revoke/recall/breach handlers, and model-readiness validation on the explicit HTTP convene roster |
 | `ocean-runtime` | Generic capability execution, permission gates, cancellation, and tool events |
 | Extensions | General subagent roles, prompts, worker policy, dispatch, budgets, lifecycle, joins, and orchestration |
@@ -63,7 +63,8 @@ Both report `requires_permission() == true`. `longhouse__convene` accepts model 
 directly; `convene` skips aliases that cannot resolve or lack credentials, so this path
 may run a partial council. It folds events into the shared in-memory registry but does
 not publish them to the daemon event bus. Its result includes topic, proposal, tally,
-and decision data; it does not grant or return a persisted firekeeper title/token.
+decision, and convergence-basis data; it does not grant or return a persisted
+firekeeper title/token.
 
 `board_post`, `claim_outcome`, revocation, recall, and breach are daemon HTTP handlers,
 not `LonghouseProvider` tools.
@@ -94,6 +95,12 @@ a registry-issued scarce credential.
 deduplicates repeated messages from the same worker ID, but it does not prevent an
 extension or caller from introducing additional identities. Conserved child credentials
 remain future work.
+
+Live convening also registers each worker under its resolved `provider:model` identity.
+Workers in the same group share one capped log-likelihood evidence budget, so the two
+default DeepSeek seats cannot manufacture two independent signals. This is correlation
+control, not identity conservation: a caller can still introduce other identities or
+models, and partial correlation between different model IDs is not learned automatically.
 
 ### Topic projection is in memory
 
@@ -129,16 +136,32 @@ endorse/inhibit rounds.
 - Later-round prompts receive a stable numbered list of proposal texts, with each text
   truncated to 220 characters. They do not receive a raw transcript or a complete
   evidence/quorum-distance projection.
-- Endorse and inhibit calls currently use unit weight. Cross-inhibition subtracts that
-  unit stance from a proposal's net support; it is not size-scaled.
+- Endorse and inhibit calls use unit raw stance weight. In the default sequential rule,
+  the daemon converts the configured reviewer reliability prior to log-likelihood ratio
+  evidence, then caps the total absolute evidence contributed by each correlation group.
+  The default prior is `0.75` and the default group cap is the matching `ln(3)`
+  (approximately `1.099`), so any number of exact replicas receives one default
+  reviewer's evidence budget. The prior is daemon-owned configuration, never
+  model-reported confidence. Legacy `NetWeight` mode still uses raw tallies.
 - A worker's newer stance replaces its prior stance and refreshes its timestamp.
   Unreasserted stances decay; repeatedly reasserted stances do not fade automatically.
+- The default rule normalizes proposal evidence with softmax and stops when either the
+  leader's posterior error is at most `0.20`, or the upper bound on expected value of
+  perfect information (`decision_loss * posterior_error`) is no greater than the next
+  query cost. The default cost/loss units are `0.02` and `1.0`. This posterior is
+  conditional on the configured priors and group assumptions; it is not claimed as an
+  empirically calibrated real-world error rate until outcome learning exists.
+- Later-round reviewers are queried sequentially, with one worker from every distinct
+  provider/model group before correlated replicas. The engine is evaluated after every
+  returned mark, so reaching either stopping bound avoids spending the next model call.
+  Proposal calls remain concurrent because the field needs candidate alternatives first.
 - `max_rounds` bounds the number of deliberation rounds.
 - Each model call has a 45-second timeout and a 512-token output cap.
-- `deadline_ms` is checked before later rounds and while returned votes are consumed.
+- `deadline_ms` is checked before later rounds and before each later-round query.
   It is not an independent timer and does not preempt a model call already in progress.
-- After the loop, pending quorum is force-resolved using the configured deterministic
-  tie behavior or emits an abort when resolution fails.
+- After the loop, pending sequential evidence emits `Timeout` or `Split`; a deadline is
+  not treated as evidence and never chooses an unsupported proposal. Explicit legacy
+  `NetWeight` mode retains deterministic clear-leader and seeded tie resolution.
 
 There is no aggregate per-topic token accounting or token-cost ceiling. The shipped
 controls bound round count, individual call duration/output, and the council control
@@ -171,6 +194,8 @@ The following are target concepts, not current behavior:
 - aggregate per-topic token accounting;
 - successor-session rebinding and template-level quarantine;
 - vote-synchrony detection;
+- learned reliability calibration and partial-correlation estimation across different
+  provider/model groups;
 - cross-daemon/federated quorum weighting;
 - coupling title recall to request/turn cancellation.
 
@@ -199,6 +224,7 @@ Stable source anchors:
 
 - `crates/ocean-longhouse/src/agent.rs`
 - `crates/ocean-longhouse/src/convene.rs`
+- `crates/ocean-longhouse/src/evidence.rs`
 - `crates/ocean-longhouse/src/quorum.rs`
 - `crates/ocean-longhouse/src/registry.rs`
 - `crates/ocean-longhouse/src/longhouse_provider.rs`

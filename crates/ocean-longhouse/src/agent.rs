@@ -43,6 +43,13 @@ impl ModelHandle {
         &self.model.id
     }
 
+    /// Durable correlation identity used by the Longhouse evidence engine.
+    /// Replicas routed to the same provider/model share one evidence budget,
+    /// even when the roster gave them different display labels.
+    pub fn correlation_group(&self) -> String {
+        format!("{}:{}", self.model.provider, self.model.id)
+    }
+
     /// Whether a usable credential was found for this model.
     pub fn has_credential(&self) -> bool {
         self.api_key.is_some()

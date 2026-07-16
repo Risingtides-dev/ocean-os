@@ -4,9 +4,9 @@
 //! This crate turns the *scripted* longhouse demo (a daemon endpoint that emits
 //! fake `LonghouseEvent`s on a timer) into a **real** council:
 //!
-//! * a pure, daemon-computed [`QuorumEngine`](quorum::QuorumEngine) that counts
-//!   credential-weighted, time-decaying, cross-inhibiting marks and decides when
-//!   a proposal crosses quorum — **never an LLM**; and
+//! * a pure, daemon-computed [`QuorumEngine`](quorum::QuorumEngine) that combines
+//!   time-decaying stances with correlation-capped sequential evidence and
+//!   cost-sensitive stopping — **never an LLM**; and
 //! * a [`convene`](convene::convene) flow that staffs a council with real LLM
 //!   workers on **cheap** models (deepseek + kimi), runs a two-round propose →
 //!   endorse/inhibit protocol, feeds every mark to the engine, and emits the
@@ -20,7 +20,8 @@
 //!       ▲
 //!       │  (this crate depends UP, never down)
 //! ocean-longhouse
-//!   ├── quorum.rs    QuorumEngine — PURE Rust, no LLM, fully unit-tested
+//!   ├── evidence.rs  sequential evidence + stopping — PURE Rust
+//!   ├── quorum.rs    stance field + decision latch — PURE Rust
 //!   ├── agent.rs     ModelHandle — one cheap-model turn via stream_simple
 //!   └── convene.rs   convene() — orchestrates rounds, feeds the engine, emits events
 //!       ▲
@@ -28,7 +29,7 @@
 //! ocean-daemon      POST /v1/longhouse/convene → streams events on /v1/agent/events
 //! ```
 //!
-//! The engine **counts**; LLMs only **produce** marks. That is the whole point:
+//! The engine **decides**; LLMs only **produce** marks. That is the whole point:
 //! convergence is deterministic arithmetic the daemon owns and can fully test
 //! without any model in the loop (see the unit tests in [`quorum`]).
 
@@ -36,6 +37,7 @@ pub mod agent;
 pub mod config;
 pub mod convene;
 pub mod escrow;
+pub mod evidence;
 pub mod longhouse_provider;
 pub mod prepare;
 pub mod quorum;
@@ -54,6 +56,10 @@ pub use escrow::{
     EscrowState, PersistedTitle, PolicyBreachLedger, Revocation, RevokeAuthorization, RevokeError,
     Revoker, RevokerKey, SqliteTitleRegistry, TitleStatus, TitleVerifier, TriggerRefused,
 };
+pub use evidence::{
+    ConvergenceBasis, EvidenceConfigError, EvidenceSnapshot, ProposalEvidence, ReviewerCredential,
+    SequentialEvidenceConfig,
+};
 pub use longhouse_provider::{LonghouseProvider, LonghouseRegistryHandle};
 pub use prepare::{
     cached_index, cached_index_for, cached_workflows_for, clear_index_cache, clear_workflow_cache,
@@ -65,7 +71,9 @@ pub use quorum::{
     QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule, RecallOutcome, RecallVote,
 };
 pub use registry::{LonghouseRegistry, TopicSnapshot, TopicState};
-pub use replay::{replay, sweep, RecordedMark, RecordedMarkKind, Recording, ReplayResult};
+pub use replay::{
+    replay, sweep, RecordedMark, RecordedMarkKind, RecordedReviewer, Recording, ReplayResult,
+};
 pub use subagent::{
     assemble_spec, ModelPolicy, SubagentRequest, SubagentSpec, DEFAULT_BUDGET_TOKENS,
     DEFAULT_MAX_TURNS, DEFAULT_SKILL_COUNT,
