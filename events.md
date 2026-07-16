@@ -3849,3 +3849,27 @@ area:      [backend]
 
 Recovered TASK-9 from the abandoned partial worktree and completed the persistent-room named-agent binding seam. Agent joins now reject unresolved folder definitions; mention handling resolves before any room_trigger/auto-convene footprint and records only an honest System note for legacy phantoms; execution re-resolves and applies the AgentDef instructions, model, tool allowlist, and subprocess capabilities while preserving cwd, permission, YOLO, decision-token, and tool posture. The shared Result-based resolver preserves valid all-None data-only definitions and the non-room turn remains fail-open. Added four adjacent handler-path tests. Targeted tests, daemon check, ocean-core (24) and ocean-store (38) tests, and daemon Clippy passed; the full daemon run passed 357/358 after updating the source-order assertion, with the pre-existing host-sensitive Longhouse inspect candidate-count assertion still failing (expected 2, observed 6).
 _________________________________________________________________________________
+time:      [07:38] [16-07-26]
+agent:     [pi] [gpt-5.6] [worker]
+worktree:  [feat/rooms-sse-g1] /private/tmp/ocean-rooms-task10
+type:      [feature-request]
+area:      [backend]
+
+TASK-10 committed as 822e7558: `/v1/rooms/persistent/{key}/events` is now an open, non-call room SSE tail over the existing SQLite transcript rows and per-room seq, with numeric Last-Event-ID precedence, bounded replay, subscribe-before-replay, post-commit wake hints, and durable gap/Lagged recovery. Join/leave markers, human posts, auto-convene audits, agent replies, and failed-turn audits publish after commit; no event table or UUID message schema was added. Added store marker-return coverage and nine daemon SSE tests covering exact wire frames, two-subscriber latency/order, reconnect, room isolation, roster/audit delivery, replay/live seam, forced bounded-channel lag recovery, and typed rejections. Store passed 39/39; daemon passed 366 tests with the one unrelated host-sensitive Longhouse inspect test skipped after reproducing its expected-2/observed-6 failure unchanged on main 8dfe99bb; workspace check, store+daemon Clippy -D warnings, fmt, docs-check, and diff-check passed. Commit remains local and unpushed.
+_________________________________________________________________________________
+time:      [07:48] [16-07-26]
+agent:     [pi] [gpt-5.6-sol]
+worktree:  [feat/rooms-sse-g1] /private/tmp/ocean-rooms-task10
+type:      [bug report]
+area:      [backend]
+
+Closed TASK-10's async lifecycle review blocker: room SSE tail tasks now select downstream receiver closure against both the replay/live test seam and the idle broadcast wake wait, releasing retained AppState and broadcast receivers immediately when HTTP clients disconnect. Added regression coverage for disconnects during the paused seam and ordinary idle live wait; targeted test, daemon check, denied-warning Clippy, room tests, and docs-check passed.
+_________________________________________________________________________________
+time:      [07:50] [16-07-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [review]
+area:      [testing]
+
+Refined and merged TASK-10 after finding one async lifecycle blocker in the initial SSE tail: idle client disconnects did not wake `run_room_tail`, stranding its task, AppState, and broadcast receiver. Pi's narrow `tx.closed()` select fix and two-state regression passed Fable's re-gate and independent Codex verification. Tail tests passed 7/7, endpoint tests 3/3, store tests 39/39, workspace check, denied-warning Clippy, fmt, docs-check, and diff-check passed. Fast-forwarded commits 822e7558 and b74b3ffc onto main; live daemon acceptance remains the close gate.
+_________________________________________________________________________________
