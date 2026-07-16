@@ -3342,3 +3342,18 @@ Verification:
 - all 341 daemon tests passed
 - `cargo check --workspace --tests`, `cargo fmt --all`, `cargo xtask docs-check`, and `git diff --check` passed
 - fresh async/protocol review found no correctness or compatibility issue; fresh metrics/privacy review's provider-error logging blocker was fixed, with its two requested regression gaps closed
+_________________________________________________________________________________
+
+time:      [07:56pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  /tmp/ocean-advisor-bounds-20260715
+type:      [ci fix]: restore denied-warning compliance for advisor execution
+area:      [backend]: ocean-daemon advisor helper signature
+
+Hosted macOS and Ubuntu repository gates caught `clippy::too_many_arguments` on the new advisor executor after PR #289 merged; the Rust 1.88 and cargo-deny lanes had passed. Grouped the timeout and completed-turn review inputs into `AdvisorInput`, preserving the exact two-permit, 30-second, attribution, privacy, and fail-open behavior while removing the lint instead of suppressing it.
+
+Verification:
+- `cargo test -p ocean-daemon advisor -- --nocapture` passed
+- `cargo clippy --workspace --all-targets -- -D warnings` passed
+- `cargo fmt --all`, `cargo xtask docs-check`, and `git diff --check` passed
+_________________________________________________________________________________
