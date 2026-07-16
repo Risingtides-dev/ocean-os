@@ -370,13 +370,45 @@ where
     // duplicate answer mutates the engine. No merge operation exists; the
     // correlation cap guards echo chambers through the existing endorse math,
     // unchanged.
+    // TASK-8 layers on top: a closed conservative validity filter drops the
+    // observed meta-leak shapes with zero mutation, and structured `ANSWER:`
+    // keys consolidate KEY-to-KEY (the discriminating signal live prose
+    // Jaccard could not provide) while unstructured answers keep the TASK-7
+    // path. Compliance counters are traced so the structured-contract
+    // hit-rate is measurable from live runs — the design's first gate.
     let mut registration_order: Vec<Uuid> = Vec::new();
-    for (idx, answer) in proposal_results {
-        let Some(answer) = answer else { continue };
+    let mut proposal_keys: HashMap<Uuid, Option<String>> = HashMap::new();
+    // Compliance counters classify EVERY returned answer up front, independent
+    // of the registration loop's engine early-exit, so the measurement gate
+    // sees the true structured-contract hit-rate even when the field
+    // converges before all answers register.
+    let returned: Vec<(usize, String)> = proposal_results
+        .into_iter()
+        .filter_map(|(idx, answer)| answer.map(|answer| (idx, answer)))
+        .collect();
+    emit_compliance_trace(topic_id, "round1", &returned, &req.question);
+    for (idx, answer) in returned {
         let w = &workers[idx];
         let now = clock.now_ms();
 
-        let duplicate_of = find_duplicate_canonical(&registration_order, &proposals, &answer);
+        if let Some(reason) = rejected_meta_leak(&answer, &req.question) {
+            tracing::warn!(
+                topic = %topic_id,
+                worker = %w.agent_id,
+                reason,
+                "longhouse round-1 proposal rejected by validity filter; worker remains rival-eligible"
+            );
+            continue;
+        }
+        let key = structured_answer_key(&answer);
+
+        let duplicate_of = find_duplicate_canonical(
+            &registration_order,
+            &proposals,
+            &proposal_keys,
+            key.as_ref(),
+            &answer,
+        );
         if let Some(canonical) = duplicate_of {
             engine.endorse(canonical, w.agent_id, None, now);
             recorded.push(RecordedMark {
@@ -413,6 +445,7 @@ where
             },
         });
         proposals.insert(proposal_id, answer.clone());
+        proposal_keys.insert(proposal_id, key);
         registration_order.push(proposal_id);
         proposal_by_author.insert(w.agent_id, proposal_id);
 
@@ -575,13 +608,42 @@ where
                                     .collect();
                                 budget_remaining -= prompts.len() as f64;
                                 let results = run_round(&workers, prompts, RIVAL_SYSTEM).await;
+                                let returned: Vec<(usize, String)> = results
+                                    .into_iter()
+                                    .filter_map(|(idx, answer)| answer.map(|a| (idx, a)))
+                                    .collect();
+                                emit_compliance_trace(topic_id, "rival", &returned, &req.question);
                                 let mut landed = false;
-                                for (idx, answer) in results {
-                                    let Some(answer) = answer else { continue };
-                                    if !is_distinct_rival(&answer, &proposals) {
+                                for (idx, answer) in returned {
+                                    let w = &workers[idx];
+                                    // TASK-8: rivals share round-1's validity
+                                    // filter and parser/equivalence path — a
+                                    // key matching any registered hypothesis
+                                    // (exact-first, long-key similarity) is
+                                    // not a rival, and unstructured rivals
+                                    // keep the TASK-7 similarity check.
+                                    if let Some(reason) = rejected_meta_leak(&answer, &req.question)
+                                    {
+                                        tracing::warn!(
+                                            topic = %topic_id,
+                                            worker = %w.agent_id,
+                                            reason,
+                                            "longhouse rival rejected by validity filter"
+                                        );
                                         continue;
                                     }
-                                    let w = &workers[idx];
+                                    let key = structured_answer_key(&answer);
+                                    let duplicates_registered = match &key {
+                                        Some(new) => proposal_keys.values().any(|existing| {
+                                            existing
+                                                .as_ref()
+                                                .is_some_and(|existing| keys_match(new, existing))
+                                        }),
+                                        None => !is_distinct_rival(&answer, &proposals),
+                                    };
+                                    if duplicates_registered {
+                                        continue;
+                                    }
                                     let proposal_id = Uuid::new_v4();
                                     let now = clock.now_ms();
                                     engine.propose(proposal_id, w.agent_id, now);
@@ -593,6 +655,7 @@ where
                                         },
                                     });
                                     proposals.insert(proposal_id, answer.clone());
+                                    proposal_keys.insert(proposal_id, key);
                                     proposal_by_author.insert(w.agent_id, proposal_id);
                                     emit(LonghouseEvent::MarkPosted {
                                         topic_id,
@@ -1199,11 +1262,14 @@ fn apply_vote<F>(
 }
 
 const ROUND1_SYSTEM: &str =
-    "You are one member of a small council answering a question. Give your single best \
-     answer in ONE short paragraph (max 3 sentences). Be concrete and decisive. Do not \
-     hedge or list multiple options — commit to one answer. If the best answer is the \
-     obvious one others will also give, state it plainly anyway: matching answers are \
-     merged into shared support, never penalized.";
+    "You are one member of a small council answering a question. Reply in EXACTLY this \
+     shape:\n\
+     ANSWER: <your committed choice, in a few words>\n\
+     <then up to 3 sentences of rationale>\n\
+     Be concrete and decisive. Do not hedge or list multiple options — commit to one \
+     answer. If the best answer is the obvious one others will also give, state it \
+     plainly anyway: matching answers are merged into shared support, never penalized. \
+     Never restate the question or describe what you are about to do.";
 
 fn round1_user(question: &str) -> String {
     format!("Question for the council:\n\n{question}\n\nYour proposed answer:")
@@ -1220,8 +1286,10 @@ const ROUND2_SYSTEM: &str =
 const RIVAL_SYSTEM: &str =
     "You are one member of a small council. The board currently holds only ONE proposed \
      answer, and a one-hypothesis field cannot be decided. Propose a GENUINELY DIFFERENT \
-     alternative answer in ONE short paragraph (max 3 sentences). If you truly cannot \
-     offer a distinct alternative, reply with exactly: PASS";
+     alternative answer in EXACTLY this shape:\n\
+     ANSWER: <your committed alternative, in a few words>\n\
+     <then up to 3 sentences of rationale>\n\
+     If you truly cannot offer a distinct alternative, reply with exactly: PASS";
 
 fn rival_user(question: &str, projection: &str) -> String {
     format!(
@@ -1326,20 +1394,194 @@ fn content_tokens(text: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Longest normalized ANSWER key accepted as a committed choice (TASK-8). A
+/// longer "key" means the model dumped prose after `ANSWER:`; such answers
+/// fall through to the unstructured TASK-7 path rather than keying falsely.
+const MAX_ANSWER_KEY_CHARS: usize = 80;
+
+/// TASK-8 structured answer contract: parse the first nonblank line of the
+/// form `ANSWER: <choice>` into a normalized, bounded, nonempty key. Returns
+/// `None` for unstructured answers (TASK-7 similarity remains their path).
+/// Leading markdown directives (bullets, quotes, emphasis) are stripped, one
+/// trailing balanced parenthetical aside is dropped ("IndexedDB (for
+/// transcripts)" keys as "indexeddb"), and negation vocabulary — including
+/// `n't` contractions — survives normalization, so "ANSWER: not IndexedDB"
+/// can never key-match "ANSWER: IndexedDB". Prefix matching is char-based,
+/// never byte-sliced, so non-ASCII model output cannot panic.
+fn structured_answer_key(answer: &str) -> Option<String> {
+    let line = answer.lines().find(|line| !line.trim().is_empty())?;
+    let line = line
+        .trim()
+        .trim_start_matches(|c: char| c.is_whitespace() || "-*>#•_`\"'".contains(c));
+    let mut rest_start = 0usize;
+    let mut chars = line.char_indices();
+    for expected in "answer:".chars() {
+        let (index, actual) = chars.next()?;
+        if actual.to_lowercase().next() != Some(expected) {
+            return None;
+        }
+        rest_start = index + actual.len_utf8();
+    }
+    let key = normalize_answer_key(&line[rest_start..]);
+    // Strip exactly ONE leading choice directive: "ANSWER: Use IndexedDB" and
+    // "ANSWER: IndexedDB" commit to the same choice, and short keys are
+    // deliberately denied similarity matching, so the directive must go here.
+    // Closed list; a non-directive first token is never touched.
+    const CHOICE_DIRECTIVES: &[&str] = &["use", "choose", "select", "adopt", "prefer", "recommend"];
+    let key = match key.split_once(' ') {
+        Some((first, rest)) if CHOICE_DIRECTIVES.contains(&first) => rest.to_owned(),
+        // A directive-only key ("ANSWER: use") strips to empty: nonempty is
+        // required AFTER directive stripping, so it falls through to TASK-7.
+        None if CHOICE_DIRECTIVES.contains(&key.as_str()) => String::new(),
+        _ => key,
+    };
+    (!key.is_empty() && key.chars().count() <= MAX_ANSWER_KEY_CHARS).then_some(key)
+}
+
+/// Plain text normal form: lowercase, collapse every non-alphanumeric run to
+/// a single space. Used by meta-prefix matching and the exact-question-echo
+/// check — deliberately WITHOUT aside stripping or contraction rewriting, so
+/// an "echo" differing from the question by a parenthetical is not treated as
+/// exact.
+fn normalize_text(raw: &str) -> String {
+    raw.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Key normal form: rewrite `n't`/curly-`n’t` contractions to ` not` BEFORE
+/// punctuation loss (so key-scoped negation survives tokenization), drop ONE
+/// trailing balanced parenthetical aside, then apply the plain normal form.
+/// Interior and unbalanced parentheses are left to collapse as punctuation —
+/// only the trailing aside pattern is a rationale-in-the-key.
+fn normalize_answer_key(raw: &str) -> String {
+    let lowered = raw
+        .to_lowercase()
+        .replace("n\u{2019}t", " not")
+        .replace("n't", " not");
+    normalize_text(strip_trailing_aside(lowered.trim()))
+}
+
+/// Strip a single trailing balanced `(...)` aside; anything else is returned
+/// unchanged.
+fn strip_trailing_aside(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    if !trimmed.ends_with(')') {
+        return text;
+    }
+    let mut depth = 0usize;
+    for (index, c) in trimmed.char_indices().rev() {
+        match c {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &trimmed[..index];
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// TASK-8 validity filter — CLOSED and conservative by contract: only the
+/// exact meta-leak shapes observed live (topics fd3617fe, 4daf0476) and a
+/// normalized exact question echo are rejected. Prefixes are the narrow
+/// `... me to` forms — "the user wants offline access, so IndexedDB" is a
+/// legitimate answer and must survive. Anything unrecognized falls through
+/// to registration and produces honest nonconvergence, never a rejection —
+/// a false rejection deletes a genuine hypothesis, which is as bad as a
+/// false merge. Rejection causes zero engine/recording/event mutation and
+/// leaves the worker eligible for the bounded rival pass.
+fn rejected_meta_leak(answer: &str, question: &str) -> Option<&'static str> {
+    const META_PREFIXES: &[(&str, &str)] = &[
+        ("we need to answer", "question_echo_prefix"),
+        ("the user wants me to", "meta_reasoning_leak"),
+        ("the user asks me to", "meta_reasoning_leak"),
+        ("as an ai", "meta_reasoning_leak"),
+    ];
+    let normalized = normalize_text(answer);
+    for (prefix, reason) in META_PREFIXES {
+        if normalized.starts_with(prefix) {
+            return Some(reason);
+        }
+    }
+    if normalized == normalize_text(question) {
+        return Some("question_echo_exact");
+    }
+    None
+}
+
+/// Structured KEY equivalence, shared by round-1 consolidation and the rival
+/// path: exact normalized equality first, then — for keys long enough to
+/// judge — the same conservative TASK-7 similarity (token floor, negation
+/// signature, Jaccard). Short keys never merge on similarity.
+fn keys_match(a: &str, b: &str) -> bool {
+    a == b || answers_are_duplicates(a, b)
+}
+
+/// TASK-8 compliance measurement: classify every RETURNED answer of a phase
+/// (round1 / rival) as structured, fallback (unstructured), or rejected, and
+/// emit one structured trace per phase. This is the design's first acceptance
+/// gate — if live models don't emit `ANSWER:` reliably, the counters say so
+/// regardless of how the registration loop terminated.
+fn emit_compliance_trace(
+    topic_id: Uuid,
+    phase: &'static str,
+    returned: &[(usize, String)],
+    question: &str,
+) {
+    let (mut structured, mut fallback, mut rejected) = (0u32, 0u32, 0u32);
+    for (_, answer) in returned {
+        if rejected_meta_leak(answer, question).is_some() {
+            rejected += 1;
+        } else if structured_answer_key(answer).is_some() {
+            structured += 1;
+        } else {
+            fallback += 1;
+        }
+    }
+    tracing::info!(
+        topic = %topic_id,
+        phase,
+        returned = returned.len(),
+        structured,
+        fallback,
+        rejected,
+        "longhouse ANSWER-contract compliance"
+    );
+}
+
 /// First registered proposal the answer duplicates, in REGISTRATION order —
 /// a `HashMap` scan would pick a process-randomized canonical whenever an
 /// answer clears the threshold against more than one hypothesis.
+///
+/// TASK-8 equivalence path: structured answers compare KEY-to-KEY only
+/// (normalized equality — incidental rationale wording, including negations,
+/// cannot split identical commitments), unstructured answers keep the TASK-7
+/// prose-similarity path, and MIXED structured/unstructured pairs never merge
+/// (safe false split by contract).
 fn find_duplicate_canonical(
     registration_order: &[Uuid],
     proposals: &HashMap<Uuid, String>,
+    proposal_keys: &HashMap<Uuid, Option<String>>,
+    key: Option<&String>,
     answer: &str,
 ) -> Option<Uuid> {
     registration_order
         .iter()
         .find(|id| {
-            proposals
-                .get(id)
-                .is_some_and(|existing| answers_are_duplicates(existing, answer))
+            let existing_key = proposal_keys.get(*id).and_then(|k| k.as_ref());
+            match (key, existing_key) {
+                (Some(new), Some(existing)) => keys_match(new, existing),
+                (None, None) => proposals
+                    .get(id)
+                    .is_some_and(|existing| answers_are_duplicates(existing, answer)),
+                _ => false,
+            }
         })
         .copied()
 }
@@ -2285,13 +2527,16 @@ mod tests {
         let mut proposals = HashMap::new();
         proposals.insert(id_first, first);
         proposals.insert(id_second, second);
+        let mut keys = HashMap::new();
+        keys.insert(id_first, None);
+        keys.insert(id_second, None);
         // Registration order decides, whichever way the map happens to hash.
         assert_eq!(
-            find_duplicate_canonical(&[id_first, id_second], &proposals, &ambiguous),
+            find_duplicate_canonical(&[id_first, id_second], &proposals, &keys, None, &ambiguous),
             Some(id_first)
         );
         assert_eq!(
-            find_duplicate_canonical(&[id_second, id_first], &proposals, &ambiguous),
+            find_duplicate_canonical(&[id_second, id_first], &proposals, &keys, None, &ambiguous),
             Some(id_second)
         );
     }
@@ -2469,6 +2714,370 @@ mod tests {
             has_abort(&events, AbortReason::Split),
             "honest pre-deadline split once review budget is spent"
         );
+    }
+
+    // ---- TASK-8: structured ANSWER contract + validity filter ---------------
+
+    /// Parser and equivalence units: keying is case/punct-insensitive, strips
+    /// parenthetical asides, bounds the key, and never keys prose or blank.
+    #[test]
+    fn structured_answer_parsing_and_key_equivalence() {
+        assert_eq!(
+            structured_answer_key("ANSWER: IndexedDB\nBecause it is right."),
+            Some("indexeddb".to_owned())
+        );
+        assert_eq!(
+            structured_answer_key(
+                "\n  answer:  IndexedDB (for transcript persistence)  \nrationale"
+            ),
+            Some("indexeddb".to_owned())
+        );
+        // Negation is part of the key: an opposite commitment can never match.
+        assert_eq!(
+            structured_answer_key("ANSWER: not IndexedDB\nreason"),
+            Some("not indexeddb".to_owned())
+        );
+        // Unstructured, blank-keyed, and overlong keys fall through to TASK-7.
+        assert_eq!(
+            structured_answer_key("IndexedDB is the right choice."),
+            None
+        );
+        assert_eq!(structured_answer_key("ANSWER:   \nprose"), None);
+        let overlong = format!("ANSWER: {}", "word ".repeat(40));
+        assert_eq!(structured_answer_key(&overlong), None);
+
+        // KEY-to-KEY only: identical keys merge despite divergent, even
+        // negated, rationale; different keys never merge even with identical
+        // rationale; mixed structured/unstructured never merges.
+        let ka = Uuid::new_v4();
+        let kb = Uuid::new_v4();
+        let unstructured = Uuid::new_v4();
+        let mut proposals = HashMap::new();
+        proposals.insert(ka, "ANSWER: IndexedDB\ngreat for writes".to_owned());
+        proposals.insert(kb, "ANSWER: Cache API\ngreat for writes".to_owned());
+        proposals.insert(
+            unstructured,
+            "IndexedDB transactional writes handle transcript persistence with indexed \
+             queries and eviction control"
+                .to_owned(),
+        );
+        let mut keys = HashMap::new();
+        keys.insert(ka, Some("indexeddb".to_owned()));
+        keys.insert(kb, Some("cache api".to_owned()));
+        keys.insert(unstructured, None);
+        let order = vec![ka, kb, unstructured];
+
+        let incidental_not = "ANSWER: IndexedDB\nCache API is NOT designed for this workload.";
+        assert_eq!(
+            find_duplicate_canonical(
+                &order,
+                &proposals,
+                &keys,
+                structured_answer_key(incidental_not).as_ref(),
+                incidental_not,
+            ),
+            Some(ka),
+            "identical keys consolidate despite negated rationale"
+        );
+        let same_rationale_new_key = "ANSWER: localStorage\ngreat for writes";
+        assert_eq!(
+            find_duplicate_canonical(
+                &order,
+                &proposals,
+                &keys,
+                structured_answer_key(same_rationale_new_key).as_ref(),
+                same_rationale_new_key,
+            ),
+            None,
+            "different keys never merge on shared rationale"
+        );
+        // A structured IndexedDB answer must NOT merge into the unstructured
+        // IndexedDB proposal (mixed pair = safe false split).
+        let structured_dup_of_unstructured =
+            "ANSWER: IndexedDB\ntransactional writes handle transcript persistence with \
+             indexed queries and eviction control";
+        assert_eq!(
+            find_duplicate_canonical(
+                &order[2..],
+                &proposals,
+                &keys,
+                structured_answer_key(structured_dup_of_unstructured).as_ref(),
+                structured_dup_of_unstructured,
+            ),
+            None,
+            "mixed structured/unstructured never merges"
+        );
+    }
+
+    /// Validity filter is closed and conservative: the exact live meta-leak
+    /// shapes are rejected; a legitimate answer reusing the question's terms
+    /// is retained; unrecognized weirdness falls through (degradation pin).
+    #[test]
+    fn validity_filter_rejects_only_the_observed_leak_shapes() {
+        let question = "Should offline session transcripts be persisted in IndexedDB or the \
+                        Cache API? Commit to exactly one.";
+        // Live shapes, verbatim from topics fd3617fe and 4daf0476.
+        assert_eq!(
+            rejected_meta_leak(&format!("We need to answer: \"{question}\""), question),
+            Some("question_echo_prefix")
+        );
+        assert_eq!(
+            rejected_meta_leak(
+                "The user wants me to answer a question about transcript storage.",
+                question
+            ),
+            Some("meta_reasoning_leak")
+        );
+        // Normalized exact echo.
+        assert_eq!(
+            rejected_meta_leak(
+                "should offline session transcripts be persisted in indexeddb or the cache \
+                 api?? commit to exactly ONE",
+                question
+            ),
+            Some("question_echo_exact")
+        );
+        // Legitimate answer reusing the question's terms is retained.
+        assert_eq!(
+            rejected_meta_leak(
+                "ANSWER: IndexedDB\nOffline session transcripts need indexed queries, which \
+                 the Cache API cannot provide.",
+                question
+            ),
+            None
+        );
+        // Narrowed prefixes: "the user wants <thing>" is a legitimate answer
+        // shape; only the "... me to" meta forms reject.
+        assert_eq!(
+            rejected_meta_leak(
+                "The user wants offline access, so IndexedDB with transactional writes is \
+                 the right persistence layer.",
+                question
+            ),
+            None
+        );
+        // Degradation pin: unrecognized meta weirdness falls through to
+        // registration (honest nonconvergence), never rejection.
+        assert_eq!(
+            rejected_meta_leak("Let me think about this question carefully.", question),
+            None
+        );
+    }
+
+    /// Parser robustness (codex blocker 2): non-ASCII cannot panic the
+    /// byte-sliced prefix path (it no longer exists), leading markdown
+    /// directives strip, only ONE trailing balanced aside drops (interior and
+    /// unbalanced parentheses survive as punctuation), contractions keep
+    /// their negation in the key, and long keys may match through the shared
+    /// conservative similarity helper.
+    #[test]
+    fn structured_key_parser_is_robust_and_contract_exact() {
+        // Non-ASCII in and around the prefix: safely None, never a panic.
+        assert_eq!(structured_answer_key("ÁNSWER: IndexedDB"), None);
+        assert_eq!(structured_answer_key("réponse: IndexedDB"), None);
+        assert_eq!(structured_answer_key("é\nANSWER: IndexedDB"), None); // first nonblank line wins
+                                                                         // Leading markdown directives strip before prefix matching.
+        assert_eq!(
+            structured_answer_key("- **ANSWER:** IndexedDB\nrationale"),
+            Some("indexeddb".to_owned())
+        );
+        // Interior parentheses survive as punctuation; only a trailing
+        // balanced aside is dropped. ("use" is a leading choice directive and
+        // strips; "(fast)" is interior and survives.)
+        assert_eq!(
+            structured_answer_key("ANSWER: use (fast) IndexedDB"),
+            Some("fast indexeddb".to_owned())
+        );
+        // Leading choice directives: all six strip exactly once, so
+        // "ANSWER: Use IndexedDB" consolidates with "ANSWER: IndexedDB".
+        for directive in ["Use", "Choose", "Select", "Adopt", "Prefer", "Recommend"] {
+            assert_eq!(
+                structured_answer_key(&format!("ANSWER: {directive} IndexedDB")),
+                Some("indexeddb".to_owned()),
+                "directive {directive} must strip"
+            );
+        }
+        // Exactly ONE strips — a second directive is part of the choice.
+        assert_eq!(
+            structured_answer_key("ANSWER: prefer use IndexedDB"),
+            Some("use indexeddb".to_owned())
+        );
+        // Non-directive first tokens are never touched.
+        assert_eq!(
+            structured_answer_key("ANSWER: PostgreSQL selects rows quickly"),
+            Some("postgresql selects rows quickly".to_owned())
+        );
+        // Directive-only keys strip to empty: nonempty is required AFTER
+        // stripping, so no directive alone is ever a committed choice.
+        for directive in ["use", "Choose", "SELECT", "adopt", "prefer", "recommend"] {
+            assert_eq!(
+                structured_answer_key(&format!("ANSWER: {directive}")),
+                None,
+                "directive-only key {directive} must not register"
+            );
+        }
+        assert_eq!(
+            structured_answer_key("ANSWER: IndexedDB (for transcripts)"),
+            Some("indexeddb".to_owned())
+        );
+        assert_eq!(
+            structured_answer_key("ANSWER: IndexedDB (broken"),
+            Some("indexeddb broken".to_owned())
+        );
+        // Contractions keep their negation inside the key.
+        let key = structured_answer_key("ANSWER: can't use IndexedDB").unwrap();
+        assert!(key.contains("not"), "n't must survive as negation: {key}");
+        // Long keys may match through the shared conservative similarity path;
+        // short keys only match exactly.
+        assert!(keys_match(
+            "indexeddb with periodic transcript pruning enabled",
+            "indexeddb with periodic pruning of transcripts enabled"
+        ));
+        assert!(!keys_match("indexeddb", "indexeddb pruning"));
+    }
+
+    /// Degradation pin, end-to-end (codex blocker 3): an UNRECOGNIZED meta
+    /// leak registers as a real proposal (mixed pair, never merged) and the
+    /// council ends in honest nonconvergence — the filter never guesses.
+    #[tokio::test]
+    async fn unrecognized_leak_registers_and_ends_honestly_open() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new(
+                "a",
+                "group-a",
+                [
+                    ScriptedReply::Text("Let me think about this question step by step."),
+                    ScriptedReply::None,
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "b",
+                "group-b",
+                [
+                    ScriptedReply::Text("ANSWER: IndexedDB\nIndexed queries win."),
+                    ScriptedReply::None,
+                ],
+                &calls,
+            ),
+        ];
+        let req = sequential_request(&["a", "b"], SequentialEvidenceConfig::default(), 2, 60_000);
+        let mut events = Vec::new();
+        let outcome = convene_with_resolver(
+            req,
+            &StepClock::new(0, 50),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.proposals.len(),
+            2,
+            "the unrecognized leak must REGISTER, not be silently rejected"
+        );
+        assert_eq!(outcome.decision, None);
+        assert_eq!(outcome.convergence_basis, None);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, LonghouseEvent::Converged { .. })));
+    }
+
+    /// End-to-end recovery: a worker whose round-1 answer is rejected by the
+    /// validity filter stays rival-eligible and can land a valid structured
+    /// rival; identical structured keys consolidate; the field converges.
+    #[tokio::test]
+    async fn rejected_worker_recovers_with_structured_rival() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new(
+                "a",
+                "group-a",
+                [ScriptedReply::Text(
+                    "ANSWER: IndexedDB\nIndexed queries and transactional writes.",
+                )],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "b",
+                "group-b",
+                [
+                    // Rejected by the validity filter (live meta-leak shape) —
+                    // zero mutation, and b stays eligible for the rival pass.
+                    ScriptedReply::Text("The user wants me to answer a question about storage."),
+                    ScriptedReply::Text("ANSWER: Cache API\nSimpler offline retrieval."),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "c",
+                "group-c",
+                [
+                    // Identical key, divergent + negated rationale: consolidates.
+                    ScriptedReply::Text(
+                        "ANSWER: IndexedDB (for transcripts)\nCache API is NOT built for this.",
+                    ),
+                    ScriptedReply::Text("PASS"),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "d",
+                "group-d",
+                [
+                    ScriptedReply::Text("answer: indexeddb\nBest structured storage."),
+                    ScriptedReply::Text("PASS"),
+                ],
+                &calls,
+            ),
+        ];
+        let req = sequential_request(
+            &["a", "b", "c", "d"],
+            SequentialEvidenceConfig::default(),
+            2,
+            60_000,
+        );
+        let mut events = Vec::new();
+        let outcome = convene_with_resolver(
+            req,
+            &StepClock::new(0, 50),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        // One canonical (a) + two key-consolidated endorses (c, d); b's leak
+        // registered nothing; b's structured rival landed as the second
+        // hypothesis; unanimous evidence converges on the canonical.
+        assert_eq!(outcome.proposals.len(), 2);
+        let canonical = outcome
+            .proposals
+            .iter()
+            .find_map(|(id, text)| text.starts_with("ANSWER: IndexedDB").then_some(*id))
+            .expect("canonical structured proposal");
+        let consolidated = outcome
+            .recording
+            .marks
+            .iter()
+            .filter(|mark| {
+                matches!(mark.kind, RecordedMarkKind::Endorse { proposal } if proposal == canonical)
+            })
+            .count();
+        assert_eq!(consolidated, 2, "c and d fold by key despite rationale");
+        assert_eq!(outcome.decision, Some(canonical));
+        assert_eq!(
+            outcome.convergence_basis,
+            Some(ConvergenceBasis::EvidenceBound)
+        );
+        // The rejected leak produced no proposal mark for b's first answer.
+        let b_proposals = outcome
+            .recording
+            .marks
+            .iter()
+            .filter(|mark| matches!(mark.kind, RecordedMarkKind::Propose { .. }))
+            .count();
+        assert_eq!(b_proposals, 2, "exactly canonical + b's rival registered");
     }
 
     // ---- TASK-4: escalation routing + abort taxonomy -----------------------
