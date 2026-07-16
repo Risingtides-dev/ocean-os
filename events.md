@@ -3663,3 +3663,14 @@ type:      [fix]: use Option+Space as the composer dictation toggle
 area:      [ocean-tui]: keyboard routing, recording hints, and capture errors
 
 Replaced the unwanted F2-only dictation UX with the operator-requested macOS Option+Space toggle. Enhanced terminals route ALT+Space directly; terminals that encode Option+Space as a non-breaking-space character use a bounded fallback. The same chord starts and stops recording, Esc cancels, and plain Space remains ordinary typing without arming capture. Updated the live meter hint and short-recording errors, added key-level coverage for both Option encodings and plain-Space rejection, and refreshed the owning TUI contract.
+
+_________________________________________________________________________________
+time:      [03:51am] [16-07-26]
+agent:     [pi], [coding-agent]
+worktree:  [main]
+type:      [fix]: make Anthropic thinking replay signature-safe
+area:      [ocean-protocol]: Anthropic history serialization and prompt caching
+
+Fixed Fable 5 and other Anthropic/Claude Code high-thinking turns failing after a cross-provider model switch with `thinking.signature: Field required`. Anthropic wire encoding now preserves only non-empty signed thinking blocks, drops unsigned or empty-signature reasoning without exposing it as visible text, omits messages emptied by that filtering, and places rolling cache breakpoints against the converted provider-valid history. The shared persisted history schema remains compatible.
+
+Verification: all 132 ocean-protocol tests passed; `cargo check --workspace`, formatting, and diff checks passed. Focused regression coverage exercises unsigned and empty signatures, thinking-only messages, signed replay, chain-of-thought non-leakage, and converted-history cache indexing. A fresh final reviewer approved the change with no findings.

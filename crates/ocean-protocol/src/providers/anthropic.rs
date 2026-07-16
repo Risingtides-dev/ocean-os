@@ -156,12 +156,23 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
     for m in messages {
         match m {
             Message::User { content, .. } => {
-                let blocks = content.iter().map(content_to_block).collect::<Vec<_>>();
-                out.push(json!({"role": "user", "content": blocks}));
+                let blocks = content
+                    .iter()
+                    .filter_map(content_to_block)
+                    .collect::<Vec<_>>();
+                if !blocks.is_empty() {
+                    out.push(json!({"role": "user", "content": blocks}));
+                }
             }
             Message::Assistant(a) => {
-                let blocks = a.content.iter().map(content_to_block).collect::<Vec<_>>();
-                out.push(json!({"role": "assistant", "content": blocks}));
+                let blocks = a
+                    .content
+                    .iter()
+                    .filter_map(content_to_block)
+                    .collect::<Vec<_>>();
+                if !blocks.is_empty() {
+                    out.push(json!({"role": "assistant", "content": blocks}));
+                }
             }
             Message::ToolResult(tr) => {
                 let body: Vec<Value> = tr
@@ -191,33 +202,36 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
     out
 }
 
-fn content_to_block(c: &Content) -> Value {
+fn content_to_block(c: &Content) -> Option<Value> {
     match c {
-        Content::Text { text } => json!({"type": "text", "text": text}),
+        Content::Text { text } => Some(json!({"type": "text", "text": text})),
         Content::Thinking {
             thinking,
-            thinking_signature,
-        } => {
-            let mut v = json!({"type": "thinking", "thinking": thinking});
-            if let Some(sig) = thinking_signature {
-                v["signature"] = json!(sig);
-            }
-            v
-        }
-        Content::Image { data, mime_type } => json!({
+            thinking_signature: Some(signature),
+        } if !signature.is_empty() => Some(json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": signature,
+        })),
+        // Anthropic accepts replayed thinking only with its opaque signature.
+        // Other providers legitimately produce unsigned reasoning in Ocean's
+        // shared history shape; forwarding it creates an invalid request, while
+        // converting it to text would leak hidden chain-of-thought.
+        Content::Thinking { .. } => None,
+        Content::Image { data, mime_type } => Some(json!({
             "type": "image",
             "source": {"type": "base64", "media_type": mime_type, "data": data}
-        }),
+        })),
         Content::ToolCall {
             id,
             name,
             arguments,
-        } => json!({
+        } => Some(json!({
             "type": "tool_use",
             "id": id,
             "name": name,
             "input": arguments,
-        }),
+        })),
     }
 }
 
@@ -384,9 +398,9 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     // second-to-last message. With a single message there is no stable history
     // yet, so we skip it (the system + tools breakpoints still cache the prefix).
     if cache {
-        let n = context.messages.len();
-        if n >= 2 {
-            if let Some(arr) = body["messages"].as_array_mut() {
+        if let Some(arr) = body["messages"].as_array_mut() {
+            let n = arr.len();
+            if n >= 2 {
                 let target = n - 2;
                 if let Some(content) = arr[target].get_mut("content").and_then(Value::as_array_mut)
                 {
@@ -805,6 +819,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn assistant_unsigned_thinking_is_dropped_before_anthropic_replay() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "cross-provider private reasoning".into(),
+                    thinking_signature: None,
+                },
+                Content::Thinking {
+                    thinking: "reasoning with an empty signature".into(),
+                    thinking_signature: Some(String::new()),
+                },
+                Content::text("visible answer"),
+            ],
+            api: "openai-completions".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        let blocks = out[0]["content"].as_array().expect("content blocks");
+        assert_eq!(blocks, &[json!({"type": "text", "text": "visible answer"})]);
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(
+            !serialized.contains("cross-provider private reasoning")
+                && !serialized.contains("reasoning with an empty signature"),
+            "unsigned thinking must not reach Anthropic or leak as text: {serialized}"
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_only_message_is_omitted_from_anthropic_replay() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![Content::Thinking {
+                thinking: "private reasoning only".into(),
+                thinking_signature: None,
+            }],
+            api: "openai-completions".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        assert!(
+            convert_messages(&messages).is_empty(),
+            "filtering unsigned thinking must not leave an empty assistant message"
+        );
+    }
+
+    #[test]
+    fn assistant_signed_thinking_preserves_anthropic_signature() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![Content::Thinking {
+                thinking: "provider reasoning".into(),
+                thinking_signature: Some("sig-abc".into()),
+            }],
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        assert_eq!(
+            out[0]["content"][0],
+            json!({
+                "type": "thinking",
+                "thinking": "provider reasoning",
+                "signature": "sig-abc",
+            })
+        );
+    }
+
     // OCEAN-188: Anthropic reports cache_creation/cache_read separately from
     // input_tokens, so the total footprint must add both cache buckets on top
     // of input + output. With input=100, output=50, cache_write=512,
@@ -1075,6 +1172,44 @@ mod tests {
             args2,
             json!({}),
             "malformed tool args must fall back to an empty object, not panic"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoint_uses_converted_history_after_unsigned_thinking_drop() {
+        let unsigned_only = Message::Assistant(AssistantMessage {
+            content: vec![Content::Thinking {
+                thinking: "private reasoning only".into(),
+                thinking_signature: None,
+            }],
+            api: "openai-completions".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        });
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::user_text("stable turn"),
+                unsigned_only,
+                Message::user_text("newest turn"),
+            ],
+            tools: vec![],
+        };
+
+        let body = build_body(&anthropic_model(), &ctx, &StreamOptions::default());
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2, "unsigned-only message must be omitted");
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "the converted stable message must carry the rolling breakpoint: {body}"
+        );
+        assert!(
+            messages[1]["content"][0].get("cache_control").is_none(),
+            "the converted newest message must remain fresh: {body}"
         );
     }
 
