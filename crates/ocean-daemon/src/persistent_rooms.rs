@@ -98,6 +98,104 @@ pub(super) fn room_store_error_response(
     )
 }
 
+// ---- Named-agent resolution seam (TASK-9 / OCEAN Rooms Gate-1) -------------
+//
+// A folder-as-agent definition resolved down to the four values a turn needs to
+// actually DRIVE that agent: its instructions layer, tool allowlist, model, and
+// tier-1 subprocess capabilities. This is the SINGLE named-agent resolution
+// path shared by `agent_turn` (the folder-as-agent turn in `main.rs`) and the
+// persistent-room convene path (`room_join` validation, the `room_post_message`
+// footprint gate, and `spawn_room_agent_turn`). Binding truth flows one way:
+// only an Agent participant that resolves to a real AgentDef may be convened;
+// a default assistant is never silently substituted for an unresolved name.
+
+/// A resolved folder-as-agent, reduced to the four turn-driving values. Each
+/// field is independently `Option`, and a valid data-only agent (an
+/// `agent.toml` that declares none of instructions/tools/model/caps)
+/// legitimately resolves to all-four-`None` — that is NOT an error. Resolution
+/// failure (empty name or an unresolvable folder) is signaled only by
+/// [`resolve_named_agent`] returning `Err`, never by an all-`None` `Ok`.
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedAgent {
+    /// Trimmed `instructions.md` when the agent authored any. Prepended as a
+    /// steering layer above the (guided) prompt, exactly as `agent_turn` does.
+    pub(super) instructions_layer: Option<String>,
+    /// `agent.toml` `tools` + `tools/` filename stems, non-empty only when the
+    /// agent narrows its toolset. Applied via `PromptControl::with_tool_allowlist`.
+    pub(super) tool_allowlist: Option<Vec<String>>,
+    /// Declared per-agent model. Fail-soft to the global model when `None`/empty
+    /// (the emptiness trim happens inside `PromptControl::with_agent_model`).
+    pub(super) model: Option<String>,
+    /// Declared tier-1 subprocess capabilities plus the agent root used to
+    /// resolve relative commands. Non-empty only when the agent declares caps;
+    /// applied via `PromptControl::with_agent_capabilities`.
+    pub(super) subprocess_caps: Option<(
+        std::path::PathBuf,
+        Vec<ocean_agent::agentdir::SubprocessCapability>,
+    )>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct RoomTurnCapture {
+    agent_id: String,
+    prompt: String,
+    tool_allowlist: Option<Vec<String>>,
+    model: Option<String>,
+    subprocess_caps: Option<(
+        std::path::PathBuf,
+        Vec<ocean_agent::agentdir::SubprocessCapability>,
+    )>,
+}
+
+#[cfg(test)]
+static ROOM_TURN_CAPTURES: Mutex<Vec<RoomTurnCapture>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn capture_room_turn(agent_id: &str, prompt: &str, control: &ocean_agent::PromptControl) {
+    let capture = RoomTurnCapture {
+        agent_id: agent_id.to_string(),
+        prompt: prompt.to_string(),
+        tool_allowlist: control.tool_allowlist.clone(),
+        model: control.agent_model.clone(),
+        subprocess_caps: control.agent_capabilities.clone(),
+    };
+    match ROOM_TURN_CAPTURES.lock() {
+        Ok(mut captures) => captures.push(capture),
+        Err(poisoned) => poisoned.into_inner().push(capture),
+    }
+}
+
+/// Resolve a named folder-as-agent to the four turn-driving values above.
+///
+/// Returns `Err` ONLY for an empty name or an `agentdir::resolve` failure
+/// (missing folder, bad name, unparseable `agent.toml`). A resolved-but-
+/// data-only agent returns `Ok` with all four fields `None` — that distinction
+/// is load-bearing: all-`None` `Ok` is a real, bound agent that declares no
+/// overrides, NOT a sentinel for "unresolved". Callers must branch on the
+/// `Result`, never on the presence of any single field.
+pub(super) fn resolve_named_agent(
+    name: &str,
+) -> Result<ResolvedAgent, ocean_agent::agentdir::ResolveError> {
+    let def = ocean_agent::agentdir::resolve(&super::agents_root(), name)?;
+    let instructions_layer = def.system_prompt().map(str::to_owned);
+    let tool_allowlist = {
+        let tools = def.effective_tools();
+        (!tools.is_empty()).then_some(tools)
+    };
+    let model = def.config.model.clone();
+    let subprocess_caps = {
+        let caps = def.config.subprocess_capabilities.clone();
+        (!caps.is_empty()).then(|| (def.root.clone(), caps))
+    };
+    Ok(ResolvedAgent {
+        instructions_layer,
+        tool_allowlist,
+        model,
+        subprocess_caps,
+    })
+}
+
 #[derive(serde::Deserialize)]
 pub(super) struct RoomCreateRequest {
     /// Persistent room key, e.g. `"ocean-surface-map-fix"`. Must be non-empty.
@@ -229,6 +327,23 @@ pub(super) async fn room_join(
     Json(req): Json<RoomJoinRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
+    // Named-agent binding (TASK-9): an Agent participant MUST name a resolvable
+    // folder-as-agent. Reject an unresolved name with a typed 4xx so a phantom
+    // agent can never enter the roster as an Agent (it would later convene a
+    // default-assistant turn it never authorized). Human/Bot/System participants
+    // are unaffected — only `kind == Agent` is bound to a real AgentDef.
+    if matches!(req.kind, RoomParticipantKind::Agent) {
+        if let Err(_e) = resolve_named_agent(&req.id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "code": "agent_unresolved",
+                    "error": format!("agent '{}' does not resolve", req.id),
+                })),
+            );
+        }
+    }
     let participant = RoomParticipant {
         id: req.id,
         kind: req.kind,
@@ -363,6 +478,30 @@ pub(super) async fn room_post_message(
             let Some(agent) = resolved_agent else {
                 continue;
             };
+
+            // Named-agent binding gate (TASK-9): a roster Agent participant must
+            // ALSO resolve to a real folder-as-agent definition before any
+            // convene footprint is written. A legacy phantom Agent (already in
+            // the roster from before this gate, or whose folder was since
+            // removed) must NOT claim a convene — emit NO `room_trigger` event
+            // and NO `auto-convene:` audit line, and queue NO turn. Instead post
+            // one honest System note via a direct `append_message`. System rows
+            // skip trigger evaluation, and this is a direct store write (not a
+            // recursive `room_post_message`), so it convenes nobody. `room_join`
+            // blocks NEW unresolved agents; this gate catches the legacy ones.
+            if resolve_named_agent(&agent.id).is_err() {
+                let _ = with_rooms(&state, |reg| {
+                    reg.append_message(
+                        &key,
+                        "system",
+                        RoomParticipantKind::System,
+                        RoomMessageKind::System,
+                        &format!("agent '{}' is not bound; no turn queued", agent.id),
+                        Utc::now(),
+                    )
+                });
+                continue;
+            }
 
             // Emit a notice onto the agent event bus so any subscriber sees the
             // convene. Uses the generic Extension event so it respects the
@@ -584,6 +723,38 @@ fn spawn_room_agent_turn(
             .collect();
         let prompt = build_room_prompt(&room, &agent, &tail, triggered_by_seq);
 
+        // Named-agent binding (TASK-9): a room agent turn must DRIVE a resolved
+        // folder-as-agent, never a default assistant. Re-resolve the participant
+        // id to a real AgentDef before building the turn; on failure fail-closed
+        // (post an honest System note, queue NO turn) rather than silently
+        // running the default model. `room_join` blocks NEW unresolved agents;
+        // this re-resolve catches LEGACY phantoms already in stored rosters.
+        // (room_post_message's gate already short-circuited a phantom before the
+        // footprint, but a re-resolve here is defense-in-depth: the roster may
+        // have changed between the mention and the spawn, or the folder removed.)
+        let resolved = match resolve_named_agent(&agent.id) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = with_rooms(&state, |reg| {
+                    reg.append_message(
+                        &room,
+                        "system",
+                        RoomParticipantKind::System,
+                        RoomMessageKind::System,
+                        &format!("agent '{}' is not bound; no turn queued", agent.id),
+                        Utc::now(),
+                    )
+                });
+                return;
+            }
+        };
+        // Prepend the resolved agent's instructions as a steering layer, exactly
+        // as `agent_turn` does for a named folder-as-agent.
+        let prompt = match resolved.instructions_layer {
+            Some(instr) => format!("{instr}\n\n{prompt}"),
+            None => prompt,
+        };
+
         // Does this session already exist on disk? If so we RESUME it (strict);
         // otherwise we create it under the deterministic id. This mirrors the
         // create-if-missing logic in `agent_turn`. `session_detail` errors on a
@@ -629,6 +800,25 @@ fn spawn_room_agent_turn(
             cancel,
             None,
         );
+        // Apply the resolved agent's declared tool allowlist, model, and tier-1
+        // subprocess capabilities to this turn, exactly as `agent_turn` does:
+        // allowlist narrows the toolset, model drives the turn (fail-soft to the
+        // global model via `with_agent_model`'s empty-trim), and caps launch
+        // per-turn and merge their tools (fail-soft). PRESERVED vs the prior
+        // room path: no `without_tools()`, `yolo` from `effective_permission_mode()`,
+        // and `decision_token: None` above — only the four resolved fields are
+        // newly applied.
+        let control = match resolved.tool_allowlist {
+            Some(tools) => control.with_tool_allowlist(tools),
+            None => control,
+        };
+        let control = control.with_agent_model(resolved.model);
+        let control = match resolved.subprocess_caps {
+            Some((root, caps)) => control.with_agent_capabilities(root, caps),
+            None => control,
+        };
+        #[cfg(test)]
+        capture_room_turn(&agent.id, &prompt_req.prompt, &control);
 
         let res = state.runtime.prompt(prompt_req, control).await;
         record_prompt_result(&state, request_id, &res, None).await;
@@ -883,5 +1073,289 @@ pub(super) async fn room_events(
             )
         }
         Err(e) => room_store_error_response(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{
+        fake_convene_state, write_agent_fixture, TestEnvRestore, AUTO_CONVENE_ENV_LOCK,
+    };
+
+    fn clear_turn_captures() {
+        ROOM_TURN_CAPTURES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    async fn wait_for_turn_capture(agent_id: &str) -> Option<RoomTurnCapture> {
+        for _ in 0..200 {
+            let capture = ROOM_TURN_CAPTURES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .find(|capture| capture.agent_id == agent_id)
+                .cloned();
+            if capture.is_some() {
+                return capture;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    fn create_mention_room(state: &AppState, key: &RoomKey) {
+        with_rooms(state, |store| {
+            store
+                .create(
+                    key.clone(),
+                    "Named Agent Seam",
+                    Some(RoomTriggerPolicy {
+                        on_mention: true,
+                        ..Default::default()
+                    }),
+                    Utc::now(),
+                )
+                .expect("room fixture");
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_agentdef_join_is_rejected() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_root).expect("agents root");
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("missing-join");
+        create_mention_room(&state, &key);
+
+        let (status, Json(body)) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "phantom".into(),
+                display_name: "Phantom".into(),
+                kind: RoomParticipantKind::Agent,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["code"], json!("agent_unresolved"));
+        let room = with_rooms(&state, |store| store.get(&key))
+            .expect("room lookup")
+            .expect("room exists");
+        assert!(room.room.participants.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_phantom_mention_has_no_convene_footprint_or_request() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_root).expect("agents root");
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        clear_turn_captures();
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
+        let key = RoomKey::new("legacy-phantom");
+        create_mention_room(&state, &key);
+        with_rooms(&state, |store| {
+            store
+                .add_participant(
+                    &key,
+                    RoomParticipant {
+                        id: "phantom".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Phantom".into(),
+                    },
+                    Utc::now(),
+                )
+                .expect("legacy roster fixture");
+        });
+
+        let (status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@phantom report".into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(matches!(
+            trigger_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(state.requests.read().await.is_empty());
+        assert!(wait_for_turn_capture("phantom").await.is_none());
+        let transcript =
+            with_rooms(&state, |store| store.transcript(&key, None)).expect("transcript");
+        assert!(transcript
+            .iter()
+            .any(|message| message.author_kind == RoomParticipantKind::System
+                && message.kind == RoomMessageKind::System
+                && message.body == "agent 'phantom' is not bound; no turn queued"));
+        assert!(!transcript
+            .iter()
+            .any(|message| message.body.starts_with("auto-convene:")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn valid_folder_applies_instructions_model_allowlist_and_caps() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(
+            &agents_root,
+            "bound-agent",
+            r#"model = "fake-ok"
+tools = ["read", "glob"]
+
+[[subprocess_capability]]
+name = "fixture-cap"
+command = "/definitely/missing/ocean-fixture-cap"
+args = ["--stdio"]
+env = { FIXTURE = "1" }
+"#,
+            Some("BOUND_AGENT_INSTRUCTIONS"),
+        );
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        clear_turn_captures();
+        let key = RoomKey::new("bound-agent-profile");
+        create_mention_room(&state, &key);
+
+        let (join_status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "bound-agent".into(),
+                display_name: "Bound Agent".into(),
+                kind: RoomParticipantKind::Agent,
+            }),
+        )
+        .await;
+        assert_eq!(join_status, StatusCode::OK);
+
+        let (post_status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@bound-agent report".into(),
+            }),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::CREATED);
+
+        let capture = wait_for_turn_capture("bound-agent")
+            .await
+            .expect("resolved room turn must reach runtime dispatch");
+        assert!(capture.prompt.starts_with("BOUND_AGENT_INSTRUCTIONS\n\n"));
+        assert_eq!(
+            capture.tool_allowlist,
+            Some(vec!["read".to_string(), "glob".to_string()])
+        );
+        assert_eq!(capture.model.as_deref(), Some("fake-ok"));
+        let (root, caps) = capture
+            .subprocess_caps
+            .expect("declared subprocess capability must reach PromptControl");
+        assert_eq!(root, agents_root.join("bound-agent"));
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].effective_name(), "fixture-cap");
+        assert_eq!(caps[0].command, "/definitely/missing/ocean-fixture-cap");
+        assert!(state.requests.read().await.values().any(|request| {
+            request.status.session_id == Some(core_sid(room_agent_session_id(&key, "bound-agent")))
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_data_only_agentdef_is_resolved_and_queued() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "data-only", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        clear_turn_captures();
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
+        let key = RoomKey::new("data-only-profile");
+        create_mention_room(&state, &key);
+
+        let (join_status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "data-only".into(),
+                display_name: "Data Only".into(),
+                kind: RoomParticipantKind::Agent,
+            }),
+        )
+        .await;
+        assert_eq!(join_status, StatusCode::OK);
+
+        let (post_status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@data-only report".into(),
+            }),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::CREATED);
+        let event = trigger_rx
+            .try_recv()
+            .expect("resolved agent emits room_trigger");
+        assert!(matches!(
+            event.event,
+            AgentTurnEvent::Extension { ref extension, .. } if extension == "room_trigger"
+        ));
+
+        let capture = wait_for_turn_capture("data-only")
+            .await
+            .expect("all-None profile must still dispatch");
+        assert!(capture.tool_allowlist.is_none());
+        assert!(capture.model.is_none());
+        assert!(capture.subprocess_caps.is_none());
+        assert!(!capture.prompt.starts_with("\n\n"));
+        assert!(state.requests.read().await.values().any(|request| {
+            request.status.session_id == Some(core_sid(room_agent_session_id(&key, "data-only")))
+        }));
     }
 }

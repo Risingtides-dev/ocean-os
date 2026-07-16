@@ -143,9 +143,9 @@ use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
 use persistent_rooms::{
-    room_create, room_db_path, room_events, room_get, room_join, room_leave, room_post_message,
-    room_snapshot, room_transcript, rooms_list_persistent, with_rooms, with_rooms_handle,
-    RoomStoreHandle,
+    resolve_named_agent, room_create, room_db_path, room_events, room_get, room_join, room_leave,
+    room_post_message, room_snapshot, room_transcript, rooms_list_persistent, with_rooms,
+    with_rooms_handle, RoomStoreHandle,
 };
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
@@ -5726,6 +5726,11 @@ async fn agent_turn(
     // fail-soft (unresolvable -> global); `agent_capabilities` (A2) are launched
     // per-turn and their tools merged into the registry (fail-soft: a spec that
     // can't spawn is skipped, never breaking the turn).
+    //
+    // Resolution goes through the shared `resolve_named_agent` seam (the same
+    // helper the persistent-room convene path uses), so folder-as-agent binding
+    // truth has exactly one source. `agent: None` ⇒ empty name ⇒ `Err` ⇒ the
+    // unchanged fail-open defaults (no warning, surface profile preserved).
     #[allow(clippy::type_complexity)]
     let (guided_prompt, agent_tool_allowlist, agent_model, agent_capabilities): (
         String,
@@ -5735,26 +5740,27 @@ async fn agent_turn(
             std::path::PathBuf,
             Vec<ocean_agent::agentdir::SubprocessCapability>,
         )>,
-    ) = match agent.as_deref() {
-        Some(name) => match ocean_agent::agentdir::resolve(&agents_root(), name) {
-            Ok(def) => {
-                let allow = def.effective_tools();
-                let allow = (!allow.is_empty()).then_some(allow);
-                let model = def.config.model.clone();
-                let caps = def.config.subprocess_capabilities.clone();
-                let caps = (!caps.is_empty()).then(|| (def.root.clone(), caps));
-                let prompt = match def.system_prompt() {
-                    Some(instr) => format!("{instr}\n\n{guided_prompt}"),
-                    None => guided_prompt,
-                };
-                (prompt, allow, model, caps)
-            }
-            Err(e) => {
+    ) = match resolve_named_agent(agent.as_deref().unwrap_or("")) {
+        Ok(resolved) => {
+            let prompt = match resolved.instructions_layer {
+                Some(instr) => format!("{instr}\n\n{guided_prompt}"),
+                None => guided_prompt,
+            };
+            (
+                prompt,
+                resolved.tool_allowlist,
+                resolved.model,
+                resolved.subprocess_caps,
+            )
+        }
+        Err(e) => {
+            // Match the prior behavior exactly: warn only when a name was
+            // actually supplied (the `agent: None` path stays silent).
+            if let Some(name) = agent.as_deref() {
                 tracing::warn!(agent = name, error = %e, "named agent did not resolve; using surface profile");
-                (guided_prompt, None, None, None)
             }
-        },
-        None => (guided_prompt, None, None, None),
+            (guided_prompt, None, None, None)
+        }
     };
 
     // Longhouse pre-turn consult (OCEAN-283, default-ON). Unless the operator
@@ -13108,14 +13114,15 @@ mod tests {
     /// env is process-global, so two of them racing would clobber each other.
     /// A tokio (non-poisoning) mutex so async tests can hold the guard across
     /// `.await` without tripping `clippy::await_holding_lock`.
-    static AUTO_CONVENE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static AUTO_CONVENE_ENV_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// Panic-safe restoration for process-global environment changed while
     /// constructing deterministic test runtimes.
-    struct TestEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    pub(super) struct TestEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
     impl TestEnvRestore {
-        fn capture(names: &[&'static str]) -> Self {
+        pub(super) fn capture(names: &[&'static str]) -> Self {
             Self(
                 names
                     .iter()
@@ -13136,12 +13143,27 @@ mod tests {
         }
     }
 
+    pub(super) fn write_agent_fixture(
+        agents_root: &std::path::Path,
+        name: &str,
+        config: &str,
+        instructions: Option<&str>,
+    ) {
+        let dir = agents_root.join(name);
+        std::fs::create_dir_all(&dir).expect("agent fixture directory");
+        std::fs::write(dir.join("agent.toml"), config).expect("agent fixture config");
+        if let Some(instructions) = instructions {
+            std::fs::write(dir.join("instructions.md"), instructions)
+                .expect("agent fixture instructions");
+        }
+    }
+
     /// Build an `AppState` whose runtime is pinned to the Fake provider (so a
     /// turn runs synchronously and deterministically with no live LLM) and whose
     /// room store is a fresh in-memory SQLite DB. Returns the state plus the
     /// tempdir guard (kept alive for the session config dir). Caller must hold
     /// `AUTO_CONVENE_ENV_LOCK` for the duration.
-    fn fake_convene_state(tmp: &tempfile::TempDir) -> AppState {
+    pub(super) fn fake_convene_state(tmp: &tempfile::TempDir) -> AppState {
         std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
         std::env::set_var("OCEAN_MODEL", "fake-ok");
         // YOLO so the fake turn never blocks on a permission prompt (the fake
@@ -13296,8 +13318,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn at_mention_queues_turn_and_posts_reply_back() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
         // Subscribe before the post: the room_trigger notice must be emitted
         // synchronously between the persisted author row and audit append.
         let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
@@ -13464,8 +13495,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_room_convene_resolves_its_project() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
 
         // The room's workspace is a real directory NOT inside a git repo, so the
         // session's workspace anchor is exactly this path (no git-toplevel shift),
@@ -13576,8 +13616,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unbound_room_convene_falls_back_with_no_project() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
 
         // Plain `create` (no workspace_root) — the legacy path.
         let key = RoomKey::new("unbound-convene-room");
@@ -17283,13 +17332,10 @@ mod tests {
         }
     }
 
-    // Serialize OCEAN_AGENTS_DIR mutation across the agent-endpoint tests so
-    // parallel env writes don't race.
-    static AGENTS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test]
     async fn agents_endpoints_list_and_resolve_from_root() {
-        let _guard = AGENTS_ENV_LOCK.lock().await;
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_AGENTS_DIR"]);
         let tmp = tempfile::tempdir().unwrap();
         // one well-formed agent folder
         let a = tmp.path().join("researcher");
@@ -17313,8 +17359,6 @@ mod tests {
         // bad name -> ok:false, not a panic/500
         let bad = agent_def(Path("../escape".to_string())).await;
         assert_eq!(bad.0["ok"], json!(false));
-
-        std::env::remove_var("OCEAN_AGENTS_DIR");
     }
 
     // ---- OCEAN-245: opt-in Longhouse pre-turn consult turn-hook ----------------
@@ -18207,7 +18251,7 @@ mod tests {
         let agent_cwd = agent.find("state.runtime.resolve_cwd_for_turn(").unwrap();
         let turn_started = agent.find("AgentTurnEvent::TurnStarted {").unwrap();
         let named_agent_end = agent
-            .find("None => (guided_prompt, None, None, None),\n    };")
+            .find("            (guided_prompt, None, None, None)\n        }\n    };")
             .unwrap();
         let agent_prep = agent.find(&prep_call).unwrap();
         let agent_apply = agent.find(&apply_call).unwrap();
