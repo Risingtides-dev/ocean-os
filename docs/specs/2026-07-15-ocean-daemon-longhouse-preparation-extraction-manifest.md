@@ -1,7 +1,7 @@
 # Ocean Daemon Longhouse Preparation Extraction Manifest
 
 **Date:** 2026-07-15  
-**Status:** Characterization complete and independently reviewed; extraction authorized
+**Status:** Ready for publication; characterization, extraction, dedicated-target validation, compatibility/MSRV/local CI, and independent review passed; hosted CI and merge pending
 **Owner:** Ocean OS  
 **Rollback point:** characterization commit `66ba5db`
 
@@ -200,6 +200,28 @@ Commit `66ba5db` adds three daemon-only characterization tests without moving or
 The router tests serialize `fake_convene_state` environment mutation through `AUTO_CONVENE_ENV_LOCK` and restore `OCEAN_CONFIG_DIR`, `OCEAN_MODEL`, and `OCEAN_YOLO` panic-safely. They avoid host-library membership assumptions where optional cwd/top-N values are omitted and do not duplicate the `ocean-longhouse` exact-token corpus or cache/parser tests.
 
 After rebasing onto PR #295, all focused preparation/inspect/workflow/router tests and all 348 daemon tests passed serialized in dedicated target `/tmp/ocean-target-longhouse-prep`. A fresh characterization re-review reported PASS with no unresolved medium-or-higher issue. `cargo fmt --all -- --check` and `git diff --check` passed.
+
+## Extraction result
+
+Commit `15f8cfb` moved the exact characterized 334-line implementation boundary into the 349-line private `src/longhouse_preparation.rs` module. The additional lines are the owner header/imports, required `pub(super)` visibility for three parent-mounted handlers plus the parent-test request DTO/fields, and rustfmt's multiline handler signatures. A whitespace/comment/visibility-normalized comparison against characterization commit `66ba5db` found the moved definitions and bodies identical; the only executable-token normalization required was rustfmt's trailing parameter commas.
+
+`main.rs` retains `longhouse_routes()`, all route/banner/middleware composition, `longhouse_prepare_enabled`, turn-time render/apply/fail-open preparation and call sites, skill query/fetch, compatibility subagent spec, Longhouse demo/convene/topics/title/escrow/recall/board state, `AppState`, and all parent characterization tests. The extraction-aware source test now reads the module automatically and proves all three cache lookups remain inside their original `spawn_blocking` closures before the unchanged JoinError fallbacks. The module accepts no daemon state and owns no event, runtime, model, capability, permission, session, turn, dispatch, or governance authority.
+
+Two fresh mechanical and security/architecture extraction reviews reported PASS with no unresolved medium-or-higher issue. The disclosed skill-fetch symlink-retarget risk remains byte-for-byte outside this module and requires its separate security disposition before any librarian extraction.
+
+Post-extraction validation passed:
+
+- focused preparation, inspect, workflow, librarian/spec non-regression, and five router-contract groups;
+- all 348 daemon tests serialized;
+- 118 `ocean-longhouse` tests plus one host-dependent ignored test and its doc test;
+- `cargo check --workspace --tests`;
+- `livekit-tap` and `deepgram-stt` daemon feature checks;
+- `cargo xtask ci --compatibility`;
+- pinned Rust 1.88 `cargo xtask ci --msrv`;
+- canonical `cargo xtask ci`, including workspace tests, denied-warning all-target Clippy, format, docs/index validation, and dependency policy;
+- `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check`.
+
+Hosted default-parallel macOS/Ubuntu CI, pinned Rust 1.88, cargo-deny, and merge remain pending. Live daemon deployment/supervision remains owned by the concurrent operator workstream and is not performed by this checkpoint.
 
 ## Validation
 
