@@ -673,7 +673,11 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive("ocean_daemon=info".parse()?)
                 .add_directive("ocean_runtime=info".parse()?)
                 .add_directive("ocean_agent=info".parse()?)
-                .add_directive("ocean_protocol=info".parse()?),
+                .add_directive("ocean_protocol=info".parse()?)
+                // TASK-8 compliance measurement gate: the ANSWER-contract
+                // counters and validity-filter rejections trace from
+                // ocean_longhouse and must be visible in production logs.
+                .add_directive("ocean_longhouse=info".parse()?),
         )
         .with_span_events(
             tracing_subscriber::fmt::format::FmtSpan::NEW

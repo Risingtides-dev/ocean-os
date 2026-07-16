@@ -1501,6 +1501,7 @@ fn rejected_meta_leak(answer: &str, question: &str) -> Option<&'static str> {
         ("we need to answer", "question_echo_prefix"),
         ("the user wants me to", "meta_reasoning_leak"),
         ("the user asks me to", "meta_reasoning_leak"),
+        ("we are asked to", "meta_reasoning_leak"),
         ("as an ai", "meta_reasoning_leak"),
     ];
     let normalized = normalize_text(answer);
@@ -2824,6 +2825,15 @@ mod tests {
         assert_eq!(
             rejected_meta_leak(
                 "The user wants me to answer a question about transcript storage.",
+                question
+            ),
+            Some("meta_reasoning_leak")
+        );
+        // Live shape from council #4's rival pass (topic 5564e15e).
+        assert_eq!(
+            rejected_meta_leak(
+                "We are asked to provide a genuinely different alternative answer. The only \
+                 proposal so far is IndexedDB.",
                 question
             ),
             Some("meta_reasoning_leak")
