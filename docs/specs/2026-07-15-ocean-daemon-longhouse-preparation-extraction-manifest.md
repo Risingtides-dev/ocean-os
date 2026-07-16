@@ -1,9 +1,9 @@
 # Ocean Daemon Longhouse Preparation Extraction Manifest
 
 **Date:** 2026-07-15  
-**Status:** Proposed; characterization and independent review required before extraction  
+**Status:** Characterization complete and independently reviewed; extraction authorized
 **Owner:** Ocean OS  
-**Rollback point:** Pending; set to the accepted characterization commit before any production move
+**Rollback point:** characterization commit `66ba5db`
 
 ## Purpose
 
@@ -15,11 +15,13 @@ The result remains a private module of the `ocean-daemon` binary. It is not a da
 
 ## Current upstream and reconciliation rule
 
-This manifest starts from fetched `origin/main` merge `dc44343`, which includes:
+This manifest started from fetched `origin/main` merge `dc44343`, which includes:
 
 - persistent-room extraction PR #293 and publication PR #294;
 - PR #292's exact-token Longhouse relevance/scoring correction and fixture;
 - PRs #290/#291's advisor fix and bounded Longhouse inspection route.
+
+Before the characterization commit, the branch rebased onto `1413424` (PR #295), which reconciled effective harness-profile gates in daemon/agent/runtime code but did not change Longhouse preparation, routes, roots/cache, response projection, or tests. The complete focused and serialized daemon test sets were rerun after that reconciliation.
 
 PR #292 changed `ocean-longhouse` scoring, explained-match fields, Longhouse inspect wire evidence, and related daemon tests. Those changes are the baseline. This checkpoint must not restore the earlier substring scorer, remove `exact_name_phrase`, or alter index/cache/root behavior.
 
@@ -187,6 +189,18 @@ Before any future skill-librarian extraction, use a separate security dispositio
 - a cold-index test for a symlinked skill targeting outside selected roots;
 - an approved decision on canonical-root revalidation and TOCTOU behavior.
 
+## Characterization result
+
+Commit `66ba5db` adds three daemon-only characterization tests without moving or changing a production body:
+
+- `longhouse_preparation_http_extractors_methods_and_defaults_are_exact` drives all three real routes and freezes exact missing-prompt `422`, missing-content-type `415`, malformed-JSON `400`, GET/PUT `405` plus `Allow: POST`, unknown-field tolerance, all-optionals-omitted parsing, `top_n: 0`, and empty/default envelope shapes;
+- `longhouse_preparation_http_envelopes_and_privacy_are_exact` freezes exact non-empty prepare/inspect/workflow key sets, both PR #292 explained-match shapes and contributing terms, exact-name phrase flags, top-N cap, cwd confinement, and complete-response non-disclosure of prompt-only/session/client/cwd/body/source-path sentinels;
+- `longhouse_preparation_source_preserves_blocking_read_only_boundary` automatically reads the current owner (`main.rs` before extraction or `longhouse_preparation.rs` after it), proves each cache lookup remains inside its `spawn_blocking` closure before the await/fallback boundary, freezes the three fail-open expressions, and rejects state/event/ordinary-spawn/runtime/permission/turn authority markers.
+
+The router tests serialize `fake_convene_state` environment mutation through `AUTO_CONVENE_ENV_LOCK` and restore `OCEAN_CONFIG_DIR`, `OCEAN_MODEL`, and `OCEAN_YOLO` panic-safely. They avoid host-library membership assumptions where optional cwd/top-N values are omitted and do not duplicate the `ocean-longhouse` exact-token corpus or cache/parser tests.
+
+After rebasing onto PR #295, all focused preparation/inspect/workflow/router tests and all 348 daemon tests passed serialized in dedicated target `/tmp/ocean-target-longhouse-prep`. A fresh characterization re-review reported PASS with no unresolved medium-or-higher issue. `cargo fmt --all -- --check` and `git diff --check` passed.
+
 ## Validation
 
 Use a dedicated `CARGO_TARGET_DIR`. Run environment/cache-mutating tests serialized locally.
@@ -240,4 +254,4 @@ Before extraction acceptance, a separate fresh reviewer must:
 
 ## Rollback
 
-Before extraction, replace the pending rollback point with the accepted characterization commit. Rollback reverts only the mechanical extraction commit, restoring the characterized bodies to `main.rs`. No schema, wire version, persistent data, cache format, or external API migration is part of this checkpoint.
+Rollback reverts only the mechanical extraction commit after `66ba5db`, restoring the characterized bodies to `main.rs`. No schema, wire version, persistent data, cache format, or external API migration is part of this checkpoint.

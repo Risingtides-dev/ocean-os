@@ -3445,3 +3445,11 @@ area:      [backend]: ocean-daemon Phase 2C advisory HTTP adapters
 
 Proposed the next behavior-neutral boundary, then narrowed it after fresh manifest review: move only the state-free Longhouse prepare/inspect/workflow-brief HTTP shells into private `src/longhouse_preparation.rs`. The manifest freezes PR #292 exact-token inspection evidence, real-router extractor/method/envelope/privacy contracts, cwd roots/cache selection, `spawn_blocking`/fail-open behavior, and the read-only no-state/no-event/no-runtime authority boundary. Skill query/fetch and compatibility subagent-spec remain in composition; the reviewer disclosed a cached indexed-path symlink-retarget risk that requires a separate security disposition before any librarian extraction and is neither frozen nor changed here. Router composition, turn-time preparation, Longhouse governance/title/escrow/recall state, and `ocean-longhouse` algorithms remain excluded. Characterization and independent review are required before any production move.
 _________________________________________________________________________________
+time:      [09:45pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [test]: characterize Longhouse preparation boundary
+area:      [backend]: ocean-daemon Phase 2C advisory HTTP adapters
+
+Added three daemon-only characterization tests for the narrowed Longhouse preparation boundary. The real router now freezes exact missing-prompt/content-type/malformed JSON responses, POST-only method behavior, unknown-field and all-optionals-omitted defaults, top-N zero, complete prepare/inspect/workflow key sets, both PR #292 evidence shapes and contributing terms, cwd confinement, and full-response prompt/session/client/cwd/body/source-path redaction. An extraction-aware source assertion proves each cache lookup remains inside its `spawn_blocking` closure before the exact fail-open fallback and excludes state/event/runtime/permission/turn authority. Rebased onto PR #295's harness-profile changes, which touched no Longhouse seam. Focused tests and all 348 daemon tests passed serialized; fresh re-review found no unresolved medium-or-higher issue. Characterization commit: `66ba5db`.
+_________________________________________________________________________________
