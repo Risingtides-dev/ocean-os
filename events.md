@@ -3722,3 +3722,23 @@ reviews approved the implementation after the tie and documentation additions.
 `cargo test -p ocean-longhouse` passed 132 tests with one ignored; all-target
 Clippy with denied warnings, formatting, and diff checks passed.
 _________________________________________________________________________________
+
+time:      [03:02] [16-07-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [feature-request]
+area:      [backend]
+
+Completed Longhouse TASK-3 with a pure, stateless ReviewPlanner over the live
+QuorumAssessment. The closed output type permits only Continue with one of four
+typed review actions or non-terminal NeedsEscalation; it has no commitment or
+abort constructor. Deterministic policy prefers unused correlation groups,
+detects projected loss of unique leadership through the canonical decay
+trajectory, chooses cap-aware adversarial challenges, keeps evidence requests
+non-weight-bearing, and immediately escalates a lone-proposal field without
+spending a reviewer call. Regressions cover exact capped replicas, no-value
+CostBound ties, projected decay, advisory cap transitions rechecked against a
+fresh live assessment, budget exhaustion, and deterministic reviewer choice.
+`cargo test -p ocean-longhouse` passed 140 tests with one ignored; all-target
+Clippy with denied warnings, formatting, and diff checks passed.
+_________________________________________________________________________________
