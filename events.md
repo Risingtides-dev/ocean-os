@@ -3793,3 +3793,51 @@ frozen implementation. Final gates passed: 154 Longhouse tests with one ignored,
 workspace test compilation, compatibility feature and release lanes, docs/index
 checks, formatting, and diff checks.
 _________________________________________________________________________________
+time:      [03:52] [07-16-26]
+agent:     [claude] [fable-5]
+worktree:  main
+type:      release
+area:      testing
+
+TASK-5 landed (dabb5238, codex): six production-path integration tests through convene_with_resolver on the private CouncilHandle seam (fakeable only at the ask boundary, unanimously seam-approved). Scenarios prove the four TASK-1..4 pieces COMPOSE: lone-proposal -> rival -> resume -> CostBound; budget-zero -> sole InsufficientAlternatives (no Timeout/Converged/basis); deadline Timeout untouched; RequestEvidence observable + non-weight-bearing end-to-end; headroom-gated ChallengeLeader -> real inhibit; capped-runner/uncapped-leader lead-flip -> ReassertAfterDecay with the pre-reassertion field reconstructed from the run's own recording and deadline < t*_runner pinned. Both review lanes (fable + pi) approved; final gates 154/0/1 longhouse, 48/0 SDK, 320 daemon, workspace + clippy -D + docs-check green. Longhouse refine-and-test effort COMPLETE (TASK-1..5 all landed on the stitchpad board).
+_________________________________________________________________________________
+time:      [04:15] [07-16-26]
+agent:     [claude] [fable-5]
+worktree:  main
+type:      review
+area:      testing
+
+Live production test of the refined Longhouse engine (daemon rebuilt+restarted at dabb5238 after purging a poisoned libocean_core rmeta carrying phantom TokenUsage fields from reverted WIP — root cause of the flip-flopping E0063 that had ocean looping). Two real councils on 'IndexedDB vs Cache API': topic 0ffd8ae7 (3 proposals + endorse + observable Evidence mark — RequestEvidence fired in production, non-weight-bearing; honest Timeout abort) and topic 4139172f (2 equal-support proposals — exact tie; planner escalated TiedField, force_resolve refused the coin flip; honest Split abort). Zero false convergence; abort taxonomy held. PRODUCT FINDING: semantically identical proposals fragment the evidence field — unanimous councils cannot converge without a proposal-consolidation pass after round 1. Proposed as TASK-7 (convene-layer only; engine contract untouched).
+_________________________________________________________________________________
+time:      [05:06] [07-16-26]
+agent:     [claude] [fable-5]
+worktree:  main
+type:      feature-request
+area:      backend
+
+TASK-7 landed: pre-registration proposal consolidation in convene.rs. Duplicate round-1 answers fold into endorse(canonical) pre-engine (no merge op; cap math untouched); one deterministic duplicate definition (Jaccard 0.6, 4-token floor, negation-signature hard veto incl. n't normalization) shared with is_distinct_rival; registration-order canonical selection. Two-round review: pi (composition) + codex (adversarial: negation escape via contractions, HashMap nondeterminism — both fixed and regression-pinned). Gates 158/0/1, clippy -D clean, workspace clean. Next: daemon rebuild/restart + live re-run of the IndexedDB council to confirm unanimous convergence in production.
+_________________________________________________________________________________
+time:      [05:53] [07-16-26]
+agent:     [claude] [fable-5]
+worktree:  main
+type:      release
+area:      backend
+
+TASK-8 landed (d40008c9 + 7c81f10b) and LIVE CONVERGENCE achieved: council topic 488d0579 converged EvidenceBound on IndexedDB — the first converged production council on the refined engine, closing the full refine->test->gap->fix arc. Structured ANSWER contract (char-safe parser, directive stripping, trailing-aside, negation-preserving keys), KEY-to-KEY consolidation (fired live: second IndexedDB answer folded to endorse), closed conservative validity filter (+ council-4's live leak shape), per-phase compliance counters now visible in daemon logs (first measurement: 3 returned / 2 structured / 1 fallback / 0 rejected = 67% adoption). Three review rounds by pi+codex. Follow-ups flagged: topics read-model missing Converged ingestion (blocks ocean's UI lane); accumulate compliance datapoints before prompt tuning. Longhouse phase complete; federations next.
+_________________________________________________________________________________
+time:      [05:58] [07-16-26]
+agent:     [claude] [fable-5]
+worktree:  main
+type:      review
+area:      backend
+
+Correction to prior entry: the /v1/longhouse/topics 'read-model gap' was a false alarm — the endpoint serves state=="converged" (verified by codex: topic 488d0579 has state, decision, firekeeper, tallies); my inspection script read a nonexistent 'converged' boolean. No ingestion bug, no TASK-6 dependency. Longhouse live acceptance closed by codex: mechanism production-proven; 67% ANSWER-contract compliance is an n=3 baseline, counters accumulating.
+_________________________________________________________________________________
+
+time:      [05:58] [07-16-26]
+agent:     [claude] [fable 5]
+type:      review
+area:      backend
+
+Federation identity/security review lane accepted (assigned by codex on the pad). Independently verified the Gate-1 seam anchors on current main before pi's plan lands: spawn_room_agent_turn inherits global YOLO via effective_yolo() (main.rs:5883) and carries no agent selector on PromptRequest (main.rs:5813); the /v1/agent/turn named-agent path is fail-open on unresolved agents and on empty effective_tools() allowlists (main.rs:7061-7081); the call-voice TurnRunner already demonstrates the required fail-closed pattern — build_prompt_control(...).without_tools() with yolo:false hardcoded (main.rs:3840-3848). Audit gates posted to the pad; per codex's spec re-read, 6d3bfab9 is discarded for Gate 1 (no local auth machinery — Bedrock mints identity in Gate 2). Holding edits until pi's plan freezes.
+_________________________________________________________________________________
