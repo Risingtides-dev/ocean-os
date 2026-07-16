@@ -1,0 +1,234 @@
+[
+  {
+    "case": "midword-edit-does-not-match-credit",
+    "prompt": "edit the invoice",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Credit Control", "description": "Manage customer balances" }
+    ],
+    "candidate_count": 0,
+    "selected": []
+  },
+  {
+    "case": "midword-rust-does-not-match-trust",
+    "prompt": "rust audit",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Trust Review", "description": "General governance review" }
+    ],
+    "candidate_count": 0,
+    "selected": []
+  },
+  {
+    "case": "closed-short-domain-allowlist",
+    "prompt": "AI CI DB OS PR QA UI UX",
+    "top_n": 8,
+    "candidates": [
+      { "name": "UX", "description": "User experience" },
+      { "name": "PR", "description": "Pull request" },
+      { "name": "AI", "description": "Artificial intelligence" },
+      { "name": "QA", "description": "Quality assurance" },
+      { "name": "DB", "description": "Database" },
+      { "name": "UI", "description": "User interface" },
+      { "name": "CI", "description": "Continuous integration" },
+      { "name": "OS", "description": "Operating system" }
+    ],
+    "candidate_count": 8,
+    "selected": [
+      { "name": "AI", "score": 3, "matched_prompt_terms": ["ai"], "exact_name_phrase": false },
+      { "name": "CI", "score": 3, "matched_prompt_terms": ["ci"], "exact_name_phrase": false },
+      { "name": "DB", "score": 3, "matched_prompt_terms": ["db"], "exact_name_phrase": false },
+      { "name": "OS", "score": 3, "matched_prompt_terms": ["os"], "exact_name_phrase": false },
+      { "name": "PR", "score": 3, "matched_prompt_terms": ["pr"], "exact_name_phrase": false },
+      { "name": "QA", "score": 3, "matched_prompt_terms": ["qa"], "exact_name_phrase": false },
+      { "name": "UI", "score": 3, "matched_prompt_terms": ["ui"], "exact_name_phrase": false },
+      { "name": "UX", "score": 3, "matched_prompt_terms": ["ux"], "exact_name_phrase": false }
+    ]
+  },
+  {
+    "case": "ordinary-short-words-remain-filtered",
+    "prompt": "to in me it go",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Go Builder", "description": "Compile programs" }
+    ],
+    "candidate_count": 0,
+    "selected": []
+  },
+  {
+    "case": "exact-multiword-name-outranks-reordered-name",
+    "prompt": "migration database review",
+    "top_n": 1,
+    "candidates": [
+      { "name": "Database Migration Review", "description": "" },
+      { "name": "Migration Database Review", "description": "" }
+    ],
+    "candidate_count": 2,
+    "selected": [
+      { "name": "Migration Database Review", "score": 12, "matched_prompt_terms": ["migration", "database", "review"], "exact_name_phrase": true }
+    ]
+  },
+  {
+    "case": "phrase-normalizes-case-punctuation-and-stop-words",
+    "prompt": "Run OCEAN/OS: REFINEMENT-WAVE please",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Ocean OS Refinement Wave", "description": "Factory orchestration" }
+    ],
+    "candidate_count": 1,
+    "selected": [
+      { "name": "Ocean OS Refinement Wave", "score": 15, "matched_prompt_terms": ["ocean", "os", "refinement", "wave"], "exact_name_phrase": true }
+    ]
+  },
+  {
+    "case": "single-description-term-stays-below-floor",
+    "prompt": "deploy",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Schema Author", "description": "Deploy applications" }
+    ],
+    "candidate_count": 0,
+    "selected": []
+  },
+  {
+    "case": "two-description-terms-clear-floor",
+    "prompt": "deploy production",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Release Helper", "description": "Deploy production services" }
+    ],
+    "candidate_count": 1,
+    "selected": [
+      { "name": "Release Helper", "score": 4, "matched_prompt_terms": ["deploy", "production"], "exact_name_phrase": false }
+    ]
+  },
+  {
+    "case": "name-and-description-mixed-evidence",
+    "prompt": "migration schema",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Database Migration", "description": "Author relational schema safely" }
+    ],
+    "candidate_count": 1,
+    "selected": [
+      { "name": "Database Migration", "score": 5, "matched_prompt_terms": ["migration", "schema"], "exact_name_phrase": false }
+    ]
+  },
+  {
+    "case": "duplicate-prompt-terms-do-not-inflate-score",
+    "prompt": "migration migration schema schema",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Database Migration", "description": "Author relational schema safely" }
+    ],
+    "candidate_count": 1,
+    "selected": [
+      { "name": "Database Migration", "score": 5, "matched_prompt_terms": ["migration", "schema"], "exact_name_phrase": false }
+    ]
+  },
+  {
+    "case": "generic-task-request-boilerplate-is-empty",
+    "prompt": "please run this task request something stuff things",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Task Runner", "description": "Use for a generic task request" }
+    ],
+    "candidate_count": 0,
+    "selected": []
+  },
+  {
+    "case": "generic-coding-prompt-does-not-pad-results",
+    "prompt": "please update this code",
+    "top_n": 5,
+    "candidates": [
+      { "name": "PDF", "description": "Document layout" },
+      { "name": "Database Migration", "description": "Schema tables" },
+      { "name": "Remotion Video", "description": "Programmatic media" }
+    ],
+    "candidate_count": 0,
+    "selected": []
+  },
+  {
+    "case": "deterministic-name-tie-break",
+    "prompt": "gamma delta",
+    "top_n": 2,
+    "candidates": [
+      { "name": "Beta Tool", "description": "Gamma delta" },
+      { "name": "Alpha Tool", "description": "Gamma delta" }
+    ],
+    "candidate_count": 2,
+    "selected": [
+      { "name": "Alpha Tool", "score": 4, "matched_prompt_terms": ["gamma", "delta"], "exact_name_phrase": false },
+      { "name": "Beta Tool", "score": 4, "matched_prompt_terms": ["gamma", "delta"], "exact_name_phrase": false }
+    ]
+  },
+  {
+    "case": "exact-policy-does-not-stem-inflections",
+    "prompt": "deploy",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Deployment Helper", "description": "Release services" }
+    ],
+    "candidate_count": 0,
+    "selected": []
+  },
+  {
+    "case": "single-word-name-keeps-base-hit-without-phrase-bonus",
+    "prompt": "PDF",
+    "top_n": 5,
+    "candidates": [
+      { "name": "PDF", "description": "Document layout" }
+    ],
+    "candidate_count": 1,
+    "selected": [
+      { "name": "PDF", "score": 3, "matched_prompt_terms": ["pdf"], "exact_name_phrase": false }
+    ]
+  },
+  {
+    "case": "zero-cap-keeps-candidate-count-but-selects-nothing",
+    "prompt": "PDF",
+    "top_n": 0,
+    "candidates": [
+      { "name": "PDF", "description": "Document layout" }
+    ],
+    "candidate_count": 1,
+    "selected": []
+  },
+  {
+    "case": "description-when-to-use-metadata-remains-eligible",
+    "prompt": "typescript imports",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Migration Helper", "description": "Use when migrating TypeScript imports across modules" }
+    ],
+    "candidate_count": 1,
+    "selected": [
+      { "name": "Migration Helper", "score": 4, "matched_prompt_terms": ["typescript", "imports"], "exact_name_phrase": false }
+    ]
+  },
+  {
+    "case": "repeated-name-term-phrase-remains-eligible",
+    "prompt": "review review workflow",
+    "top_n": 1,
+    "candidates": [
+      { "name": "Review Workflow Review", "description": "" },
+      { "name": "Review Review Workflow", "description": "" }
+    ],
+    "candidate_count": 2,
+    "selected": [
+      { "name": "Review Review Workflow", "score": 9, "matched_prompt_terms": ["review", "workflow"], "exact_name_phrase": true }
+    ]
+  },
+  {
+    "case": "stop-words-are-ignored-inside-name-phrase",
+    "prompt": "review and merge",
+    "top_n": 5,
+    "candidates": [
+      { "name": "Review for Merge", "description": "Pull request gate" }
+    ],
+    "candidate_count": 1,
+    "selected": [
+      { "name": "Review for Merge", "score": 9, "matched_prompt_terms": ["review", "merge"], "exact_name_phrase": true }
+    ]
+  }
+]

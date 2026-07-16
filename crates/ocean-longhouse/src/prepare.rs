@@ -34,9 +34,10 @@
 //!   already-loaded `Vec<SkillBrief>`.
 //! * [`SkillIndex::prepare`] — a **cheap, deterministic** relevance match
 //!   between the brief's prompt and each skill's name + description (OCEAN-283
-//!   ranking: term-set overlap, name-weighted, with a distinct-coverage bonus,
-//!   de-duplicated, and a minimum-score floor so a single weak common-word hit
-//!   never injects noise), returning the top-N most relevant skills. No
+//!   ranking: exact metadata-token overlap, name-weighted, with a distinct-
+//!   coverage bonus and an exact multiword-name phrase bonus, de-duplicated,
+//!   and a minimum-score floor so a single weak common-word hit never injects
+//!   noise), returning the top-N most relevant skills. No
 //!   embeddings, no LLM — the `docs/LONGHOUSE.md` "cheap fast model reranker"
 //!   remains the named follow-up; this is the bounded deterministic prefilter
 //!   (step 1 of the documented selection path) that it would sit on top of.
@@ -186,6 +187,10 @@ pub struct ExplainedSkillMatch {
     pub brief: SkillBrief,
     pub score: u32,
     pub matched_prompt_terms: Vec<String>,
+    /// Whether the complete retained multiword name occurred contiguously in
+    /// the prompt and contributed the exact-name phrase bonus.
+    #[serde(default)]
+    pub exact_name_phrase: bool,
 }
 
 /// One selected workflow together with the exact deterministic ranking evidence.
@@ -195,6 +200,10 @@ pub struct ExplainedWorkflowMatch {
     pub brief: WorkflowBrief,
     pub score: u32,
     pub matched_prompt_terms: Vec<String>,
+    /// Whether the complete retained multiword name occurred contiguously in
+    /// the prompt and contributed the exact-name phrase bonus.
+    #[serde(default)]
+    pub exact_name_phrase: bool,
 }
 
 /// Read-only inspection of the ordinary preparation ranking.
@@ -399,13 +408,14 @@ impl SkillIndex {
     /// OCEAN-283 ranking — a better deterministic prefilter than raw keyword
     /// overlap, still no model in the loop:
     ///
-    /// * **Term-set match, not raw count.** Prompt and skill text are reduced to
-    ///   *sets* of distinct terms, so a skill is scored by *which* prompt terms
-    ///   it covers, never by how many times one word repeats — a long
-    ///   description can't win by sheer length.
+    /// * **Exact token-set match, not substring/count.** Prompt and metadata are
+    ///   compared at alphanumeric term boundaries, so `rust` cannot match
+    ///   `trust`; duplicate prompt words and repeated description words add no
+    ///   score. A closed allowlist retains high-signal two-letter domain terms.
     /// * **Name weighted over description.** A prompt term hitting the skill's
     ///   *name* (the strongest signal of what it's for) scores more than one
-    ///   hitting only the description.
+    ///   hitting only the description. A complete retained multiword name in
+    ///   prompt order receives one inspectable phrase bonus.
     /// * **Distinct-coverage bonus.** Matching several *different* prompt terms
     ///   beats matching one term, so a skill that's relevant on multiple axes
     ///   outranks an incidental single-word collision.
@@ -413,9 +423,9 @@ impl SkillIndex {
     ///   [`MIN_RELEVANCE_SCORE`] and is dropped — default-on means every turn
     ///   consults, so we inject a brief only when it's *genuinely* relevant,
     ///   never noise.
-    /// * **De-duplicated.** The same skill reachable from two roots (e.g. a repo
-    ///   `./skills` copy shadowing a home one) collapses to a single brief, so
-    ///   we never inject the same name twice or waste a slot.
+    /// * **De-duplicated by identity.** The same `(name, source_path)` candidate
+    ///   reachable through overlapping roots occupies one slot. Distinct files
+    ///   are intentionally not collapsed solely because their names match.
     ///
     /// Skills below the floor are dropped — we never pad results to `top_n` with
     /// irrelevant skills. Ties break deterministically (score, then name, then
@@ -425,14 +435,14 @@ impl SkillIndex {
             return Vec::new();
         }
 
-        let prompt_terms = tokenize(prompt);
+        let prompt_terms = PromptTerms::from_text(prompt);
         if prompt_terms.is_empty() {
             return Vec::new();
         }
 
-        // Preserve the automatic hook's original allocation profile: score and
-        // sort once, then stop de-duplicating as soon as `top_n` is filled. Only
-        // explicit inspection materializes explanations and counts every candidate.
+        // Preserve the automatic hook's bounded profile: tokenize the prompt
+        // once, score and sort once, then stop de-duplicating as soon as `top_n`
+        // is filled. Only inspection retains explanations and counts every candidate.
         let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
         self.scored_skills(&prompt_terms)
             .into_iter()
@@ -454,7 +464,7 @@ impl SkillIndex {
             return (Vec::new(), 0);
         }
 
-        let prompt_terms = tokenize(prompt);
+        let prompt_terms = PromptTerms::from_text(prompt);
         if prompt_terms.is_empty() {
             return (Vec::new(), 0);
         }
@@ -474,6 +484,7 @@ impl SkillIndex {
                     brief: skill.clone(),
                     score,
                     matched_prompt_terms: evidence.matched_prompt_terms,
+                    exact_name_phrase: evidence.exact_name_phrase,
                 });
             }
         }
@@ -482,7 +493,7 @@ impl SkillIndex {
 
     /// Score and sort relevant skills once. Both ordinary preparation and
     /// inspection project this same order, floor, and tie-break path.
-    fn scored_skills<'a>(&'a self, prompt_terms: &[String]) -> Vec<(u32, &'a SkillBrief)> {
+    fn scored_skills<'a>(&'a self, prompt_terms: &PromptTerms<'_>) -> Vec<(u32, &'a SkillBrief)> {
         let mut scored: Vec<_> = self
             .skills
             .iter()
@@ -653,7 +664,7 @@ impl WorkflowIndex {
         if top_n == 0 || self.workflows.is_empty() {
             return Vec::new();
         }
-        let prompt_terms = tokenize(prompt);
+        let prompt_terms = PromptTerms::from_text(prompt);
         if prompt_terms.is_empty() {
             return Vec::new();
         }
@@ -673,7 +684,7 @@ impl WorkflowIndex {
         if self.workflows.is_empty() {
             return (Vec::new(), 0);
         }
-        let prompt_terms = tokenize(prompt);
+        let prompt_terms = PromptTerms::from_text(prompt);
         if prompt_terms.is_empty() {
             return (Vec::new(), 0);
         }
@@ -694,13 +705,17 @@ impl WorkflowIndex {
                     brief: workflow.clone(),
                     score,
                     matched_prompt_terms: evidence.matched_prompt_terms,
+                    exact_name_phrase: evidence.exact_name_phrase,
                 });
             }
         }
         (selected, candidate_count)
     }
 
-    fn scored_workflows<'a>(&'a self, prompt_terms: &[String]) -> Vec<(u32, &'a WorkflowBrief)> {
+    fn scored_workflows<'a>(
+        &'a self,
+        prompt_terms: &PromptTerms<'_>,
+    ) -> Vec<(u32, &'a WorkflowBrief)> {
         let mut scored: Vec<_> = self
             .workflows
             .iter()
@@ -1097,158 +1112,256 @@ fn first_md_heading(text: &str) -> Option<String> {
     None
 }
 
-/// Lowercase alphanumeric tokens of length ≥ 3, deduped, with high-frequency
-/// English/agent stop-words dropped. Short tokens (`a`, `to`, `ai`) and filler
-/// (`the`, `with`, `please`, `help`) are removed so they can't drive spurious
-/// overlaps now that every turn is consulted — the match stays on *content*
-/// words. Cheap and order-stable (insertion order preserved).
-fn tokenize(text: &str) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for word in text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 3)
-    {
-        let lower = word.to_ascii_lowercase();
-        if is_stop_word(&lower) {
-            continue;
+/// Prompt terms retain both ordered occurrences (for exact-name phrase
+/// detection) and a first-occurrence-ordered distinct set (for base scoring).
+/// Candidate metadata is scanned by borrowed token boundaries, so the default-on
+/// path does not allocate lowercase name/description copies per candidate.
+#[derive(Debug)]
+struct PromptTerms<'a> {
+    distinct: Vec<String>,
+    ordered: Vec<&'a str>,
+}
+
+impl<'a> PromptTerms<'a> {
+    fn from_text(text: &'a str) -> Self {
+        let mut seen = std::collections::BTreeSet::<String>::new();
+        let mut distinct = Vec::new();
+        let mut ordered = Vec::new();
+        for word in text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+        {
+            if !is_relevance_term(word) || is_stop_word_ascii_case(word) {
+                continue;
+            }
+            // Ordered phrase evidence borrows the prompt slice; repetitive input
+            // stores pointers, not one owned lowercase String per occurrence.
+            ordered.push(word);
+            if word.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                if seen.iter().any(|known| known.eq_ignore_ascii_case(word)) {
+                    continue;
+                }
+                let lower = word.to_ascii_lowercase();
+                seen.insert(lower.clone());
+                distinct.push(lower);
+            } else if !seen.contains(word) {
+                let lower = word.to_string();
+                seen.insert(lower.clone());
+                distinct.push(lower);
+            }
         }
-        if seen.insert(lower.clone()) {
-            out.push(lower);
-        }
+        Self { distinct, ordered }
     }
-    out
+
+    fn is_empty(&self) -> bool {
+        self.distinct.is_empty()
+    }
 }
 
-/// Common filler words that carry no skill-selection signal. Dropping them keeps
-/// a generic prompt ("please help me with the thing") from colliding with a
-/// skill description that happens to contain "help" or "with". Deliberately
-/// small + conservative — only words that are almost never a skill's *topic*.
-fn is_stop_word(word: &str) -> bool {
-    matches!(
-        word,
-        "the"
-            | "and"
-            | "for"
-            | "you"
-            | "your"
-            | "with"
-            | "this"
-            | "that"
-            | "from"
-            | "into"
-            | "can"
-            | "will"
-            | "would"
-            | "should"
-            | "could"
-            | "have"
-            | "has"
-            | "are"
-            | "was"
-            | "were"
-            | "but"
-            | "not"
-            | "use"
-            | "using"
-            | "used"
-            | "via"
-            | "per"
-            | "out"
-            | "get"
-            | "got"
-            | "let"
-            | "lets"
-            | "make"
-            | "made"
-            | "want"
-            | "need"
-            | "help"
-            | "please"
-            | "now"
-            | "then"
-            | "than"
-            | "when"
-            | "what"
-            | "which"
-            | "how"
-            | "who"
-            | "why"
-            | "all"
-            | "any"
-            | "some"
-            | "here"
-            | "there"
-            | "about"
-            | "over"
-            | "under"
-            | "more"
-    )
+/// High-signal two-letter domain terms retained despite the ordinary three-byte
+/// floor. The allowlist is deliberately closed: retaining every short token
+/// would admit request boilerplate such as `to`, `in`, `me`, and `it`.
+const SHORT_DOMAIN_TERMS: &[&str] = &["ai", "ci", "db", "os", "pr", "qa", "ui", "ux"];
+
+fn is_relevance_term(word: &str) -> bool {
+    word.len() >= 3
+        || SHORT_DOMAIN_TERMS
+            .iter()
+            .any(|allowed| word.eq_ignore_ascii_case(allowed))
 }
 
-/// Relevance of a skill to the prompt — a better deterministic score than raw
-/// keyword overlap (OCEAN-283). Term *sets*, not counts; name-weighted; with a
-/// distinct-coverage bonus.
-///
-/// For each *distinct* prompt term: +[`NAME_HIT`] if it appears in the skill's
-/// name (the strongest signal of what the skill is for), else +[`DESC_HIT`] if
-/// it appears in the description. Then +1 per distinct prompt term matched
-/// anywhere (the coverage bonus), so a skill relevant on several axes outranks
-/// one with a single incidental collision. A skill that repeats a word in a long
-/// description gains nothing extra — only *distinct* term coverage counts.
+/// Common filler words that carry no skill-selection signal. This stays
+/// conservative: topical words such as `review`, `build`, `deploy`, and
+/// `workflow` remain eligible. The final six nouns close generic task/request
+/// collisions without introducing a broad programming-language stop list.
+const STOP_WORDS: &[&str] = &[
+    "the",
+    "and",
+    "for",
+    "you",
+    "your",
+    "with",
+    "this",
+    "that",
+    "from",
+    "into",
+    "can",
+    "will",
+    "would",
+    "should",
+    "could",
+    "have",
+    "has",
+    "are",
+    "was",
+    "were",
+    "but",
+    "not",
+    "use",
+    "using",
+    "used",
+    "via",
+    "per",
+    "out",
+    "get",
+    "got",
+    "let",
+    "lets",
+    "make",
+    "made",
+    "want",
+    "need",
+    "help",
+    "please",
+    "now",
+    "then",
+    "than",
+    "when",
+    "what",
+    "which",
+    "how",
+    "who",
+    "why",
+    "all",
+    "any",
+    "some",
+    "here",
+    "there",
+    "about",
+    "over",
+    "under",
+    "more",
+    "thing",
+    "things",
+    "something",
+    "stuff",
+    "task",
+    "request",
+];
+
+fn is_stop_word_ascii_case(word: &str) -> bool {
+    STOP_WORDS
+        .iter()
+        .any(|stop| word.eq_ignore_ascii_case(stop))
+}
+
+fn metadata_terms(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|word| {
+        !word.is_empty() && is_relevance_term(word) && !is_stop_word_ascii_case(word)
+    })
+}
+
+fn metadata_contains_term(text: &str, term: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case(term))
+}
+
+/// True only when a candidate's complete retained **multiword** name appears
+/// contiguously and in order in the prompt. Punctuation and stop words are
+/// normalized away on both sides. Single-word names keep their ordinary name
+/// hit and do not receive an extra phrase bonus.
+fn exact_name_phrase(prompt_terms: &PromptTerms<'_>, name: &str, name_term_count: usize) -> bool {
+    if name_term_count < 2 || name_term_count > prompt_terms.ordered.len() {
+        return false;
+    }
+    prompt_terms.ordered.windows(name_term_count).any(|window| {
+        metadata_terms(name)
+            .zip(window)
+            .all(|(name_term, prompt_term)| name_term.eq_ignore_ascii_case(prompt_term))
+    })
+}
+
+/// Relevance of compact metadata to the prompt (OCEAN-283/C2). Terms match only
+/// at alphanumeric boundaries: `edit` cannot match `credit`, and `rust` cannot
+/// match `trust`. Each distinct name hit contributes [`NAME_HIT`] plus one
+/// coverage point; description-only hits contribute [`DESC_HIT`] plus coverage.
+/// The complete retained multiword name adds [`EXACT_NAME_PHRASE_BONUS`].
+#[derive(Debug)]
+struct RelevanceAnalysis {
+    score: u32,
+    exact_name_phrase: bool,
+}
+
 #[derive(Debug)]
 struct RelevanceEvidence {
     score: u32,
     matched_prompt_terms: Vec<String>,
+    exact_name_phrase: bool,
 }
 
 /// The single relevance algorithm used by ordinary preparation and inspection
 /// for both skills and workflows. The callback lets explicit inspection retain
-/// matched terms while the default-on automatic hook computes scores without
-/// allocating per-candidate evidence.
+/// matched terms while the automatic hook computes scores without allocating
+/// per-candidate evidence.
 fn analyze_relevance(
-    prompt_terms: &[String],
+    prompt_terms: &PromptTerms<'_>,
     name: &str,
     description: &str,
     mut matched_term: impl FnMut(&str),
-) -> u32 {
-    let name = name.to_ascii_lowercase();
-    let desc = description.to_ascii_lowercase();
+) -> RelevanceAnalysis {
     let mut weighted = 0u32;
     let mut distinct_hits = 0u32;
-    for term in prompt_terms {
-        if name.contains(term.as_str()) {
+    for term in &prompt_terms.distinct {
+        if metadata_contains_term(name, term) {
             weighted += NAME_HIT;
             distinct_hits += 1;
             matched_term(term);
-        } else if desc.contains(term.as_str()) {
+        } else if metadata_contains_term(description, term) {
             weighted += DESC_HIT;
             distinct_hits += 1;
             matched_term(term);
         }
     }
-    weighted + distinct_hits
-}
-
-fn relevance_score(prompt_terms: &[String], name: &str, description: &str) -> u32 {
-    analyze_relevance(prompt_terms, name, description, |_| {})
-}
-
-fn relevance_evidence(prompt_terms: &[String], name: &str, description: &str) -> RelevanceEvidence {
-    let mut matched_prompt_terms = Vec::new();
-    let score = analyze_relevance(prompt_terms, name, description, |term| {
-        matched_prompt_terms.push(term.to_string());
-    });
-    RelevanceEvidence {
-        score,
-        matched_prompt_terms,
+    // Phrase window scanning is reserved for candidates whose every retained
+    // name term already matched. The all-terms check handles repeated name tokens
+    // without allocating a per-candidate set.
+    let name_term_count = metadata_terms(name).count();
+    let every_name_term_matched = name_term_count >= 2
+        && metadata_terms(name).all(|name_term| {
+            prompt_terms
+                .distinct
+                .iter()
+                .any(|term| name_term.eq_ignore_ascii_case(term))
+        });
+    let exact_name_phrase =
+        every_name_term_matched && exact_name_phrase(prompt_terms, name, name_term_count);
+    let phrase_bonus = if exact_name_phrase {
+        EXACT_NAME_PHRASE_BONUS
+    } else {
+        0
+    };
+    RelevanceAnalysis {
+        score: weighted + distinct_hits + phrase_bonus,
+        exact_name_phrase,
     }
 }
 
-/// Score for a prompt term found in a skill's **name** — the strongest signal.
+fn relevance_score(prompt_terms: &PromptTerms<'_>, name: &str, description: &str) -> u32 {
+    analyze_relevance(prompt_terms, name, description, |_| {}).score
+}
+
+fn relevance_evidence(
+    prompt_terms: &PromptTerms<'_>,
+    name: &str,
+    description: &str,
+) -> RelevanceEvidence {
+    let mut matched_prompt_terms = Vec::new();
+    let analysis = analyze_relevance(prompt_terms, name, description, |term| {
+        matched_prompt_terms.push(term.to_string());
+    });
+    RelevanceEvidence {
+        score: analysis.score,
+        matched_prompt_terms,
+        exact_name_phrase: analysis.exact_name_phrase,
+    }
+}
+
+/// Score for an exact prompt term found in a candidate's **name**.
 const NAME_HIT: u32 = 2;
-/// Score for a prompt term found only in a skill's **description**.
+/// Score for an exact prompt term found only in a candidate's description.
 const DESC_HIT: u32 = 1;
+/// Bonus for the complete retained multiword candidate name in prompt order.
+const EXACT_NAME_PHRASE_BONUS: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -1477,6 +1590,150 @@ mod tests {
                 "Send and search Slack messages across channels",
             ),
         ])
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RelevanceFixture {
+        case: String,
+        prompt: String,
+        top_n: usize,
+        candidates: Vec<RelevanceFixtureCandidate>,
+        candidate_count: usize,
+        selected: Vec<RelevanceFixtureSelection>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RelevanceFixtureCandidate {
+        name: String,
+        description: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    struct RelevanceFixtureSelection {
+        name: String,
+        score: u32,
+        matched_prompt_terms: Vec<String>,
+        exact_name_phrase: bool,
+    }
+
+    #[test]
+    fn relevance_v2_golden_corpus_is_stable_for_skills_and_workflows() {
+        let fixtures: Vec<RelevanceFixture> =
+            serde_json::from_str(include_str!("../tests/fixtures/relevance_v2.json"))
+                .expect("valid relevance-v2 fixture corpus");
+
+        for fixture in fixtures {
+            let skill_briefs: Vec<_> = fixture
+                .candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| SkillBrief {
+                    name: candidate.name.clone(),
+                    description: candidate.description.clone(),
+                    source_path: PathBuf::from(format!("/synthetic/{index}.yaml")),
+                    source: SkillSource::Repo,
+                })
+                .collect();
+            let workflow_briefs: Vec<_> = fixture
+                .candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| WorkflowBrief {
+                    name: candidate.name.clone(),
+                    description: candidate.description.clone(),
+                    source_path: PathBuf::from(format!("/synthetic/{index}.md")),
+                })
+                .collect();
+            let skills = SkillIndex::from_briefs(skill_briefs);
+            let workflows = WorkflowIndex {
+                workflows: workflow_briefs,
+            };
+
+            let (selected_skills, skill_candidates) =
+                skills.rank_skills_explained(&fixture.prompt, fixture.top_n);
+            let (selected_workflows, workflow_candidates) =
+                workflows.rank_explained(&fixture.prompt, fixture.top_n);
+            let skill_snapshot: Vec<_> = selected_skills
+                .iter()
+                .map(|selected| RelevanceFixtureSelection {
+                    name: selected.brief.name.clone(),
+                    score: selected.score,
+                    matched_prompt_terms: selected.matched_prompt_terms.clone(),
+                    exact_name_phrase: selected.exact_name_phrase,
+                })
+                .collect();
+            let workflow_snapshot: Vec<_> = selected_workflows
+                .iter()
+                .map(|selected| RelevanceFixtureSelection {
+                    name: selected.brief.name.clone(),
+                    score: selected.score,
+                    matched_prompt_terms: selected.matched_prompt_terms.clone(),
+                    exact_name_phrase: selected.exact_name_phrase,
+                })
+                .collect();
+
+            assert_eq!(
+                skill_candidates, fixture.candidate_count,
+                "skill candidate count: {}",
+                fixture.case
+            );
+            assert_eq!(
+                workflow_candidates, fixture.candidate_count,
+                "workflow candidate count: {}",
+                fixture.case
+            );
+            assert_eq!(skill_snapshot, fixture.selected, "skills: {}", fixture.case);
+            assert_eq!(
+                workflow_snapshot, fixture.selected,
+                "workflows: {}",
+                fixture.case
+            );
+            assert_eq!(
+                skills.rank_skills(&fixture.prompt, fixture.top_n),
+                selected_skills
+                    .iter()
+                    .map(|selected| selected.brief.clone())
+                    .collect::<Vec<_>>(),
+                "ordinary/explained skill parity: {}",
+                fixture.case
+            );
+            assert_eq!(
+                workflows.rank(&fixture.prompt, fixture.top_n),
+                selected_workflows
+                    .iter()
+                    .map(|selected| selected.brief.clone())
+                    .collect::<Vec<_>>(),
+                "ordinary/explained workflow parity: {}",
+                fixture.case
+            );
+            assert_eq!(
+                skills.rank_skills_explained(&fixture.prompt, fixture.top_n),
+                (selected_skills, skill_candidates),
+                "repeated skill ranking is stable: {}",
+                fixture.case
+            );
+            assert_eq!(
+                workflows.rank_explained(&fixture.prompt, fixture.top_n),
+                (selected_workflows, workflow_candidates),
+                "repeated workflow ranking is stable: {}",
+                fixture.case
+            );
+        }
+    }
+
+    #[test]
+    fn repetitive_prompt_phrase_terms_borrow_input_storage() {
+        let prompt = "rust ".repeat(100_000);
+        let terms = PromptTerms::from_text(&prompt);
+        assert_eq!(terms.distinct, ["rust"]);
+        assert_eq!(terms.ordered.len(), 100_000);
+
+        let start = prompt.as_ptr() as usize;
+        let end = start + prompt.len();
+        assert!(terms.ordered.iter().all(|term| {
+            let ptr = term.as_ptr() as usize;
+            ptr >= start && ptr + term.len() <= end
+        }));
     }
 
     #[test]
@@ -1900,7 +2157,9 @@ mod tests {
             inspection.selected_skills[0].matched_prompt_terms,
             ["zeta", "zorpquok", "alpha"]
         );
-        assert_eq!(inspection.selected_skills[0].score, 8);
+        assert_eq!(inspection.selected_skills[0].score, 11);
+        assert!(inspection.selected_skills[0].exact_name_phrase);
+        assert!(inspection.selected_workflows[0].exact_name_phrase);
         assert_eq!(inspection, index.inspect_top_n(&turn, 1));
         assert_eq!(
             serde_json::to_value(&inspection.prep).unwrap(),
@@ -1921,6 +2180,29 @@ mod tests {
         assert!(inspection.selected_skills.is_empty());
         assert!(inspection.skill_candidates > 0);
         assert_eq!(inspection.prep, index.prepare_top_n(&turn, 0));
+    }
+
+    #[test]
+    fn inspection_phrase_evidence_deserializes_additively() {
+        let legacy_skill = serde_json::json!({
+            "brief": brief("PDF", "Document layout"),
+            "score": 3,
+            "matched_prompt_terms": ["pdf"]
+        });
+        let parsed: ExplainedSkillMatch = serde_json::from_value(legacy_skill).unwrap();
+        assert!(!parsed.exact_name_phrase);
+
+        let legacy_workflow = serde_json::json!({
+            "brief": WorkflowBrief {
+                name: "PR Review".to_string(),
+                description: "Review a pull request".to_string(),
+                source_path: PathBuf::from("/workflows/pr-review.md"),
+            },
+            "score": 6,
+            "matched_prompt_terms": ["pr", "review"]
+        });
+        let parsed: ExplainedWorkflowMatch = serde_json::from_value(legacy_workflow).unwrap();
+        assert!(!parsed.exact_name_phrase);
     }
 
     /// The workflow cache serves stale data on a cache hit and re-scans on TTL=0.

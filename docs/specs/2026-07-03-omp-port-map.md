@@ -388,17 +388,19 @@ summary exists to keep the backlog honest.
   before the runtime's hard context-window trim. The richer OMP tiers remain absent.
 - The original W7 core destination is invalid. General orchestration must ship through extensions
   over generic permission-gated execution, cancellation, capability, and event/tool seams.
+- Post-turn advisor attribution, its dedicated two-permit/no-backlog limiter, fixed 30-second
+  timeout, and fixed-cardinality outcome/latency metrics are live; richer review evidence and
+  durable notes remain separate privacy/persistence decisions.
+- The default-on Longhouse consult now has a path-redacted explained-ranking route and a shared
+  fixture-backed exact-token ranker for skills/workflows. It remains local, deterministic,
+  read-only, time-bounded, fail-open, permission-neutral, and separate from council/convene.
 
 ### Next high-leverage sequence
 
 1. Reconcile which capabilities are truly surface-scoped and carry that policy through one runtime
    composition seam rather than logging unused booleans.
-2. Add advisor attribution, time/concurrency bounds, and observable status before increasing the
-   context it reviews.
-3. Make the default-on Longhouse consult inspectable and tune relevance without granting it
-   execution authority.
-4. Build the command minimizer, then the shared walker/search substrate.
-5. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
+2. Build the command minimizer, then the shared walker/search substrate.
+3. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
 
 ## Scoping principle (John, 2026-07-03)
 

@@ -27,10 +27,12 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
 
 - [ ] Reconcile the harness-profile contract: decide which capabilities are surface-scoped,
       then carry that policy through runtime composition instead of leaving logged-only flags.
-- [ ] Bound and attribute the post-turn advisor before broadening it: source turn identity,
-      timeout/concurrency policy, observable outcome, and truthful usage/failure accounting.
-- [ ] Make the default-on Longhouse pre-turn consult inspectable and tune relevance while
-      preserving its read-only, permission-neutral, fail-open boundary.
+- [x] Bound and attribute the post-turn advisor before broadening it: authoritative source-turn
+      identity, a dedicated two-permit fail-open limiter, a fixed 30-second timeout, and
+      fixed-cardinality outcome/latency metrics are live in `ocean-daemon`.
+- [x] Make the default-on Longhouse pre-turn consult inspectable and tune relevance while
+      preserving its read-only, permission-neutral, fail-open boundary: the path-redacted
+      `/v1/longhouse/inspect` projection and fixture-backed exact-token ranker are live.
 - [ ] Implement the command-output minimizer, then a shared walker/search substrate, as
       independent reviewed checkpoints over existing artifact and capability seams.
 - [ ] Route isolation, task dispatch, typed yields, joins, budgets, and orchestration policy
