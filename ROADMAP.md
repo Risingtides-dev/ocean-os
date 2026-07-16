@@ -35,8 +35,13 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
 - [x] Make the default-on Longhouse pre-turn consult inspectable and tune relevance while
       preserving its read-only, permission-neutral, fail-open boundary: the path-redacted
       `/v1/longhouse/inspect` projection and fixture-backed exact-token ranker are live.
-- [ ] Implement the command-output minimizer, then a shared walker/search substrate, as
-      independent reviewed checkpoints over existing artifact and capability seams.
+- [x] Implement the standalone M1 command-output minimizer as a dependency-free,
+      already-tokenized library with fixed conservative cargo/git/gh/npm/npx/pytest filters.
+      It is intentionally outside `default-members` and has no live runtime wiring.
+- [ ] Design and review command-capture/runtime integration for `ocean-minimizer` over the
+      existing artifact and capability seams; adding the standalone crate did not enable a
+      harness-profile capability.
+- [ ] Implement a shared walker/search substrate as an independent reviewed checkpoint.
 - [ ] Route isolation, task dispatch, typed yields, joins, budgets, and orchestration policy
       through the approved extension architecture; do not revive their superseded core placement.
 

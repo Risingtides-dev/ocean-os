@@ -1,0 +1,14 @@
+Need to install the following packages:
+cowsay@1.6.0
+Ok to proceed? (y)
+
+npm warn deprecated foo@1.0.0: use bar instead
+npm notice New major version of npm available!
+ _______
+< Hello >
+ -------
+        \   ^__^
+         \  (oo)\_______
+            (__)\       )\/\
+                ||----w |
+                ||     ||

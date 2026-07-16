@@ -32,7 +32,7 @@ clients (TUI / CLI / ACP / surface)
   -> ocean-protocol + ocean-providers (wire encoding + model/auth routing)
 ```
 
-Use `crates/AGENTS.md` for all 26 current workspace packages, ownership exclusions, entry points, local contracts, and narrow validation commands.
+Use `crates/AGENTS.md` for all 27 current workspace packages, ownership exclusions, entry points, local contracts, and narrow validation commands.
 
 ## Work Guidance
 

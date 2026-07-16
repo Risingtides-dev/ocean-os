@@ -3477,3 +3477,38 @@ area:      [backend]: ocean-daemon Phase 2C advisory HTTP adapters
 
 PR #296 merged the reviewed Longhouse preparation extraction as `29d65f8` after hosted run `29466034956` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, and advanced the next bounded wave to separately manifested turn-time Longhouse preparation/presentation. The cached skill-path symlink-retarget finding remains a separate security disposition before any librarian extraction; live daemon deployment/supervision remains outside this workstream.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [10:17pm] [15-07-26]
+agent:     [codex], [gpt-5.6], [worker]
+worktree:  pi/omp-minimizer-m1-20260715
+type:      [feature]: add standalone command-output minimizer M1
+area:      [backend]: dependency-free conservative output filters
+
+Added the unwired `ocean-minimizer` workspace library with an already-tokenized
+`Invocation`/`Program` API, deterministic disposition and passthrough reasons,
+exact byte/line accounting, changed-only original text, a 4 MiB fail-open bound,
+and one final fixed line cap. Implemented conservative fixed filters for selected
+cargo, default human git status/log, default gh PR checks, npm install/ci, npx
+first-run preambles, and attributed pytest summaries/failure blocks. Machine,
+custom, NUL, oversized, unknown, and ambiguous shapes remain byte-identical.
+Preserved selected pinned OMP fixtures, added exact gh/npx/pytest goldens and
+OMP/RTK MIT attribution, and documented that M1 has no shell parser, TOML/user
+configuration, artifacts/footer, or daemon/runtime/agent/TUI/profile wiring.
+
+Provenance:
+- Oh My Pi `03c48d073bd4849726cc14750b5aecfa310bdf26`
+- RTK pytest algorithm `878af7de99e0ba71da2e8fd996f6b52a1836e06c`
+
+Fresh review rounds hardened ambiguous boundaries before acceptance: strict `gh`
+command paths; exact pytest summaries that cannot consume failure evidence;
+byte-preserving npm noise recognition with raw/nonzero fail-open modes; structural
+git status/log parsing for metadata-shaped filenames and content; and npx
+no-preamble passthrough before the final cap. Final independent review found no
+remaining medium-or-higher issue.
+
+Verification:
+- all 17 `ocean-minimizer` tests and doc tests passed on current Rust and pinned Rust 1.88
+- denied-warning all-target crate Clippy passed
+- `cargo check --workspace --tests` and `cargo xtask ci --compatibility` passed
+- metadata/index parity, format, docs-check, diff-check, and `cargo deny check` passed
