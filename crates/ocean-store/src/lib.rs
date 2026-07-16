@@ -80,8 +80,9 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use ocean_core::{
-    Room, RoomKey, RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind,
-    RoomTriggerPolicy,
+    FederatedMessageMeta, FederatedRoomMemberProjection, OutboxItemState, Room,
+    RoomAccessProjection, RoomAccessState, RoomKey, RoomMessage, RoomMessageKind, RoomOutboxItem,
+    RoomParticipant, RoomParticipantKind, RoomTriggerPolicy,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -194,6 +195,22 @@ pub enum RoomStoreError {
     AlreadyExists(RoomKey),
     /// No participant with the given id is in the room (on remove).
     UnknownParticipant { room: RoomKey, participant: String },
+    /// No outbox item found for the given client_event_id.
+    UnknownOutboxItem {
+        room: RoomKey,
+        client_event_id: String,
+    },
+    /// Outbox item exists but is not in a failed state.
+    OutboxItemNotFailed {
+        room: RoomKey,
+        client_event_id: String,
+        current_state: String,
+    },
+    /// The room exists but is in a state that rejects the operation (local / revoked).
+    RoomStateRejected {
+        room: RoomKey,
+        state: RoomAccessState,
+    },
     /// An underlying SQLite error.
     Db(rusqlite::Error),
     /// A stored value could not be (de)serialized.
@@ -208,6 +225,29 @@ impl std::fmt::Display for RoomStoreError {
             Self::AlreadyExists(k) => write!(f, "room '{k}' already exists"),
             Self::UnknownParticipant { room, participant } => {
                 write!(f, "room '{room}' has no participant '{participant}'")
+            }
+            Self::UnknownOutboxItem {
+                room,
+                client_event_id,
+            } => {
+                write!(f, "room '{room}' has no outbox item '{client_event_id}'")
+            }
+            Self::OutboxItemNotFailed {
+                room,
+                client_event_id,
+                current_state,
+            } => {
+                write!(
+                    f,
+                    "outbox item '{client_event_id}' in room '{room}' is in state '{current_state}', not failed"
+                )
+            }
+            Self::RoomStateRejected { room, state } => {
+                write!(
+                    f,
+                    "room '{room}' is in state '{}', rejecting operation",
+                    serde_json::to_string(state).unwrap_or_else(|_| format!("{:?}", state))
+                )
             }
             Self::Db(e) => write!(f, "sqlite error: {e}"),
             Self::Encode(e) => write!(f, "encode error: {e}"),
@@ -384,6 +424,52 @@ pub trait RoomStore {
 
     /// The room's current trigger policy, if any.
     fn trigger_policy(&self, key: &RoomKey) -> Result<Option<RoomTriggerPolicy>>;
+
+    // ── S2-P1 federation: access projection + outbox ──────────────────────
+
+    /// Upsert the room's access projection (S2-P1).
+    ///
+    /// Stores the given state, confirmed sequence, and member list. This is the
+    /// single writer path by which the daemon persists an access snapshot. Called
+    /// after every successful federation RPC and on local-state transitions.
+    fn upsert_access_projection(
+        &mut self,
+        key: &RoomKey,
+        state: RoomAccessState,
+        confirmed_sequence: Option<u64>,
+        members: &[FederatedRoomMemberProjection],
+    ) -> Result<()>;
+
+    /// Read the room's access projection (S2-P1).
+    ///
+    /// Returns `None` when the room exists but no access projection has ever been
+    /// upserted (fresh local room). Returns `UnknownRoom` when the room itself
+    /// does not exist.
+    fn read_access_projection(&self, key: &RoomKey) -> Result<Option<RoomAccessProjection>>;
+
+    /// Append an item to the room's outbox (S2-P1).
+    ///
+    /// Outbox items are isolated from the transcript (`seq` column) — they are
+    /// a separate table keyed by `(room_id, client_event_id)`. Fails if the room
+    /// does not exist or if an item with the same `client_event_id` already exists.
+    fn append_outbox_item(&mut self, key: &RoomKey, item: &RoomOutboxItem) -> Result<()>;
+
+    /// Read outbox items for a room filtered by state (S2-P1).
+    ///
+    /// If `state` is `None`, returns all items regardless of state. Returns an
+    /// empty vec when the room is unknown (not an error).
+    fn read_outbox_items(
+        &self,
+        key: &RoomKey,
+        state: Option<OutboxItemState>,
+    ) -> Result<Vec<RoomOutboxItem>>;
+
+    /// Retry a failed outbox item, setting its state back to `Pending` (S2-P1).
+    ///
+    /// Returns `UnknownOutboxItem` if the item does not exist, and
+    /// `OutboxItemNotFailed` if it is not in the `Failed` state.  Only the
+    /// `state` field is altered — every other column is left untouched.
+    fn retry_outbox_item(&mut self, key: &RoomKey, client_event_id: &str) -> Result<()>;
 }
 
 /// SQLite-backed durable room store.
@@ -443,22 +529,51 @@ impl SqliteRoomStore {
                 kind        TEXT NOT NULL,           -- RoomMessageKind, snake_case
                 body        TEXT NOT NULL,
                 created_at  TEXT NOT NULL,           -- RFC3339
+                federated   TEXT,                    -- JSON FederatedMessageMeta, NULL = local
                 PRIMARY KEY (room_id, seq)
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
             CREATE INDEX IF NOT EXISTS idx_participants_room ON participants(room_id, position);
+
+            CREATE TABLE IF NOT EXISTS room_access (
+                room_id             TEXT PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+                state               TEXT NOT NULL,    -- RoomAccessState, snake_case
+                confirmed_sequence  TEXT,             -- canonical decimal u64, NULL = none
+                member_projection   TEXT NOT NULL     -- JSON [FederatedRoomMemberProjection]
+            );
+
+            CREATE TABLE IF NOT EXISTS outbox (
+                room_id            TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                client_event_id    TEXT NOT NULL,
+                source_id          TEXT NOT NULL,
+                source_sequence    TEXT NOT NULL,     -- canonical decimal u64
+                author_member_id   TEXT NOT NULL,
+                event_type         TEXT NOT NULL,
+                payload            TEXT NOT NULL,     -- JSON Value
+                mention_member_ids TEXT NOT NULL,     -- JSON [String]
+                state              TEXT NOT NULL,     -- OutboxItemState, snake_case
+                PRIMARY KEY (room_id, client_event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_outbox_room_state ON outbox(room_id, state);
             "#,
         )?;
-        // Backfill the OCEAN-260 workspace_root column on DBs created before it
-        // existed. `CREATE TABLE IF NOT EXISTS` above is a no-op on an existing
-        // `rooms` table, so a separate ADD COLUMN is the only way older stores
-        // gain the column. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a
-        // duplicate-column error here just means the column is already present
-        // (fresh DB) — swallow exactly that and propagate anything else.
+        // Backfill columns on DBs created before they existed.
+        // workspace_root (OCEAN-260) — on the `rooms` table.
         match self
             .conn
             .execute("ALTER TABLE rooms ADD COLUMN workspace_root TEXT", [])
+        {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
+        // federated (S2-P1) — on the `messages` table.
+        match self
+            .conn
+            .execute("ALTER TABLE messages ADD COLUMN federated TEXT", [])
         {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
@@ -481,6 +596,19 @@ impl SqliteRoomStore {
             .conn
             .query_row(
                 "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
+    /// Does any room (open or closed) exist for this key? (S2-P1)
+    fn room_exists(&self, key: &RoomKey) -> Result<bool> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1",
                 params![key.as_str()],
                 |r| r.get(0),
             )
@@ -586,7 +714,7 @@ impl SqliteRoomStore {
         // but stay total) and bind as i64 for SQLite.
         let fetch = effective_limit.saturating_add(1) as i64;
         let mut stmt = self.conn.prepare(
-            "SELECT seq, author_id, author_kind, kind, body, created_at
+            "SELECT seq, author_id, author_kind, kind, body, created_at, federated
              FROM messages WHERE room_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![key.as_str(), after, fetch], |row| {
@@ -596,11 +724,27 @@ impl SqliteRoomStore {
             let kind: String = row.get(3)?;
             let body: String = row.get(4)?;
             let created_at: String = row.get(5)?;
-            Ok((seq, author_id, author_kind, kind, body, created_at))
+            let federated: Option<String> = row.get(6)?;
+            Ok((
+                seq,
+                author_id,
+                author_kind,
+                kind,
+                body,
+                created_at,
+                federated,
+            ))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (seq, author_id, author_kind, kind, body, created_at) = r?;
+            let (seq, author_id, author_kind, kind, body, created_at, federated) = r?;
+            let federated_meta: Option<FederatedMessageMeta> =
+                match federated {
+                    Some(json) => Some(serde_json::from_str(&json).map_err(|e| {
+                        RoomStoreError::Encode(format!("invalid federated JSON: {e}"))
+                    })?),
+                    None => None,
+                };
             out.push(RoomMessage {
                 seq: seq as u64,
                 author_id,
@@ -608,6 +752,7 @@ impl SqliteRoomStore {
                 kind: decode_message_kind(&kind)?,
                 body,
                 created_at: parse_ts(&created_at)?,
+                federated: federated_meta,
             });
         }
         // If we got the sentinel row back, there is at least one more page. Drop
@@ -655,8 +800,8 @@ impl SqliteRoomStore {
             |r| r.get(0),
         )?;
         conn.execute(
-            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
             params![
                 key.as_str(),
                 next_seq,
@@ -674,6 +819,7 @@ impl SqliteRoomStore {
             kind,
             body: body.to_string(),
             created_at: now,
+            federated: None,
         })
     }
 
@@ -1066,6 +1212,244 @@ impl RoomStore for SqliteRoomStore {
             None => Ok(None),
         }
     }
+
+    fn upsert_access_projection(
+        &mut self,
+        key: &RoomKey,
+        state: RoomAccessState,
+        confirmed_sequence: Option<u64>,
+        members: &[FederatedRoomMemberProjection],
+    ) -> Result<()> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let state_str = serde_json::to_string(&state)
+            .map_err(|e| RoomStoreError::Encode(format!("state serialize: {e}")))?;
+        let state_str = state_str.trim_matches('"'); // "local" → local
+        let seq_text = confirmed_sequence.map(write_u64_text);
+        let member_json = serde_json::to_string(members)
+            .map_err(|e| RoomStoreError::Encode(format!("members serialize: {e}")))?;
+        self.conn.execute(
+            "INSERT INTO room_access (room_id, state, confirmed_sequence, member_projection)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(room_id) DO UPDATE SET
+               state = excluded.state,
+               confirmed_sequence = excluded.confirmed_sequence,
+               member_projection = excluded.member_projection",
+            params![key.as_str(), state_str, seq_text, member_json],
+        )?;
+        Ok(())
+    }
+
+    fn read_access_projection(&self, key: &RoomKey) -> Result<Option<RoomAccessProjection>> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let row = self
+            .conn
+            .query_row(
+                "SELECT state, confirmed_sequence, member_projection
+                 FROM room_access WHERE room_id = ?1",
+                params![key.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((state_str, seq_text, member_json)) = row else {
+            return Ok(None);
+        };
+        let state: RoomAccessState =
+            serde_json::from_value(serde_json::Value::String(state_str))
+                .map_err(|e| RoomStoreError::Encode(format!("bad access state: {e}")))?;
+        let confirmed_sequence: Option<u64> = match seq_text {
+            Some(t) => Some(read_u64_text(Some(t))?),
+            None => None,
+        };
+        let members: Vec<FederatedRoomMemberProjection> = serde_json::from_str(&member_json)
+            .map_err(|e| RoomStoreError::Encode(format!("bad member projection: {e}")))?;
+        Ok(Some(RoomAccessProjection {
+            state,
+            last_confirmed_global_sequence: confirmed_sequence,
+            members,
+            outbox: Vec::new(),
+        }))
+    }
+
+    fn append_outbox_item(&mut self, key: &RoomKey, item: &RoomOutboxItem) -> Result<()> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let state_str = serde_json::to_string(&item.state)
+            .map_err(|e| RoomStoreError::Encode(format!("state serialize: {e}")))?;
+        let state_str = state_str.trim_matches('"');
+        let payload_json = item.payload.to_string();
+        let mentions_json = serde_json::to_string(&item.mention_member_ids)
+            .map_err(|e| RoomStoreError::Encode(format!("mentions serialize: {e}")))?;
+        let src_seq = write_u64_text(item.source_sequence);
+        self.conn.execute(
+            "INSERT INTO outbox (room_id, client_event_id, source_id, source_sequence,
+                                 author_member_id, event_type, payload, mention_member_ids, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                key.as_str(),
+                item.client_event_id,
+                item.source_id,
+                src_seq,
+                item.author_member_id,
+                item.event_type,
+                payload_json,
+                mentions_json,
+                state_str,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn read_outbox_items(
+        &self,
+        key: &RoomKey,
+        state: Option<OutboxItemState>,
+    ) -> Result<Vec<RoomOutboxItem>> {
+        // Silently return empty when room is unknown (not an error per spec).
+        if !self.room_exists(key)? {
+            return Ok(Vec::new());
+        }
+        let (where_clause, param) = match state {
+            Some(ref s) => {
+                let s_str = serde_json::to_string(s)
+                    .map_err(|e| RoomStoreError::Encode(format!("state serialize: {e}")))?;
+                let s_str = s_str.trim_matches('"').to_string();
+                ("WHERE room_id = ?1 AND state = ?2".to_string(), Some(s_str))
+            }
+            None => ("WHERE room_id = ?1".to_string(), None),
+        };
+        let sql = format!(
+            "SELECT client_event_id, source_id, source_sequence, author_member_id,
+                    event_type, payload, mention_member_ids, state
+             FROM outbox {} ORDER BY rowid",
+            where_clause,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows: Vec<_> = if let Some(ref s_str) = param {
+            stmt.query_map(params![key.as_str(), s_str], |row| {
+                let client_event_id: String = row.get(0)?;
+                let source_id: String = row.get(1)?;
+                let source_sequence: String = row.get(2)?;
+                let author_member_id: String = row.get(3)?;
+                let event_type: String = row.get(4)?;
+                let payload: String = row.get(5)?;
+                let mention_member_ids: String = row.get(6)?;
+                let state: String = row.get(7)?;
+                Ok((
+                    client_event_id,
+                    source_id,
+                    source_sequence,
+                    author_member_id,
+                    event_type,
+                    payload,
+                    mention_member_ids,
+                    state,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![key.as_str()], |row| {
+                let client_event_id: String = row.get(0)?;
+                let source_id: String = row.get(1)?;
+                let source_sequence: String = row.get(2)?;
+                let author_member_id: String = row.get(3)?;
+                let event_type: String = row.get(4)?;
+                let payload: String = row.get(5)?;
+                let mention_member_ids: String = row.get(6)?;
+                let state: String = row.get(7)?;
+                Ok((
+                    client_event_id,
+                    source_id,
+                    source_sequence,
+                    author_member_id,
+                    event_type,
+                    payload,
+                    mention_member_ids,
+                    state,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut out = Vec::new();
+        for (
+            client_event_id,
+            source_id,
+            source_sequence,
+            author_member_id,
+            event_type,
+            payload,
+            mention_member_ids,
+            state,
+        ) in rows
+        {
+            let source_sequence = read_u64_text(Some(source_sequence))?;
+            let payload: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|e| RoomStoreError::Encode(format!("bad payload JSON: {e}")))?;
+            let mention_member_ids: Vec<String> = serde_json::from_str(&mention_member_ids)
+                .map_err(|e| RoomStoreError::Encode(format!("bad mentions JSON: {e}")))?;
+            let state_str = format!("\"{state}\"");
+            let state: OutboxItemState = serde_json::from_str(&state_str)
+                .map_err(|e| RoomStoreError::Encode(format!("bad outbox state: {e}")))?;
+            out.push(RoomOutboxItem {
+                client_event_id,
+                source_id,
+                source_sequence,
+                author_member_id,
+                event_type,
+                payload,
+                mention_member_ids,
+                state,
+            });
+        }
+        Ok(out)
+    }
+
+    fn retry_outbox_item(&mut self, key: &RoomKey, client_event_id: &str) -> Result<()> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownOutboxItem {
+                room: key.clone(),
+                client_event_id: client_event_id.to_string(),
+            });
+        }
+        // Read current state — if it doesn't exist or isn't Failed, error.
+        let current: Option<(String,)> = self
+            .conn
+            .query_row(
+                "SELECT state FROM outbox WHERE room_id = ?1 AND client_event_id = ?2",
+                params![key.as_str(), client_event_id],
+                |r| Ok((r.get::<_, String>(0)?,)),
+            )
+            .optional()?;
+        let Some((state_str,)) = current else {
+            return Err(RoomStoreError::UnknownOutboxItem {
+                room: key.clone(),
+                client_event_id: client_event_id.to_string(),
+            });
+        };
+        if state_str != "failed" {
+            return Err(RoomStoreError::OutboxItemNotFailed {
+                room: key.clone(),
+                client_event_id: client_event_id.to_string(),
+                current_state: state_str,
+            });
+        }
+        // Only mutate the state column — every other field is preserved.
+        self.conn.execute(
+            "UPDATE outbox SET state = 'pending' WHERE room_id = ?1 AND client_event_id = ?2",
+            params![key.as_str(), client_event_id],
+        )?;
+        Ok(())
+    }
 }
 
 // ---- (de)serialization helpers ---------------------------------------------
@@ -1241,6 +1625,36 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&Utc))
         .map_err(|e| RoomStoreError::Encode(format!("bad timestamp '{s}': {e}")))
+}
+
+// ── canonical decimal u64 sequence helpers (S2-P1) ────────────────────────
+
+/// Read a `u64` from its canonical decimal TEXT column.
+///
+/// Federation sequence numbers are stored as TEXT so they never lose precision
+/// across producers (SQLite integers are signed i64). Returns `0` for a NULL
+/// column.  Rejects non-decimal text including hex, leading zeros (`"01"`),
+/// empty strings, and overflow (`">18446744073709551615"`).
+fn read_u64_text(s: Option<String>) -> Result<u64> {
+    let raw = match s {
+        Some(v) => v,
+        None => return Ok(0_u64),
+    };
+    if raw.is_empty() || raw.as_bytes()[0] == b'0' && raw.len() > 1 || raw.as_bytes()[0] == b'-' {
+        return Err(RoomStoreError::Encode(format!("invalid u64 text: '{raw}'")));
+    }
+    let v: u128 = raw
+        .parse()
+        .map_err(|_| RoomStoreError::Encode(format!("invalid u64 decimal: '{raw}'")))?;
+    if v > u64::MAX as u128 {
+        return Err(RoomStoreError::Encode(format!("u64 overflow: '{raw}'")));
+    }
+    Ok(v as u64)
+}
+
+/// Write a `u64` to its canonical decimal TEXT form.
+fn write_u64_text(v: u64) -> String {
+    v.to_string()
 }
 
 #[cfg(test)]
@@ -2403,5 +2817,426 @@ mod tests {
         );
         assert!(decision.should_convene);
         assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
+    }
+
+    // ── S2-P1 federation store tests ──────────────────────────────────────
+
+    fn member_proj(member_id: &str, display_name: &str) -> FederatedRoomMemberProjection {
+        FederatedRoomMemberProjection {
+            member_id: member_id.into(),
+            owner_member_id: None,
+            actor_type: ocean_core::FederatedActorType::User,
+            role_in_room: ocean_core::FederatedRoomRole::Member,
+            display_name: display_name.into(),
+            public_agent_descriptor: None,
+            joined_at: "2026-07-16T18:00:00Z".into(),
+            derived_presence: None,
+            local_binding_available: None,
+        }
+    }
+
+    // ── reopen + migration ────────────────────────────────────────────────
+
+    #[test]
+    fn reopen_preserves_access_projection_and_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let key = RoomKey::new("r1");
+
+        // First open: create room + upsert access projection + append outbox.
+        {
+            let mut s = SqliteRoomStore::open(&db_path).unwrap();
+            s.create(key.clone(), "R1", None, now()).unwrap();
+            let members = vec![member_proj("m1", "Alice")];
+            s.upsert_access_projection(&key, RoomAccessState::Live, Some(42), &members)
+                .unwrap();
+            let item = RoomOutboxItem {
+                client_event_id: "evt-1".into(),
+                source_id: key.as_str().into(),
+                source_sequence: 1,
+                author_member_id: "m1".into(),
+                event_type: "message".into(),
+                payload: serde_json::json!({"body": "hi"}),
+                mention_member_ids: vec![],
+                state: OutboxItemState::Pending,
+            };
+            s.append_outbox_item(&key, &item).unwrap();
+        }
+
+        // Reopen: projection and outbox survive.
+        {
+            let s = SqliteRoomStore::open(&db_path).unwrap();
+            let proj = s.read_access_projection(&key).unwrap().unwrap();
+            assert_eq!(proj.state, RoomAccessState::Live);
+            assert_eq!(proj.last_confirmed_global_sequence, Some(42));
+            assert_eq!(proj.members.len(), 1);
+            assert_eq!(proj.members[0].display_name, "Alice");
+
+            let items = s.read_outbox_items(&key, None).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].client_event_id, "evt-1");
+            assert_eq!(items[0].state, OutboxItemState::Pending);
+        }
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let mut s = store();
+        s.migrate().unwrap();
+        s.migrate().unwrap(); // second call must not error or duplicate
+                              // Prove tables still work after double migrate.
+        let key = RoomKey::new("r2");
+        s.create(key.clone(), "R2", None, now()).unwrap();
+        assert!(s.get(&key).unwrap().is_some());
+    }
+
+    // ── transcript paging metadata ────────────────────────────────────────
+
+    #[test]
+    fn transcript_page_returns_federated_metadata() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+
+        // Append a message, then inject federated metadata directly via SQL.
+        s.append_message(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "hello",
+            now(),
+        )
+        .unwrap();
+
+        let meta = FederatedMessageMeta {
+            ledger_event_id: "evt_x".into(),
+            global_sequence: 99,
+            source_id: "room:r1:member:m1:producer:p1".into(),
+            source_sequence: 5,
+            client_event_id: "cli-1".into(),
+            origin_principal_id: "princ-1".into(),
+            origin_member_id: "mem-1".into(),
+        };
+        s.conn
+            .execute(
+                "UPDATE messages SET federated = ?1 WHERE room_id = ?2 AND seq = 0",
+                params![serde_json::to_string(&meta).unwrap(), key.as_str()],
+            )
+            .unwrap();
+
+        let page = s.transcript_page(&key, None, None).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert!(!page.has_more);
+        let msg = &page.messages[0];
+        assert_eq!(msg.seq, 0);
+        assert_eq!(msg.body, "hello");
+        let fed = msg.federated.as_ref().unwrap();
+        assert_eq!(fed.global_sequence, 99);
+        assert_eq!(fed.source_sequence, 5);
+        assert_eq!(fed.ledger_event_id, "evt_x");
+    }
+
+    // ── outbox excluded from transcript ───────────────────────────────────
+
+    #[test]
+    fn outbox_items_do_not_appear_in_transcript() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.append_message(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "real message",
+            now(),
+        )
+        .unwrap();
+
+        let item = RoomOutboxItem {
+            client_event_id: "evt-1".into(),
+            source_id: key.as_str().into(),
+            source_sequence: 1,
+            author_member_id: "m1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"body": "outbox msg"}),
+            mention_member_ids: vec![],
+            state: OutboxItemState::Pending,
+        };
+        s.append_outbox_item(&key, &item).unwrap();
+
+        // Transcript must contain only the "real message" (1 row), NOT the outbox item.
+        let page = s.transcript_page(&key, None, None).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].body, "real message");
+    }
+
+    // ── u64 TEXT edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn u64_max_roundtrips_through_access_projection() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let members = vec![member_proj("m1", "Alice")];
+        s.upsert_access_projection(&key, RoomAccessState::Live, Some(u64::MAX), &members)
+            .unwrap();
+        let proj = s.read_access_projection(&key).unwrap().unwrap();
+        assert_eq!(
+            proj.last_confirmed_global_sequence,
+            Some(u64::MAX),
+            "u64::MAX must survive roundtrip"
+        );
+    }
+
+    #[test]
+    fn u64_max_roundtrips_through_outbox() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let item = RoomOutboxItem {
+            client_event_id: "evt-max".into(),
+            source_id: key.as_str().into(),
+            source_sequence: u64::MAX,
+            author_member_id: "m1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"body": "max"}),
+            mention_member_ids: vec![],
+            state: OutboxItemState::Pending,
+        };
+        s.append_outbox_item(&key, &item).unwrap();
+        let items = s.read_outbox_items(&key, None).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source_sequence, u64::MAX);
+    }
+
+    #[test]
+    fn corrupt_u64_text_is_fail_closed() {
+        // Inject a non-decimal value directly into the TEXT sequence column.
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let members = vec![member_proj("m1", "Alice")];
+        s.upsert_access_projection(&key, RoomAccessState::Live, Some(1), &members)
+            .unwrap();
+
+        // Corrupt the confirmed_sequence column directly.
+        s.conn
+            .execute(
+                "UPDATE room_access SET confirmed_sequence = '0xDEAD' WHERE room_id = ?1",
+                params![key.as_str()],
+            )
+            .unwrap();
+
+        let err = s.read_access_projection(&key).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid u64"),
+            "corrupt hex u64 must fail closed — got: {err}"
+        );
+    }
+
+    #[test]
+    fn leading_zero_u64_text_is_fail_closed() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let members = vec![member_proj("m1", "Alice")];
+        s.upsert_access_projection(&key, RoomAccessState::Live, Some(1), &members)
+            .unwrap();
+
+        // Inject leading-zero text directly.
+        s.conn
+            .execute(
+                "UPDATE room_access SET confirmed_sequence = '00042' WHERE room_id = ?1",
+                params![key.as_str()],
+            )
+            .unwrap();
+
+        let err = s.read_access_projection(&key).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid u64"),
+            "leading-zero u64 must fail closed — got: {err}"
+        );
+    }
+
+    // ── stable outbox order ───────────────────────────────────────────────
+
+    #[test]
+    fn outbox_items_are_returned_in_stable_insertion_order() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        for i in 0..5 {
+            let item = RoomOutboxItem {
+                client_event_id: format!("evt-{i}"),
+                source_id: key.as_str().into(),
+                source_sequence: i,
+                author_member_id: "m1".into(),
+                event_type: "message".into(),
+                payload: serde_json::json!({"i": i}),
+                mention_member_ids: vec![],
+                state: OutboxItemState::Pending,
+            };
+            s.append_outbox_item(&key, &item).unwrap();
+        }
+        let items = s.read_outbox_items(&key, None).unwrap();
+        assert_eq!(items.len(), 5);
+        let ids: Vec<_> = items.iter().map(|i| &i.client_event_id as &str).collect();
+        assert_eq!(ids, vec!["evt-0", "evt-1", "evt-2", "evt-3", "evt-4"]);
+    }
+
+    // ── retry preserves every non-state field ─────────────────────────────
+
+    #[test]
+    fn retry_preserves_all_non_state_fields() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let item = RoomOutboxItem {
+            client_event_id: "evt-1".into(),
+            source_id: "room:r1:member:m1:producer:p1".into(),
+            source_sequence: 7,
+            author_member_id: "m1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"body": "retry me", "extra": true}),
+            mention_member_ids: vec!["m2".into(), "m3".into()],
+            state: OutboxItemState::Failed,
+        };
+        s.append_outbox_item(&key, &item).unwrap();
+
+        s.retry_outbox_item(&key, "evt-1").unwrap();
+
+        let items = s.read_outbox_items(&key, None).unwrap();
+        assert_eq!(items.len(), 1);
+        let retried = &items[0];
+        assert_eq!(retried.state, OutboxItemState::Pending); // only this changed
+        assert_eq!(retried.client_event_id, "evt-1");
+        assert_eq!(retried.source_id, "room:r1:member:m1:producer:p1");
+        assert_eq!(retried.source_sequence, 7);
+        assert_eq!(retried.author_member_id, "m1");
+        assert_eq!(retried.event_type, "message");
+        assert_eq!(
+            retried.payload,
+            serde_json::json!({"body": "retry me", "extra": true})
+        );
+        assert_eq!(retried.mention_member_ids, vec!["m2", "m3"]);
+    }
+
+    // ── distinct outcomes ─────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_room_rejected_on_access_ops() {
+        let s = store();
+        let key = RoomKey::new("nonexistent");
+        let err = s.read_access_projection(&key).unwrap_err();
+        assert!(
+            matches!(err, RoomStoreError::UnknownRoom(_)),
+            "unknown room must be UnknownRoom — got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_room_returns_none_access_projection() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        // Never upserted — fresh local room.
+        let proj = s.read_access_projection(&key).unwrap();
+        assert!(
+            proj.is_none(),
+            "fresh local room must return None projection"
+        );
+    }
+
+    #[test]
+    fn unknown_outbox_item_rejected_on_retry() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let err = s.retry_outbox_item(&key, "nonexistent").unwrap_err();
+        assert!(
+            matches!(err, RoomStoreError::UnknownOutboxItem { .. }),
+            "retry on unknown item must be UnknownOutboxItem — got: {err}"
+        );
+    }
+
+    #[test]
+    fn not_failed_outbox_item_rejected_on_retry() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let item = RoomOutboxItem {
+            client_event_id: "evt-1".into(),
+            source_id: key.as_str().into(),
+            source_sequence: 1,
+            author_member_id: "m1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"body": "pending"}),
+            mention_member_ids: vec![],
+            state: OutboxItemState::Pending,
+        };
+        s.append_outbox_item(&key, &item).unwrap();
+        let err = s.retry_outbox_item(&key, "evt-1").unwrap_err();
+        assert!(
+            matches!(err, RoomStoreError::OutboxItemNotFailed { .. }),
+            "retry on pending item must be OutboxItemNotFailed — got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_outbox_returns_empty_on_unknown_room() {
+        let s = store();
+        let key = RoomKey::new("nonexistent");
+        let items = s.read_outbox_items(&key, None).unwrap();
+        assert!(
+            items.is_empty(),
+            "unknown room must return empty outbox, not error"
+        );
+    }
+
+    #[test]
+    fn outbox_state_filter_works() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+
+        let pending = RoomOutboxItem {
+            client_event_id: "evt-pending".into(),
+            source_id: key.as_str().into(),
+            source_sequence: 1,
+            author_member_id: "m1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"body": "pending"}),
+            mention_member_ids: vec![],
+            state: OutboxItemState::Pending,
+        };
+        let failed = RoomOutboxItem {
+            client_event_id: "evt-failed".into(),
+            source_id: key.as_str().into(),
+            source_sequence: 2,
+            author_member_id: "m1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"body": "failed"}),
+            mention_member_ids: vec![],
+            state: OutboxItemState::Failed,
+        };
+        s.append_outbox_item(&key, &pending).unwrap();
+        s.append_outbox_item(&key, &failed).unwrap();
+
+        let all = s.read_outbox_items(&key, None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let only_pending = s
+            .read_outbox_items(&key, Some(OutboxItemState::Pending))
+            .unwrap();
+        assert_eq!(only_pending.len(), 1);
+        assert_eq!(only_pending[0].client_event_id, "evt-pending");
+
+        let only_failed = s
+            .read_outbox_items(&key, Some(OutboxItemState::Failed))
+            .unwrap();
+        assert_eq!(only_failed.len(), 1);
+        assert_eq!(only_failed[0].client_event_id, "evt-failed");
     }
 }
