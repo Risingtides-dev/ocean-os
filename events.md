@@ -3413,3 +3413,11 @@ Verification:
 - `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check` passed
 - Fresh final review found no medium-or-higher issues after repeated-name and repetitive-prompt allocation fixes
 _________________________________________________________________________________
+time:      [09:10pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [docs]: publish persistent-room checkpoint
+area:      [backend]: ocean-daemon Phase 2C durable rooms
+
+PR #293 merged the reviewed persistent-room extraction as `92e03bf` after hosted run `29463198497` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published. The inherited best-effort audit interleaving residual remains documented, and live daemon deployment/supervision remains outside this workstream.
+_________________________________________________________________________________

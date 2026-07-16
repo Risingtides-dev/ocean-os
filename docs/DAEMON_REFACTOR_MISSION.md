@@ -73,7 +73,7 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Model roles | Complete | Private `src/model_roles.rs`; once-at-startup fail-open config loading plus exact turn/advisor precedence and verbatim string behavior frozen by focused tests |
 | Request/permission control records | Published | Private `src/request_control.rs`; PR #286 merged as `ee3860a` after characterization, extraction, dedicated-target gates, fresh reviews, and hosted CI; policy, token verification, HTTP/events, GC scheduling, and shutdown drain stay in composition; live daemon supervision/deployment is owned by the concurrent operator workstream |
 | Recall tally registry | Published | Private `src/recall_registry.rs`; first-threshold ownership, distinct-voter semantics, zero clamp, poison recovery, exact HTTP responses, persisted revocation, and successful-only cleanup were characterized; dedicated-target gates, two fresh reviews, hosted CI, and PR #287 merge `3e051c1` passed |
-| Persistent rooms | Ready for publication | Private `src/persistent_rooms.rs`; exact HTTP envelopes/defaults, persisted-row/event/audit/spawn ordering, closed-room audit asymmetry/paging, poison recovery, static/dynamic route precedence, call/LiveKit consumers, cwd/session identity, and three-state permission behavior were characterized; dedicated-target gates and two fresh extraction reviews passed; hosted CI and merge remain |
+| Persistent rooms | Published | Private `src/persistent_rooms.rs`; exact HTTP envelopes/defaults, persisted-row/event/audit/spawn ordering, closed-room audit asymmetry/paging, poison recovery, static/dynamic route precedence, call/LiveKit consumers, cwd/session identity, and three-state permission behavior were characterized; dedicated-target gates, two fresh extraction reviews, hosted CI, and PR #293 merge `92e03bf` passed |
 | Longhouse, calls, remaining registries | Later domain waves | One reviewed domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
@@ -81,9 +81,9 @@ At this checkpoint, `main.rs` is approximately 20.5k lines after persistent-room
 
 ## Course from here
 
-1. Publish the persistent-room checkpoint, then move one remaining state registry or control-plane domain at a time before turn/SSE orchestration.
+1. Move Longhouse next and calls after it, one separately manifested domain at a time before turn/SSE orchestration.
 2. Keep filesystem/project policy, permission authority, settings policy, host/extension ownership, and call-site orchestration fixed while domain boundaries move.
-3. Move Longhouse next and calls after it, only with explicit lifecycle/persistence manifests.
+3. Treat any remaining state-registry or control-plane boundary as its own characterized checkpoint; do not bundle it with a domain move.
 4. Move turn/SSE orchestration last.
 5. Request separate Phase 3 approval before splitting `AppState`, generating route metadata, creating a daemon library, or redesigning internal service boundaries.
 
