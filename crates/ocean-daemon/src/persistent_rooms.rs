@@ -1,21 +1,30 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
 use chrono::Utc;
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 use ocean_core::{
-    evaluate_trigger_policy, PermissionMode, PromptRequest, RequestState, RoomKey, RoomMessageKind,
-    RoomParticipant, RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
+    evaluate_trigger_policy, PermissionMode, PromptRequest, RequestState, RoomKey, RoomMessage,
+    RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
 };
 use ocean_store::RoomStore;
 use serde_json::json;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use uuid::Uuid;
 
-use super::{build_prompt_control, core_sid, record_prompt_result, sdk_sid, AppState};
+use super::{
+    build_prompt_control, core_sid, record_prompt_result, sdk_sid, sse_until_shutdown, AppState,
+    SSE_KEEPALIVE_INTERVAL,
+};
 use crate::request_control::register_running_request;
 use crate::yolo_settings::effective_permission_mode;
 
@@ -23,6 +32,69 @@ use crate::yolo_settings::effective_permission_mode;
 /// synchronous, and both adapters recover a poisoned mutex without holding the
 /// guard across an await.
 pub(super) type RoomStoreHandle = Arc<Mutex<ocean_store::SqliteRoomStore>>;
+
+/// A room-scoped wake hint. It deliberately carries no transcript payload:
+/// SQLite remains the durable authority and every subscriber pages the store
+/// after a hint, closing lag and replay/live seam gaps without trusting the
+/// bounded channel for delivery.
+#[derive(Debug, Clone)]
+pub(super) struct RoomWakeHint {
+    room: RoomKey,
+    seq: u64,
+}
+
+/// Daemon-wide bounded wake channel for durable room transcript tails.
+#[derive(Clone)]
+pub(super) struct RoomWakeBus {
+    tx: broadcast::Sender<RoomWakeHint>,
+}
+
+impl Default for RoomWakeBus {
+    fn default() -> Self {
+        Self::new(256)
+    }
+}
+
+impl RoomWakeBus {
+    pub(super) fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<RoomWakeHint> {
+        self.tx.subscribe()
+    }
+
+    fn publish(&self, room: &RoomKey, message: &RoomMessage) {
+        let _ = self.tx.send(RoomWakeHint {
+            room: room.clone(),
+            seq: message.seq,
+        });
+    }
+}
+
+/// Publish only after the store adapter has returned, which means the allocating
+/// SQLite transaction has committed. A missing subscriber is harmless: hints
+/// are advisory and reconnect/recovery always pages the durable log.
+fn publish_room_wake(state: &AppState, room: &RoomKey, message: &RoomMessage) {
+    state.room_wakes.publish(room, message);
+}
+
+/// Append one durable transcript row and issue its post-commit wake hint.
+fn append_room_message(
+    state: &AppState,
+    room: &RoomKey,
+    author_id: &str,
+    author_kind: RoomParticipantKind,
+    kind: RoomMessageKind,
+    body: &str,
+) -> Result<RoomMessage, ocean_store::RoomStoreError> {
+    let message = with_rooms(state, |store| {
+        store.append_message(room, author_id, author_kind, kind, body, Utc::now())
+    })?;
+    publish_room_wake(state, room, &message);
+    Ok(message)
+}
 
 // ---- Persistent Rooms (OCEAN-65) -------------------------------------------
 //
@@ -350,13 +422,16 @@ pub(super) async fn room_join(
         display_name: req.display_name,
     };
     let result = with_rooms(&state, |reg| {
-        reg.add_participant(&key, participant, Utc::now())
+        reg.add_participant_with_message(&key, participant, Utc::now())
     });
     match result {
-        Ok(rec) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "room": rec.room })),
-        ),
+        Ok((rec, message)) => {
+            publish_room_wake(&state, &key, &message);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "room": rec.room })),
+            )
+        }
         Err(e) => room_store_error_response(e),
     }
 }
@@ -369,13 +444,16 @@ pub(super) async fn room_leave(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
     let result = with_rooms(&state, |reg| {
-        reg.remove_participant(&key, participant_id.trim(), Utc::now())
+        reg.remove_participant_with_message(&key, participant_id.trim(), Utc::now())
     });
     match result {
-        Ok(rec) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "room": rec.room })),
-        ),
+        Ok((rec, message)) => {
+            publish_room_wake(&state, &key, &message);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "room": rec.room })),
+            )
+        }
         Err(e) => room_store_error_response(e),
     }
 }
@@ -428,6 +506,7 @@ pub(super) async fn room_post_message(
         Ok((msg, policy, roster)) => (msg, policy, roster),
         Err(e) => return room_store_error_response(e),
     };
+    publish_room_wake(&state, &key, &msg);
 
     // ---- Auto-convene wiring point (OCEAN-65 / OCEAN-111) -------------------
     //
@@ -490,16 +569,14 @@ pub(super) async fn room_post_message(
             // recursive `room_post_message`), so it convenes nobody. `room_join`
             // blocks NEW unresolved agents; this gate catches the legacy ones.
             if resolve_named_agent(&agent.id).is_err() {
-                let _ = with_rooms(&state, |reg| {
-                    reg.append_message(
-                        &key,
-                        "system",
-                        RoomParticipantKind::System,
-                        RoomMessageKind::System,
-                        &format!("agent '{}' is not bound; no turn queued", agent.id),
-                        Utc::now(),
-                    )
-                });
+                let _ = append_room_message(
+                    &state,
+                    &key,
+                    "system",
+                    RoomParticipantKind::System,
+                    RoomMessageKind::System,
+                    &format!("agent '{}' is not bound; no turn queued", agent.id),
+                );
                 continue;
             }
 
@@ -522,20 +599,18 @@ pub(super) async fn room_post_message(
 
             // Audit line inside the room — only written now that an Agent has
             // actually been resolved and is about to be convened.
-            let _ = with_rooms(&state, |reg| {
-                reg.append_message(
-                    &key,
-                    "system",
-                    RoomParticipantKind::System,
-                    RoomMessageKind::System,
-                    &format!(
-                        "auto-convene: {} ({})",
-                        decision.target_participant.clone().unwrap_or_default(),
-                        decision.reason
-                    ),
-                    Utc::now(),
-                )
-            });
+            let _ = append_room_message(
+                &state,
+                &key,
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                &format!(
+                    "auto-convene: {} ({})",
+                    decision.target_participant.clone().unwrap_or_default(),
+                    decision.reason
+                ),
+            );
 
             spawn_room_agent_turn(state.clone(), key.clone(), agent, msg.seq);
         }
@@ -735,16 +810,14 @@ fn spawn_room_agent_turn(
         let resolved = match resolve_named_agent(&agent.id) {
             Ok(r) => r,
             Err(_) => {
-                let _ = with_rooms(&state, |reg| {
-                    reg.append_message(
-                        &room,
-                        "system",
-                        RoomParticipantKind::System,
-                        RoomMessageKind::System,
-                        &format!("agent '{}' is not bound; no turn queued", agent.id),
-                        Utc::now(),
-                    )
-                });
+                let _ = append_room_message(
+                    &state,
+                    &room,
+                    "system",
+                    RoomParticipantKind::System,
+                    RoomMessageKind::System,
+                    &format!("agent '{}' is not bound; no turn queued", agent.id),
+                );
                 return;
             }
         };
@@ -828,34 +901,30 @@ fn spawn_room_agent_turn(
         if res.ok {
             let body = res.stdout.trim();
             if !body.is_empty() {
-                let _ = with_rooms(&state, |reg| {
-                    reg.append_message(
-                        &room,
-                        &agent.id,
-                        RoomParticipantKind::Agent,
-                        RoomMessageKind::Message,
-                        body,
-                        Utc::now(),
-                    )
-                });
+                let _ = append_room_message(
+                    &state,
+                    &room,
+                    &agent.id,
+                    RoomParticipantKind::Agent,
+                    RoomMessageKind::Message,
+                    body,
+                );
             }
         } else {
             // Surface a failed convene as a system audit line so the room shows
             // the agent was woken but could not answer (e.g. no provider key).
-            let _ = with_rooms(&state, |reg| {
-                reg.append_message(
-                    &room,
-                    "system",
-                    RoomParticipantKind::System,
-                    RoomMessageKind::System,
-                    &format!(
-                        "auto-convene failed for {}: {}",
-                        agent.id,
-                        res.stderr.lines().next().unwrap_or("turn failed")
-                    ),
-                    Utc::now(),
-                )
-            });
+            let _ = append_room_message(
+                &state,
+                &room,
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                &format!(
+                    "auto-convene failed for {}: {}",
+                    agent.id,
+                    res.stderr.lines().next().unwrap_or("turn failed")
+                ),
+            );
         }
     });
 }
@@ -1034,46 +1103,200 @@ pub(super) async fn room_snapshot(
     }
 }
 
-/// `GET /v1/rooms/persistent/{key}/events?after_seq=N&limit=M` — the live-tail
-/// half of the hydrate-then-subscribe pattern: return transcript entries with
-/// `seq > N` (omit `after_seq` for the start of the log). The transcript IS the
-/// room's event log — chat lines plus join/leave/system markers, each carrying a
-/// monotonic `seq` — so this is a thin alias over the same read `room_transcript`
-/// serves, shaped as `events` for the client that just snapshotted at `last_seq`
-/// and wants only what happened since.
-///
-/// Bounded + paginated (OCEAN-249): a busy room's event log no longer streams
-/// unbounded on each poll. `last_seq` (the last seq in this batch, for the
-/// existing tail-resume contract) is retained; `next_seq`/`has_more` are added so
-/// a client can drain a large backlog page-by-page before catching up to live.
-///
-/// Mirrors `room_transcript`'s soft-closed audit fallback so a finished call's
-/// frozen room keeps replaying.
+#[derive(Debug, serde::Deserialize, Default)]
+pub(super) struct RoomEventsQuery {
+    /// Replay starts strictly after this room-scoped sequence number.
+    #[serde(default)]
+    after_seq: Option<u64>,
+}
+
+type RoomEventsError = (StatusCode, Json<serde_json::Value>);
+type RoomTailSeam = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+fn room_events_error(status: StatusCode, code: &str, error: impl Into<String>) -> RoomEventsError {
+    (
+        status,
+        Json(json!({ "ok": false, "code": code, "error": error.into() })),
+    )
+}
+
+fn room_resume_seq(
+    headers: &HeaderMap,
+    query: &RoomEventsQuery,
+) -> Result<Option<u64>, RoomEventsError> {
+    let Some(raw) = headers.get("last-event-id") else {
+        return Ok(query.after_seq);
+    };
+    let value = raw.to_str().map_err(|_| {
+        room_events_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_last_event_id",
+            "Last-Event-ID must be an unsigned integer",
+        )
+    })?;
+    value.parse::<u64>().map(Some).map_err(|_| {
+        room_events_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_last_event_id",
+            "Last-Event-ID must be an unsigned integer",
+        )
+    })
+}
+
+/// Page every durable row after `last_sent_seq`, sending in ascending seq order.
+/// Each query is bounded; newly committed rows may extend the loop, while a
+/// caught-up empty/final page returns control to the wake receiver.
+async fn send_room_catch_up(
+    state: &AppState,
+    room: &RoomKey,
+    last_sent_seq: &mut Option<u64>,
+    tx: &mpsc::Sender<RoomMessage>,
+) -> Result<bool, ocean_store::RoomStoreError> {
+    loop {
+        let page = with_rooms(state, |store| {
+            store.transcript_page(room, *last_sent_seq, Some(128))
+        })?;
+        if page.messages.is_empty() {
+            return Ok(true);
+        }
+        for message in page.messages {
+            if last_sent_seq.is_some_and(|last| message.seq <= last) {
+                continue;
+            }
+            let seq = message.seq;
+            if tx.send(message).await.is_err() {
+                return Ok(false);
+            }
+            *last_sent_seq = Some(seq);
+        }
+        if !page.has_more {
+            return Ok(true);
+        }
+    }
+}
+
+async fn run_room_tail(
+    state: AppState,
+    room: RoomKey,
+    resume: Option<u64>,
+    mut hints: broadcast::Receiver<RoomWakeHint>,
+    tx: mpsc::Sender<RoomMessage>,
+    seam: Option<RoomTailSeam>,
+) {
+    let mut last_sent_seq = resume;
+    match send_room_catch_up(&state, &room, &mut last_sent_seq, &tx).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::warn!(room = %room, %error, "room SSE replay failed");
+            return;
+        }
+    }
+
+    // Tests can hold this exact replay/live seam open. The broadcast receiver was
+    // already subscribed, so hints accumulate while replay is paused; production
+    // passes `None` and continues immediately.
+    if let Some((ready, release)) = seam {
+        let _ = ready.send(());
+        let _ = release.await;
+    }
+
+    loop {
+        match hints.recv().await {
+            Ok(hint) if hint.room != room || Some(hint.seq) <= last_sent_seq => continue,
+            Ok(hint) => {
+                let expected = last_sent_seq.map_or(0, |last| last.saturating_add(1));
+                if hint.seq > expected {
+                    tracing::debug!(
+                        room = %room,
+                        observed_seq = hint.seq,
+                        ?last_sent_seq,
+                        "room SSE observed seq gap; paging durable log"
+                    );
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(room = %room, skipped, "room SSE wake receiver lagged; paging durable log");
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+
+        match send_room_catch_up(&state, &room, &mut last_sent_seq, &tx).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(room = %room, %error, "room SSE durable catch-up failed");
+                return;
+            }
+        }
+    }
+}
+
+fn room_message_tail(
+    state: AppState,
+    room: RoomKey,
+    resume: Option<u64>,
+    hints: broadcast::Receiver<RoomWakeHint>,
+    seam: Option<RoomTailSeam>,
+) -> ReceiverStream<RoomMessage> {
+    let (tx, rx) = mpsc::channel(64);
+    tokio::spawn(run_room_tail(state, room, resume, hints, tx, seam));
+    ReceiverStream::new(rx)
+}
+
+/// `GET /v1/rooms/persistent/{key}/events?after_seq=N` — durable replay plus a
+/// room-scoped live SSE tail. `Last-Event-ID` wins over `after_seq`. Every frame
+/// is `event: room_message`, `id: <seq>`, and the exact existing `RoomMessage`
+/// JSON. SQLite is authoritative; the bounded broadcast carries wake hints only.
 pub(super) async fn room_events(
     State(state): State<AppState>,
-    Path(key): Path<String>,
-    Query(q): Query<TranscriptQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(key.trim());
-    let result = with_rooms(&state, |reg| {
-        read_transcript_page(reg, &key, q.after_seq, q.limit)
-    });
-    match result {
-        Ok(page) => {
-            let last_seq = page.messages.last().map(|m| m.seq);
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "events": page.messages,
-                    "last_seq": last_seq,
-                    "next_seq": page.next_seq,
-                    "has_more": page.has_more,
-                })),
-            )
-        }
-        Err(e) => room_store_error_response(e),
+    Path(raw_key): Path<String>,
+    Query(query): Query<RoomEventsQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, RoomEventsError> {
+    let resume = room_resume_seq(&headers, &query)?;
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return Err(room_events_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_room_key",
+            "invalid room key; must be non-empty",
+        ));
     }
+    let room = RoomKey::new(trimmed);
+    if room.as_str().starts_with("call:") {
+        return Err(room_events_error(
+            StatusCode::BAD_REQUEST,
+            "call_room_events_unsupported",
+            "call-prefixed rooms do not support room event streams",
+        ));
+    }
+
+    match with_rooms(&state, |store| store.get(&room)) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+            return Err(room_events_error(
+                StatusCode::NOT_FOUND,
+                "room_not_found",
+                format!("no open room with key '{room}'"),
+            ));
+        }
+        Err(error) => return Err(room_store_error_response(error)),
+    }
+
+    // Subscribe BEFORE the first replay query. Hints arriving during replay stay
+    // buffered in this receiver; after replay, every hint (or Lagged signal)
+    // pages SQLite from `last_sent_seq`, which closes the seam without trusting
+    // channel retention.
+    let hints = state.room_wakes.subscribe();
+    let stream = room_message_tail(state.clone(), room, resume, hints, None).map(|message| {
+        let seq = message.seq.to_string();
+        let data = serde_json::to_string(&message)
+            .expect("RoomMessage contains only infallibly serializable fields");
+        Ok(Event::default().id(seq).event("room_message").data(data))
+    });
+    let stream = sse_until_shutdown(stream, state.shutdown.clone());
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL)))
 }
 
 #[cfg(test)]
@@ -1120,6 +1343,451 @@ mod tests {
                 )
                 .expect("room fixture");
         });
+    }
+
+    fn create_plain_room(state: &AppState, key: &RoomKey) {
+        with_rooms(state, |store| {
+            store
+                .create(key.clone(), key.as_str(), None, Utc::now())
+                .expect("room fixture");
+        });
+    }
+
+    async fn paused_tail(
+        state: &AppState,
+        key: &RoomKey,
+        resume: Option<u64>,
+    ) -> (ReceiverStream<RoomMessage>, oneshot::Sender<()>) {
+        let hints = state.room_wakes.subscribe();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let stream = room_message_tail(
+            state.clone(),
+            key.clone(),
+            resume,
+            hints,
+            Some((ready_tx, release_rx)),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), ready_rx)
+            .await
+            .expect("tail replay ready timeout")
+            .expect("tail replay task dropped");
+        (stream, release_tx)
+    }
+
+    async fn next_message(stream: &mut ReceiverStream<RoomMessage>) -> RoomMessage {
+        tokio::time::timeout(std::time::Duration::from_millis(250), stream.next())
+            .await
+            .expect("room message exceeded 250ms")
+            .expect("room tail ended")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_fans_out_post_once_in_order_under_250ms() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("fanout");
+        create_plain_room(&state, &key);
+
+        let (mut first, release_first) = paused_tail(&state, &key, None).await;
+        let (mut second, release_second) = paused_tail(&state, &key, None).await;
+        release_first.send(()).unwrap();
+        release_second.send(()).unwrap();
+
+        let (status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "first".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let returned_at = tokio::time::Instant::now();
+        let first_a = next_message(&mut first).await;
+        let first_b = next_message(&mut second).await;
+        assert!(returned_at.elapsed() < std::time::Duration::from_millis(250));
+        assert_eq!(first_a, first_b);
+        assert_eq!(first_a.seq, 0);
+
+        let (status, _) = room_post_message(
+            State(state),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "second".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(next_message(&mut first).await.seq, 1);
+        assert_eq!(next_message(&mut second).await.seq, 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), first.next())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), second.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_last_event_resume_has_no_gap_or_duplicate() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("resume");
+        create_plain_room(&state, &key);
+        for body in ["zero", "one", "two", "three"] {
+            append_room_message(
+                &state,
+                &key,
+                "human",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                body,
+            )
+            .unwrap();
+        }
+
+        let (mut resumed, release) = paused_tail(&state, &key, Some(1)).await;
+        release.send(()).unwrap();
+        assert_eq!(next_message(&mut resumed).await.seq, 2);
+        assert_eq!(next_message(&mut resumed).await.seq, 3);
+        append_room_message(
+            &state,
+            &key,
+            "human",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "four",
+        )
+        .unwrap();
+        assert_eq!(next_message(&mut resumed).await.seq, 4);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), resumed.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_isolates_other_rooms() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let room_a = RoomKey::new("room-a");
+        let room_b = RoomKey::new("room-b");
+        create_plain_room(&state, &room_a);
+        create_plain_room(&state, &room_b);
+        let (mut tail_a, release) = paused_tail(&state, &room_a, None).await;
+        release.send(()).unwrap();
+
+        append_room_message(
+            &state,
+            &room_b,
+            "human",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "private to B",
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(75), tail_a.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_join_leave_and_auto_convene_audit_are_live() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let plain = RoomKey::new("roster-live");
+        create_plain_room(&state, &plain);
+        let (mut roster_tail, release) = paused_tail(&state, &plain, None).await;
+        release.send(()).unwrap();
+
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(plain.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "amy".into(),
+                display_name: "Amy".into(),
+                kind: RoomParticipantKind::Human,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            next_message(&mut roster_tail).await.kind,
+            RoomMessageKind::ParticipantJoined
+        );
+        let (status, _) = room_leave(
+            State(state.clone()),
+            Path((plain.as_str().to_string(), "amy".into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            next_message(&mut roster_tail).await.kind,
+            RoomMessageKind::ParticipantLeft
+        );
+
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let convene = RoomKey::new("convene-live");
+        create_mention_room(&state, &convene);
+        let (join_status, _) = room_join(
+            State(state.clone()),
+            Path(convene.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "helper".into(),
+                display_name: "Helper".into(),
+                kind: RoomParticipantKind::Agent,
+            }),
+        )
+        .await;
+        assert_eq!(join_status, StatusCode::OK);
+        let (mut convene_tail, release) = paused_tail(&state, &convene, Some(0)).await;
+        release.send(()).unwrap();
+        let (post_status, _) = room_post_message(
+            State(state),
+            Path(convene.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@helper report".into(),
+            }),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::CREATED);
+        assert_eq!(next_message(&mut convene_tail).await.body, "@helper report");
+        let audit = next_message(&mut convene_tail).await;
+        assert_eq!(audit.kind, RoomMessageKind::System);
+        assert!(audit.body.starts_with("auto-convene: helper"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_buffers_replay_live_seam_hint() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("seam");
+        create_plain_room(&state, &key);
+        let (mut tail, release) = paused_tail(&state, &key, None).await;
+        append_room_message(
+            &state,
+            &key,
+            "human",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "during seam",
+        )
+        .unwrap();
+        release.send(()).unwrap();
+        let message = next_message(&mut tail).await;
+        assert_eq!(message.seq, 0);
+        assert_eq!(message.body, "during seam");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_recovers_forced_broadcast_lag_from_durable_pages() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = fake_convene_state(&tmp);
+        state.room_wakes = RoomWakeBus::new(2);
+        let key = RoomKey::new("lagged");
+        create_plain_room(&state, &key);
+        let (mut tail, release) = paused_tail(&state, &key, None).await;
+        for i in 0..40 {
+            append_room_message(
+                &state,
+                &key,
+                "human",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                &format!("line-{i}"),
+            )
+            .unwrap();
+        }
+        release.send(()).unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            seen.push(next_message(&mut tail).await.seq);
+        }
+        assert_eq!(seen, (0..40).collect::<Vec<_>>());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), tail.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_events_http_frame_uses_seq_id_and_exact_room_message_json() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("wire-frame");
+        create_plain_room(&state, &key);
+        let expected = append_room_message(
+            &state,
+            &key,
+            "human",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "exact JSON",
+        )
+        .unwrap();
+        let app = crate::room_routes().with_state(state);
+        let request = axum::http::Request::builder()
+            .uri("/v1/rooms/persistent/wire-frame/events")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+            .await
+            .expect("SSE frame exceeded 250ms")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        assert!(wire.contains("event: room_message\n"), "wire: {wire:?}");
+        assert!(wire.contains("id: 0\n"), "wire: {wire:?}");
+        let data = wire
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("data line");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(data).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_events_http_last_event_id_wins_and_replays_strictly_after() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("header-resume");
+        create_plain_room(&state, &key);
+        for body in ["zero", "one", "two"] {
+            append_room_message(
+                &state,
+                &key,
+                "human",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                body,
+            )
+            .unwrap();
+        }
+        let app = crate::room_routes().with_state(state);
+        let request = axum::http::Request::builder()
+            .uri("/v1/rooms/persistent/header-resume/events?after_seq=0")
+            .header("last-event-id", "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+            .await
+            .expect("resume frame exceeded 250ms")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        assert!(wire.contains("id: 2\n"), "wire: {wire:?}");
+        assert!(wire.contains("\"body\":\"two\""), "wire: {wire:?}");
+        assert!(!wire.contains("\"body\":\"one\""), "wire: {wire:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_events_rejects_invalid_resume_unknown_closed_and_call_rooms() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let open = RoomKey::new("open-room");
+        let closed = RoomKey::new("closed-room");
+        let call = RoomKey::new("call:excluded");
+        for key in [&open, &closed, &call] {
+            create_plain_room(&state, key);
+        }
+        with_rooms(&state, |store| store.close(&closed)).unwrap();
+
+        let mut invalid = HeaderMap::new();
+        invalid.insert("last-event-id", "not-a-number".parse().unwrap());
+        let result = room_events(
+            State(state.clone()),
+            Path(open.as_str().to_string()),
+            Query(RoomEventsQuery { after_seq: Some(7) }),
+            invalid,
+        )
+        .await;
+        let Err((status, Json(body))) = result else {
+            panic!("invalid Last-Event-ID unexpectedly opened a stream");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_last_event_id");
+
+        let mut numeric = HeaderMap::new();
+        numeric.insert("last-event-id", "11".parse().unwrap());
+        assert_eq!(
+            room_resume_seq(&numeric, &RoomEventsQuery { after_seq: Some(7) }).unwrap(),
+            Some(11),
+            "numeric Last-Event-ID must win over after_seq"
+        );
+
+        for (key, expected_status, expected_code) in [
+            ("missing", StatusCode::NOT_FOUND, "room_not_found"),
+            (closed.as_str(), StatusCode::NOT_FOUND, "room_not_found"),
+            (
+                call.as_str(),
+                StatusCode::BAD_REQUEST,
+                "call_room_events_unsupported",
+            ),
+        ] {
+            let result = room_events(
+                State(state.clone()),
+                Path(key.to_string()),
+                Query(RoomEventsQuery::default()),
+                HeaderMap::new(),
+            )
+            .await;
+            let Err((status, Json(body))) = result else {
+                panic!("rejected room unexpectedly opened a stream");
+            };
+            assert_eq!(status, expected_status);
+            assert_eq!(body["code"], expected_code);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

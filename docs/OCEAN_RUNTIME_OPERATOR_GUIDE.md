@@ -473,7 +473,7 @@ DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave
 POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
 GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N&limit=M)
 GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+has_more (?after_seq=N&limit=M)
-GET    /v1/rooms/persistent/{key}/events                  live-tail: events since after_seq (?after_seq=N&limit=M); returns last_seq+next_seq+has_more
+GET    /v1/rooms/persistent/{key}/events                  room_message SSE: bounded SQLite replay after ?after_seq=N (numeric Last-Event-ID wins), then post-commit wake-hint tail; open non-call rooms only
 
 # Room media — retained independently from the retired projection API
 POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join token for web in-room voice/video

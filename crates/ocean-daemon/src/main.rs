@@ -145,7 +145,7 @@ use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_mod
 use persistent_rooms::{
     resolve_named_agent, room_create, room_db_path, room_events, room_get, room_join, room_leave,
     room_post_message, room_snapshot, room_transcript, rooms_list_persistent, with_rooms,
-    with_rooms_handle, RoomStoreHandle,
+    with_rooms_handle, RoomStoreHandle, RoomWakeBus,
 };
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
@@ -226,6 +226,10 @@ struct AppState {
     /// the guard is always dropped before any `await`, and every store method is
     /// synchronous, so a std `Mutex` is correct and never blocks the scheduler.
     rooms: RoomStoreHandle,
+    /// Bounded room-scoped wake hints for persistent transcript SSE tails. The
+    /// payload is only `(room, seq)`; SQLite remains authoritative for replay,
+    /// live delivery, lag recovery, ordering, and deduplication.
+    room_wakes: RoomWakeBus,
     /// The **persisted Longhouse title registry** (OCEAN-246/272). Holds firekeeper
     /// and validator titles durably across turns, storing only a salt+SHA-256
     /// *verifier* per title (never the raw token). Convene mints into it; the
@@ -786,6 +790,7 @@ async fn main() -> anyhow::Result<()> {
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
         rooms: Arc::new(Mutex::new(room_store)),
+        room_wakes: RoomWakeBus::default(),
         titles: Arc::new(Mutex::new(title_registry)),
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
         recalls: new_recall_registry(),
@@ -10655,9 +10660,10 @@ mod tests {
 
     /// The runtime assertions prove the emitted payload and final transcript;
     /// this source-order characterization closes the otherwise-unobservable
-    /// synchronous seam between `AgentEventBus::emit`, the audit append, and the
-    /// non-awaited spawn. It is intentionally updated to read the owning private
-    /// module when the production body moves mechanically.
+    /// synchronous seam between the committed author row, its wake publication,
+    /// `AgentEventBus::emit`, the committed audit append+wake, and the non-awaited
+    /// spawn. It is intentionally updated to read the owning private module when
+    /// the production body moves mechanically.
     #[test]
     fn room_post_message_source_preserves_persist_event_audit_spawn_order() {
         let source = include_str!("persistent_rooms.rs");
@@ -10673,21 +10679,29 @@ mod tests {
         let persisted_author = body
             .find("\n    let append = with_rooms(&state")
             .expect("author append must stay in the handler");
+        let published_author = body
+            .find("\n    publish_room_wake(&state, &key, &msg);")
+            .expect("author wake must follow its committed append");
         let emitted_event = body
             .find("\n            state.agent_events.emit(")
             .expect("room_trigger event emission must stay in the handler");
-        let appended_audit = body
-            .find("\n            let _ = with_rooms(&state")
-            .expect("auto-convene audit append must stay in the handler");
+        let audit_section = body
+            .find("// Audit line inside the room")
+            .expect("auto-convene audit section must stay identifiable");
+        let appended_audit = audit_section
+            + body[audit_section..]
+                .find("\n            let _ = append_room_message(")
+                .expect("auto-convene audit append+wake must stay in the handler");
         let spawned_turn = body
             .find("\n            spawn_room_agent_turn(state.clone()")
             .expect("room-agent turn spawn must stay in the handler");
 
         assert!(
-            persisted_author < emitted_event
+            persisted_author < published_author
+                && published_author < emitted_event
                 && emitted_event < appended_audit
                 && appended_audit < spawned_turn,
-            "required order is persisted author row → emitted event → audit row → spawn"
+            "required order is persisted author row → author wake → emitted event → audit row+wake → spawn"
         );
     }
 
@@ -11793,6 +11807,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
+            room_wakes: RoomWakeBus::default(),
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13180,6 +13195,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
+            room_wakes: RoomWakeBus::default(),
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13938,6 +13954,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
+            room_wakes: RoomWakeBus::default(),
             titles: Arc::new(Mutex::new(titles)),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             recalls: new_recall_registry(),
@@ -14727,15 +14744,12 @@ mod tests {
 
     // ---- Room hydration: snapshot + events (OCEAN-232) ---------------------
 
-    /// `GET /v1/rooms/persistent/{key}/snapshot` and `.../events` are the
-    /// store-backed hydrate-then-tail pair the collaboration model documents.
-    /// These were documented but never registered (clients 404'd); this proves
-    /// the round-trip end-to-end through the real handlers against a real store:
-    /// a snapshot returns the room, roster, full transcript, and `last_seq`; the
-    /// events feed returns the same log and honors `after_seq` as a live tail;
-    /// and an unknown room 404s rather than panics.
+    /// `GET /v1/rooms/persistent/{key}/snapshot` is the bounded hydration half
+    /// of the hydrate-then-tail contract. This proves its room, roster,
+    /// transcript, cursor, and unknown-room behavior; dedicated SSE tests cover
+    /// the durable live tail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn room_snapshot_and_events_hydrate_persistent_room() {
+    async fn room_snapshot_hydrates_persistent_room() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
@@ -14817,79 +14831,10 @@ mod tests {
             "no cursor when the snapshot already returned everything"
         );
 
-        // --- events (no after_seq): the same log, shaped as `events`. ---
-        let (status, Json(all)) = room_events(
-            State(state.clone()),
-            Path("hydrate-me".to_string()),
-            Query(TranscriptQuery {
-                after_seq: None,
-                limit: None,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(all["ok"], json!(true));
-        assert_eq!(
-            all["events"].as_array().unwrap().len(),
-            transcript.len(),
-            "events with no after_seq returns the full transcript"
-        );
-        assert_eq!(all["last_seq"].as_u64().unwrap(), last_seq);
-        // Full log fits one page: no more, no cursor.
-        assert_eq!(all["has_more"], json!(false));
-        assert!(all["next_seq"].is_null());
+        // The room-scoped SSE tail is covered by dedicated replay/live tests in
+        // `persistent_rooms`; snapshot remains the bounded hydration half.
 
-        // --- events (after_seq = last_seq): the live tail is empty until more
-        // happens — exactly what a client that just snapshotted should see. ---
-        let (status, Json(tail)) = room_events(
-            State(state.clone()),
-            Path("hydrate-me".to_string()),
-            Query(TranscriptQuery {
-                after_seq: Some(last_seq),
-                limit: None,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            tail["events"].as_array().unwrap().is_empty(),
-            "after_seq at the head returns no entries"
-        );
-        assert!(tail["last_seq"].is_null(), "empty tail reports no last_seq");
-        // An empty tail is the end of the log: no more pages, no cursor.
-        assert_eq!(tail["has_more"], json!(false));
-        assert!(tail["next_seq"].is_null());
-
-        // Append once more, then tail from the prior head: only the new line.
-        with_rooms(&state, |reg| {
-            reg.append_message(
-                &key,
-                "amy",
-                RoomParticipantKind::Human,
-                RoomMessageKind::Message,
-                "third",
-                Utc::now(),
-            )
-            .unwrap();
-        });
-        let (_status, Json(tail2)) = room_events(
-            State(state.clone()),
-            Path("hydrate-me".to_string()),
-            Query(TranscriptQuery {
-                after_seq: Some(last_seq),
-                limit: None,
-            }),
-        )
-        .await;
-        let tail2_events = tail2["events"].as_array().unwrap();
-        assert_eq!(
-            tail2_events.len(),
-            1,
-            "exactly one new entry since last_seq"
-        );
-        assert_eq!(tail2_events[0]["body"], json!("third"));
-
-        // --- unknown room: 404, not a panic, on both endpoints. ---
+        // --- unknown room: snapshot returns 404, not a panic. ---
         let (status, _) = room_snapshot(
             State(state.clone()),
             Path("no-such-room".to_string()),
@@ -14900,17 +14845,6 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = room_events(
-            State(state.clone()),
-            Path("no-such-room".to_string()),
-            Query(TranscriptQuery {
-                after_seq: None,
-                limit: None,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-
         std::env::remove_var("OCEAN_YOLO");
     }
 
@@ -15020,9 +14954,9 @@ mod tests {
     }
 
     /// Soft close intentionally creates an HTTP asymmetry: ordinary list/detail
-    /// hide the room, while transcript/snapshot/events retain a bounded audit
-    /// view. Freeze the daemon fallback's `limit=0` floor and cursor semantics,
-    /// not `ocean-store`'s underlying SQL implementation.
+    /// and the live SSE endpoint hide the room, while transcript/snapshot retain
+    /// a bounded audit view. Freeze the audit fallback's `limit=0` floor and
+    /// cursor semantics, not `ocean-store`'s underlying SQL implementation.
     #[tokio::test]
     async fn closed_persistent_room_preserves_audit_http_asymmetry() {
         use ocean_store::RoomStore as _;
@@ -15186,23 +15120,15 @@ mod tests {
         let (status, _, raw) = persistent_room_http_request(
             app,
             axum::http::Method::GET,
-            "/v1/rooms/persistent/closed-audit/events?limit=100",
+            "/v1/rooms/persistent/closed-audit/events",
             None,
             false,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let events = persistent_room_http_json(&raw);
-        assert_json_object_keys(
-            &events,
-            &["ok", "events", "last_seq", "next_seq", "has_more"],
-        );
-        assert_eq!(events["ok"], true);
-        assert_eq!(events["events"], serde_json::Value::Array(paged));
-        assert_eq!(events["events"], snapshot["transcript"]);
-        assert_eq!(events["last_seq"], 2);
-        assert_eq!(events["has_more"], false);
-        assert!(events["next_seq"].is_null());
+        assert_eq!(events["ok"], false);
+        assert_eq!(events["code"], "room_not_found");
     }
 
     // ---- OCEAN-250: list endpoints are bounded + pageable ------------------

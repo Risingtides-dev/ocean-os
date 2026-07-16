@@ -315,6 +315,17 @@ pub trait RoomStore {
         now: DateTime<Utc>,
     ) -> Result<RoomRecord>;
 
+    /// Add a participant and return both the unchanged room result and the
+    /// committed `ParticipantJoined` transcript row. This additive adapter lets
+    /// live-tail publishers issue a wake hint only after the allocating
+    /// transaction commits, without querying for a possibly-raced latest row.
+    fn add_participant_with_message(
+        &mut self,
+        key: &RoomKey,
+        participant: RoomParticipant,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomRecord, RoomMessage)>;
+
     /// Remove a participant by id and append a `ParticipantLeft` marker. Fails
     /// if the participant isn't present. Bumps `updated_at`.
     fn remove_participant(
@@ -323,6 +334,16 @@ pub trait RoomStore {
         participant_id: &str,
         now: DateTime<Utc>,
     ) -> Result<RoomRecord>;
+
+    /// Remove a participant and return both the unchanged room result and the
+    /// committed `ParticipantLeft` transcript row. See
+    /// [`RoomStore::add_participant_with_message`].
+    fn remove_participant_with_message(
+        &mut self,
+        key: &RoomKey,
+        participant_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomRecord, RoomMessage)>;
 
     /// Append a chat/system message, assigning the next room-scoped `seq`.
     fn append_message(
@@ -865,6 +886,16 @@ impl RoomStore for SqliteRoomStore {
         participant: RoomParticipant,
         now: DateTime<Utc>,
     ) -> Result<RoomRecord> {
+        self.add_participant_with_message(key, participant, now)
+            .map(|(record, _)| record)
+    }
+
+    fn add_participant_with_message(
+        &mut self,
+        key: &RoomKey,
+        participant: RoomParticipant,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomRecord, RoomMessage)> {
         if !self.room_is_open(key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
@@ -899,7 +930,7 @@ impl RoomStore for SqliteRoomStore {
                 next_pos,
             ],
         )?;
-        Self::insert_message_on(
+        let message = Self::insert_message_on(
             &tx,
             key,
             &participant.id,
@@ -910,7 +941,8 @@ impl RoomStore for SqliteRoomStore {
         )?;
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
-        Ok(self.load_record(key, false)?.expect("room exists"))
+        let record = self.load_record(key, false)?.expect("room exists");
+        Ok((record, message))
     }
 
     fn remove_participant(
@@ -919,6 +951,16 @@ impl RoomStore for SqliteRoomStore {
         participant_id: &str,
         now: DateTime<Utc>,
     ) -> Result<RoomRecord> {
+        self.remove_participant_with_message(key, participant_id, now)
+            .map(|(record, _)| record)
+    }
+
+    fn remove_participant_with_message(
+        &mut self,
+        key: &RoomKey,
+        participant_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomRecord, RoomMessage)> {
         if !self.room_is_open(key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
@@ -948,7 +990,7 @@ impl RoomStore for SqliteRoomStore {
             "DELETE FROM participants WHERE room_id = ?1 AND id = ?2",
             params![key.as_str(), participant_id],
         )?;
-        Self::insert_message_on(
+        let message = Self::insert_message_on(
             &tx,
             key,
             participant_id,
@@ -959,7 +1001,8 @@ impl RoomStore for SqliteRoomStore {
         )?;
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
-        Ok(self.load_record(key, false)?.expect("room exists"))
+        let record = self.load_record(key, false)?.expect("room exists");
+        Ok((record, message))
     }
 
     fn append_message(
@@ -1576,6 +1619,28 @@ mod tests {
             s.remove_participant(&key, "ghost", now()),
             Err(RoomStoreError::UnknownParticipant { .. })
         ));
+    }
+
+    #[test]
+    fn participant_mutation_adapters_return_committed_marker_rows() {
+        let mut s = store();
+        let key = RoomKey::new("marker-return");
+        s.create(key.clone(), "Marker Return", None, now()).unwrap();
+
+        let (joined_room, joined) = s
+            .add_participant_with_message(&key, human("john", "John"), now())
+            .unwrap();
+        assert_eq!(joined.kind, RoomMessageKind::ParticipantJoined);
+        assert_eq!(joined.seq, 0);
+        assert_eq!(joined_room.transcript, vec![joined.clone()]);
+
+        let (left_room, left) = s
+            .remove_participant_with_message(&key, "john", now())
+            .unwrap();
+        assert_eq!(left.kind, RoomMessageKind::ParticipantLeft);
+        assert_eq!(left.seq, 1);
+        assert_eq!(left_room.transcript.last(), Some(&left));
+        assert_eq!(s.transcript(&key, Some(0)).unwrap(), vec![left]);
     }
 
     #[test]
