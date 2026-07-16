@@ -4,7 +4,7 @@
 //! and Longhouse governance remain in `main.rs`; ranking and cache authority remain
 //! in `ocean-longhouse`.
 
-use super::longhouse_prepare_enabled;
+use super::longhouse_turn_preparation::longhouse_prepare_enabled;
 use axum::Json;
 use serde_json::json;
 
