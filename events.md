@@ -3891,3 +3891,11 @@ area:      [frontend]: Provider authentication and daemon voice boundary
 Added Agent models and Voice models sections to the TUI's bare `/login` popup. xAI STT/TTS now configures the dedicated `xai` auth block, while OpenAI Realtime configures `openai-realtime`; masked atomic 0600 saves preserve Claude/Codex OAuth and other provider blocks. The daemon Realtime client-secret route now resolves only `OCEAN_OPENAI_REALTIME_API_KEY`, `OPENAI_REALTIME_API_KEY`, or `openai-realtime.api_key`, deliberately excluding generic agent `openai` keys and `openai-codex` OAuth. Added categorized short-terminal scrolling, resolver/persistence/UI regressions, owning contracts, and operator guidance. Embedding rows remain deferred until a live typed embedding consumer exists; shared semantic search remains ocean-bedrock-owned.
 
 Verification: ocean-oauth 39 unit + 2 integration tests; ocean-providers 42 tests; ocean-tui 359 passed / 4 ignored plus focused categorized/short-height regressions; daemon voice 23 tests; denied-warning Clippy across all touched crates; `cargo check --workspace`; TUI release build; docs-check; diff-check. Fresh Longhouse review topic d4f46714-52fb-4225-9871-c2a64db8bde9 converged APPROVE.
+_________________________________________________________________________________
+time:      [09:52am] [16-07-26]
+agent:     [ocean] [gpt-5.6]
+worktree:  main
+type:      [bug report]: Realtime default model was stale
+area:      [backend]: OpenAI Realtime voice model
+
+Updated DEFAULT_REALTIME_MODEL from the stale `gpt-realtime-2` to the canonical GA id `gpt-realtime`. Verified against live OpenAI docs: the GA model is `gpt-realtime` (snapshot `gpt-realtime-2025-08-28`); the old id was a pre-release/preview identifier no longer current in the public API. Docstring now documents snapshot pinning as the override use case. All 11 voice_realtime tests pass.

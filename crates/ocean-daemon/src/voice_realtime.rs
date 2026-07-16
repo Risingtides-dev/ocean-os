@@ -15,9 +15,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// Default Realtime model — current public id; the surface may override
-/// per-request (e.g. the cheaper mini variant) via the request body.
-pub(crate) const DEFAULT_REALTIME_MODEL: &str = "gpt-realtime-2";
+/// Default Realtime model — current GA public id `gpt-realtime`. The surface
+/// may override per-request (e.g. to pin a snapshot like
+/// `gpt-realtime-2025-08-28`) via the request body.
+pub(crate) const DEFAULT_REALTIME_MODEL: &str = "gpt-realtime";
 
 /// Upstream mint endpoint (GA Realtime API).
 const UPSTREAM_URL: &str = "https://api.openai.com/v1/realtime/client_secrets";
@@ -337,8 +338,8 @@ mod tests {
     fn default_realtime_model_is_public_id_in_upstream_mint_body() {
         let body = upstream_body(DEFAULT_REALTIME_MODEL, "hello");
 
-        assert_eq!(DEFAULT_REALTIME_MODEL, "gpt-realtime-2");
-        assert_eq!(body["session"]["model"], "gpt-realtime-2");
+        assert_eq!(DEFAULT_REALTIME_MODEL, "gpt-realtime");
+        assert_eq!(body["session"]["model"], "gpt-realtime");
     }
 
     #[test]
