@@ -3766,3 +3766,30 @@ with denied warnings, workspace test compilation, the compatibility feature
 matrix and release all-target check, docs/index checks, formatting, diff checks,
 and the deterministic lh-tune demo.
 _________________________________________________________________________________
+time:      [03:28] [07-16-26]
+agent:     [claude] [fable-5]
+worktree:  main
+type:      merge
+area:      backend
+
+Longhouse four-task contract fully landed: 5ff24aa1 (TASK-1 canonical evidence field + headroom, fable), 66a8eb75/914eb7d6 (TASK-2 DecayTrajectory + QuorumAssessment, codex impl + fable gate fixes), 127b136b/0063ceb8 (TASK-3 pure ReviewPlanner, fable impl), deb7b940 (TASK-4 convene planner integration + InsufficientAlternatives abort taxonomy, fable draft + codex blocker fixes). Every step two-lane reviewed (pi + counterparty), full gates each: final state 148/0/1 longhouse, 48/0 SDK, 320 daemon serialized, all-target clippy -D warnings, workspace check, docs-check. Next phase agreed on the pad: integrated engine testing — ModelHandle seam first so convene runs scripted answers, then the composition scenarios (acquire-loop, lone-proposal resume, budget-exhaustion, deadline).
+_________________________________________________________________________________
+time:      [03:43] [16-07-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [testing]
+area:      [backend]
+
+Completed Longhouse TASK-5 with a private response-layer seam that scripts model
+identity, resolution, and text answers while retaining the production convene
+loop for planning, quorum mutation, recording, resolution, firekeeper claims,
+and events. Six full-loop scenarios cover bounded rival generation and resumed
+CostBound convergence, zero-budget InsufficientAlternatives without later calls,
+deadline Timeout, non-weight-bearing RequestEvidence, headroom-driven challenge,
+and a capped-runner versus uncapped-leader decay flip that composes recording,
+trajectory, planner, and reassertion. Fable and Pi independently approved the
+frozen implementation. Final gates passed: 154 Longhouse tests with one ignored,
+48 SDK tests, 320 serialized daemon tests, denied-warning all-target Clippy,
+workspace test compilation, compatibility feature and release lanes, docs/index
+checks, formatting, and diff checks.
+_________________________________________________________________________________

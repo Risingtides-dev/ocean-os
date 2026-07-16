@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use async_trait::async_trait;
 use ocean_agent_sdk::{
     AbortReason, AgentRole, ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark,
     MarkKind, ProposalTally,
@@ -119,10 +120,41 @@ impl Clock for SystemClock {
     }
 }
 
+/// Narrow response-layer seam used by the real provider handle and scripted
+/// integration tests. It exposes model identity plus one text turn only;
+/// proposal registration, planner consultation, engine mutation, and event
+/// emission remain inside the real convene control flow.
+#[async_trait]
+trait CouncilHandle: Clone + Send + Sync {
+    fn model_id(&self) -> &str;
+    fn correlation_group(&self) -> String;
+    fn has_credential(&self) -> bool;
+    async fn ask(&self, system: &str, user: &str) -> Option<String>;
+}
+
+#[async_trait]
+impl CouncilHandle for ModelHandle {
+    fn model_id(&self) -> &str {
+        ModelHandle::model_id(self)
+    }
+
+    fn correlation_group(&self) -> String {
+        ModelHandle::correlation_group(self)
+    }
+
+    fn has_credential(&self) -> bool {
+        ModelHandle::has_credential(self)
+    }
+
+    async fn ask(&self, system: &str, user: &str) -> Option<String> {
+        ModelHandle::ask(self, system, user).await
+    }
+}
+
 /// One seated worker: a stable id + the model driving it + its role.
-struct Worker {
+struct Worker<H> {
     agent_id: Uuid,
-    handle: ModelHandle,
+    handle: H,
     role: AgentRole,
     label: String,
 }
@@ -202,9 +234,25 @@ impl std::fmt::Debug for FirekeeperTitle {
 /// (`bus.emit(ev.into_turn_event())`), so the deck animates a live council.
 ///
 /// `clock` is injected for deterministic testing of the timing/quorum path.
-pub async fn convene<F>(req: ConveneRequest, clock: &dyn Clock, mut emit: F) -> ConveneOutcome
+pub async fn convene<F>(req: ConveneRequest, clock: &dyn Clock, emit: F) -> ConveneOutcome
 where
     F: FnMut(LonghouseEvent),
+{
+    convene_with_resolver(req, clock, emit, ModelHandle::resolve).await
+}
+
+/// Generic only over handle resolution so integration tests can script the LLM
+/// response boundary while exercising the exact production control flow.
+async fn convene_with_resolver<F, R, H>(
+    req: ConveneRequest,
+    clock: &dyn Clock,
+    mut emit: F,
+    mut resolve: R,
+) -> ConveneOutcome
+where
+    F: FnMut(LonghouseEvent),
+    R: FnMut(&str) -> anyhow::Result<H>,
+    H: CouncilHandle,
 {
     let topic_id = Uuid::new_v4();
     let board_id = Uuid::new_v4();
@@ -223,9 +271,9 @@ where
     // Staff the council: resolve each model alias to a real handle. A model that
     // fails to resolve (no credential) is dropped with a warning — the council
     // proceeds with whoever resolved.
-    let mut workers: Vec<Worker> = Vec::new();
-    for (i, alias) in req.models.iter().enumerate() {
-        match ModelHandle::resolve(alias) {
+    let mut workers: Vec<Worker<H>> = Vec::new();
+    for alias in &req.models {
+        match resolve(alias) {
             Ok(handle) if handle.has_credential() => {
                 workers.push(Worker {
                     agent_id: Uuid::new_v4(),
@@ -237,7 +285,6 @@ where
             Ok(_) => tracing::warn!(alias, "model resolved but has no credential; skipping"),
             Err(e) => tracing::warn!(alias, error = %e, "failed to resolve model; skipping"),
         }
-        let _ = i;
     }
 
     let members: Vec<LonghouseMember> = workers
@@ -917,8 +964,8 @@ where
 /// Run the proposal round concurrently. Candidate generation precedes
 /// sequential evidence evaluation, so there is no stopping decision to save
 /// these calls. A `None` answer means that worker did not contribute.
-async fn run_round(
-    workers: &[Worker],
+async fn run_round<H: CouncilHandle>(
+    workers: &[Worker<H>],
     prompts: Vec<(usize, String)>,
     system: &str,
 ) -> Vec<(usize, Option<String>)> {
@@ -938,7 +985,7 @@ async fn run_round(
 /// to estimate full information gain or that different groups are perfectly
 /// independent; it is a deterministic proxy that avoids asking an exact
 /// replica before every distinct group has had the same opportunity.
-fn independence_first_order(workers: &[Worker]) -> Vec<usize> {
+fn independence_first_order<H: CouncilHandle>(workers: &[Worker<H>]) -> Vec<usize> {
     let mut seen = HashSet::new();
     let mut independent = Vec::with_capacity(workers.len());
     let mut replicas = Vec::new();
@@ -1302,7 +1349,181 @@ fn federation_label(f: Federation) -> &'static str {
 mod tests {
     use super::*;
 
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use crate::evidence::SequentialEvidenceConfig;
+
+    #[derive(Debug, Clone)]
+    enum ScriptedReply {
+        Text(&'static str),
+        Endorse(&'static str),
+        Inhibit(&'static str),
+        None,
+    }
+
+    impl ScriptedReply {
+        fn render(self, user: &str) -> Option<String> {
+            match self {
+                Self::Text(text) => Some(text.to_owned()),
+                Self::Endorse(proposal) => Some(format!(
+                    "ENDORSE {}: scripted support",
+                    proposal_number(user, proposal).unwrap_or_else(|| panic!(
+                        "proposal {proposal:?} absent from prompt:\n{user}"
+                    ))
+                )),
+                Self::Inhibit(proposal) => Some(format!(
+                    "INHIBIT {}: scripted challenge",
+                    proposal_number(user, proposal).unwrap_or_else(|| panic!(
+                        "proposal {proposal:?} absent from prompt:\n{user}"
+                    ))
+                )),
+                Self::None => None,
+            }
+        }
+    }
+
+    fn proposal_number(prompt: &str, proposal: &str) -> Option<usize> {
+        prompt.lines().find_map(|line| {
+            let (number, text) = line.split_once(". ")?;
+            (text.trim() == proposal)
+                .then(|| number.trim().parse::<usize>().ok())
+                .flatten()
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    struct ScriptedCall {
+        alias: String,
+        system: String,
+        user: String,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedHandle {
+        alias: String,
+        group: String,
+        replies: Arc<Mutex<VecDeque<ScriptedReply>>>,
+        calls: Arc<Mutex<Vec<ScriptedCall>>>,
+    }
+
+    impl ScriptedHandle {
+        fn new(
+            alias: &str,
+            group: &str,
+            replies: impl IntoIterator<Item = ScriptedReply>,
+            calls: &Arc<Mutex<Vec<ScriptedCall>>>,
+        ) -> Self {
+            Self {
+                alias: alias.to_owned(),
+                group: group.to_owned(),
+                replies: Arc::new(Mutex::new(replies.into_iter().collect())),
+                calls: Arc::clone(calls),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CouncilHandle for ScriptedHandle {
+        fn model_id(&self) -> &str {
+            &self.alias
+        }
+
+        fn correlation_group(&self) -> String {
+            self.group.clone()
+        }
+
+        fn has_credential(&self) -> bool {
+            true
+        }
+
+        async fn ask(&self, system: &str, user: &str) -> Option<String> {
+            self.calls.lock().unwrap().push(ScriptedCall {
+                alias: self.alias.clone(),
+                system: system.to_owned(),
+                user: user.to_owned(),
+            });
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ScriptedReply::None)
+                .render(user)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedClock(i64);
+
+    impl Clock for FixedClock {
+        fn now_ms(&self) -> i64 {
+            self.0
+        }
+    }
+
+    #[derive(Debug)]
+    struct StepClock {
+        next: AtomicI64,
+        step: i64,
+    }
+
+    impl StepClock {
+        fn new(start: i64, step: i64) -> Self {
+            Self {
+                next: AtomicI64::new(start),
+                step,
+            }
+        }
+    }
+
+    impl Clock for StepClock {
+        fn now_ms(&self) -> i64 {
+            self.next.fetch_add(self.step, Ordering::SeqCst)
+        }
+    }
+
+    fn scripted_resolver(
+        handles: Vec<ScriptedHandle>,
+    ) -> impl FnMut(&str) -> anyhow::Result<ScriptedHandle> {
+        let handles: HashMap<String, ScriptedHandle> = handles
+            .into_iter()
+            .map(|handle| (handle.alias.clone(), handle))
+            .collect();
+        move |alias| {
+            handles
+                .get(alias)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown scripted model {alias}"))
+        }
+    }
+
+    fn sequential_request(
+        models: &[&str],
+        evidence: SequentialEvidenceConfig,
+        max_rounds: usize,
+        deadline_ms_from_now: i64,
+    ) -> ConveneRequest {
+        ConveneRequest {
+            question: "Which proposal should the council adopt?".to_owned(),
+            federation: Federation::Commons,
+            trigger: ConveneTrigger::UserRequest,
+            models: models.iter().map(|model| (*model).to_owned()).collect(),
+            quorum: QuorumConfig {
+                rule: QuorumRule::SequentialEvidence(evidence),
+                mark_ttl_ms: 60_000,
+                tie_break_seed: 11,
+            },
+            deadline_ms_from_now,
+            max_rounds,
+        }
+    }
+
+    fn has_abort(events: &[LonghouseEvent], expected: AbortReason) -> bool {
+        events.iter().any(
+            |event| matches!(event, LonghouseEvent::Aborted { reason, .. } if *reason == expected),
+        )
+    }
 
     fn uid(n: u8) -> Uuid {
         let mut b = [0u8; 16];
@@ -1316,6 +1537,514 @@ mod tests {
             mark_ttl_ms: 60_000,
             tie_break_seed: 11,
         })
+    }
+
+    // ---- TASK-5: full convene acquire-loop integration ---------------------
+
+    #[tokio::test]
+    async fn lone_proposal_generates_rival_resumes_and_converges() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new("a", "group-a", [ScriptedReply::Text("Proposal A")], &calls),
+            ScriptedHandle::new(
+                "b",
+                "group-b",
+                [ScriptedReply::None, ScriptedReply::Text("Proposal B")],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "c",
+                "group-c",
+                [
+                    ScriptedReply::None,
+                    ScriptedReply::Text("PASS"),
+                    ScriptedReply::Endorse("Proposal A"),
+                ],
+                &calls,
+            ),
+        ];
+        let default = SequentialEvidenceConfig::default();
+        let evidence = SequentialEvidenceConfig::new(
+            default.target_error(),
+            default.default_reliability(),
+            default.correlation_cap(),
+            1.0,
+            default.decision_loss(),
+        )
+        .unwrap();
+        let req = sequential_request(&["a", "b", "c"], evidence, 3, 10_000);
+        let mut events = Vec::new();
+
+        let outcome = convene_with_resolver(
+            req,
+            &FixedClock(0),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        assert!(outcome.decision.is_some());
+        assert_eq!(outcome.convergence_basis, Some(ConvergenceBasis::CostBound));
+        assert_eq!(outcome.proposals.len(), 2);
+        assert_eq!(
+            outcome
+                .decision
+                .and_then(|decision| outcome.proposals.get(&decision))
+                .map(String::as_str),
+            Some("Proposal A")
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, LonghouseEvent::Converged { .. })));
+        assert!(!has_abort(&events, AbortReason::InsufficientAlternatives));
+        let proposal_marks = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    LonghouseEvent::MarkPosted {
+                        mark: Mark {
+                            kind: MarkKind::Proposal,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(proposal_marks, 2, "the rival must land on the real board");
+        let calls = calls.lock().unwrap();
+        let rival_call = calls
+            .iter()
+            .position(|call| call.system == RIVAL_SYSTEM)
+            .expect("the lone field must enter bounded rival generation");
+        let resumed_review = calls
+            .iter()
+            .position(|call| call.alias == "c" && call.system == ROUND2_SYSTEM)
+            .expect("the landed rival must resume normal review planning");
+        assert!(rival_call < resumed_review);
+    }
+
+    #[tokio::test]
+    async fn zero_review_budget_aborts_insufficient_without_extra_calls() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new("a", "group-a", [ScriptedReply::Text("Proposal A")], &calls),
+            ScriptedHandle::new("b", "group-b", [ScriptedReply::None], &calls),
+            ScriptedHandle::new("c", "group-c", [ScriptedReply::None], &calls),
+        ];
+        let req = sequential_request(
+            &["a", "b", "c"],
+            SequentialEvidenceConfig::default(),
+            1,
+            10_000,
+        );
+        let mut events = Vec::new();
+
+        let outcome = convene_with_resolver(
+            req,
+            &FixedClock(0),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        assert_eq!(outcome.decision, None);
+        assert_eq!(outcome.convergence_basis, None);
+        assert!(has_abort(&events, AbortReason::InsufficientAlternatives));
+        assert!(!has_abort(&events, AbortReason::Timeout));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, LonghouseEvent::Converged { .. })));
+        let terminal: Vec<AbortReason> = events
+            .iter()
+            .filter_map(|event| match event {
+                LonghouseEvent::Aborted { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminal, vec![AbortReason::InsufficientAlternatives]);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ..,
+                LonghouseEvent::Aborted {
+                    reason: AbortReason::InsufficientAlternatives,
+                    ..
+                },
+                LonghouseEvent::TopicClosed { .. }
+            ]
+        ));
+        assert_eq!(outcome.proposals.len(), 1);
+        assert_eq!(outcome.recording.marks.len(), 1);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "only the concurrent proposal round may run");
+        assert!(calls.iter().all(|call| call.system == ROUND1_SYSTEM));
+    }
+
+    #[tokio::test]
+    async fn deadline_still_aborts_as_timeout() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new("a", "group-a", [ScriptedReply::Text("Proposal A")], &calls),
+            ScriptedHandle::new("b", "group-b", [ScriptedReply::Text("Proposal B")], &calls),
+        ];
+        let req = sequential_request(&["a", "b"], SequentialEvidenceConfig::default(), 4, 0);
+        let mut events = Vec::new();
+
+        let outcome = convene_with_resolver(
+            req,
+            &FixedClock(0),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        assert_eq!(outcome.decision, None);
+        assert_eq!(outcome.convergence_basis, None);
+        assert!(has_abort(&events, AbortReason::Timeout));
+        assert!(!has_abort(&events, AbortReason::InsufficientAlternatives));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn request_evidence_runs_in_convene_and_remains_non_weight_bearing() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new(
+                "a",
+                "group-a",
+                [
+                    ScriptedReply::Text("Proposal A"),
+                    ScriptedReply::Text("A concrete falsifiable artifact"),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new("b", "group-b", [ScriptedReply::Text("Proposal B")], &calls),
+            ScriptedHandle::new(
+                "c",
+                "group-c",
+                [ScriptedReply::None, ScriptedReply::Endorse("Proposal A")],
+                &calls,
+            ),
+        ];
+        let default = SequentialEvidenceConfig::default();
+        let evidence = SequentialEvidenceConfig::new(
+            default.target_error(),
+            default.default_reliability(),
+            default.correlation_cap(),
+            0.0,
+            default.decision_loss(),
+        )
+        .unwrap();
+        let req = sequential_request(&["a", "b", "c"], evidence, 3, 10_000);
+        let mut events = Vec::new();
+
+        let outcome = convene_with_resolver(
+            req,
+            &FixedClock(0),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        assert_eq!(outcome.decision, None);
+        assert_eq!(outcome.recording.marks.len(), 3);
+        let evidence_marks: Vec<&Mark> = events
+            .iter()
+            .filter_map(|event| match event {
+                LonghouseEvent::MarkPosted { mark, .. } if mark.kind == MarkKind::Evidence => {
+                    Some(mark)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evidence_marks.len(), 1);
+        assert!(evidence_marks[0].target.is_some());
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.system == EVIDENCE_SYSTEM)
+                .count(),
+            1,
+            "the same stable plan cannot re-request evidence"
+        );
+        assert!(calls
+            .iter()
+            .any(|call| call.user.contains("strongest concrete evidence")));
+        let evidence_event = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    LonghouseEvent::MarkPosted {
+                        mark: Mark {
+                            kind: MarkKind::Evidence,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(
+            events[evidence_event + 1..]
+                .iter()
+                .all(|event| !matches!(event, LonghouseEvent::QuorumUpdated { .. })),
+            "a rationale artifact must not trigger an evidence-field update"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_loop_challenges_with_a_headroom_bearing_reviewer() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new("a", "group-a", [ScriptedReply::Text("Proposal A")], &calls),
+            ScriptedHandle::new("b", "group-b", [ScriptedReply::Text("Proposal B")], &calls),
+            ScriptedHandle::new(
+                "c",
+                "group-a",
+                [ScriptedReply::None, ScriptedReply::Inhibit("Proposal B")],
+                &calls,
+            ),
+        ];
+        let default = SequentialEvidenceConfig::default();
+        let evidence = SequentialEvidenceConfig::new(
+            0.01,
+            default.default_reliability(),
+            default.correlation_cap(),
+            0.0,
+            default.decision_loss(),
+        )
+        .unwrap();
+        let mut req = sequential_request(&["a", "b", "c"], evidence, 2, 2_000);
+        // Both proposal groups retain positive mass at the deadline, while
+        // normal decay has opened cap headroom for correlated reviewer c.
+        req.quorum.mark_ttl_ms = 10_000;
+        let mut events = Vec::new();
+
+        let outcome = convene_with_resolver(
+            req,
+            &StepClock::new(0, 100),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        assert_eq!(outcome.decision, None);
+        let calls = calls.lock().unwrap();
+        let challenge = calls
+            .iter()
+            .find(|call| call.alias == "c" && call.user.contains("Adversarial comparison"))
+            .expect("the planner must route c through ChallengeLeader");
+        assert_eq!(challenge.system, ROUND2_SYSTEM);
+        assert!(outcome.recording.marks.iter().any(|mark| {
+            matches!(
+                mark.kind,
+                RecordedMarkKind::Inhibit { proposal }
+                    if outcome.proposals.get(&proposal).map(String::as_str) == Some("Proposal B")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                LonghouseEvent::MarkPosted {
+                    mark: Mark {
+                        kind: MarkKind::Inhibit,
+                        summary,
+                        ..
+                    },
+                    ..
+                } if summary == "scripted challenge"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn projected_lead_flip_reasserts_the_oldest_supporter() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new(
+                "a",
+                "group-a",
+                [
+                    ScriptedReply::Text("Proposal A"),
+                    ScriptedReply::Endorse("Proposal A"),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new("b", "group-b", [ScriptedReply::Text("Proposal B")], &calls),
+            ScriptedHandle::new(
+                "c",
+                "group-c",
+                [ScriptedReply::None, ScriptedReply::Endorse("Proposal A")],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "d",
+                "group-b",
+                [ScriptedReply::None, ScriptedReply::Endorse("Proposal B")],
+                &calls,
+            ),
+        ];
+        let default = SequentialEvidenceConfig::default();
+        let evidence = SequentialEvidenceConfig::new(
+            0.01,
+            default.default_reliability(),
+            default.correlation_cap(),
+            0.0,
+            default.decision_loss(),
+        )
+        .unwrap();
+        let mut req = sequential_request(&["a", "b", "c", "d"], evidence, 2, 1_250);
+        req.quorum.mark_ttl_ms = 1_000;
+        let quorum = req.quorum;
+        let mut events = Vec::new();
+
+        let outcome = convene_with_resolver(
+            req,
+            &StepClock::new(0, 50),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        assert_eq!(outcome.decision, None);
+        let calls = calls.lock().unwrap();
+        let review_aliases: Vec<&str> = calls
+            .iter()
+            .filter(|call| call.system == ROUND2_SYSTEM)
+            .map(|call| call.alias.as_str())
+            .collect();
+        assert!(
+            review_aliases.starts_with(&["c", "d", "a"]),
+            "after independent sample c and correlated challenge d, a cap-transition A-to-B lead flip must re-poll oldest A supporter a; got {review_aliases:?}"
+        );
+        let challenge = calls
+            .iter()
+            .find(|call| call.alias == "d" && call.user.contains("Adversarial comparison"))
+            .expect("correlated reviewer d must challenge through the real loop");
+        assert!(challenge.user.contains("current leader"));
+        let reassert = calls
+            .iter()
+            .find(|call| call.alias == "a" && call.system == ROUND2_SYSTEM)
+            .expect("oldest leader supporter a must be reasserted");
+        assert!(
+            reassert.user.contains("Re-assert your current stance"),
+            "expected reassertion prompt, got: {}",
+            reassert.user
+        );
+        assert!(outcome.recording.marks.iter().any(|mark| {
+            matches!(
+                mark.kind,
+                RecordedMarkKind::Endorse { proposal }
+                    if outcome.proposals.get(&proposal).map(String::as_str) == Some("Proposal A")
+                        && mark.at_ms >= 650
+            )
+        }));
+
+        // Rebuild the exact pre-reassertion field from the real run. At the
+        // planner capture instant A is the unique leader; at the deadline the
+        // cap-aware trajectory flips to B because B's correlated group stays
+        // capped while A's independent mass decays. This prevents the test
+        // from passing on an arbitrary or prompt-only re-poll.
+        let proposal_a = outcome
+            .proposals
+            .iter()
+            .find_map(|(id, text)| (text == "Proposal A").then_some(*id))
+            .unwrap();
+        let proposal_b = outcome
+            .proposals
+            .iter()
+            .find_map(|(id, text)| (text == "Proposal B").then_some(*id))
+            .unwrap();
+        let author_a = outcome
+            .recording
+            .marks
+            .iter()
+            .find_map(|mark| {
+                matches!(
+                    mark.kind,
+                    RecordedMarkKind::Propose { proposal } if proposal == proposal_a
+                )
+                .then_some(mark.author)
+            })
+            .unwrap();
+        let mut pre_reassert = QuorumEngine::new(quorum);
+        for reviewer in &outcome.recording.reviewers {
+            pre_reassert.register_reviewer(
+                ReviewerCredential::new(
+                    reviewer.agent_id,
+                    reviewer.correlation_group.clone(),
+                    reviewer.reliability_prior,
+                )
+                .unwrap(),
+            );
+        }
+        for mark in outcome
+            .recording
+            .marks
+            .iter()
+            .filter(|mark| mark.at_ms < 650)
+        {
+            match mark.kind {
+                RecordedMarkKind::Propose { proposal } => {
+                    pre_reassert.propose(proposal, mark.author, mark.at_ms)
+                }
+                RecordedMarkKind::Endorse { proposal } => {
+                    pre_reassert.endorse(proposal, mark.author, None, mark.at_ms)
+                }
+                RecordedMarkKind::Inhibit { proposal } => {
+                    pre_reassert.inhibit(proposal, mark.author, None, mark.at_ms)
+                }
+            }
+        }
+        let assessment = pre_reassert.assessment(600).unwrap();
+        assert_eq!(
+            assessment
+                .snapshot()
+                .unique_leader()
+                .map(|item| item.proposal),
+            Some(proposal_a)
+        );
+        assert_eq!(
+            assessment
+                .trajectory()
+                .snapshot_at(1_250)
+                .unique_leader()
+                .map(|item| item.proposal),
+            Some(proposal_b)
+        );
+        let runner_cap_exit = assessment
+            .trajectory()
+            .cap_transition_times()
+            .into_iter()
+            .find(|transition| {
+                matches!(
+                    &transition.group,
+                    crate::evidence::GroupId::Registered(group) if group == "group-b"
+                )
+            })
+            .expect("the correlated runner must be capped at capture");
+        assert!(
+            runner_cap_exit.at_ms > 1_250.0,
+            "the projected flip must occur while the runner is still capped"
+        );
+        assert!(matches!(
+            ReviewPlanner::plan(
+                &assessment,
+                600,
+                1_250,
+                2.0,
+                &pre_reassert.reviewers().cloned().collect::<Vec<_>>()
+            ),
+            PlanOutcome::Continue(ReviewAction::ReassertAfterDecay {
+                proposal,
+                reviewer,
+                ..
+            }) if proposal == proposal_a && reviewer == author_a
+        ));
     }
 
     // ---- TASK-4: escalation routing + abort taxonomy -----------------------

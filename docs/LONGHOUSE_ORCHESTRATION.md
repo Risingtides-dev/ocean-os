@@ -234,6 +234,12 @@ cargo test -p ocean-daemon
 cargo check --workspace --tests
 ```
 
+The `convene.rs` integration harness scripts only the private provider-response
+boundary (`CouncilHandle::ask` plus model identity/resolution). Its scenarios
+must continue to run the production convene loop for planner selection, quorum
+mutation, recording, terminal resolution, firekeeper ratification, and event
+emission; do not replace those layers with test doubles.
+
 Stable source anchors:
 
 - `crates/ocean-longhouse/src/agent.rs`
