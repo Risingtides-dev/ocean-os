@@ -3702,3 +3702,23 @@ ________________________________________________________________________________
 ## 2026-07-16 · wake primitive: heartbeat push-wake + Stop-hook turn-end wiring (0cd26914)
 
 Completed ocean-heartbeat into the generic external-channel wake primitive and lit up the dormant ocean-hooks seam, so Ocean agents can join stitchpad (or any pad/queue/notifier) like the other harnesses with zero stitchpad/herdr deps in core. `ocean-heartbeat wake` = one-shot push wake: POST /v1/agent/turns to a pinned session (durable --session-file), wait for that turn's turn_finished on session-scoped SSE, exit 0 delivered / 3 deferred (429 or wait timeout) / 1 failed — the pad-watcher adapter contract. ocean-agent now fires run_hooks(Stop) when a turn completes (under the session lock): a block{reason} continues the session with reason as the next user message, re-fires with stop_hook_active:true, bounded at 4, fail-open throughout. Stitchpad wiring is now pure config: [[hooks.Stop]] → ~/.stitchpad/adapters/stop-hook.sh + an ocean.sh adapter exec'ing ocean-heartbeat wake. Gates: fmt, check --workspace, 156 ocean-agent tests (new continuation test), live wake smoke against the running daemon.
+_________________________________________________________________________________
+time:      [02:48] [07-16-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [feature-request]
+area:      [backend]
+
+Completed Longhouse TASK-2: a read-only QuorumAssessment wraps the canonical
+sequential EvidenceSnapshot with exact correlation headroom, unused registered
+groups, and an immutable cap-aware DecayTrajectory. Every projected contribution
+reuses Stance::effective in f32 before the existing f64 cast and routes through
+the TASK-1 canonical evaluator. Closed-form cap-exit hints are exact for mixed-age
+stances under the shared TTL but explicitly advisory; snapshot_at remains the
+boundary authority. Regressions pin exact live/trajectory equality after every
+stance mutation and around a cap exit, CostBound latch immutability, near-tie
+openness, and the load-bearing exact CostBound tie gate. Independent Fable and Pi
+reviews approved the implementation after the tie and documentation additions.
+`cargo test -p ocean-longhouse` passed 132 tests with one ignored; all-target
+Clippy with denied warnings, formatting, and diff checks passed.
+_________________________________________________________________________________
