@@ -71,6 +71,11 @@ impl RoomWakeBus {
             seq: message.seq,
         });
     }
+
+    #[cfg(test)]
+    fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
 }
 
 /// Publish only after the store adapter has returned, which means the allocating
@@ -1198,11 +1203,18 @@ async fn run_room_tail(
     // passes `None` and continues immediately.
     if let Some((ready, release)) = seam {
         let _ = ready.send(());
-        let _ = release.await;
+        tokio::select! {
+            _ = tx.closed() => return,
+            _ = release => {}
+        }
     }
 
     loop {
-        match hints.recv().await {
+        let hint = tokio::select! {
+            _ = tx.closed() => return,
+            hint = hints.recv() => hint,
+        };
+        match hint {
             Ok(hint) if hint.room != room || Some(hint.seq) <= last_sent_seq => continue,
             Ok(hint) => {
                 let expected = last_sent_seq.map_or(0, |last| last.saturating_add(1));
@@ -1380,6 +1392,46 @@ mod tests {
             .await
             .expect("room message exceeded 250ms")
             .expect("room tail ended")
+    }
+
+    async fn wait_for_wake_receivers(state: &AppState, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.room_wakes.receiver_count() == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("room tail retained its wake receiver after client disconnect");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_releases_wake_receiver_when_client_disconnects_idle() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("disconnect-release");
+        create_plain_room(&state, &key);
+        assert_eq!(state.room_wakes.receiver_count(), 0);
+
+        // Disconnect while the test seam is paused: the tail must observe the
+        // closed mpsc receiver without waiting forever on the seam release.
+        let (paused, release) = paused_tail(&state, &key, None).await;
+        assert_eq!(state.room_wakes.receiver_count(), 1);
+        drop(paused);
+        wait_for_wake_receivers(&state, 0).await;
+        assert!(release.send(()).is_err(), "paused tail task still alive");
+
+        // Disconnect again after entering the ordinary idle live wait. No room
+        // hint is published, so only `tx.closed()` can release the task.
+        let (live, release) = paused_tail(&state, &key, None).await;
+        assert_eq!(state.room_wakes.receiver_count(), 1);
+        release.send(()).expect("release live tail");
+        tokio::task::yield_now().await;
+        drop(live);
+        wait_for_wake_receivers(&state, 0).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
