@@ -1,9 +1,9 @@
 # Ocean Daemon Longhouse Turn Preparation Extraction Manifest
 
 **Date:** 2026-07-15  
-**Status:** Proposed; pre-move characterization and independent review required  
+**Status:** Characterization complete and independently reviewed; extraction authorized
 **Owner:** Ocean OS  
-**Rollback point:** Pending; set to the accepted characterization commit before any production move
+**Rollback point:** characterization commit `f6e8efe`
 
 ## Purpose
 
@@ -184,6 +184,18 @@ The pre-move characterization commit must correct the current source comment's u
 11. Update the nearest owning `AGENTS.md`, living mission, code-health plan, this manifest, and root `events.md`.
 12. Commit, fetch/rebase, revalidate affected seams, push, open a PR, wait for hosted macOS/Ubuntu/MSRV/cargo-deny CI, merge, and record publication in a separate docs follow-up.
 
+## Characterization result
+
+Commit `f6e8efe` adds three extraction-focused daemon tests and a comment-only availability correction without changing production behavior:
+
+- `longhouse_turn_preparation_rendering_and_application_are_exact` freezes the full advisory header and byte layout, skill → SOP → workflow order, trimmed and blank descriptions, unsanitized embedded newline behavior, real-file source-path/body non-disclosure, exact prepend layout, and byte-identical no-op prompts;
+- `longhouse_turn_preparation_source_preserves_blocking_fail_open_boundary` automatically selects `main.rs` before extraction or requires a wired/definition-free parent plus `longhouse_turn_preparation.rs` afterward; it freezes the gate truth table, exact 250 ms declaration, cwd/root and `TurnBrief.cwd` behavior, cache/ranking inside the blocking closure, timeout and outcome `None` branches, exact helper-owned warning bodies, uncancelled/cache-lock disclosure, exact symbol inventory, and no added authority markers;
+- `longhouse_turn_preparation_call_sites_and_order_are_exact` freezes exactly three preparation calls and the ordinary prompt, asynchronous create-request, and agent-turn prerequisite/application/runtime order, including prompt assignment, permit-owned spawned execution, raw-prompt ranking, guided-prompt application, browser-layer precedence, and later request registration.
+
+Existing environment tests now also cover trimmed opt-out and near-miss values, and the fail-open test covers whitespace-only prompts. The prior “detached and harmless” source comment now correctly distinguishes read-only/no-authority behavior from the retained uncancelled-task/cache-lock availability risk; runtime behavior is unchanged.
+
+Focused groups and all 351 daemon tests passed serialized in dedicated target `/tmp/ocean-target-longhouse-turn-prep-char`; formatting and diff checks passed. Independent Codex review iteratively identified and verified fixes for self-satisfying deadline checks, closure/ranking and spawned-task boundaries, full-module authority scanning, call-site prerequisites/assignments, cwd propagation, real-file privacy coverage, exact helper-warning bodies, wired-owner detection, and timeout fail-open coverage. Final review reported that the characterization matches the approved behavior-neutral boundary with no unresolved medium-or-higher finding.
+
 ## Validation matrix
 
 Use dedicated `CARGO_TARGET_DIR` paths and serialize environment/cache-mutating tests.
@@ -226,7 +238,7 @@ Hosted CI must pass the default-parallel macOS and Ubuntu repository gates, pinn
 
 ## Rollback
 
-Before the move, set the rollback point to the accepted characterization commit. Rollback is one revert of the extraction commit: restore the five definitions and comments to their characterized positions in `main.rs`, remove the private module/imports, and restore the sibling adapter import. No wire, persistence, schema, cache, or migration rollback is required because none may change.
+Rollback is one revert of the extraction commit after `f6e8efe`: restore the five definitions and comments to their characterized positions in `main.rs`, remove the private module/imports, and restore the sibling adapter import. No wire, persistence, schema, cache, or migration rollback is required because none may change.
 
 ## Review requirement
 
