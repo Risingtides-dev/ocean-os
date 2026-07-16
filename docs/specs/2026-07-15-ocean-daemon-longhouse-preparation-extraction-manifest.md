@@ -1,7 +1,7 @@
 # Ocean Daemon Longhouse Preparation Extraction Manifest
 
 **Date:** 2026-07-15  
-**Status:** Ready for publication; characterization, extraction, dedicated-target validation, compatibility/MSRV/local CI, and independent review passed; hosted CI and merge pending
+**Status:** Published through PR #296 merge `29d65f8`; characterization, extraction, dedicated-target validation, compatibility/MSRV/local CI, independent review, and hosted CI passed
 **Owner:** Ocean OS  
 **Rollback point:** characterization commit `66ba5db`
 
@@ -221,7 +221,7 @@ Post-extraction validation passed:
 - canonical `cargo xtask ci`, including workspace tests, denied-warning all-target Clippy, format, docs/index validation, and dependency policy;
 - `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check`.
 
-Hosted default-parallel macOS/Ubuntu CI, pinned Rust 1.88, cargo-deny, and merge remain pending. Live daemon deployment/supervision remains owned by the concurrent operator workstream and is not performed by this checkpoint.
+Hosted run `29466034956` passed the default-parallel macOS and Ubuntu repository gates, pinned Rust 1.88 MSRV lane, and cargo-deny lane; PR #296 merged as `29d65f8`. Live daemon deployment/supervision remains owned by the concurrent operator workstream and was not performed by this checkpoint.
 
 ## Validation
 

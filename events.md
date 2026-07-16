@@ -3469,3 +3469,11 @@ Verification:
 - format, docs/index, dependency policy, and diff checks passed
 - hosted CI and merge remain pending; live daemon deployment/supervision remains outside this workstream
 _________________________________________________________________________________
+time:      [10:18pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [docs]: publish Longhouse preparation extraction
+area:      [backend]: ocean-daemon Phase 2C advisory HTTP adapters
+
+PR #296 merged the reviewed Longhouse preparation extraction as `29d65f8` after hosted run `29466034956` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, and advanced the next bounded wave to separately manifested turn-time Longhouse preparation/presentation. The cached skill-path symlink-retarget finding remains a separate security disposition before any librarian extraction; live daemon deployment/supervision remains outside this workstream.
+_________________________________________________________________________________
