@@ -7,10 +7,11 @@
 //!
 //! 1. **Round 1 — propose.** Each worker gets the question and posts one
 //!    `proposal` mark (a candidate answer).
-//! 2. **Rounds 2..N — endorse / inhibit re-assertion.** Each worker sees the
-//!    current bounded proposal projection and posts an `endorse` or `inhibit`
-//!    mark. Reviewers are queried sequentially, independent groups first, so
-//!    an evidence or cost bound can avoid spending the next provider call.
+//! 2. **Rounds 2..N — active review acquisition.** In sequential-evidence
+//!    mode, a fresh [`crate::planner::ReviewPlanner`] decision chooses an
+//!    independent sample, adversarial challenge, decay reassertion, or
+//!    non-weight-bearing evidence request before every provider call. Legacy
+//!    net-weight mode retains the static endorse/inhibit reassertion order.
 //!
 //! After **every** mark the daemon-side [`QuorumEngine`] re-tallies, and we emit
 //! a `QuorumUpdated`. When the engine reports convergence (or we hit a stopping
@@ -36,7 +37,8 @@ use uuid::Uuid;
 
 use crate::agent::ModelHandle;
 use crate::evidence::{ConvergenceBasis, ReviewerCredential};
-use crate::quorum::{QuorumConfig, QuorumEngine, QuorumOutcome};
+use crate::planner::{EscalationReason, PlanOutcome, ReviewAction, ReviewPlanner};
+use crate::quorum::{QuorumConfig, QuorumEngine, QuorumOutcome, QuorumRule};
 use crate::replay::{RecordedMark, RecordedMarkKind, RecordedReviewer, Recording};
 
 /// A request to convene a council on a question.
@@ -57,9 +59,10 @@ pub struct ConveneRequest {
     /// Hard deadline budget in ms from convening. Sequential evidence aborts if
     /// its stopping rule has not fired; legacy net-weight mode may force-resolve.
     pub deadline_ms_from_now: i64,
-    /// Maximum deliberation rounds, including the proposal round. Round 1 proposes;
-    /// rounds 2..N are endorse/inhibit re-assertion rounds. This bounds open-ended
-    /// deliberation until token-budget accounting lands.
+    /// Maximum deliberation rounds, including the proposal round. Round 1
+    /// proposes. In sequential mode, the remaining rounds become a provider
+    /// call budget of `(max_rounds - 1) * seated_workers`; legacy net-weight
+    /// mode retains one static reassertion pass per remaining round.
     pub max_rounds: usize,
 }
 
@@ -367,108 +370,324 @@ where
         };
     }
 
-    // ---- Rounds 2..N: endorse / inhibit re-assertion --------------------------
+    // ---- Rounds 2..N: review acquisition --------------------------------------
+    //
+    // Legacy net-weight mode keeps the original static re-assertion rounds.
+    // Sequential-evidence mode replaces them with the pure [`ReviewPlanner`]:
+    // a FRESH assessment is rebuilt from the engine before every provider
+    // call, uncertainty governs who is asked next, and every escalation goes
+    // through [`route_escalation`] (pure, test-pinned). No planner outcome can
+    // construct commitment or emit an abort; the single direct-abort path is
+    // the exhausted lone-proposal escalation, which emits
+    // `InsufficientAlternatives` here in the convene loop and NEVER enters
+    // `force_resolve` — the `Timeout -> Split` remap is unreachable from it.
     let max_rounds = req.max_rounds.max(1);
-    for round in 2..=max_rounds {
-        if engine.is_converged() || clock.now_ms() >= deadline_ms {
-            break;
-        }
+    let mut direct_abort: Option<DirectAbort> = None;
+    match req.quorum.rule {
+        QuorumRule::NetWeight { .. } => {
+            for round in 2..=max_rounds {
+                if engine.is_converged() || clock.now_ms() >= deadline_ms {
+                    break;
+                }
 
-        // Build a bounded projection of the proposals for the voters to see.
-        let projection = projection_text(&proposals);
-        let proposal_ids: Vec<Uuid> = proposals.keys().copied().collect();
+                // Build a bounded projection of the proposals for the voters to see.
+                let projection = projection_text(&proposals);
+                let proposal_ids: Vec<Uuid> = proposals.keys().copied().collect();
 
-        // Query one reviewer at a time so the evidence engine can stop before
-        // the next provider call is spent. Distinct correlation groups go
-        // first; replicas of a provider/model are deferred until the end.
-        let vote_prompts: Vec<(usize, String)> = independence_first_order(&workers)
-            .into_iter()
-            .map(|idx| {
-                let w = &workers[idx];
-                let own = proposal_by_author.get(&w.agent_id).copied();
-                (
-                    idx,
-                    round2_user(&req.question, &projection, &proposal_ids, own, round),
-                )
-            })
-            .collect();
+                // Query one reviewer at a time so the evidence engine can stop before
+                // the next provider call is spent. Distinct correlation groups go
+                // first; replicas of a provider/model are deferred until the end.
+                let vote_prompts: Vec<(usize, String)> = independence_first_order(&workers)
+                    .into_iter()
+                    .map(|idx| {
+                        let w = &workers[idx];
+                        let own = proposal_by_author.get(&w.agent_id).copied();
+                        (
+                            idx,
+                            round2_user(&req.question, &projection, &proposal_ids, own, round),
+                        )
+                    })
+                    .collect();
 
-        let mut contributed = false;
+                let mut contributed = false;
 
-        for (idx, prompt) in vote_prompts {
-            if engine.is_converged() || clock.now_ms() >= deadline_ms {
-                break;
+                for (idx, prompt) in vote_prompts {
+                    if engine.is_converged() || clock.now_ms() >= deadline_ms {
+                        break;
+                    }
+                    let answer = workers[idx].handle.ask(ROUND2_SYSTEM, &prompt).await;
+                    let Some(answer) = answer else { continue };
+                    let now = clock.now_ms();
+                    let Some(vote) = parse_vote(&answer, &proposal_ids) else {
+                        continue;
+                    };
+                    contributed = true;
+                    apply_vote(
+                        &mut engine,
+                        workers[idx].agent_id,
+                        &vote,
+                        now,
+                        started,
+                        topic_id,
+                        &mut recorded,
+                        &mut emit,
+                    );
+                }
+
+                // If a whole re-assertion round produced no usable marks, another identical
+                // prompt cycle is unlikely to help; terminate and let force_resolve decide.
+                if !contributed {
+                    break;
+                }
             }
-            let answer = workers[idx].handle.ask(ROUND2_SYSTEM, &prompt).await;
-            let Some(answer) = answer else { continue };
-            let w = &workers[idx];
-            let now = clock.now_ms();
-            let Some(vote) = parse_vote(&answer, &proposal_ids) else {
-                continue;
-            };
-            contributed = true;
-            match vote.kind {
-                VoteKind::Endorse => engine.endorse(vote.target, w.agent_id, None, now),
-                VoteKind::Inhibit => engine.inhibit(vote.target, w.agent_id, None, now),
-            }
-            recorded.push(RecordedMark {
-                at_ms: now - started,
-                author: w.agent_id,
-                kind: match vote.kind {
-                    VoteKind::Endorse => RecordedMarkKind::Endorse {
-                        proposal: vote.target,
-                    },
-                    VoteKind::Inhibit => RecordedMarkKind::Inhibit {
-                        proposal: vote.target,
-                    },
-                },
-            });
-            emit(LonghouseEvent::MarkPosted {
-                topic_id,
-                mark: Mark {
-                    mark_id: Uuid::new_v4(),
-                    author: w.agent_id,
-                    kind: match vote.kind {
-                        VoteKind::Endorse => MarkKind::Endorse,
-                        VoteKind::Inhibit => MarkKind::Inhibit,
-                    },
-                    target: Some(vote.target),
-                    summary: truncate(&vote.rationale, 160),
-                },
-            });
-            emit_quorum(&mut engine, topic_id, clock.now_ms(), &mut emit);
         }
+        QuorumRule::SequentialEvidence(_) => {
+            // The planner's roster is the daemon-owned credential set; the
+            // review budget preserves the legacy spend ceiling of one call per
+            // worker per re-assertion round.
+            let planner_roster: Vec<ReviewerCredential> = engine.reviewers().cloned().collect();
+            let mut budget_remaining = (max_rounds.saturating_sub(1) * workers.len().max(1)) as f64;
+            let mut rivals_generated = false;
+            // Non-weight-bearing rationale artifacts. Observable on the event
+            // stream as `MarkKind::Evidence` and surfaced to later reviewers
+            // as prompt context — never fed to the engine, never recorded in
+            // the replay evidence mass, and requested at most once per
+            // proposal per convene.
+            let mut evidence_notes: Vec<String> = Vec::new();
+            let mut evidence_requested: HashSet<Uuid> = HashSet::new();
+            let mut review_seq: usize = 1;
 
-        // If a whole re-assertion round produced no usable marks, another identical
-        // prompt cycle is unlikely to help; terminate and let force_resolve decide.
-        if !contributed {
-            break;
+            'acquire: loop {
+                if engine.is_converged() || clock.now_ms() >= deadline_ms {
+                    break;
+                }
+                let now = clock.now_ms();
+                let Some(assessment) = engine.assessment(now) else {
+                    break;
+                };
+                let action = match ReviewPlanner::plan(
+                    &assessment,
+                    now,
+                    deadline_ms,
+                    budget_remaining,
+                    &planner_roster,
+                ) {
+                    PlanOutcome::Continue(action) => action,
+                    PlanOutcome::NeedsEscalation(reason) => {
+                        match route_escalation(reason, rivals_generated, budget_remaining) {
+                            EscalationRoute::GenerateRivals => {
+                                rivals_generated = true;
+                                // One bounded pass: every worker without a live
+                                // proposal is asked once for a genuine rival.
+                                let projection = projection_text(&proposals);
+                                let prompts: Vec<(usize, String)> = workers
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, w)| !proposal_by_author.contains_key(&w.agent_id))
+                                    .take(budget_remaining.max(0.0) as usize)
+                                    .map(|(idx, _)| (idx, rival_user(&req.question, &projection)))
+                                    .collect();
+                                budget_remaining -= prompts.len() as f64;
+                                let results = run_round(&workers, prompts, RIVAL_SYSTEM).await;
+                                let mut landed = false;
+                                for (idx, answer) in results {
+                                    let Some(answer) = answer else { continue };
+                                    if !is_distinct_rival(&answer, &proposals) {
+                                        continue;
+                                    }
+                                    let w = &workers[idx];
+                                    let proposal_id = Uuid::new_v4();
+                                    let now = clock.now_ms();
+                                    engine.propose(proposal_id, w.agent_id, now);
+                                    recorded.push(RecordedMark {
+                                        at_ms: now - started,
+                                        author: w.agent_id,
+                                        kind: RecordedMarkKind::Propose {
+                                            proposal: proposal_id,
+                                        },
+                                    });
+                                    proposals.insert(proposal_id, answer.clone());
+                                    proposal_by_author.insert(w.agent_id, proposal_id);
+                                    emit(LonghouseEvent::MarkPosted {
+                                        topic_id,
+                                        mark: Mark {
+                                            mark_id: proposal_id,
+                                            author: w.agent_id,
+                                            kind: MarkKind::Proposal,
+                                            target: None,
+                                            summary: truncate(&answer, 160),
+                                        },
+                                    });
+                                    emit_quorum(&mut engine, topic_id, now, &mut emit);
+                                    landed = true;
+                                }
+                                if landed {
+                                    // A rival registered: rebuild the
+                                    // assessment and resume planning.
+                                    continue 'acquire;
+                                }
+                                direct_abort = Some(DirectAbort::InsufficientAlternatives);
+                                break 'acquire;
+                            }
+                            EscalationRoute::AbortInsufficientAlternatives => {
+                                direct_abort = Some(DirectAbort::InsufficientAlternatives);
+                                break 'acquire;
+                            }
+                            // Tied/saturated/budget/deadline: hand control to
+                            // the Resolve section below — early force_resolve
+                            // pre-deadline, honest Timeout at the deadline.
+                            // Escalation itself never aborts and never commits.
+                            EscalationRoute::ResolveEarly => break 'acquire,
+                        }
+                    }
+                };
+
+                let mut projection = projection_text(&proposals);
+                if !evidence_notes.is_empty() {
+                    projection.push_str("\n\nEvidence on the table:\n");
+                    projection.push_str(&evidence_notes.join("\n"));
+                }
+                let proposal_ids: Vec<Uuid> = proposals.keys().copied().collect();
+
+                match action {
+                    ReviewAction::SampleIndependent { reviewer, .. }
+                    | ReviewAction::ReassertAfterDecay { reviewer, .. } => {
+                        let Some(idx) = workers.iter().position(|w| w.agent_id == reviewer) else {
+                            continue;
+                        };
+                        budget_remaining -= 1.0;
+                        let round = review_seq;
+                        review_seq += 1;
+                        let own = proposal_by_author.get(&reviewer).copied();
+                        let prompt =
+                            round2_user(&req.question, &projection, &proposal_ids, own, round);
+                        let Some(answer) = workers[idx].handle.ask(ROUND2_SYSTEM, &prompt).await
+                        else {
+                            continue;
+                        };
+                        let now = clock.now_ms();
+                        let Some(vote) = parse_vote(&answer, &proposal_ids) else {
+                            continue;
+                        };
+                        apply_vote(
+                            &mut engine,
+                            reviewer,
+                            &vote,
+                            now,
+                            started,
+                            topic_id,
+                            &mut recorded,
+                            &mut emit,
+                        );
+                    }
+                    ReviewAction::ChallengeLeader {
+                        leader,
+                        runner_up,
+                        reviewer,
+                    } => {
+                        let Some(idx) = workers.iter().position(|w| w.agent_id == reviewer) else {
+                            continue;
+                        };
+                        budget_remaining -= 1.0;
+                        review_seq += 1;
+                        let prompt = challenge_user(
+                            &req.question,
+                            &projection,
+                            &proposal_ids,
+                            leader,
+                            runner_up,
+                        );
+                        let Some(answer) = workers[idx].handle.ask(ROUND2_SYSTEM, &prompt).await
+                        else {
+                            continue;
+                        };
+                        let now = clock.now_ms();
+                        let Some(vote) = parse_vote(&answer, &proposal_ids) else {
+                            continue;
+                        };
+                        // An adversarial comparison must land on one of the two
+                        // compared proposals; anything else is an abstention.
+                        if vote.target != leader && vote.target != runner_up {
+                            continue;
+                        }
+                        apply_vote(
+                            &mut engine,
+                            reviewer,
+                            &vote,
+                            now,
+                            started,
+                            topic_id,
+                            &mut recorded,
+                            &mut emit,
+                        );
+                    }
+                    ReviewAction::RequestEvidence { proposal } => {
+                        // Bounded no-repeat: with a saturated field the plan
+                        // is stable, so an unanswered/answered request must not
+                        // re-fire every tick. One request per proposal per
+                        // convene; a repeat means the acquisition plane has
+                        // nothing left to buy — hand control to Resolve.
+                        if !claim_evidence_request(&mut evidence_requested, proposal) {
+                            break 'acquire;
+                        }
+                        // Ask the proposal's author for a falsifiable rationale.
+                        // The response carries NO quorum weight: it is emitted
+                        // as an observable `Evidence` mark and becomes prompt
+                        // context for later reviewers — never an
+                        // endorse/inhibit, never replay evidence mass.
+                        let author = proposal_by_author
+                            .iter()
+                            .find(|(_, owned)| **owned == proposal)
+                            .map(|(author, _)| *author);
+                        let Some(author) = author else { continue };
+                        let Some(idx) = workers.iter().position(|w| w.agent_id == author) else {
+                            continue;
+                        };
+                        budget_remaining -= 1.0;
+                        review_seq += 1;
+                        let text = proposals.get(&proposal).cloned().unwrap_or_default();
+                        let prompt = evidence_user(&req.question, &text);
+                        if let Some(answer) =
+                            workers[idx].handle.ask(EVIDENCE_SYSTEM, &prompt).await
+                        {
+                            evidence_notes.push(emit_evidence(
+                                topic_id, author, proposal, &answer, &mut emit,
+                            ));
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    // The exhausted lone-proposal escalation terminates here, directly:
+    // by construction it never reaches force_resolve or any ConvergenceBasis.
+    if let Some(abort) = direct_abort {
+        emit(abort.event(topic_id));
+        emit(LonghouseEvent::TopicClosed { topic_id });
+        let now = clock.now_ms();
+        return ConveneOutcome {
+            topic_id,
+            board_id,
+            decision: None,
+            convergence_basis: None,
+            tallies: engine.tallies(now),
+            proposals,
+            recording: Recording {
+                question: req.question.clone(),
+                reviewers: recorded_reviewers,
+                marks: recorded,
+            },
+        };
     }
 
     // ---- Resolve ------------------------------------------------------------
     let now = clock.now_ms();
-    let decision = match engine.evaluate(now) {
-        QuorumOutcome::Converged { decision, .. } => Some(decision),
-        QuorumOutcome::Pending { .. } => {
-            // The topic always terminates, but only legacy net-weight mode may
-            // manufacture a deadline winner. Sequential evidence returns the
-            // honest Timeout/Split abort when neither stopping bound fired.
-            let reason = if now >= deadline_ms {
-                AbortReason::Timeout
-            } else {
-                AbortReason::Split
-            };
-            match engine.force_resolve(now, reason, true) {
-                Ok(winner) => Some(winner),
-                Err(abort) => {
-                    emit(LonghouseEvent::Aborted {
-                        topic_id,
-                        reason: abort,
-                    });
-                    None
-                }
-            }
+    let decision = match resolve_engine(&mut engine, now, deadline_ms) {
+        ResolutionOutcome::Committed(decision) => Some(decision),
+        ResolutionOutcome::Aborted(reason) => {
+            emit(LonghouseEvent::Aborted { topic_id, reason });
+            None
         }
     };
 
@@ -734,6 +953,165 @@ fn independence_first_order(workers: &[Worker]) -> Vec<usize> {
     independent
 }
 
+/// Where the convene loop routes a planner escalation. Pure and test-pinned:
+/// this function IS the code path, so the tests on it constrain the loop.
+///
+/// The invariants it encodes: `LoneProposal` is the only escalation that may
+/// spend more resources (one bounded rival-generation pass per convene), its
+/// exhaustion is the only direct abort (emitted in the loop, never through
+/// `force_resolve`), and every other reason resolves through the honest
+/// Resolve section — early `force_resolve` pre-deadline or `Timeout` at the
+/// deadline. No route constructs commitment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscalationRoute {
+    /// Ask non-proposing workers for a genuine rival, once per convene.
+    GenerateRivals,
+    /// Terminate directly with `AbortReason::InsufficientAlternatives`.
+    AbortInsufficientAlternatives,
+    /// Hand control to the Resolve section (force_resolve / deadline).
+    ResolveEarly,
+}
+
+/// The only planner-driven direct terminal path. Deadline and split exits are
+/// intentionally unrepresentable here; they belong to [`ResolutionOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectAbort {
+    InsufficientAlternatives,
+}
+
+impl DirectAbort {
+    fn event(self, topic_id: Uuid) -> LonghouseEvent {
+        let reason = match self {
+            Self::InsufficientAlternatives => AbortReason::InsufficientAlternatives,
+        };
+        LonghouseEvent::Aborted { topic_id, reason }
+    }
+}
+
+/// Mutually exclusive terminal outcomes after acquisition stops. The typed
+/// split keeps an honest sequential abort distinct from a daemon-latched
+/// commitment all the way to event emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolutionOutcome {
+    Committed(Uuid),
+    Aborted(AbortReason),
+}
+
+fn resolve_engine(engine: &mut QuorumEngine, now_ms: i64, deadline_ms: i64) -> ResolutionOutcome {
+    match engine.evaluate(now_ms) {
+        QuorumOutcome::Converged { decision, .. } => ResolutionOutcome::Committed(decision),
+        QuorumOutcome::Pending { .. } => {
+            // Only legacy net-weight mode may manufacture a deadline winner.
+            // Sequential evidence passes the honest reason through unchanged.
+            let reason = if now_ms >= deadline_ms {
+                AbortReason::Timeout
+            } else {
+                AbortReason::Split
+            };
+            match engine.force_resolve(now_ms, reason, true) {
+                Ok(decision) => ResolutionOutcome::Committed(decision),
+                Err(reason) => ResolutionOutcome::Aborted(reason),
+            }
+        }
+    }
+}
+
+fn route_escalation(
+    reason: EscalationReason,
+    rivals_generated: bool,
+    budget_remaining: f64,
+) -> EscalationRoute {
+    match reason {
+        EscalationReason::LoneProposal if !rivals_generated && budget_remaining >= 1.0 => {
+            EscalationRoute::GenerateRivals
+        }
+        EscalationReason::LoneProposal => EscalationRoute::AbortInsufficientAlternatives,
+        EscalationReason::TiedField
+        | EscalationReason::BudgetExhausted
+        | EscalationReason::DeadlineReached
+        | EscalationReason::NoEligibleReviewers => EscalationRoute::ResolveEarly,
+    }
+}
+
+/// Publish one non-weight-bearing artifact and return its bounded prompt form.
+/// The engine is deliberately absent from this function's parameters, so an
+/// evidence request cannot mutate the quorum field by construction.
+fn emit_evidence<F>(
+    topic_id: Uuid,
+    author: Uuid,
+    proposal: Uuid,
+    answer: &str,
+    emit: &mut F,
+) -> String
+where
+    F: FnMut(LonghouseEvent),
+{
+    emit(LonghouseEvent::MarkPosted {
+        topic_id,
+        mark: Mark {
+            mark_id: Uuid::new_v4(),
+            author,
+            kind: MarkKind::Evidence,
+            target: Some(proposal),
+            summary: truncate(answer, 160),
+        },
+    });
+    format!("- {}", truncate(answer, 220))
+}
+
+/// Reserve the sole artifact request allowed for a proposal in one convene.
+fn claim_evidence_request(requested: &mut HashSet<Uuid>, proposal: Uuid) -> bool {
+    requested.insert(proposal)
+}
+
+/// Feed one parsed vote to the engine and mirror it to the recording and the
+/// event stream. Shared by the legacy static rounds and the planner loop so
+/// the two paths cannot drift in how a mark lands.
+#[allow(clippy::too_many_arguments)]
+fn apply_vote<F>(
+    engine: &mut QuorumEngine,
+    author: Uuid,
+    vote: &Vote,
+    now: i64,
+    started: i64,
+    topic_id: Uuid,
+    recorded: &mut Vec<RecordedMark>,
+    emit: &mut F,
+) where
+    F: FnMut(LonghouseEvent),
+{
+    match vote.kind {
+        VoteKind::Endorse => engine.endorse(vote.target, author, None, now),
+        VoteKind::Inhibit => engine.inhibit(vote.target, author, None, now),
+    }
+    recorded.push(RecordedMark {
+        at_ms: now - started,
+        author,
+        kind: match vote.kind {
+            VoteKind::Endorse => RecordedMarkKind::Endorse {
+                proposal: vote.target,
+            },
+            VoteKind::Inhibit => RecordedMarkKind::Inhibit {
+                proposal: vote.target,
+            },
+        },
+    });
+    emit(LonghouseEvent::MarkPosted {
+        topic_id,
+        mark: Mark {
+            mark_id: Uuid::new_v4(),
+            author,
+            kind: match vote.kind {
+                VoteKind::Endorse => MarkKind::Endorse,
+                VoteKind::Inhibit => MarkKind::Inhibit,
+            },
+            target: Some(vote.target),
+            summary: truncate(&vote.rationale, 160),
+        },
+    });
+    emit_quorum(engine, topic_id, now, emit);
+}
+
 const ROUND1_SYSTEM: &str =
     "You are one member of a small council answering a question. Give your single best \
      answer in ONE short paragraph (max 3 sentences). Be concrete and decisive. Do not \
@@ -750,6 +1128,69 @@ const ROUND2_SYSTEM: &str =
      or\n\
      INHIBIT <number>: <one short reason>\n\
      Use the proposal numbers shown. Do not add anything else.";
+
+const RIVAL_SYSTEM: &str =
+    "You are one member of a small council. The board currently holds only ONE proposed \
+     answer, and a one-hypothesis field cannot be decided. Propose a GENUINELY DIFFERENT \
+     alternative answer in ONE short paragraph (max 3 sentences). If you truly cannot \
+     offer a distinct alternative, reply with exactly: PASS";
+
+fn rival_user(question: &str, projection: &str) -> String {
+    format!(
+        "Question for the council:\n\n{question}\n\nThe only proposal so far:\n{projection}\n\n\
+         Your genuinely different alternative (or PASS):"
+    )
+}
+
+/// Reject the explicit abstention vocabulary and exact restatements before a
+/// generated answer can enter the one-hypothesis field as a rival proposal.
+fn is_distinct_rival(answer: &str, proposals: &HashMap<Uuid, String>) -> bool {
+    let answer = answer.trim();
+    let abstention = answer.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    !answer.is_empty()
+        && !abstention.eq_ignore_ascii_case("PASS")
+        && !proposals
+            .values()
+            .any(|existing| existing.trim().eq_ignore_ascii_case(answer))
+}
+
+const EVIDENCE_SYSTEM: &str =
+    "You are one member of a council. Provide the strongest CONCRETE evidence for the \
+     proposal you authored: a source, a test, a falsifiable claim, or a worked example. \
+     Max 3 sentences. Do NOT vote and do NOT restate the proposal.";
+
+fn evidence_user(question: &str, proposal: &str) -> String {
+    format!(
+        "Question:\n{question}\n\nYour proposal on the board:\n{proposal}\n\n\
+         Your strongest concrete evidence for it:"
+    )
+}
+
+/// Adversarial leader/runner-up comparison. Numbering matches
+/// [`projection_text`]'s stable sorted order, and the reply is parsed with the
+/// same [`parse_vote`] grammar — the caller rejects any target that is not one
+/// of the two compared proposals.
+fn challenge_user(
+    question: &str,
+    projection: &str,
+    ids: &[Uuid],
+    leader: Uuid,
+    runner_up: Uuid,
+) -> String {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    let number_of = |id: Uuid| sorted.iter().position(|x| *x == id).map_or(0, |p| p + 1);
+    let leader_no = number_of(leader);
+    let runner_no = number_of(runner_up);
+    format!(
+        "Question:\n{question}\n\nProposals on the blackboard:\n{projection}\n\n\
+         Adversarial comparison: weigh proposal {leader_no} (current leader) DIRECTLY \
+         against proposal {runner_no} (runner-up). Which is stronger, and which — if \
+         either — is actively weaker or harmful? Vote ONLY on proposal {leader_no} or \
+         {runner_no}.\n\n\
+         Your vote (ENDORSE <n>: reason  OR  INHIBIT <n>: reason):"
+    )
+}
 
 fn round2_user(
     question: &str,
@@ -861,10 +1302,265 @@ fn federation_label(f: Federation) -> &'static str {
 mod tests {
     use super::*;
 
+    use crate::evidence::SequentialEvidenceConfig;
+
     fn uid(n: u8) -> Uuid {
         let mut b = [0u8; 16];
         b[15] = n;
         Uuid::from_bytes(b)
+    }
+
+    fn sequential_engine() -> QuorumEngine {
+        QuorumEngine::new(QuorumConfig {
+            rule: QuorumRule::SequentialEvidence(SequentialEvidenceConfig::default()),
+            mark_ttl_ms: 60_000,
+            tie_break_seed: 11,
+        })
+    }
+
+    // ---- TASK-4: escalation routing + abort taxonomy -----------------------
+
+    /// The routing table IS the loop's escalation behavior: LoneProposal is
+    /// the only escalation that spends more resources, its exhaustion is the
+    /// only direct abort, and everything else resolves through the honest
+    /// Resolve section. `EscalationRoute` has no commitment variant, so no
+    /// escalation can be converted into `Converged`.
+    #[test]
+    fn escalation_routing_is_exhaustive_and_never_commits() {
+        assert_eq!(
+            route_escalation(EscalationReason::LoneProposal, false, 1.0),
+            EscalationRoute::GenerateRivals
+        );
+        assert_eq!(
+            route_escalation(EscalationReason::LoneProposal, true, 1.0),
+            EscalationRoute::AbortInsufficientAlternatives
+        );
+        assert_eq!(
+            route_escalation(EscalationReason::LoneProposal, false, 0.0),
+            EscalationRoute::AbortInsufficientAlternatives,
+            "a zero review budget cannot be overspent on rival generation"
+        );
+        for reason in [
+            EscalationReason::TiedField,
+            EscalationReason::BudgetExhausted,
+            EscalationReason::DeadlineReached,
+            EscalationReason::NoEligibleReviewers,
+        ] {
+            for spent in [false, true] {
+                assert_eq!(
+                    route_escalation(reason, spent, 1.0),
+                    EscalationRoute::ResolveEarly
+                );
+            }
+        }
+    }
+
+    /// `InsufficientAlternatives` is unreachable through `force_resolve`:
+    /// sequential mode returns the caller's reason verbatim as `Err` and never
+    /// latches a basis, and convene's Resolve callsite only ever passes
+    /// `Timeout` or `Split`. The direct-abort path is the ONLY emitter.
+    #[test]
+    fn insufficient_alternatives_never_flows_through_force_resolve() {
+        let topic_id = uid(99);
+        let event = DirectAbort::InsufficientAlternatives.event(topic_id);
+        assert!(matches!(
+            event,
+            LonghouseEvent::Aborted {
+                topic_id: emitted_topic,
+                reason: AbortReason::InsufficientAlternatives,
+            } if emitted_topic == topic_id
+        ));
+        assert_eq!(
+            serde_json::to_value(AbortReason::InsufficientAlternatives).unwrap(),
+            serde_json::json!("insufficient_alternatives")
+        );
+
+        for reason in [AbortReason::Timeout, AbortReason::Split] {
+            let mut engine = sequential_engine();
+            engine.propose(uid(1), uid(10), 0);
+            let result = engine.force_resolve(1_000, reason, true);
+            assert_eq!(result, Err(reason), "sequential passes reason through");
+            assert!(!engine.is_converged(), "no forced basis may latch");
+            assert_eq!(engine.convergence_basis(), None);
+        }
+    }
+
+    #[test]
+    fn timeout_split_and_commitment_remain_distinct_terminal_routes() {
+        let mut deadline_pending = sequential_engine();
+        deadline_pending.propose(uid(1), uid(10), 0);
+        deadline_pending.propose(uid(2), uid(20), 0);
+        assert_eq!(
+            resolve_engine(&mut deadline_pending, 1_000, 1_000),
+            ResolutionOutcome::Aborted(AbortReason::Timeout)
+        );
+        assert_eq!(deadline_pending.convergence_basis(), None);
+
+        let mut early_pending = sequential_engine();
+        early_pending.propose(uid(1), uid(10), 0);
+        early_pending.propose(uid(2), uid(20), 0);
+        assert_eq!(
+            resolve_engine(&mut early_pending, 500, 1_000),
+            ResolutionOutcome::Aborted(AbortReason::Split)
+        );
+        assert_eq!(early_pending.convergence_basis(), None);
+
+        let mut committed = sequential_engine();
+        committed.propose(uid(1), uid(10), 0);
+        committed.propose(uid(2), uid(20), 0);
+        committed.endorse(uid(1), uid(30), None, 0);
+        committed.endorse(uid(1), uid(40), None, 0);
+        assert_eq!(
+            resolve_engine(&mut committed, 0, 1_000),
+            ResolutionOutcome::Committed(uid(1))
+        );
+        assert!(committed.convergence_basis().is_some());
+    }
+
+    #[test]
+    fn rival_generation_rejects_pass_blank_and_exact_restatements() {
+        let mut proposals = HashMap::new();
+        proposals.insert(uid(1), "Existing answer".to_string());
+
+        assert!(!is_distinct_rival("PASS", &proposals));
+        assert!(!is_distinct_rival("  pass  ", &proposals));
+        assert!(!is_distinct_rival("`PASS.`", &proposals));
+        assert!(!is_distinct_rival("   ", &proposals));
+        assert!(!is_distinct_rival(" existing answer ", &proposals));
+        assert!(is_distinct_rival(
+            "A genuinely different answer",
+            &proposals
+        ));
+    }
+
+    /// LoneProposal escalation, rival registration, resume: the planner
+    /// escalates on a one-hypothesis field; after a rival proposal registers,
+    /// a FRESH assessment resumes normal planning with a review action.
+    #[test]
+    fn rival_registration_resumes_planning() {
+        let config = SequentialEvidenceConfig::default();
+        let mut engine = sequential_engine();
+        let roster: Vec<ReviewerCredential> = [(uid(10), "a"), (uid(20), "b"), (uid(30), "c")]
+            .into_iter()
+            .map(|(reviewer, group)| {
+                ReviewerCredential::with_default_prior(reviewer, group, config).unwrap()
+            })
+            .collect();
+        for credential in &roster {
+            engine.register_reviewer(credential.clone());
+        }
+        engine.propose(uid(1), uid(10), 0);
+
+        let lone = engine.assessment(0).unwrap();
+        assert_eq!(
+            ReviewPlanner::plan(&lone, 0, 10_000, 5.0, &roster),
+            PlanOutcome::NeedsEscalation(EscalationReason::LoneProposal)
+        );
+        assert_eq!(
+            route_escalation(EscalationReason::LoneProposal, false, 1.0),
+            EscalationRoute::GenerateRivals
+        );
+
+        // A rival lands (what the bounded generation pass does on success).
+        engine.propose(uid(2), uid(20), 1);
+        let fresh = engine.assessment(1).unwrap();
+        assert!(
+            matches!(
+                ReviewPlanner::plan(&fresh, 1, 10_000, 5.0, &roster),
+                PlanOutcome::Continue(_)
+            ),
+            "a two-proposal field must resume review planning"
+        );
+    }
+
+    /// Every accepted stance is followed by a new assessment in the loop. This
+    /// composition test pins the observable consequence: the capture instant,
+    /// canonical snapshot, and next action all update after the stance lands.
+    #[test]
+    fn accepted_stance_rebuilds_assessment_before_next_plan() {
+        let config = SequentialEvidenceConfig::default();
+        let mut engine = sequential_engine();
+        let roster: Vec<ReviewerCredential> = [(uid(10), "a"), (uid(20), "b"), (uid(30), "c")]
+            .into_iter()
+            .map(|(reviewer, group)| {
+                ReviewerCredential::with_default_prior(reviewer, group, config).unwrap()
+            })
+            .collect();
+        for credential in &roster {
+            engine.register_reviewer(credential.clone());
+        }
+        engine.propose(uid(1), uid(10), 0);
+        engine.propose(uid(2), uid(20), 0);
+
+        let before = engine.assessment(0).unwrap();
+        assert!(matches!(
+            ReviewPlanner::plan(&before, 0, 10_000, 5.0, &roster),
+            PlanOutcome::Continue(ReviewAction::SampleIndependent { reviewer, .. })
+                if reviewer == uid(30)
+        ));
+
+        engine.endorse(uid(1), uid(30), None, 1);
+        let fresh = engine.assessment(1).unwrap();
+        assert_eq!(fresh.trajectory().captured_at_ms(), 1);
+        assert_eq!(
+            fresh.snapshot(),
+            &fresh.trajectory().snapshot_at(1),
+            "the rebuilt assessment must share the commitment evaluator"
+        );
+        assert_ne!(before.snapshot(), fresh.snapshot());
+        assert!(!matches!(
+            ReviewPlanner::plan(&fresh, 1, 10_000, 4.0, &roster),
+            PlanOutcome::Continue(ReviewAction::SampleIndependent { reviewer, .. })
+                if reviewer == uid(30)
+        ));
+    }
+
+    #[test]
+    fn evidence_mark_is_observable_non_weight_bearing_and_bounded() {
+        let mut engine = sequential_engine();
+        engine.propose(uid(1), uid(10), 0);
+        engine.propose(uid(2), uid(20), 0);
+        let before = engine.assessment(0).unwrap().snapshot().clone();
+        let mut events = Vec::new();
+
+        let note = emit_evidence(
+            uid(90),
+            uid(10),
+            uid(1),
+            "A falsifiable test result",
+            &mut |event| events.push(event),
+        );
+
+        assert_eq!(before, *engine.assessment(0).unwrap().snapshot());
+        assert_eq!(note, "- A falsifiable test result");
+        assert!(matches!(
+            events.as_slice(),
+            [LonghouseEvent::MarkPosted {
+                topic_id,
+                mark: Mark {
+                    author,
+                    kind: MarkKind::Evidence,
+                    target: Some(target),
+                    ..
+                },
+            }] if *topic_id == uid(90) && *author == uid(10) && *target == uid(1)
+        ));
+
+        let mut requested = HashSet::new();
+        assert!(claim_evidence_request(&mut requested, uid(1)));
+        assert!(!claim_evidence_request(&mut requested, uid(1)));
+    }
+
+    /// The challenge prompt numbers proposals exactly like `projection_text`
+    /// (stable sorted-id order), so a parsed vote lands on the intended
+    /// proposal.
+    #[test]
+    fn challenge_prompt_numbering_matches_projection_order() {
+        let ids = vec![uid(9), uid(3)];
+        let prompt = challenge_user("q", "projection", &ids, uid(9), uid(3));
+        // Sorted order: uid(3) is proposal 1, uid(9) is proposal 2.
+        assert!(prompt.contains("proposal 2 (current leader)"));
+        assert!(prompt.contains("proposal 1 (runner-up)"));
     }
 
     #[test]

@@ -3742,3 +3742,27 @@ fresh live assessment, budget exhaustion, and deterministic reviewer choice.
 `cargo test -p ocean-longhouse` passed 140 tests with one ignored; all-target
 Clippy with denied warnings, formatting, and diff checks passed.
 _________________________________________________________________________________
+
+time:      [03:18] [16-07-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [feature-request]
+area:      [backend]
+
+Completed Longhouse TASK-4 by replacing the static sequential review loop with
+fresh-assessment ReviewPlanner consultation before every provider call while
+leaving legacy NetWeight ordering intact. Review spend is bounded and charged
+only at actual asks. Lone fields receive one budget-capped rival-generation
+pass, then terminate through the typed InsufficientAlternatives event without
+entering force_resolve. Evidence requests emit observable non-weight-bearing
+marks, adversarial challenges stay leader/runner-up scoped, and terminal routing
+keeps Committed, Timeout, Split, and InsufficientAlternatives structurally
+distinct. Regressions cover fresh assessment rebuilding, rival recovery,
+zero-budget and PASS handling, direct-abort isolation, evidence-field immutability,
+and terminal taxonomy. Independent Fable and Pi reviews approved the frozen
+tree. Final gates passed: 148 Longhouse tests
+with one ignored, 48 SDK tests, 320 serialized daemon tests, all-target Clippy
+with denied warnings, workspace test compilation, the compatibility feature
+matrix and release all-target check, docs/index checks, formatting, diff checks,
+and the deterministic lh-tune demo.
+_________________________________________________________________________________

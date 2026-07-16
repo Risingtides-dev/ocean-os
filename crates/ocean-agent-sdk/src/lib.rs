@@ -853,7 +853,7 @@ pub struct Mark {
     /// The agent that posted it.
     pub author: Uuid,
     pub kind: MarkKind,
-    /// For endorse/inhibit: the proposal this mark targets.
+    /// For endorse/inhibit/evidence: the proposal this mark targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<Uuid>,
     /// Short human-facing summary of the mark's content (the deck shows this on
@@ -881,6 +881,12 @@ pub enum AbortReason {
     BudgetExhausted,
     /// A run was recalled by a steward / operator.
     Recalled,
+    /// A lone-proposal field exhausted its bounded rival-generation
+    /// escalation: with one hypothesis the sequential decision is never
+    /// identifiable, so the topic terminates honestly instead of riding to a
+    /// mislabeled `Timeout` or manufacturing a seeded winner. Emitted directly
+    /// by the convene loop — never by `force_resolve`.
+    InsufficientAlternatives,
 }
 
 /// The longhouse coordination events. Carried as the `payload` of

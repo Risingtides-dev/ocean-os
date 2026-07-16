@@ -2,7 +2,7 @@
 
 **Status:** Current implementation reference plus explicitly labeled target boundaries
 
-**Updated:** 2026-07-15
+**Updated:** 2026-07-16
 
 **Primary code:** `crates/ocean-longhouse`, `crates/ocean-daemon/src/main.rs`
 
@@ -22,7 +22,7 @@ guide for the current HTTP quick reference.
 
 | Layer | Shipped responsibility |
 | --- | --- |
-| `ocean-longhouse` | Council model calls, correlation-aware sequential evidence, legacy net-weight quorum, in-memory topic projection, replay/tuning, advisory preparation, title/escrow primitives, and two permission-gated capability tools |
+| `ocean-longhouse` | Council model calls, correlation-aware sequential evidence, uncertainty-driven review planning, legacy net-weight quorum, in-memory topic projection, replay/tuning, advisory preparation, title/escrow primitives, and two permission-gated capability tools |
 | `ocean-daemon` | HTTP composition, event-bus publication, shared Longhouse registry, persisted title storage, board/claim/revoke/recall/breach handlers, and model-readiness validation on the explicit HTTP convene roster |
 | `ocean-runtime` | Generic capability execution, permission gates, cancellation, and tool events |
 | Extensions | General subagent roles, prompts, worker policy, dispatch, budgets, lifecycle, joins, and orchestration |
@@ -151,17 +151,31 @@ endorse/inhibit rounds.
   query cost. The default cost/loss units are `0.02` and `1.0`. This posterior is
   conditional on the configured priors and group assumptions; it is not claimed as an
   empirically calibrated real-world error rate until outcome learning exists.
-- Later-round reviewers are queried sequentially, with one worker from every distinct
-  provider/model group before correlated replicas. The engine is evaluated after every
-  returned mark, so reaching either stopping bound avoids spending the next model call.
+- In sequential mode, the pure `ReviewPlanner` receives a freshly rebuilt
+  `QuorumAssessment` before every later provider call. It prefers unused correlation
+  groups, can request a leader/runner-up challenge, re-poll evidence projected to decay,
+  or request one non-weight-bearing evidence artifact per proposal. Evidence artifacts
+  are observable `MarkKind::Evidence` events and prompt context; they do not enter the
+  quorum field. Legacy `NetWeight` mode retains the static distinct-group-first order.
+- A one-proposal sequential field cannot become identifiable by adding more stances.
+  The convene loop therefore spends at most its remaining review-call budget on one
+  bounded rival-generation pass. If no distinct rival lands, it emits the typed
+  `InsufficientAlternatives` abort directly; that path never enters `force_resolve`,
+  cannot inherit the `Timeout`/`Split` remap, and cannot latch a convergence basis.
+- The engine is evaluated after every accepted stance, and the next planner call uses a
+  new assessment. Reaching either sequential stopping bound avoids the next model call.
   Proposal calls remain concurrent because the field needs candidate alternatives first.
-- `max_rounds` bounds the number of deliberation rounds.
+- `max_rounds` bounds legacy deliberation rounds. In sequential mode it defines a later
+  provider-call budget of `(max_rounds - 1) * seated_workers`, decremented only when an
+  actual ask begins.
 - Each model call has a 45-second timeout and a 512-token output cap.
 - `deadline_ms` is checked before later rounds and before each later-round query.
   It is not an independent timer and does not preempt a model call already in progress.
-- After the loop, pending sequential evidence emits `Timeout` or `Split`; a deadline is
-  not treated as evidence and never chooses an unsupported proposal. Explicit legacy
-  `NetWeight` mode retains deterministic clear-leader and seeded tie resolution.
+- After the loop, pending sequential evidence emits `Timeout` at the deadline or `Split`
+  on an early exhausted escalation; a deadline is not treated as evidence and never
+  chooses an unsupported proposal. `InsufficientAlternatives` remains a third, direct
+  non-timeout terminal reason. Explicit legacy `NetWeight` mode retains deterministic
+  clear-leader and seeded tie resolution.
 
 There is no aggregate per-topic token accounting or token-cost ceiling. The shipped
 controls bound round count, individual call duration/output, and the council control
@@ -225,6 +239,7 @@ Stable source anchors:
 - `crates/ocean-longhouse/src/agent.rs`
 - `crates/ocean-longhouse/src/convene.rs`
 - `crates/ocean-longhouse/src/evidence.rs`
+- `crates/ocean-longhouse/src/planner.rs`
 - `crates/ocean-longhouse/src/quorum.rs`
 - `crates/ocean-longhouse/src/registry.rs`
 - `crates/ocean-longhouse/src/longhouse_provider.rs`
