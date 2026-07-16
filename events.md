@@ -3653,4 +3653,4 @@ area:      [frontend]: ocean-tui cross-platform compilation
 
 Hosted PR #301's Ubuntu denied-warning Clippy lane exposed macOS-only dictation producers and audio helpers as dead code on Linux. Kept the portable synthetic meter/WAV tests, marked only the two macOS-produced lifecycle variants as intentionally unconstructed on non-macOS production builds, and target-gated capture-only constants plus helper compilation. Runtime behavior and the macOS capture path are unchanged.
 
-Verification: all 356 TUI tests passed with 4 ignored; denied-warning all-target TUI Clippy, formatting, diff check, docs-check, and the release TUI build passed locally. Hosted Ubuntu rerun remains pending before merge.
+Verification: all 356 TUI tests passed with 4 ignored; denied-warning all-target TUI Clippy, formatting, diff check, docs-check, and the release TUI build passed locally. Hosted PR run `29477165601` then passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny.
