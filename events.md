@@ -4372,3 +4372,20 @@ type:  [design]
 
 Drafted the Phase 6 orchestration-transport ratification: docs/specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md (proposed, not accepted; authorizes no code). It relocates the June 2026 R5 durable-workflow design (typed async DAG, SQLite run-state, retries, closeouts — ocean-agents AGENT_FILESYSTEM_ARCHITECTURE.md 115dc4c) into an extension-owned Ocean Crew engine over ordinary Ocean turns, reconciling the three prior layers: Bedrock workflow specs (data), OCEAN-338/340 WorkflowBrief prep (discovery), R5 engine (execution, never built). Defines six generic host seams (execution request, cancellation, scoped lifecycle, interactive UI artifact lane incl. the TUI /v1/component/event gap, deduplicated continuation, confined state dir), a bounded v1 graph model, grace/auto-start safety, read-only Observatory attestation, stages A–E with gates, invariants, exclusions, stop conditions. Indexed in docs/README.md active plans, docs/AGENTS.md, root AGENTS.md work guidance. Verification: cargo xtask docs-check.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [02:17pm] [16-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator], [subagents]
+worktree:  [pi/minimizer-runtime-design-20260716] /tmp/ocean-minimizer-runtime-design-20260716
+type:      [design]: accept minimizer M2 command-capture runtime boundary
+area:      [backend]: provider context economy and artifact recovery
+
+Accepted a docs-only, characterization-first M2 design after six parallel source/donor/walker audits and four independent architecture review rounds. Opaque `bash -lc` command strings remain ineligible because shell text cannot attest actual argv. M2 instead adds an optional direct argv mode to the existing permission-gated Bash tool; only exact bare cargo/git/gh/npm/npx/pytest argv can reach M1. Existing command execution remains unchanged.
+
+The design preserves raw current Ocean text in live events, ordered checkpoints, and durable session history. Only active-run provider request clones may receive a minimized projection. Every projection carries an exact raw artifact pinned for that projection lifetime under explicit 32-entry/1-MiB run bounds; run completion drops both projection and lease, so restart/resume cannot retain stale artifact URIs. A monotonic message-ordinal sidecar—not provider tool-call ids—binds projections through trims, avoiding repeated Gemini-style `call_1` collisions. A sealed `ToolExecutionResult` default method keeps public `AgentToolResult` and external MCP/plugin implementors source-compatible. One ordered output-economy wrapper owns ordinary spill-before-minimize behavior and must restore missing concurrency forwarding.
+
+The roadmap now separates M2 implementation from three walker/search checkpoints: standalone walker, typed search, then live grep/glob parity adoption. No runtime, profile, protocol, session, TUI, or artifact behavior changed.
+
+Verification:
+- `cargo xtask docs-check` passed with 27 packages, 120 active Markdown files, and 129 local links
+- `git diff --check` passed
+- final independent review accepted the design with no medium-or-higher findings
