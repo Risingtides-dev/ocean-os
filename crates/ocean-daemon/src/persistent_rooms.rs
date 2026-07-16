@@ -28,13 +28,14 @@ pub(super) type RoomStoreHandle = Arc<Mutex<ocean_store::SqliteRoomStore>>;
 //
 // These routes serve the *persistent* `Room` lifecycle: create, fetch, roster
 // join/leave, post message, read transcript. They are intentionally additive and
-// fully separate from ephemeral agent sessions. They also live entirely apart
-// from the `agent_turn` handler and its cwd/permission machinery, which is in
-// flight on held security PRs — none of this code touches turn execution.
+// fully separate from ephemeral agent sessions and the caller-submitted
+// `agent_turn` handler. Auto-convene delegates a daemon-internal prompt through
+// the existing runtime/session/permission owners; this module does not replace
+// their authority.
 //
 // Error shape mirrors `GET /v1/longhouse/topics/{topic_id}`: a typed `{ ok,
 // error }` body, 400 on a bad key, 404 on an unknown room. The store maps to
-// status codes in `room_store_error_status`.
+// status codes in `room_store_error_response`.
 
 /// Where the persistent-rooms SQLite DB lives. `OCEAN_DB_PATH` overrides the
 /// whole path; otherwise it is `rooms.db` under the agent's config dir
