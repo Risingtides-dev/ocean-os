@@ -3397,3 +3397,11 @@ Verification:
 - Rust 1.88 `cargo xtask ci --msrv`
 - canonical `cargo xtask ci`, including workspace tests, denied-warning all-target Clippy, format, docs, and dependency policy
 _________________________________________________________________________________
+time:      [09:10pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [docs]: publish persistent-room checkpoint
+area:      [backend]: ocean-daemon Phase 2C durable rooms
+
+PR #293 merged the reviewed persistent-room extraction as `92e03bf` after hosted run `29463198497` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published. The inherited best-effort audit interleaving residual remains documented, and live daemon deployment/supervision remains outside this workstream.
+_________________________________________________________________________________
