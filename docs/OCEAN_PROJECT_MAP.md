@@ -160,9 +160,11 @@ the owning repository's current runbook, not this architecture map.
 
 `ocean-surface` emits `client_type = "surface-tauri"` inside its Tauri host, but
 `ocean-agent::surface_flag` does not currently map that string. Those turns use
-the generic fallback prompt instead of a dedicated or GUI profile. This is a
-code-level integration gap tracked in [`../ROADMAP.md`](../ROADMAP.md), not a
-documentation convention to paper over.
+the generic fallback prompt instead of a dedicated or GUI profile, while the
+daemon harness seam preserves its existing CLI-compatible hashline/artifact
+bundle. Choosing a first-class Tauri classification is a code-level integration
+decision tracked in [`../ROADMAP.md`](../ROADMAP.md), not a documentation
+convention to paper over.
 
 ## Source anchors
 

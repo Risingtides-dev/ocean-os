@@ -71,9 +71,9 @@ use tokio::sync::broadcast;
 /// a boot-time readiness summary. Called once at the top of `main`.
 mod startup;
 
-/// W0 — per-surface harness-profile seam (OMP port foundation). Resolves a
-/// `HarnessProfile` (+ capability bundle) from the turn's `client_type` so
-/// future harness features scope per surface instead of behind a global flag.
+/// W0 — effective per-surface harness gates. Resolves only the behavior this
+/// seam currently controls (hashline edits and artifact spill); global/unwired
+/// capabilities are intentionally not advertised here.
 mod harness_profile;
 
 /// Bounded, fail-open post-turn advisor execution and attribution.
@@ -5973,26 +5973,18 @@ async fn agent_turn(
         session_id = %session_id
     );
 
-    // W0 — resolve the per-surface harness profile from `client_type`. This is
-    // the SEAM the OMP-port features attach to: future capability checks read
-    // `harness_caps.hashline_edits` / `.lsp` / `.stream_rules` / … (from
-    // `harness_profile.capabilities()`) instead of branching on `client_type`
-    // or a global flag. W0 only establishes that the profile resolves correctly
-    // and logs it; it does NOT yet gate any turn behaviour, so `harness_profile`
-    // / `harness_caps` are intentionally unread past this debug line for now.
+    // W0 — resolve the only per-surface harness behaviors currently applied to
+    // the turn. LSP and memory are registered globally; stream rules, rich
+    // context, and minimization are not wired and therefore are not claimed by
+    // this effective bundle.
     let harness_profile = harness_profile::HarnessProfile::from_client_type(client_type.as_deref());
-    let harness_caps = harness_profile.capabilities();
+    let harness_caps = harness_profile.effective_capabilities();
     tracing::debug!(
         client_type = client_type.as_deref().unwrap_or("<none>"),
         ?harness_profile,
-        lsp = harness_caps.lsp,
         hashline_edits = harness_caps.hashline_edits,
-        stream_rules = harness_caps.stream_rules,
-        rich_context = harness_caps.rich_context,
-        memory = harness_caps.memory,
-        artifacts = harness_caps.artifacts,
-        minimizer = harness_caps.minimizer,
-        "agent_turn: resolved harness profile (W0 seam; not yet gating behaviour)"
+        artifact_spill = harness_caps.artifact_spill,
+        "agent_turn: resolved effective harness profile"
     );
 
     // Session↔workspace binding (OCEAN-52) + resume cwd selection (OCEAN-55).
@@ -6497,9 +6489,9 @@ async fn agent_turn(
     // W1 harness profile: only surfaces whose profile grants it (tui/acp/cli)
     // get hashline-tagged reads + the hashline_edit tool; web/voice stay plain.
     .with_hashline_edits(harness_caps.hashline_edits)
-    // W3 harness profile: surfaces whose profile grants it spill oversized tool
-    // output to session artifacts (read artifact://<id>); web/voice stay plain.
-    .with_artifact_spill(harness_caps.artifacts)
+    // W3 harness profile: surfaces whose effective profile grants it spill
+    // oversized output to session artifacts; voice stays plain.
+    .with_artifact_spill(harness_caps.artifact_spill)
     .with_event_sink(event_tx)
     // Per-turn reasoning override (OCEAN-28/41): threads the optional
     // request `thinking_level` into this turn's config only, leaving the
