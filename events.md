@@ -3546,3 +3546,11 @@ Verification:
 - delegated loader path logs, unsanitized advisory text, detached-task/cache-lock availability, and librarian symlink-retarget findings remain separate; deployment remains operator-owned
 - hosted CI and merge remain pending
 _________________________________________________________________________________
+time:      [02:03am] [16-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [pi/daemon-longhouse-turn-prep-published-20260716]
+type:      [gh actions]: publish Longhouse turn preparation extraction
+area:      [backend]: ocean-daemon Phase 2C advisory turn seam
+
+PR #299 merged the reviewed Longhouse turn-preparation extraction as `9095d5a` after hosted run `29475103379` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, corrected the final rustfmt-expanded module size from the pre-format 239-line estimate to the actual 246 lines, and advanced the next bounded wave to separately manifested Longhouse governance. Delegated loader path logs, unsanitized advisory text, uncancelled timed-out work/cache-lock amplification, and the librarian symlink-retarget finding remain separate; live daemon deployment/supervision remains outside this workstream.
+_________________________________________________________________________________
