@@ -1,7 +1,7 @@
 # Ocean Daemon Recall Registry Extraction Manifest
 
 **Date:** 2026-07-15
-**Status:** Ready for publication; characterization, extraction, dedicated-target validation, and independent review passed; hosted CI and merge pending
+**Status:** Published; PR #287 merged as `3e051c1` after characterization, extraction, dedicated-target validation, independent review, hosted CI, and Rust 1.88 MSRV passed
 **Owner:** Ocean OS
 **Rollback point:** `aea7044` (characterization commit)
 
@@ -171,7 +171,7 @@ Extraction commit `df09399` moved the private recall handle, constructor, poison
 
 Focused recall-registry, recall-route, claim-route, revoke-route, Longhouse recall, Longhouse escrow, and five router-contract groups passed. All 338 daemon tests passed serialized. Workspace test compilation, `livekit-tap`, `deepgram-stt`, formatting, documentation, and diff checks passed in dedicated target `/tmp/ocean-target-recall-registry`. Both fresh security/concurrency reviews found no unresolved medium-or-higher issue; the extraction review reported normalized mechanical equality. The inherited low residual remains explicit: no deterministic route injection forces a post-carry revocation execution error, while unchanged branch placement visibly retains the tally on every failure arm.
 
-Hosted default-parallel CI and merge remain pending. Live daemon deployment/supervision belongs to the concurrent operator workstream and is not performed by this checkpoint.
+Hosted Ubuntu, macOS, Rust 1.88 MSRV, and cargo-deny lanes passed. The Rust 1.88 lane exposed an unrelated upstream TUI test incompatibility; commit `dff5ea2` changed the assertion to compare `cwd.as_path()` with `Path::new("/repo")`, after which the complete MSRV gate passed. PR #287 merged as `3e051c1`. Live daemon deployment/supervision belongs to the concurrent operator workstream and was not performed by this checkpoint.
 
 ## Rollback
 

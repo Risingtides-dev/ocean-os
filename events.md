@@ -3326,6 +3326,22 @@ Verification:
 - `cargo xtask docs-check` passed (26 packages, 113 active Markdown files, 122 local links)
 - `git diff --check` passed
 - fresh source-backed documentation review found no factual, classification, or ownership-boundary issue
+time:      [07:19pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [pi/daemon-persistent-rooms-20260715]
+type:      [refactor]: characterize persistent-room extraction boundary
+area:      [backend]: ocean-daemon Phase 2C durable room adapter
+
+Added the persistent-room extraction manifest and daemon-level characterization for exact real-router create/list/detail/join/message/leave envelopes, serde defaults, custom versus Axum errors, store-error mapping, persisted-author/event/audit/spawn ordering, closed-room ordinary-read versus audit-read asymmetry, bounded cursor replay, shared-handle poison recovery, and retained static/dynamic route precedence. Reconciled the pre-existing internal unbound-room neutral-cwd compatibility fallback without weakening caller-submitted/resumed cwd policy, and updated merged recall PR #287 documentation to published merge `3e051c1`. No persistent-room production body has moved yet, and `ocean-store` retains schema/transaction/paging authority.
+
+Verification:
+- focused persistent-room HTTP, poison, trigger, paging, route-precedence, and route-retirement tests passed
+- all 343 daemon tests passed serialized
+- all 38 `ocean-store` tests passed
+- `cargo fmt --all -- --check`
+- `cargo xtask docs-check` (26 packages, 114 active Markdown files, 120 links)
+- `git diff --check`
+- two fresh characterization/boundary re-reviews: PASS, no unresolved medium-or-higher issue
 _________________________________________________________________________________
 
 time:      [07:37pm] [15-07-26]
@@ -3365,3 +3381,19 @@ type:      [feature]: add bounded Longhouse preparation inspection
 area:      [backend]: explained deterministic consult ranking
 
 Added serializable explained skill/workflow ranking inspection as a projection of the existing scorer, relevance floor, de-duplication, and tie-break path, retaining the exact ordinary `TurnPrep` internally. Mounted read-only `POST /v1/longhouse/inspect` with the prepare request/cwd/cache/top-N behavior, consult-enabled state, indexed/candidate counts, and path-redacted compact selected evidence; the wire response returns only contributing terms, not the raw prompt, session, cwd, source paths, or bodies. Kept ordinary automatic preparation on its original lightweight allocation path and updated route contracts and operator/Longhouse documentation without changing prompt injection or ranking policy.
+time:      [07:54pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [refactor]: extract persistent-room daemon adapter
+area:      [backend]: ocean-daemon Phase 2C durable rooms
+
+Moved the approved 886-line persistent-room implementation boundary into private `src/persistent_rooms.rs`: one shared SQLite handle and poison-recovering lock adapters, exact durable-room HTTP lifecycle/paging, mention trigger/event/audit handling, stable room-agent session identity, and auto-convene orchestration. `AppState`, startup open/migration, router composition, call persistence/retries, and LiveKit authorization remain in `main.rs` over the same store. Rebased through PR #288's documentation-only `cf907a3`, PR #289's advisor/AppState update `8e5f204`, and final `origin/main` `39f6f27`, which adds PR #290's advisor-input Clippy fix and PR #291's Longhouse inspection route without changing a persistent-room seam. Two fresh reviews found all moved bodies mechanically equal to rebased characterization commit `6ea6767` and no unresolved medium-or-higher security/concurrency/ownership issue. The complete focused/full/feature/compatibility/MSRV/canonical gate set passed after final reconciliation; a first canonical retry exhausted local disk, then the unchanged gate passed from a fresh dedicated target after removing only this workstream's stale targets. Live daemon deployment and supervision remain with the concurrent operator workstream.
+
+Verification:
+- focused room HTTP, poison, trigger/order, closed-audit paging, call persistence, LiveKit, and route-contract groups passed
+- all 348 daemon tests and 38 `ocean-store` tests passed
+- `cargo check --workspace --tests`; `livekit-tap`; `deepgram-stt`
+- `cargo xtask ci --compatibility`
+- Rust 1.88 `cargo xtask ci --msrv`
+- canonical `cargo xtask ci`, including workspace tests, denied-warning all-target Clippy, format, docs, and dependency policy
+_________________________________________________________________________________

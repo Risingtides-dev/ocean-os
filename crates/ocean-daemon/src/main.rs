@@ -29,13 +29,12 @@ use ocean_agent_sdk::{
     ProposalTally, ToolCall, ToolCallId, ToolResult,
 };
 use ocean_core::{
-    evaluate_trigger_policy, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
+    EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionMode, PermissionStatus, PermissionsResponse, ProjectRef, PromptRequest,
     RequestControlResponse, RequestCreateResponse, RequestId, RequestState, RequestStatus,
-    RequestsResponse, RoomKey, RoomMessageKind, RoomParticipant, RoomParticipantKind,
-    RoomTriggerEvent, RoomTriggerPolicy, SessionDetail, SessionId, SessionResponse,
-    SessionRunState,
+    RequestsResponse, RoomKey, RoomMessageKind, RoomParticipantKind, SessionDetail, SessionId,
+    SessionResponse, SessionRunState,
 };
 use ocean_runtime::{AgentEvent, PermissionDecision as AgentPermissionDecision, PermissionPolicy};
 // Brings the `RoomStore` trait methods (create/get/list/append_message/…) into
@@ -102,6 +101,8 @@ mod metrics;
 mod model_catalog;
 /// Immutable startup model-role loading and pure turn/advisor role resolution.
 mod model_roles;
+/// Durable persistent-room HTTP lifecycle, paging, and auto-convene adapter.
+mod persistent_rooms;
 /// Project registry CRUD, pagination, git enrichment, and session association adapters.
 mod project_registry;
 /// In-memory quorum-of-recall tally storage and bounded synchronous mutations.
@@ -132,6 +133,11 @@ use filesystem::{fs_dirs, fs_file};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
+use persistent_rooms::{
+    room_create, room_db_path, room_events, room_get, room_join, room_leave, room_post_message,
+    room_snapshot, room_transcript, rooms_list_persistent, with_rooms, with_rooms_handle,
+    RoomStoreHandle,
+};
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
     project_get, project_patch, projects_list,
@@ -162,7 +168,15 @@ use metrics::{labelled_value, metric_value};
 #[cfg(test)]
 use model_catalog::ModelSetRequest;
 #[cfg(test)]
-use ocean_core::{Project, ProjectConfig};
+use ocean_core::{
+    evaluate_trigger_policy, Project, ProjectConfig, RoomParticipant, RoomTriggerEvent,
+    RoomTriggerPolicy,
+};
+#[cfg(test)]
+use persistent_rooms::{
+    parse_mentions, resolve_agent_participant, room_agent_session_id, room_store_error_response,
+    RoomMessageRequest, RoomsListQuery, TranscriptQuery,
+};
 #[cfg(test)]
 use project_registry::{
     parse_discovered_worktree_list, parse_worktree_list, CreateProjectRequest, PatchProjectRequest,
@@ -313,7 +327,6 @@ struct AppState {
 }
 
 type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
-type RoomStoreHandle = Arc<Mutex<ocean_store::SqliteRoomStore>>;
 /// Shared handle to the daemon's **persisted** Longhouse title registry
 /// (OCEAN-246/272): the durable, salt+hash-verifier store of firekeeper/validator
 /// titles. Held behind a std `Mutex` exactly like [`RoomStoreHandle`] — every
@@ -3903,22 +3916,6 @@ impl ocean_call::EventSink for BusSink {
     }
 }
 
-/// Run a closure with a locked room store behind a [`RoomStoreHandle`], recovering
-/// a poisoned lock the same way [`with_rooms`] does. Synchronous: the guard is
-/// dropped before this returns, so no `await` is ever held across the lock. Takes
-/// the handle directly (rather than `&AppState`) so the call sink — which only
-/// holds the `rooms` handle, not the whole state — can write through.
-fn with_rooms_handle<T>(
-    rooms: &RoomStoreHandle,
-    f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T,
-) -> T {
-    let mut guard = match rooms.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    f(&mut guard)
-}
-
 /// The active lane's [`ocean_call::TurnRunner`]: runs one ephemeral agent turn
 /// over a wake command and returns the assistant's reply text for TTS.
 ///
@@ -5435,29 +5432,6 @@ async fn longhouse_board_post(
     )
 }
 
-// ---- Persistent Rooms (OCEAN-65) -------------------------------------------
-//
-// These routes serve the *persistent* `Room` lifecycle: create, fetch, roster
-// join/leave, post message, read transcript. They are intentionally additive and
-// fully separate from ephemeral agent sessions. They also live entirely apart
-// from the `agent_turn` handler and its cwd/permission machinery, which is in
-// flight on held security PRs — none of this code touches turn execution.
-//
-// Error shape mirrors `GET /v1/longhouse/topics/{topic_id}`: a typed `{ ok,
-// error }` body, 400 on a bad key, 404 on an unknown room. The store maps to
-// status codes in `room_store_error_status`.
-
-/// Where the persistent-rooms SQLite DB lives. `OCEAN_DB_PATH` overrides the
-/// whole path; otherwise it is `rooms.db` under the agent's config dir
-/// (`ocean_agent::config_dir_from_env`), so the DB sits next to sessions and
-/// projects under one config directory.
-fn room_db_path() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("OCEAN_DB_PATH") {
-        return std::path::PathBuf::from(p);
-    }
-    ocean_agent::config_dir_from_env().join("rooms.db")
-}
-
 /// Where the persisted Longhouse **title registry** SQLite DB lives (OCEAN-272).
 /// `OCEAN_TITLES_DB_PATH` overrides the whole path; otherwise it is `titles.db`
 /// under the agent's config dir (`ocean_agent::config_dir_from_env`), so the
@@ -5468,825 +5442,6 @@ fn titles_db_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     ocean_agent::config_dir_from_env().join("titles.db")
-}
-
-/// Run a closure with the locked room store, recovering a poisoned lock the same
-/// way the longhouse handlers do (`into_inner`). Synchronous: the guard is
-/// dropped before this returns, so no `await` is ever held across the lock.
-fn with_rooms<T>(state: &AppState, f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T) -> T {
-    let mut guard = match state.rooms.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    f(&mut guard)
-}
-
-/// Map a store error onto an HTTP status + typed JSON body.
-fn room_store_error_response(
-    err: ocean_store::RoomStoreError,
-) -> (StatusCode, Json<serde_json::Value>) {
-    use ocean_store::RoomStoreError::*;
-    let status = match &err {
-        BadKey(_) => StatusCode::BAD_REQUEST,
-        UnknownRoom(_) | UnknownParticipant { .. } => StatusCode::NOT_FOUND,
-        AlreadyExists(_) => StatusCode::CONFLICT,
-        // A durable backend can fail on I/O or (de)serialization, which the
-        // in-memory registry never could. Surface those as 500s, not as a
-        // misleading 4xx.
-        Db(_) | Encode(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (
-        status,
-        Json(json!({ "ok": false, "error": err.to_string() })),
-    )
-}
-
-#[derive(serde::Deserialize)]
-struct RoomCreateRequest {
-    /// Persistent room key, e.g. `"ocean-surface-map-fix"`. Must be non-empty.
-    key: String,
-    /// Human-readable room name.
-    name: String,
-    /// Optional trigger policy controlling auto-convene/notify behaviour.
-    #[serde(default)]
-    trigger_policy: Option<RoomTriggerPolicy>,
-    /// Optional workspace directory the room belongs to (OCEAN-260). When set,
-    /// the room is bound to this project/cwd, so a room-bound agent turn resolves
-    /// its owning project and `cwd` from it. Absent/empty ⇒ no binding (room
-    /// agents fall back to room+agent keying with the daemon's launch dir).
-    #[serde(default)]
-    workspace_root: Option<String>,
-}
-
-/// `POST /v1/rooms/persistent` — create a persistent room.
-async fn room_create(
-    State(state): State<AppState>,
-    Json(req): Json<RoomCreateRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(req.key.trim());
-    // Normalize an empty/whitespace workspace_root to None so a blank field is
-    // treated as "no binding" rather than a bound-to-empty-string room.
-    let workspace_root = req
-        .workspace_root
-        .map(|w| w.trim().to_string())
-        .filter(|w| !w.is_empty());
-    let result = with_rooms(&state, |reg| {
-        reg.create_in_workspace(
-            key,
-            &req.name,
-            workspace_root,
-            req.trigger_policy,
-            Utc::now(),
-        )
-    });
-    match result {
-        Ok(rec) => (
-            StatusCode::CREATED,
-            Json(json!({ "ok": true, "room": rec.room })),
-        ),
-        Err(e) => room_store_error_response(e),
-    }
-}
-
-/// `GET /v1/rooms/persistent` — list all persistent rooms (no transcripts).
-/// Pagination query for `GET /v1/rooms/persistent` (OCEAN-250).
-#[derive(Debug, serde::Deserialize, Default)]
-struct RoomsListQuery {
-    /// Max rooms to return in this page. Omitted ⇒ the store's default cap
-    /// (`DEFAULT_LIST_LIMIT`); any value is clamped to `MAX_LIST_LIMIT`.
-    #[serde(default)]
-    limit: Option<usize>,
-    /// Cursor: the room key of the last room from the previous page. Omitted ⇒
-    /// the first page. Replay `next_cursor` here for the following page.
-    #[serde(default)]
-    cursor: Option<String>,
-}
-
-/// `GET /v1/rooms/persistent?limit=&cursor=` — list open persistent rooms, one
-/// bounded page at a time (OCEAN-250). Rooms are ordered most-recently-updated
-/// first; the `rooms` array shape is unchanged, with additive
-/// `next_cursor`/`has_more` so a poller doesn't re-serialize every room each call.
-async fn rooms_list_persistent(
-    State(state): State<AppState>,
-    Query(q): Query<RoomsListQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    match with_rooms(&state, |reg| reg.list_page(q.cursor.as_deref(), q.limit)) {
-        Ok(page) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "rooms": page.rooms,
-                "next_cursor": page.next_cursor,
-                "has_more": page.has_more,
-            })),
-        ),
-        Err(e) => room_store_error_response(e),
-    }
-}
-
-/// `GET /v1/rooms/persistent/{key}` — one persistent room (with its transcript).
-async fn room_get(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let trimmed = key.trim();
-    if trimmed.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
-        );
-    }
-    let key = RoomKey::new(trimmed);
-    match with_rooms(&state, |reg| reg.get(&key)) {
-        Ok(Some(rec)) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "room": rec.room, "transcript": rec.transcript })),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "ok": false, "error": format!("no room with key '{key}'") })),
-        ),
-        Err(e) => room_store_error_response(e),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct RoomJoinRequest {
-    /// Stable participant id, unique within the room.
-    id: String,
-    /// Display name shown in the roster and transcript.
-    display_name: String,
-    /// What kind of actor is joining. Defaults to `human`.
-    #[serde(default = "default_participant_kind")]
-    kind: RoomParticipantKind,
-}
-
-fn default_participant_kind() -> RoomParticipantKind {
-    RoomParticipantKind::Human
-}
-
-/// `POST /v1/rooms/persistent/{key}/participants` — add a participant.
-async fn room_join(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Json(req): Json<RoomJoinRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(key.trim());
-    let participant = RoomParticipant {
-        id: req.id,
-        kind: req.kind,
-        display_name: req.display_name,
-    };
-    let result = with_rooms(&state, |reg| {
-        reg.add_participant(&key, participant, Utc::now())
-    });
-    match result {
-        Ok(rec) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "room": rec.room })),
-        ),
-        Err(e) => room_store_error_response(e),
-    }
-}
-
-/// `DELETE /v1/rooms/persistent/{key}/participants/{participant_id}` — remove a
-/// participant from the roster.
-async fn room_leave(
-    State(state): State<AppState>,
-    Path((key, participant_id)): Path<(String, String)>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(key.trim());
-    let result = with_rooms(&state, |reg| {
-        reg.remove_participant(&key, participant_id.trim(), Utc::now())
-    });
-    match result {
-        Ok(rec) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "room": rec.room })),
-        ),
-        Err(e) => room_store_error_response(e),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct RoomMessageRequest {
-    /// Author participant id (or a synthetic id like `"system"`).
-    author_id: String,
-    /// Author kind for attribution. Defaults to `human`.
-    #[serde(default = "default_participant_kind")]
-    author_kind: RoomParticipantKind,
-    /// Message body. `@id` mentions in the body drive trigger evaluation.
-    body: String,
-}
-
-/// `POST /v1/rooms/persistent/{key}/messages` — append a chat message to the
-/// transcript, then evaluate the room's trigger policy against any @-mentions in
-/// the body. On a positive decision that resolves to an agent participant, emit a
-/// `room_trigger` notice onto the agent event bus AND queue a real agent turn for
-/// that agent (it reads the room context and posts its reply back into the
-/// transcript). See `spawn_room_agent_turn` for the turn path (OCEAN-111/225).
-async fn room_post_message(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Json(req): Json<RoomMessageRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(key.trim());
-    // Append the message, then read back the policy AND the participant roster
-    // in the same lock acquisition — we need the roster to resolve a mentioned
-    // id to a runnable agent participant. The std mutex guard is dropped when
-    // `with_rooms` returns; it is never held across an `.await`.
-    let append = with_rooms(&state, |reg| {
-        let msg = reg.append_message(
-            &key,
-            &req.author_id,
-            req.author_kind,
-            RoomMessageKind::Message,
-            &req.body,
-            Utc::now(),
-        )?;
-        let policy = reg.trigger_policy(&key)?;
-        let roster = reg
-            .get(&key)?
-            .map(|rec| rec.room.participants)
-            .unwrap_or_default();
-        Ok::<_, ocean_store::RoomStoreError>((msg, policy, roster))
-    });
-
-    let (msg, policy, roster) = match append {
-        Ok((msg, policy, roster)) => (msg, policy, roster),
-        Err(e) => return room_store_error_response(e),
-    };
-
-    // ---- Auto-convene wiring point (OCEAN-65 / OCEAN-111) -------------------
-    //
-    // Parse @-mentions from the message body, evaluate each against the room's
-    // trigger policy, and for every positive decision that resolves to an AGENT
-    // participant in the roster: (a) emit the `room_trigger` notice + an audit
-    // line (the observable contract, unchanged), and (b) ACTUALLY queue an
-    // agent turn that wakes the agent, gives it the room context, and posts its
-    // reply back into the transcript.
-    //
-    // Anti-loop guardrail #1 (the cheap, total one): an agent's OWN posted
-    // reply is authored as `RoomParticipantKind::Agent`, and we never evaluate
-    // triggers on agent-authored messages. So an agent that @-mentions another
-    // agent (or itself) in its reply can never ping-pong the room. Only
-    // human/bot/system-authored lines can convene an agent.
-    let mut fired = Vec::new();
-    if !matches!(req.author_kind, RoomParticipantKind::Agent) {
-        for participant_id in parse_mentions(&req.body) {
-            let decision = evaluate_trigger_policy(
-                policy.as_ref(),
-                &RoomTriggerEvent::Mention {
-                    participant_id: participant_id.clone(),
-                },
-            );
-            if !decision.should_convene {
-                continue;
-            }
-
-            // Resolve the target participant id → an AGENT participant in the
-            // roster BEFORE writing any convene footprint. Only genuine `Agent`
-            // participants are runnable; a mention of a human/bot/tool id (or an
-            // unknown id) resolves to `None`. The policy may say "convene", but
-            // if there's no agent to wake then no convene actually happens — so
-            // neither the `room_trigger` event nor the `auto-convene:` transcript
-            // line may fire (OCEAN-128: writing the audit line for a non-agent
-            // mention claimed a convene that never occurred).
-            let resolved_agent = decision
-                .target_participant
-                .as_deref()
-                .and_then(|id| resolve_agent_participant(&roster, id));
-
-            // `triggers_fired` reflects raw policy evaluation; record it even
-            // when the mention is a non-agent so the response is honest about
-            // what the policy matched. The convene FOOTPRINT (event + audit line
-            // + queued turn) below is gated on an actually-resolved agent.
-            fired.push(decision.clone());
-
-            let Some(agent) = resolved_agent else {
-                continue;
-            };
-
-            // Emit a notice onto the agent event bus so any subscriber sees the
-            // convene. Uses the generic Extension event so it respects the
-            // existing agent-event scoping rules.
-            state.agent_events.emit(AgentTurnEvent::Extension {
-                extension: "room_trigger".into(),
-                payload: json!({
-                    "room": key.as_str(),
-                    "target": decision.target_participant,
-                    "reason": decision.reason,
-                    "triggered_by_seq": msg.seq,
-                }),
-                // Room-wide, not session-scoped: reaches `?all=1` subscribers
-                // only, exactly like longhouse council events (Invariant 5
-                // exception). Keeps this out of any single session's stream.
-                scope: None,
-            });
-
-            // Audit line inside the room — only written now that an Agent has
-            // actually been resolved and is about to be convened.
-            let _ = with_rooms(&state, |reg| {
-                reg.append_message(
-                    &key,
-                    "system",
-                    RoomParticipantKind::System,
-                    RoomMessageKind::System,
-                    &format!(
-                        "auto-convene: {} ({})",
-                        decision.target_participant.clone().unwrap_or_default(),
-                        decision.reason
-                    ),
-                    Utc::now(),
-                )
-            });
-
-            spawn_room_agent_turn(state.clone(), key.clone(), agent, msg.seq);
-        }
-    }
-
-    (
-        StatusCode::CREATED,
-        Json(json!({ "ok": true, "message": msg, "triggers_fired": fired })),
-    )
-}
-
-/// Extract `@id` mentions from a message body. A mention is `@` followed by a
-/// run of id-safe characters (alphanumerics, `-`, `_`). Returns ids without the
-/// leading `@`, de-duplicated in first-seen order.
-fn parse_mentions(body: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'@' {
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() {
-                let c = bytes[j];
-                if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            if j > start {
-                let id = body[start..j].to_string();
-                if !out.contains(&id) {
-                    out.push(id);
-                }
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-// ---- Auto-convene: participant→session resolution + turn queueing (OCEAN-111)
-
-/// Fixed namespace for deriving a stable per-(room, agent) session id with UUID
-/// v5. Same room + same agent participant ⇒ same session every time, so the
-/// agent RESUMES its room transcript across mentions instead of forking a fresh
-/// session on every wake. The constant itself is arbitrary but must never
-/// change, or existing room-agent sessions would orphan.
-const ROOM_AGENT_SESSION_NS: Uuid = Uuid::from_u128(0x0ce1_a111_0000_4780_8000_526f_6f6d_4147);
-
-/// How many recent transcript lines to feed the woken agent as context. Enough
-/// to ground the reply in the conversation without bloating the prompt.
-const ROOM_CONTEXT_TAIL: usize = 20;
-
-/// Resolve a mentioned participant id to a runnable AGENT participant. Returns
-/// the participant only when it exists in the roster AND is of kind `Agent` —
-/// a mention of a human/bot/tool/system id (or an unknown id) resolves to
-/// `None`, so the notice still fires but no turn is queued.
-fn resolve_agent_participant(
-    roster: &[RoomParticipant],
-    participant_id: &str,
-) -> Option<RoomParticipant> {
-    roster
-        .iter()
-        .find(|p| p.id == participant_id && matches!(p.kind, RoomParticipantKind::Agent))
-        .cloned()
-}
-
-/// Deterministic session id for a (room, agent-participant) pair. Stable across
-/// daemon restarts and repeated mentions so the agent keeps one durable
-/// transcript per room.
-fn room_agent_session_id(room: &RoomKey, participant_id: &str) -> AgentSessionId {
-    let seed = format!("{}:{}", room.as_str(), participant_id);
-    sdk_sid(Uuid::new_v5(&ROOM_AGENT_SESSION_NS, seed.as_bytes()))
-}
-
-/// Build the prompt handed to a woken agent: a framing header that tells it it's
-/// answering a mention in a room, the recent transcript as context, and a
-/// pointer at the triggering line. `tail` is oldest→newest.
-fn build_room_prompt(
-    room: &RoomKey,
-    agent: &RoomParticipant,
-    tail: &[ocean_core::RoomMessage],
-    triggered_by_seq: u64,
-) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "You are \"{}\" (participant id `{}`), an agent in the Ocean room \"{}\". \
-You were just @-mentioned. Read the recent transcript below and reply directly \
-to the mention. Your reply will be posted back into the room for everyone to \
-see, so address the room — do not narrate that you are an agent or that you \
-were mentioned.\n\n",
-        agent.display_name,
-        agent.id,
-        room.as_str(),
-    ));
-    out.push_str("--- recent room transcript ---\n");
-    for m in tail {
-        let marker = if m.seq == triggered_by_seq {
-            "  «— mention"
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "[#{seq}] {author}: {body}{marker}\n",
-            seq = m.seq,
-            author = m.author_id,
-            body = m.body,
-            marker = marker,
-        ));
-    }
-    out.push_str("--- end transcript ---\n\nYour reply:");
-    out
-}
-
-/// Queue an agent turn in response to a room mention, run it asynchronously, and
-/// post the reply back into the room. The room store mutex is NEVER held across
-/// the await: every store touch goes through `with_rooms`, whose std guard is
-/// dropped synchronously before `runtime.prompt(...).await`.
-///
-/// Anti-loop guardrail #2: the reply is posted with `author_kind = Agent`, and
-/// `room_post_message` refuses to evaluate triggers on agent-authored messages,
-/// so a reply can never re-convene anyone.
-fn spawn_room_agent_turn(
-    state: AppState,
-    room: RoomKey,
-    agent: RoomParticipant,
-    triggered_by_seq: u64,
-) {
-    tokio::spawn(async move {
-        // Resolve a working directory for the turn. A `Room` may now carry its own
-        // `workspace_root` (OCEAN-260): if it does, that binding is the project the
-        // room belongs to, so the turn runs in that dir and resolves its owning
-        // project from it via the reverse map (`project_for_workspace`, OCEAN-228).
-        // If the room has no binding (None — the legacy default, and every room
-        // created before OCEAN-260), we fall back to the daemon's launch dir and
-        // key the session by room+agent, exactly as before. (Sessions that land in
-        // a project's workspace are still associated back to that project on read,
-        // via `find_by_workspace` in `enrich_session_detail`.)
-        let room_workspace = with_rooms(&state, |reg| {
-            reg.get(&room)
-                .ok()
-                .flatten()
-                .and_then(|rec| rec.room.workspace_root)
-        });
-
-        let (cwd, project_id) = match room_workspace {
-            Some(ws) => {
-                // Bound room: cwd is the room's workspace. Resolve the owning
-                // project (best-effort) so the turn is project-scoped; a lookup
-                // error or "no project at this root" degrades to no project_id
-                // rather than failing the convene.
-                let project_id = state
-                    .runtime
-                    .project_for_workspace(&ws)
-                    .ok()
-                    .flatten()
-                    .map(|p| p.id);
-                (ws, project_id)
-            }
-            None => {
-                // Unbound room (legacy): the daemon's launch dir, no project.
-                let cwd = std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| ".".to_string());
-                (cwd, None)
-            }
-        };
-
-        let session_id = room_agent_session_id(&room, &agent.id);
-
-        // Read the recent transcript tail (read-before-answer context). Lock is
-        // dropped when `with_rooms` returns, before any await below.
-        let tail = with_rooms(&state, |reg| reg.transcript(&room, None)).unwrap_or_default();
-        let tail: Vec<_> = tail
-            .into_iter()
-            .rev()
-            .take(ROOM_CONTEXT_TAIL)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        let prompt = build_room_prompt(&room, &agent, &tail, triggered_by_seq);
-
-        // Does this session already exist on disk? If so we RESUME it (strict);
-        // otherwise we create it under the deterministic id. This mirrors the
-        // create-if-missing logic in `agent_turn`. `session_detail` errors on a
-        // missing/corrupt session, so `Ok` ⇒ exists ⇒ resume.
-        let is_new = state.runtime.session_detail(core_sid(session_id)).is_err();
-
-        let request_id = Uuid::new_v4();
-        // Auto-convene has no per-request flag, so the effective posture is the
-        // operator's resolved global permission mode.
-        let permission_mode = effective_permission_mode();
-        let yolo = permission_mode == PermissionMode::SkipAll;
-        let mut prompt_req = PromptRequest {
-            prompt,
-            images: None,
-            request_id: Some(request_id),
-            session_id: Some(core_sid(session_id)),
-            create_if_missing: is_new,
-            max_turns: None,
-            yolo,
-            cwd,
-            // The room's workspace binding resolves to its owning project
-            // (OCEAN-260); `None` for unbound rooms preserves the legacy posture.
-            project_id,
-            client_type: Some("room".to_string()),
-            // Daemon-internal auto-convene: no external submitter, so no
-            // decision_token. Permission gating here defers to OCEAN_YOLO.
-            decision_token: None,
-        };
-
-        let (_request_id, cancel) = register_running_request(
-            &state.requests,
-            &mut prompt_req,
-            format!("auto-convene: {} in room {}", agent.id, room.as_str()),
-            RequestState::Running,
-        )
-        .await;
-
-        let control = build_prompt_control(
-            &state,
-            request_id,
-            Some(core_sid(session_id)),
-            permission_mode,
-            cancel,
-            None,
-        );
-
-        let res = state.runtime.prompt(prompt_req, control).await;
-        record_prompt_result(&state, request_id, &res, None).await;
-
-        // Post the agent's reply back into the room as the agent participant.
-        // The lock is taken synchronously here, after the await completed.
-        if res.ok {
-            let body = res.stdout.trim();
-            if !body.is_empty() {
-                let _ = with_rooms(&state, |reg| {
-                    reg.append_message(
-                        &room,
-                        &agent.id,
-                        RoomParticipantKind::Agent,
-                        RoomMessageKind::Message,
-                        body,
-                        Utc::now(),
-                    )
-                });
-            }
-        } else {
-            // Surface a failed convene as a system audit line so the room shows
-            // the agent was woken but could not answer (e.g. no provider key).
-            let _ = with_rooms(&state, |reg| {
-                reg.append_message(
-                    &room,
-                    "system",
-                    RoomParticipantKind::System,
-                    RoomMessageKind::System,
-                    &format!(
-                        "auto-convene failed for {}: {}",
-                        agent.id,
-                        res.stderr.lines().next().unwrap_or("turn failed")
-                    ),
-                    Utc::now(),
-                )
-            });
-        }
-    });
-}
-
-#[derive(serde::Deserialize)]
-struct TranscriptQuery {
-    /// If set, return only entries with `seq > after_seq` (live-tail).
-    #[serde(default)]
-    after_seq: Option<u64>,
-    /// Max rows to return in this page (OCEAN-249). Omitted ⇒ the store's default
-    /// cap; any value is clamped to `MAX_TRANSCRIPT_LIMIT`. Transcript reads are
-    /// never unbounded — page with the returned `next_seq` cursor.
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// Read one bounded transcript page for a room, transparently falling back to the
-/// soft-closed audit view (OCEAN-249 + OCEAN-170).
-///
-/// The open path defers to `transcript_page` (the `LIMIT`ed query). For a closed
-/// room — a finished call's frozen transcript that must stay queryable — the audit
-/// getter still returns a (now `MAX_TRANSCRIPT_LIMIT`-bounded) record, so we apply
-/// the same `after_seq` filter and `limit + 1` sentinel paging in memory to hand
-/// back an identical `TranscriptPage` shape regardless of room state. `Ok(None)`
-/// from the audit view (room never existed) is mapped back to `UnknownRoom` so the
-/// handlers preserve their 404.
-fn read_transcript_page(
-    reg: &ocean_store::SqliteRoomStore,
-    key: &RoomKey,
-    after_seq: Option<u64>,
-    limit: Option<usize>,
-) -> Result<ocean_store::TranscriptPage, ocean_store::RoomStoreError> {
-    use ocean_store::RoomStore as _;
-    match reg.transcript_page(key, after_seq, limit) {
-        // Open room (the live case): the store already paged it.
-        Ok(page) => Ok(page),
-        // Closed room: page the frozen audit transcript in-handler with the same
-        // contract the store would apply.
-        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
-            match reg.get_including_closed(key) {
-                Ok(Some(rec)) => {
-                    let effective_limit = ocean_store::clamp_transcript_limit(limit);
-                    let mut msgs: Vec<_> = rec
-                        .transcript
-                        .into_iter()
-                        .filter(|m| after_seq.is_none_or(|after| m.seq > after))
-                        .collect();
-                    let has_more = msgs.len() > effective_limit;
-                    if has_more {
-                        msgs.truncate(effective_limit);
-                    }
-                    let next_seq = if has_more {
-                        msgs.last().map(|m| m.seq)
-                    } else {
-                        None
-                    };
-                    Ok(ocean_store::TranscriptPage {
-                        messages: msgs,
-                        next_seq,
-                        has_more,
-                    })
-                }
-                // Genuinely no such room (never created): preserve the 404.
-                Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
-                Err(e) => Err(e),
-            }
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// `GET /v1/rooms/persistent/{key}/transcript?after_seq=N&limit=M` — read one
-/// bounded page of a room's transcript, optionally only entries after a given seq.
-///
-/// Bounded + paginated (OCEAN-249): the read is capped (default cap when `limit`
-/// is omitted, clamped to `MAX_TRANSCRIPT_LIMIT`), and the response carries
-/// additive `next_seq` (cursor to replay as `after_seq`) and `has_more` fields so
-/// a client can page through a long transcript instead of forcing a full-table
-/// read on every call. The `transcript` array shape is unchanged.
-///
-/// Falls back to the audit (soft-closed) view when the room is closed: a finished
-/// call closes its room on `CallEnded` (OCEAN-170), but its transcript must stay
-/// queryable afterwards — that frozen record is the whole reason it was persisted.
-async fn room_transcript(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Query(q): Query<TranscriptQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(key.trim());
-    let result = with_rooms(&state, |reg| {
-        read_transcript_page(reg, &key, q.after_seq, q.limit)
-    });
-    match result {
-        Ok(page) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "transcript": page.messages,
-                "next_seq": page.next_seq,
-                "has_more": page.has_more,
-            })),
-        ),
-        Err(e) => room_store_error_response(e),
-    }
-}
-
-/// `GET /v1/rooms/persistent/{key}/snapshot` — full room hydration in one read:
-/// the room entity (id, name, roster, timestamps, trigger policy), its complete
-/// transcript, and `last_seq` so the caller can immediately tail live updates via
-/// `GET /v1/rooms/persistent/{key}/events?after_seq=last_seq`.
-///
-/// This is the store-backed realization of the collaboration model's "Room
-/// hydration / snapshot" step (OCEAN-232): switching into a room must load full
-/// state, not just subscribe to future events. Persistent rooms carry everything
-/// hydration needs, so this endpoint serves the durable snapshot directly.
-///
-/// Like `room_get`/`room_transcript`, falls back to the soft-closed audit view so
-/// a finished call's frozen room (closed on `CallEnded`, OCEAN-170) stays
-/// hydratable for replay.
-async fn room_snapshot(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Query(q): Query<TranscriptQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let trimmed = key.trim();
-    if trimmed.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
-        );
-    }
-    let key = RoomKey::new(trimmed);
-    // Hydrate room metadata (entity + roster) and the FIRST bounded transcript page
-    // under one lock. The transcript is no longer the room's entire log poured into
-    // one response (OCEAN-249): a long-lived call room would make every hydration a
-    // full-table read. We serve `limit` rows + a `next_seq` cursor so the client
-    // immediately knows whether to page (`/transcript?after_seq=next_seq`) or tail
-    // (`/events?after_seq=last_seq`). Both reads prefer the live room and fall back
-    // to the soft-closed audit view (OCEAN-170). The std mutex guard is dropped
-    // inside `with_rooms`; it is never held across an `.await`.
-    let result = with_rooms(&state, |reg| {
-        // Room metadata: live first, then audit for a soft-closed room.
-        let record = match reg.get(&key) {
-            Ok(Some(rec)) => Ok(Some(rec)),
-            Ok(None) => reg.get_including_closed(&key),
-            Err(e) => Err(e),
-        }?;
-        let Some(record) = record else {
-            return Ok(None);
-        };
-        // First bounded page of the transcript (from the start of the log).
-        let page = read_transcript_page(reg, &key, q.after_seq, q.limit)?;
-        Ok(Some((record, page)))
-    });
-    match result {
-        Ok(Some((rec, page))) => {
-            let last_seq = page.messages.last().map(|m| m.seq);
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "room": rec.room.clone(),
-                    "participants": rec.room.participants,
-                    "transcript": page.messages,
-                    "last_seq": last_seq,
-                    "next_seq": page.next_seq,
-                    "has_more": page.has_more,
-                })),
-            )
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "ok": false, "error": format!("no room with key '{key}'") })),
-        ),
-        Err(e) => room_store_error_response(e),
-    }
-}
-
-/// `GET /v1/rooms/persistent/{key}/events?after_seq=N&limit=M` — the live-tail
-/// half of the hydrate-then-subscribe pattern: return transcript entries with
-/// `seq > N` (omit `after_seq` for the start of the log). The transcript IS the
-/// room's event log — chat lines plus join/leave/system markers, each carrying a
-/// monotonic `seq` — so this is a thin alias over the same read `room_transcript`
-/// serves, shaped as `events` for the client that just snapshotted at `last_seq`
-/// and wants only what happened since.
-///
-/// Bounded + paginated (OCEAN-249): a busy room's event log no longer streams
-/// unbounded on each poll. `last_seq` (the last seq in this batch, for the
-/// existing tail-resume contract) is retained; `next_seq`/`has_more` are added so
-/// a client can drain a large backlog page-by-page before catching up to live.
-///
-/// Mirrors `room_transcript`'s soft-closed audit fallback so a finished call's
-/// frozen room keeps replaying.
-async fn room_events(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Query(q): Query<TranscriptQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let key = RoomKey::new(key.trim());
-    let result = with_rooms(&state, |reg| {
-        read_transcript_page(reg, &key, q.after_seq, q.limit)
-    });
-    match result {
-        Ok(page) => {
-            let last_seq = page.messages.last().map(|m| m.seq);
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "events": page.messages,
-                    "last_seq": last_seq,
-                    "next_seq": page.next_seq,
-                    "has_more": page.has_more,
-                })),
-            )
-        }
-        Err(e) => room_store_error_response(e),
-    }
 }
 
 async fn session(
@@ -12027,23 +11182,457 @@ mod tests {
         assert!(parse_mentions("email me @ work").is_empty());
     }
 
+    /// The runtime assertions prove the emitted payload and final transcript;
+    /// this source-order characterization closes the otherwise-unobservable
+    /// synchronous seam between `AgentEventBus::emit`, the audit append, and the
+    /// non-awaited spawn. It is intentionally updated to read the owning private
+    /// module when the production body moves mechanically.
     #[test]
-    fn room_store_error_maps_to_expected_status() {
+    fn room_post_message_source_preserves_persist_event_audit_spawn_order() {
+        let source = include_str!("persistent_rooms.rs");
+        let start = source
+            .find("async fn room_post_message(")
+            .expect("room_post_message production body must exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n}\n\n/// Extract `@id` mentions")
+            .expect("room_post_message body terminator must remain identifiable");
+        let body = &tail[..end];
+
+        let persisted_author = body
+            .find("\n    let append = with_rooms(&state")
+            .expect("author append must stay in the handler");
+        let emitted_event = body
+            .find("\n            state.agent_events.emit(")
+            .expect("room_trigger event emission must stay in the handler");
+        let appended_audit = body
+            .find("\n            let _ = with_rooms(&state")
+            .expect("auto-convene audit append must stay in the handler");
+        let spawned_turn = body
+            .find("\n            spawn_room_agent_turn(state.clone()")
+            .expect("room-agent turn spawn must stay in the handler");
+
+        assert!(
+            persisted_author < emitted_event
+                && emitted_event < appended_audit
+                && appended_audit < spawned_turn,
+            "required order is persisted author row → emitted event → audit row → spawn"
+        );
+    }
+
+    #[test]
+    fn room_store_error_maps_to_exact_status_and_envelope() {
         use ocean_store::RoomStoreError;
-        let (s, _) = room_store_error_response(RoomStoreError::BadKey("".into()));
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-        let (s, _) = room_store_error_response(RoomStoreError::UnknownRoom(RoomKey::new("x")));
-        assert_eq!(s, StatusCode::NOT_FOUND);
-        let (s, _) = room_store_error_response(RoomStoreError::AlreadyExists(RoomKey::new("x")));
-        assert_eq!(s, StatusCode::CONFLICT);
-        let (s, _) = room_store_error_response(RoomStoreError::UnknownParticipant {
-            room: RoomKey::new("x"),
-            participant: "p".into(),
+
+        let cases = [
+            (
+                RoomStoreError::BadKey("".into()),
+                StatusCode::BAD_REQUEST,
+                "invalid room key ''; must be non-empty".to_string(),
+            ),
+            (
+                RoomStoreError::UnknownRoom(RoomKey::new("x")),
+                StatusCode::NOT_FOUND,
+                "no room with key 'x'".to_string(),
+            ),
+            (
+                RoomStoreError::AlreadyExists(RoomKey::new("x")),
+                StatusCode::CONFLICT,
+                "room 'x' already exists".to_string(),
+            ),
+            (
+                RoomStoreError::UnknownParticipant {
+                    room: RoomKey::new("x"),
+                    participant: "p".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "room 'x' has no participant 'p'".to_string(),
+            ),
+            (
+                RoomStoreError::Db(rusqlite::Error::QueryReturnedNoRows),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sqlite error: Query returned no rows".to_string(),
+            ),
+            (
+                RoomStoreError::Encode("boom".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encode error: boom".to_string(),
+            ),
+        ];
+
+        for (err, expected_status, expected_error) in cases {
+            let (status, Json(body)) = room_store_error_response(err);
+            assert_eq!(status, expected_status);
+            assert_eq!(
+                body,
+                json!({ "ok": false, "error": expected_error }),
+                "the mapper owns an exact two-key typed error envelope"
+            );
+        }
+    }
+
+    /// Send one request through the exact persistent-room router mounted by
+    /// `main()`, retaining the raw body so Axum extractor rejection text is part
+    /// of the adapter contract rather than being bypassed by direct handler calls.
+    async fn persistent_room_http_request(
+        app: Router,
+        method: axum::http::Method,
+        uri: &str,
+        body: Option<String>,
+        json_content_type: bool,
+    ) -> (StatusCode, Option<String>, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt as _;
+
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if json_content_type {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        let request = builder
+            .body(axum::body::Body::from(body.unwrap_or_default()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            content_type,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
+    }
+
+    fn persistent_room_http_json(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).unwrap_or_else(|error| {
+            panic!("persistent-room response was not JSON ({error}): {raw:?}")
+        })
+    }
+
+    fn assert_json_object_keys(value: &serde_json::Value, expected: &[&str]) {
+        let mut actual: Vec<&str> = value
+            .as_object()
+            .expect("JSON value must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    /// Characterize the ordinary persistent-room HTTP lifecycle through Axum:
+    /// exact envelopes/statuses, key/workspace normalization, serde actor-kind
+    /// defaults, transcript exclusion from list, and dense join→message→leave
+    /// ordering all survive the later mechanical module move.
+    #[tokio::test]
+    async fn persistent_room_http_lifecycle_preserves_envelopes_and_ordering() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let app = room_routes().with_state(fake_convene_state(&tmp));
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(
+                json!({
+                    "key": "  lifecycle-room  ",
+                    "name": "  Verbatim Room Name  ",
+                    "workspace_root": "   "
+                })
+                .to_string(),
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        let create = persistent_room_http_json(&raw);
+        assert_json_object_keys(&create, &["ok", "room"]);
+        assert_eq!(create["ok"], true);
+        assert_eq!(create["room"]["id"], "lifecycle-room");
+        assert_eq!(create["room"]["name"], "  Verbatim Room Name  ");
+        assert_eq!(create["room"]["participants"], json!([]));
+        assert!(create["room"].get("workspace_root").is_none());
+        assert!(create["room"].get("trigger_policy").is_none());
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list = persistent_room_http_json(&raw);
+        assert_json_object_keys(&list, &["ok", "rooms", "next_cursor", "has_more"]);
+        assert_eq!(list["ok"], true);
+        assert_eq!(list["rooms"].as_array().unwrap().len(), 1);
+        assert_eq!(list["rooms"][0]["id"], "lifecycle-room");
+        assert_eq!(list["rooms"][0]["name"], "  Verbatim Room Name  ");
+        assert!(list["rooms"][0].get("workspace_root").is_none());
+        assert!(list["rooms"][0].get("trigger_policy").is_none());
+        assert!(list["rooms"][0].get("transcript").is_none());
+        assert_eq!(list["next_cursor"], serde_json::Value::Null);
+        assert_eq!(list["has_more"], false);
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/lifecycle-room",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let detail = persistent_room_http_json(&raw);
+        assert_json_object_keys(&detail, &["ok", "room", "transcript"]);
+        assert_eq!(detail["ok"], true);
+        assert_eq!(detail["room"]["id"], "lifecycle-room");
+        assert_eq!(detail["room"]["name"], "  Verbatim Room Name  ");
+        assert!(detail["room"].get("workspace_root").is_none());
+        assert!(detail["room"].get("trigger_policy").is_none());
+        assert_eq!(detail["transcript"], json!([]));
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/lifecycle-room/participants",
+            Some(json!({ "id": "alice", "display_name": "Alice" }).to_string()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let join = persistent_room_http_json(&raw);
+        assert_json_object_keys(&join, &["ok", "room"]);
+        assert_eq!(join["ok"], true);
+        assert_eq!(join["room"]["id"], "lifecycle-room");
+        assert_eq!(join["room"]["participants"][0]["id"], "alice");
+        assert_eq!(join["room"]["participants"][0]["kind"], "human");
+        assert_eq!(join["room"]["participants"][0]["display_name"], "Alice");
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/lifecycle-room/messages",
+            Some(json!({ "author_id": "alice", "body": "hello room" }).to_string()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let posted = persistent_room_http_json(&raw);
+        assert_json_object_keys(&posted, &["ok", "message", "triggers_fired"]);
+        assert_eq!(posted["ok"], true);
+        assert_eq!(posted["message"]["seq"], 1);
+        assert_eq!(posted["message"]["author_id"], "alice");
+        assert_eq!(posted["message"]["author_kind"], "human");
+        assert_eq!(posted["message"]["kind"], "message");
+        assert_eq!(posted["message"]["body"], "hello room");
+        assert_eq!(posted["triggers_fired"], json!([]));
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::DELETE,
+            "/v1/rooms/persistent/lifecycle-room/participants/alice",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let leave = persistent_room_http_json(&raw);
+        assert_json_object_keys(&leave, &["ok", "room"]);
+        assert_eq!(leave["ok"], true);
+        assert_eq!(leave["room"]["id"], "lifecycle-room");
+        assert_eq!(leave["room"]["participants"], json!([]));
+
+        let (_, _, raw) = persistent_room_http_request(
+            app,
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/lifecycle-room",
+            None,
+            false,
+        )
+        .await;
+        let detail = persistent_room_http_json(&raw);
+        let transcript = detail["transcript"].as_array().unwrap();
+        assert_eq!(transcript.len(), 3);
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|row| row["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(transcript[0]["kind"], "participant_joined");
+        assert_eq!(transcript[1]["kind"], "message");
+        assert_eq!(transcript[1]["body"], "hello room");
+        assert_eq!(transcript[2]["kind"], "participant_left");
+    }
+
+    /// Characterize custom room errors independently from Axum's path/JSON/query
+    /// extractor rejections. The latter are raw text responses and must not be
+    /// accidentally wrapped or normalized during extraction.
+    #[tokio::test]
+    async fn persistent_room_http_errors_preserve_custom_and_axum_shapes() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let app = room_routes().with_state(fake_convene_state(&tmp));
+
+        let create = |key: &str| json!({ "key": key, "name": "Error Room" }).to_string();
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(create("   ")),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "invalid room key ''; must be non-empty" })
+        );
+
+        let (status, _, _) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(create("duplicate")),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some(create("duplicate")),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "room 'duplicate' already exists" })
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/missing",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "no room with key 'missing'" })
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::DELETE,
+            "/v1/rooms/persistent/duplicate/participants/missing",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "room 'duplicate' has no participant 'missing'" })
+        );
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent",
+            Some("{\"key\":".to_string()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+        assert_eq!(
+            raw,
+            "Failed to parse the request body as JSON: key: EOF while parsing a value at line 1 column 7"
+        );
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent?limit=not-a-number",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+        assert_eq!(
+            raw,
+            "Failed to deserialize query string: limit: invalid digit found in string"
+        );
+
+        let (status, content_type, raw) = persistent_room_http_request(
+            app,
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/%20",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "invalid room key; must be non-empty" })
+        );
+    }
+
+    /// Both room-lock adapters deliberately recover `PoisonError` rather than
+    /// making a prior panic permanently disable HTTP, call persistence, and
+    /// LiveKit authorization. One poisoned handle must remain usable through
+    /// both entry points.
+    #[tokio::test]
+    async fn room_store_helpers_recover_one_poisoned_handle() {
+        use ocean_store::RoomStore as _;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let rooms = state.rooms.clone();
+        let poison_target = rooms.clone();
+        let panicked = std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("intentional room-store poison");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(rooms.is_poisoned());
+
+        let key = RoomKey::new("poison-recovery");
+        with_rooms_handle(&rooms, |store| {
+            store
+                .create(key.clone(), "Recovered", None, Utc::now())
+                .unwrap();
         });
-        assert_eq!(s, StatusCode::NOT_FOUND);
-        // Durable-backend failures are 500s, not misleading 4xx.
-        let (s, _) = room_store_error_response(RoomStoreError::Encode("boom".into()));
-        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        let recovered = with_rooms(&state, |store| store.get(&key).unwrap());
+        assert_eq!(recovered.unwrap().room.name, "Recovered");
+        assert!(
+            rooms.is_poisoned(),
+            "recovery does not hide the prior panic"
+        );
     }
 
     /// OCEAN-107: rooms + transcripts must survive a daemon restart. Open the
@@ -14244,6 +13833,9 @@ mod tests {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        // Subscribe before the post: the room_trigger notice must be emitted
+        // synchronously between the persisted author row and audit append.
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         // Room with an agent participant `helper` and an on_mention policy.
         let key = RoomKey::new("convene-room");
@@ -14282,15 +13874,83 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        let returned_message = &body.0["message"];
+        assert_eq!(returned_message["seq"], 1);
+        assert_eq!(returned_message["author_id"], "john");
+        assert_eq!(returned_message["author_kind"], "human");
+        assert_eq!(
+            returned_message["body"],
+            "@helper can you summarize the plan?"
+        );
         let fired = body
             .0
             .get("triggers_fired")
             .and_then(|v| v.as_array())
             .unwrap();
         assert_eq!(
-            fired.len(),
-            1,
+            fired,
+            &[json!({
+                "should_convene": true,
+                "target_participant": "helper",
+                "reason": "on_mention: @helper mentioned",
+            })],
             "mention of an agent must fire exactly one trigger"
+        );
+
+        let envelope = trigger_rx
+            .try_recv()
+            .expect("resolved Agent mention must emit room_trigger");
+        match envelope.event {
+            AgentTurnEvent::Extension {
+                extension,
+                payload,
+                scope,
+            } => {
+                assert_eq!(extension, "room_trigger");
+                assert_eq!(
+                    payload,
+                    json!({
+                        "room": "convene-room",
+                        "target": "helper",
+                        "reason": "on_mention: @helper mentioned",
+                        "triggered_by_seq": 1,
+                    })
+                );
+                assert_eq!(scope, None, "room triggers remain globally scoped");
+            }
+            other => panic!("expected room_trigger Extension event, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                trigger_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "one resolved mention emits exactly one trigger event"
+        );
+
+        // The event is followed synchronously by the audit append. The spawned
+        // turn may already have replied, but these first three persisted rows
+        // must stay densely ordered: join → author row → auto-convene audit.
+        let immediate = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert!(immediate.len() >= 3);
+        let returned: ocean_core::RoomMessage =
+            serde_json::from_value(returned_message.clone()).unwrap();
+        assert_eq!(
+            returned, immediate[1],
+            "the response message is the exact persisted author row"
+        );
+        assert_eq!(immediate[0].seq, 0);
+        assert_eq!(immediate[0].kind, RoomMessageKind::ParticipantJoined);
+        assert_eq!(immediate[1].seq, 1);
+        assert_eq!(immediate[1].author_id, "john");
+        assert_eq!(immediate[1].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[2].seq, 2);
+        assert_eq!(immediate[2].author_id, "system");
+        assert_eq!(immediate[2].author_kind, RoomParticipantKind::System);
+        assert_eq!(immediate[2].kind, RoomMessageKind::System);
+        assert_eq!(
+            immediate[2].body,
+            "auto-convene: helper (on_mention: @helper mentioned)"
         );
 
         // The convened turn runs async; its reply lands as an Agent-authored
@@ -14306,6 +13966,10 @@ mod tests {
             reply.body.contains("OCEAN_FAKE_OK"),
             "reply should carry the (fake) provider output, got: {:?}",
             reply.body
+        );
+        assert!(
+            reply.seq > 2,
+            "the spawned turn reply must follow the synchronous audit row"
         );
 
         // A session was queued/registered for the deterministic room+agent id.
@@ -14529,6 +14193,7 @@ mod tests {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         let key = RoomKey::new("no-loop-room");
         with_rooms(&state, |reg| {
@@ -14568,6 +14233,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["message"]["seq"], 1);
+        assert_eq!(body.0["message"]["author_id"], "helper");
+        assert_eq!(body.0["message"]["author_kind"], "agent");
         let fired = body
             .0
             .get("triggers_fired")
@@ -14576,6 +14244,23 @@ mod tests {
         assert!(
             fired.is_empty(),
             "an agent-authored message must never fire a trigger (anti-loop guard)"
+        );
+        assert!(
+            matches!(
+                trigger_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "agent-authored rows must emit no room_trigger event"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert_eq!(transcript.len(), 2, "join + agent row, with no audit row");
+        assert_eq!(transcript[1].seq, 1);
+        assert_eq!(transcript[1].body, "done — cc @helper @other");
+        assert!(
+            transcript
+                .iter()
+                .all(|row| !row.body.starts_with("auto-convene:")),
+            "agent-authored rows must write no auto-convene audit footprint"
         );
 
         // Give any errant spawned turn a moment; assert no turn was registered.
@@ -15443,6 +15128,7 @@ mod tests {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         // Room whose only non-author participant is a HUMAN, plus an on_mention
         // policy. Mentioning the human must convene nobody.
@@ -15470,7 +15156,7 @@ mod tests {
             .unwrap();
         });
 
-        let (status, _body) = room_post_message(
+        let (status, body) = room_post_message(
             State(state.clone()),
             Path("no-agent-room".to_string()),
             Json(RoomMessageRequest {
@@ -15481,6 +15167,34 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["message"]["seq"], 1);
+        assert_eq!(body.0["message"]["author_id"], "john");
+        assert_eq!(
+            body.0["triggers_fired"],
+            json!([{
+                "should_convene": true,
+                "target_participant": "dana",
+                "reason": "on_mention: @dana mentioned",
+            }]),
+            "raw policy matches stay observable even without a runnable Agent"
+        );
+        assert!(
+            matches!(
+                trigger_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "an unresolved/non-Agent policy match emits no room_trigger event"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert_eq!(transcript.len(), 2, "join + author row, with no audit row");
+        assert_eq!(transcript[1].seq, 1);
+        assert_eq!(transcript[1].body, "@dana what did you think?");
+        assert!(
+            transcript
+                .iter()
+                .all(|row| !row.body.starts_with("auto-convene:")),
+            "a non-Agent match writes no false convene audit footprint"
+        );
 
         // Give any errant spawned turn a moment, then assert nothing was queued.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -15784,6 +15498,192 @@ mod tests {
         assert!(all["next_seq"].is_null());
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// Soft close intentionally creates an HTTP asymmetry: ordinary list/detail
+    /// hide the room, while transcript/snapshot/events retain a bounded audit
+    /// view. Freeze the daemon fallback's `limit=0` floor and cursor semantics,
+    /// not `ocean-store`'s underlying SQL implementation.
+    #[tokio::test]
+    async fn closed_persistent_room_preserves_audit_http_asymmetry() {
+        use ocean_store::RoomStore as _;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("closed-audit");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "Closed Audit", None, Utc::now())
+                .unwrap();
+            store
+                .add_participant(
+                    &key,
+                    RoomParticipant {
+                        id: "alice".into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "Alice".into(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            for body in ["first", "second"] {
+                store
+                    .append_message(
+                        &key,
+                        "alice",
+                        RoomParticipantKind::Human,
+                        RoomMessageKind::Message,
+                        body,
+                        Utc::now(),
+                    )
+                    .unwrap();
+            }
+            store.close(&key).unwrap();
+        });
+        let app = room_routes().with_state(state);
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list = persistent_room_http_json(&raw);
+        assert_eq!(list["rooms"], json!([]));
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            persistent_room_http_json(&raw),
+            json!({ "ok": false, "error": "no room with key 'closed-audit'" })
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/transcript?limit=0",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let first_page = persistent_room_http_json(&raw);
+        assert_json_object_keys(&first_page, &["ok", "transcript", "next_seq", "has_more"]);
+        assert_eq!(first_page["transcript"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page["transcript"][0]["seq"], 0);
+        assert_eq!(first_page["transcript"][0]["kind"], "participant_joined");
+        assert_eq!(first_page["has_more"], true);
+        assert_eq!(first_page["next_seq"], 0);
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/transcript?after_seq=0&limit=100",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let remainder = persistent_room_http_json(&raw);
+        assert_eq!(
+            remainder["transcript"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(remainder["transcript"][0]["body"], "first");
+        assert_eq!(remainder["transcript"][1]["body"], "second");
+        assert_eq!(remainder["has_more"], false);
+        assert!(remainder["next_seq"].is_null());
+        let mut paged = first_page["transcript"].as_array().unwrap().clone();
+        paged.extend(remainder["transcript"].as_array().unwrap().iter().cloned());
+        assert_eq!(
+            paged
+                .iter()
+                .map(|row| row["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "closed fallback paging replays every row once in ascending order"
+        );
+
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/snapshot?limit=100",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let snapshot = persistent_room_http_json(&raw);
+        assert_json_object_keys(
+            &snapshot,
+            &[
+                "ok",
+                "room",
+                "participants",
+                "transcript",
+                "last_seq",
+                "next_seq",
+                "has_more",
+            ],
+        );
+        assert_eq!(snapshot["ok"], true);
+        assert_eq!(snapshot["room"]["id"], "closed-audit");
+        assert_eq!(snapshot["room"]["name"], "Closed Audit");
+        let expected_participants = json!([{
+            "id": "alice",
+            "kind": "human",
+            "display_name": "Alice",
+        }]);
+        assert_eq!(snapshot["participants"], expected_participants);
+        assert_eq!(
+            snapshot["room"]["participants"], expected_participants,
+            "top-level and nested frozen rosters stay identical"
+        );
+        assert_eq!(
+            snapshot["transcript"],
+            serde_json::Value::Array(paged.clone())
+        );
+        assert_eq!(snapshot["last_seq"], 2);
+        assert_eq!(snapshot["has_more"], false);
+        assert!(snapshot["next_seq"].is_null());
+
+        let (status, _, raw) = persistent_room_http_request(
+            app,
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/closed-audit/events?limit=100",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events = persistent_room_http_json(&raw);
+        assert_json_object_keys(
+            &events,
+            &["ok", "events", "last_seq", "next_seq", "has_more"],
+        );
+        assert_eq!(events["ok"], true);
+        assert_eq!(events["events"], serde_json::Value::Array(paged));
+        assert_eq!(events["events"], snapshot["transcript"]);
+        assert_eq!(events["last_seq"], 2);
+        assert_eq!(events["has_more"], false);
+        assert!(events["next_seq"].is_null());
     }
 
     // ---- OCEAN-250: list endpoints are bounded + pageable ------------------
