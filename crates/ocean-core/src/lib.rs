@@ -1791,7 +1791,7 @@ mod tests {
         };
         let json = serde_json::to_value(&proj).unwrap();
         assert_eq!(json["state"], "local");
-        assert!(json.get("me_mbers").is_none(), "empty members omitted");
+        assert!(json.get("members").is_none(), "empty members omitted");
         assert!(json.get("outbox").is_none(), "empty outbox omitted");
         assert!(json.get("last_confirmed_global_sequence").is_none());
         let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
@@ -2023,5 +2023,150 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["code"], "abc123");
+    }
+
+    // ── required-field rejection — missing metadata/projection fields fail ─
+
+    #[test]
+    fn federated_message_meta_rejects_missing_global_sequence() {
+        let json = serde_json::json!({
+            "ledger_event_id": "evt_x",
+            "source_id": "room:warroom:member:m1:producer:p1",
+            "source_sequence": 3,
+            "client_event_id": "cli-1",
+            "origin_principal_id": "p",
+            "origin_member_id": "m"
+        });
+        let err = serde_json::from_value::<FederatedMessageMeta>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("global_sequence"),
+            "missing global_sequence must fail"
+        );
+    }
+
+    #[test]
+    fn federated_room_member_rejects_missing_display_name() {
+        let json = serde_json::json!({
+            "member_id": "mem-1",
+            "actor_type": "user",
+            "role_in_room": "owner",
+            "joined_at": "2026-07-16T18:00:00Z"
+        });
+        let err = serde_json::from_value::<FederatedRoomMemberProjection>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("display_name"),
+            "missing display_name must fail"
+        );
+    }
+
+    #[test]
+    fn room_outbox_item_rejects_missing_state() {
+        let json = serde_json::json!({
+            "client_event_id": "cli-1",
+            "source_id": "s",
+            "source_sequence": 1,
+            "author_member_id": "m",
+            "event_type": "message",
+            "payload": {}
+        });
+        let err = serde_json::from_value::<RoomOutboxItem>(json).unwrap_err();
+        assert!(err.to_string().contains("state"), "missing state must fail");
+    }
+
+    #[test]
+    fn public_agent_descriptor_rejects_missing_display_name() {
+        let json = serde_json::json!({
+            "skills_count": 3,
+            "subagent_names": []
+        });
+        let err = serde_json::from_value::<PublicAgentDescriptor>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("display_name"),
+            "missing display_name must fail"
+        );
+    }
+
+    // ── forbidden-key sanitization — bearer material NEVER survives roundtrip ─
+
+    #[test]
+    fn member_projection_strips_forbidden_owner_principal_token_id() {
+        let json = serde_json::json!({
+            "member_id": "mem-1",
+            "actor_type": "user",
+            "role_in_room": "owner",
+            "display_name": "Alice",
+            "joined_at": "2026-07-16T18:00:00Z",
+            "owner_principal_token_id": "sec-fk-999"
+        });
+        let proj: FederatedRoomMemberProjection = serde_json::from_value(json).unwrap();
+        // Forbidden key must not map to any field — roundtrip cleans it.
+        let out = serde_json::to_value(&proj).unwrap();
+        assert!(
+            out.get("owner_principal_token_id").is_none(),
+            "owner_principal_token_id MUST NOT survive serde roundtrip"
+        );
+    }
+
+    #[test]
+    fn public_agent_descriptor_strips_provider_config_keys() {
+        let json = serde_json::json!({
+            "display_name": "BadAgent",
+            "model_alias": "gpt",
+            "provider_api_key": "sk-1234",
+            "execution_role": "admin"
+        });
+        let pda: PublicAgentDescriptor = serde_json::from_value(json).unwrap();
+        let out = serde_json::to_value(&pda).unwrap();
+        assert!(
+            out.get("provider_api_key").is_none(),
+            "provider_api_key MUST NOT survive serde roundtrip"
+        );
+        assert!(
+            out.get("execution_role").is_none(),
+            "execution_role MUST NOT survive serde roundtrip"
+        );
+    }
+
+    #[test]
+    fn federated_message_meta_strips_unknown_bearer_keys() {
+        let json = serde_json::json!({
+            "ledger_event_id": "evt_x",
+            "global_sequence": 1,
+            "source_id": "room:r:m:m1:p:p1",
+            "source_sequence": 1,
+            "client_event_id": "cli-1",
+            "origin_principal_id": "p",
+            "origin_member_id": "m",
+            "owner_principal_token_id": "sec-fk-999"
+        });
+        let meta: FederatedMessageMeta = serde_json::from_value(json).unwrap();
+        let out = serde_json::to_value(&meta).unwrap();
+        assert!(
+            out.get("owner_principal_token_id").is_none(),
+            "owner_principal_token_id MUST NOT survive serde roundtrip on FederatedMessageMeta"
+        );
+    }
+
+    #[test]
+    fn room_access_projection_roundtrip_strips_forbidden_keys_in_nested_members() {
+        let json = serde_json::json!({
+            "state": "live",
+            "last_confirmed_global_sequence": 1,
+            "members": [{
+                "member_id": "mem-1",
+                "actor_type": "user",
+                "role_in_room": "owner",
+                "display_name": "Alice",
+                "joined_at": "2026-07-16T18:00:00Z",
+                "owner_principal_token_id": "sec-999"
+            }],
+            "outbox": []
+        });
+        let proj: RoomAccessProjection = serde_json::from_value(json).unwrap();
+        let out = serde_json::to_value(&proj).unwrap();
+        assert!(
+            out["members"][0].get("owner_principal_token_id").is_none(),
+            "owner_principal_token_id in nested member MUST NOT survive"
+        );
     }
 }

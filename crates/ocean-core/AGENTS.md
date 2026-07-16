@@ -31,12 +31,6 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 - `cargo test -p ocean-core`
 - `cargo check --workspace`
 
-## Child devlog Index
-
-No child boundaries defined within `ocean-core/` at this time.
-
----
-
 ## Gate-2 S2-P1 — Federation types (2026-07-16)
 
 This crate owns the v2.2 wire types added for the producer-contract freeze
@@ -60,3 +54,7 @@ types the daemon routes use.
 `ocean-store` and `ocean-daemon` own their implementation surfaces; this
 crate owns the type definitions + exhaustive serde round-trip/enum/backward
 compat tests (see `#[cfg(test)] mod tests`).
+
+## Child devlog Index
+
+No child boundaries defined within `ocean-core/` at this time.
