@@ -227,6 +227,17 @@ pub struct AgentRuntime {
     /// created on demand and kept for the process lifetime (one cheap Arc<Mutex>
     /// per session ever touched — negligible).
     session_locks: Arc<std::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Lifecycle hooks from `<config_dir>/ocean.toml` (`[[hooks.Stop]]`).
+    ///
+    /// This is the plugin-agnostic wake/engagement seam: at turn end the runtime
+    /// fires the configured `Stop` hook subprocesses (ocean-hooks contract —
+    /// `{cwd, session_id, stop_hook_active}` on stdin, optional
+    /// `{"decision":"block","reason":…}` on stdout) and a blocking decision
+    /// continues the turn with `reason` as the next user message. Ocean core
+    /// knows nothing about any specific consumer (stitchpad, notifiers, audit
+    /// loggers); those live entirely in operator config. Empty config → zero
+    /// cost, zero behavior change.
+    hooks: ocean_hooks::HooksConfig,
     /// Test-only override for the per-turn environment snapshot used by provider
     /// failover (OCEAN-275). Production always reads the real process env via
     /// [`AgentRuntime::turn_env`]; tests inject a deterministic [`ProviderEnv`]
@@ -247,11 +258,19 @@ impl AgentRuntime {
     pub fn from_env() -> anyhow::Result<Self> {
         let config_dir = config_dir_from_env();
         let state = build_state_from_env(&config_dir)?;
+        // Stop hooks are fail-open at load: a malformed ocean.toml already logs
+        // loudly in `build_capability_registry`; the runtime must still start
+        // (matching the MCP posture), so hooks degrade to none rather than
+        // taking the agent down.
+        let hooks = config::DaemonConfig::load(&config_dir)
+            .map(|cfg| cfg.hooks)
+            .unwrap_or_default();
         let runtime = Self {
             config_dir,
             state: Arc::new(RwLock::new(state)),
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            hooks,
             #[cfg(test)]
             test_env: None,
         };
@@ -788,11 +807,11 @@ impl AgentRuntime {
         let _turn_guard = lock.lock().await;
 
         let failed_provider = state.provider_config.selection.provider.clone();
-        match self
+        let (turn, effective_state) = match self
             .dispatch_turn(req.clone(), control.clone(), &state, false)
             .await
         {
-            Ok(ok) => Ok(ok),
+            Ok(ok) => (ok, state),
             Err(e) => {
                 if !failover_eligible(&e) {
                     // Mid-stream, user-error, or non-availability — final. Unwrap
@@ -834,11 +853,109 @@ impl AgentRuntime {
                 // final (success or failure) — no further fan-out.
                 // The primary already persisted the accepted user row. Reuse
                 // it rather than appending the same prompt a second time.
-                self.dispatch_turn(req, control, &alt_state, true)
+                let ok = self
+                    .dispatch_turn(req.clone(), control.clone(), &alt_state, true)
                     .await
-                    .map_err(unwrap_turn_failure)
+                    .map_err(unwrap_turn_failure)?;
+                (ok, alt_state)
+            }
+        };
+
+        // Stop hooks (the ocean-hooks seam): the turn completed and persisted;
+        // before releasing it, give configured `[[hooks.Stop]]` subprocesses a
+        // chance to block the stop and continue the session with new input —
+        // the generic "reply before you sleep" engagement gate external
+        // channels (stitchpad pads, review queues, notifiers) plug into
+        // without Ocean core knowing them. Still under the session lock, so
+        // continuation turns are part of this turn's transaction. No hooks
+        // configured → zero cost, identical behavior.
+        Ok(self
+            .run_stop_hook_continuations(turn, &req, &control, &effective_state)
+            .await)
+    }
+
+    /// Fire `Stop` hooks for a just-completed turn and run bounded continuation
+    /// turns while a hook blocks the stop.
+    ///
+    /// Contract (mirrors the de-facto local-agent Stop-hook protocol):
+    /// - each hook gets `{cwd, session_id, stop_hook_active}` on stdin;
+    /// - `{"decision":"block","reason":…}` continues the session with `reason`
+    ///   as the next user message; anything else stops normally;
+    /// - continuation turns fire the hooks again with `stop_hook_active: true`,
+    ///   so a well-behaved hook (e.g. stitchpad's) self-limits to one block;
+    /// - a hard iteration bound protects against a hook that always blocks;
+    /// - everything is fail-open: hook warnings and continuation failures are
+    ///   appended to stderr and never fail the already-completed turn.
+    async fn run_stop_hook_continuations(
+        &self,
+        turn: (SessionId, String, String, TokenUsage),
+        req: &PromptRequest,
+        control: &PromptControl,
+        state: &RuntimeState,
+    ) -> (SessionId, String, String, TokenUsage) {
+        use ocean_hooks::{HookEvent, HookOutcome};
+
+        /// Hard upper bound on hook-driven continuation turns per operator
+        /// prompt, independent of hook behavior — a misconfigured hook that
+        /// blocks unconditionally must not spin the session forever.
+        const MAX_STOP_HOOK_CONTINUATIONS: usize = 4;
+
+        if self.hooks.count_for(HookEvent::Stop) == 0 {
+            return turn;
+        }
+        let (session_id, mut stdout, mut stderr, mut usage) = turn;
+        let context = ocean_hooks::HookContext::new(req.cwd.clone(), session_id.to_string());
+        let mut stop_hook_active = false;
+        for _ in 0..=MAX_STOP_HOOK_CONTINUATIONS {
+            let result =
+                ocean_hooks::run_hooks(&self.hooks, HookEvent::Stop, &context, stop_hook_active)
+                    .await;
+            for warning in result.warnings {
+                tracing::warn!(%session_id, %warning, "stop hook warning");
+                stderr.push_str(&format!("stop-hook: {warning}\n"));
+            }
+            let reason = match result.outcome {
+                HookOutcome::Continue => break,
+                HookOutcome::Block { reason } if reason.trim().is_empty() => break,
+                HookOutcome::Block { reason } => reason,
+            };
+            tracing::info!(
+                %session_id,
+                reason_len = reason.len(),
+                "stop hook blocked turn release; continuing session with hook reason"
+            );
+            let mut follow = req.clone();
+            follow.prompt = reason;
+            follow.session_id = Some(session_id);
+            follow.create_if_missing = false;
+            // Continuations fire the hooks with `stop_hook_active: true`.
+            stop_hook_active = true;
+            match self
+                .dispatch_turn(follow, control.clone(), state, false)
+                .await
+            {
+                Ok((_, cont_stdout, cont_stderr, cont_usage)) => {
+                    if !stdout.is_empty() && !stdout.ends_with('\n') {
+                        stdout.push('\n');
+                    }
+                    stdout.push_str(&cont_stdout);
+                    stderr.push_str(&cont_stderr);
+                    usage.input += cont_usage.input;
+                    usage.output += cont_usage.output;
+                    usage.cache_read += cont_usage.cache_read;
+                    usage.cache_write += cont_usage.cache_write;
+                    usage.total_tokens += cont_usage.total_tokens;
+                }
+                Err(e) => {
+                    // Fail-open: the operator's turn already completed and
+                    // persisted; a failed continuation is reported, not fatal.
+                    tracing::warn!(%session_id, error = %e, "stop-hook continuation turn failed");
+                    stderr.push_str(&format!("stop-hook continuation failed: {e}\n"));
+                    break;
+                }
             }
         }
+        (session_id, stdout, stderr, usage)
     }
 
     /// Dispatch a single turn to the fake echo path or the real agent loop,
@@ -3803,6 +3920,7 @@ done
             state: std::sync::Arc::new(std::sync::RwLock::new(state)),
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            hooks: ocean_hooks::HooksConfig::default(),
             test_env,
         }
     }
@@ -4450,6 +4568,85 @@ done
 
     // OCEAN-275 end-to-end: a turn whose PRIMARY provider is degraded is routed
     // through `prompt()` to a ready alternate and SUCCEEDS, rather than failing.
+    /// Stop hooks (the ocean-hooks seam): a configured `[[hooks.Stop]]` command
+    /// that blocks the stop must continue the session with the hook's reason as
+    /// the next user message, and a hook honoring `stop_hook_active: true`
+    /// (blocking only the first firing) must yield exactly ONE continuation —
+    /// proving the flag is passed on re-entry and the loop terminates without
+    /// hitting the hard bound. Runs on the no-network fake provider.
+    #[tokio::test]
+    async fn stop_hook_block_runs_one_continuation_turn_then_stops() {
+        let config_dir = temp_config_dir("stop-hook-continuation");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // A hook that blocks the FIRST stop and honors stop_hook_active on the
+        // continuation's stop (the stitchpad-style self-limit).
+        let hook_path = config_dir.join("stop-hook-test.sh");
+        std::fs::write(
+            &hook_path,
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *'\"stop_hook_active\":true'*) exit 0 ;;\nesac\nprintf '{\"decision\":\"block\",\"reason\":\"hook continuation ping\"}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        runtime.hooks = ocean_hooks::HooksConfig {
+            stop: vec![ocean_hooks::HookCommand {
+                command: hook_path.display().to_string(),
+                args: vec![],
+                timeout_secs: 10,
+                enabled: true,
+            }],
+        };
+
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "hello".into(),
+                    images: None,
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                    decision_token: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+
+        assert!(res.ok, "turn should succeed, got stderr: {}", res.stderr);
+        // Exactly two fake echoes: the operator turn + ONE hook continuation.
+        assert_eq!(
+            res.stdout.matches("OCEAN_FAKE_OK").count(),
+            2,
+            "expected exactly one stop-hook continuation, stdout: {}",
+            res.stdout
+        );
+        // The continuation's user message is the hook's reason, persisted on the
+        // same session transcript.
+        let session_id = res.session_id.expect("session id");
+        let session = session::load_resumable(&config_dir, session_id)
+            .unwrap()
+            .expect("session persisted");
+        let transcript = serde_json::to_string(&session.messages).unwrap();
+        assert!(
+            transcript.contains("hook continuation ping"),
+            "hook reason must land on the transcript, got: {transcript}"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
     // The injected env makes `fake-ok` the configured fallback — it's ready with
     // no credential and runs the no-network fake path, so this exercises the full
     // selection-time failover wiring deterministically.

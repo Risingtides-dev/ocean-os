@@ -73,6 +73,47 @@ enum Command {
         #[arg(long)]
         bin: Option<PathBuf>,
     },
+    /// One-shot event-triggered wake: post a single turn to an Ocean session
+    /// and (by default) wait for it to finish.
+    ///
+    /// This is the generic push-wake primitive for external channels — pad
+    /// watchers (stitchpad), cron shims, notification bridges — anything that
+    /// needs "nudge that agent now" without linking against Ocean or knowing
+    /// daemon internals. Exit contract (adapter-friendly):
+    ///   0 = turn delivered and completed
+    ///   3 = deferred (daemon at capacity, or wait timed out) — retry later
+    ///   1 = failed (daemon unreachable, unknown session, turn failed)
+    Wake {
+        /// Session to wake. Wins over --session-file.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Durable session-id file (read when --session-id is absent; updated
+        /// after a successful post).
+        #[arg(long)]
+        session_file: Option<PathBuf>,
+        /// Prompt text for the wake turn. Use `-` to read stdin.
+        #[arg(long)]
+        prompt: String,
+        /// Working directory for the turn.
+        #[arg(long)]
+        cwd: PathBuf,
+        /// Client type reported to the daemon.
+        #[arg(long, default_value = "wake")]
+        client_type: String,
+        /// Optional project id for daemon project routing.
+        #[arg(long)]
+        project_id: Option<String>,
+        /// Seconds to wait for the turn to finish before deferring (exit 3).
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+        /// Ack-only: don't wait for TurnFinished on the event stream.
+        #[arg(long)]
+        no_wait: bool,
+        /// Allow minting a brand-new session when no session id resolves.
+        /// Default is to fail (a wake targets a specific existing agent).
+        #[arg(long)]
+        allow_new_session: bool,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -121,7 +162,252 @@ async fn main() -> Result<()> {
             every_seconds,
             bin,
         } => print_launchd(&cli.daemon_url, &config, label, every_seconds, bin),
+        Command::Wake {
+            session_id,
+            session_file,
+            prompt,
+            cwd,
+            client_type,
+            project_id,
+            timeout_seconds,
+            no_wait,
+            allow_new_session,
+        } => {
+            let code = wake_once(
+                &cli.daemon_url,
+                WakeArgs {
+                    session_id,
+                    session_file,
+                    prompt,
+                    cwd,
+                    client_type,
+                    project_id,
+                    timeout_seconds,
+                    no_wait,
+                    allow_new_session,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("wake failed: {e:#}");
+                WAKE_FAILED
+            });
+            std::process::exit(code);
+        }
     }
+}
+
+/// Adapter exit codes for `wake` (matches the common pad-watcher contract:
+/// 0 delivered · 3 deferred/retry-later · everything else failed).
+const WAKE_DELIVERED: i32 = 0;
+const WAKE_FAILED: i32 = 1;
+const WAKE_DEFERRED: i32 = 3;
+
+struct WakeArgs {
+    session_id: Option<String>,
+    session_file: Option<PathBuf>,
+    prompt: String,
+    cwd: PathBuf,
+    client_type: String,
+    project_id: Option<String>,
+    timeout_seconds: u64,
+    no_wait: bool,
+    allow_new_session: bool,
+}
+
+async fn wake_once(daemon_url: &str, args: WakeArgs) -> Result<i32> {
+    // Resolve the prompt (`-` = stdin so callers can pipe untrusted pad text
+    // without shell-quoting games).
+    let prompt = if args.prompt == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        text
+    } else {
+        args.prompt.clone()
+    };
+    if prompt.trim().is_empty() {
+        eprintln!("wake: empty prompt");
+        return Ok(WAKE_FAILED);
+    }
+
+    // Resolve the target session: explicit id wins, else the durable file.
+    // A wake addresses a *specific* agent; minting a fresh session silently
+    // would "deliver" the nudge to nobody, so that needs explicit opt-in.
+    let session_path = args.session_file.clone().map(expand_home);
+    let session_id = args
+        .session_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            session_path
+                .as_ref()
+                .and_then(|p| fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    if session_id.is_none() && !args.allow_new_session {
+        eprintln!("wake: no session id resolved (pass --session-id/--session-file, or --allow-new-session)");
+        return Ok(WAKE_FAILED);
+    }
+
+    // The POST is fire-and-ack (202 + status Running), so the HTTP client only
+    // needs a short request timeout; turn completion is awaited separately on
+    // the SSE stream below.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let base = daemon_url.trim_end_matches('/');
+    let health = format!("{base}/health");
+    if let Err(e) = client
+        .get(&health)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        eprintln!("wake: daemon not healthy at {health}: {e}");
+        return Ok(WAKE_FAILED);
+    }
+
+    let mut body = json!({
+        "prompt": prompt,
+        "cwd": args.cwd,
+        "client_type": args.client_type,
+    });
+    if let Some(project_id) = args.project_id.as_ref() {
+        body["project_id"] = json!(project_id);
+    }
+    if let Some(sid) = session_id.as_ref() {
+        body["session_id"] = json!(sid);
+    }
+
+    let url = format!("{base}/v1/agent/turns");
+    eprintln!(
+        "[{}] wake → {url} (session {})",
+        chrono::Utc::now().to_rfc3339(),
+        session_id.as_deref().unwrap_or("<new>")
+    );
+    let response = client.post(&url).json(&body).send().await?;
+    // Backpressure is a defer, not a failure: the daemon sheds load with 429
+    // and an honest busy body; the caller's gate stays open for a retry.
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        eprintln!("wake: daemon at capacity (429); deferring");
+        return Ok(WAKE_DEFERRED);
+    }
+    let status = response.status();
+    let ack: serde_json::Value = response.json().await.unwrap_or_default();
+    let ok = ack.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !status.is_success() || !ok {
+        let error = ack.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        if error.contains("busy") || error.contains("capacity") {
+            eprintln!("wake: daemon busy: {error}; deferring");
+            return Ok(WAKE_DEFERRED);
+        }
+        eprintln!("wake: turn rejected ({status}): {error}");
+        return Ok(WAKE_FAILED);
+    }
+
+    let turn_id = ack
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let acked_session = ack
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // Persist the (possibly daemon-minted) session id for the next wake.
+    if let (Some(path), false) = (session_path.as_ref(), acked_session.is_empty()) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, format!("{acked_session}\n"));
+    }
+
+    if args.no_wait {
+        println!("{}", serde_json::to_string_pretty(&ack)?);
+        return Ok(WAKE_DELIVERED);
+    }
+
+    // Wait for THIS turn's TurnFinished on the session-scoped event stream.
+    // A wait timeout is a defer (the agent may legitimately still be working);
+    // a Failed status is a hard failure.
+    match tokio::time::timeout(
+        Duration::from_secs(args.timeout_seconds),
+        wait_for_turn_finished(base, &acked_session, &turn_id),
+    )
+    .await
+    {
+        Ok(Ok(true)) => {
+            println!("{}", serde_json::to_string_pretty(&ack)?);
+            Ok(WAKE_DELIVERED)
+        }
+        Ok(Ok(false)) => {
+            eprintln!("wake: turn {turn_id} finished with status=failed");
+            Ok(WAKE_FAILED)
+        }
+        Ok(Err(e)) => {
+            eprintln!("wake: event stream error while waiting: {e:#}");
+            Ok(WAKE_FAILED)
+        }
+        Err(_) => {
+            eprintln!(
+                "wake: turn {turn_id} still running after {}s; deferring",
+                args.timeout_seconds
+            );
+            Ok(WAKE_DEFERRED)
+        }
+    }
+}
+
+/// Stream `/v1/agent/events?session_id=…` until `turn_id`'s `turn_finished`
+/// frame arrives. Returns `true` iff the turn completed successfully.
+async fn wait_for_turn_finished(base: &str, session_id: &str, turn_id: &str) -> Result<bool> {
+    // No overall client timeout here — the SSE connection is long-lived; the
+    // caller bounds the wait with `tokio::time::timeout`.
+    let client = reqwest::Client::builder().build()?;
+    let url = format!("{base}/v1/agent/events?session_id={session_id}");
+    let mut response = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("subscribe {url}"))?;
+
+    let mut buf = String::new();
+    while let Some(chunk) = response.chunk().await? {
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        // Consume complete SSE lines; keep the trailing partial line buffered.
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim_end_matches('\r').to_string();
+            buf.drain(..=pos);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim()) else {
+                continue;
+            };
+            let is_finished = event
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t.eq_ignore_ascii_case("turn_finished"))
+                .unwrap_or(false);
+            if !is_finished {
+                continue;
+            }
+            if event.get("turn_id").and_then(|v| v.as_str()) != Some(turn_id) {
+                continue;
+            }
+            let Some(status) = event.get("status").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if status.eq_ignore_ascii_case("running") {
+                continue;
+            }
+            return Ok(status.eq_ignore_ascii_case("completed"));
+        }
+    }
+    anyhow::bail!("event stream ended before turn {turn_id} finished")
 }
 
 async fn run_once(daemon_url: &str, path: &Path) -> Result<()> {
