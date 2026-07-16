@@ -1772,11 +1772,14 @@ mod tests {
             kind: RoomMessageKind::Message,
             body: "hello".into(),
             created_at: Utc::now(),
-            federated: Some(meta),
+            federated: Some(meta.clone()),
         };
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["federated"]["global_sequence"], 42);
-        assert_eq!(json["federated"]["source_sequence"], 7);
+        assert_eq!(
+            json["federated"],
+            serde_json::to_value(&meta).unwrap(),
+            "federated must match the full exact FederatedMessageMeta object"
+        );
         let roundtrip: RoomMessage = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, msg);
     }
@@ -1790,10 +1793,7 @@ mod tests {
             outbox: vec![],
         };
         let json = serde_json::to_value(&proj).unwrap();
-        assert_eq!(json["state"], "local");
-        assert!(json.get("members").is_none(), "empty members omitted");
-        assert!(json.get("outbox").is_none(), "empty outbox omitted");
-        assert!(json.get("last_confirmed_global_sequence").is_none());
+        assert_eq!(json, serde_json::json!({"state": "local"}));
         let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, proj);
     }
@@ -1998,8 +1998,7 @@ mod tests {
             ttl_minutes: None,
         };
         let min_json = serde_json::to_value(&min).unwrap();
-        assert!(min_json.get("recipient_name").is_none());
-        assert!(min_json.get("ttl_minutes").is_none());
+        assert_eq!(min_json, serde_json::json!({}));
     }
 
     #[test]
@@ -2022,7 +2021,7 @@ mod tests {
             code: "abc123".into(),
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["code"], "abc123");
+        assert_eq!(json, serde_json::json!({"code": "abc123"}));
     }
 
     // ── required-field rejection — missing metadata/projection fields fail ─
@@ -2108,23 +2107,30 @@ mod tests {
     }
 
     #[test]
-    fn public_agent_descriptor_strips_provider_config_keys() {
+    fn public_agent_descriptor_strips_local_path_tool_and_credential_keys() {
         let json = serde_json::json!({
             "display_name": "BadAgent",
             "model_alias": "gpt",
             "provider_api_key": "sk-1234",
-            "execution_role": "admin"
+            "execution_role": "admin",
+            "local_paths": ["/etc/secrets"],
+            "tool_config": {"shell": true},
+            "permission_posture": "allow_all"
         });
         let pda: PublicAgentDescriptor = serde_json::from_value(json).unwrap();
         let out = serde_json::to_value(&pda).unwrap();
-        assert!(
-            out.get("provider_api_key").is_none(),
-            "provider_api_key MUST NOT survive serde roundtrip"
-        );
-        assert!(
-            out.get("execution_role").is_none(),
-            "execution_role MUST NOT survive serde roundtrip"
-        );
+        for forbidden in &[
+            "provider_api_key",
+            "execution_role",
+            "local_paths",
+            "tool_config",
+            "permission_posture",
+        ] {
+            assert!(
+                out.get(forbidden).is_none(),
+                "{forbidden} MUST NOT survive serde roundtrip on PublicAgentDescriptor"
+            );
+        }
     }
 
     #[test]
