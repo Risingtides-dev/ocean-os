@@ -1,0 +1,18 @@
+============================= test session starts =============================
+platform darwin -- Python 3.14.3, pytest-9.0.2
+rootdir: /app
+collected 2 items
+
+tests/test_math.py .F
+
+=================================== FAILURES ===================================
+______________________________ test_adds_badly ______________________________
+
+def test_adds_badly():
+>       assert 1 + 1 == 3
+E       assert (1 + 1) == 3
+
+tests/test_math.py:4: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_math.py::test_adds_badly - assert (1 + 1) == 3
+========================= 1 failed, 1 passed in 0.02s =========================

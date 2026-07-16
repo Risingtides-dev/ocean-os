@@ -3304,6 +3304,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocean-minimizer"
+version = "0.1.0"
+
+[[package]]
 name = "ocean-oauth"
 version = "0.1.0"
 dependencies = [

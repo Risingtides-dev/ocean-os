@@ -23,7 +23,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 ## Workspace Package Index
 
-The workspace currently contains 26 Rust packages.
+The workspace currently contains 27 Rust packages.
 
 | Package | Owns | Does not own | Primary entry | Local contract | Narrow validation |
 |---|---|---|---|---|---|
@@ -45,6 +45,7 @@ The workspace currently contains 26 Rust packages.
 | `ocean-lsp` | Language-server clients, discovery, diagnostics ledger, `lsp` tool | General AST parsing or editor UI | `ocean-lsp/src/lib.rs`, `tool.rs` | `ocean-lsp/AGENTS.md` | `cargo test -p ocean-lsp` |
 | `ocean-mcp` | Client connections to external MCP servers and tool adapters | Ocean MCP server; subprocess plugins | `ocean-mcp/src/lib.rs`, `provider.rs` | — | `cargo test -p ocean-mcp` |
 | `ocean-memory` | Typed provenance-bearing SQLite memory and ingest | Session transcripts; shared Bedrock storage | `ocean-memory/src/lib.rs` | — | `cargo test -p ocean-memory` |
+| `ocean-minimizer` | Standalone conservative output minimization for already-tokenized cargo/git/gh/npm/npx/pytest invocations | Shell parsing/execution; TOML/config; artifacts; live runtime wiring | `ocean-minimizer/src/lib.rs::minimize` | `ocean-minimizer/AGENTS.md` | `cargo test -p ocean-minimizer && cargo clippy -p ocean-minimizer --all-targets -- -D warnings` |
 | `ocean-oauth` | Browser OAuth/PKCE login and Ocean auth-file writes | Model routing and provider wire calls | `ocean-oauth/src/lib.rs` | `ocean-oauth/AGENTS.md` | `cargo test -p ocean-oauth` |
 | `ocean-plugin` | Subprocess plugin manifests, lifecycle, JSON-RPC, capability adapter | External MCP transport | `ocean-plugin/src/lib.rs`, `plugin.rs` | — | `cargo test -p ocean-plugin` |
 | `ocean-protocol` | Anthropic/OpenAI/Gemini/Codex wire encoding, streaming, retry | Model catalog, credentials, readiness | `ocean-protocol/src/lib.rs`, `providers/` | `ocean-protocol/AGENTS.md` | `cargo test -p ocean-protocol` |
@@ -57,6 +58,7 @@ The workspace currently contains 26 Rust packages.
 ## Non-default Members
 
 - `ocean-ast` is standalone and not yet wired into the live runtime. It stays outside `default-members` to avoid adding its multi-grammar compile cost to ordinary default builds; validate it explicitly or through `--workspace`.
+- `ocean-minimizer` is a standalone, dependency-free M1 library and is not yet wired into command capture or a harness profile. It stays outside `default-members` so ordinary builds do not imply live minimization; validate it explicitly or through `--workspace`.
 - `xtask` is a developer task runner, not a product binary. Invoke it explicitly with `cargo xtask <command>`; `cargo xtask ci` owns the executable local/CI gate manifest while workspace commands still build/test xtask through `--workspace`.
 
 ## Cross-crate Change Impact
@@ -94,6 +96,7 @@ The workspace currently contains 26 Rust packages.
 - `ocean-daemon/` — long-running HTTP daemon and API surface → `ocean-daemon/AGENTS.md`
 - `ocean-extension/` — non-executing extension package schema validation → `ocean-extension/AGENTS.md`
 - `ocean-lsp/` — code intelligence over workspace language servers → `ocean-lsp/AGENTS.md`
+- `ocean-minimizer/` — standalone conservative command-output minimization → `ocean-minimizer/AGENTS.md`
 - `ocean-oauth/` — browser OAuth + PKCE provider login → `ocean-oauth/AGENTS.md`
 - `ocean-protocol/` — multi-provider LLM wire protocol → `ocean-protocol/AGENTS.md`
 - `ocean-runtime/` — agent loop and permission-gated tool execution → `ocean-runtime/AGENTS.md`

@@ -1,0 +1,8 @@
+warning: unused variable: `ctx`
+  --> crates/pi-shell/src/minimizer/filters/mod.rs:134:30
+   |
+134 | pub fn filter(ctx: &MinimizerCtx, input: &str) -> MinimizerOutput {
+   |                              ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+cargo test: 53 passed (3 suites, 0.45s)

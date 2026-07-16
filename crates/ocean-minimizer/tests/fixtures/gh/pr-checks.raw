@@ -1,0 +1,4 @@
+✓	build	1m2s	https://ci.test/build
+X	test	3m4s	https://ci.test/test
+*	lint	0s	https://ci.test/lint
+-	docs	0s	https://ci.test/docs

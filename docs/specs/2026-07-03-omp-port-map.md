@@ -33,7 +33,7 @@ live. New features then attach to a profile in one line.
 | `ocean-ast` (new) | ast-grep-core wrapper, structural edits, `summarize_code` fold/unfold | `crates/pi-ast` (lift patterns) |
 | `ocean-walker` (new) | parallel FS walker, TTL+mtime scan cache, invalidate_path | `crates/pi-walker` |
 | `ocean-search` (new or in walker) | in-process grep (grep-regex/searcher), typed results | `crates/pi-natives/src/grep.rs` |
-| `ocean-minimizer` (new) | per-command output filters (TOML defs), artifact spill footer | `crates/pi-shell/src/minimizer/` |
+| `ocean-minimizer` | M1 standalone fixed filters over already-tokenized invocations; no TOML/config, artifact persistence/reference, footer, or runtime wiring | `crates/pi-shell/src/minimizer/` |
 | `ocean-iso` (new, later) | CoW worktree isolation (APFS clonefile) for subagents | `crates/pi-iso` |
 | `ocean-daemon` (extend) | harness profiles, tool harness (output-meta, artifacts, bm25 discovery, resolve protocol), TTSR, compaction, checkpoint/rewind | `packages/coding-agent/src/{tools,session}` |
 | `ocean-agent` (extend) | models catalog (ocean.toml), role grammar v2, path-scoped policy, retry/fallback chains | `src/config/{model-registry,model-resolver,settings-schema}.ts` |
@@ -88,9 +88,10 @@ Source: `packages/coding-agent/src/tools/` · behavior contracts in `prompts/too
 ### Execution — profile: tui/acp
 
 - **bash** — persistent session; `cwd`/`env` params instead of `cd`/exports; optional PTY;
-  `async: true` → job ID; auto-background after 60s. **Output minimizer**: ~70 per-command
-  filters (cargo, git, gh, npm, pytest…) + TOML defs collapse pass-noise to failures, with
-  `[raw output: artifact://id]` preserving exact bytes. → ocean-minimizer.
+  `async: true` → job ID; auto-background after 60s. OMP's **output minimizer** combines
+  per-command filters, TOML definitions, and a caller-owned raw-output artifact reference.
+  Ocean M1 implements only a standalone fixed-filter library for cargo/git/gh/npm/npx/pytest;
+  command capture and any artifact-backed integration remain a separate checkpoint.
 - **eval** — persistent kernels (IPython, JS VM, Ruby, Julia); state survives across calls AND
   subagents; prelude: `tool.<name>(args)` re-enters session tools from code, `completion()`,
   `parallel()`, `budget`. Heavy port; consider embedded deno/python later.
@@ -268,7 +269,10 @@ propagate through git deps).
   (a) `minimizer/` (~25k): output-compression engine — brush-parser command analysis that
   refuses to touch pipes, ~25 Rust filters (git.rs 92KB, jvm.rs 124KB, cargo, docker…) + 9-stage
   declarative TOML pipelines with ~75 built-in per-command defs, xxHash64 trust-hash on user
-  defs, 4MiB cap → raw fallback, never fakes success. **Port first** → `ocean-minimizer`.
+  defs, and a 4MiB raw fallback. OMP returns original text to its caller for optional artifact
+  persistence; the minimizer itself does not persist an artifact or append a footer. Ocean M1
+  intentionally ports a smaller dependency-free fixed subset with no TOML/config/artifacts and
+  remains standalone in `ocean-minimizer`.
   (b) `process.rs` (1,755): cross-platform process-tree management (children/kill/group).
   (c) `fixup.rs`: AST pre-exec rewrites stripping `| head` / redundant `2>&1`.
   (d) The brush+uutils embedded shell (coreutils as in-process builtins via `uutil_builtin!`
@@ -374,7 +378,7 @@ summary exists to keep the backlog honest.
 | W0 — profile seam | **Reconciled partial** | `ocean-daemon::harness_profile` resolves per turn and exposes only the two effective gates carried into `PromptControl`: hashline edits and artifact spill. `acp-zed` is attributed explicitly with behavior equal to its prior CLI fallback. LSP/memory are documented as global; unwired stream-rule/rich-context/minimizer flags are gone. | New external surface classifications remain policy decisions (`surface-tauri` still uses the compatibility fallback). Future mechanisms join the seam only when they are actually wired. |
 | W1 — edit reliability | **Built** | `ocean-hashline`, session snapshots, `HashlineEditTool`, `NoopLoopGuard`, `SpillingTool`, and `artifact://` retrieval are live. | Output metadata is thinner than OMP's complete directional/range protocol, and the broader hashline dialect remains out of scope. |
 | W2 — TUI streaming | **Strong partial** | `shell/markdown.rs` implements prefix-freeze; `shell/diff.rs` has word-level inverse diffs; the composer has persisted history, Ctrl-R, a kill ring, mentions, and a fuzzy slash palette; tool drawers and a basic Kitty image viewer are live. | No append-only native-scrollback architecture, OMP theme-token/80-theme compatibility, full image protocol ladder/ImageBudget, or complete composer integration set. |
-| W3 — context economy | **Partial** | Artifact spill is live. `ocean-agent::compact_history` deterministically elides older tool bodies and `ocean-runtime::trim_to_context_window` provides the hard suffix bound. `ocean-ast` implements structural summaries as a standalone crate. | No BM25 tool discovery, command minimizer, promote/prune/shake/summarize pipeline, protection matchers, live general AST-read wiring, or conversational checkpoint/rewind. |
+| W3 — context economy | **Partial** | Artifact spill is live. `ocean-agent::compact_history` deterministically elides older tool bodies and `ocean-runtime::trim_to_context_window` provides the hard suffix bound. `ocean-ast` implements structural summaries as a standalone crate. `ocean-minimizer` M1 implements fixed conservative filters as a standalone, dependency-free crate. | No live command-capture/minimizer integration, BM25 tool discovery, promote/prune/shake/summarize pipeline, protection matchers, live general AST-read wiring, or conversational checkpoint/rewind. |
 | W4 — roles/catalog | **Partial** | Flat `[roles]`, per-turn model/advisor control, provider readiness, OAuth/API-key routing, retry, and cross-provider fallback are live. | No cycle-safe role aliases, thinking suffix grammar, per-role fallback, `tiny` role, path policy, configurable rich catalog, promotion target, or timed fallback cooldown/revert. |
 | W5 — code intelligence | **Substantial partial** | `ocean-lsp::LspProvider` is live with diagnostics, definition, references, hover, symbols, rename, and reload. Built-in grep supports Rust regex with literal fallback. | No shared walker/search engine, cross-line typed/mtime-ranked search, `ast_edit`, generic preview/resolve, rename-file/code-actions/raw request, or mutation-counter write-through diagnostics. |
 | W6 — rules/TTSR | **Absent** | The profile names `stream_rules`; no runtime engine is wired. | Typed rule capability taxonomy, `rule://`, three-tier delivery, abort/rewind/inject, and a builtin pack remain unimplemented. |
@@ -404,8 +408,9 @@ summary exists to keep the backlog honest.
 
 ### Next high-leverage sequence
 
-1. Build the command minimizer, then the shared walker/search substrate.
-2. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
+1. Review and design command-capture integration for the completed standalone minimizer M1; do not imply that adding the crate enabled live minimization.
+2. Build the shared walker/search substrate as its own checkpoint.
+3. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
 
 ## Scoping principle (John, 2026-07-03)
 
@@ -413,9 +418,10 @@ summary exists to keep the backlog honest.
 harness is valuable; the wide per-integration option surface is not. Concretely: the LSP
 *tool* (multiplexing, rename, deferred diagnostics) ships with servers for the languages
 Ocean actually works in (Rust, TS/JS, Python, Go, shell) — no Ruby-on-Rails-grade long tail.
-Same rule everywhere: minimizer filters for our commands (cargo/git/gh/npm/pytest), grammars
-for our languages, web-search providers we'd use. The mechanism must make adding an
-integration a config entry, never a code change.
+Same rule everywhere: minimizer filters for Ocean's commands
+(cargo/git/gh/npm/npx/pytest), grammars for Ocean's languages, and web-search providers Ocean
+would use. M1 keeps minimizer support as reviewed compiled code rather than importing OMP's TOML
+or user-config surface; later extensibility requires its own design.
 
 **Closed TUI gap:** ocean-tui now has the fuzzy `/` command palette, keyboard/mouse navigation,
 and an extensible registry. Continue using that palette as the discoverability surface for later
@@ -427,8 +433,9 @@ harness mechanisms rather than adding hidden commands.
 1. **W1 — edit reliability: built.** Preserve the tests and profile-gated runtime wiring.
 2. **W2 — TUI streaming lock-in: strong partial.** Finish only the missing mechanisms that fit
    the current terminal workbench; do not replace it to imitate OMP.
-3. **W3 — context economy: partial.** Minimizer and shared search are the next independent wins;
-   richer compaction/checkpoint behavior needs explicit session and cache contracts.
+3. **W3 — context economy: partial.** The standalone minimizer M1 is built but unwired; its
+   command-capture integration and the shared search substrate remain independent checkpoints.
+   Richer compaction/checkpoint behavior needs explicit session and cache contracts.
 4. **W4 — roles v2 + models catalog: partial.** Current flat roles and provider catalog are stable
    compatibility surfaces; extend them additively rather than replacing them wholesale.
 5. **W5 — code intelligence: substantial partial.** Build on `ocean-lsp`; do not create a second

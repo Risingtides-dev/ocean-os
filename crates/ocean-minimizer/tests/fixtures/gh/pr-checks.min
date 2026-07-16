@@ -1,0 +1,2 @@
+checks: 1 passed, 1 failed, 1 pending, 1 skipping
+X	test	3m4s	https://ci.test/test
