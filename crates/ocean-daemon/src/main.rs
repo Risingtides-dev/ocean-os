@@ -95,6 +95,8 @@ mod cors;
 mod event_adapter;
 /// Home-sandboxed directory listing and capped file-read HTTP policy.
 mod filesystem;
+/// State-free Longhouse prepare, inspect, and workflow HTTP adapters.
+mod longhouse_preparation;
 /// In-process turn counters, Prometheus rendering, and in-flight RAII guard.
 mod metrics;
 /// Model catalog, current-selection, and persisted-selection HTTP adapters.
@@ -130,6 +132,7 @@ use component_interaction::component_event;
 use cors::{cors_layer, parse_allowed_origins};
 use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
+use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prepare};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
@@ -163,6 +166,8 @@ use yolo_settings::{
 use axum::http::Method;
 #[cfg(test)]
 use filesystem::{expand_tilde, path_is_under, FsDirsQuery, FsFileQuery, FS_FILE_CAP};
+#[cfg(test)]
+use longhouse_preparation::LonghousePrepareRequest;
 #[cfg(test)]
 use metrics::{labelled_value, metric_value};
 #[cfg(test)]
@@ -2676,340 +2681,6 @@ async fn longhouse_convene(
         resp["token"] = json!(token);
     }
     Json(resp)
-}
-
-/// Request body for `POST /v1/longhouse/prepare`.
-///
-/// Mirrors the [`ocean_longhouse::TurnBrief`] the prep loop ranks against — the
-/// daemon's own turn shape minus the heavy bits. Only `prompt` is required; the
-/// rest scope the skill index (`cwd`) or are reserved for future SOP/workflow
-/// selection. `top_n` overrides how many compact skill briefs come back.
-#[derive(Debug, serde::Deserialize)]
-struct LonghousePrepareRequest {
-    /// The upcoming turn's prompt — the text Longhouse ranks skills against.
-    prompt: String,
-    /// Opaque daemon session id this turn belongs to (carried through to the
-    /// brief; unused in v1 ranking).
-    #[serde(default)]
-    session_id: Option<String>,
-    /// Working directory of the turn. When set, the skill index also scans the
-    /// repo-local `./skills` dir under it (`SkillRoots::for_cwd`), on top of the
-    /// documented home libraries.
-    #[serde(default)]
-    cwd: Option<String>,
-    /// Which client is steering ("tui", "surface", "voice"). Reserved for future
-    /// client-aware SOP reminders; unused in v1 ranking.
-    #[serde(default)]
-    client_type: Option<String>,
-    /// Cap on how many compact skill briefs to return. Defaults to
-    /// [`ocean_longhouse::DEFAULT_TOP_N`] when omitted.
-    #[serde(default)]
-    top_n: Option<usize>,
-}
-
-/// Path-redacted wire projection for explicit ranking inspection. Internal
-/// preparation retains source paths for later body fetches; this diagnostic does
-/// not disclose the caller's cwd or home-library layout.
-#[derive(serde::Serialize)]
-struct LonghouseInspectSkillBrief {
-    name: String,
-    description: String,
-    source: ocean_longhouse::SkillSource,
-}
-
-impl From<ocean_longhouse::SkillBrief> for LonghouseInspectSkillBrief {
-    fn from(brief: ocean_longhouse::SkillBrief) -> Self {
-        Self {
-            name: brief.name,
-            description: brief.description,
-            source: brief.source,
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct LonghouseInspectWorkflowBrief {
-    name: String,
-    description: String,
-}
-
-impl From<ocean_longhouse::WorkflowBrief> for LonghouseInspectWorkflowBrief {
-    fn from(brief: ocean_longhouse::WorkflowBrief) -> Self {
-        Self {
-            name: brief.name,
-            description: brief.description,
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct LonghouseInspectSopBrief {
-    name: String,
-    description: String,
-}
-
-impl From<ocean_longhouse::SopBrief> for LonghouseInspectSopBrief {
-    fn from(brief: ocean_longhouse::SopBrief) -> Self {
-        Self {
-            name: brief.name,
-            description: brief.description,
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct LonghouseInspectSkillMatch {
-    brief: LonghouseInspectSkillBrief,
-    score: u32,
-    matched_prompt_terms: Vec<String>,
-    exact_name_phrase: bool,
-}
-
-impl From<ocean_longhouse::ExplainedSkillMatch> for LonghouseInspectSkillMatch {
-    fn from(selected: ocean_longhouse::ExplainedSkillMatch) -> Self {
-        Self {
-            brief: selected.brief.into(),
-            score: selected.score,
-            matched_prompt_terms: selected.matched_prompt_terms,
-            exact_name_phrase: selected.exact_name_phrase,
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct LonghouseInspectWorkflowMatch {
-    brief: LonghouseInspectWorkflowBrief,
-    score: u32,
-    matched_prompt_terms: Vec<String>,
-    exact_name_phrase: bool,
-}
-
-impl From<ocean_longhouse::ExplainedWorkflowMatch> for LonghouseInspectWorkflowMatch {
-    fn from(selected: ocean_longhouse::ExplainedWorkflowMatch) -> Self {
-        Self {
-            brief: selected.brief.into(),
-            score: selected.score,
-            matched_prompt_terms: selected.matched_prompt_terms,
-            exact_name_phrase: selected.exact_name_phrase,
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct LonghouseInspectPrep {
-    skills: Vec<LonghouseInspectSkillBrief>,
-    sops: Vec<LonghouseInspectSopBrief>,
-    workflows: Vec<LonghouseInspectWorkflowBrief>,
-}
-
-impl From<ocean_longhouse::TurnPrep> for LonghouseInspectPrep {
-    fn from(prep: ocean_longhouse::TurnPrep) -> Self {
-        Self {
-            skills: prep.skills.into_iter().map(Into::into).collect(),
-            sops: prep.sops.into_iter().map(Into::into).collect(),
-            workflows: prep.workflows.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-/// `POST /v1/longhouse/prepare` — the **read-only pre-turn preparation step**,
-/// the "first safe integration slice" from `docs/LONGHOUSE.md` §"First safe
-/// integration slice" (lines 101-115). This is the first real consumer of
-/// [`ocean_longhouse::SkillIndex::prepare`] (OCEAN-226): the library capability
-/// shipped in OCEAN-215 ph1 had no caller until now.
-///
-/// The daemon hands Longhouse a compact [`ocean_longhouse::TurnBrief`] (the
-/// prompt + a little session context) and gets back a [`ocean_longhouse::TurnPrep`]:
-/// the handful of skills (plus, in later phases, SOPs/workflows) most relevant to
-/// that prompt, each as a *compact* brief — name + one-line when-to-use, never a
-/// full body. A client may call this before submitting a turn and fold the briefs
-/// into its own guidance.
-///
-/// **Advisory only — Longhouse recommends, it never acts (per the repo's Longhouse
-/// rule + `docs/LONGHOUSE.md` line 115).** This endpoint performs no local side
-/// effects, executes nothing, and touches no permission gate: it loads the skill
-/// index off disk and ranks it. The returned `advisory: true` makes that contract
-/// explicit on the wire. The main agent still routes every real action back
-/// through the daemon's permission gates.
-///
-/// **Fail-open** (matches `prepare` itself): a missing/garbled skill library, an
-/// empty index, or an irrelevant prompt yields `ok: true` with an empty `prep` —
-/// it never errors, so consulting Longhouse can never block a would-be turn.
-///
-/// The disk scan runs on a blocking thread (`spawn_blocking`) so the index walk
-/// never stalls the async scheduler; the cheap keyword ranking then runs inline.
-async fn longhouse_prepare(Json(req): Json<LonghousePrepareRequest>) -> Json<serde_json::Value> {
-    let brief = ocean_longhouse::TurnBrief {
-        session_id: req.session_id.unwrap_or_default(),
-        prompt: req.prompt,
-        cwd: req.cwd.clone(),
-        client_type: req.client_type,
-    };
-    let top_n = req.top_n;
-
-    // Rank against the CACHED skill index on a blocking thread: a cold/stale load
-    // walks ~/.spawner/skills, ~/.codex/skills (+ repo-local ./skills when a cwd
-    // is given), which is filesystem I/O we must not run on the async scheduler;
-    // a warm cache hit just ranks an already-loaded index (OCEAN-283). Both load
-    // and rank are fail-open, so a JoinError (the only way this can fail)
-    // collapses to an empty prep — never a 500 — preserving the contract that
-    // consulting Longhouse can't block a turn.
-    let prep = tokio::task::spawn_blocking(move || {
-        let roots = match brief.cwd.as_deref() {
-            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
-            _ => ocean_longhouse::SkillRoots::default(),
-        };
-        let index = ocean_longhouse::cached_index_for(&roots);
-        let skills_indexed = index.len();
-        let prep = match top_n {
-            Some(n) => index.prepare_top_n(&brief, n),
-            None => index.prepare(&brief),
-        };
-        (prep, skills_indexed)
-    })
-    .await;
-
-    let (prep, skills_indexed) = prep.unwrap_or_else(|err| {
-        // spawn_blocking only errors if the closure panicked; the loader and
-        // ranker don't panic, but stay fail-open here regardless.
-        tracing::warn!(error = %err, "longhouse prepare task failed; returning empty prep");
-        (ocean_longhouse::TurnPrep::default(), 0)
-    });
-
-    Json(json!({
-        "ok": true,
-        // Advisory contract: Longhouse only recommends. This endpoint executes
-        // nothing and bypasses no permission gate.
-        "advisory": true,
-        // How many skills the index held this call (diagnostic: distinguishes
-        // "no library on disk" from "library present, nothing matched").
-        "skills_indexed": skills_indexed,
-        "prep": prep,
-    }))
-}
-
-/// `POST /v1/longhouse/inspect` — explain the exact deterministic selection that
-/// ordinary preparation would return. This is advisory and read-only: it does
-/// not run a turn, grant capabilities, invoke a model, or change prompt injection.
-/// It returns only contributing prompt terms and path-redacted compact metadata,
-/// never the raw submitted prompt, session id, cwd, or any skill/workflow body.
-async fn longhouse_inspect(Json(req): Json<LonghousePrepareRequest>) -> Json<serde_json::Value> {
-    let brief = ocean_longhouse::TurnBrief {
-        session_id: req.session_id.unwrap_or_default(),
-        prompt: req.prompt,
-        cwd: req.cwd.clone(),
-        client_type: req.client_type,
-    };
-    let top_n = req.top_n;
-
-    // Identical cwd-confined roots and process-wide cache as `/prepare`. Only
-    // `cwd/skills` and `cwd/docs/orchestrator/workflows` are considered locally;
-    // source paths remain internal and are redacted from the response below.
-    let inspection = tokio::task::spawn_blocking(move || {
-        let roots = match brief.cwd.as_deref() {
-            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
-            _ => ocean_longhouse::SkillRoots::default(),
-        };
-        let index = ocean_longhouse::cached_index_for(&roots);
-        match top_n {
-            Some(n) => index.inspect_top_n(&brief, n),
-            None => index.inspect(&brief),
-        }
-    })
-    .await
-    .unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "longhouse inspect task failed; returning empty inspection");
-        ocean_longhouse::TurnPrepInspection::default()
-    });
-
-    Json(json!({
-        "ok": true,
-        "advisory": true,
-        "consult_enabled": longhouse_prepare_enabled(),
-        "skills_indexed": inspection.skills_indexed,
-        "skill_candidates": inspection.skill_candidates,
-        "workflows_indexed": inspection.workflows_indexed,
-        "workflow_candidates": inspection.workflow_candidates,
-        "selected_skills": inspection
-            .selected_skills
-            .into_iter()
-            .map(LonghouseInspectSkillMatch::from)
-            .collect::<Vec<_>>(),
-        "selected_workflows": inspection
-            .selected_workflows
-            .into_iter()
-            .map(LonghouseInspectWorkflowMatch::from)
-            .collect::<Vec<_>>(),
-        "prep": LonghouseInspectPrep::from(inspection.prep),
-    }))
-}
-
-// --- Workflow-brief endpoint: POST /v1/workflows/prepare (OCEAN-340) ----------
-//
-// Surfaces the OCEAN-338 WorkflowBrief loader's `workflows` field from
-// `TurnPrep` over HTTP as a thin, advisory, read-only, fail-open shell.
-// Mirrors `longhouse_prepare` exactly: same `spawn_blocking` pattern, same
-// fail-open JoinError collapse, same `advisory: true` wire contract.  Returns
-// `{ ok: true, advisory: true, workflows: [...WorkflowBrief] }`.  Until a
-// `docs/orchestrator/workflows/` dir exists in the cwd the array is empty —
-// that is the expected, correct behaviour.
-
-/// `POST /v1/workflows/prepare` — the **read-only workflow-brief step** from
-/// the Longhouse discovery wave (OCEAN-340).  Runs the same prepare path as
-/// `longhouse_prepare` but surfaces only the `workflows` field populated by the
-/// OCEAN-338 WorkflowBrief loader.
-///
-/// **Advisory only** — Longhouse recommends, it never acts.  This endpoint
-/// performs no local side effects, executes nothing, and touches no permission
-/// gate.  The `advisory: true` field makes that contract explicit on the wire.
-///
-/// **Fail-open**: a missing `docs/orchestrator/workflows/` dir, a garbled
-/// loader, or a JoinError all collapse to `workflows: []` — never a 5xx —
-/// so consulting this endpoint can never block a would-be turn.
-///
-/// The disk scan runs on a blocking thread (`spawn_blocking`) so the workflow
-/// dir walk never stalls the async scheduler, matching `longhouse_prepare`.
-async fn workflows_prepare(Json(req): Json<LonghousePrepareRequest>) -> Json<serde_json::Value> {
-    let brief = ocean_longhouse::TurnBrief {
-        session_id: req.session_id.unwrap_or_default(),
-        prompt: req.prompt,
-        cwd: req.cwd.clone(),
-        client_type: req.client_type,
-    };
-    let top_n = req.top_n;
-
-    // Scan the workflow dir on a blocking thread — same rationale as
-    // `longhouse_prepare`: filesystem I/O must not run on the async scheduler.
-    // A missing dir returns an empty index (fail-open), and a JoinError (the
-    // only way this can fail) collapses to workflows:[] — never a 500.
-    let workflows = tokio::task::spawn_blocking(move || {
-        let roots = match brief.cwd.as_deref() {
-            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
-            _ => ocean_longhouse::SkillRoots::default(),
-        };
-        let index = ocean_longhouse::cached_index_for(&roots);
-        let prep = match top_n {
-            Some(n) => index.prepare_top_n(&brief, n),
-            None => index.prepare(&brief),
-        };
-        prep.workflows
-    })
-    .await;
-
-    let workflows = workflows.unwrap_or_else(|err| {
-        // spawn_blocking only errors if the closure panicked; the loader
-        // doesn't panic, but stay fail-open here regardless.
-        tracing::warn!(error = %err, "workflows prepare task failed; returning empty list");
-        Vec::new()
-    });
-
-    Json(json!({
-        "ok": true,
-        // Advisory contract: Longhouse only recommends. This endpoint executes
-        // nothing and bypasses no permission gate.
-        "advisory": true,
-        "workflows": workflows,
-    }))
 }
 
 // --- Skill-librarian API: /v1/skills/query + /v1/skills/fetch (OCEAN-281) -----
@@ -16679,6 +16350,466 @@ mod tests {
             format!("---\nname: \"{name}\"\ndescription: \"{desc}\"\n---\n\n{body}\n"),
         )
         .expect("write SKILL.md");
+    }
+
+    fn sorted_json_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .expect("expected JSON object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    async fn longhouse_adapter_request(
+        app: Router,
+        method: axum::http::Method,
+        path: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        if let Some(content_type) = content_type {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+        }
+        let response = app
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 response");
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn longhouse_preparation_http_extractors_methods_and_defaults_are_exact() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = longhouse_routes().with_state(fake_convene_state(&tmp));
+        let routes = [
+            "/v1/longhouse/prepare",
+            "/v1/longhouse/inspect",
+            "/v1/workflows/prepare",
+        ];
+        let missing_prompt =
+            "Failed to deserialize the JSON body into the target type: missing field `prompt` at line 1 column 2";
+        let missing_content_type = "Expected request with `Content-Type: application/json`";
+        let malformed_json =
+            "Failed to parse the request body as JSON: EOF while parsing an object at line 1 column 1";
+
+        for path in routes {
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            assert_eq!(body, missing_prompt, "{path}");
+
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                None,
+                r#"{"prompt":"anything"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{path}");
+            assert_eq!(body, missing_content_type, "{path}");
+
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                "{",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(body, malformed_json, "{path}");
+
+            for method in [axum::http::Method::GET, axum::http::Method::PUT] {
+                let (status, headers, body) = longhouse_adapter_request(
+                    app.clone(),
+                    method.clone(),
+                    path,
+                    Some("application/json"),
+                    "{}",
+                )
+                .await;
+                assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+                assert_eq!(
+                    headers
+                        .get(axum::http::header::ALLOW)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("POST"),
+                    "{method} {path}"
+                );
+                assert_eq!(body, "", "{method} {path}");
+            }
+
+            let request = json!({
+                "prompt": "qqzzxx-longhouse-adapter-defaults",
+                "cwd": tmp.path().to_string_lossy(),
+                "top_n": 0,
+                "unknown_field_is_ignored": true
+            });
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                &request.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+            match path {
+                "/v1/longhouse/prepare" => {
+                    assert_eq!(
+                        sorted_json_keys(&body),
+                        ["advisory", "ok", "prep", "skills_indexed"]
+                    );
+                    assert_eq!(
+                        sorted_json_keys(&body["prep"]),
+                        ["skills", "sops", "workflows"]
+                    );
+                    assert_eq!(body["prep"]["skills"], json!([]));
+                    assert_eq!(body["prep"]["workflows"], json!([]));
+                }
+                "/v1/longhouse/inspect" => {
+                    assert_eq!(
+                        sorted_json_keys(&body),
+                        [
+                            "advisory",
+                            "consult_enabled",
+                            "ok",
+                            "prep",
+                            "selected_skills",
+                            "selected_workflows",
+                            "skill_candidates",
+                            "skills_indexed",
+                            "workflow_candidates",
+                            "workflows_indexed",
+                        ]
+                    );
+                    assert_eq!(body["selected_skills"], json!([]));
+                    assert_eq!(body["selected_workflows"], json!([]));
+                }
+                "/v1/workflows/prepare" => {
+                    assert_eq!(sorted_json_keys(&body), ["advisory", "ok", "workflows"]);
+                    assert_eq!(body["workflows"], json!([]));
+                }
+                _ => unreachable!(),
+            }
+
+            let defaults_only = json!({
+                "prompt": "qqzzxx-longhouse-all-optionals-omitted"
+            });
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                &defaults_only.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+            assert_eq!(body["ok"], json!(true));
+            assert_eq!(body["advisory"], json!(true));
+            match path {
+                "/v1/longhouse/prepare" => {
+                    assert!(body["skills_indexed"].is_u64());
+                    assert!(body["prep"].is_object());
+                }
+                "/v1/longhouse/inspect" => {
+                    assert!(body["consult_enabled"].is_boolean());
+                    assert!(body["selected_skills"].is_array());
+                    assert!(body["selected_workflows"].is_array());
+                }
+                "/v1/workflows/prepare" => assert!(body["workflows"].is_array()),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn longhouse_preparation_http_envelopes_and_privacy_are_exact() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace-private-cwd-sentinel");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        plant_repo_skill_md(
+            &cwd,
+            "adapter",
+            "Adapternonce Alpha",
+            "adapternonce alpha compact description",
+            "SKILL_BODY_SECRET_SENTINEL",
+        );
+        plant_repo_skill(
+            tmp.path(),
+            "outside",
+            "Adapternonce Outside",
+            "adapternonce outside selected cwd",
+        );
+        let workflow_dir = cwd.join("docs/orchestrator/workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(
+            workflow_dir.join("adapter.md"),
+            "---\nname: adapternonce workflow\ndescription: adapternonce workflow compact description\n---\n\nWORKFLOW_BODY_SECRET_SENTINEL\n",
+        )
+        .expect("workflow");
+
+        let app = longhouse_routes().with_state(fake_convene_state(&tmp));
+        let request = json!({
+            "prompt": "adapternonce alpha then adapternonce workflow qzxvnoncontribsecret",
+            "session_id": "SESSION_SECRET_SENTINEL",
+            "cwd": cwd.to_string_lossy(),
+            "client_type": "CLIENT_SECRET_SENTINEL",
+            "top_n": 1,
+        });
+
+        let (status, _, prepare_wire) = longhouse_adapter_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/longhouse/prepare",
+            Some("application/json"),
+            &request.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let prepare: serde_json::Value = serde_json::from_str(&prepare_wire).expect("prepare JSON");
+        assert_eq!(
+            sorted_json_keys(&prepare),
+            ["advisory", "ok", "prep", "skills_indexed"]
+        );
+        assert_eq!(
+            sorted_json_keys(&prepare["prep"]),
+            ["skills", "sops", "workflows"]
+        );
+        assert_eq!(
+            sorted_json_keys(&prepare["prep"]["skills"][0]),
+            ["description", "name", "source", "source_path"]
+        );
+        assert_eq!(
+            sorted_json_keys(&prepare["prep"]["workflows"][0]),
+            ["description", "name", "source_path"]
+        );
+
+        let (status, _, inspect_wire) = longhouse_adapter_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/longhouse/inspect",
+            Some("application/json"),
+            &request.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inspect: serde_json::Value = serde_json::from_str(&inspect_wire).expect("inspect JSON");
+        assert_eq!(
+            sorted_json_keys(&inspect),
+            [
+                "advisory",
+                "consult_enabled",
+                "ok",
+                "prep",
+                "selected_skills",
+                "selected_workflows",
+                "skill_candidates",
+                "skills_indexed",
+                "workflow_candidates",
+                "workflows_indexed",
+            ]
+        );
+        assert_eq!(inspect["selected_skills"].as_array().unwrap().len(), 1);
+        assert_eq!(inspect["selected_workflows"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_skills"][0]),
+            [
+                "brief",
+                "exact_name_phrase",
+                "matched_prompt_terms",
+                "score"
+            ]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_skills"][0]["brief"]),
+            ["description", "name", "source"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_workflows"][0]),
+            [
+                "brief",
+                "exact_name_phrase",
+                "matched_prompt_terms",
+                "score"
+            ]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_workflows"][0]["brief"]),
+            ["description", "name"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["prep"]),
+            ["skills", "sops", "workflows"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["prep"]["skills"][0]),
+            ["description", "name", "source"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["prep"]["workflows"][0]),
+            ["description", "name"]
+        );
+        assert_eq!(
+            inspect["selected_skills"][0]["exact_name_phrase"],
+            json!(true)
+        );
+        assert_eq!(
+            inspect["selected_workflows"][0]["exact_name_phrase"],
+            json!(true)
+        );
+        for selected in [
+            &inspect["selected_skills"][0],
+            &inspect["selected_workflows"][0],
+        ] {
+            let terms = selected["matched_prompt_terms"].as_array().expect("terms");
+            assert!(
+                terms.iter().any(|term| term == "adapternonce"),
+                "selected evidence lost the planted contributing nonce: {terms:?}"
+            );
+            assert!(terms.iter().all(|term| term != "qzxvnoncontribsecret"));
+        }
+        for private in [
+            "qzxvnoncontribsecret",
+            "SESSION_SECRET_SENTINEL",
+            "CLIENT_SECRET_SENTINEL",
+            "SKILL_BODY_SECRET_SENTINEL",
+            "WORKFLOW_BODY_SECRET_SENTINEL",
+            cwd.to_string_lossy().as_ref(),
+        ] {
+            assert!(
+                !inspect_wire.contains(private),
+                "inspect response leaked private text: {private}"
+            );
+        }
+        assert!(
+            !inspect_wire.contains("source_path"),
+            "inspect response leaked source paths"
+        );
+        assert!(inspect["selected_skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|selected| selected["brief"]["name"] != json!("Adapternonce Outside")));
+
+        let (status, _, workflows_wire) = longhouse_adapter_request(
+            app,
+            axum::http::Method::POST,
+            "/v1/workflows/prepare",
+            Some("application/json"),
+            &request.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let workflows: serde_json::Value =
+            serde_json::from_str(&workflows_wire).expect("workflows JSON");
+        assert_eq!(
+            sorted_json_keys(&workflows),
+            ["advisory", "ok", "workflows"]
+        );
+        assert_eq!(workflows["workflows"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            sorted_json_keys(&workflows["workflows"][0]),
+            ["description", "name", "source_path"]
+        );
+    }
+
+    #[test]
+    fn longhouse_preparation_source_preserves_blocking_read_only_boundary() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let extracted = src_dir.join("longhouse_preparation.rs");
+        let owner = if extracted.exists() {
+            extracted
+        } else {
+            src_dir.join("main.rs")
+        };
+        let source = std::fs::read_to_string(&owner).expect("Longhouse preparation owner source");
+        let prepare_start = source
+            .find("async fn longhouse_prepare(")
+            .expect("prepare handler");
+        let inspect_start = source
+            .find("async fn longhouse_inspect(")
+            .expect("inspect handler");
+        let workflows_start = source
+            .find("async fn workflows_prepare(")
+            .expect("workflows handler");
+        let boundary_end = source
+            .find("// --- Skill-librarian API:")
+            .unwrap_or(source.len());
+        let sections = [
+            &source[prepare_start..inspect_start],
+            &source[inspect_start..workflows_start],
+            &source[workflows_start..boundary_end],
+        ];
+        for section in sections {
+            let spawn = section
+                .find("tokio::task::spawn_blocking(move || {")
+                .expect("blocking closure");
+            let cache = section
+                .find("ocean_longhouse::cached_index_for")
+                .expect("cached index inside closure");
+            let await_after_closure = section
+                .find("\n    })\n    .await")
+                .expect("blocking closure awaited");
+            let fallback = section
+                .find("unwrap_or_else")
+                .expect("JoinError fail-open fallback");
+            assert!(
+                spawn < cache && cache < await_after_closure && await_after_closure < fallback,
+                "index work or fallback moved across the blocking closure boundary"
+            );
+        }
+        assert!(sections[0].contains("(ocean_longhouse::TurnPrep::default(), 0)"));
+        assert!(sections[1].contains("ocean_longhouse::TurnPrepInspection::default()"));
+        assert!(sections[2].contains("Vec::new()"));
+
+        let boundary = &source[prepare_start..boundary_end];
+        for forbidden in [
+            "State<AppState>",
+            ".emit(",
+            "tokio::spawn(",
+            "AgentRuntime",
+            "PermissionPolicy",
+            "run_turn",
+        ] {
+            assert!(
+                !boundary.contains(forbidden),
+                "Longhouse preparation boundary gained authority marker {forbidden:?}"
+            );
+        }
     }
 
     #[tokio::test]
