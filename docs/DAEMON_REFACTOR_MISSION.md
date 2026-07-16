@@ -1,8 +1,9 @@
 # Ocean Daemon Refactor: Mission, Progress, and Target
 
 **Status:** Active, green, and shipping in bounded checkpoints
-**Updated:** 2026-07-15
-**Published implementation:** `3e051c1`
+**Updated:** 2026-07-16
+**Published Phase 2C implementation:** `b21006b`
+**Current manifest baseline:** `5b9e23a`
 **Scope:** `crates/ocean-daemon`
 
 ## Mission
@@ -76,14 +77,16 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Persistent rooms | Published | Private `src/persistent_rooms.rs`; exact HTTP envelopes/defaults, persisted-row/event/audit/spawn ordering, closed-room audit asymmetry/paging, poison recovery, static/dynamic route precedence, call/LiveKit consumers, cwd/session identity, and three-state permission behavior were characterized; dedicated-target gates, two fresh extraction reviews, hosted CI, and PR #293 merge `92e03bf` passed |
 | Longhouse preparation adapters | Published | Private `src/longhouse_preparation.rs` owns only state-free prepare/inspect/workflow HTTP shells; exact extractor/method/envelope/privacy, PR #292 evidence, cwd confinement, and blocking/read-only behavior were characterized; the 334-line move, dedicated-target gates, compatibility/MSRV/local CI, two fresh extraction reviews, hosted CI, and PR #296 merge `29d65f8` passed; librarian fetch/spec remain separate after a disclosed symlink-retarget security disposition |
 | Longhouse turn preparation/presentation | Published | Private `src/longhouse_turn_preparation.rs` owns only the fresh opt-out gate, cached read-only preparation under the existing blocking deadline, and deterministic advisory rendering/application; exact presentation/no-op, environment, cwd/cache/blocking/deadline/fail-open, helper-warning, module-authority, and all three call-site ordering contracts were characterized at `f6e8efe`; the exact 228-line move, dedicated-target gates, compatibility/MSRV/local CI, two fresh extraction reviews, hosted CI, and PR #299 merge `9095d5a` passed |
-| Longhouse governance, calls, remaining registries | Later domain waves | One separately manifested domain at a time |
+| Longhouse topic projection/demo | Manifested | Fresh `5b9e23a` mapping applied the handoff stop rule: the proposed private `src/longhouse_topics.rs` owner contains only the scripted demo plus topic list/detail adapters over the existing shared registry; real convene remains composition-owned because it is directly coupled to ready-model filtering, asynchronous council orchestration, durable title grant/bind, and raw-token response delivery |
+| Longhouse convene and title/control governance | Next security wave | Re-manifest the coupled convene/title boundary separately; claim/revoke/recall/breach/board authority must not be hidden behind a new trait, substate, or public API |
+| Calls and remaining registries | Later domain waves | One separately manifested domain at a time after both governance waves |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
 At this checkpoint, `main.rs` is approximately 20.8k lines after persistent-room and both Longhouse characterizations deliberately expanded the parent test suite, while the 886-line room, 334-line Longhouse HTTP-preparation, and 228-line Longhouse turn-preparation implementation boundaries moved into private owners. CORS, metrics, pure event adapters, ordinary turn/session-read workspace policy, model catalog and roles, security-sensitive settings, the home-sandboxed filesystem surface, project-registry adapters, Slack Canvas host fulfillment, component-interaction fulfillment, bounded advisor execution, request/permission control records, recall tally storage, persistent-room lifecycle/orchestration, and Longhouse advisory preparation now have independent private owners. The 238-line request-control module owns storage mechanics and exact bounded transitions only. The 52-line recall-registry module owns memory-only tally construction, casting, poison recovery, and named removal only. The current 2,081-line persistent-room module owns the shared handle/lock adapters, durable-room HTTP lifecycle/paging, named-agent auto-convene path, and durable room SSE tail/disconnect cleanup; `AppState`, startup, router composition, call persistence/retries, and LiveKit authorization remain in `main.rs`. The 349-line Longhouse preparation module owns only state-free prepare/inspect/workflow HTTP adaptation. The 246-line Longhouse turn-preparation module owns only the fresh gate, rendering/application, deadline, and read-only blocking preparation helper; routes, all three call sites, librarian/spec compatibility, governance state, and `ocean-longhouse` algorithms remain outside it. Characterization tests deliberately keep checked contracts visible even when they increase raw line count.
 
 ## Course from here
 
-1. Follow the [final 28% execution handoff](specs/2026-07-16-ocean-daemon-phase2c-final-28-percent-handoff.md): separately manifest Longhouse governance next, then calls before turn/SSE orchestration.
+1. Characterize, review, and extract the narrowed [Longhouse topic-projection manifest](specs/2026-07-16-ocean-daemon-longhouse-topic-projection-extraction-manifest.md), then separately manifest the coupled real-convene/title-control boundary before calls and turn/SSE orchestration.
 2. Keep filesystem/project policy, permission authority, settings policy, host/extension ownership, and call-site orchestration fixed while domain boundaries move.
 3. Treat the deferred librarian security disposition and any remaining state-registry or control-plane boundary as their own checkpoints; do not bundle them with a domain move.
 4. Move turn/SSE orchestration last.
@@ -123,6 +126,7 @@ A wave is complete only when:
 - [Persistent-rooms extraction manifest](specs/2026-07-15-ocean-daemon-persistent-rooms-extraction-manifest.md)
 - [Longhouse-preparation extraction manifest](specs/2026-07-15-ocean-daemon-longhouse-preparation-extraction-manifest.md)
 - [Longhouse turn-preparation extraction manifest](specs/2026-07-15-ocean-daemon-longhouse-turn-preparation-extraction-manifest.md)
+- [Longhouse topic-projection extraction manifest](specs/2026-07-16-ocean-daemon-longhouse-topic-projection-extraction-manifest.md)
 - [Final 28% execution handoff](specs/2026-07-16-ocean-daemon-phase2c-final-28-percent-handoff.md)
 - [Daemon local contract](../crates/ocean-daemon/AGENTS.md)
 - [Runtime operator guide](OCEAN_RUNTIME_OPERATOR_GUIDE.md)
