@@ -169,9 +169,11 @@ pub enum Action {
         id: u64,
         toggle: bool,
     },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     DictationCaptureStarted {
         id: u64,
     },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     DictationLevel {
         id: u64,
         level: f32,

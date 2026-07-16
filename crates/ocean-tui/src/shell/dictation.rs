@@ -9,8 +9,11 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::action::Action;
 
+#[cfg(target_os = "macos")]
 const OUTPUT_SAMPLE_RATE: u32 = 16_000;
+#[cfg(target_os = "macos")]
 const MAX_CAPTURE_SECS: u64 = 30;
+#[cfg(target_os = "macos")]
 const MIN_CAPTURE_MS: u64 = 120;
 
 #[derive(Clone, Copy)]
@@ -310,6 +313,7 @@ fn microphone_error(context: &str, error: impl std::fmt::Display) -> String {
     format!("{context}: {error}; check System Settings → Privacy & Security → Microphone")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn normalized_level(rms: f32) -> f32 {
     if !rms.is_finite() || rms <= 0.0 {
         return 0.0;
@@ -318,6 +322,7 @@ fn normalized_level(rms: f32) -> f32 {
     ((20.0 * rms.log10() + 50.0) / 50.0).clamp(0.0, 1.0)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn resample_mono(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<i16> {
     if samples.is_empty() || input_rate == 0 || output_rate == 0 {
         return Vec::new();
@@ -340,6 +345,7 @@ fn resample_mono(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<i16>
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn pcm16_wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
     let data_len = samples
         .len()

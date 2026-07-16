@@ -3643,3 +3643,14 @@ area:      [repository]: history search, TUI lifecycle, and active contracts
 Closed the fresh review findings on the reconciled runtime/TUI checkpoint before publication. Hold-Space dictation now activates only after the Kitty keyboard protocol push succeeds. Final-round context occupancy clears on a normal turn start, an SSE continuity gap, or adoption of a turn whose start was missed. Persisted history search preflights a 64 MiB cumulative raw-session budget and enforces the same bound during reads so concurrent replacement or growth cannot bypass it; capacity failures return an explicit 503 response. Reconciled active route-count, Tauri prompt-versus-harness, launch-chooser, workspace-binding, and devlog-date documentation.
 
 Verification: focused history, capacity-response, terminal-protocol, context-lifecycle, and router tests passed; `cargo check --workspace`, `cargo build -p ocean-tui --release`, `cargo xtask docs-check`, `cargo xtask ci --compatibility`, the pinned Rust 1.88 MSRV lane, and the final canonical `cargo xtask ci` rerun passed. Two fresh reviewers found no remaining logic or documentation issue after the fixes.
+
+_________________________________________________________________________________
+time:      [02:34am] [16-07-26]
+agent:     [pi], [orchestrator]
+worktree:  [fix/reconciliation-review-20260716]
+type:      [fix]: keep macOS dictation warning-free on Linux
+area:      [frontend]: ocean-tui cross-platform compilation
+
+Hosted PR #301's Ubuntu denied-warning Clippy lane exposed macOS-only dictation producers and audio helpers as dead code on Linux. Kept the portable synthetic meter/WAV tests, marked only the two macOS-produced lifecycle variants as intentionally unconstructed on non-macOS production builds, and target-gated capture-only constants plus helper compilation. Runtime behavior and the macOS capture path are unchanged.
+
+Verification: all 356 TUI tests passed with 4 ignored; denied-warning all-target TUI Clippy, formatting, diff check, docs-check, and the release TUI build passed locally. Hosted Ubuntu rerun remains pending before merge.
