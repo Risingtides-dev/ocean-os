@@ -30,6 +30,9 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   voice credential (`OCEAN_OPENAI_REALTIME_API_KEY`,
   `OPENAI_REALTIME_API_KEY`, or auth-file `openai-realtime.api_key`). It must
   never inherit the agent `openai` API-key block or `openai-codex` OAuth.
+- The daemon default Realtime model is `gpt-realtime-2.1`; preserve that exact
+  ID in the upstream `session.model` body unless a surface explicitly supplies
+  a compatible per-request override.
 - Realtime `purpose: "planner"` is pre-session and propose-only: validate the
   registered project plus canonical live worktree before credential resolution,
   advertise only `propose_handoff`, and mutate only through the existing

@@ -3899,3 +3899,11 @@ type:      [bug report]: Realtime default model was stale
 area:      [backend]: OpenAI Realtime voice model
 
 Updated DEFAULT_REALTIME_MODEL from the stale `gpt-realtime-2` to the canonical GA id `gpt-realtime`. Verified against live OpenAI docs: the GA model is `gpt-realtime` (snapshot `gpt-realtime-2025-08-28`); the old id was a pre-release/preview identifier no longer current in the public API. Docstring now documents snapshot pinning as the override use case. All 11 voice_realtime tests pass.
+_________________________________________________________________________________
+time:      [10:02am] [16-07-26]
+agent:     [ocean] [gpt-5.6]
+worktree:  main
+type:      [bug report]: Restore operator-specified Realtime 2.1 model
+area:      [backend]: OpenAI Realtime voice model
+
+Corrected Ocean's Realtime default to the exact operator-provided model ID `gpt-realtime-2.1`. The prior change to `gpt-realtime` was an erroneous override based on a mismatched docs catalog page despite the operator supplying the current Agents SDK example. The owning daemon contract and upstream mint-body regression now pin `gpt-realtime-2.1`; explicit surface overrides remain supported. Verification: all 11 voice_realtime tests, workspace check, denied-warning daemon Clippy, docs-check, and diff-check pass.
