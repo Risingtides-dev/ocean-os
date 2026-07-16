@@ -1,7 +1,7 @@
 # Ocean Daemon Longhouse Turn Preparation Extraction Manifest
 
 **Date:** 2026-07-15  
-**Status:** Characterization complete and independently reviewed; extraction authorized
+**Status:** Ready for publication; characterization, extraction, dedicated-target validation, compatibility/MSRV/local CI, and independent review passed; hosted CI and merge pending
 **Owner:** Ocean OS  
 **Rollback point:** characterization commit `f6e8efe`
 
@@ -195,6 +195,16 @@ Commit `f6e8efe` adds three extraction-focused daemon tests and a comment-only a
 Existing environment tests now also cover trimmed opt-out and near-miss values, and the fail-open test covers whitespace-only prompts. The prior “detached and harmless” source comment now correctly distinguishes read-only/no-authority behavior from the retained uncancelled-task/cache-lock availability risk; runtime behavior is unchanged.
 
 Focused groups and all 351 daemon tests passed serialized in dedicated target `/tmp/ocean-target-longhouse-turn-prep-char`; formatting and diff checks passed. Independent Codex review iteratively identified and verified fixes for self-satisfying deadline checks, closure/ranking and spawned-task boundaries, full-module authority scanning, call-site prerequisites/assignments, cwd propagation, real-file privacy coverage, exact helper-warning bodies, wired-owner detection, and timeout fail-open coverage. Final review reported that the characterization matches the approved behavior-neutral boundary with no unresolved medium-or-higher finding.
+
+## Extraction result
+
+Commit `4eea76b` moves the exact characterized 228-line implementation boundary into the 239-line private `crates/ocean-daemon/src/longhouse_turn_preparation.rs` owner, including its module header/import and only the required `pub(super)` visibility. `main.rs` retains all three turn call sites, their exact await/order, parent characterization tests, route/runtime/request/event/prompt-layer authority, and test-only imports. The sibling `longhouse_preparation.rs` changes only its private gate import path.
+
+Comparison against rollback `f6e8efe` found the five moved definitions token-identical apart from `pub(super)` and rustfmt signature/constant wrapping. Focused characterization/render/application/gate/preparation/deadline/HTTP-adapter/router groups passed. All 351 daemon tests passed serialized; 118 Longhouse tests and one doc test passed with one host-dependent ignore; workspace test compilation and `livekit-tap`/`deepgram-stt` checks passed. Compatibility, pinned Rust 1.88 MSRV, canonical local CI, formatting, docs, and diff checks passed in the dedicated wave target.
+
+Fresh independent Codex correctness review and Claude security/architecture review both reported PASS. They confirmed exact bodies and call-site ordering, fixed-field helper warning privacy, cwd/root propagation, cache/ranking inside the blocking closure, 250 ms timeout and all fail-open results, diagnostic gate parity, and no added HTTP/runtime/permission/event/persistence/governance/call/librarian authority. Residual delegated loader path logs, unsanitized advisory text, uncancelled timed-out work/cache-lock amplification, and the separate librarian symlink-retarget finding remain unchanged. Live daemon deployment/supervision remains owned by the concurrent operator workstream and was not performed.
+
+Hosted default-parallel macOS/Ubuntu CI, pinned Rust 1.88, cargo-deny, and merge remain pending.
 
 ## Validation matrix
 
