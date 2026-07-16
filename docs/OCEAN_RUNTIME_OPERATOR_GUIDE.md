@@ -520,6 +520,7 @@ POST   /v1/longhouse/demo                 scripted demo harness (fake events)
 POST   /v1/longhouse/convene              convene a real council; events on /v1/agent/events
 POST   /v1/council/convene                alias of /v1/longhouse/convene (same handler)
 POST   /v1/longhouse/prepare              read-only pre-turn prep: compact skill briefs (advisory, no gate bypass)
+POST   /v1/longhouse/inspect              explain the exact prep ranking with path-redacted compact matches/counts (advisory, no raw-prompt/body/path echo)
 POST   /v1/skills/query                   skill-librarian prefilter: rank skills for an intent (advisory, read-only)
 POST   /v1/skills/fetch                   skill-librarian fetch: one skill's full body by id (advisory, read-only)
 POST   /v1/subagents/spec                 compatibility: assemble advisory spec only (no spawn; extension migration pending)

@@ -3357,3 +3357,11 @@ Verification:
 - `cargo clippy --workspace --all-targets -- -D warnings` passed
 - `cargo fmt --all`, `cargo xtask docs-check`, and `git diff --check` passed
 _________________________________________________________________________________
+
+time:      [08:07pm] [15-07-26]
+agent:     [codex], [gpt-5.6], [worker]
+worktree:  pi/consult-inspect-20260715
+type:      [feature]: add bounded Longhouse preparation inspection
+area:      [backend]: explained deterministic consult ranking
+
+Added serializable explained skill/workflow ranking inspection as a projection of the existing scorer, relevance floor, de-duplication, and tie-break path, retaining the exact ordinary `TurnPrep` internally. Mounted read-only `POST /v1/longhouse/inspect` with the prepare request/cwd/cache/top-N behavior, consult-enabled state, indexed/candidate counts, and path-redacted compact selected evidence; the wire response returns only contributing terms, not the raw prompt, session, cwd, source paths, or bodies. Kept ordinary automatic preparation on its original lightweight allocation path and updated route contracts and operator/Longhouse documentation without changing prompt injection or ranking policy.

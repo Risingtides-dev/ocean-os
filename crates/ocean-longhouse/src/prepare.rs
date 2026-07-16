@@ -179,6 +179,40 @@ impl TurnPrep {
     }
 }
 
+/// One selected skill together with the exact deterministic ranking evidence.
+/// Only compact metadata is exposed; the skill body is never loaded or returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedSkillMatch {
+    pub brief: SkillBrief,
+    pub score: u32,
+    pub matched_prompt_terms: Vec<String>,
+}
+
+/// One selected workflow together with the exact deterministic ranking evidence.
+/// Only frontmatter-derived compact metadata is exposed; the body is never returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedWorkflowMatch {
+    pub brief: WorkflowBrief,
+    pub score: u32,
+    pub matched_prompt_terms: Vec<String>,
+}
+
+/// Read-only inspection of the ordinary preparation ranking.
+///
+/// `prep` is the exact ordinary [`TurnPrep`] for the same brief and cap. Candidate
+/// counts are the de-duplicated entries that cleared the ordinary relevance floor,
+/// before `top_n` truncation; indexed counts are all compact briefs in each index.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPrepInspection {
+    pub skills_indexed: usize,
+    pub skill_candidates: usize,
+    pub workflows_indexed: usize,
+    pub workflow_candidates: usize,
+    pub selected_skills: Vec<ExplainedSkillMatch>,
+    pub selected_workflows: Vec<ExplainedWorkflowMatch>,
+    pub prep: TurnPrep,
+}
+
 /// Configurable roots for the skill index. Defaults to the documented sources
 /// (`docs/LONGHOUSE.md` §"Skill Librarian"). Any root may be absent on disk — the
 /// loader skips missing dirs silently.
@@ -308,12 +342,7 @@ impl SkillIndex {
     /// Deterministic + fail-open: an empty/irrelevant prompt, an empty skill
     /// index, or a missing workflow dir all yield empty results without error.
     pub fn prepare(&self, brief: &TurnBrief) -> TurnPrep {
-        let workflows = workflows_for_brief(brief, DEFAULT_TOP_N);
-        TurnPrep {
-            skills: self.rank_skills(&brief.prompt, DEFAULT_TOP_N),
-            sops: Vec::new(),
-            workflows,
-        }
+        self.prepare_top_n(brief, DEFAULT_TOP_N)
     }
 
     /// Same as [`prepare`](Self::prepare) but with an explicit result cap
@@ -324,6 +353,44 @@ impl SkillIndex {
             skills: self.rank_skills(&brief.prompt, top_n),
             sops: Vec::new(),
             workflows,
+        }
+    }
+
+    /// Inspect the exact ordinary ranking with the default result cap.
+    pub fn inspect(&self, brief: &TurnBrief) -> TurnPrepInspection {
+        self.inspect_top_n(brief, DEFAULT_TOP_N)
+    }
+
+    /// Inspect the exact ordinary ranking with an explicit result cap.
+    ///
+    /// This is a projection of the same scored candidate lists used by
+    /// [`prepare_top_n`](Self::prepare_top_n), not a second debug scorer. It
+    /// reports only compact briefs, scores, and matched prompt terms.
+    pub fn inspect_top_n(&self, brief: &TurnBrief, top_n: usize) -> TurnPrepInspection {
+        let (selected_skills, skill_candidates) = self.rank_skills_explained(&brief.prompt, top_n);
+        let workflow_inspection = workflows_inspection_for_brief(brief, top_n);
+
+        let prep = TurnPrep {
+            skills: selected_skills
+                .iter()
+                .map(|selected| selected.brief.clone())
+                .collect(),
+            sops: Vec::new(),
+            workflows: workflow_inspection
+                .selected
+                .iter()
+                .map(|selected| selected.brief.clone())
+                .collect(),
+        };
+
+        TurnPrepInspection {
+            skills_indexed: self.len(),
+            skill_candidates,
+            workflows_indexed: workflow_inspection.indexed,
+            workflow_candidates: workflow_inspection.candidates,
+            selected_skills,
+            selected_workflows: workflow_inspection.selected,
+            prep,
         }
     }
 
@@ -363,31 +430,73 @@ impl SkillIndex {
             return Vec::new();
         }
 
-        let mut scored: Vec<(u32, &SkillBrief)> = self
-            .skills
-            .iter()
-            .filter_map(|skill| {
-                let score = relevance_score(&prompt_terms, skill);
-                (score >= MIN_RELEVANCE_SCORE).then_some((score, skill))
-            })
-            .collect();
-
-        // Highest score first; deterministic tie-break on name then path.
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.1.name.cmp(&b.1.name))
-                .then_with(|| a.1.source_path.cmp(&b.1.source_path))
-        });
-
-        // De-dupe by (name, source_path): the same skill present under two roots
-        // must not occupy two slots. Keep the first (highest-scored) occurrence.
+        // Preserve the automatic hook's original allocation profile: score and
+        // sort once, then stop de-duplicating as soon as `top_n` is filled. Only
+        // explicit inspection materializes explanations and counts every candidate.
         let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
-        scored
+        self.scored_skills(&prompt_terms)
             .into_iter()
             .filter(|(_, skill)| seen.insert((skill.name.as_str(), skill.source_path.as_path())))
             .take(top_n)
             .map(|(_, skill)| skill.clone())
             .collect()
+    }
+
+    /// Inspect the authoritative scored skill order. Candidate count is measured
+    /// after the ordinary de-duplication rule and before the result cap; matched
+    /// term strings are allocated only for selected inspection entries.
+    fn rank_skills_explained(
+        &self,
+        prompt: &str,
+        top_n: usize,
+    ) -> (Vec<ExplainedSkillMatch>, usize) {
+        if self.skills.is_empty() {
+            return (Vec::new(), 0);
+        }
+
+        let prompt_terms = tokenize(prompt);
+        if prompt_terms.is_empty() {
+            return (Vec::new(), 0);
+        }
+
+        let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
+        let mut selected = Vec::new();
+        let mut candidate_count = 0usize;
+        for (score, skill) in self.scored_skills(&prompt_terms) {
+            if !seen.insert((skill.name.as_str(), skill.source_path.as_path())) {
+                continue;
+            }
+            candidate_count += 1;
+            if selected.len() < top_n {
+                let evidence = relevance_evidence(&prompt_terms, &skill.name, &skill.description);
+                debug_assert_eq!(score, evidence.score);
+                selected.push(ExplainedSkillMatch {
+                    brief: skill.clone(),
+                    score,
+                    matched_prompt_terms: evidence.matched_prompt_terms,
+                });
+            }
+        }
+        (selected, candidate_count)
+    }
+
+    /// Score and sort relevant skills once. Both ordinary preparation and
+    /// inspection project this same order, floor, and tie-break path.
+    fn scored_skills<'a>(&'a self, prompt_terms: &[String]) -> Vec<(u32, &'a SkillBrief)> {
+        let mut scored: Vec<_> = self
+            .skills
+            .iter()
+            .filter_map(|skill| {
+                let score = relevance_score(prompt_terms, &skill.name, &skill.description);
+                (score >= MIN_RELEVANCE_SCORE).then_some((score, skill))
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.name.cmp(&b.1.name))
+                .then_with(|| a.1.source_path.cmp(&b.1.source_path))
+        });
+        scored
     }
 }
 
@@ -549,29 +658,63 @@ impl WorkflowIndex {
             return Vec::new();
         }
 
-        let mut scored: Vec<(u32, &WorkflowBrief)> = self
+        let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
+        self.scored_workflows(&prompt_terms)
+            .into_iter()
+            .filter(|(_, workflow)| {
+                seen.insert((workflow.name.as_str(), workflow.source_path.as_path()))
+            })
+            .take(top_n)
+            .map(|(_, workflow)| workflow.clone())
+            .collect()
+    }
+
+    fn rank_explained(&self, prompt: &str, top_n: usize) -> (Vec<ExplainedWorkflowMatch>, usize) {
+        if self.workflows.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let prompt_terms = tokenize(prompt);
+        if prompt_terms.is_empty() {
+            return (Vec::new(), 0);
+        }
+
+        let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
+        let mut selected = Vec::new();
+        let mut candidate_count = 0usize;
+        for (score, workflow) in self.scored_workflows(&prompt_terms) {
+            if !seen.insert((workflow.name.as_str(), workflow.source_path.as_path())) {
+                continue;
+            }
+            candidate_count += 1;
+            if selected.len() < top_n {
+                let evidence =
+                    relevance_evidence(&prompt_terms, &workflow.name, &workflow.description);
+                debug_assert_eq!(score, evidence.score);
+                selected.push(ExplainedWorkflowMatch {
+                    brief: workflow.clone(),
+                    score,
+                    matched_prompt_terms: evidence.matched_prompt_terms,
+                });
+            }
+        }
+        (selected, candidate_count)
+    }
+
+    fn scored_workflows<'a>(&'a self, prompt_terms: &[String]) -> Vec<(u32, &'a WorkflowBrief)> {
+        let mut scored: Vec<_> = self
             .workflows
             .iter()
-            .filter_map(|wf| {
-                let score = workflow_relevance_score(&prompt_terms, wf);
-                (score >= MIN_RELEVANCE_SCORE).then_some((score, wf))
+            .filter_map(|workflow| {
+                let score = relevance_score(prompt_terms, &workflow.name, &workflow.description);
+                (score >= MIN_RELEVANCE_SCORE).then_some((score, workflow))
             })
             .collect();
-
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.name.cmp(&b.1.name))
                 .then_with(|| a.1.source_path.cmp(&b.1.source_path))
         });
-
-        // De-dupe by (name, source_path) — same discipline as skills.
-        let mut seen: std::collections::HashSet<(&str, &Path)> = std::collections::HashSet::new();
         scored
-            .into_iter()
-            .filter(|(_, wf)| seen.insert((wf.name.as_str(), wf.source_path.as_path())))
-            .take(top_n)
-            .map(|(_, wf)| wf.clone())
-            .collect()
     }
 }
 
@@ -698,32 +841,36 @@ pub fn clear_workflow_cache() {
 /// [`SkillIndex::prepare_top_n`] use to populate `TurnPrep::workflows`.
 fn workflows_for_brief(brief: &TurnBrief, top_n: usize) -> Vec<WorkflowBrief> {
     let cwd = match brief.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
-        Some(c) => c,
+        Some(cwd) => cwd,
         None => return Vec::new(),
     };
     let roots = WorkflowRoots::for_cwd(cwd);
-    let index = cached_workflows_for(&roots);
-    index.rank(&brief.prompt, top_n)
+    cached_workflows_for(&roots).rank(&brief.prompt, top_n)
 }
 
-/// Relevance score for a workflow against the prompt — identical algorithm to
-/// skill scoring: term-set, name-weighted, coverage bonus.
-fn workflow_relevance_score(prompt_terms: &[String], wf: &WorkflowBrief) -> u32 {
-    let name = wf.name.to_ascii_lowercase();
-    let desc = wf.description.to_ascii_lowercase();
+#[derive(Default)]
+struct WorkflowInspection {
+    indexed: usize,
+    candidates: usize,
+    selected: Vec<ExplainedWorkflowMatch>,
+}
 
-    let mut weighted = 0u32;
-    let mut distinct_hits = 0u32;
-    for term in prompt_terms {
-        if name.contains(term.as_str()) {
-            weighted += NAME_HIT;
-            distinct_hits += 1;
-        } else if desc.contains(term.as_str()) {
-            weighted += DESC_HIT;
-            distinct_hits += 1;
-        }
+/// Load the same cwd-confined cached workflow index as ordinary preparation,
+/// then derive the explicit inspection projection from its authoritative score.
+fn workflows_inspection_for_brief(brief: &TurnBrief, top_n: usize) -> WorkflowInspection {
+    let cwd = match brief.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
+        Some(c) => c,
+        None => return WorkflowInspection::default(),
+    };
+    let roots = WorkflowRoots::for_cwd(cwd);
+    let index = cached_workflows_for(&roots);
+    let indexed = index.len();
+    let (selected, candidates) = index.rank_explained(&brief.prompt, top_n);
+    WorkflowInspection {
+        indexed,
+        candidates,
+        selected,
     }
-    weighted + distinct_hits
 }
 
 // ── Skill scoring ─────────────────────────────────────────────────────────────
@@ -1049,25 +1196,53 @@ fn is_stop_word(word: &str) -> bool {
 /// anywhere (the coverage bonus), so a skill relevant on several axes outranks
 /// one with a single incidental collision. A skill that repeats a word in a long
 /// description gains nothing extra — only *distinct* term coverage counts.
-fn relevance_score(prompt_terms: &[String], skill: &SkillBrief) -> u32 {
-    let name = skill.name.to_ascii_lowercase();
-    let desc = skill.description.to_ascii_lowercase();
+#[derive(Debug)]
+struct RelevanceEvidence {
+    score: u32,
+    matched_prompt_terms: Vec<String>,
+}
 
+/// The single relevance algorithm used by ordinary preparation and inspection
+/// for both skills and workflows. The callback lets explicit inspection retain
+/// matched terms while the default-on automatic hook computes scores without
+/// allocating per-candidate evidence.
+fn analyze_relevance(
+    prompt_terms: &[String],
+    name: &str,
+    description: &str,
+    mut matched_term: impl FnMut(&str),
+) -> u32 {
+    let name = name.to_ascii_lowercase();
+    let desc = description.to_ascii_lowercase();
     let mut weighted = 0u32;
     let mut distinct_hits = 0u32;
     for term in prompt_terms {
         if name.contains(term.as_str()) {
             weighted += NAME_HIT;
             distinct_hits += 1;
+            matched_term(term);
         } else if desc.contains(term.as_str()) {
             weighted += DESC_HIT;
             distinct_hits += 1;
+            matched_term(term);
         }
     }
-
-    // Coverage bonus: reward breadth of distinct matched terms, not depth of
-    // repetition. Zero hits ⇒ zero score (the skill is simply irrelevant).
     weighted + distinct_hits
+}
+
+fn relevance_score(prompt_terms: &[String], name: &str, description: &str) -> u32 {
+    analyze_relevance(prompt_terms, name, description, |_| {})
+}
+
+fn relevance_evidence(prompt_terms: &[String], name: &str, description: &str) -> RelevanceEvidence {
+    let mut matched_prompt_terms = Vec::new();
+    let score = analyze_relevance(prompt_terms, name, description, |term| {
+        matched_prompt_terms.push(term.to_string());
+    });
+    RelevanceEvidence {
+        score,
+        matched_prompt_terms,
+    }
 }
 
 /// Score for a prompt term found in a skill's **name** — the strongest signal.
@@ -1678,6 +1853,74 @@ mod tests {
             prep.workflows.is_empty(),
             "no cwd → no workflow scan → empty workflows"
         );
+    }
+
+    #[test]
+    fn inspection_has_exact_prepare_parity_and_deterministic_explanations() {
+        let guard = ttl_env_guard();
+        clear_workflow_cache();
+        std::env::set_var("OCEAN_LONGHOUSE_SKILL_TTL_SECS", "0");
+
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "docs/orchestrator/workflows/zeta.md",
+            "---\nname: zorpquok-zeta\ndescription: alpha workflow\n---\n",
+        );
+        write(
+            tmp.path(),
+            "docs/orchestrator/workflows/alpha.md",
+            "---\nname: zorpquok-alpha\ndescription: zeta workflow\n---\n",
+        );
+        let index = SkillIndex::from_briefs(vec![
+            brief("Zorpquok Zeta", "alpha skill"),
+            brief("Zorpquok Alpha", "zeta skill"),
+            brief("Unrelated", "does not match"),
+        ]);
+        let turn = TurnBrief {
+            prompt: "zeta zorpquok alpha zeta".to_string(),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let inspection = index.inspect_top_n(&turn, 1);
+        assert_eq!(inspection.prep, index.prepare_top_n(&turn, 1));
+        assert_eq!(inspection.skills_indexed, 3);
+        assert_eq!(inspection.skill_candidates, 2);
+        assert_eq!(inspection.workflows_indexed, 2);
+        assert_eq!(inspection.workflow_candidates, 2);
+        assert_eq!(inspection.selected_skills.len(), 1);
+        assert_eq!(inspection.selected_workflows.len(), 1);
+        assert_eq!(inspection.selected_skills[0].brief.name, "Zorpquok Alpha");
+        assert_eq!(
+            inspection.selected_workflows[0].brief.name,
+            "zorpquok-alpha"
+        );
+        assert_eq!(
+            inspection.selected_skills[0].matched_prompt_terms,
+            ["zeta", "zorpquok", "alpha"]
+        );
+        assert_eq!(inspection.selected_skills[0].score, 8);
+        assert_eq!(inspection, index.inspect_top_n(&turn, 1));
+        assert_eq!(
+            serde_json::to_value(&inspection.prep).unwrap(),
+            serde_json::to_value(index.prepare_top_n(&turn, 1)).unwrap(),
+            "inspection prep must remain serde-equivalent to ordinary prepare"
+        );
+
+        clear_workflow_cache();
+        drop(guard);
+    }
+
+    #[test]
+    fn inspection_zero_cap_reports_candidates_but_selects_empty_prep() {
+        let index = sample_index();
+        let turn = TurnBrief::from_prompt("postgres remotion slack video schema messaging");
+        let inspection = index.inspect_top_n(&turn, 0);
+        assert!(inspection.prep.is_empty());
+        assert!(inspection.selected_skills.is_empty());
+        assert!(inspection.skill_candidates > 0);
+        assert_eq!(inspection.prep, index.prepare_top_n(&turn, 0));
     }
 
     /// The workflow cache serves stale data on a cache hit and re-scans on TTL=0.

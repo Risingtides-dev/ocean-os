@@ -87,6 +87,14 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
   body when `topic_id` is not a valid UUID, `404` when the id is unknown — never
   a panic.
 - `POST /v1/longhouse/prepare` — read-only pre-turn skill/SOP preparation.
+- `POST /v1/longhouse/inspect` — read-only inspection of that exact preparation
+  ranking. It accepts the same brief and `top_n`, uses the same cwd-scoped cached
+  indexes, scorer, floor, de-duplication, and tie-breaks, and returns indexed and
+  candidate counts plus the selected compact briefs, scores, deterministic
+  contributing prompt terms, and a path-redacted projection of the exact ordinary
+  `prep`. The response reports whether the automatic consult is enabled but does
+  not alter it; it never returns the raw prompt, session id, cwd, source paths, or
+  full bodies, runs a turn, grants capabilities, or invokes a model.
 - `POST /v1/longhouse/claim` — daemon-held `claim_outcome` gate (OCEAN-272).
 - `POST /v1/longhouse/board` — `board_post` append note/evidence (OCEAN-272).
 - `POST /v1/longhouse/revoke` — hard recall of a persisted title (OCEAN-272).
@@ -142,6 +150,8 @@ Selection path:
 3. Daemon injects those briefs into the main Ocean agent.
 
 Model-based reranking is future work; the shipped preparation path makes no LLM call.
+The explained selection can be inspected through `POST /v1/longhouse/inspect`;
+inspection is a projection of this same scorer rather than a second debug ranker.
 
 ## Extension-owned subagent boundary
 

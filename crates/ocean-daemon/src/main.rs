@@ -1199,6 +1199,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/longhouse/convene",
         "POST /v1/council/convene",
         "POST /v1/longhouse/prepare",
+        "POST /v1/longhouse/inspect",
         "POST /v1/skills/query",
         "POST /v1/skills/fetch",
         "POST /v1/subagents/spec",
@@ -2240,6 +2241,9 @@ fn longhouse_routes() -> Router<AppState> {
         // Read-only pre-turn prep step — the "first safe integration slice"
         // (OCEAN-226). Advisory only; no gate, no side effect.
         .route("/v1/longhouse/prepare", post(longhouse_prepare))
+        // Read-only ranking inspection: same request, roots, caches, scorer,
+        // tie-breaks, and cap as prepare; returns compact evidence and exact prep.
+        .route("/v1/longhouse/inspect", post(longhouse_inspect))
         // Skill-librarian query→fetch pair (OCEAN-281): the same SkillIndex the
         // prep step uses, exposed as a standalone library browse — `query`
         // ranks, `fetch` returns one skill's full body. Advisory + read-only.
@@ -2690,6 +2694,107 @@ struct LonghousePrepareRequest {
     top_n: Option<usize>,
 }
 
+/// Path-redacted wire projection for explicit ranking inspection. Internal
+/// preparation retains source paths for later body fetches; this diagnostic does
+/// not disclose the caller's cwd or home-library layout.
+#[derive(serde::Serialize)]
+struct LonghouseInspectSkillBrief {
+    name: String,
+    description: String,
+    source: ocean_longhouse::SkillSource,
+}
+
+impl From<ocean_longhouse::SkillBrief> for LonghouseInspectSkillBrief {
+    fn from(brief: ocean_longhouse::SkillBrief) -> Self {
+        Self {
+            name: brief.name,
+            description: brief.description,
+            source: brief.source,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct LonghouseInspectWorkflowBrief {
+    name: String,
+    description: String,
+}
+
+impl From<ocean_longhouse::WorkflowBrief> for LonghouseInspectWorkflowBrief {
+    fn from(brief: ocean_longhouse::WorkflowBrief) -> Self {
+        Self {
+            name: brief.name,
+            description: brief.description,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct LonghouseInspectSopBrief {
+    name: String,
+    description: String,
+}
+
+impl From<ocean_longhouse::SopBrief> for LonghouseInspectSopBrief {
+    fn from(brief: ocean_longhouse::SopBrief) -> Self {
+        Self {
+            name: brief.name,
+            description: brief.description,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct LonghouseInspectSkillMatch {
+    brief: LonghouseInspectSkillBrief,
+    score: u32,
+    matched_prompt_terms: Vec<String>,
+}
+
+impl From<ocean_longhouse::ExplainedSkillMatch> for LonghouseInspectSkillMatch {
+    fn from(selected: ocean_longhouse::ExplainedSkillMatch) -> Self {
+        Self {
+            brief: selected.brief.into(),
+            score: selected.score,
+            matched_prompt_terms: selected.matched_prompt_terms,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct LonghouseInspectWorkflowMatch {
+    brief: LonghouseInspectWorkflowBrief,
+    score: u32,
+    matched_prompt_terms: Vec<String>,
+}
+
+impl From<ocean_longhouse::ExplainedWorkflowMatch> for LonghouseInspectWorkflowMatch {
+    fn from(selected: ocean_longhouse::ExplainedWorkflowMatch) -> Self {
+        Self {
+            brief: selected.brief.into(),
+            score: selected.score,
+            matched_prompt_terms: selected.matched_prompt_terms,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct LonghouseInspectPrep {
+    skills: Vec<LonghouseInspectSkillBrief>,
+    sops: Vec<LonghouseInspectSopBrief>,
+    workflows: Vec<LonghouseInspectWorkflowBrief>,
+}
+
+impl From<ocean_longhouse::TurnPrep> for LonghouseInspectPrep {
+    fn from(prep: ocean_longhouse::TurnPrep) -> Self {
+        Self {
+            skills: prep.skills.into_iter().map(Into::into).collect(),
+            sops: prep.sops.into_iter().map(Into::into).collect(),
+            workflows: prep.workflows.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 /// `POST /v1/longhouse/prepare` — the **read-only pre-turn preparation step**,
 /// the "first safe integration slice" from `docs/LONGHOUSE.md` §"First safe
 /// integration slice" (lines 101-115). This is the first real consumer of
@@ -2763,6 +2868,62 @@ async fn longhouse_prepare(Json(req): Json<LonghousePrepareRequest>) -> Json<ser
         // "no library on disk" from "library present, nothing matched").
         "skills_indexed": skills_indexed,
         "prep": prep,
+    }))
+}
+
+/// `POST /v1/longhouse/inspect` — explain the exact deterministic selection that
+/// ordinary preparation would return. This is advisory and read-only: it does
+/// not run a turn, grant capabilities, invoke a model, or change prompt injection.
+/// It returns only contributing prompt terms and path-redacted compact metadata,
+/// never the raw submitted prompt, session id, cwd, or any skill/workflow body.
+async fn longhouse_inspect(Json(req): Json<LonghousePrepareRequest>) -> Json<serde_json::Value> {
+    let brief = ocean_longhouse::TurnBrief {
+        session_id: req.session_id.unwrap_or_default(),
+        prompt: req.prompt,
+        cwd: req.cwd.clone(),
+        client_type: req.client_type,
+    };
+    let top_n = req.top_n;
+
+    // Identical cwd-confined roots and process-wide cache as `/prepare`. Only
+    // `cwd/skills` and `cwd/docs/orchestrator/workflows` are considered locally;
+    // source paths remain internal and are redacted from the response below.
+    let inspection = tokio::task::spawn_blocking(move || {
+        let roots = match brief.cwd.as_deref() {
+            Some(cwd) if !cwd.is_empty() => ocean_longhouse::SkillRoots::for_cwd(cwd),
+            _ => ocean_longhouse::SkillRoots::default(),
+        };
+        let index = ocean_longhouse::cached_index_for(&roots);
+        match top_n {
+            Some(n) => index.inspect_top_n(&brief, n),
+            None => index.inspect(&brief),
+        }
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "longhouse inspect task failed; returning empty inspection");
+        ocean_longhouse::TurnPrepInspection::default()
+    });
+
+    Json(json!({
+        "ok": true,
+        "advisory": true,
+        "consult_enabled": longhouse_prepare_enabled(),
+        "skills_indexed": inspection.skills_indexed,
+        "skill_candidates": inspection.skill_candidates,
+        "workflows_indexed": inspection.workflows_indexed,
+        "workflow_candidates": inspection.workflow_candidates,
+        "selected_skills": inspection
+            .selected_skills
+            .into_iter()
+            .map(LonghouseInspectSkillMatch::from)
+            .collect::<Vec<_>>(),
+        "selected_workflows": inspection
+            .selected_workflows
+            .into_iter()
+            .map(LonghouseInspectWorkflowMatch::from)
+            .collect::<Vec<_>>(),
+        "prep": LonghouseInspectPrep::from(inspection.prep),
     }))
 }
 
@@ -16625,6 +16786,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn longhouse_inspect_is_advisory_bounded_and_does_not_echo_sensitive_text() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        let prompt_secret = "inspectnonce-prompt-secret";
+        let body_secret = "INSPECT_BODY_SECRET_MUST_NOT_LEAK";
+        plant_repo_skill_md(
+            &cwd,
+            "alpha",
+            "Inspectnonce Alpha",
+            "inspectnonce compact alpha",
+            body_secret,
+        );
+        plant_repo_skill_md(
+            &cwd,
+            "bravo",
+            "Inspectnonce Bravo",
+            "inspectnonce compact bravo",
+            "SECOND_PRIVATE_BODY",
+        );
+        // A matching sibling library is outside the requested cwd and must not
+        // be considered as a repo-local root.
+        plant_repo_skill(
+            tmp.path(),
+            "outside",
+            "Inspectnonce Outside",
+            "inspectnonce outside cwd",
+        );
+        let workflow_dir = cwd.join("docs/orchestrator/workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(
+            workflow_dir.join("inspect.md"),
+            "---\nname: inspectnonce-workflow\ndescription: inspectnonce compact workflow\n---\n\nPRIVATE_WORKFLOW_BODY\n",
+        )
+        .expect("workflow");
+
+        let req = LonghousePrepareRequest {
+            prompt: format!("{prompt_secret} inspectnonce"),
+            session_id: Some("private-session-id".to_string()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            client_type: Some("test-client".to_string()),
+            top_n: Some(1),
+        };
+        let Json(body) = longhouse_inspect(Json(req)).await;
+
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["advisory"], json!(true));
+        assert!(body["consult_enabled"].is_boolean());
+        assert_eq!(body["skill_candidates"], json!(2));
+        assert_eq!(body["workflow_candidates"], json!(1));
+        assert_eq!(body["selected_skills"].as_array().unwrap().len(), 1);
+        assert_eq!(body["selected_workflows"].as_array().unwrap().len(), 1);
+        assert_eq!(body["prep"]["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(body["prep"]["workflows"].as_array().unwrap().len(), 1);
+        assert!(body["selected_skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|selected| selected["brief"]["name"] != json!("Inspectnonce Outside")));
+
+        let wire = serde_json::to_string(&body).expect("response JSON");
+        assert!(!wire.contains("source_path"));
+        assert!(
+            !wire.contains(cwd.to_string_lossy().as_ref()),
+            "response leaked the caller's cwd"
+        );
+        assert_eq!(
+            body["selected_skills"][0]["matched_prompt_terms"],
+            json!(["inspectnonce"]),
+            "only contributing terms are returned, not the raw prompt"
+        );
+        for private in [
+            prompt_secret,
+            body_secret,
+            "SECOND_PRIVATE_BODY",
+            "PRIVATE_WORKFLOW_BODY",
+            "private-session-id",
+        ] {
+            assert!(
+                !wire.contains(private),
+                "response leaked private text: {private}"
+            );
+        }
+    }
+
+    #[test]
+    fn longhouse_inspect_route_is_in_the_mounted_contract() {
+        assert!(banner_routes().contains(&"POST /v1/longhouse/inspect"));
+        assert!(source_registered_routes().contains("POST /v1/longhouse/inspect"));
+    }
+
+    #[tokio::test]
     async fn skills_query_returns_ranked_brief_with_fetchable_id() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cwd = tmp.path();
@@ -18888,7 +19141,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            74,
+            75,
             "route baseline changed; review the manifest"
         );
 
