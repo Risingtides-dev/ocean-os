@@ -3654,3 +3654,12 @@ area:      [frontend]: ocean-tui cross-platform compilation
 Hosted PR #301's Ubuntu denied-warning Clippy lane exposed macOS-only dictation producers and audio helpers as dead code on Linux. Kept the portable synthetic meter/WAV tests, marked only the two macOS-produced lifecycle variants as intentionally unconstructed on non-macOS production builds, and target-gated capture-only constants plus helper compilation. Runtime behavior and the macOS capture path are unchanged.
 
 Verification: all 356 TUI tests passed with 4 ignored; denied-warning all-target TUI Clippy, formatting, diff check, docs-check, and the release TUI build passed locally. Hosted PR run `29477165601` then passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny.
+
+_________________________________________________________________________________
+time:      [03:39am] [16-07-26]
+agent:     [tui-dictation-ux], [gpt-5.4]
+worktree:  [main]
+type:      [fix]: use Option+Space as the composer dictation toggle
+area:      [ocean-tui]: keyboard routing, recording hints, and capture errors
+
+Replaced the unwanted F2-only dictation UX with the operator-requested macOS Option+Space toggle. Enhanced terminals route ALT+Space directly; terminals that encode Option+Space as a non-breaking-space character use a bounded fallback. The same chord starts and stops recording, Esc cancels, and plain Space remains ordinary typing without arming capture. Updated the live meter hint and short-recording errors, added key-level coverage for both Option encodings and plain-Space rejection, and refreshed the owning TUI contract.

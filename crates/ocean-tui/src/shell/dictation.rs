@@ -136,7 +136,7 @@ fn capture(
         match commands.try_recv() {
             Ok(CaptureCommand::Cancel) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             Ok(CaptureCommand::Finish) => {
-                return Err("recording too short — hold Space a little longer".into());
+                return Err("recording ended before the microphone opened — try again".into());
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -168,7 +168,7 @@ fn capture(
             return Err(error);
         }
         if started.elapsed() < Duration::from_millis(MIN_CAPTURE_MS) {
-            return Err("recording too short — hold Space a little longer".into());
+            return Err("recording too short — speak a little longer".into());
         }
 
         let input = samples

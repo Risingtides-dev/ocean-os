@@ -114,10 +114,12 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
   and scroll use Unicode cell width and follow the cursor row, never the final
   input row.
-- Composer dictation is local capture over daemon-owned STT: only after the
-  Kitty keyboard event-type protocol push succeeds, a quick Space tap remains
-  one space while a 180ms hold opens the mic and release stops it; `F2` is the
-  explicit toggle fallback.
+- Composer dictation is local capture over daemon-owned STT. `Option+Space`
+  (Crossterm `ALT+Space`, with macOS non-breaking-space fallback) toggles
+  recording on and off while chat is focused; ordinary Space remains ordinary
+  typing in every terminal. Esc cancels an active capture or transcription.
+  The Kitty keyboard disambiguation protocol remains enabled where supported so
+  modifier chords arrive distinctly.
   macOS capture is a bounded 30s mono WAV path in `shell/dictation.rs`; other
   platforms fail visibly without audio build dependencies. The live RMS history
   replaces the prompt box with a btop-style meter, while the draft/cursor remain

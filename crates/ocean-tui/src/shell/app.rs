@@ -890,6 +890,14 @@ impl App {
         Ok(())
     }
 
+    fn is_dictation_toggle_key(key: &crossterm::event::KeyEvent) -> bool {
+        key.kind == KeyEventKind::Press
+            && ((key.code == KeyCode::Char(' ') && key.modifiers == KeyModifiers::ALT)
+            // Terminal.app and terminals without enhanced-key reporting may
+            // encode macOS Option+Space as a literal non-breaking space.
+            || (key.code == KeyCode::Char('\u{a0}') && key.modifiers.is_empty()))
+    }
+
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
         // REPORT_EVENT_TYPES makes every enhanced-terminal key arrive again on
         // release. Space release owns the hold gesture; all other releases are
@@ -904,7 +912,7 @@ impl App {
         }
 
         // While the prompt box is a live meter/transcription state, ordinary
-        // input stays locked. Esc cancels; F2 is the explicit toggle fallback.
+        // input stays locked. Esc cancels; Option+Space stops the recording.
         if self.chat.dictation_blocks_input() {
             if let CrosstermEvent::Key(key) = &evt {
                 if key.kind == KeyEventKind::Press
@@ -919,7 +927,7 @@ impl App {
                     if let Some(id) = self.active_dictation_id {
                         self.dispatch(Action::DictationCancel { id });
                     }
-                } else if key.kind == KeyEventKind::Press && key.code == KeyCode::F(2) {
+                } else if Self::is_dictation_toggle_key(key) {
                     self.dispatch(Action::DictationToggle);
                 }
             }
@@ -1259,11 +1267,7 @@ impl App {
         }
         if let CrosstermEvent::Key(k) = evt {
             let chat_focused = self.focus == Focus::Center && self.center == Center::Chat;
-            if chat_focused
-                && k.kind == KeyEventKind::Press
-                && k.code == KeyCode::F(2)
-                && k.modifiers.is_empty()
-            {
+            if chat_focused && Self::is_dictation_toggle_key(&k) {
                 self.dispatch(Action::DictationToggle);
                 return;
             }
@@ -4923,6 +4927,30 @@ mod tests {
             .collect()
     }
 
+    fn key_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn option_space_is_the_dictation_toggle_without_claiming_plain_space() {
+        assert!(App::is_dictation_toggle_key(&key_with_modifiers(
+            KeyCode::Char(' '),
+            KeyModifiers::ALT,
+        )));
+        assert!(App::is_dictation_toggle_key(&key_with_modifiers(
+            KeyCode::Char('\u{a0}'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!App::is_dictation_toggle_key(&key_with_modifiers(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+    }
     fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> CrosstermEvent {
         CrosstermEvent::Key(crossterm::event::KeyEvent {
             code,

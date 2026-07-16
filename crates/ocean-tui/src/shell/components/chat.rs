@@ -1170,7 +1170,7 @@ impl ChatComponent {
                     elapsed % 60.0
                 ),
                 if self.dictation.toggle {
-                    "press F2 to transcribe".to_string()
+                    "Option+Space to transcribe".to_string()
                 } else {
                     "release SPACE to transcribe".to_string()
                 },
