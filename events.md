@@ -3581,14 +3581,14 @@ Verification:
 Release rebuild/install intentionally deferred until the current TUI tranche is complete.
 _________________________________________________________________________________
 
-## 2026-07-18 — Collapsed tool bursts and concise todo titles
+## 2026-07-15 — Collapsed tool bursts and concise todo titles
 
 - Added collapsed parent summaries for consecutive TUI tool-call bursts, with truthful running/done/failed counts and nested access to the existing independently expandable per-call drawers.
 - Added optional agent-supplied todo `title` labels bounded to 36 terminal cells while preserving authoritative full `text`; the Files tray prefers the concise title and legacy callers remain compatible.
 - Verification: `cargo test -p ocean-runtime --no-fail-fast` passed; focused and full tool-group/todo-title TUI coverage passed. Full `cargo test -p ocean-tui --no-fail-fast` reached 340 passed / 4 ignored with one unrelated concurrent selection failure at `shell::app::tests::drag_past_a_pane_edge_clamps_the_head_into_the_rect`.
 - worktree: `/Users/smathdaddy-macbook/ocean-os`
 
-## 2026-07-18 — Clamp chat selection to stable transcript rows
+## 2026-07-15 — Clamp chat selection to stable transcript rows
 
 - Fixed pane-edge chat drags so positions over composer/chrome saturate to the nearest rendered transcript row instead of mixing stable transcript and screen-relative row coordinates.
 - Updated the pane-edge regression to assert the stable-row contract while preserving pane-bounded columns and sibling-lane isolation.
@@ -3632,3 +3632,14 @@ type:      [maintenance]: reconcile mixed dirty checkout onto current upstream
 area:      [repository]: agent, runtime, daemon, TUI, and operator documentation
 
 Preserved the 35-path shared dirty checkout losslessly at recovery commit 5d86ab8, replayed it onto current origin/main c21f45a in an isolated integration worktree, and retained both sides of the sole additive conflict in ocean-daemon main composition (upstream Longhouse preparation extraction plus local bounded history search). Reviewed the combined mounted route/banner/operator-guide contract and advanced its explicit baseline from 75 to 76 for the two independently added routes. Because history, runtime tools, selection, render components, Files visibility, and dictation changes were interleaved inside shared App/chat/daemon/doc files, preserved a compiling semantic checkpoint instead of manufacturing path-split commits. Verification before commit: ocean-agent 160 passed; ocean-runtime 182 passed across targets; ocean-daemon 350 passed; ocean-tui 354 passed and 4 ignored; denied-warning TUI Clippy, format, docs-check, and diff checks passed. Recovery ref remains clean and untouched pending final workspace gate and promotion.
+
+_________________________________________________________________________________
+time:      [02:15am] [16-07-26]
+agent:     [pi], [orchestrator]
+worktree:  [fix/reconciliation-review-20260716]
+type:      [maintenance]: close reconciliation review findings
+area:      [repository]: history search, TUI lifecycle, and active contracts
+
+Closed the fresh review findings on the reconciled runtime/TUI checkpoint before publication. Hold-Space dictation now activates only after the Kitty keyboard protocol push succeeds. Final-round context occupancy clears on a normal turn start, an SSE continuity gap, or adoption of a turn whose start was missed. Persisted history search preflights a 64 MiB cumulative raw-session budget and enforces the same bound during reads so concurrent replacement or growth cannot bypass it; capacity failures return an explicit 503 response. Reconciled active route-count, Tauri prompt-versus-harness, launch-chooser, workspace-binding, and devlog-date documentation.
+
+Verification: focused history, capacity-response, terminal-protocol, context-lifecycle, and router tests passed; `cargo check --workspace`, `cargo build -p ocean-tui --release`, `cargo xtask docs-check`, `cargo xtask ci --compatibility`, the pinned Rust 1.88 MSRV lane, and the final canonical `cargo xtask ci` rerun passed. Two fresh reviewers found no remaining logic or documentation issue after the fixes.

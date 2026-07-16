@@ -395,8 +395,9 @@ cargo run -p ocean-tui -- --project /path/to/repo --session <uuid-or-prefix>
 
 
 `--session` resolves persisted Ocean sessions and binds their transcript/event
-stream directly in the workbench. Without it, the rail auto-resumes the newest
-UUID session for the launch project; `/new` explicitly starts clean.
+stream directly in the workbench. Without it, startup opens the centered chooser
+for a new session, explicit resume, blank editor, or graph; it never auto-resumes.
+`/new` explicitly starts clean after entering the workbench.
 
 
 ## HTTP API quick reference

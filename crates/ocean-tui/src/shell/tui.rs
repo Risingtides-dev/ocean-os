@@ -2,7 +2,7 @@
 //! hook that restores the terminal so a crash never leaves a wedged shell.
 
 use std::{
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     ops::{Deref, DerefMut},
 };
 
@@ -58,6 +58,20 @@ impl Drop for Guard {
     }
 }
 
+fn try_enable_key_releases(writer: &mut impl Write, supported: io::Result<bool>) -> bool {
+    if !matches!(supported, Ok(true)) {
+        return false;
+    }
+    execute!(
+        writer,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )
+    .is_ok()
+}
+
 pub fn init() -> io::Result<Guard> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -77,16 +91,10 @@ pub fn init() -> io::Result<Guard> {
     // Kitty keyboard protocol where supported (iTerm2, Ghostty, kitty, WezTerm):
     // disambiguation preserves modifier combos; event types make press-and-hold
     // gestures honest by reporting release separately from key repeat.
-    let key_releases = matches!(supports_keyboard_enhancement(), Ok(true));
-    if key_releases {
-        let _ = execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            )
-        );
-    }
+    // Capability detection is not enough: only intercept Space for hold-to-
+    // dictate after the protocol push itself succeeds. A failed push means the
+    // terminal will never send the release event needed to finish the gesture.
+    let key_releases = try_enable_key_releases(&mut stdout, supports_keyboard_enhancement());
     install_panic_hook();
     match Terminal::new(CrosstermBackend::new(stdout)) {
         Ok(terminal) => Ok(Guard {
@@ -121,4 +129,35 @@ fn install_panic_hook() {
         let _ = restore();
         hook(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "push failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn key_releases_require_a_successful_protocol_push() {
+        let mut failed = FailingWriter;
+        assert!(!try_enable_key_releases(&mut failed, Ok(true)));
+
+        let mut unsupported = Vec::new();
+        assert!(!try_enable_key_releases(&mut unsupported, Ok(false)));
+        assert!(unsupported.is_empty());
+
+        let mut accepted = Vec::new();
+        assert!(try_enable_key_releases(&mut accepted, Ok(true)));
+        assert!(!accepted.is_empty());
+    }
 }

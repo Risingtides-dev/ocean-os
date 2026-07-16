@@ -73,7 +73,8 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   into a sibling lane.
 - Metrics are truthful or absent: tok/s and context occupancy render only from
   daemon-reported values for the LAST finished turn (both clear on
-  `TurnStarted`). Context occupancy uses the provider-reported final request,
+  `TurnStarted`; context also clears on stream gaps or adoption after a missing
+  start). Context occupancy uses the provider-reported final request,
   never cumulative multi-round usage; unknown values remain absent. The model
   row falls back to the startup `/v1/models` fetch before the first turn.
 - The lower Files rail is a separate session-component tray, never part of
@@ -113,9 +114,10 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
   and scroll use Unicode cell width and follow the cursor row, never the final
   input row.
-- Composer dictation is local capture over daemon-owned STT: in terminals with
-  Kitty keyboard event types, a quick Space tap remains one space while a 180ms
-  hold opens the mic and release stops it; `F2` is the explicit toggle fallback.
+- Composer dictation is local capture over daemon-owned STT: only after the
+  Kitty keyboard event-type protocol push succeeds, a quick Space tap remains
+  one space while a 180ms hold opens the mic and release stops it; `F2` is the
+  explicit toggle fallback.
   macOS capture is a bounded 30s mono WAV path in `shell/dictation.rs`; other
   platforms fail visibly without audio build dependencies. The live RMS history
   replaces the prompt box with a btop-style meter, while the draft/cursor remain
@@ -133,7 +135,7 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   request completion; a stale global display must never approve a new turn.
 - Prefer clear status/error presentation over hidden failures (see
   `ModelRerouted` — resilience must never silently lie to the operator).
-- Keep the launch cwd as the active surface root; auto-resume must not overwrite it with a stored session root.
+- Keep the launch cwd as the active surface root; resuming a session must not overwrite it with a stored session root.
 - Side-rail widths are operator-resizable but must clamp against the body width, the minimum center workspace, and only the currently visible opposite rail; a hidden rail's stored width consumes no layout budget.
 - Sessions and Files share `shell/rail.rs` for row selection, focus/blur styling,
   bounded mouse geometry, scroll clamping, and empty states. Preserve one-cell

@@ -190,10 +190,10 @@ impl SessionComponentTray {
         self.todo.uncertain = false;
         self.observed_calls.clear();
         self.continuity_uncertain = false;
-        // Keep the last completed measurement visible while the next turn runs.
-        // It is timestamped and explicitly final-round provenance, so it cannot be
-        // mistaken for a live estimate; replacing it only on a finished event also
-        // avoids a distracting panel collapse/reopen cycle.
+        // Context occupancy belongs only to the last finished turn. Once a new
+        // turn starts, the previous final-round measurement is stale until the
+        // daemon reports the new turn's final request.
+        self.context_usage = None;
     }
 
     fn apply_event(&mut self, event: &AgentTurnEvent) {
@@ -219,6 +219,7 @@ impl SessionComponentTray {
                     self.todo.uncertain = true;
                     self.observed_calls.clear();
                     self.continuity_uncertain = true;
+                    self.context_usage = None;
                 }
                 if self.continuity_uncertain {
                     self.todo.uncertain = true;
@@ -243,6 +244,7 @@ impl SessionComponentTray {
                     self.observed_calls.clear();
                     self.continuity_uncertain = true;
                     self.todo.uncertain = true;
+                    self.context_usage = None;
                 } else {
                     match self.observed_calls.remove(&call_id.0) {
                         Some(true) => {
@@ -292,6 +294,7 @@ impl Component for SessionComponentTray {
                 self.continuity_uncertain = true;
                 self.observed_calls.clear();
                 self.todo.invalidate();
+                self.context_usage = None;
             }
             Action::AgentEvent(event) => self.apply_event(event),
             _ => {}
@@ -610,6 +613,10 @@ mod tests {
         assert!(screen.contains("75% · provider measured"));
 
         tray.update(&begin(sid, turn(3)));
+        assert!(
+            !tray.is_visible(),
+            "a new turn clears the previous final-round measurement"
+        );
         tray.update(&turn_finished(
             sid,
             turn(3),
@@ -836,12 +843,67 @@ mod tests {
             json!({"action": "add", "text": "stale"}),
         ));
         tray.update(&finished(sid, tid, call(3), true));
+        tray.update(&turn_finished(
+            sid,
+            tid,
+            Some(ContextUsage {
+                used_tokens: 10,
+                context_window: 100,
+                source: "provider_reported_final_round".into(),
+                measured_at_ms: 123,
+            }),
+            AgentTurnStatus::Completed,
+        ));
+        assert!(tray.context_usage.is_some());
+
         tray.update(&Action::AgentStreamGap(sid));
         assert!(tray.todo.items.is_empty());
         assert!(tray.todo.uncertain);
+        assert!(
+            tray.context_usage.is_none(),
+            "a continuity gap invalidates final-round context provenance"
+        );
 
         tray.update(&begin(sid, turn(4)));
         assert!(!tray.is_visible());
+    }
+
+    #[test]
+    fn adopting_a_turn_after_a_missing_start_clears_prior_context() {
+        let mut tray = SessionComponentTray::new();
+        let sid = session(1);
+        let first = turn(2);
+        tray.update(&Action::SessionBound(sid));
+        tray.update(&begin(sid, first));
+        tray.update(&turn_finished(
+            sid,
+            first,
+            Some(ContextUsage {
+                used_tokens: 10,
+                context_window: 100,
+                source: "provider_reported_final_round".into(),
+                measured_at_ms: 123,
+            }),
+            AgentTurnStatus::Completed,
+        ));
+        assert!(tray.context_usage.is_some());
+
+        tray.update(&started(
+            sid,
+            turn(3),
+            call(4),
+            json!({"action": "add", "text": "partial"}),
+        ));
+        assert!(tray.context_usage.is_none());
+
+        tray.context_usage = Some(ContextUsage {
+            used_tokens: 20,
+            context_window: 100,
+            source: "provider_reported_final_round".into(),
+            measured_at_ms: 456,
+        });
+        tray.update(&finished(sid, turn(5), call(6), true));
+        assert!(tray.context_usage.is_none());
     }
 
     #[test]

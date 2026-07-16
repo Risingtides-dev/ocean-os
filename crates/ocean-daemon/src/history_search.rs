@@ -5,7 +5,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use ocean_agent::{AgentRuntime, HistorySearchHit, MAX_HISTORY_SEARCH_QUERY_CHARS};
+use ocean_agent::{
+    AgentRuntime, HistorySearchCapacityError, HistorySearchHit, MAX_HISTORY_SEARCH_QUERY_CHARS,
+    MAX_HISTORY_SEARCH_STORE_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -83,12 +86,7 @@ pub(super) async fn history_search(
         Ok(Ok(hits)) => response(StatusCode::OK, query, hits, None),
         Ok(Err(error)) => {
             tracing::warn!(error = %error, "history transcript search failed");
-            response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                query,
-                Vec::new(),
-                Some("transcript history could not be searched".into()),
-            )
+            search_error_response(query, &error)
         }
         Err(error) => {
             tracing::warn!(error = %error, "history transcript search task failed");
@@ -99,6 +97,30 @@ pub(super) async fn history_search(
                 Some("transcript history could not be searched".into()),
             )
         }
+    }
+}
+
+fn search_error_response(
+    query: String,
+    error: &anyhow::Error,
+) -> (StatusCode, Json<HistorySearchResponse>) {
+    if error.downcast_ref::<HistorySearchCapacityError>().is_some() {
+        response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            query,
+            Vec::new(),
+            Some(format!(
+                "transcript history exceeds the {} MiB search capacity",
+                MAX_HISTORY_SEARCH_STORE_BYTES / (1024 * 1024)
+            )),
+        )
+    } else {
+        response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            query,
+            Vec::new(),
+            Some("transcript history could not be searched".into()),
+        )
     }
 }
 
@@ -117,4 +139,28 @@ fn response(
             error,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_errors_map_to_an_explicit_service_response() {
+        let error: anyhow::Error = HistorySearchCapacityError {
+            observed_bytes: MAX_HISTORY_SEARCH_STORE_BYTES + 1,
+            max_bytes: MAX_HISTORY_SEARCH_STORE_BYTES,
+        }
+        .into();
+        let (status, Json(body)) = search_error_response("ocean".into(), &error);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ok);
+        assert_eq!(body.query, "ocean");
+        assert!(body.hits.is_empty());
+        assert!(body
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("64 MiB search capacity"));
+    }
 }

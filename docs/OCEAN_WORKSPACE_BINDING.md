@@ -71,18 +71,20 @@ if session.workspace_root.as_deref().map(PathBuf::from) != Some(new_root.clone()
 
 ### Rule
 
-The workbench is the only TUI. It discovers persisted Ocean session files for
-the launch project and resumes the newest UUID-backed session directly in chat.
-Selecting another UUID session in the rail rehydrates its transcript and swaps
-the scoped SSE stream in place; no nested terminal process is launched.
+The workbench is the only TUI. Normal launch opens a centered chooser over a
+clean chat surface: start new in the launch cwd, open the current-workspace
+resume picker, enter a blank editor, or open the graph. It never implicitly
+resumes the newest session. Choosing a UUID session rehydrates its transcript
+and swaps the scoped SSE stream in place; no nested terminal process is launched.
 
-`--session <id-or-prefix>` performs the same native binding explicitly. Exact
-duplicate records choose the newest file, while ambiguous prefixes fail before
-terminal setup. The launch cwd remains authoritative for future turns.
+`--session <id-or-prefix>` bypasses the chooser and performs the same native
+binding explicitly. Exact duplicate records choose the newest file, while
+ambiguous prefixes fail before terminal setup. The launch cwd remains
+authoritative for future turns.
 
 ### Acceptance
 
-- `cd repo && ocean` → native workbench, newest project session selected when present
+- `cd repo && ocean` → native workbench chooser, with no implicit session resume
 - `cd repo && ocean --session <id>` → requested transcript/event stream, launch cwd retained
 - selecting a session in the rail → in-place resume, never a nested TUI process
 - `/new` → unbind current history and mint on the next prompt

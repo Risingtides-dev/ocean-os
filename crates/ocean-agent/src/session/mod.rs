@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Write;
+use std::io::{Read, Write};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -507,8 +507,59 @@ pub fn detail(config_dir: &Path, id: SessionId) -> anyhow::Result<SessionDetail>
     Ok(session_detail(session))
 }
 
+fn history_search_capacity_error(observed_bytes: u64, max_bytes: u64) -> anyhow::Error {
+    HistorySearchCapacityError {
+        observed_bytes,
+        max_bytes,
+    }
+    .into()
+}
+
+fn enforce_history_search_store_budget(paths: &[PathBuf], max_bytes: u64) -> anyhow::Result<()> {
+    let mut observed_bytes = 0u64;
+    for path in paths {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        observed_bytes = observed_bytes.saturating_add(metadata.len());
+        if observed_bytes > max_bytes {
+            return Err(history_search_capacity_error(observed_bytes, max_bytes));
+        }
+    }
+    Ok(())
+}
+
+fn read_history_file_bounded(
+    path: &Path,
+    observed_bytes: &mut u64,
+    max_bytes: u64,
+) -> anyhow::Result<Option<String>> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let remaining = max_bytes.saturating_sub(*observed_bytes);
+    let mut bytes = Vec::new();
+    if file
+        .take(remaining.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let next_observed = observed_bytes.saturating_add(bytes.len() as u64);
+    if next_observed > max_bytes {
+        return Err(history_search_capacity_error(next_observed, max_bytes));
+    }
+    *observed_bytes = next_observed;
+    Ok(String::from_utf8(bytes).ok())
+}
+
 /// Search persisted display transcript text for user and assistant entries only.
-/// Tool results and non-display content blocks are never considered.
+/// Tool results and non-display content blocks are never considered. The store's
+/// cumulative file size is bounded before any raw session is deserialized.
 pub fn search_history(
     config_dir: &Path,
     query: &str,
@@ -535,13 +586,17 @@ pub fn search_history(
     }
     paths.retain(|path| path.extension().and_then(|value| value.to_str()) == Some("json"));
     paths.sort();
+    enforce_history_search_store_budget(&paths, MAX_HISTORY_SEARCH_STORE_BYTES)?;
 
     // Preserve the one-id-one-session invariant even if a stale duplicate is
     // present on disk. Selection mirrors the resumable loader, without mutating
     // files on this read-only path.
     let mut sessions: HashMap<SessionId, (PathBuf, Session)> = HashMap::new();
+    let mut observed_bytes = 0u64;
     for path in paths {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Some(text) =
+            read_history_file_bounded(&path, &mut observed_bytes, MAX_HISTORY_SEARCH_STORE_BYTES)?
+        else {
             continue;
         };
         let Ok(candidate) = serde_json::from_str::<Session>(&text) else {
@@ -1030,6 +1085,47 @@ mod history_search_tests {
             error_message: None,
             timestamp,
         })
+    }
+
+    #[test]
+    fn history_search_store_budget_rejects_before_deserialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.json");
+        let second = tmp.path().join("second.json");
+        std::fs::write(&first, "123456").unwrap();
+        std::fs::write(&second, "abcdef").unwrap();
+
+        let error = enforce_history_search_store_budget(&[first, second], 10).unwrap_err();
+        let capacity = error
+            .downcast_ref::<HistorySearchCapacityError>()
+            .expect("typed capacity error");
+        assert_eq!(capacity.observed_bytes, 12);
+        assert_eq!(capacity.max_bytes, 10);
+    }
+
+    #[test]
+    fn history_search_bounded_read_catches_growth_after_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.json");
+        let second = tmp.path().join("second.json");
+        std::fs::write(&first, "1234").unwrap();
+        std::fs::write(&second, "abcd").unwrap();
+        let paths = vec![first, second.clone()];
+        enforce_history_search_store_budget(&paths, 10).unwrap();
+
+        // Simulate an atomic replacement or growth between metadata preflight
+        // and the later open/read pass.
+        std::fs::write(&second, "abcdefgh").unwrap();
+        let mut observed = 0;
+        assert!(read_history_file_bounded(&paths[0], &mut observed, 10)
+            .unwrap()
+            .is_some());
+        let error = read_history_file_bounded(&paths[1], &mut observed, 10).unwrap_err();
+        let capacity = error
+            .downcast_ref::<HistorySearchCapacityError>()
+            .expect("typed capacity error");
+        assert_eq!(capacity.observed_bytes, 11);
+        assert_eq!(capacity.max_bytes, 10);
     }
 
     #[test]

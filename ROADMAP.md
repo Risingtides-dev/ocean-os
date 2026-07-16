@@ -9,10 +9,10 @@ approved design or permission to alter public contracts.
 
 ## Near-term integration gaps
 
-- [ ] Reconcile the Tauri surface identity. `ocean-surface` currently emits
-      `client_type = "surface-tauri"`, while `ocean-agent::surface_flag` does not
-      map that value; Tauri turns therefore use the generic fallback profile
-      instead of an authored Ocean Agents profile.
+- [ ] Decide the Tauri effective harness classification. `ocean-agent` now maps
+      `client_type = "surface-tauri"` to the `TAURI` prompt identity and native-
+      shell component guidance, while the daemon harness seam intentionally
+      retains CLI-compatible hashline/artifact gates pending cross-repo policy.
 - [ ] Wire configured lifecycle hooks into the completed-turn path. The
       `ocean-hooks` protocol and config parsing exist, but production turn code
       does not currently call `run_hooks`.

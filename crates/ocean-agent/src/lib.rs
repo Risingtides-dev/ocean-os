@@ -73,6 +73,27 @@ pub const DEFAULT_HISTORY_SEARCH_LIMIT: usize = 20;
 pub const MAX_HISTORY_SEARCH_LIMIT: usize = 50;
 /// Bound request work before any transcript files are opened.
 pub const MAX_HISTORY_SEARCH_QUERY_CHARS: usize = 512;
+/// Maximum cumulative size of persisted session files searched by one request.
+pub const MAX_HISTORY_SEARCH_STORE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Search-capacity error returned before raw session files are deserialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistorySearchCapacityError {
+    pub observed_bytes: u64,
+    pub max_bytes: u64,
+}
+
+impl std::fmt::Display for HistorySearchCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transcript history store is {} bytes; search budget is {} bytes",
+            self.observed_bytes, self.max_bytes
+        )
+    }
+}
+
+impl std::error::Error for HistorySearchCapacityError {}
 
 /// Classification of a deterministic transcript-text match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
