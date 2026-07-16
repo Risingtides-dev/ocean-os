@@ -369,6 +369,27 @@ pub fn resolve_xai_api_key() -> Option<String> {
     auth_file_key(&json, "xai").map(str::to_string)
 }
 
+/// Resolve the API key dedicated to OpenAI Realtime voice. This intentionally
+/// does not inspect the ordinary `openai` provider block or Codex OAuth: voice
+/// credentials must never change, inherit, or masquerade as agent-model auth.
+/// Resolution order is the voice-specific env aliases, then the
+/// `openai-realtime` auth-file block. Resolved per request for key rotation.
+pub fn resolve_openai_realtime_api_key() -> Option<String> {
+    let env = ProviderEnv::from_process();
+    resolve_openai_realtime_api_key_from_env(&env)
+}
+
+fn resolve_openai_realtime_api_key_from_env(env: &ProviderEnv) -> Option<String> {
+    for name in ["OCEAN_OPENAI_REALTIME_API_KEY", "OPENAI_REALTIME_API_KEY"] {
+        if let Some(key) = env.get(name).map(str::trim).filter(|key| !key.is_empty()) {
+            return Some(key.to_string());
+        }
+    }
+    let path = env.auth_file.as_ref()?;
+    let json = read_auth_json(path).ok()?;
+    auth_file_key(&json, "openai-realtime").map(str::to_string)
+}
+
 /// Resolve full provider config from a provided environment snapshot.
 pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, ProviderConfigError> {
     let selection = resolve_model_selection(env)?;
@@ -1623,6 +1644,47 @@ mod tests {
                 name: "OCEAN_DEEPSEEK_API_KEY".into()
             }
         );
+    }
+
+    #[test]
+    fn realtime_voice_credential_is_isolated_from_agent_openai_auth() {
+        let dir =
+            std::env::temp_dir().join(format!("ocean-realtime-auth-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(
+            &path,
+            r#"{"openai":{"api_key":"agent-key"},"openai-codex":{"type":"oauth","access":"oauth-agent"},"openai-realtime":{"api_key":"voice-key"}}"#,
+        )
+        .unwrap();
+
+        let voice_env = ProviderEnv {
+            vars: BTreeMap::new(),
+            auth_file: Some(path.clone()),
+            codex_auth_file: None,
+        };
+        assert_eq!(
+            resolve_openai_realtime_api_key_from_env(&voice_env).as_deref(),
+            Some("voice-key")
+        );
+
+        fs::write(
+            &path,
+            r#"{"openai":{"api_key":"agent-key"},"openai-codex":{"type":"oauth","access":"oauth-agent"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_openai_realtime_api_key_from_env(&voice_env), None);
+
+        let env_override = ProviderEnv {
+            vars: BTreeMap::from([("OPENAI_REALTIME_API_KEY".into(), "voice-env-key".into())]),
+            ..voice_env
+        };
+        assert_eq!(
+            resolve_openai_realtime_api_key_from_env(&env_override).as_deref(),
+            Some("voice-env-key")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

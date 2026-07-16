@@ -21,6 +21,9 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 - Agent turns are session/workspace scoped and do not carry a Track-0 `room_id`. Durable collaboration uses `RoomKey` and `/v1/rooms/persistent/*`; LiveKit token minting remains independent at `/v1/rooms/{room_id}/livekit-token`.
 - Persistent room transcript rows and their per-room `seq` are the only durable room-event log. Store participant-mutation adapters return their committed join/leave marker for post-commit daemon wake publication; do not add a parallel room-events table or treat the bounded wake channel as authority.
 - Subagent definitions and orchestration are extension-owned. Core crates may provide generic permission-gated execution/capability seams, but must not own named subagent roles, spawn/join policy, worker budgets, or orchestration schedulers.
+- Feature credentials remain isolated from agent routing: xAI speech uses `xai`,
+  OpenAI Realtime voice uses `openai-realtime`, and future embedding providers
+  require dedicated blocks plus a live typed consumer before picker exposure.
 
 ## Workspace Package Index
 

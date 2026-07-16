@@ -286,6 +286,31 @@ mod tests {
     }
 
     #[test]
+    fn voice_keys_preserve_agent_oauth_and_each_other() {
+        let (_guard, auth) = fresh();
+        std::fs::write(
+            &auth,
+            r#"{"claude-code":{"type":"oauth","access":"claude-token"},"openai-codex":{"type":"oauth","access":"codex-token"}}"#,
+        )
+        .unwrap();
+
+        store_api_key("xai", "xai-voice-key", Some(auth.clone())).unwrap();
+        store_api_key("openai-realtime", "openai-voice-key", Some(auth.clone())).unwrap();
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
+        assert_eq!(v["xai"]["api_key"], "xai-voice-key");
+        assert_eq!(v["openai-realtime"]["api_key"], "openai-voice-key");
+        assert_eq!(v["claude-code"]["access"], "claude-token");
+        assert_eq!(v["openai-codex"]["access"], "codex-token");
+        assert!(
+            v.get("openai").is_none(),
+            "voice save must not create agent OpenAI auth"
+        );
+        #[cfg(unix)]
+        assert!(mode_is_0600(&auth), "expected 0600 on auth file");
+    }
+
+    #[test]
     fn rejects_empty_key_after_trim() {
         let (_guard, auth) = fresh();
         let err = store_api_key("glm", "   \n  ", Some(auth.clone())).unwrap_err();

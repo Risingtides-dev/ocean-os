@@ -127,6 +127,13 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   is a generation-tagged insertion animation, not invented interim STT; Esc,
   quit, late results, and dropped handles cancel safely, and dictation never
   auto-submits.
+- Bare `/login` categorizes credentials as Agent models and Voice models.
+  Voice rows use masked inline API-key entry and dedicated auth blocks: `xai`
+  for daemon-owned STT/TTS and `openai-realtime` for Realtime client-secret
+  minting. Saving either must preserve agent OAuth/API-key blocks and must not
+  change the selected agent model. Do not advertise Embedding models until a
+  live typed embedding capability and consumer exist; shared semantic search is
+  currently owned by ocean-bedrock.
 - `/permissions` is a daemon-backed three-state picker, not a client-side
   approval bypass: manual prompts for every known tool, automatic prompts only
   for runtime-classified unsafe tools, and skip-all suppresses prompts. Render

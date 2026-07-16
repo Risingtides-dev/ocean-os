@@ -26,6 +26,10 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   historical WebM multipart metadata; `audio/wav`/`audio/x-wav`/`audio/wave`
   selects bounded native WAV metadata for TUI dictation. Unknown content types
   fail soft to WebM for wire compatibility; no client receives the xAI key.
+- `POST /v1/voice/realtime/client-secret` resolves only the dedicated Realtime
+  voice credential (`OCEAN_OPENAI_REALTIME_API_KEY`,
+  `OPENAI_REALTIME_API_KEY`, or auth-file `openai-realtime.api_key`). It must
+  never inherit the agent `openai` API-key block or `openai-codex` OAuth.
 - Realtime `purpose: "planner"` is pre-session and propose-only: validate the
   registered project plus canonical live worktree before credential resolution,
   advertise only `propose_handoff`, and mutate only through the existing

@@ -7207,24 +7207,13 @@ async fn voice_realtime_client_secret(
         }
     };
 
-    let credential = match ocean_providers::resolve_credential_from_env(
-        &ocean_providers::ProviderId::OpenAi,
-    ) {
-        Ok(Some(credential)) => credential,
-        Ok(None) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "error": "no OpenAI credential configured (OCEAN_OPENAI_API_KEY / OPENAI_API_KEY / auth.json)"
-                })),
-            );
-        }
-        Err(err) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": format!("credential resolution failed: {err}") })),
-            );
-        }
+    let Some(credential) = ocean_providers::resolve_openai_realtime_api_key() else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "no OpenAI Realtime voice credential configured (OCEAN_OPENAI_REALTIME_API_KEY / OPENAI_REALTIME_API_KEY / auth.json openai-realtime block)"
+            })),
+        );
     };
 
     // Briefing: best-effort. A bad/unknown session id degrades to the
@@ -7262,7 +7251,7 @@ async fn voice_realtime_client_secret(
         (instructions, body)
     };
     let _ = instructions;
-    match voice_realtime::mint_client_secret(credential.secret.expose(), &model, &body).await {
+    match voice_realtime::mint_client_secret(&credential, &model, &body).await {
         Ok(normalized) => (StatusCode::OK, Json(normalized)),
         Err(err) => {
             tracing::warn!(error = %err, "realtime client-secret mint failed");

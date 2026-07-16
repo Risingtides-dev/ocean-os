@@ -165,11 +165,27 @@ enum SelectionSpace {
     Editor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ProviderSection {
+    Agent,
+    Voice,
+}
+
+impl ProviderSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "AGENT MODELS",
+            Self::Voice => "VOICE MODELS",
+        }
+    }
+}
+
 /// One row in the `/providers` auth popup: a static descriptor (label, auth-file
 /// block key, credential env vars) plus a status string computed at open time
 /// and refreshed after an inline API-key save.
 #[derive(Clone)]
 struct ProviderRow {
+    section: ProviderSection,
     label: &'static str,
     block_key: &'static str,
     env_vars: &'static [&'static str],
@@ -185,11 +201,23 @@ impl ProviderRow {
     }
 }
 
-/// Static descriptor (no per-open status) for [`ProviderRow`].
-const PROVIDER_TABLE: &[(&str, &str, &[&str])] = &[
-    ("Claude (Claude Code OAuth)", "claude-code", &[]),
-    ("Codex (ChatGPT OAuth)", "openai-codex", &[]),
+/// Static descriptors (no per-open status) for [`ProviderRow`]. Voice uses
+/// dedicated auth blocks so key saves cannot alter agent OAuth/model routing.
+const PROVIDER_TABLE: &[(ProviderSection, &str, &str, &[&str])] = &[
     (
+        ProviderSection::Agent,
+        "Claude (Claude Code OAuth)",
+        "claude-code",
+        &[],
+    ),
+    (
+        ProviderSection::Agent,
+        "Codex (ChatGPT OAuth)",
+        "openai-codex",
+        &[],
+    ),
+    (
+        ProviderSection::Agent,
         "GLM — Z.AI coding plan",
         "glm",
         &[
@@ -201,29 +229,46 @@ const PROVIDER_TABLE: &[(&str, &str, &[&str])] = &[
         ],
     ),
     (
+        ProviderSection::Agent,
         "DeepSeek",
         "deepseek",
         &["DEEPSEEK_API_KEY", "OCEAN_DEEPSEEK_API_KEY"],
     ),
     (
+        ProviderSection::Agent,
         "Kimi (Moonshot)",
         "kimi",
         &["MOONSHOT_API_KEY", "KIMI_API_KEY", "OCEAN_MOONSHOT_API_KEY"],
     ),
     (
+        ProviderSection::Agent,
         "MiniMax",
         "minimax",
         &["MINIMAX_API_KEY", "OCEAN_MINIMAX_API_KEY"],
     ),
     (
+        ProviderSection::Agent,
         "Google (Gemini)",
         "google",
         &["GEMINI_API_KEY", "GOOGLE_API_KEY", "OCEAN_GOOGLE_API_KEY"],
     ),
     (
-        "OpenAI",
+        ProviderSection::Agent,
+        "OpenAI API (agent models)",
         "openai",
         &["OPENAI_API_KEY", "OCEAN_OPENAI_API_KEY"],
+    ),
+    (
+        ProviderSection::Voice,
+        "xAI Voice — STT / TTS",
+        "xai",
+        &["XAI_API_KEY"],
+    ),
+    (
+        ProviderSection::Voice,
+        "OpenAI Realtime — GPT Realtime",
+        "openai-realtime",
+        &["OCEAN_OPENAI_REALTIME_API_KEY", "OPENAI_REALTIME_API_KEY"],
     ),
 ];
 
@@ -3382,7 +3427,8 @@ impl App {
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
         PROVIDER_TABLE
             .iter()
-            .map(|(label, block_key, env_vars)| ProviderRow {
+            .map(|(section, label, block_key, env_vars)| ProviderRow {
+                section: *section,
                 label,
                 block_key,
                 env_vars,
@@ -3398,7 +3444,7 @@ impl App {
     fn refresh_welcome_provider_line(&mut self) {
         let n_configured = Self::build_provider_rows()
             .iter()
-            .filter(|r| r.status != "not configured")
+            .filter(|r| r.section == ProviderSection::Agent && r.status != "not configured")
             .count();
         // Terse configuration condition ONLY when nothing is configured.
         // Configured credentials are never claimed as runtime readiness
@@ -3509,9 +3555,16 @@ impl App {
     fn draw_providers(&mut self, frame: &mut ratatui::Frame) {
         use ratatui::widgets::{Block, Borders, Clear};
         let full = frame.area();
-        let rows = self.providers_rows.len().max(1) as u16;
-        let width = 60u16.min(full.width.saturating_sub(4));
-        // list + title + footer; a touch more room in key-entry mode.
+        let section_count = self
+            .providers_rows
+            .iter()
+            .map(|row| row.section)
+            .collect::<HashSet<_>>()
+            .len() as u16;
+        let rows = self.providers_rows.len().max(1) as u16 + section_count;
+        let width = 68u16.min(full.width.saturating_sub(4));
+        // credential rows + category headers + title/footer; a touch more room
+        // in key-entry mode.
         let base = rows + 5;
         let height = (if matches!(self.providers_mode, ProvidersMode::KeyEntry { .. }) {
             base + 2
@@ -3529,7 +3582,7 @@ impl App {
             .border_style(Style::default().fg(theme::EDGE).bg(theme::SLATE))
             .style(Style::default().bg(theme::SLATE))
             .title(Span::styled(
-                " PROVIDERS ",
+                " LOGIN — AGENT + VOICE ",
                 Style::default()
                     .fg(theme::CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -3568,40 +3621,83 @@ impl App {
                 );
             }
             ProvidersMode::List => {
-                for (i, row) in self.providers_rows.iter().enumerate() {
-                    let selected = i == self.providers_sel;
-                    let bed = if selected { theme::BG_HL } else { theme::SLATE };
-                    let marker = if selected { g("▎", "|") } else { " " };
-                    let left = format!(" {marker} {}", row.label);
-                    let status_fg = if row.status.starts_with("env:")
-                        || row.status == "oauth ok"
-                        || row.status == "auth file"
-                    {
-                        theme::GREEN
-                    } else if row.status == "oauth expired" {
-                        theme::CYAN
-                    } else {
-                        theme::COMMENT
-                    };
-                    let value = Span::styled(row.status.clone(), Style::default().fg(status_fg));
-                    let pad = (inner.width as usize)
-                        .saturating_sub(left.chars().count() + value.content.chars().count() + 1);
-                    frame.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled(
-                                left,
-                                if selected {
-                                    Style::default().fg(theme::FG).add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(theme::FG)
-                                },
-                            ),
-                            Span::raw(" ".repeat(pad)),
-                            value,
-                        ]))
-                        .style(Style::default().bg(bed)),
-                        Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
-                    );
+                enum LoginRow<'a> {
+                    Header(ProviderSection),
+                    Provider(usize, &'a ProviderRow),
+                }
+                let mut login_rows = Vec::with_capacity(self.providers_rows.len() + 2);
+                let mut last_section = None;
+                for (index, row) in self.providers_rows.iter().enumerate() {
+                    if last_section != Some(row.section) {
+                        login_rows.push(LoginRow::Header(row.section));
+                        last_section = Some(row.section);
+                    }
+                    login_rows.push(LoginRow::Provider(index, row));
+                }
+                let selected_row = login_rows
+                    .iter()
+                    .position(|row| {
+                        matches!(row, LoginRow::Provider(index, _) if *index == self.providers_sel)
+                    })
+                    .unwrap_or(0);
+                let visible = inner.height as usize;
+                let start = selection_window_start(selected_row, login_rows.len(), visible);
+
+                for (slot, login_row) in login_rows.iter().skip(start).take(visible).enumerate() {
+                    let rect = Rect::new(inner.x, inner.y + slot as u16, inner.width, 1);
+                    match login_row {
+                        LoginRow::Header(section) => {
+                            frame.render_widget(
+                                Paragraph::new(Span::styled(
+                                    format!(" {} ", section.label()),
+                                    Style::default()
+                                        .fg(theme::CYAN)
+                                        .add_modifier(Modifier::BOLD),
+                                ))
+                                .style(Style::default().bg(theme::SLATE)),
+                                rect,
+                            );
+                        }
+                        LoginRow::Provider(i, row) => {
+                            let selected = *i == self.providers_sel;
+                            let bed = if selected { theme::BG_HL } else { theme::SLATE };
+                            let marker = if selected { g("▎", "|") } else { " " };
+                            let left = format!(" {marker} {}", row.label);
+                            let status_fg = if row.status.starts_with("env:")
+                                || row.status == "oauth ok"
+                                || row.status == "auth file"
+                            {
+                                theme::GREEN
+                            } else if row.status == "oauth expired" {
+                                theme::CYAN
+                            } else {
+                                theme::COMMENT
+                            };
+                            let value =
+                                Span::styled(row.status.clone(), Style::default().fg(status_fg));
+                            let pad = (inner.width as usize).saturating_sub(
+                                left.chars().count() + value.content.chars().count() + 1,
+                            );
+                            frame.render_widget(
+                                Paragraph::new(Line::from(vec![
+                                    Span::styled(
+                                        left,
+                                        if selected {
+                                            Style::default()
+                                                .fg(theme::FG)
+                                                .add_modifier(Modifier::BOLD)
+                                        } else {
+                                            Style::default().fg(theme::FG)
+                                        },
+                                    ),
+                                    Span::raw(" ".repeat(pad)),
+                                    value,
+                                ]))
+                                .style(Style::default().bg(bed)),
+                                rect,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -6185,7 +6281,8 @@ mod tests {
         // should prompt the user to log in.
         let rows: Vec<ProviderRow> = PROVIDER_TABLE
             .iter()
-            .map(|(label, block_key, env_vars)| ProviderRow {
+            .map(|(section, label, block_key, env_vars)| ProviderRow {
+                section: *section,
                 label,
                 block_key,
                 env_vars,
@@ -6194,6 +6291,53 @@ mod tests {
             .collect();
         let n_configured = rows.iter().filter(|r| r.status != "not configured").count();
         assert_eq!(n_configured, 0);
+    }
+
+    #[test]
+    fn login_popup_separates_voice_credentials_from_agent_models() {
+        let mut app = offline_app();
+        app.providers_rows = PROVIDER_TABLE
+            .iter()
+            .map(|(section, label, block_key, env_vars)| ProviderRow {
+                section: *section,
+                label,
+                block_key,
+                env_vars,
+                status: "not configured".into(),
+            })
+            .collect();
+        app.providers_open = true;
+
+        let screen = render_app_to_string(&mut app, 100, 30);
+        assert!(screen.contains("AGENT MODELS"));
+        assert!(screen.contains("VOICE MODELS"));
+        assert!(screen.contains("xAI Voice"));
+        assert!(screen.contains("OpenAI Realtime"));
+
+        let realtime = app
+            .providers_rows
+            .iter()
+            .find(|row| row.block_key == "openai-realtime")
+            .expect("dedicated realtime row");
+        assert_eq!(realtime.section, ProviderSection::Voice);
+        assert_ne!(realtime.block_key, "openai");
+        assert!(!realtime.is_oauth());
+    }
+
+    #[test]
+    fn short_login_popup_scrolls_to_selected_voice_row() {
+        let mut app = offline_app();
+        app.providers_rows = App::build_provider_rows();
+        app.providers_open = true;
+        app.providers_sel = app
+            .providers_rows
+            .iter()
+            .position(|row| row.block_key == "openai-realtime")
+            .expect("realtime voice row");
+
+        let screen = render_app_to_string(&mut app, 80, 12);
+        assert!(screen.contains("VOICE MODELS"));
+        assert!(screen.contains("OpenAI Realtime"));
     }
 
     #[test]

@@ -3881,3 +3881,13 @@ area:      [docs]: behavior-neutral refactor continuity
 
 Added the active final-28% handoff for cold-start continuation from last published Phase 2C checkpoint `b21006b`, reconciled against current source baseline `4712fdb`. It sequences Longhouse topic/convene governance, security-sensitive title/escrow/recall/breach/board governance, call HTTP/webhook/token adaptation, call runtime/persistence, a fresh remaining-registry inventory, and agent-turn/SSE orchestration last. The handoff records exact program protocol, authority and lifecycle invariants, characterization priorities, stop rules, validation/publication gates, deferred security dispositions, frozen compatibility quirks, and the restart/completion checklist. Linked it from the mission and docs active-plan index. No runtime, deployment, or supervision change was performed.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [09:42am] [16-07-26]
+agent:     [ocean] [gpt-5.6]
+worktree:  main
+type:      [feature-request]: Isolate voice credentials in TUI login
+area:      [frontend]: Provider authentication and daemon voice boundary
+
+Added Agent models and Voice models sections to the TUI's bare `/login` popup. xAI STT/TTS now configures the dedicated `xai` auth block, while OpenAI Realtime configures `openai-realtime`; masked atomic 0600 saves preserve Claude/Codex OAuth and other provider blocks. The daemon Realtime client-secret route now resolves only `OCEAN_OPENAI_REALTIME_API_KEY`, `OPENAI_REALTIME_API_KEY`, or `openai-realtime.api_key`, deliberately excluding generic agent `openai` keys and `openai-codex` OAuth. Added categorized short-terminal scrolling, resolver/persistence/UI regressions, owning contracts, and operator guidance. Embedding rows remain deferred until a live typed embedding consumer exists; shared semantic search remains ocean-bedrock-owned.
+
+Verification: ocean-oauth 39 unit + 2 integration tests; ocean-providers 42 tests; ocean-tui 359 passed / 4 ignored plus focused categorized/short-height regressions; daemon voice 23 tests; denied-warning Clippy across all touched crates; `cargo check --workspace`; TUI release build; docs-check; diff-check. Fresh Longhouse review topic d4f46714-52fb-4225-9871-c2a64db8bde9 converged APPROVE.

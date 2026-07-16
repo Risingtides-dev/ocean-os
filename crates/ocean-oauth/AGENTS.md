@@ -18,6 +18,9 @@ This crate owns browser OAuth 2.0 + PKCE login for provider subscriptions: bind 
 - This crate performs fresh logins only. Token refresh lives in `ocean-agent::oauth_refresh` / `ocean-protocol::oauth` — never duplicate it here.
 - Token endpoints honor the same env overrides as the refresh pass: `OCEAN_OAUTH_ANTHROPIC_TOKEN_URL`, `OCEAN_OAUTH_OPENAI_TOKEN_URL`.
 - Auth-file writes are atomic (`.auth.json.tmp-{pid}` + rename, 0600) and must preserve unrelated provider blocks.
+- Plain API-key writes also serve isolated feature credentials such as `xai`
+  and `openai-realtime`; they retain the same atomic 0600 merge contract and
+  must never overwrite unrelated agent OAuth or API-key blocks.
 - Tests never touch the real `~/.config/ocean-rs/auth.json` and never hit real provider endpoints.
 
 ## Work Guidance

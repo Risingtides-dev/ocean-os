@@ -386,6 +386,15 @@ Primary controls:
 - `/new` — start a fresh daemon session in the active project
 - `/models`, `/thinking`, `/login`, `/settings` — runtime controls
 
+Bare `/login` separates **Agent models** from **Voice models**. Agent rows keep
+their existing OAuth/API-key behavior. Voice keys are entered in the same masked
+popup but persist independently: xAI STT/TTS uses the `xai` auth block (or
+`XAI_API_KEY`), while OpenAI Realtime uses `openai-realtime` (or
+`OCEAN_OPENAI_REALTIME_API_KEY` / `OPENAI_REALTIME_API_KEY`). Realtime voice
+does not inherit the agent `openai` API key or Codex OAuth. Embedding choices
+are not advertised here until Ocean has a live typed embedding consumer; shared
+semantic search remains owned by ocean-bedrock.
+
 Launch targeting:
 
 ```bash
