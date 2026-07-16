@@ -8,14 +8,18 @@
 ## Organizing principle: harness profiles
 
 Per John (2026-07-03): the IDE-grade harness is **surface-scoped, not global**. The daemon
-resolves a **harness profile from `client_type`** (already on every turn):
+resolves a **harness profile from `client_type`** (already on every turn). The following table is
+the target design vocabulary, not a claim that every listed mechanism is live; the implementation
+audit below is authoritative. Today the effective profile seam gates only hashline edits and
+artifact spill. LSP and memory are global, while rules/TTSR, rich context, and minimization remain
+unwired.
 
-| Profile | client_type | Harness level |
+| Profile | client_type | Target harness level |
 |---|---|---|
 | `tui` | `tui` | Full IDE harness — LSP, hashline, rules/TTSR, rich context, artifacts, minimizer |
 | `web` | `surface-web`, `surface-extension` | Lean conversational — memory + roles, no IDE machinery |
-| `voice` | `leo-voice` | Minimal — short context, no tools beyond essentials |
-| `acp` | ACP/editor clients | IDE harness minus TUI-only rendering |
+| `voice` | `leo-voice`, `call-voice` | Minimal — short context, no tools beyond essentials |
+| `acp` | `acp-zed` | IDE harness minus TUI-only rendering |
 
 Every feature below is tagged with its profile home. The **profile seam itself is the first
 build**: a `HarnessProfile` resolved per-turn in ocean-daemon that gates which capabilities are
@@ -367,7 +371,7 @@ summary exists to keep the backlog honest.
 
 | Wave | Status | Current evidence | Remaining gap |
 |---|---|---|---|
-| W0 — profile seam | **Partial** | `ocean-daemon::harness_profile` resolves per turn and defines all bundles. `PromptControl::with_hashline_edits` and `with_artifact_spill` carry two gates into runtime composition. | LSP and memory are registered as universal providers rather than controlled through the profile seam; stream rules, rich context, and minimizer remain declarative. ACP is not selected by `client_type`. |
+| W0 — profile seam | **Reconciled partial** | `ocean-daemon::harness_profile` resolves per turn and exposes only the two effective gates carried into `PromptControl`: hashline edits and artifact spill. `acp-zed` is attributed explicitly with behavior equal to its prior CLI fallback. LSP/memory are documented as global; unwired stream-rule/rich-context/minimizer flags are gone. | New external surface classifications remain policy decisions (`surface-tauri` still uses the compatibility fallback). Future mechanisms join the seam only when they are actually wired. |
 | W1 — edit reliability | **Built** | `ocean-hashline`, session snapshots, `HashlineEditTool`, `NoopLoopGuard`, `SpillingTool`, and `artifact://` retrieval are live. | Output metadata is thinner than OMP's complete directional/range protocol, and the broader hashline dialect remains out of scope. |
 | W2 — TUI streaming | **Strong partial** | `shell/markdown.rs` implements prefix-freeze; `shell/diff.rs` has word-level inverse diffs; the composer has persisted history, Ctrl-R, a kill ring, mentions, and a fuzzy slash palette; tool drawers and a basic Kitty image viewer are live. | No append-only native-scrollback architecture, OMP theme-token/80-theme compatibility, full image protocol ladder/ImageBudget, or complete composer integration set. |
 | W3 — context economy | **Partial** | Artifact spill is live. `ocean-agent::compact_history` deterministically elides older tool bodies and `ocean-runtime::trim_to_context_window` provides the hard suffix bound. `ocean-ast` implements structural summaries as a standalone crate. | No BM25 tool discovery, command minimizer, promote/prune/shake/summarize pipeline, protection matchers, live general AST-read wiring, or conversational checkpoint/rewind. |
@@ -378,6 +382,9 @@ summary exists to keep the backlog honest.
 
 ### Corrections to the 2026-07-05 snapshot
 
+- W0 now names only its effective per-turn gates: hashline edits and artifact spill. LSP/memory
+  remain globally registered, and stream rules, rich context, and minimization are not advertised
+  until wired. The in-repo `acp-zed` emitter now resolves explicitly without changing its gates.
 - `NoopLoopGuard` is wired into `hashline_edit`; it is no longer dead code.
 - Grep is regex-first with explicit literal fallback; it is still not the planned typed search engine.
 - `ocean-lsp` is a live capability provider rather than a dormant profile flag.
@@ -397,10 +404,8 @@ summary exists to keep the backlog honest.
 
 ### Next high-leverage sequence
 
-1. Reconcile which capabilities are truly surface-scoped and carry that policy through one runtime
-   composition seam rather than logging unused booleans.
-2. Build the command minimizer, then the shared walker/search substrate.
-3. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
+1. Build the command minimizer, then the shared walker/search substrate.
+2. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
 
 ## Scoping principle (John, 2026-07-03)
 

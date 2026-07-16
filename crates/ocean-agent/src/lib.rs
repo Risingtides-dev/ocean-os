@@ -1809,15 +1809,16 @@ pub struct PromptControl {
     /// Hashline-edit harness capability for this turn (W1 / harness profiles).
     /// When true the turn's `read` tags output + records snapshots and a
     /// `hashline_edit` tool is offered. Set by the daemon from the surface's
-    /// `HarnessProfile`; `false` for lean surfaces (web/voice) and every
-    /// legacy caller (defaults off in `PromptControl::new`).
+    /// daemon's effective `HarnessProfile`; `false` for web/voice and every
+    /// direct legacy caller (defaults off in `PromptControl::new`).
     pub hashline_edits: bool,
     /// Artifact-spill harness capability for this turn (W3 / harness profiles).
     /// When true, oversized tool output is truncated for the model with a notice
     /// and the full output is spilled to the session artifact store (readable via
     /// `read artifact://<id>`). Set by the daemon from the surface's
-    /// `HarnessProfile`; `false` for lean surfaces (web/voice) and every legacy
-    /// caller (defaults off in `PromptControl::new`).
+    /// daemon's effective `HarnessProfile`; `false` for voice and every direct
+    /// legacy caller, while TUI/ACP/CLI/web daemon turns enable it (defaults off
+    /// in `PromptControl::new`).
     pub artifact_spill: bool,
 }
 
@@ -1875,14 +1876,14 @@ impl PromptControl {
     }
 
     /// Enable the hashline-edit harness for this turn (W1). Set from the
-    /// surface's `HarnessProfile` capabilities on the daemon side.
+    /// surface's effective `HarnessProfile` capabilities on the daemon side.
     pub fn with_hashline_edits(mut self, on: bool) -> Self {
         self.hashline_edits = on;
         self
     }
 
     /// Enable the artifact-spill harness for this turn (W3). Set from the
-    /// surface's `HarnessProfile` capabilities on the daemon side.
+    /// surface's effective `HarnessProfile` capabilities on the daemon side.
     pub fn with_artifact_spill(mut self, on: bool) -> Self {
         self.artifact_spill = on;
         self
@@ -2857,6 +2858,25 @@ mod tests {
             disabled.tool_allowlist.as_deref(),
             Some(["read".into()].as_slice())
         );
+    }
+
+    #[test]
+    fn prompt_control_harness_gates_default_off_and_apply_independently() {
+        let default = PromptControl::yolo(false);
+        assert!(!default.hashline_edits);
+        assert!(!default.artifact_spill);
+
+        let profiled = PromptControl::yolo(false)
+            .with_hashline_edits(true)
+            .with_artifact_spill(true);
+        assert!(profiled.hashline_edits);
+        assert!(profiled.artifact_spill);
+
+        let web_like = PromptControl::yolo(false)
+            .with_hashline_edits(false)
+            .with_artifact_spill(true);
+        assert!(!web_like.hashline_edits);
+        assert!(web_like.artifact_spill);
     }
 
     #[test]

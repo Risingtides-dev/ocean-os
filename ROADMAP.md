@@ -25,8 +25,10 @@ The source-researched mechanism inventory and dated implementation matrix live i
 [`docs/specs/2026-07-03-omp-port-map.md`](docs/specs/2026-07-03-omp-port-map.md).
 Ocean ports mechanisms into current owners rather than reproducing OMP package boundaries.
 
-- [ ] Reconcile the harness-profile contract: decide which capabilities are surface-scoped,
-      then carry that policy through runtime composition instead of leaving logged-only flags.
+- [x] Reconcile the effective harness-profile contract: only hashline edits and artifact spill
+      are surface-scoped and carried into `PromptControl`; LSP/memory remain globally registered,
+      while unwired stream-rule/rich-context/minimizer claims were removed. New external surface
+      classification remains a separate policy decision above.
 - [x] Bound and attribute the post-turn advisor before broadening it: authoritative source-turn
       identity, a dedicated two-permit fail-open limiter, a fixed 30-second timeout, and
       fixed-cardinality outcome/latency metrics are live in `ocean-daemon`.

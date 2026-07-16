@@ -101,8 +101,9 @@ pub struct SessionContext {
     /// every tool's oversized text output is truncated for the model with an
     /// explicit notice and the full output is spilled to the session artifact
     /// store, readable back via `read artifact://<id>`; `read` also gains
-    /// `artifact://` resolution. Off for lean surfaces (web/voice). Resolved
-    /// per-turn from the daemon's `HarnessProfile`.
+    /// `artifact://` resolution. Enabled for TUI/ACP/CLI/web daemon turns and
+    /// off for voice; direct legacy callers default off. Resolved per-turn from
+    /// the daemon's effective `HarnessProfile`.
     pub artifacts: bool,
 }
 

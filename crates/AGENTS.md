@@ -36,7 +36,7 @@ The workspace currently contains 26 Rust packages.
 | `ocean-cli` | Thin daemon command/prompt/session client | Agent loop and session persistence | `ocean-cli/src/main.rs` | — | `cargo test -p ocean-cli` |
 | `ocean-context` | Evidence-bearing handoff claims, extraction, replay, reverification | Agent sessions; hashline edits; general AST summaries | `ocean-context/src/lib.rs`, `extract.rs` | — | `cargo test -p ocean-context` |
 | `ocean-core` | Low-level daemon request/response/event/session protocol types | Product-facing agent SDK behavior | `ocean-core/src/lib.rs` | `ocean-core/AGENTS.md` | `cargo test -p ocean-core` |
-| `ocean-daemon` | HTTP/SSE service, runtime composition, execution authority | Provider implementation; client-owned state | `ocean-daemon/src/main.rs` | `ocean-daemon/AGENTS.md` | `cargo test -p ocean-daemon` |
+| `ocean-daemon` | HTTP/SSE service, per-turn harness-profile composition, execution authority | Provider implementation; client-owned state | `ocean-daemon/src/main.rs`, `harness_profile.rs` | `ocean-daemon/AGENTS.md` | `cargo test -p ocean-daemon` |
 | `ocean-extension` | Schema-v1 extension package parsing, SemVer compatibility, and confined resource validation | Install/trust/enable state; routes; execution | `ocean-extension/src/lib.rs` | `ocean-extension/AGENTS.md` | `cargo test -p ocean-extension` |
 | `ocean-hashline` | File-hash-anchored surgical edits and stale recovery | General AST summarization or session persistence | `ocean-hashline/src/lib.rs`, `patcher.rs` | — | `cargo test -p ocean-hashline` |
 | `ocean-heartbeat` | Scheduled/routine CLI that calls the daemon | In-daemon scheduling authority | `ocean-heartbeat/src/main.rs` | — | `cargo test -p ocean-heartbeat` |

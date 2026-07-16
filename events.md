@@ -3420,4 +3420,20 @@ type:      [docs]: publish persistent-room checkpoint
 area:      [backend]: ocean-daemon Phase 2C durable rooms
 
 PR #293 merged the reviewed persistent-room extraction as `92e03bf` after hosted run `29463198497` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published. The inherited best-effort audit interleaving residual remains documented, and live daemon deployment/supervision remains outside this workstream.
+
+time:      [09:22pm] [15-07-26]
+agent:     [codex], [gpt-5.6], [reviewer]
+worktree:  pi/harness-profile-truth-20260715
+type:      [refactor]: reconcile effective harness-profile truth
+area:      [backend]: daemon turn composition and client attribution
+
+Reduced `HarnessProfile` to the two behaviors the daemon actually applies per turn—hashline edits and artifact spill—and removed logged-only claims for globally registered LSP/memory and unwired stream rules, rich context, and minimization. Mapped the verified `acp-zed` emitter explicitly without changing its former CLI-fallback gates; preserved CLI fallback behavior for room, heartbeat, missing/unknown callers, and the unresolved external `surface-tauri` policy. Added table-driven emitter/fallback coverage plus `PromptControl` default/application tests, and refreshed roadmap, project-map, OMP audit, and owner contracts without enabling a new tool or changing surface policy.
+
+Verification:
+- `cargo test -p ocean-agent` passed (156 tests)
+- `cargo test -p ocean-runtime` passed (unit, integration, and doc tests)
+- `cargo test -p ocean-daemon -- --test-threads=1` passed (345 tests)
+- `cargo check --workspace --tests` and `cargo clippy --workspace --all-targets -- -D warnings` passed
+- `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check` passed
+- Fresh final review found no medium-or-higher behavior or documentation mismatches
 _________________________________________________________________________________
