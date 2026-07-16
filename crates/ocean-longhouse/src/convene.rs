@@ -361,11 +361,49 @@ where
     // Fire all proposal calls concurrently — they're independent.
     let proposal_results = run_round(&workers, proposal_prompts, ROUND1_SYSTEM).await;
 
+    // TASK-7 pre-registration consolidation: semantically duplicate answers
+    // must not enter the engine as rival hypotheses — a unanimous council that
+    // registers N copies of one answer fragments its own evidence field and
+    // can never converge (live finding, topics 0ffd8ae7/4139172f). A duplicate
+    // is folded into an endorse of the first-REGISTERED matching proposal
+    // (deterministic: registration order, never HashMap order) before that
+    // duplicate answer mutates the engine. No merge operation exists; the
+    // correlation cap guards echo chambers through the existing endorse math,
+    // unchanged.
+    let mut registration_order: Vec<Uuid> = Vec::new();
     for (idx, answer) in proposal_results {
         let Some(answer) = answer else { continue };
         let w = &workers[idx];
-        let proposal_id = Uuid::new_v4();
         let now = clock.now_ms();
+
+        let duplicate_of = find_duplicate_canonical(&registration_order, &proposals, &answer);
+        if let Some(canonical) = duplicate_of {
+            engine.endorse(canonical, w.agent_id, None, now);
+            recorded.push(RecordedMark {
+                at_ms: now - started,
+                author: w.agent_id,
+                kind: RecordedMarkKind::Endorse {
+                    proposal: canonical,
+                },
+            });
+            emit(LonghouseEvent::MarkPosted {
+                topic_id,
+                mark: Mark {
+                    mark_id: Uuid::new_v4(),
+                    author: w.agent_id,
+                    kind: MarkKind::Endorse,
+                    target: Some(canonical),
+                    summary: truncate(&answer, 160),
+                },
+            });
+            emit_quorum(&mut engine, topic_id, clock.now_ms(), &mut emit);
+            if engine.is_converged() {
+                break;
+            }
+            continue;
+        }
+
+        let proposal_id = Uuid::new_v4();
         engine.propose(proposal_id, w.agent_id, now);
         recorded.push(RecordedMark {
             at_ms: now - started,
@@ -375,6 +413,7 @@ where
             },
         });
         proposals.insert(proposal_id, answer.clone());
+        registration_order.push(proposal_id);
         proposal_by_author.insert(w.agent_id, proposal_id);
 
         emit(LonghouseEvent::MarkPosted {
@@ -1162,7 +1201,9 @@ fn apply_vote<F>(
 const ROUND1_SYSTEM: &str =
     "You are one member of a small council answering a question. Give your single best \
      answer in ONE short paragraph (max 3 sentences). Be concrete and decisive. Do not \
-     hedge or list multiple options — commit to one answer.";
+     hedge or list multiple options — commit to one answer. If the best answer is the \
+     obvious one others will also give, state it plainly anyway: matching answers are \
+     merged into shared support, never penalized.";
 
 fn round1_user(question: &str) -> String {
     format!("Question for the council:\n\n{question}\n\nYour proposed answer:")
@@ -1198,7 +1239,109 @@ fn is_distinct_rival(answer: &str, proposals: &HashMap<Uuid, String>) -> bool {
         && !abstention.eq_ignore_ascii_case("PASS")
         && !proposals
             .values()
-            .any(|existing| existing.trim().eq_ignore_ascii_case(answer))
+            .any(|existing| answers_are_duplicates(existing, answer))
+}
+
+/// Conservative Jaccard threshold above which two answers are treated as the
+/// same hypothesis. Deliberately high: a false merge silently deletes a rival
+/// (bad), while a missed merge only leaves the pre-TASK-7 fragmentation (the
+/// engine stays honest and aborts). Tune only with measurements.
+const DUPLICATE_JACCARD: f64 = 0.6;
+
+/// Deterministic duplicate check shared by round-1 consolidation and rival
+/// filtering (TASK-7): one similarity definition, one code path, no LLM.
+///
+/// Two answers are duplicates when the Jaccard similarity of their normalized
+/// content-token sets reaches [`DUPLICATE_JACCARD`]. Exact restatements score
+/// 1.0, so this strictly widens the old case-insensitive equality check.
+/// Below this many content tokens an answer is too short for similarity to
+/// mean anything ("Proposal A" vs "Proposal B" share every content token), so
+/// the check falls back to exact-match equality — never merging what it
+/// cannot judge.
+const DUPLICATE_MIN_TOKENS: usize = 4;
+
+fn answers_are_duplicates(a: &str, b: &str) -> bool {
+    // NEGATION VETO (codex's review blocker, strengthened twice): "should use
+    // X" vs "should NOT use X" must never merge — that false merge deletes a
+    // directly contradictory rival. Preserving negation words as tokens is
+    // NOT sufficient (one token in a long answer clears any Jaccard
+    // threshold), and neither is boolean presence ("avoid X" vs "do not avoid
+    // X" both 'contain negation' yet point opposite ways). So the veto
+    // compares normalized negation SIGNATURES — the multiset of negation
+    // words, with n't contractions recognized before tokenization — and any
+    // difference vetoes before similarity is consulted. False-splitting two
+    // differently phrased negatives is acceptable under the conservative
+    // contract; false-merging opposites is not.
+    if negation_signature(a) != negation_signature(b) {
+        return false;
+    }
+    let ta = content_tokens(a);
+    let tb = content_tokens(b);
+    if ta.len() < DUPLICATE_MIN_TOKENS || tb.len() < DUPLICATE_MIN_TOKENS {
+        return a.trim().eq_ignore_ascii_case(b.trim());
+    }
+    let intersection = ta.intersection(&tb).count() as f64;
+    let union = ta.union(&tb).count() as f64;
+    intersection / union >= DUPLICATE_JACCARD
+}
+
+/// Normalized negation signature: how many times each negation word occurs,
+/// with ASCII and curly `n't` contractions rewritten to ` not` BEFORE
+/// tokenization (a bare alphanumeric split turns "can't" into ["can","t"] and
+/// the negation silently vanishes). Any difference between two answers'
+/// signatures — including "avoid X" vs "do not avoid X" — is a hard
+/// anti-merge veto; a matching signature merely allows similarity to be
+/// consulted.
+fn negation_signature(text: &str) -> std::collections::BTreeMap<&'static str, usize> {
+    const NEGATIONS: &[&str] = &["not", "no", "never", "cannot", "avoid", "against", "reject"];
+    let normalized = text
+        .to_lowercase()
+        .replace("n\u{2019}t", " not")
+        .replace("n't", " not");
+    let mut signature = std::collections::BTreeMap::new();
+    for token in normalized.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if let Some(word) = NEGATIONS.iter().find(|word| **word == token) {
+            *signature.entry(*word).or_insert(0usize) += 1;
+        }
+    }
+    signature
+}
+
+/// Lowercased alphanumeric tokens minus high-frequency English glue words, so
+/// similarity is carried by content ("indexeddb", "transactional", "eviction")
+/// rather than prose scaffolding shared by every answer. Negation words are
+/// deliberately NOT stopwords — they are content (and additionally a hard
+/// veto, see [`negation_signature`]).
+fn content_tokens(text: &str) -> std::collections::HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "because", "but", "by", "can", "for", "from",
+        "has", "have", "if", "in", "is", "it", "its", "more", "most", "of", "on", "or", "should",
+        "so", "than", "that", "the", "their", "them", "these", "this", "to", "use", "we", "when",
+        "which", "while", "will", "with", "would", "you", "your",
+    ];
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| token.len() > 1 && !STOPWORDS.contains(token))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// First registered proposal the answer duplicates, in REGISTRATION order —
+/// a `HashMap` scan would pick a process-randomized canonical whenever an
+/// answer clears the threshold against more than one hypothesis.
+fn find_duplicate_canonical(
+    registration_order: &[Uuid],
+    proposals: &HashMap<Uuid, String>,
+    answer: &str,
+) -> Option<Uuid> {
+    registration_order
+        .iter()
+        .find(|id| {
+            proposals
+                .get(id)
+                .is_some_and(|existing| answers_are_duplicates(existing, answer))
+        })
+        .copied()
 }
 
 const EVIDENCE_SYSTEM: &str =
@@ -2045,6 +2188,287 @@ mod tests {
                 ..
             }) if proposal == proposal_a && reviewer == author_a
         ));
+    }
+
+    // ---- TASK-7: pre-registration proposal consolidation --------------------
+
+    /// One duplicate definition powers both round-1 consolidation and rival
+    /// filtering. Conservative: paraphrases of one answer merge; answers
+    /// naming different technologies never do.
+    #[test]
+    fn duplicate_check_merges_paraphrases_and_keeps_rivals() {
+        let canonical = "IndexedDB transactional writes handle transcript persistence with \
+                         indexed queries and eviction control";
+        let paraphrase = "IndexedDB handles transcript persistence: transactional writes, \
+                          indexed queries, eviction control";
+        let rival = "Cache API pairs with service workers for response storage and a \
+                     simpler offline retrieval model";
+        assert!(answers_are_duplicates(canonical, paraphrase));
+        assert!(answers_are_duplicates(paraphrase, canonical), "symmetric");
+        assert!(
+            answers_are_duplicates(canonical, canonical),
+            "exact restatement"
+        );
+        assert!(!answers_are_duplicates(canonical, rival));
+
+        // Token floor: answers too short for similarity to mean anything fall
+        // back to exact equality — "Proposal A" and "Proposal B" share every
+        // content token but must never merge.
+        assert!(!answers_are_duplicates("Proposal A", "Proposal B"));
+        assert!(answers_are_duplicates("Proposal A", "proposal a"));
+
+        // Negation veto (codex's blocker): a directly contradictory rival
+        // differing only by negation must NEVER merge, no matter how long the
+        // shared remainder is — one negation token inside a long answer would
+        // clear any Jaccard threshold, so presence-of-negation is a hard veto,
+        // not a similarity input.
+        let affirm = "the council should adopt IndexedDB for transcript persistence \
+                      because transactional writes handle incremental updates";
+        let negate = "the council should not adopt IndexedDB for transcript persistence \
+                      because transactional writes handle incremental updates poorly";
+        assert!(!answers_are_duplicates(affirm, negate));
+        assert!(!answers_are_duplicates(negate, affirm), "veto is symmetric");
+
+        // Contractions must register as negations: a bare alphanumeric split
+        // turns "can't" into ["can","t"] and the veto silently vanishes. Both
+        // ASCII and curly apostrophes are normalized before tokenization.
+        let can = "the council can adopt IndexedDB for transcript persistence safely";
+        let cant_ascii = "the council can't adopt IndexedDB for transcript persistence safely";
+        let cant_curly =
+            "the council can\u{2019}t adopt IndexedDB for transcript persistence safely";
+        assert!(!answers_are_duplicates(can, cant_ascii));
+        assert!(!answers_are_duplicates(can, cant_curly));
+
+        // Boolean negation-presence is not enough: "avoid X" and "do not
+        // avoid X" both contain negation words yet point opposite directions.
+        // The SIGNATURE ({avoid:1} vs {avoid:1, not:1}) differs, so they veto.
+        let avoid = "avoid IndexedDB for transcript persistence because eviction \
+                     behavior is unpredictable across browsers";
+        let do_not_avoid = "do not avoid IndexedDB for transcript persistence because eviction \
+                            behavior is unpredictable across browsers";
+        assert!(!answers_are_duplicates(avoid, do_not_avoid));
+        assert!(
+            !answers_are_duplicates(do_not_avoid, avoid),
+            "veto is symmetric"
+        );
+
+        // is_distinct_rival now rejects near-duplicates, not just exact ones —
+        // the same definition, so late rivals can't re-fragment the field.
+        let mut proposals = HashMap::new();
+        proposals.insert(Uuid::new_v4(), canonical.to_owned());
+        assert!(!is_distinct_rival(paraphrase, &proposals));
+        assert!(is_distinct_rival(rival, &proposals));
+    }
+
+    /// Ambiguous-match determinism (codex's blocker): when an answer clears
+    /// the duplicate threshold against MORE THAN ONE registered hypothesis,
+    /// the canonical must be the first-REGISTERED match — a HashMap scan would
+    /// pick a process-randomized winner.
+    #[test]
+    fn ambiguous_duplicate_folds_into_first_registered_canonical() {
+        // Token design: a = t1..t10, b = t5..t14 (distinct from a: 6/14 ≈
+        // 0.43 < 0.6), c = t3..t12 (duplicates BOTH: 8/12 ≈ 0.67 ≥ 0.6).
+        let words: Vec<&str> = vec![
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november",
+        ];
+        let text = |range: std::ops::Range<usize>| words[range].join(" ");
+        let first = text(0..10);
+        let second = text(4..14);
+        let ambiguous = text(2..12);
+        assert!(!answers_are_duplicates(&first, &second));
+        assert!(answers_are_duplicates(&first, &ambiguous));
+        assert!(answers_are_duplicates(&second, &ambiguous));
+
+        let id_first = Uuid::new_v4();
+        let id_second = Uuid::new_v4();
+        let mut proposals = HashMap::new();
+        proposals.insert(id_first, first);
+        proposals.insert(id_second, second);
+        // Registration order decides, whichever way the map happens to hash.
+        assert_eq!(
+            find_duplicate_canonical(&[id_first, id_second], &proposals, &ambiguous),
+            Some(id_first)
+        );
+        assert_eq!(
+            find_duplicate_canonical(&[id_second, id_first], &proposals, &ambiguous),
+            Some(id_second)
+        );
+    }
+
+    /// d1 — the live finding, fixed: a unanimous distinct-group council must
+    /// CONVERGE. Consolidation folds the duplicates into endorses of one
+    /// canonical proposal; the resulting lone field escalates through rival
+    /// generation (identifiability requires an alternative); once a genuine
+    /// rival lands, the unanimous evidence crosses EvidenceBound.
+    #[tokio::test]
+    async fn unanimous_distinct_group_council_converges() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let canonical = "IndexedDB transactional writes handle transcript persistence with \
+                         indexed queries and eviction control";
+        let handles = vec![
+            ScriptedHandle::new("a", "group-a", [ScriptedReply::Text(canonical)], &calls),
+            ScriptedHandle::new(
+                "b",
+                "group-b",
+                [
+                    ScriptedReply::Text(
+                        "IndexedDB handles transcript persistence: transactional writes, \
+                         indexed queries, eviction control",
+                    ),
+                    ScriptedReply::Text(
+                        "Cache API pairs with service workers for response storage and a \
+                         simpler offline retrieval model",
+                    ),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "c",
+                "group-c",
+                [
+                    ScriptedReply::Text(
+                        "transcript persistence belongs in IndexedDB: transactional writes \
+                         plus indexed queries and eviction control",
+                    ),
+                    ScriptedReply::Text("PASS"),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "d",
+                "group-d",
+                [
+                    ScriptedReply::Text(
+                        "IndexedDB, for transcript persistence — transactional writes, \
+                         indexed queries, eviction control",
+                    ),
+                    ScriptedReply::Text("PASS"),
+                ],
+                &calls,
+            ),
+        ];
+        let req = sequential_request(
+            &["a", "b", "c", "d"],
+            SequentialEvidenceConfig::default(),
+            2,
+            60_000,
+        );
+        let mut events = Vec::new();
+        let outcome = convene_with_resolver(
+            req,
+            &StepClock::new(0, 50),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        // Consolidation registered ONE canonical proposal from the unanimous
+        // four, plus the solicited rival.
+        assert_eq!(outcome.proposals.len(), 2);
+        let canonical_id = outcome
+            .proposals
+            .iter()
+            .find_map(|(id, text)| (text == canonical).then_some(*id))
+            .expect("canonical proposal registered");
+        let consolidated_endorses = outcome
+            .recording
+            .marks
+            .iter()
+            .filter(|mark| {
+                matches!(mark.kind, RecordedMarkKind::Endorse { proposal } if proposal == canonical_id)
+            })
+            .count();
+        assert_eq!(consolidated_endorses, 3, "b, c, d fold into endorses");
+
+        // The unanimous answer converges on the evidence bound once the field
+        // is identifiable — never a coin flip, never a timeout.
+        assert_eq!(outcome.decision, Some(canonical_id));
+        assert_eq!(
+            outcome.convergence_basis,
+            Some(ConvergenceBasis::EvidenceBound)
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, LonghouseEvent::Converged { decision, .. } if *decision == canonical_id)));
+    }
+
+    /// d2 — the anti-echo-chamber proof: a SAME-GROUP unanimous council must
+    /// NOT converge. Consolidation turns the echo into capped same-group
+    /// endorses, so total group evidence stays cap-bound and the field ends
+    /// honestly open (budget-exhausted Split), no matter how loudly one
+    /// correlation group agrees with itself.
+    #[tokio::test]
+    async fn same_group_unanimous_council_stays_unconverged() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handles = vec![
+            ScriptedHandle::new(
+                "a",
+                "same-model",
+                [
+                    ScriptedReply::Text(
+                        "IndexedDB transactional writes handle transcript persistence with \
+                         indexed queries and eviction control",
+                    ),
+                    ScriptedReply::Text("evidence: internal benchmark, 2ms per write"),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "b",
+                "same-model",
+                [
+                    ScriptedReply::Text(
+                        "IndexedDB handles transcript persistence: transactional writes, \
+                         indexed queries, eviction control",
+                    ),
+                    ScriptedReply::Text("PASS"),
+                ],
+                &calls,
+            ),
+            ScriptedHandle::new(
+                "c",
+                "same-model",
+                [
+                    ScriptedReply::Text(
+                        "transcript persistence belongs in IndexedDB: transactional writes \
+                         plus indexed queries and eviction control",
+                    ),
+                    ScriptedReply::Text(
+                        "Cache API pairs with service workers for response storage and a \
+                         simpler offline retrieval model",
+                    ),
+                ],
+                &calls,
+            ),
+        ];
+        let req = sequential_request(
+            &["a", "b", "c"],
+            SequentialEvidenceConfig::default(),
+            2,
+            60_000,
+        );
+        let mut events = Vec::new();
+        let outcome = convene_with_resolver(
+            req,
+            &StepClock::new(0, 50),
+            |event| events.push(event),
+            scripted_resolver(handles),
+        )
+        .await;
+
+        // The echo chamber consolidated (one canonical + capped endorses) and a
+        // rival landed — but one correlation group's agreement is one unit of
+        // evidence, so nothing may converge.
+        assert_eq!(outcome.decision, None);
+        assert_eq!(outcome.convergence_basis, None);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, LonghouseEvent::Converged { .. })));
+        assert!(
+            has_abort(&events, AbortReason::Split),
+            "honest pre-deadline split once review budget is spent"
+        );
     }
 
     // ---- TASK-4: escalation routing + abort taxonomy -----------------------
