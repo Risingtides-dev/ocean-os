@@ -16681,6 +16681,466 @@ mod tests {
         .expect("write SKILL.md");
     }
 
+    fn sorted_json_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .expect("expected JSON object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    async fn longhouse_adapter_request(
+        app: Router,
+        method: axum::http::Method,
+        path: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        if let Some(content_type) = content_type {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+        }
+        let response = app
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 response");
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn longhouse_preparation_http_extractors_methods_and_defaults_are_exact() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = longhouse_routes().with_state(fake_convene_state(&tmp));
+        let routes = [
+            "/v1/longhouse/prepare",
+            "/v1/longhouse/inspect",
+            "/v1/workflows/prepare",
+        ];
+        let missing_prompt =
+            "Failed to deserialize the JSON body into the target type: missing field `prompt` at line 1 column 2";
+        let missing_content_type = "Expected request with `Content-Type: application/json`";
+        let malformed_json =
+            "Failed to parse the request body as JSON: EOF while parsing an object at line 1 column 1";
+
+        for path in routes {
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            assert_eq!(body, missing_prompt, "{path}");
+
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                None,
+                r#"{"prompt":"anything"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{path}");
+            assert_eq!(body, missing_content_type, "{path}");
+
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                "{",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(body, malformed_json, "{path}");
+
+            for method in [axum::http::Method::GET, axum::http::Method::PUT] {
+                let (status, headers, body) = longhouse_adapter_request(
+                    app.clone(),
+                    method.clone(),
+                    path,
+                    Some("application/json"),
+                    "{}",
+                )
+                .await;
+                assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+                assert_eq!(
+                    headers
+                        .get(axum::http::header::ALLOW)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("POST"),
+                    "{method} {path}"
+                );
+                assert_eq!(body, "", "{method} {path}");
+            }
+
+            let request = json!({
+                "prompt": "qqzzxx-longhouse-adapter-defaults",
+                "cwd": tmp.path().to_string_lossy(),
+                "top_n": 0,
+                "unknown_field_is_ignored": true
+            });
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                &request.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+            match path {
+                "/v1/longhouse/prepare" => {
+                    assert_eq!(
+                        sorted_json_keys(&body),
+                        ["advisory", "ok", "prep", "skills_indexed"]
+                    );
+                    assert_eq!(
+                        sorted_json_keys(&body["prep"]),
+                        ["skills", "sops", "workflows"]
+                    );
+                    assert_eq!(body["prep"]["skills"], json!([]));
+                    assert_eq!(body["prep"]["workflows"], json!([]));
+                }
+                "/v1/longhouse/inspect" => {
+                    assert_eq!(
+                        sorted_json_keys(&body),
+                        [
+                            "advisory",
+                            "consult_enabled",
+                            "ok",
+                            "prep",
+                            "selected_skills",
+                            "selected_workflows",
+                            "skill_candidates",
+                            "skills_indexed",
+                            "workflow_candidates",
+                            "workflows_indexed",
+                        ]
+                    );
+                    assert_eq!(body["selected_skills"], json!([]));
+                    assert_eq!(body["selected_workflows"], json!([]));
+                }
+                "/v1/workflows/prepare" => {
+                    assert_eq!(sorted_json_keys(&body), ["advisory", "ok", "workflows"]);
+                    assert_eq!(body["workflows"], json!([]));
+                }
+                _ => unreachable!(),
+            }
+
+            let defaults_only = json!({
+                "prompt": "qqzzxx-longhouse-all-optionals-omitted"
+            });
+            let (status, _, body) = longhouse_adapter_request(
+                app.clone(),
+                axum::http::Method::POST,
+                path,
+                Some("application/json"),
+                &defaults_only.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+            assert_eq!(body["ok"], json!(true));
+            assert_eq!(body["advisory"], json!(true));
+            match path {
+                "/v1/longhouse/prepare" => {
+                    assert!(body["skills_indexed"].is_u64());
+                    assert!(body["prep"].is_object());
+                }
+                "/v1/longhouse/inspect" => {
+                    assert!(body["consult_enabled"].is_boolean());
+                    assert!(body["selected_skills"].is_array());
+                    assert!(body["selected_workflows"].is_array());
+                }
+                "/v1/workflows/prepare" => assert!(body["workflows"].is_array()),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn longhouse_preparation_http_envelopes_and_privacy_are_exact() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace-private-cwd-sentinel");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        plant_repo_skill_md(
+            &cwd,
+            "adapter",
+            "Adapternonce Alpha",
+            "adapternonce alpha compact description",
+            "SKILL_BODY_SECRET_SENTINEL",
+        );
+        plant_repo_skill(
+            tmp.path(),
+            "outside",
+            "Adapternonce Outside",
+            "adapternonce outside selected cwd",
+        );
+        let workflow_dir = cwd.join("docs/orchestrator/workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(
+            workflow_dir.join("adapter.md"),
+            "---\nname: adapternonce workflow\ndescription: adapternonce workflow compact description\n---\n\nWORKFLOW_BODY_SECRET_SENTINEL\n",
+        )
+        .expect("workflow");
+
+        let app = longhouse_routes().with_state(fake_convene_state(&tmp));
+        let request = json!({
+            "prompt": "adapternonce alpha then adapternonce workflow qzxvnoncontribsecret",
+            "session_id": "SESSION_SECRET_SENTINEL",
+            "cwd": cwd.to_string_lossy(),
+            "client_type": "CLIENT_SECRET_SENTINEL",
+            "top_n": 1,
+        });
+
+        let (status, _, prepare_wire) = longhouse_adapter_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/longhouse/prepare",
+            Some("application/json"),
+            &request.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let prepare: serde_json::Value = serde_json::from_str(&prepare_wire).expect("prepare JSON");
+        assert_eq!(
+            sorted_json_keys(&prepare),
+            ["advisory", "ok", "prep", "skills_indexed"]
+        );
+        assert_eq!(
+            sorted_json_keys(&prepare["prep"]),
+            ["skills", "sops", "workflows"]
+        );
+        assert_eq!(
+            sorted_json_keys(&prepare["prep"]["skills"][0]),
+            ["description", "name", "source", "source_path"]
+        );
+        assert_eq!(
+            sorted_json_keys(&prepare["prep"]["workflows"][0]),
+            ["description", "name", "source_path"]
+        );
+
+        let (status, _, inspect_wire) = longhouse_adapter_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/longhouse/inspect",
+            Some("application/json"),
+            &request.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inspect: serde_json::Value = serde_json::from_str(&inspect_wire).expect("inspect JSON");
+        assert_eq!(
+            sorted_json_keys(&inspect),
+            [
+                "advisory",
+                "consult_enabled",
+                "ok",
+                "prep",
+                "selected_skills",
+                "selected_workflows",
+                "skill_candidates",
+                "skills_indexed",
+                "workflow_candidates",
+                "workflows_indexed",
+            ]
+        );
+        assert_eq!(inspect["selected_skills"].as_array().unwrap().len(), 1);
+        assert_eq!(inspect["selected_workflows"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_skills"][0]),
+            [
+                "brief",
+                "exact_name_phrase",
+                "matched_prompt_terms",
+                "score"
+            ]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_skills"][0]["brief"]),
+            ["description", "name", "source"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_workflows"][0]),
+            [
+                "brief",
+                "exact_name_phrase",
+                "matched_prompt_terms",
+                "score"
+            ]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["selected_workflows"][0]["brief"]),
+            ["description", "name"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["prep"]),
+            ["skills", "sops", "workflows"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["prep"]["skills"][0]),
+            ["description", "name", "source"]
+        );
+        assert_eq!(
+            sorted_json_keys(&inspect["prep"]["workflows"][0]),
+            ["description", "name"]
+        );
+        assert_eq!(
+            inspect["selected_skills"][0]["exact_name_phrase"],
+            json!(true)
+        );
+        assert_eq!(
+            inspect["selected_workflows"][0]["exact_name_phrase"],
+            json!(true)
+        );
+        for selected in [
+            &inspect["selected_skills"][0],
+            &inspect["selected_workflows"][0],
+        ] {
+            let terms = selected["matched_prompt_terms"].as_array().expect("terms");
+            assert!(
+                terms.iter().any(|term| term == "adapternonce"),
+                "selected evidence lost the planted contributing nonce: {terms:?}"
+            );
+            assert!(terms.iter().all(|term| term != "qzxvnoncontribsecret"));
+        }
+        for private in [
+            "qzxvnoncontribsecret",
+            "SESSION_SECRET_SENTINEL",
+            "CLIENT_SECRET_SENTINEL",
+            "SKILL_BODY_SECRET_SENTINEL",
+            "WORKFLOW_BODY_SECRET_SENTINEL",
+            cwd.to_string_lossy().as_ref(),
+        ] {
+            assert!(
+                !inspect_wire.contains(private),
+                "inspect response leaked private text: {private}"
+            );
+        }
+        assert!(
+            !inspect_wire.contains("source_path"),
+            "inspect response leaked source paths"
+        );
+        assert!(inspect["selected_skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|selected| selected["brief"]["name"] != json!("Adapternonce Outside")));
+
+        let (status, _, workflows_wire) = longhouse_adapter_request(
+            app,
+            axum::http::Method::POST,
+            "/v1/workflows/prepare",
+            Some("application/json"),
+            &request.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let workflows: serde_json::Value =
+            serde_json::from_str(&workflows_wire).expect("workflows JSON");
+        assert_eq!(
+            sorted_json_keys(&workflows),
+            ["advisory", "ok", "workflows"]
+        );
+        assert_eq!(workflows["workflows"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            sorted_json_keys(&workflows["workflows"][0]),
+            ["description", "name", "source_path"]
+        );
+    }
+
+    #[test]
+    fn longhouse_preparation_source_preserves_blocking_read_only_boundary() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let extracted = src_dir.join("longhouse_preparation.rs");
+        let owner = if extracted.exists() {
+            extracted
+        } else {
+            src_dir.join("main.rs")
+        };
+        let source = std::fs::read_to_string(&owner).expect("Longhouse preparation owner source");
+        let prepare_start = source
+            .find("async fn longhouse_prepare(")
+            .expect("prepare handler");
+        let inspect_start = source
+            .find("async fn longhouse_inspect(")
+            .expect("inspect handler");
+        let workflows_start = source
+            .find("async fn workflows_prepare(")
+            .expect("workflows handler");
+        let boundary_end = source
+            .find("// --- Skill-librarian API:")
+            .unwrap_or(source.len());
+        let sections = [
+            &source[prepare_start..inspect_start],
+            &source[inspect_start..workflows_start],
+            &source[workflows_start..boundary_end],
+        ];
+        for section in sections {
+            let spawn = section
+                .find("tokio::task::spawn_blocking(move || {")
+                .expect("blocking closure");
+            let cache = section
+                .find("ocean_longhouse::cached_index_for")
+                .expect("cached index inside closure");
+            let await_after_closure = section
+                .find("\n    })\n    .await")
+                .expect("blocking closure awaited");
+            let fallback = section
+                .find("unwrap_or_else")
+                .expect("JoinError fail-open fallback");
+            assert!(
+                spawn < cache && cache < await_after_closure && await_after_closure < fallback,
+                "index work or fallback moved across the blocking closure boundary"
+            );
+        }
+        assert!(sections[0].contains("(ocean_longhouse::TurnPrep::default(), 0)"));
+        assert!(sections[1].contains("ocean_longhouse::TurnPrepInspection::default()"));
+        assert!(sections[2].contains("Vec::new()"));
+
+        let boundary = &source[prepare_start..boundary_end];
+        for forbidden in [
+            "State<AppState>",
+            ".emit(",
+            "tokio::spawn(",
+            "AgentRuntime",
+            "PermissionPolicy",
+            "run_turn",
+        ] {
+            assert!(
+                !boundary.contains(forbidden),
+                "Longhouse preparation boundary gained authority marker {forbidden:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn longhouse_inspect_is_advisory_bounded_and_does_not_echo_sensitive_text() {
         let tmp = tempfile::tempdir().expect("tempdir");
