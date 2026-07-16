@@ -91,10 +91,11 @@ Existing embedded daemon routes (live in `crates/ocean-daemon/src/main.rs`):
   ranking. It accepts the same brief and `top_n`, uses the same cwd-scoped cached
   indexes, scorer, floor, de-duplication, and tie-breaks, and returns indexed and
   candidate counts plus the selected compact briefs, scores, deterministic
-  contributing prompt terms, and a path-redacted projection of the exact ordinary
-  `prep`. The response reports whether the automatic consult is enabled but does
-  not alter it; it never returns the raw prompt, session id, cwd, source paths, or
-  full bodies, runs a turn, grants capabilities, or invokes a model.
+  contributing prompt terms, the `exact_name_phrase` bonus flag, and a
+  path-redacted projection of the exact ordinary `prep`. The response reports
+  whether the automatic consult is enabled without altering it. It never returns
+  the raw prompt, session id, cwd, source paths, or full bodies, and it never runs
+  a turn, grants capabilities, or invokes a model.
 - `POST /v1/longhouse/claim` — daemon-held `claim_outcome` gate (OCEAN-272).
 - `POST /v1/longhouse/board` — `board_post` append note/evidence (OCEAN-272).
 - `POST /v1/longhouse/revoke` — hard recall of a persisted title (OCEAN-272).
@@ -145,9 +146,19 @@ Longhouse indexes and queries (implemented — `ocean-longhouse/src/prepare.rs`)
 
 Selection path:
 
-1. Deterministically index and rank local skill metadata/content against the task brief.
-2. Apply the relevance floor and return up to `top_n` compact briefs (default: five).
-3. Daemon injects those briefs into the main Ocean agent.
+1. Deterministically index compact skill/workflow names and descriptions; bodies
+   do not participate in relevance.
+2. Normalize the prompt into distinct alphanumeric terms. Match only exact
+   metadata-token boundaries (never substrings), retain the closed short-domain
+   allowlist `ai`, `ci`, `db`, `os`, `pr`, `qa`, `ui`, and `ux`, and drop common
+   request boilerplate.
+3. Weight name hits above description hits, reward distinct coverage, add one
+   explicit bonus when the complete retained multiword name occurs in prompt
+   order, then apply the existing relevance floor and stable score/name/path
+   tie-break. Exact matching intentionally does not stem `deploy` into
+   `deployment` or singulars into plurals.
+4. Return up to `top_n` compact briefs (default: five); daemon injects them into
+   the main Ocean agent under the existing advisory framing.
 
 Model-based reranking is future work; the shipped preparation path makes no LLM call.
 The explained selection can be inspected through `POST /v1/longhouse/inspect`;

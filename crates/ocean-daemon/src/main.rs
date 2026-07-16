@@ -2762,6 +2762,7 @@ struct LonghouseInspectSkillMatch {
     brief: LonghouseInspectSkillBrief,
     score: u32,
     matched_prompt_terms: Vec<String>,
+    exact_name_phrase: bool,
 }
 
 impl From<ocean_longhouse::ExplainedSkillMatch> for LonghouseInspectSkillMatch {
@@ -2770,6 +2771,7 @@ impl From<ocean_longhouse::ExplainedSkillMatch> for LonghouseInspectSkillMatch {
             brief: selected.brief.into(),
             score: selected.score,
             matched_prompt_terms: selected.matched_prompt_terms,
+            exact_name_phrase: selected.exact_name_phrase,
         }
     }
 }
@@ -2779,6 +2781,7 @@ struct LonghouseInspectWorkflowMatch {
     brief: LonghouseInspectWorkflowBrief,
     score: u32,
     matched_prompt_terms: Vec<String>,
+    exact_name_phrase: bool,
 }
 
 impl From<ocean_longhouse::ExplainedWorkflowMatch> for LonghouseInspectWorkflowMatch {
@@ -2787,6 +2790,7 @@ impl From<ocean_longhouse::ExplainedWorkflowMatch> for LonghouseInspectWorkflowM
             brief: selected.brief.into(),
             score: selected.score,
             matched_prompt_terms: selected.matched_prompt_terms,
+            exact_name_phrase: selected.exact_name_phrase,
         }
     }
 }
@@ -16723,7 +16727,7 @@ mod tests {
         .expect("workflow");
 
         let req = LonghousePrepareRequest {
-            prompt: format!("{prompt_secret} inspectnonce"),
+            prompt: format!("{prompt_secret} inspectnonce alpha"),
             session_id: Some("private-session-id".to_string()),
             cwd: Some(cwd.to_string_lossy().into_owned()),
             client_type: Some("test-client".to_string()),
@@ -16754,8 +16758,13 @@ mod tests {
         );
         assert_eq!(
             body["selected_skills"][0]["matched_prompt_terms"],
-            json!(["inspectnonce"]),
+            json!(["inspectnonce", "alpha"]),
             "only contributing terms are returned, not the raw prompt"
+        );
+        assert_eq!(
+            body["selected_skills"][0]["exact_name_phrase"],
+            json!(true),
+            "the additive phrase-bonus evidence remains inspectable"
         );
         for private in [
             prompt_secret,

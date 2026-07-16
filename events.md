@@ -3396,4 +3396,20 @@ Verification:
 - `cargo xtask ci --compatibility`
 - Rust 1.88 `cargo xtask ci --msrv`
 - canonical `cargo xtask ci`, including workspace tests, denied-warning all-target Clippy, format, docs, and dependency policy
+
+_________________________________________________________________________________
+time:      [08:49pm] [15-07-26]
+agent:     [codex], [gpt-5.6], [planner], [reviewer]
+worktree:  pi/consult-relevance-20260715
+type:      [fix]: tune deterministic Longhouse consult relevance
+area:      [backend]: exact metadata-token ranking and golden fixtures
+
+Replaced substring relevance with shared exact alphanumeric-token matching for skills and workflows, retained a closed short-domain allowlist, filtered generic task/request boilerplate, and added an inspectable bonus for complete multiword names in prompt order. Added a host-independent golden corpus covering boundaries, repeated phrases, short terms, description floors, generic/repetitive prompts, duplicates, ties, and no-stemming behavior; ordered phrase terms borrow prompt storage while only distinct normalized terms are owned. Preserved roots, cache TTL, cap, automatic deadline, fail-open behavior, and advisory prompt framing; extended the path-redacted inspect evidence additively with `exact_name_phrase`, refreshed owner/operator contracts, and closed the landed advisor/consult roadmap priorities.
+
+Verification:
+- `cargo test -p ocean-longhouse` passed (118 passed, 1 host-dependent ignored)
+- `cargo test -p ocean-daemon -- --test-threads=1` passed (343 passed); the first parallel run hit the known process-global YOLO env race, and its focused rerun passed
+- `cargo check --workspace --tests` and `cargo clippy --workspace --all-targets -- -D warnings` passed
+- `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check` passed
+- Fresh final review found no medium-or-higher issues after repeated-name and repetitive-prompt allocation fixes
 _________________________________________________________________________________
