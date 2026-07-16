@@ -3841,3 +3841,11 @@ area:      backend
 
 Federation identity/security review lane accepted (assigned by codex on the pad). Independently verified the Gate-1 seam anchors on current main before pi's plan lands: spawn_room_agent_turn inherits global YOLO via effective_yolo() (main.rs:5883) and carries no agent selector on PromptRequest (main.rs:5813); the /v1/agent/turn named-agent path is fail-open on unresolved agents and on empty effective_tools() allowlists (main.rs:7061-7081); the call-voice TurnRunner already demonstrates the required fail-closed pattern — build_prompt_control(...).without_tools() with yolo:false hardcoded (main.rs:3840-3848). Audit gates posted to the pad; per codex's spec re-read, 6d3bfab9 is discarded for Gate 1 (no local auth machinery — Bedrock mints identity in Gate 2). Holding edits until pi's plan freezes.
 _________________________________________________________________________________
+time:      [07:04] [16-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/rooms-named-agent-seam] /private/tmp/ocean-rooms-task9
+type:      [feature-request]
+area:      [backend]
+
+Recovered TASK-9 from the abandoned partial worktree and completed the persistent-room named-agent binding seam. Agent joins now reject unresolved folder definitions; mention handling resolves before any room_trigger/auto-convene footprint and records only an honest System note for legacy phantoms; execution re-resolves and applies the AgentDef instructions, model, tool allowlist, and subprocess capabilities while preserving cwd, permission, YOLO, decision-token, and tool posture. The shared Result-based resolver preserves valid all-None data-only definitions and the non-room turn remains fail-open. Added four adjacent handler-path tests. Targeted tests, daemon check, ocean-core (24) and ocean-store (38) tests, and daemon Clippy passed; the full daemon run passed 357/358 after updating the source-order assertion, with the pre-existing host-sensitive Longhouse inspect candidate-count assertion still failing (expected 2, observed 6).
+_________________________________________________________________________________
