@@ -74,7 +74,7 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Request/permission control records | Published | Private `src/request_control.rs`; PR #286 merged as `ee3860a` after characterization, extraction, dedicated-target gates, fresh reviews, and hosted CI; policy, token verification, HTTP/events, GC scheduling, and shutdown drain stay in composition; live daemon supervision/deployment is owned by the concurrent operator workstream |
 | Recall tally registry | Published | Private `src/recall_registry.rs`; first-threshold ownership, distinct-voter semantics, zero clamp, poison recovery, exact HTTP responses, persisted revocation, and successful-only cleanup were characterized; dedicated-target gates, two fresh reviews, hosted CI, and PR #287 merge `3e051c1` passed |
 | Persistent rooms | Published | Private `src/persistent_rooms.rs`; exact HTTP envelopes/defaults, persisted-row/event/audit/spawn ordering, closed-room audit asymmetry/paging, poison recovery, static/dynamic route precedence, call/LiveKit consumers, cwd/session identity, and three-state permission behavior were characterized; dedicated-target gates, two fresh extraction reviews, hosted CI, and PR #293 merge `92e03bf` passed |
-| Longhouse preparation adapters | Ready for publication | Private `src/longhouse_preparation.rs` owns only state-free prepare/inspect/workflow HTTP shells; exact extractor/method/envelope/privacy, PR #292 evidence, cwd confinement, and blocking/read-only behavior were characterized; the 334-line move, dedicated-target gates, compatibility/MSRV/local CI, and two fresh extraction reviews passed; librarian fetch/spec remain separate after a disclosed symlink-retarget security disposition; hosted CI and merge remain |
+| Longhouse preparation adapters | Published | Private `src/longhouse_preparation.rs` owns only state-free prepare/inspect/workflow HTTP shells; exact extractor/method/envelope/privacy, PR #292 evidence, cwd confinement, and blocking/read-only behavior were characterized; the 334-line move, dedicated-target gates, compatibility/MSRV/local CI, two fresh extraction reviews, hosted CI, and PR #296 merge `29d65f8` passed; librarian fetch/spec remain separate after a disclosed symlink-retarget security disposition |
 | Longhouse governance, calls, remaining registries | Later domain waves | One separately manifested domain at a time |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
@@ -82,7 +82,7 @@ At this checkpoint, `main.rs` is approximately 20.6k lines after persistent-room
 
 ## Course from here
 
-1. Publish the Longhouse preparation-adapter checkpoint, then separately manifest turn-time preparation/presentation and governance before calls and turn/SSE orchestration.
+1. Separately manifest turn-time Longhouse preparation/presentation next, then governance before calls and turn/SSE orchestration.
 2. Keep filesystem/project policy, permission authority, settings policy, host/extension ownership, and call-site orchestration fixed while domain boundaries move.
 3. Treat the deferred librarian security disposition and any remaining state-registry or control-plane boundary as their own checkpoints; do not bundle them with a domain move.
 4. Move turn/SSE orchestration last.
