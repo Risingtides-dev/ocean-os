@@ -6749,9 +6749,11 @@ async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_lo
                 deadline_ms = LONGHOUSE_PREP_DEADLINE.as_millis() as u64,
                 "longhouse pre-turn consult exceeded its deadline; injecting no brief"
             );
-            // The spawn_blocking task is detached and harmless — it only reads
-            // files + ranks; its (now-ignored) result simply warms the cache for
-            // a later turn. The current turn proceeds with no brief.
+            // Dropping the join handle does not cancel this read-only task. It
+            // cannot grant authority, but a stalled cold/stale load can retain
+            // the process-wide cache lock and make later blocking tasks queue
+            // behind it. The current turn still proceeds with no brief; bounding
+            // detached work is a separate availability hardening checkpoint.
             return None;
         }
     };
@@ -17636,6 +17638,67 @@ mod tests {
     }
 
     #[test]
+    fn longhouse_turn_preparation_rendering_and_application_are_exact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_path = tmp.path().join("skill-body.md");
+        let sop_path = tmp.path().join("sop-body.md");
+        let workflow_path = tmp.path().join("workflow-body.md");
+        std::fs::write(&skill_path, "SKILL_BODY_PRIVATE_SENTINEL").unwrap();
+        std::fs::write(&sop_path, "SOP_BODY_PRIVATE_SENTINEL").unwrap();
+        std::fs::write(&workflow_path, "WORKFLOW_BODY_PRIVATE_SENTINEL").unwrap();
+        let prep = ocean_longhouse::TurnPrep {
+            skills: vec![ocean_longhouse::SkillBrief {
+                name: "Skill Ω".to_string(),
+                description: "  Use first\nline two  ".to_string(),
+                source_path: skill_path.clone(),
+                source: ocean_longhouse::SkillSource::Repo,
+            }],
+            sops: vec![
+                ocean_longhouse::SopBrief {
+                    name: "Deploy SOP".to_string(),
+                    description: "  Follow the checklist  ".to_string(),
+                    source_path: sop_path.clone(),
+                },
+                ocean_longhouse::SopBrief {
+                    name: "Blank SOP".to_string(),
+                    description: "  \t ".to_string(),
+                    source_path: sop_path.clone(),
+                },
+            ],
+            workflows: vec![ocean_longhouse::WorkflowBrief {
+                name: "Nightly workflow".to_string(),
+                description: "  Run nightly  ".to_string(),
+                source_path: workflow_path.clone(),
+            }],
+        };
+        let expected = "Longhouse consult (advisory — relevant skills/SOPs for this turn; recommendations only, not granted capabilities; you still route every action through the normal permission gates):\n- Skill Ω — Use first\nline two\n- Deploy SOP — Follow the checklist\n- Blank SOP\n- Nightly workflow — Run nightly";
+        let rendered = render_longhouse_prep(&prep).expect("mixed prep renders");
+        assert_eq!(rendered, expected);
+        for private in [
+            skill_path.to_string_lossy().into_owned(),
+            sop_path.to_string_lossy().into_owned(),
+            workflow_path.to_string_lossy().into_owned(),
+            "SKILL_BODY_PRIVATE_SENTINEL".to_string(),
+            "SOP_BODY_PRIVATE_SENTINEL".to_string(),
+            "WORKFLOW_BODY_PRIVATE_SENTINEL".to_string(),
+        ] {
+            assert!(!rendered.contains(&private), "render leaked {private}");
+        }
+
+        for prompt in ["", " \n\t ", "\n  preserve this task byte-for-byte  \n\n"] {
+            assert_eq!(
+                apply_longhouse_prep(prompt, Some(&prep)),
+                format!("{expected}\n\n{prompt}")
+            );
+            assert_eq!(apply_longhouse_prep(prompt, None), prompt);
+            assert_eq!(
+                apply_longhouse_prep(prompt, Some(&ocean_longhouse::TurnPrep::default())),
+                prompt
+            );
+        }
+    }
+
+    #[test]
     fn apply_browser_context_none_leaves_prompt_byte_for_byte() {
         // OCEAN-40 fail-open: no browser context → prompt returned unchanged.
         let prompt = "summarize this page";
@@ -17866,7 +17929,7 @@ mod tests {
         );
 
         // Explicit opt-OUT spellings turn it off.
-        for off in ["0", "false", "FALSE", "no", "off", "Off"] {
+        for off in ["0", "false", "FALSE", "no", "off", "Off", " \tOFF\n"] {
             env::set_var("OCEAN_LONGHOUSE_PREPARE", off);
             assert!(
                 !longhouse_prepare_enabled(),
@@ -17876,7 +17939,16 @@ mod tests {
 
         // ON spellings (and, deliberately, anything unrecognized) keep it on — the
         // default-on bias means only an explicit off disables it.
-        for on in ["1", "true", "TRUE", "Yes", "on", "", "nonsense"] {
+        for on in [
+            "1",
+            "true",
+            "TRUE",
+            "Yes",
+            "on",
+            "",
+            "nonsense",
+            " off-ish ",
+        ] {
             env::set_var("OCEAN_LONGHOUSE_PREPARE", on);
             assert!(
                 longhouse_prepare_enabled(),
@@ -18016,13 +18088,16 @@ mod tests {
             "an unmatched prompt must inject nothing (fail-open), got {none:?}"
         );
 
-        // (c) Fail-open on an empty prompt: skip the scan entirely → None.
-        assert!(
-            longhouse_prep_for_turn(String::new(), cwd.to_string_lossy().into_owned())
-                .await
-                .is_none(),
-            "an empty prompt can rank nothing and must inject nothing"
-        );
+        // (c) Fail-open on an empty or whitespace-only prompt: skip the scan
+        // entirely → None.
+        for empty in [String::new(), " \n\t ".to_string()] {
+            assert!(
+                longhouse_prep_for_turn(empty, cwd.to_string_lossy().into_owned())
+                    .await
+                    .is_none(),
+                "an empty prompt can rank nothing and must inject nothing"
+            );
+        }
 
         match prior {
             Some(v) => env::set_var("OCEAN_LONGHOUSE_PREPARE", v),
@@ -18061,6 +18136,292 @@ mod tests {
             bounded.is_err(),
             "a prep that exceeds its deadline must time out (→ fail-open None), not block the turn"
         );
+    }
+
+    #[test]
+    fn longhouse_turn_preparation_source_preserves_blocking_fail_open_boundary() {
+        fn function_item<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source.find(signature).expect("function signature");
+            let relative_end = source[start..]
+                .find("\n}\n")
+                .expect("top-level function end");
+            &source[start..start + relative_end + 3]
+        }
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main_path = src_dir.join("main.rs");
+        let main_source = std::fs::read_to_string(&main_path).expect("daemon composition source");
+        let production_main = main_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production main prefix");
+        let extracted = src_dir.join("longhouse_turn_preparation.rs");
+        let is_extracted = extracted.exists();
+        let source = if is_extracted {
+            assert!(production_main.contains("mod longhouse_turn_preparation;"));
+            assert!(production_main.contains("use longhouse_turn_preparation::{"));
+            for signature in [
+                ["fn longhouse_prepare_", "enabled() -> bool"].concat(),
+                ["fn render_longhouse_", "prep("].concat(),
+                ["fn apply_longhouse_", "prep("].concat(),
+                ["async fn longhouse_", "prep_for_turn("].concat(),
+            ] {
+                assert!(
+                    !production_main.contains(&signature),
+                    "production definition remained in main.rs: {signature}"
+                );
+            }
+            std::fs::read_to_string(&extracted).expect("extracted turn-preparation source")
+        } else {
+            main_source
+        };
+        let gate = function_item(&source, "fn longhouse_prepare_enabled() -> bool");
+        let render = function_item(&source, "fn render_longhouse_prep(");
+        let apply = function_item(&source, "fn apply_longhouse_prep(");
+        let prepare = function_item(&source, "async fn longhouse_prep_for_turn(");
+
+        assert!(gate.contains("env::var(\"OCEAN_LONGHOUSE_PREPARE\")"));
+        assert!(gate.contains("v.trim().to_ascii_lowercase().as_str()"));
+        assert!(gate.contains("\"0\" | \"false\" | \"no\" | \"off\""));
+        assert!(gate.contains("Err(_) => true"));
+
+        let skill = render.find("for skill in &prep.skills").unwrap();
+        let sop = render.find("for sop in &prep.sops").unwrap();
+        let workflow = render.find("for wf in &prep.workflows").unwrap();
+        assert!(skill < sop && sop < workflow);
+        assert!(render.contains("let desc = skill.description.trim();"));
+        assert!(render.contains("let desc = sop.description.trim();"));
+        assert!(render.contains("let desc = wf.description.trim();"));
+        assert!(apply.contains("Some(block) => format!(\"{block}\\n\\n{prompt}\")"));
+        assert!(apply.contains("None => prompt.to_string()"));
+        let deadline_prefix = ["const LONGHOUSE_PREP_", "DEADLINE:"].concat();
+        let deadline_start = source.find(&deadline_prefix).expect("deadline constant");
+        let deadline_end = source[deadline_start..].find(';').unwrap() + deadline_start + 1;
+        let normalize_source = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected_deadline = [
+            "const LONGHOUSE_PREP_",
+            "DEADLINE: std::time::Duration = std::time::Duration::from_millis(",
+            "250",
+            ");",
+        ]
+        .concat();
+        assert_eq!(
+            normalize_source(&source[deadline_start..deadline_end]),
+            expected_deadline
+        );
+
+        let gate_check = prepare.find("if !longhouse_prepare_enabled()").unwrap();
+        let empty_check = prepare.find("if prompt.trim().is_empty()").unwrap();
+        let spawn = prepare
+            .find("tokio::task::spawn_blocking(move || {")
+            .unwrap();
+        let empty_cwd = prepare.find("if cwd.is_empty()").unwrap();
+        let default_roots = prepare
+            .find("ocean_longhouse::SkillRoots::default()")
+            .unwrap();
+        let cwd_roots = prepare
+            .find("ocean_longhouse::SkillRoots::for_cwd(&cwd)")
+            .unwrap();
+        let cache = prepare
+            .find("ocean_longhouse::cached_index_for(&roots)")
+            .unwrap();
+        let brief = prepare.find("ocean_longhouse::TurnBrief {").unwrap();
+        let brief_cwd = prepare.find("cwd: Some(cwd),").unwrap();
+        let rank = prepare.find("index.prepare(&brief)").unwrap();
+        let closure_end = prepare.find("\n    });").unwrap();
+        let timeout = prepare
+            .find("tokio::time::timeout(LONGHOUSE_PREP_DEADLINE, scan).await")
+            .unwrap();
+        let timeout_match_end = prepare
+            .find("\n    };\n\n    match prep {")
+            .expect("timeout match end");
+        let outcome = prepare.find("match prep {").unwrap();
+        assert!(
+            gate_check < empty_check
+                && empty_check < spawn
+                && spawn < empty_cwd
+                && empty_cwd < default_roots
+                && default_roots < cwd_roots
+                && cwd_roots < cache
+                && cache < brief
+                && brief < brief_cwd
+                && brief_cwd < rank
+                && rank < closure_end
+                && closure_end < timeout
+                && timeout < timeout_match_end
+                && timeout_match_end < outcome
+        );
+        let timeout_branch = &prepare[timeout..timeout_match_end];
+        assert!(timeout_branch.contains("Err(_elapsed) => {"));
+        assert!(timeout_branch.contains("return None;"));
+        let outcomes = &prepare[outcome..];
+        assert!(outcomes.contains("Ok(prep) if !prep.is_empty() => Some(prep)"));
+        assert!(outcomes.contains("Ok(_) => None"));
+        assert!(outcomes.contains("Err(err) => {"));
+        assert!(outcomes.contains("\n            None\n"));
+        assert!(!prepare.contains("current_dir"));
+        assert!(prepare.contains("Dropping the join handle does not cancel this read-only task."));
+        assert!(prepare.contains("process-wide cache lock"));
+        assert_eq!(prepare.matches("tracing::warn!(").count(), 2);
+        let timeout_warning_start = prepare.find("tracing::warn!(").unwrap();
+        let timeout_warning_end = prepare[timeout_warning_start..]
+            .find("\n            );")
+            .unwrap()
+            + timeout_warning_start
+            + "\n            );".len();
+        let join_warning_start = prepare[timeout_warning_end..]
+            .find("tracing::warn!(")
+            .unwrap()
+            + timeout_warning_end;
+        let join_warning_end = prepare[join_warning_start..]
+            .find(";\n            None")
+            .unwrap()
+            + join_warning_start
+            + 1;
+        let normalize = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            normalize(&prepare[timeout_warning_start..timeout_warning_end]),
+            normalize(
+                "tracing::warn!( deadline_ms = LONGHOUSE_PREP_DEADLINE.as_millis() as u64, \"longhouse pre-turn consult exceeded its deadline; injecting no brief\" );"
+            )
+        );
+        assert_eq!(
+            normalize(&prepare[join_warning_start..join_warning_end]),
+            normalize(
+                "tracing::warn!(error = %err, \"longhouse pre-turn consult task failed; injecting no brief\");"
+            )
+        );
+
+        let boundary = format!("{gate}\n{render}\n{apply}\n{prepare}");
+        let authority_boundary = if is_extracted {
+            source.as_str()
+        } else {
+            boundary.as_str()
+        };
+        for forbidden in [
+            "State<AppState>",
+            ".emit(",
+            "tokio::spawn(",
+            "AgentRuntime",
+            "PermissionPolicy",
+            "runtime.prompt",
+            "skills_fetch",
+            "subagent_spec",
+            "room_livekit_token",
+        ] {
+            assert!(
+                !authority_boundary.contains(forbidden),
+                "turn-preparation boundary gained authority marker {forbidden:?}"
+            );
+        }
+        if is_extracted {
+            let definitions = source
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| {
+                    line.starts_with("fn ")
+                        || line.starts_with("async fn ")
+                        || line.starts_with("pub(super) fn ")
+                        || line.starts_with("pub(super) async fn ")
+                })
+                .count();
+            assert_eq!(definitions, 4, "private owner gained an extra function");
+            assert_eq!(source.matches(&deadline_prefix).count(), 1);
+            assert!(!source.contains("\nstruct "));
+            assert!(!source.contains("\nenum "));
+        }
+    }
+
+    #[test]
+    fn longhouse_turn_preparation_call_sites_and_order_are_exact() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let from = source.find(start).expect("section start");
+            let to = source[from..].find(end).expect("section end") + from;
+            &source[from..to]
+        }
+
+        let source = include_str!("main.rs");
+        let prep_call = ["let consult = longhouse_", "prep_for_turn("].concat();
+        let apply_call = ["= apply_longhouse_", "prep("].concat();
+        assert_eq!(source.matches(&prep_call).count(), 3);
+
+        let prompt = section(source, "async fn prompt(", "async fn create_request(");
+        assert_eq!(prompt.matches(&apply_call).count(), 1);
+        let prompt_cwd = prompt.find("state.runtime.resolve_cwd_for_turn(").unwrap();
+        let prompt_registration = prompt.find("register_running_request(").unwrap();
+        let prompt_user_event = prompt.find("emit_user_message(&state.events").unwrap();
+        let prompt_prep = prompt.find(&prep_call).unwrap();
+        let prompt_apply = prompt.find(&apply_call).unwrap();
+        let prompt_control = prompt.find("let control = build_prompt_control(").unwrap();
+        let prompt_runtime = prompt
+            .find("state.runtime.prompt(req, control).await")
+            .unwrap();
+        assert!(
+            prompt_cwd < prompt_registration
+                && prompt_registration < prompt_user_event
+                && prompt_user_event < prompt_prep
+                && prompt_prep < prompt_apply
+                && prompt_apply < prompt_control
+                && prompt_control < prompt_runtime
+        );
+        assert!(prompt.contains("req.prompt.clone(), req.cwd.clone()"));
+        assert!(
+            prompt.contains("req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());")
+        );
+
+        let create = section(
+            source,
+            "async fn create_request(",
+            "async fn cancel_request(",
+        );
+        assert_eq!(create.matches(&apply_call).count(), 1);
+        let create_user_event = create.find("emit_user_message(&state.events").unwrap();
+        let spawn = create
+            .find("let handle = tokio::spawn(async move {")
+            .unwrap();
+        let permit = create.find("let _turn_permit = permit;").unwrap();
+        let create_prep = create.find(&prep_call).unwrap();
+        let create_apply = create.find(&apply_call).unwrap();
+        let create_runtime = create
+            .find("task_state.runtime.prompt(req, control).await")
+            .unwrap();
+        let spawned_end = create.find("\n    });\n    attach_request_handle").unwrap();
+        let response = create.rfind("Json(RequestCreateResponse {").unwrap();
+        assert!(
+            create_user_event < spawn
+                && spawn < permit
+                && permit < create_prep
+                && create_prep < create_apply
+                && create_apply < create_runtime
+                && create_runtime < spawned_end
+                && spawned_end < response
+        );
+        assert!(create.contains("req.prompt.clone(), req.cwd.clone()"));
+        assert!(
+            create.contains("req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());")
+        );
+
+        let agent = section(source, "async fn agent_turn(", "fn render_turn_guidance(");
+        assert_eq!(agent.matches(&apply_call).count(), 1);
+        let agent_cwd = agent.find("state.runtime.resolve_cwd_for_turn(").unwrap();
+        let turn_started = agent.find("AgentTurnEvent::TurnStarted {").unwrap();
+        let named_agent_end = agent
+            .find("None => (guided_prompt, None, None, None),\n    };")
+            .unwrap();
+        let agent_prep = agent.find(&prep_call).unwrap();
+        let agent_apply = agent.find(&apply_call).unwrap();
+        let browser = agent.find("apply_browser_context(").unwrap();
+        let registration = agent.find("register_running_request(").unwrap();
+        assert!(
+            agent_cwd < turn_started
+                && turn_started < named_agent_end
+                && named_agent_end < agent_prep
+                && agent_prep < agent_apply
+                && agent_apply < browser
+                && browser < registration
+        );
+        assert!(agent.contains("prompt.clone(), cwd.clone()"));
+        assert!(agent.contains("apply_longhouse_prep(&guided_prompt, consult.as_ref())"));
     }
 
     // ---- OCEAN-231: handler-level tests for the livekit-token + call_place ----
