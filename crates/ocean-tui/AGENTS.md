@@ -51,7 +51,9 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 
 ## Work Guidance
 
-- Preserve keyboard-driven workflows and terminal responsiveness.
+- Sessions, Files, the session-component tray, and Terminal use the shared
+  untitled panel frame: keep the slate bed, hairline, inset, footer, focus,
+  selection, and content geometry, but do not render redundant pane-name labels.
 - Chrome contract (2026-07-11, owner-directed): the TITLE row is identity only
   — `workspace › surface`, no branding, no controls. The BOTTOM row is the
   control + info bar: six nav buttons on the LEFT (mouse-first, closest to the
@@ -75,18 +77,35 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   never cumulative multi-round usage; unknown values remain absent. The model
   row falls back to the startup `/v1/models` fetch before the first turn.
 - The lower Files rail is a separate session-component tray, never part of
-  `FileTreeComponent`. Its todo adapter applies only successful correlated tool
+  `FileTreeComponent`. Its context meter uses a btop-inspired terminal grammar:
+  a quiet empty bed, per-cell truecolor deep-aqua→cyan→amber→coral ramp, and a
+  `░`/`▒`/`▓` frontier for sub-cell dithering (`.`/`:`/`=`/`#` fallback through
+  `g()`); numeric warning thresholds remain truthful and separate from texture.
+  Its todo adapter applies only successful correlated tool
   finishes and keeps confirmed items pinned while the same session remains
   bound. The runtime's in-memory todo tool uses that same session scope, so the
   display never outlives executable todo state. Explicit todo clear, session
   switch/new session, daemon restart, or SSE-gap invalidation removes the pin.
-  It never parses human-formatted todo output into invented durable state. Empty
+  Auto-reveal the Files rail only when this tray transitions hidden→visible;
+  once mounted, unrelated actions and Terminal render ticks must respect an
+  operator's explicit Files close.
+  It never parses human-formatted todo output into invented durable state. Todo
+  `text` remains authoritative; an optional agent-supplied `title` (at most 36
+  terminal cells) is display-only and is preferred in the compact tray. Empty
   or short layouts return the full rail to the file tree; tray selection and
   mouse routing remain pane-bounded.
-- Tool drawers (`shell/components/chat.rs`): one per call, independently
-  expandable (`▸`/`▾` via `g()`), collapsed header never wraps; consecutive
-  VISIBLE tool turns render single-spaced — a suppressed Thinking turn between
-  tool calls must not reintroduce the blank row.
+- Consecutive tool bursts (`shell/components/chat.rs`) collapse under one
+  non-wrapping parent summary with truthful running/done/failed counts. Hidden
+  Thinking turns do not split a burst; visible prose/cards/errors do. Opening a
+  parent reveals the existing independently expandable per-call drawers;
+  keyboard focus reveals a nested drawer's parent, and `Ctrl+O` remains the
+  global open-all override. Mouse routing uses the exact wrapped + scrolled
+  geometry and preserves drag-to-select precedence.
+- Assistant Markdown links to existing workspace-local `.md`, `.markdown`, and
+  `.mdx` files open in the native editor on a clean mouse click. Resolve and
+  canonicalize against the active workspace, reject symlink/`..` escapes and
+  non-doc/external/missing targets, derive hit cells from Ratatui's exact wrapped
+  + scrolled render, and preserve drag-to-select precedence.
 - Chat composer (`shell/components/chat.rs`): `cursor` is a UTF-8 byte offset
   (`None` = end). Every input replacement/insert/delete/kill/completion path
   must preserve that invariant. Readline keys are cursor-relative; `Ctrl+Y`
@@ -94,6 +113,16 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
   and scroll use Unicode cell width and follow the cursor row, never the final
   input row.
+- Composer dictation is local capture over daemon-owned STT: in terminals with
+  Kitty keyboard event types, a quick Space tap remains one space while a 180ms
+  hold opens the mic and release stops it; `F2` is the explicit toggle fallback.
+  macOS capture is a bounded 30s mono WAV path in `shell/dictation.rs`; other
+  platforms fail visibly without audio build dependencies. The live RMS history
+  replaces the prompt box with a btop-style meter, while the draft/cursor remain
+  untouched. `/v1/voice/stt` returns one final transcript, so word-by-word paint
+  is a generation-tagged insertion animation, not invented interim STT; Esc,
+  quit, late results, and dropped handles cancel safely, and dictation never
+  auto-submits.
 - `/permissions` is a daemon-backed three-state picker, not a client-side
   approval bypass: manual prompts for every known tool, automatic prompts only
   for runtime-classified unsafe tools, and skip-all suppresses prompts. Render

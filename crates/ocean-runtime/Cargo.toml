@@ -33,6 +33,7 @@ thiserror = "1"
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+unicode-width = "0.2"
 uuid.workspace = true
 
 [dev-dependencies]

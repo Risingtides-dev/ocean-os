@@ -40,6 +40,41 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 // --- Request shapes ----------------------------------------------------------
 
+/// Small allowlist of audio containers accepted from first-party surfaces.
+/// Browser capture keeps the historical WebM default; native TUI dictation
+/// sends mono PCM WAV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SttAudioFormat {
+    WebM,
+    Wav,
+}
+
+impl SttAudioFormat {
+    pub(crate) fn from_content_type(content_type: Option<&str>) -> Self {
+        match content_type
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+        {
+            Some("audio/wav" | "audio/x-wav" | "audio/wave") => Self::Wav,
+            _ => Self::WebM,
+        }
+    }
+
+    fn filename(self) -> &'static str {
+        match self {
+            Self::WebM => "clip.webm",
+            Self::Wav => "clip.wav",
+        }
+    }
+
+    fn mime(self) -> &'static str {
+        match self {
+            Self::WebM => "application/octet-stream",
+            Self::Wav => "audio/wav",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct TtsRequest {
     pub text: String,
@@ -49,16 +84,19 @@ pub(crate) struct TtsRequest {
 
 // --- Pure body builders ------------------------------------------------------
 
-/// Build the multipart form for xAI STT: one `file` part (filename `clip.webm`,
-/// mime `application/octet-stream`) plus text fields `model=grok-stt`,
+/// Build the multipart form for xAI STT: one format-labeled `file` part
+/// (historical WebM or native WAV) plus text fields `model=grok-stt`,
 /// `language=en`, `response_format=json`.
 ///
 /// Exposed for unit testing; the handler uses this to build the form before
 /// calling [`transcribe`].
-pub(crate) fn build_stt_form(audio_bytes: &[u8]) -> Result<reqwest::multipart::Form, String> {
+pub(crate) fn build_stt_form(
+    audio_bytes: &[u8],
+    format: SttAudioFormat,
+) -> Result<reqwest::multipart::Form, String> {
     let part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
-        .file_name("clip.webm")
-        .mime_str("application/octet-stream")
+        .file_name(format.filename())
+        .mime_str(format.mime())
         .map_err(|e| format!("multipart mime: {e}"))?;
 
     Ok(reqwest::multipart::Form::new()
@@ -102,8 +140,12 @@ pub(crate) fn stt_text(payload: &Value) -> String {
 ///
 /// Returns `Ok(text)` on success, or a human-readable error string (mapped to
 /// 502 by the handler — the key itself never appears in errors).
-pub(crate) async fn transcribe(api_key: &str, audio_bytes: &[u8]) -> Result<String, String> {
-    let form = build_stt_form(audio_bytes)?;
+pub(crate) async fn transcribe(
+    api_key: &str,
+    audio_bytes: &[u8],
+    format: SttAudioFormat,
+) -> Result<String, String> {
+    let form = build_stt_form(audio_bytes, format)?;
 
     let resp = HTTP
         .post(XAI_STT_URL)
@@ -176,7 +218,7 @@ mod tests {
 
     #[test]
     fn stt_form_has_correct_text_fields() {
-        let form = build_stt_form(b"fake audio").unwrap();
+        let form = build_stt_form(b"fake audio", SttAudioFormat::WebM).unwrap();
         // We can't inspect reqwest::multipart::Form internals easily, but we
         // can verify it round-trips through a boundary snapshot.
         let boundary = form.boundary().to_string();
@@ -186,11 +228,27 @@ mod tests {
     #[test]
     fn stt_form_accepts_empty_audio() {
         // An empty body is valid at the form layer — upstream will reject it.
-        let form = build_stt_form(b"").unwrap();
+        let form = build_stt_form(b"", SttAudioFormat::WebM).unwrap();
         assert!(!form.boundary().is_empty());
     }
 
     // --- STT payload normalization -------------------------------------------
+
+    #[test]
+    fn stt_audio_format_honors_wav_and_defaults_to_webm() {
+        assert_eq!(
+            SttAudioFormat::from_content_type(Some("audio/wav; charset=binary")),
+            SttAudioFormat::Wav
+        );
+        assert_eq!(
+            SttAudioFormat::from_content_type(Some("application/octet-stream")),
+            SttAudioFormat::WebM
+        );
+        assert_eq!(
+            SttAudioFormat::from_content_type(None),
+            SttAudioFormat::WebM
+        );
+    }
 
     #[test]
     fn stt_text_missing_field_is_empty_transcript() {

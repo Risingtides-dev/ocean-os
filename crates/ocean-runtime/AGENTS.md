@@ -37,7 +37,10 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
   daemon restart remains the durability boundary. The session cache has a soft
   bound of 1,024 recently-used entries: eviction only reclaims **empty** idle
   tools — non-empty sessions are never silently dropped, preventing the TUI
-  tray from displaying a projection with no corresponding daemon tool.
+  tray from displaying a projection with no corresponding daemon tool. Todo
+  items keep authoritative `text` plus an optional agent-supplied `title` of at
+  most 36 terminal cells; list output retains the text, while compact clients
+  may render the title.
 
 
 ## Work Guidance

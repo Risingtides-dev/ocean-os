@@ -145,7 +145,7 @@ The daemon also exposes current route families for:
 - optional call placement/webhooks/demo and daemon-owned voice endpoints;
 - health, readiness, metrics, cancellation, and permission decisions.
 
-The canonical `app_router` currently registers 72 explicit method/path pairs. Executable parity tests keep router registration, discovery output, and the operator-guide quick reference synchronized while preserving Axum fallback behavior and tracing/CORS middleware order. CORS policy and turn metrics are private daemon leaves; composition remains in `main.rs`. The extended route reference is [`OCEAN_RUNTIME_OPERATOR_GUIDE.md`](OCEAN_RUNTIME_OPERATOR_GUIDE.md), and ongoing extraction boundaries live in [`DAEMON_REFACTOR_MISSION.md`](DAEMON_REFACTOR_MISSION.md).
+The canonical `app_router` currently registers 75 explicit method/path pairs. Executable parity tests keep router registration, discovery output, and the operator-guide quick reference synchronized while preserving Axum fallback behavior and tracing/CORS middleware order. CORS policy and turn metrics are private daemon leaves; composition remains in `main.rs`. The extended route reference is [`OCEAN_RUNTIME_OPERATOR_GUIDE.md`](OCEAN_RUNTIME_OPERATOR_GUIDE.md), and ongoing extraction boundaries live in [`DAEMON_REFACTOR_MISSION.md`](DAEMON_REFACTOR_MISSION.md).
 
 ## Clients
 

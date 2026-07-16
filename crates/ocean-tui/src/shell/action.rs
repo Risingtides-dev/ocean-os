@@ -58,11 +58,16 @@ pub enum Action {
     /// A turn (or its session mint) could not be sent even after the daemon-blip
     /// retry window. The chat unwinds its busy state, surfaces the error in the
     /// transcript, and restores `prompt` to the composer so nothing typed is lost.
-    TurnSendFailed { prompt: String, err: String },
+    TurnSendFailed {
+        prompt: String,
+        err: String,
+    },
     /// The turn POST was connected but its final response was lost/invalid.
     /// The daemon may already be executing it, so do NOT restore the prompt or
     /// offer an automatic retry that could duplicate side effects.
-    TurnOutcomeUnknown { err: String },
+    TurnOutcomeUnknown {
+        err: String,
+    },
     /// Transient status message. COMPATIBILITY PATH for slash-command and
     /// notice producers — health transitions use the typed
     /// [`Action::HealthDegraded`]/[`Action::HealthRecovered`] variants instead
@@ -85,7 +90,9 @@ pub enum Action {
     NewSession,
     /// `+ new` on a project header in the rail: start a fresh session AND
     /// re-root the workbench (cwd for turns, file tree, graph) to `cwd`.
-    NewSessionInProject { cwd: PathBuf },
+    NewSessionInProject {
+        cwd: PathBuf,
+    },
     /// `/copy` — put the given text (the last reply) on the system clipboard.
     CopyToClipboard(String),
     /// `/model <id>` — override the model for subsequent turns this session.
@@ -144,6 +151,53 @@ pub enum Action {
         current: String,
         entries: Vec<crate::shell::client::ModelEntry>,
     },
+    /// Image capture/loading completed. Images queue on the composer and are
+    /// attached to the next submitted turn through `AgentTurnRequest.images`.
+    ClipboardImages(Result<Vec<ocean_agent_sdk::TurnImage>, String>),
+    /// Enhanced-terminal Space press/release gesture. A tap remains a normal
+    /// space; crossing the hold threshold activates one dictation generation.
+    DictationHoldPressed,
+    DictationHoldActivated {
+        id: u64,
+    },
+    DictationHoldReleased,
+    /// Explicit toggle fallback for terminals that cannot report key releases.
+    DictationToggle,
+    /// Local capture/transcription lifecycle. Generation ids make late device,
+    /// HTTP, and word-animation completions harmless.
+    DictationStart {
+        id: u64,
+        toggle: bool,
+    },
+    DictationCaptureStarted {
+        id: u64,
+    },
+    DictationLevel {
+        id: u64,
+        level: f32,
+    },
+    DictationStop {
+        id: u64,
+    },
+    DictationCaptured {
+        id: u64,
+        audio: Result<Vec<u8>, String>,
+    },
+    DictationTranscribed {
+        id: u64,
+        transcript: Result<String, String>,
+    },
+    DictationTextChunk {
+        id: u64,
+        text: String,
+        first: bool,
+        last: bool,
+    },
+    DictationCancel {
+        id: u64,
+    },
+    /// Insert ordinary composer text through the component's UTF-8 cursor path.
+    ComposerInsert(String),
     /// Open a file in the editor (from the file tree or the graph).
     OpenFile(PathBuf),
     /// Blocking session discovery for the startup resume picker completed.

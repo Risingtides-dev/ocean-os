@@ -336,6 +336,7 @@ pub fn surface_flag(client_type: Option<&str>) -> &'static str {
         Some("surface-extension") => "BRWSR",
         Some("tui") => "TUI",
         Some("surface-web") => "WEB",
+        Some("surface-tauri") => "TAURI",
         Some("surface-gpui") | Some("surface-native") => "GUI",
         Some("cli") => "CLI",
         Some("leo-voice") => "VOX",
@@ -444,6 +445,10 @@ fn append_client_type_from(
     match client_type {
             Some("tui") => tui_surface_prompt(prompt),
             Some("surface-web") => web_surface_prompt(prompt, "Ocean Surface (web) — a browser PWA"),
+            Some("surface-tauri") => web_surface_prompt(
+                prompt,
+                "Ocean Surface (Tauri desktop) — the native shell hosting the canonical Leptos/WASM Surface",
+            ),
             Some("surface-extension") => extension_surface_prompt(prompt),
             Some("surface-gpui") => gpui_surface_prompt(prompt, "Ocean GUI (GPUI native desktop)"),
             Some("surface-native") => gpui_surface_prompt(prompt, "Ocean native surface"),
@@ -656,6 +661,7 @@ mod tests {
         assert_eq!(surface_flag(Some("surface-extension")), "BRWSR");
         assert_eq!(surface_flag(Some("tui")), "TUI");
         assert_eq!(surface_flag(Some("surface-web")), "WEB");
+        assert_eq!(surface_flag(Some("surface-tauri")), "TAURI");
         assert_eq!(surface_flag(Some("surface-gpui")), "GUI");
         assert_eq!(surface_flag(Some("surface-native")), "GUI");
         assert_eq!(surface_flag(Some("cli")), "CLI");
@@ -757,6 +763,18 @@ mod tests {
         assert!(prompt.contains("Leptos components"));
         assert!(prompt.contains("component_render"));
         assert!(prompt.contains("Responses render as HTML"));
+    }
+
+    #[test]
+    fn tauri_surface_gets_leptos_component_guidance() {
+        let root = empty_assistants_root();
+        let prompt = build_system_prompt_from(None, Some("surface-tauri"), Some(root.path()), None);
+
+        assert!(prompt.contains("Tauri desktop"));
+        assert!(prompt.contains("canonical Leptos/WASM Surface"));
+        assert!(prompt.contains("Leptos components"));
+        assert!(prompt.contains("component_render"));
+        assert!(!prompt.contains("does not render Leptos components"));
     }
 
     #[test]

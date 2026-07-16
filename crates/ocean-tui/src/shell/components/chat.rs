@@ -6,14 +6,21 @@
 //! inline `code`/**bold**/*italic*), tool cards with ⌃O collapse/expand,
 //! multi-line input (⌃J newline), and wheel/PageUp scrollback.
 
+use std::{
+    collections::{HashSet, VecDeque},
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ocean_agent_sdk::{AgentTurnEvent, ThinkingLevel, ToolCallId};
 use ocean_core::{OceanEvent, PermissionId};
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -106,10 +113,200 @@ enum ToolStatus {
 /// scroll), so a click maps to exactly the drawer whose header painted there.
 #[derive(Debug)]
 struct DrawerHit {
-    id: ToolCallId,
+    target: DrawerTarget,
     row: u16,
     col_start: u16,
     col_end: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DrawerTarget {
+    Group(ToolCallId),
+    Tool(ToolCallId),
+}
+
+#[derive(Debug, Clone)]
+struct ToolGroup {
+    root: ToolCallId,
+    start: usize,
+    end: usize,
+    tool_indices: Vec<usize>,
+}
+
+fn tool_groups(turns: &[Turn]) -> Vec<ToolGroup> {
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while index < turns.len() {
+        if !matches!(turns[index], Turn::Tool { .. }) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let root = match &turns[index] {
+            Turn::Tool { id, .. } => id.clone(),
+            _ => unreachable!(),
+        };
+        let mut tool_indices = vec![index];
+        let mut cursor = index + 1;
+        let mut last_tool_end = cursor;
+        while cursor < turns.len() {
+            match &turns[cursor] {
+                Turn::Tool { .. } => {
+                    tool_indices.push(cursor);
+                    last_tool_end = cursor + 1;
+                    cursor += 1;
+                }
+                // Historical thinking is visually suppressed in collapsed mode,
+                // so it must not fragment one continuous execution burst.
+                Turn::Thinking(_) => cursor += 1,
+                _ => break,
+            }
+        }
+        groups.push(ToolGroup {
+            root,
+            start,
+            end: last_tool_end,
+            tool_indices,
+        });
+        index = last_tool_end;
+    }
+    groups
+}
+
+fn tool_group_counts(group: &ToolGroup, turns: &[Turn]) -> (usize, usize, usize) {
+    group
+        .tool_indices
+        .iter()
+        .fold((0, 0, 0), |(running, done, failed), index| {
+            match &turns[*index] {
+                Turn::Tool {
+                    status: ToolStatus::Running,
+                    ..
+                } => (running + 1, done, failed),
+                Turn::Tool {
+                    status: ToolStatus::Ok,
+                    ..
+                } => (running, done + 1, failed),
+                Turn::Tool {
+                    status: ToolStatus::Err,
+                    ..
+                } => (running, done, failed + 1),
+                _ => (running, done, failed),
+            }
+        })
+}
+
+/// One visible repo-local documentation link. Its cells are derived from a
+/// hidden Ratatui render using the transcript's exact wrap + scroll geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkHit {
+    path: PathBuf,
+    row: u16,
+    col_start: u16,
+    col_end: u16,
+}
+
+#[derive(Debug)]
+struct LogicalLink {
+    path: PathBuf,
+    line: usize,
+    span: usize,
+}
+
+/// Resolve a Markdown target to an existing documentation file inside `root`.
+/// Canonicalizing both sides blocks `..` and symlink escapes. URL-like targets,
+/// anchor-only links, queries, missing files, and non-doc extensions stay inert.
+fn resolve_doc_link(root: &Path, target: &str) -> Option<PathBuf> {
+    let target = target.trim();
+    if target.is_empty()
+        || target.starts_with('#')
+        || target.contains("://")
+        || target.contains('?')
+        || target.starts_with("mailto:")
+        || target.starts_with("file:")
+    {
+        return None;
+    }
+    let path = target.split_once('#').map_or(target, |(path, _)| path);
+    let candidate = Path::new(path);
+    let ext = candidate.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(ext.as_str(), "md" | "markdown" | "mdx") {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let candidate = root.join(candidate).canonicalize().ok()?;
+    candidate
+        .is_file()
+        .then_some(candidate)
+        .filter(|path| path.starts_with(&root))
+}
+
+fn link_mask_color(index: usize) -> Color {
+    let id = (index as u32).saturating_add(1);
+    Color::Rgb(
+        (id & 0xff) as u8,
+        ((id >> 8) & 0xff) as u8,
+        ((id >> 16) & 0xff) as u8,
+    )
+}
+
+/// Render a style-only copy of the transcript through the same Paragraph path
+/// and collapse contiguous marked cells into click rectangles. Ratatui itself
+/// therefore owns word-boundary wrapping, Unicode widths, and scroll clipping.
+fn project_link_hits(
+    lines: &[Line<'_>],
+    links: &[LogicalLink],
+    body: Rect,
+    scroll: u16,
+) -> Vec<LinkHit> {
+    if body.width == 0 || body.height == 0 || links.is_empty() {
+        return Vec::new();
+    }
+    let mut masked = lines.to_vec();
+    for line in &mut masked {
+        for span in &mut line.spans {
+            span.style = Style::reset();
+        }
+    }
+    for (index, link) in links.iter().enumerate() {
+        if let Some(span) = masked
+            .get_mut(link.line)
+            .and_then(|line| line.spans.get_mut(link.span))
+        {
+            span.style = Style::default().fg(link_mask_color(index));
+        }
+    }
+    let area = Rect::new(0, 0, body.width, body.height);
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(masked)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+        .render(area, &mut buffer);
+
+    let mut hits = Vec::new();
+    for (index, link) in links.iter().enumerate() {
+        let color = link_mask_color(index);
+        for row in 0..body.height {
+            let mut col = 0u16;
+            while col < body.width {
+                if buffer[(col, row)].fg != color {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                while col < body.width && buffer[(col, row)].fg == color {
+                    col += 1;
+                }
+                hits.push(LinkHit {
+                    path: link.path.clone(),
+                    row: body.y + row,
+                    col_start: body.x + start,
+                    col_end: body.x + col,
+                });
+            }
+        }
+    }
+    hits
 }
 
 /// The ⌃R fuzzy history-search overlay state (present only while open).
@@ -119,6 +316,46 @@ struct HistorySearch {
     query: String,
     /// Highlighted row in the match list.
     sel: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DictationPhase {
+    #[default]
+    Idle,
+    Starting,
+    Recording,
+    Transcribing,
+    Inserting,
+}
+
+#[derive(Default)]
+struct DictationUi {
+    id: Option<u64>,
+    phase: DictationPhase,
+    levels: VecDeque<f32>,
+    started_at: Option<Instant>,
+    toggle: bool,
+}
+
+impl DictationUi {
+    fn accepts(&self, id: u64) -> bool {
+        self.id == Some(id)
+    }
+
+    fn reset(&mut self) {
+        self.id = None;
+        self.phase = DictationPhase::Idle;
+        self.levels.clear();
+        self.started_at = None;
+        self.toggle = false;
+    }
+
+    fn replaces_composer(&self) -> bool {
+        matches!(
+            self.phase,
+            DictationPhase::Starting | DictationPhase::Recording | DictationPhase::Transcribing
+        )
+    }
 }
 
 #[derive(Default)]
@@ -143,16 +380,26 @@ pub struct ChatComponent {
     md: Markdown,
     /// When true, tool cards render their full output instead of a tail window.
     tools_expanded: bool,
+    /// Tool-run groups opened by the operator, keyed by the first call id in
+    /// each consecutive burst. Groups default closed; individual drawer state is
+    /// preserved while their parent is closed.
+    expanded_tool_groups: HashSet<uuid::Uuid>,
     /// Focused tool drawer (Alt-↑/↓ traverse in transcript order with wrapping;
     /// Alt-Space / Alt-Enter toggles). `None` when no drawer is focused.
     focused_drawer: Option<ToolCallId>,
     /// Per-frame map of visible drawer-header screen rows → tool id, rebuilt
     /// on every draw for mouse hit-testing. Consumed by `handle_mouse`.
     drawer_hits: Vec<DrawerHit>,
-    /// Drawer header armed by a left-button Down, committed on Up. A Drag in
-    /// between disarms it — so the app-level drag-to-select-text sweep across
-    /// a header never toggles the drawer.
-    pending_drawer_click: Option<ToolCallId>,
+    /// Exact visible cells for safe repo-local Markdown links.
+    link_hits: Vec<LinkHit>,
+    /// Last rendered transcript viewport and its first wrapped logical row.
+    /// App-level text selection uses these to survive scrollback movement.
+    transcript_rect: Rect,
+    transcript_top: usize,
+    /// Drawer or documentation link armed by left-button Down. A drag clears
+    /// both so text selection always wins over click activation.
+    pending_drawer_click: Option<DrawerTarget>,
+    pending_link_click: Option<PathBuf>,
     /// Persisted prompt history (↑/↓ recall, ⌃R search). Loaded at startup.
     history: PromptHistory,
     /// Cursor into `history` while navigating with ↑/↓; `None` when editing a
@@ -184,6 +431,9 @@ pub struct ChatComponent {
     /// Operator-controlled visibility. `/pinned hide` preserves the artifact so
     /// `/pinned show` can restore it without asking the agent to re-render.
     pinned_visible: bool,
+    /// Transient microphone UI. The draft and byte cursor remain untouched
+    /// behind the meter until generation-tagged text chunks arrive.
+    dictation: DictationUi,
 }
 
 /// Tool-aware salient preview for a drawer header: command for bash, pattern +
@@ -810,6 +1060,45 @@ pub(crate) fn paste_text(s: &str) -> String {
     out
 }
 
+fn dictation_level_glyph(level: f32) -> &'static str {
+    match (level.clamp(0.0, 1.0) * 7.0).round() as u8 {
+        0 => g("▁", "."),
+        1 => g("▂", ":"),
+        2 => g("▃", "-"),
+        3 => g("▄", "="),
+        4 => g("▅", "+"),
+        5 => g("▆", "*"),
+        6 => g("▇", "#"),
+        _ => g("█", "@"),
+    }
+}
+
+fn dictation_needs_separator(before: Option<char>, next: Option<char>) -> bool {
+    before.is_some_and(|ch| !ch.is_whitespace() && !"([{/'\"".contains(ch))
+        && next.is_some_and(|ch| !ch.is_whitespace() && !",.;:!?)]}".contains(ch))
+}
+
+fn dictation_level_color(level: f32) -> Color {
+    let level = level.clamp(0.0, 1.0);
+    let (start, end, t) = if level <= 0.7 {
+        ((0x00, 0x5f, 0xaf), (0x00, 0xd7, 0xd7), level / 0.7)
+    } else if level <= 0.88 {
+        ((0x00, 0xd7, 0xd7), (0xff, 0xb2, 0x24), (level - 0.7) / 0.18)
+    } else {
+        (
+            (0xff, 0xb2, 0x24),
+            (0xff, 0x4d, 0x67),
+            (level - 0.88) / 0.12,
+        )
+    };
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color::Rgb(
+        mix(start.0, end.0),
+        mix(start.1, end.1),
+        mix(start.2, end.2),
+    )
+}
+
 impl ChatComponent {
     /// Construct the chat surface with prompt history loaded from disk (for
     /// ↑/↓ recall and ⌃R search). `Default` leaves history empty — used in
@@ -819,6 +1108,170 @@ impl ChatComponent {
             history: PromptHistory::load(),
             pinned_visible: true,
             ..Default::default()
+        }
+    }
+
+    /// Plain-Space hold may arm only when composer overlays are absent and no
+    /// earlier dictation generation still owns the prompt box.
+    pub fn can_start_dictation(&self) -> bool {
+        self.dictation.phase == DictationPhase::Idle && !self.overlay_active()
+    }
+
+    /// Capture, transcription, and the short final-word animation own ordinary
+    /// input until completion or Esc cancellation, preventing text interleave.
+    pub fn dictation_blocks_input(&self) -> bool {
+        self.dictation.phase != DictationPhase::Idle
+    }
+
+    /// Keep redraws moving while a transcription spinner owns the composer.
+    pub fn dictation_is_active(&self) -> bool {
+        self.dictation.phase != DictationPhase::Idle
+    }
+
+    #[cfg(test)]
+    pub fn composer_text(&self) -> &str {
+        &self.input
+    }
+
+    fn draw_dictation(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme::BG_DARK)),
+            area,
+        );
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        for row in 0..area.height {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    g("▎", "|"),
+                    Style::default().fg(theme::CYAN).bg(theme::BG_DARK),
+                )),
+                Rect::new(area.x, area.y + row, 1, 1),
+            );
+        }
+
+        let elapsed = self
+            .dictation
+            .started_at
+            .map_or(0.0, |started| started.elapsed().as_secs_f32());
+        let (mark, label, hint, color) = match self.dictation.phase {
+            DictationPhase::Starting => (
+                g("◌", "o"),
+                "OPENING MICROPHONE".to_string(),
+                "Esc cancels".to_string(),
+                theme::BLUE,
+            ),
+            DictationPhase::Recording => (
+                g("●", "*"),
+                format!(
+                    "VOICE  {:02}:{:04.1}",
+                    (elapsed / 60.0) as u32,
+                    elapsed % 60.0
+                ),
+                if self.dictation.toggle {
+                    "press F2 to transcribe".to_string()
+                } else {
+                    "release SPACE to transcribe".to_string()
+                },
+                theme::CYAN,
+            ),
+            DictationPhase::Transcribing => {
+                let spinner = [g("◐", "-"), g("◓", "\\"), g("◑", "|"), g("◒", "/")]
+                    [((elapsed * 8.0) as usize) % 4];
+                (
+                    spinner,
+                    "TRANSCRIBING".to_string(),
+                    "Esc cancels".to_string(),
+                    theme::YELLOW,
+                )
+            }
+            DictationPhase::Idle | DictationPhase::Inserting => return,
+        };
+        let content_w = area.width.saturating_sub(3) as usize;
+        let header = clamp_line(&format!("  {mark} {label}"), content_w);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                header,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(theme::BG_DARK)),
+            Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
+        );
+
+        if area.height > 1 {
+            let wave_w = area.width.saturating_sub(4) as usize;
+            let history_len = self.dictation.levels.len();
+            let start = history_len.saturating_sub(wave_w);
+            let left_pad = wave_w.saturating_sub(history_len);
+            let scan = ((elapsed * 24.0) as usize) % wave_w.max(1);
+            let mut wave = vec![Span::raw("  ")];
+            for column in 0..wave_w {
+                let level = if column < left_pad {
+                    0.0
+                } else {
+                    self.dictation
+                        .levels
+                        .get(start + column - left_pad)
+                        .copied()
+                        .unwrap_or(0.0)
+                };
+                let mut style = Style::default()
+                    .fg(dictation_level_color(level))
+                    .bg(theme::BG_DARK);
+                if self.dictation.phase == DictationPhase::Transcribing {
+                    style = if column == scan {
+                        style.fg(theme::YELLOW)
+                    } else {
+                        style.add_modifier(Modifier::DIM)
+                    };
+                }
+                wave.push(Span::styled(dictation_level_glyph(level), style));
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(wave)).style(Style::default().bg(theme::BG_DARK)),
+                Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(1), 1),
+            );
+        }
+
+        if area.height > 2 {
+            let level = self.dictation.levels.back().copied().unwrap_or(0.0);
+            let meter_w = area.width.saturating_sub(16) as usize;
+            let filled = (level * meter_w as f32).round() as usize;
+            let mut meter = vec![Span::styled(
+                "  INPUT ",
+                Style::default().fg(theme::COMMENT),
+            )];
+            for column in 0..meter_w {
+                let (glyph, color) = if column < filled {
+                    (
+                        g("▓", "#"),
+                        dictation_level_color(column as f32 / meter_w.max(1) as f32),
+                    )
+                } else {
+                    (g("░", "."), theme::EDGE)
+                };
+                meter.push(Span::styled(glyph, Style::default().fg(color)));
+            }
+            meter.push(Span::styled(
+                format!(" {:>3}%", (level * 100.0).round() as u8),
+                Style::default().fg(color),
+            ));
+            frame.render_widget(
+                Paragraph::new(Line::from(meter)).style(Style::default().bg(theme::BG_DARK)),
+                Rect::new(area.x + 1, area.y + 2, area.width.saturating_sub(1), 1),
+            );
+        }
+
+        if area.height > 3 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    clamp_line(&format!("  {hint}"), content_w),
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::BG_DARK)),
+                Rect::new(area.x + 1, area.y + 3, area.width.saturating_sub(1), 1),
+            );
         }
     }
 
@@ -1315,13 +1768,31 @@ impl ChatComponent {
             })
             .collect();
         self.md.clear();
+        self.clear_tool_ui_state();
         self.pinned = None;
         self.pinned_visible = true;
         self.busy = false;
     }
 
-    /// Append an assistant text delta, coalescing into the trailing Assistant
-    /// block when the last turn is already assistant text.
+    pub fn transcript_row_for_screen(&self, screen_row: u16) -> Option<usize> {
+        (screen_row >= self.transcript_rect.y && screen_row < self.transcript_rect.bottom())
+            .then(|| self.transcript_top + usize::from(screen_row - self.transcript_rect.y))
+    }
+
+    /// Map a screen row to the nearest stable transcript row. Selection starts
+    /// and drags are pane-scoped, so they may land on chat chrome or the composer;
+    /// those positions saturate at the transcript's first/last visible row rather
+    /// than falling back to an unrelated screen-relative row.
+    pub fn nearest_transcript_row(&self, screen_row: u16) -> Option<usize> {
+        (self.transcript_rect.height > 0).then(|| {
+            let row = screen_row.clamp(
+                self.transcript_rect.y,
+                self.transcript_rect.bottom().saturating_sub(1),
+            );
+            self.transcript_top + usize::from(row - self.transcript_rect.y)
+        })
+    }
+
     fn push_assistant(&mut self, delta: &str) {
         match self.turns.last_mut() {
             Some(Turn::Assistant(s)) => s.push_str(delta),
@@ -1343,6 +1814,25 @@ impl ChatComponent {
             .find(|t| matches!(t, Turn::Tool { id: tid, .. } if tid == id))
     }
 
+    fn tool_group_root(&self, id: &ToolCallId) -> Option<ToolCallId> {
+        tool_groups(&self.turns)
+            .into_iter()
+            .filter(|group| group.tool_indices.len() > 1)
+            .find(|group| {
+                group.tool_indices.iter().any(|index| {
+                    matches!(&self.turns[*index], Turn::Tool { id: tool_id, .. } if tool_id == id)
+                })
+            })
+            .map(|group| group.root)
+    }
+
+    fn focus_drawer(&mut self, id: ToolCallId) {
+        if let Some(root) = self.tool_group_root(&id) {
+            self.expanded_tool_groups.insert(root.0);
+        }
+        self.focused_drawer = Some(id);
+    }
+
     /// All tool-call ids in transcript order — the Alt-↑/↓ traversal sequence.
     fn drawer_ids(&self) -> Vec<ToolCallId> {
         self.turns
@@ -1355,7 +1845,7 @@ impl ChatComponent {
     }
 
     /// Alt-↓ — focus the next tool drawer in transcript order, wrapping from
-    /// the last back to the first. With no current focus, start at the first.
+    /// the last back to the first. Focusing a nested drawer reveals its group.
     fn drawer_focus_next(&mut self) {
         let ids = self.drawer_ids();
         if ids.is_empty() {
@@ -1369,12 +1859,12 @@ impl ChatComponent {
                 .map(|p| (p + 1) % ids.len())
                 .unwrap_or(0),
         };
-        self.focused_drawer = Some(ids[next].clone());
+        self.focus_drawer(ids[next].clone());
     }
 
     /// Alt-↑ — focus the previous tool drawer in transcript order, wrapping
     /// from the first back to the last. With no current focus, start at the
-    /// last (so the first press from nothing lands on the newest tool).
+    /// newest tool and reveal its group.
     fn drawer_focus_prev(&mut self) {
         let ids = self.drawer_ids();
         if ids.is_empty() {
@@ -1388,7 +1878,7 @@ impl ChatComponent {
                 .map(|p| (p + ids.len() - 1) % ids.len())
                 .unwrap_or(ids.len() - 1),
         };
-        self.focused_drawer = Some(ids[prev].clone());
+        self.focus_drawer(ids[prev].clone());
     }
 
     /// Alt-Space / Alt-Enter — flip the focused drawer's local open state.
@@ -1399,11 +1889,34 @@ impl ChatComponent {
         }
     }
 
-    /// Flip one drawer's local `expanded` state by call id.
+    /// Flip one drawer's local `expanded` state by call id. Opening a nested
+    /// drawer also reveals its parent group so keyboard actions are never hidden.
     fn toggle_drawer(&mut self, id: &ToolCallId) {
-        if let Some(Turn::Tool { expanded, .. }) = self.tool_by_id(id) {
+        let root = self.tool_group_root(id);
+        let opened = if let Some(Turn::Tool { expanded, .. }) = self.tool_by_id(id) {
             *expanded = !*expanded;
+            *expanded
+        } else {
+            false
+        };
+        if opened {
+            if let Some(root) = root {
+                self.expanded_tool_groups.insert(root.0);
+            }
         }
+    }
+
+    fn toggle_tool_group(&mut self, id: &ToolCallId) {
+        if !self.expanded_tool_groups.remove(&id.0) {
+            self.expanded_tool_groups.insert(id.0);
+        }
+    }
+
+    fn clear_tool_ui_state(&mut self) {
+        self.expanded_tool_groups.clear();
+        self.focused_drawer = None;
+        self.drawer_hits.clear();
+        self.pending_drawer_click = None;
     }
 
     /// Whether any composer overlay — the ⌃R history search, the `/` command
@@ -1566,12 +2079,15 @@ impl ChatComponent {
 
     // ── `@` file mentions ────────────────────────────────────────────────────
 
-    /// Point `@`-mentions at a project root. Invalidates the file index when the
-    /// root actually changes (the app calls this on every project re-root).
+    /// Point `@`-mentions and repo-local documentation links at a project root.
+    /// Invalidates the file index when the root actually changes (the app calls
+    /// this on every project re-root).
     pub fn set_mention_root(&mut self, root: std::path::PathBuf) {
         if self.mention_root.as_deref() != Some(root.as_path()) {
             self.mention_root = Some(root);
             self.mention_index = None; // rescan lazily on next `@`
+            self.link_hits.clear(); // next draw rebuilds against the new root
+            self.pending_link_click = None;
         }
     }
 
@@ -1702,6 +2218,7 @@ impl ChatComponent {
             "/clear" => {
                 self.turns.clear();
                 self.md.clear();
+                self.clear_tool_ui_state();
                 self.scroll_back = 0;
                 self.busy = false;
                 None
@@ -1742,6 +2259,7 @@ impl ChatComponent {
                 // unbind so the next turn mints a new session id.
                 self.turns.clear();
                 self.md.clear();
+                self.clear_tool_ui_state();
                 self.pinned = None;
                 self.pinned_visible = true;
                 self.scroll_back = 0;
@@ -2298,6 +2816,7 @@ impl Component for ChatComponent {
                     if !self.busy {
                         self.turns.clear();
                         self.md.clear();
+                        self.clear_tool_ui_state();
                         self.scroll_back = 0;
                     }
                     return None;
@@ -2545,28 +3064,58 @@ impl Component for ChatComponent {
             // transcript rows, and a click there must not fall through to the
             // hidden header underneath.
             MouseEventKind::Down(MouseButton::Left) => {
-                self.pending_drawer_click = if self.overlay_active() {
-                    None
-                } else {
-                    self.drawer_hits
+                self.pending_drawer_click = None;
+                self.pending_link_click = None;
+                if !self.overlay_active() {
+                    self.pending_drawer_click = self
+                        .drawer_hits
                         .iter()
                         .find(|h| {
                             h.row == mouse.row
                                 && mouse.column >= h.col_start
                                 && mouse.column < h.col_end
                         })
-                        .map(|h| h.id.clone())
-                };
+                        .map(|h| h.target.clone());
+                    if self.pending_drawer_click.is_none() {
+                        self.pending_link_click = self
+                            .link_hits
+                            .iter()
+                            .find(|h| {
+                                h.row == mouse.row
+                                    && mouse.column >= h.col_start
+                                    && mouse.column < h.col_end
+                            })
+                            .map(|h| h.path.clone());
+                    }
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                // Text selection, not a click — disarm the pending toggle.
+                // Text selection, not a click — disarm both activations.
                 self.pending_drawer_click = None;
+                self.pending_link_click = None;
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(id) = self.pending_drawer_click.take() {
+                if let Some(target) = self.pending_drawer_click.take() {
+                    self.pending_link_click = None;
                     if !self.overlay_active() {
-                        self.focused_drawer = Some(id.clone());
-                        self.toggle_drawer(&id);
+                        match target {
+                            DrawerTarget::Group(id) => self.toggle_tool_group(&id),
+                            DrawerTarget::Tool(id) => {
+                                self.focus_drawer(id.clone());
+                                self.toggle_drawer(&id);
+                            }
+                        }
+                    }
+                } else if let Some(path) = self.pending_link_click.take() {
+                    if !self.overlay_active()
+                        && self.link_hits.iter().any(|h| {
+                            h.path == path
+                                && h.row == mouse.row
+                                && mouse.column >= h.col_start
+                                && mouse.column < h.col_end
+                        })
+                    {
+                        return Some(Action::OpenFile(path));
                     }
                 }
             }
@@ -2576,6 +3125,103 @@ impl Component for ChatComponent {
     }
 
     fn update(&mut self, action: &Action) -> Option<Action> {
+        match action {
+            Action::ComposerInsert(text) => {
+                self.insert_at_cursor(text);
+                self.reset_history_nav();
+                self.menu_sel = 0;
+                self.mention_sel = 0;
+                return None;
+            }
+            Action::DictationStart { id, toggle } => {
+                self.dictation.id = Some(*id);
+                self.dictation.phase = DictationPhase::Starting;
+                self.dictation.levels.clear();
+                self.dictation.started_at = Some(Instant::now());
+                self.dictation.toggle = *toggle;
+                return None;
+            }
+            Action::DictationCaptureStarted { id } if self.dictation.accepts(*id) => {
+                if self.dictation.phase == DictationPhase::Starting {
+                    self.dictation.phase = DictationPhase::Recording;
+                    self.dictation.started_at = Some(Instant::now());
+                }
+                return None;
+            }
+            Action::DictationLevel { id, level } if self.dictation.accepts(*id) => {
+                if matches!(
+                    self.dictation.phase,
+                    DictationPhase::Starting | DictationPhase::Recording
+                ) {
+                    self.dictation.phase = DictationPhase::Recording;
+                    self.dictation.levels.push_back(level.clamp(0.0, 1.0));
+                    while self.dictation.levels.len() > 240 {
+                        self.dictation.levels.pop_front();
+                    }
+                }
+                return None;
+            }
+            Action::DictationStop { id } if self.dictation.accepts(*id) => {
+                if matches!(
+                    self.dictation.phase,
+                    DictationPhase::Starting | DictationPhase::Recording
+                ) {
+                    self.dictation.phase = DictationPhase::Transcribing;
+                }
+                return None;
+            }
+            Action::DictationCaptured { id, audio } if self.dictation.accepts(*id) => {
+                if audio.is_ok() {
+                    self.dictation.phase = DictationPhase::Transcribing;
+                } else {
+                    self.dictation.reset();
+                }
+                return None;
+            }
+            Action::DictationTranscribed { id, transcript } if self.dictation.accepts(*id) => {
+                if transcript.is_ok() {
+                    self.dictation.phase = DictationPhase::Inserting;
+                } else {
+                    self.dictation.reset();
+                }
+                return None;
+            }
+            Action::DictationTextChunk {
+                id,
+                text,
+                first,
+                last,
+            } if self.dictation.accepts(*id) => {
+                if *first {
+                    let cursor = self.cursor_byte();
+                    let before = self.input[..cursor].chars().next_back();
+                    let next = text.chars().next();
+                    if dictation_needs_separator(before, next) {
+                        self.insert_at_cursor(" ");
+                    }
+                }
+                self.insert_at_cursor(text);
+                self.reset_history_nav();
+                self.menu_sel = 0;
+                self.mention_sel = 0;
+                if *last {
+                    let cursor = self.cursor_byte();
+                    let before = self.input[..cursor].chars().next_back();
+                    let after = self.input[cursor..].chars().next();
+                    if dictation_needs_separator(before, after) {
+                        self.insert_at_cursor(" ");
+                    }
+                    self.dictation.reset();
+                }
+                return None;
+            }
+            Action::DictationCancel { id } if self.dictation.accepts(*id) => {
+                self.dictation.reset();
+                return None;
+            }
+            _ => {}
+        }
+
         // The turn (or its session mint) never reached the daemon, even after
         // the blip-retry window: unwind the spinner, say so in the transcript,
         // and put the prompt back in the composer so nothing typed is lost.
@@ -2799,7 +3445,11 @@ impl Component for ChatComponent {
             })
             .sum::<u16>()
             .max(1);
-        let input_lines = input_rows.min(8).min((area.height / 2).max(1));
+        let input_lines = if self.dictation.replaces_composer() {
+            4.min((area.height / 2).max(1))
+        } else {
+            input_rows.min(8).min((area.height / 2).max(1))
+        };
         let pinned_lines: u16 = if self.pinned.is_some() && self.pinned_visible {
             // A pinned component gets 3-5 rows depending on kind
             match self.pinned.as_ref() {
@@ -2882,10 +3532,22 @@ impl Component for ChatComponent {
         let tools_expanded = self.tools_expanded;
         let busy = self.busy;
         let n_turns = self.turns.len();
+        let tool_groups = tool_groups(&self.turns);
+        let mut tool_group_for_turn = vec![None; n_turns];
+        for (group_index, group) in tool_groups.iter().enumerate() {
+            if group.tool_indices.len() > 1 {
+                for turn_index in &group.tool_indices {
+                    tool_group_for_turn[*turn_index] = Some(group_index);
+                }
+            }
+        }
         let mut lines: Vec<Line> = Vec::new();
-        // Per-frame record of each drawer header's logical-line index, used
+        // Per-frame record of each group/tool header's logical-line index, used
         // after wrapping + scroll to build the mouse hit map (`self.drawer_hits`).
-        let mut drawer_header_lines: Vec<(ToolCallId, usize)> = Vec::new();
+        let mut drawer_header_lines: Vec<(DrawerTarget, usize)> = Vec::new();
+        // Safe documentation links are recorded by logical line/span while the
+        // transcript is assembled, then projected through Ratatui's exact wrap.
+        let mut logical_links: Vec<LogicalLink> = Vec::new();
         // ── welcome empty-state: blank except a terse configuration condition
         // (set by the app only when no provider is configured). No branding,
         // no printed instructions — the `/` palette and /help carry discovery.
@@ -2902,6 +3564,48 @@ impl Component for ChatComponent {
             }
         }
         for (ti, turn) in self.turns.iter().enumerate() {
+            if let Some(group_index) = tool_group_for_turn[ti] {
+                let group = &tool_groups[group_index];
+                let group_open =
+                    tools_expanded || self.expanded_tool_groups.contains(&group.root.0);
+                if ti == group.start {
+                    let (running, done, failed) = tool_group_counts(group, &self.turns);
+                    let disc = if group_open {
+                        g("▾", "v")
+                    } else {
+                        g("▸", ">")
+                    };
+                    let mut summary = format!("  {disc} tools · {}", group.tool_indices.len());
+                    if done > 0 {
+                        summary.push_str(&format!(" · {done} done"));
+                    }
+                    if running > 0 {
+                        summary.push_str(&format!(" · {running} running"));
+                    }
+                    if failed > 0 {
+                        summary.push_str(&format!(" · {failed} failed"));
+                    }
+                    let color = if failed > 0 {
+                        theme::RED
+                    } else if running > 0 {
+                        theme::YELLOW
+                    } else {
+                        theme::GREEN
+                    };
+                    drawer_header_lines
+                        .push((DrawerTarget::Group(group.root.clone()), lines.len()));
+                    lines.push(Line::from(Span::styled(
+                        truncate_to_width(&summary, body.width as usize),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )));
+                    if !group_open {
+                        lines.push(Line::from(""));
+                    }
+                }
+                if !group_open {
+                    continue;
+                }
+            }
             match turn {
                 Turn::User(s) => {
                     lines.push(Line::from(vec![
@@ -2917,7 +3621,18 @@ impl Component for ChatComponent {
                 Turn::Assistant(s) => {
                     // Streaming markdown with prefix-freeze: frozen head blocks
                     // are served from cache, only the growing tail re-renders.
-                    lines.extend(md.render(s));
+                    let rendered = md.render(s);
+                    let line_base = lines.len();
+                    if let Some(root) = self.mention_root.as_deref() {
+                        logical_links.extend(rendered.links.iter().filter_map(|link| {
+                            Some(LogicalLink {
+                                path: resolve_doc_link(root, &link.target)?,
+                                line: line_base + link.line,
+                                span: link.span,
+                            })
+                        }));
+                    }
+                    lines.extend(rendered.lines);
                 }
                 Turn::Component {
                     kind,
@@ -3052,7 +3767,12 @@ impl Component for ChatComponent {
                     // args can never wrap the header (a wrap would invalidate
                     // the click hit map and break the one-row guarantee).
                     let width = body.width as usize;
-                    let prefix = format!("  {disc} ");
+                    let grouped = tool_group_for_turn[ti].is_some();
+                    let prefix = if grouped {
+                        format!("    {disc} ")
+                    } else {
+                        format!("  {disc} ")
+                    };
                     let prefix_w = UnicodeWidthStr::width(prefix.as_str());
                     let sep = " · ";
                     let sep_w = UnicodeWidthStr::width(sep);
@@ -3112,7 +3832,7 @@ impl Component for ChatComponent {
                     }
                     // Record the header's logical-line index for the mouse hit
                     // map BEFORE pushing, so the index points at the header row.
-                    drawer_header_lines.push((id.clone(), lines.len()));
+                    drawer_header_lines.push((DrawerTarget::Tool(id.clone()), lines.len()));
                     lines.push(Line::from(header));
 
                     if open {
@@ -3253,7 +3973,17 @@ impl Component for ChatComponent {
                     }
                 }
             }
-            // Single-space tool runs: a suppressed Thinking turn between tool
+            // Grouped tool bursts own their spacing: a closed burst already
+            // emitted one parent row + separator; an open burst keeps its nested
+            // drawers tight and adds one separator only after the final tool.
+            if let Some(group_index) = tool_group_for_turn[ti] {
+                let group = &tool_groups[group_index];
+                if ti + 1 == group.end {
+                    lines.push(Line::from(""));
+                }
+                continue;
+            }
+            // Single-space standalone tool runs: a suppressed Thinking turn between tool
             // calls emits nothing (its arm `continue`s), so the NEXT VISIBLE
             // turn decides the gap — Tool -> hidden Thinking -> Tool stays
             // tight. Every other visible boundary keeps its blank separator.
@@ -3284,7 +4014,7 @@ impl Component for ChatComponent {
         // wrapped row Σ(rows[0..i)), so a long assistant turn that wraps above
         // shifts the header down on screen — the hit map MUST follow that shift
         // or a click toggles the wrong drawer (the logical-index-as-row bug).
-        let drawer_wrapped: Vec<(ToolCallId, u16, u16)> = if drawer_header_lines.is_empty() {
+        let drawer_wrapped: Vec<(DrawerTarget, u16, u16)> = if drawer_header_lines.is_empty() {
             Vec::new()
         } else {
             let per_line: Vec<u16> = lines
@@ -3295,7 +4025,7 @@ impl Component for ChatComponent {
                         .line_count(body.width) as u16
                 })
                 .collect();
-            let mut mapped: Vec<(ToolCallId, u16, u16)> = Vec::new();
+            let mut mapped: Vec<(DrawerTarget, u16, u16)> = Vec::new();
             let mut cum: u16 = 0;
             // `drawer_header_lines` is in ascending logical-index order (headers
             // are pushed while walking turns top-to-bottom), so one advancing
@@ -3304,14 +4034,14 @@ impl Component for ChatComponent {
             let mut headers = drawer_header_lines.iter().peekable();
             for (i, &rows) in per_line.iter().enumerate() {
                 if headers.peek().is_some_and(|(_, li)| *li == i) {
-                    let (id, _) = headers.next().unwrap();
-                    mapped.push((id.clone(), cum, cum.saturating_add(rows)));
+                    let (target, _) = headers.next().unwrap();
+                    mapped.push((target.clone(), cum, cum.saturating_add(rows)));
                 }
                 cum = cum.saturating_add(rows);
             }
             mapped
         };
-        let para = Paragraph::new(lines)
+        let para = Paragraph::new(lines.clone())
             .style(Style::default().bg(theme::SLATE))
             .wrap(Wrap { trim: false });
         let wrapped = para.line_count(body.width) as u16;
@@ -3326,23 +4056,31 @@ impl Component for ChatComponent {
         // always reassigned so stale entries from a prior frame never linger.
         let vis_lo = scroll;
         let vis_hi = scroll.saturating_add(body.height);
+        self.transcript_rect = body;
+        self.transcript_top = usize::from(vis_lo);
         self.drawer_hits = drawer_wrapped
             .iter()
-            .filter_map(|(id, start, end)| {
+            .filter_map(|(target, start, end)| {
                 let row = (*start..*end).find(|r| *r >= vis_lo && *r < vis_hi)?;
                 Some(DrawerHit {
-                    id: id.clone(),
+                    target: target.clone(),
                     row: body.y + (row - vis_lo),
                     col_start: body.x,
                     col_end: body.x + body.width,
                 })
             })
             .collect();
+        self.link_hits = project_link_hits(&lines, &logical_links, body, scroll);
         frame.render_widget(para.scroll((scroll, 0)), body);
         // Footer: always blank. No key legends, no counters; activity lives on
         // the bottom status row (derived from this component's state), never
         // duplicated here. The reserved row stays so panel geometry is stable.
         panel::footer(frame, transcript_area, "");
+
+        if self.dictation.replaces_composer() {
+            self.draw_dictation(frame, composer_area);
+            return;
+        }
 
         // ── composer: highlight bed, accent bar, multi-line, block cursor ────
         let comp = composer_area;
@@ -3500,6 +4238,88 @@ mod tests {
             payload,
             scope: None,
         }))
+    }
+
+    #[test]
+    fn dictation_chunks_preserve_utf8_cursor_and_neighbor_spacing() {
+        let mut chat = chat_with("a你b");
+        chat.cursor = Some("a你".len());
+        chat.update(&Action::DictationStart {
+            id: 7,
+            toggle: false,
+        });
+        chat.update(&Action::DictationTranscribed {
+            id: 7,
+            transcript: Ok("hello world".into()),
+        });
+        chat.update(&Action::DictationTextChunk {
+            id: 7,
+            text: "hello ".into(),
+            first: true,
+            last: false,
+        });
+        chat.update(&Action::DictationTextChunk {
+            id: 7,
+            text: "world".into(),
+            first: false,
+            last: true,
+        });
+        assert_eq!(chat.input, "a你 hello world b");
+        assert_eq!(chat.cursor, Some("a你 hello world ".len()));
+        assert!(!chat.busy, "dictation populates but never submits");
+        assert!(
+            chat.turns.is_empty(),
+            "dictation does not create a user turn"
+        );
+    }
+
+    #[test]
+    fn late_capture_start_cannot_regress_release_to_recording() {
+        let mut chat = ChatComponent::default();
+        chat.update(&Action::DictationStart {
+            id: 4,
+            toggle: false,
+        });
+        chat.update(&Action::DictationStop { id: 4 });
+        chat.update(&Action::DictationCaptureStarted { id: 4 });
+        assert_eq!(chat.dictation.phase, DictationPhase::Transcribing);
+    }
+
+    #[test]
+    fn stale_or_cancelled_dictation_cannot_mutate_the_draft() {
+        let mut chat = chat_with("keep this");
+        chat.update(&Action::DictationStart {
+            id: 3,
+            toggle: false,
+        });
+        chat.update(&Action::DictationCancel { id: 3 });
+        chat.update(&Action::DictationTextChunk {
+            id: 3,
+            text: " stale".into(),
+            first: true,
+            last: true,
+        });
+        assert_eq!(chat.input, "keep this");
+        assert!(chat.can_start_dictation());
+    }
+
+    #[test]
+    fn live_dictation_replaces_composer_with_real_level_meter() {
+        let mut chat = chat_with("draft stays hidden");
+        chat.update(&Action::DictationStart {
+            id: 9,
+            toggle: false,
+        });
+        chat.update(&Action::DictationCaptureStarted { id: 9 });
+        for level in [0.02, 0.2, 0.55, 0.9] {
+            chat.update(&Action::DictationLevel { id: 9, level });
+        }
+        let screen = render_chat_to_string(&mut chat, 72, 18);
+        assert!(screen.contains("VOICE"), "{screen:?}");
+        assert!(screen.contains("INPUT"), "{screen:?}");
+        assert!(screen.contains("release SPACE"), "{screen:?}");
+        assert!(!screen.contains("draft stays hidden"), "{screen:?}");
+        assert_eq!(chat.input, "draft stays hidden");
     }
 
     #[test]
@@ -4934,13 +5754,30 @@ mod tests {
 
     /// Build a left-button mouse event at an absolute screen row (crossterm
     /// 0.28 has no `MouseEvent::new`; use a struct literal).
-    fn mouse_at(kind: MouseEventKind, row: u16) -> MouseEvent {
+    fn mouse_at_col(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
-            column: 2,
+            column,
             row,
             modifiers: KeyModifiers::empty(),
         }
+    }
+
+    fn mouse_at(kind: MouseEventKind, row: u16) -> MouseEvent {
+        mouse_at_col(kind, 2, row)
+    }
+
+    fn click_at(chat: &mut ChatComponent, column: u16, row: u16) -> Option<Action> {
+        chat.handle_mouse(mouse_at_col(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+        ));
+        chat.handle_mouse(mouse_at_col(
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+        ))
     }
 
     /// Simulate a full left-click (Down then Up, no Drag) at a screen row —
@@ -4948,6 +5785,99 @@ mod tests {
     fn click_row(chat: &mut ChatComponent, row: u16) {
         chat.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row));
         chat.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), row));
+    }
+
+    fn temp_workspace(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ocean-tui-chat-link-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        root
+    }
+
+    #[test]
+    fn doc_link_resolution_is_workspace_bounded_and_doc_only() {
+        let root = temp_workspace("resolve");
+        let doc = root.join("docs/guide.md");
+        let source = root.join("src.rs");
+        std::fs::write(&doc, "guide").unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+
+        assert_eq!(
+            resolve_doc_link(&root, "docs/guide.md#usage"),
+            Some(doc.canonicalize().unwrap())
+        );
+        assert!(resolve_doc_link(&root, "https://example.com/guide.md").is_none());
+        assert!(resolve_doc_link(&root, "#usage").is_none());
+        assert!(resolve_doc_link(&root, "missing.md").is_none());
+        assert!(resolve_doc_link(&root, "src.rs").is_none());
+        assert!(resolve_doc_link(&root, "../outside.md").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wrapped_repo_doc_link_clean_click_opens_editor_path() {
+        let root = temp_workspace("click");
+        let doc = root.join("docs/guide.md");
+        std::fs::write(&doc, "guide").unwrap();
+        let mut chat = ChatComponent::default();
+        chat.set_mention_root(root.clone());
+        chat.turns.push(Turn::Assistant(
+            "prefix [documentation-reference-that-is-very-long](docs/guide.md) label".into(),
+        ));
+        let _ = render_chat_to_string(&mut chat, 34, 12);
+        let hit = chat.link_hits.first().cloned().expect("visible link hit");
+        assert_eq!(hit.path, doc.canonicalize().unwrap());
+        assert!(chat.link_hits.iter().any(|h| h.row != hit.row));
+
+        let action = click_at(&mut chat, hit.col_start, hit.row).expect("link action");
+        assert!(matches!(action, Action::OpenFile(path) if path == doc.canonicalize().unwrap()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doc_link_drag_does_not_open_and_scrolled_hit_map_stays_current() {
+        let root = temp_workspace("drag-scroll");
+        let doc = root.join("docs/guide.md");
+        std::fs::write(&doc, "guide").unwrap();
+        let mut chat = ChatComponent::default();
+        chat.set_mention_root(root.clone());
+        chat.turns.push(Turn::Assistant(format!(
+            "{}\n[guide](docs/guide.md)",
+            (0..24)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+        let _ = render_chat_to_string(&mut chat, 50, 10);
+        assert!(!chat.link_hits.is_empty(), "tail link is visible");
+        let hit = chat.link_hits[0].clone();
+        chat.handle_mouse(mouse_at_col(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.col_start,
+            hit.row,
+        ));
+        chat.handle_mouse(mouse_at_col(
+            MouseEventKind::Drag(MouseButton::Left),
+            hit.col_start + 1,
+            hit.row,
+        ));
+        assert!(chat
+            .handle_mouse(mouse_at_col(
+                MouseEventKind::Up(MouseButton::Left),
+                hit.col_start + 1,
+                hit.row,
+            ))
+            .is_none());
+
+        chat.scroll_back = 10;
+        let _ = render_chat_to_string(&mut chat, 50, 10);
+        assert!(
+            chat.link_hits.is_empty(),
+            "off-screen link has no stale hit"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4968,24 +5898,81 @@ mod tests {
     }
 
     #[test]
-    fn every_drawer_header_stays_visible_no_burst_hiding() {
-        // Burst compaction was removed: every tool drawer paints its own header
-        // no matter how many run consecutively. A tall viewport shows them all;
-        // there is no "earlier tools" compaction row.
+    fn consecutive_tools_collapse_into_one_expandable_group() {
         let mut chat = ChatComponent::default();
         for i in 0..6 {
             chat.turns.push(ok_tool(&format!("tool{i}"), "ok"));
         }
-        let screen = render_chat_to_string(&mut chat, 90, 24);
+
+        let collapsed = render_chat_to_string(&mut chat, 90, 24);
+        assert!(collapsed.contains("tools · 6 · 6 done"), "{collapsed:?}");
         for i in 0..6 {
             assert!(
-                screen.contains(&format!("tool{i}")),
-                "drawer {i} header must stay visible: {screen:?}"
+                !collapsed.contains(&format!("tool{i}")),
+                "nested drawer {i} stays hidden: {collapsed:?}"
             );
         }
+        let group_hit = chat
+            .drawer_hits
+            .iter()
+            .find(|hit| matches!(hit.target, DrawerTarget::Group(_)))
+            .map(|hit| (hit.col_start, hit.row))
+            .expect("group header hit");
+        click_at(&mut chat, group_hit.0, group_hit.1);
+
+        let expanded = render_chat_to_string(&mut chat, 90, 24);
+        for i in 0..6 {
+            assert!(
+                expanded.contains(&format!("tool{i}")),
+                "expanded group reveals drawer {i}: {expanded:?}"
+            );
+        }
+        assert_eq!(
+            chat.drawer_hits
+                .iter()
+                .filter(|hit| matches!(hit.target, DrawerTarget::Tool(_)))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn visible_turns_split_groups_but_hidden_thinking_does_not() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(ok_tool("read", "one"));
+        chat.turns.push(Turn::Thinking("hidden".into()));
+        chat.turns.push(ok_tool("grep", "two"));
+        chat.turns.push(Turn::Assistant("checkpoint".into()));
+        chat.turns.push(ok_tool("write", "three"));
+        chat.turns.push(ok_tool("bash", "four"));
+
+        let screen = render_chat_to_string(&mut chat, 90, 24);
+        assert_eq!(
+            screen.matches("tools · 2 · 2 done").count(),
+            2,
+            "{screen:?}"
+        );
+        assert!(!screen.contains("read"));
+        assert!(!screen.contains("bash"));
+    }
+
+    #[test]
+    fn group_summary_surfaces_running_and_failed_counts() {
+        let mut chat = ChatComponent::default();
+        chat.turns.push(ok_tool("ok", "one"));
+        let running = add_tool(&mut chat, "running", "");
+        let failed = add_tool(&mut chat, "failed", "bad");
+        if let Some(Turn::Tool { status, .. }) = chat.tool_by_id(&running) {
+            *status = ToolStatus::Running;
+        }
+        if let Some(Turn::Tool { status, .. }) = chat.tool_by_id(&failed) {
+            *status = ToolStatus::Err;
+        }
+
+        let screen = render_chat_to_string(&mut chat, 90, 18);
         assert!(
-            !screen.contains("earlier tools"),
-            "burst hiding was removed"
+            screen.contains("tools · 3 · 1 done · 1 running · 1 failed"),
+            "{screen:?}"
         );
     }
 
@@ -5064,70 +6051,57 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_toggles_the_drawn_header_after_wrap_and_scroll() {
-        // A long assistant line that WRAPS at this narrow width sits above two
-        // tool drawers, pushing their headers down by many wrapped rows; the
-        // tall content also forces nonzero scroll. The click must still hit the
-        // drawer whose header is actually painted under the cursor — the exact
-        // logical-line-vs-wrapped-row trap. We do NOT trust the hit map to find
-        // a header: we scan the RENDERED SCREEN for the tool name, require the
-        // per-frame hit map to land on that same painted row, then click.
+    fn mouse_click_toggles_group_then_nested_drawer_after_wrap_and_scroll() {
+        // A wrapped assistant block shifts the collapsed group header and later
+        // its nested drawers. Every click must route to the row actually painted.
         let mut chat = ChatComponent::default();
         chat.turns.push(Turn::Assistant("word ".repeat(200)));
         let beta = add_tool(&mut chat, "beta", "out b");
         let alpha = add_tool(&mut chat, "alpha", "out a");
 
-        let screen = render_chat_to_string(&mut chat, 40, 24);
+        let collapsed = render_chat_to_string(&mut chat, 40, 24);
+        let group_row = collapsed
+            .lines()
+            .position(|line| line.contains("tools · 2"))
+            .unwrap_or_else(|| panic!("group header painted: {collapsed:?}"))
+            as u16;
+        assert!(chat
+            .drawer_hits
+            .iter()
+            .any(|hit| { hit.row == group_row && matches!(hit.target, DrawerTarget::Group(_)) }));
+        click_row(&mut chat, group_row);
+
+        let expanded = render_chat_to_string(&mut chat, 40, 24);
         let row_of = |needle: &str| -> u16 {
-            screen
+            expanded
                 .lines()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} header painted: {screen:?}")) as u16
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} header painted: {expanded:?}"))
+                as u16
         };
         let alpha_row = row_of("alpha");
         let beta_row = row_of("beta");
-        assert_ne!(alpha_row, beta_row, "two distinct header rows");
-        // If the hit map mapped logical line index -> row directly, the wrapping
-        // assistant text plus the scroll would put its entry on the WRONG row
-        // and these assertions fail.
-        assert!(
-            chat.drawer_hits.iter().any(|h| h.row == alpha_row),
-            "hit map covers painted alpha row {alpha_row}: {:?}",
-            chat.drawer_hits
-        );
-        assert!(
-            chat.drawer_hits.iter().any(|h| h.row == beta_row),
-            "hit map covers painted beta row {beta_row}: {:?}",
-            chat.drawer_hits
-        );
+        assert_ne!(alpha_row, beta_row);
+        assert!(chat.drawer_hits.iter().any(|hit| {
+            hit.row == alpha_row && matches!(&hit.target, DrawerTarget::Tool(id) if id == &alpha)
+        }));
+        assert!(chat.drawer_hits.iter().any(|hit| {
+            hit.row == beta_row && matches!(&hit.target, DrawerTarget::Tool(id) if id == &beta)
+        }));
 
-        // Click alpha's painted row: only alpha opens.
         click_row(&mut chat, alpha_row);
-        assert!(expanded_of(&chat, &alpha), "click opened alpha");
-        assert!(
-            !expanded_of(&chat, &beta),
-            "beta untouched by alpha's click"
-        );
+        assert!(expanded_of(&chat, &alpha));
+        assert!(!expanded_of(&chat, &beta));
 
-        // Re-render: alpha (the bottom-pinned last turn) grew a body, so beta's
-        // header shifts UP. Re-derive beta's row from the NEW screen and click
-        // it — the shifted geometry still routes to beta, and alpha stays open.
-        let screen2 = render_chat_to_string(&mut chat, 40, 24);
-        let beta_row2 = screen2
+        let shifted = render_chat_to_string(&mut chat, 40, 24);
+        let beta_row2 = shifted
             .lines()
-            .position(|l| l.contains("beta"))
-            .unwrap_or_else(|| panic!("beta header painted after alpha opened: {screen2:?}"))
+            .position(|line| line.contains("beta"))
+            .unwrap_or_else(|| panic!("beta header painted after alpha opened: {shifted:?}"))
             as u16;
-        assert_ne!(beta_row2, beta_row, "opening alpha shifted beta up");
         click_row(&mut chat, beta_row2);
-        assert!(
-            expanded_of(&chat, &beta),
-            "click opened beta at its shifted row"
-        );
-        assert!(
-            expanded_of(&chat, &alpha),
-            "alpha stayed open — drawers are independent"
-        );
+        assert!(expanded_of(&chat, &beta));
+        assert!(expanded_of(&chat, &alpha));
     }
 
     #[test]
@@ -5217,56 +6191,26 @@ mod tests {
     }
 
     #[test]
-    fn unknown_turn_outcome_never_restores_prompt() {
-        let mut chat = ChatComponent {
-            busy: true,
-            ..ChatComponent::default()
-        };
-        chat.update(&Action::TurnOutcomeUnknown {
-            err: "turn: operation timed out".into(),
-        });
-
-        assert!(!chat.busy, "unknown response must unwind the spinner");
-        assert!(
-            chat.input.is_empty(),
-            "unknown outcome must not restore a potentially side-effecting prompt"
-        );
-        let Turn::Assistant(msg) = &chat.turns[0] else {
-            panic!("expected warning assistant turn");
-        };
-        assert!(msg.contains("may already be running"));
-        assert!(msg.contains("not restored"));
-    }
-
-    // ── spec step 6: drawer body window, streaming invariance, mouse arming ──
-
-    #[test]
-    fn tool_runs_single_space_across_hidden_thinking() {
-        // Tool -> suppressed Thinking -> Tool must render ADJACENT headers:
-        // the hidden thinking emits nothing, so it must not break the run.
-        // A non-tool boundary (user turn above) keeps its blank separator.
+    fn hidden_thinking_keeps_tools_in_one_collapsed_group() {
+        // Tool -> suppressed Thinking -> Tool remains one execution burst. The
+        // user boundary above it keeps its normal blank separator.
         let mut chat = ChatComponent::default();
         chat.turns.push(Turn::User("go".into()));
-        let _a = add_tool(&mut chat, "alpha", "out a");
+        add_tool(&mut chat, "alpha", "out a");
         chat.turns.push(Turn::Thinking("hidden reasoning".into()));
-        let _b = add_tool(&mut chat, "beta", "out b");
+        add_tool(&mut chat, "beta", "out b");
         let screen = render_chat_to_string(&mut chat, 80, 20);
         let rows: Vec<&str> = screen.lines().collect();
-        let row_of = |needle: &str| {
-            rows.iter()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} not painted: {screen:?}"))
-        };
-        let (user_row, a_row, b_row) = (row_of("go"), row_of("alpha"), row_of("beta"));
-        assert_eq!(
-            b_row,
-            a_row + 1,
-            "hidden thinking must not double-space a tool run"
-        );
-        assert!(
-            a_row > user_row + 1,
-            "user -> tool boundary keeps its blank separator"
-        );
+        let user_row = rows.iter().position(|line| line.contains("go")).unwrap();
+        let group_row = rows
+            .iter()
+            .position(|line| line.contains("tools · 2 · 2 done"))
+            .unwrap_or_else(|| panic!("group not painted: {screen:?}"));
+
+        assert!(group_row > user_row + 1, "user boundary keeps a gap");
+        assert!(!screen.contains("alpha"));
+        assert!(!screen.contains("beta"));
+        assert!(!screen.contains("thinking"));
     }
 
     #[test]

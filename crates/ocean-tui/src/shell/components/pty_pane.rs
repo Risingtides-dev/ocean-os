@@ -78,7 +78,7 @@ impl Component for PtyComponent {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.last_area = area;
-        let body = panel::draw(frame, area, "TERMINAL", None, self.focused);
+        let body = panel::draw(frame, area, "", None, self.focused);
         if body.width == 0 {
             return;
         }

@@ -41,3 +41,8 @@ open = "5"
 base64.workspace = true
 ocean-oauth.workspace = true
 ocean-providers.workspace = true
+
+# Native push-to-dictate capture is macOS-first. Target-gating avoids pulling
+# ALSA development headers into the Linux workspace/MSRV lanes.
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.15"

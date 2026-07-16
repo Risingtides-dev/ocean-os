@@ -18,6 +18,8 @@
 //! `_` is deliberately NOT an italic delimiter so `snake_case` identifiers (the
 //! common case in a coding agent's transcript) survive intact.
 
+use std::ops::Deref;
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -39,13 +41,52 @@ pub struct CacheStats {
     pub misses: usize,
 }
 
+/// One rendered Markdown link, addressed by its line/span in [`MarkdownRender`].
+/// The chat uses that stable identity to project exact wrapped mouse geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkdownLink {
+    pub line: usize,
+    pub span: usize,
+    pub target: String,
+}
+
+/// Styled Markdown plus link metadata. Keeping metadata beside the rendered
+/// spans lets clients add interaction without changing the visible text.
+pub(crate) struct MarkdownRender {
+    pub lines: Vec<Line<'static>>,
+    pub links: Vec<MarkdownLink>,
+}
+
+impl Deref for MarkdownRender {
+    type Target = [Line<'static>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.lines
+    }
+}
+
+impl<'a> IntoIterator for &'a MarkdownRender {
+    type Item = &'a Line<'static>;
+    type IntoIter = std::slice::Iter<'a, Line<'static>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.lines.iter()
+    }
+}
+
+#[derive(Clone)]
+struct RenderedBlock {
+    lines: Vec<Line<'static>>,
+    links: Vec<MarkdownLink>,
+}
+
 /// Streaming markdown renderer. Owns a lazily-constructed [`Highlighter`] (the
 /// syntect load is expensive — build once, share across every code fence) and a
 /// content-addressed cache of rendered frozen blocks.
 #[derive(Default)]
 pub struct Markdown {
     hl: Option<Highlighter>,
-    cache: HashMap<u64, Vec<Line<'static>>>,
+    cache: HashMap<u64, RenderedBlock>,
     stats: CacheStats,
 }
 
@@ -70,36 +111,49 @@ impl Markdown {
 
     /// Render `src` to styled lines. Frozen (pre-tail) blocks are cached by
     /// content hash and reused; the tail block re-renders every call.
-    pub fn render(&mut self, src: &str) -> Vec<Line<'static>> {
+    pub fn render(&mut self, src: &str) -> MarkdownRender {
         let hl = self.hl.get_or_insert_with(Highlighter::new);
         let (frozen, tail) = split_blocks(src);
 
-        let mut out: Vec<Line<'static>> = Vec::new();
+        let mut rendered = MarkdownRender {
+            lines: Vec::new(),
+            links: Vec::new(),
+        };
         let mut first = true;
         for block in &frozen {
             if !first {
-                out.push(Line::from(""));
+                rendered.lines.push(Line::from(""));
             }
             first = false;
             let key = hash_block(block);
-            if let Some(cached) = self.cache.get(&key) {
+            let block = if let Some(cached) = self.cache.get(&key) {
                 self.stats.hits += 1;
-                out.extend(cached.iter().cloned());
+                cached.clone()
             } else {
                 self.stats.misses += 1;
-                let lines = render_block(block, hl);
-                out.extend(lines.iter().cloned());
-                self.cache.insert(key, lines);
-            }
+                let block = render_block(block, hl);
+                self.cache.insert(key, block.clone());
+                block
+            };
+            append_block(&mut rendered, block);
         }
         if !tail.trim().is_empty() {
             if !first {
-                out.push(Line::from(""));
+                rendered.lines.push(Line::from(""));
             }
-            out.extend(render_block(&tail, hl));
+            append_block(&mut rendered, render_block(&tail, hl));
         }
-        out
+        rendered
     }
+}
+
+fn append_block(rendered: &mut MarkdownRender, mut block: RenderedBlock) {
+    let line_base = rendered.lines.len();
+    for link in &mut block.links {
+        link.line += line_base;
+    }
+    rendered.lines.append(&mut block.lines);
+    rendered.links.append(&mut block.links);
 }
 
 fn hash_block(s: &str) -> u64 {
@@ -134,7 +188,7 @@ fn split_blocks(src: &str) -> (Vec<String>, String) {
 }
 
 /// Render one block (no interior blank lines except inside a fence) to lines.
-fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
+fn render_block(src: &str, hl: &Highlighter) -> RenderedBlock {
     let lines: Vec<&str> = src.split('\n').collect();
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut i = 0;
@@ -225,7 +279,30 @@ fn render_block(src: &str, hl: &Highlighter) -> Vec<Line<'static>> {
         }
         i += 1;
     }
-    out
+    let mut links = Vec::new();
+    for (line, rendered) in out.iter().enumerate() {
+        for (span, styled) in rendered.spans.iter().enumerate() {
+            if !styled.style.add_modifier.contains(Modifier::UNDERLINED) {
+                continue;
+            }
+            let Some(note) = rendered.spans.get(span + 1) else {
+                continue;
+            };
+            let Some(target) = note
+                .content
+                .strip_prefix(" (")
+                .and_then(|s| s.strip_suffix(')'))
+            else {
+                continue;
+            };
+            links.push(MarkdownLink {
+                line,
+                span,
+                target: target.to_string(),
+            });
+        }
+    }
+    RenderedBlock { lines: out, links }
 }
 
 /// Parse an image reference `![alt](path)` occupying (most of) a line, into
@@ -646,6 +723,27 @@ mod tests {
 
     fn plain(l: &Line) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn links_expose_label_span_and_target_metadata() {
+        let mut md = Markdown::new();
+        let rendered = md.render("See [architecture](docs/ARCHITECTURE.md#runtime) now.");
+        assert_eq!(rendered.links.len(), 1);
+        assert_eq!(rendered.links[0].line, 0);
+        assert_eq!(rendered.links[0].span, 1);
+        assert_eq!(rendered.links[0].target, "docs/ARCHITECTURE.md#runtime");
+        assert_eq!(rendered.lines[0].spans[1].content, "architecture");
+    }
+
+    #[test]
+    fn frozen_blocks_preserve_link_metadata_offsets() {
+        let mut md = Markdown::new();
+        let rendered = md.render("[one](one.md)\n\nplain\n\n[two](two.md)");
+        assert_eq!(rendered.links.len(), 2);
+        assert_eq!(rendered.links[0].line, 0);
+        assert_eq!(rendered.links[1].line, 4);
+        assert_eq!(rendered.links[1].target, "two.md");
     }
 
     #[test]

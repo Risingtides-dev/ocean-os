@@ -95,6 +95,8 @@ mod cors;
 mod event_adapter;
 /// Home-sandboxed directory listing and capped file-read HTTP policy.
 mod filesystem;
+/// Bounded fuzzy search over ocean-agent's persisted display transcripts.
+mod history_search;
 /// State-free Longhouse prepare, inspect, and workflow HTTP adapters.
 mod longhouse_preparation;
 /// Per-turn Longhouse advisory preparation and model-facing presentation.
@@ -134,6 +136,7 @@ use component_interaction::component_event;
 use cors::{cors_layer, parse_allowed_origins};
 use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
+use history_search::history_search;
 use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prepare};
 use longhouse_turn_preparation::{apply_longhouse_prep, longhouse_prep_for_turn};
 use metrics::{InFlightGuard, TurnMetrics};
@@ -582,6 +585,7 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
             get(agent_sessions).post(agent_sessions_create),
         )
         .route("/v1/agent/sessions/{id}", get(agent_session))
+        .route("/v1/agent/history/search", get(history_search))
         // Voice phases 2/3: ephemeral Realtime client-secret mint (the
         // browser talks WebRTC directly to OpenAI with the returned secret;
         // the API key never leaves the daemon) and the voice agent's handoff
@@ -1135,6 +1139,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/agent/sessions",
         "GET /v1/agent/sessions",
         "GET /v1/agent/sessions/{id}",
+        "GET /v1/agent/history/search",
         "POST /v1/agent/sessions/{id}/messages",
         "POST /v1/voice/realtime/client-secret",
         "POST /v1/voice/stt",
@@ -7251,6 +7256,7 @@ async fn voice_realtime_client_secret(
 /// never touches the provider credential.
 async fn voice_stt(
     State(_state): State<AppState>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
     let key = match ocean_providers::resolve_xai_api_key() {
@@ -7272,7 +7278,12 @@ async fn voice_stt(
         );
     }
 
-    match voice_speech::transcribe(&key, &body).await {
+    let audio_format = voice_speech::SttAudioFormat::from_content_type(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    match voice_speech::transcribe(&key, &body, audio_format).await {
         Ok(text) => (StatusCode::OK, Json(json!({ "text": text }))),
         Err(err) => {
             tracing::warn!(error = %err, "stt upstream failed");
@@ -19038,6 +19049,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn history_search_handler_returns_bounded_stable_shape() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), Some("surface".into()))
+            .unwrap();
+        state
+            .runtime
+            .append_session_message(session_id, "remember ocean lanterns".into())
+            .await
+            .unwrap();
+        state
+            .runtime
+            .append_session_message(session_id, "another ocean memory".into())
+            .await
+            .unwrap();
+
+        let app = app_router(cors_layer(Vec::new())).with_state(state);
+        let found = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/agent/history/search?q=ocean&limit=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&found.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["query"], "ocean");
+        assert_eq!(
+            body["hits"].as_array().unwrap().len(),
+            1,
+            "limit=0 clamps to 1"
+        );
+        let hit = &body["hits"][0];
+        for field in [
+            "hit_id",
+            "session_id",
+            "session_title",
+            "role",
+            "excerpt",
+            "timestamp_ms",
+            "workspace_root",
+            "score",
+            "match_kind",
+        ] {
+            assert!(hit.get(field).is_some(), "missing hit field {field}");
+        }
+        assert!(matches!(
+            hit["match_kind"].as_str(),
+            Some("exact" | "lexical" | "fuzzy")
+        ));
+        assert!(body.get("error").is_some());
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/agent/history/search")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&missing.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["hits"], json!([]));
+        assert!(body["error"].is_string());
+
+        let oversized_query = "a".repeat(ocean_agent::MAX_HISTORY_SEARCH_QUERY_CHARS + 1);
+        let oversized = app
+            .oneshot(
+                Request::get(format!("/v1/agent/history/search?q={oversized_query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+    }
+
     // Room route retirement + retained-contract guards
     // -------------------------------------------------
 
@@ -19310,7 +19414,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            75,
+            76,
             "route baseline changed; review the manifest"
         );
 

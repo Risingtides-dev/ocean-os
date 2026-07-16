@@ -37,6 +37,8 @@ pub struct EditorComponent {
     last_body_h: usize,
     last_text_w: usize,
     follow_cursor: bool,
+    selection_body: Rect,
+    selection_top: usize,
 }
 
 impl EditorComponent {
@@ -50,6 +52,8 @@ impl EditorComponent {
             last_body_h: 20,
             last_text_w: 80,
             follow_cursor: true,
+            selection_body: Rect::default(),
+            selection_top: 0,
         }
     }
 
@@ -85,6 +89,36 @@ impl EditorComponent {
 
     fn tab(&mut self) -> Option<&mut EditorTab> {
         self.tabs.get_mut(self.active)
+    }
+
+    /// Stable visual row under a painted editor body cell. Code rows map to
+    /// document lines; prose rows map to the width-dependent wrapped-row stream.
+    pub fn selection_row_for_screen(&self, screen_row: u16) -> Option<usize> {
+        (self.has_tabs()
+            && screen_row >= self.selection_body.y
+            && screen_row < self.selection_body.bottom())
+        .then(|| self.selection_top + usize::from(screen_row - self.selection_body.y))
+    }
+
+    pub fn selection_columns(&self) -> Option<(u16, u16)> {
+        (self.has_tabs() && self.selection_body.width > GUTTER_W).then(|| {
+            (
+                self.selection_body.x + GUTTER_W,
+                self.selection_body.right().saturating_sub(1),
+            )
+        })
+    }
+
+    /// Saturate editor chrome/composer-edge drags to the nearest painted content
+    /// row while retaining the same stable row coordinate used across scrolling.
+    pub fn nearest_selection_row(&self, screen_row: u16) -> Option<usize> {
+        (self.has_tabs() && self.selection_body.height > 0).then(|| {
+            let row = screen_row.clamp(
+                self.selection_body.y,
+                self.selection_body.bottom().saturating_sub(1),
+            );
+            self.selection_top + usize::from(row - self.selection_body.y)
+        })
     }
 }
 
@@ -183,7 +217,9 @@ impl Component for EditorComponent {
         };
         let state = dirty.then_some("unsaved");
         let body = panel::draw(frame, area, &title, state, self.focused);
+        self.selection_body = body;
         if body.width == 0 {
+            self.selection_top = 0;
             return;
         }
         frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), body);
@@ -191,15 +227,20 @@ impl Component for EditorComponent {
         self.last_text_w = body.width.saturating_sub(GUTTER_W) as usize;
 
         let Some(t) = self.tabs.get_mut(self.active) else {
+            self.selection_top = 0;
             panel::footer(frame, area, " no file open");
             return;
         };
         let text_w = self.last_text_w.max(1);
         let prose = is_prose(&t.ext());
         let (lines, cursor) = if prose {
-            prose_view(t, body.height as usize, text_w, self.follow_cursor)
+            let result = prose_view(t, body.height as usize, text_w, self.follow_cursor);
+            self.selection_top = t.visual_scroll;
+            result
         } else {
-            code_view(t, body.height as usize, text_w, self.follow_cursor)
+            let result = code_view(t, body.height as usize, text_w, self.follow_cursor);
+            self.selection_top = t.scroll;
+            result
         };
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(theme::BG)),

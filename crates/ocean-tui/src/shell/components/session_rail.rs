@@ -2,11 +2,10 @@
 //! project as a two-level tree, breadcrumbed like the file explorer:
 //! DIRECTORY nodes (the main checkout or a worktree dir beneath it) contain
 //! BRANCH nodes (the git branch stamped on each session record at creation)
-//! which contain the sessions. Wears CTRL's SESSIONS-panel skin: slate bed,
-//! plain SESSIONS title, dir headers in blue and branch headers in cyan with
-//! ▸/▾ carets + a session count, sessions indented beneath with their title +
-//! relative age, a cyan accent bar on the selected row, and a live `●` dot on
-//! the session currently open in the chat/PTY.
+//! which contain the sessions. Uses Ocean's shared untitled panel skin: slate
+//! bed, dir headers in blue and branch headers in cyan with ▸/▾ carets + a
+//! session count, sessions indented beneath with their title + relative age, a
+//! cyan accent bar on the selected row, and a live `●` dot on the session currently open in the chat/PTY.
 //!
 //! Enter on a header toggles the node; Enter on a session resumes it natively
 //! into the chat; `t` opens the session in the embedded terminal; `r` rescans.
@@ -326,7 +325,7 @@ impl Component for SessionRailComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let body = panel::draw(frame, area, "SESSIONS", None, self.focused);
+        let body = panel::draw(frame, area, "", None, self.focused);
         if body.width == 0 {
             return;
         }
@@ -664,7 +663,7 @@ mod tests {
         s.title = "👩‍💻 修复终端界面".into();
         let mut rail = component(vec![s]);
         let narrow = render(&mut rail, 12, 8);
-        assert!(narrow.contains("SESSIONS"));
+        assert!(!narrow.contains("SESSIONS"));
         let resized = render(&mut rail, 38, 10);
         let compact: String = resized.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(

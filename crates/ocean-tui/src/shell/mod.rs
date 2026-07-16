@@ -10,6 +10,7 @@ mod client;
 mod component;
 mod components;
 mod daemon_boot;
+mod dictation;
 mod diff;
 mod editor;
 mod errfmt;
@@ -56,6 +57,7 @@ pub fn run(
             app.resume_initial_session(session)?;
         }
         let mut terminal = tui::init()?;
+        app.set_hold_to_dictate(terminal.supports_key_releases());
         // The OCEAN splash: hold, then slide-and-fade. Runs before the event
         // pump spawns, so its direct crossterm polling can't race the app loop.
         crate::splash::play(&mut terminal)?;

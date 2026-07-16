@@ -1,5 +1,5 @@
-//! FileTreeComponent — the project explorer wearing CTRL's panel skin: slate
-//! bed, plain FILES title, hairline, accent bar on the selected row, dirs in
+//! FileTreeComponent — the project explorer wearing Ocean's shared untitled
+//! panel skin: slate bed, hairline, accent bar on the selected row, dirs in
 //! blue with ▸/▾ carets. Enter expands a dir or opens a file in the editor.
 
 use std::path::PathBuf;
@@ -174,7 +174,7 @@ impl Component for FileTreeComponent {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.body_rect = Rect::default();
-        let body = panel::draw(frame, area, "FILES", None, self.focused);
+        let body = panel::draw(frame, area, "", None, self.focused);
         if body.width == 0 {
             return;
         }
@@ -318,6 +318,7 @@ mod tests {
         std::fs::write(unicode_root.join("界面组件.rs"), "").unwrap();
         let mut component = FileTreeComponent::new(unicode_root.clone());
         let narrow = render(&mut component, 12, 7);
+        assert!(!narrow.contains("FILES"));
         assert!(narrow.contains(".rs"));
         let wide: String = render(&mut component, 30, 9)
             .chars()

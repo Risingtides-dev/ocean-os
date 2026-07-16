@@ -48,9 +48,8 @@ pub fn draw(f: &mut Frame, area: Rect, title: &str, state: Option<&str>, focused
 
     // ── title row: plain "TITLE" left, plain state text right ────────────────
     // An empty title drops the label but keeps the row (state stays
-    // right-aligned, hairline stays) — used by the chat pane, where the app
-    // title bar + breadcrumb already say where you are and a third "OCEAN"
-    // was pure redundancy.
+    // right-aligned, hairline stays). Chat and the supporting workspace panes
+    // use this to avoid redundant pane-name chrome while preserving geometry.
     let title_fg = if focused { theme::BLUE } else { theme::COMMENT };
     let state_txt = state.unwrap_or("");
     let state_w = state_txt.chars().count();

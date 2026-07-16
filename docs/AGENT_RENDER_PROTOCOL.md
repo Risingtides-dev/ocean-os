@@ -27,9 +27,10 @@ pub struct RenderEvent {
     /// Opaque component id, scoped to the session. The agent picks it,
     /// the client echoes it back on interactions.
     pub id: String,
-    /// Component kind — one of the 17 built-in kinds (see "Built-in component
+    /// Component kind — one of the 18 built-in kinds (see "Built-in component
     /// kinds" below): kanban, form, table, progress, markdown, dashboard, chart,
-    /// timeline, stat, file_tree, diff, code, callout, gallery, confirm, map, video.
+    /// interactive_plot, timeline, stat, file_tree, diff, code, callout, gallery,
+    /// confirm, map, video.
     pub kind: String,
     /// Component props — a JSON object whose schema is defined per kind.
     pub props: serde_json::Value,
@@ -175,6 +176,55 @@ components let the agent place rendered blocks anywhere in a dashboard layout.
 
 `type` is `"bar" | "line"`; `value` is numeric. Display only.
 
+#### `interactive_plot`
+
+```json
+{
+  "id": "decay-lab",
+  "kind": "interactive_plot",
+  "props": {
+    "title": "Exponential decay",
+    "description": "Change the rate to recompute the curve locally.",
+    "parameters": [
+      { "id": "rate", "label": "Decay rate", "min": 0.1, "max": 3,
+        "step": 0.1, "value": 1, "unit": "s⁻¹" }
+    ],
+    "plot": {
+      "x": { "id": "t", "label": "Time (s)", "min": 0, "max": 10, "samples": 160 },
+      "y_label": "Amplitude",
+      "series": [
+        { "label": "x(t)", "expression": "exp(-rate*t)" }
+      ]
+    },
+    "metrics": [
+      { "label": "Half-life", "expression": "ln(2)/rate", "unit": " s", "precision": 2 }
+    ]
+  }
+}
+```
+
+The web Surface evaluates expressions and updates the plot and metrics locally as
+controls move. A committed slider or number-input change emits:
+
+```json
+{
+  "type": "parameters_changed",
+  "payload": {
+    "parameters": { "rate": 1.4 },
+    "changed": { "id": "rate", "value": 1.4 }
+  }
+}
+```
+
+Expression support is deliberately bounded: numeric literals, lowercase ASCII
+parameter/x identifiers, parentheses, unary `+`/`-`, operators `+ - * / ^`,
+constants `pi`/`e`, and `sin`, `cos`, `tan`, `exp`, `ln`/`log`, `sqrt`, `abs`,
+`min`, and `max`. Limits are 12 parameters, 6 series, 12 metrics, 512 samples,
+and 512 characters per expression. Invalid or non-finite work renders an inline error instead of plot
+geometry. This kind is currently interactive anywhere the canonical Leptos/WASM
+Surface runs: browser PWA, extension, and Tauri desktop. Other clients may
+project a fallback. It does not execute tools or external actions.
+
 #### `timeline`
 
 ```json
@@ -295,8 +345,8 @@ tool: component_render
   args:
     id: string       # component id, agent-chosen
     kind: string     # kanban | form | table | progress | markdown | dashboard
-                     # | chart | timeline | stat | file_tree | diff | code
-                     # | callout | gallery | confirm | map | video
+                     # | chart | interactive_plot | timeline | stat | file_tree
+                     # | diff | code | callout | gallery | confirm | map | video
     props: object    # component-specific props (see "Built-in component kinds")
     replace: bool    # default false (true overwrites a component with the same id)
 

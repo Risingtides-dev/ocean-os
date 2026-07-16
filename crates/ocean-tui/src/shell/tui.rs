@@ -25,19 +25,30 @@ pub type Tui = Terminal<Backend>;
 /// RAII owner for terminal mode. Every return path after `init`—including a
 /// splash/render error—restores raw mode, paste/mouse flags, keyboard protocol,
 /// and the alternate screen.
-pub struct Guard(Tui);
+pub struct Guard {
+    terminal: Tui,
+    key_releases: bool,
+}
+
+impl Guard {
+    /// True when the terminal accepted the Kitty keyboard protocol used to
+    /// report distinct press/repeat/release events.
+    pub fn supports_key_releases(&self) -> bool {
+        self.key_releases
+    }
+}
 
 impl Deref for Guard {
     type Target = Tui;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.terminal
     }
 }
 
 impl DerefMut for Guard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.terminal
     }
 }
 
@@ -64,16 +75,24 @@ pub fn init() -> io::Result<Guard> {
         return Err(error);
     }
     // Kitty keyboard protocol where supported (iTerm2, Ghostty, kitty, WezTerm):
-    // without it, modifier combos like Ctrl+Opt+1 are ambiguous or dropped.
-    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+    // disambiguation preserves modifier combos; event types make press-and-hold
+    // gestures honest by reporting release separately from key repeat.
+    let key_releases = matches!(supports_keyboard_enhancement(), Ok(true));
+    if key_releases {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
         );
     }
     install_panic_hook();
     match Terminal::new(CrosstermBackend::new(stdout)) {
-        Ok(terminal) => Ok(Guard(terminal)),
+        Ok(terminal) => Ok(Guard {
+            terminal,
+            key_releases,
+        }),
         Err(error) => {
             let _ = restore();
             Err(error)

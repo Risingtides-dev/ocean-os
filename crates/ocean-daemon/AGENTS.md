@@ -21,11 +21,17 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   remains a compatibility adapter and request-wire `yolo` remains inert.
 - `call-voice` turns are always `HarnessProfile::Voice`, `yolo: false`, and
   `PromptControl::without_tools()`, regardless of global or persisted YOLO.
+- `POST /v1/voice/stt` remains the credential-owning batch transcription seam
+  for every first-party surface. Browser `application/octet-stream` retains the
+  historical WebM multipart metadata; `audio/wav`/`audio/x-wav`/`audio/wave`
+  selects bounded native WAV metadata for TUI dictation. Unknown content types
+  fail soft to WebM for wire compatibility; no client receives the xAI key.
 - Realtime `purpose: "planner"` is pre-session and propose-only: validate the
   registered project plus canonical live worktree before credential resolution,
   advertise only `propose_handoff`, and mutate only through the existing
   session/message/turn routes after an explicit Surface click.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
+- `GET /v1/agent/history/search` is a bounded adapter over ocean-agent's persisted display-transcript search (default 20, clamp 1..50); it performs no provider or embedding calls.
 - Subagent roles, dispatch, lifecycle, and orchestration are extension-owned. Do not add daemon-native `task`/`spawn_worker`/fleet machinery. The daemon may expose generic permission-gated turn, cancellation, capability-provider, and extension event/tool seams; current `/v1/subagents/spec` and folder-agent subagent metadata remain compatibility surfaces until a separately approved extension migration.
 - Slack Socket Mode, API/credential access, reconnects, replies, files, and real Canvas delivery are `ocean-slack` extension concerns. Private `slack_canvas_fulfillment.rs` is only the temporary typed host ingress/readback, runtime lookup, scoped-event, and lifecycle-enforcement compatibility seam; do not grow it into a second Slack transport authority.
 - `component_interaction.rs` is a leaf HTTP fulfillment adapter over the runtime-owned `COMPONENT_WAIT_REGISTRY`: preserve exact key scoping, remove-before-send semantics, poison/error responses, and runtime ownership of wait registration, timeout, and ordinary cleanup.
