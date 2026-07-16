@@ -3437,3 +3437,11 @@ Verification:
 - `cargo fmt --all -- --check`, `cargo xtask docs-check`, and `git diff --check` passed
 - Fresh final review found no medium-or-higher behavior or documentation mismatches
 _________________________________________________________________________________
+time:      [09:25pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [docs]: manifest Longhouse preparation extraction
+area:      [backend]: ocean-daemon Phase 2C advisory HTTP adapters
+
+Proposed the next behavior-neutral boundary, then narrowed it after fresh manifest review: move only the state-free Longhouse prepare/inspect/workflow-brief HTTP shells into private `src/longhouse_preparation.rs`. The manifest freezes PR #292 exact-token inspection evidence, real-router extractor/method/envelope/privacy contracts, cwd roots/cache selection, `spawn_blocking`/fail-open behavior, and the read-only no-state/no-event/no-runtime authority boundary. Skill query/fetch and compatibility subagent-spec remain in composition; the reviewer disclosed a cached indexed-path symlink-retarget risk that requires a separate security disposition before any librarian extraction and is neither frozen nor changed here. Router composition, turn-time preparation, Longhouse governance/title/escrow/recall state, and `ocean-longhouse` algorithms remain excluded. Characterization and independent review are required before any production move.
+_________________________________________________________________________________
