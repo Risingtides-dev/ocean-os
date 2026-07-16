@@ -57,7 +57,9 @@ pub fn run(
             app.resume_initial_session(session)?;
         }
         let mut terminal = tui::init()?;
-        app.set_hold_to_dictate(terminal.supports_key_releases());
+        // Dictation is F2-toggle only; hold-Space is off by default so Space
+        // remains ordinary typing in every terminal.
+        app.set_hold_to_dictate(false);
         // The OCEAN splash: hold, then slide-and-fade. Runs before the event
         // pump spawns, so its direct crossterm polling can't race the app loop.
         crate::splash::play(&mut terminal)?;

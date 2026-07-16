@@ -27,12 +27,14 @@ pub type Tui = Terminal<Backend>;
 /// and the alternate screen.
 pub struct Guard {
     terminal: Tui,
+    #[allow(dead_code)]
     key_releases: bool,
 }
 
 impl Guard {
     /// True when the terminal accepted the Kitty keyboard protocol used to
     /// report distinct press/repeat/release events.
+    #[allow(dead_code)]
     pub fn supports_key_releases(&self) -> bool {
         self.key_releases
     }

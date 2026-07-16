@@ -70,7 +70,7 @@ const TERM_H: u16 = 14;
 /// tick path clears it — the idle row returns to its minimal, model-only set.
 const STATUS_TTL: Duration = Duration::from_secs(8);
 /// A quick Space tap remains typing; only a deliberate hold opens the mic.
-const DICTATION_HOLD: Duration = Duration::from_millis(180);
+const DICTATION_HOLD: Duration = Duration::from_millis(1000);
 /// Floor for the dock and the main surface so neither can be squeezed to nothing.
 const MIN_TERM_H: u16 = 3;
 const MIN_CENTER_H: u16 = 5;
