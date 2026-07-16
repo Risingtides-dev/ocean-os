@@ -3873,3 +3873,11 @@ area:      [testing]
 
 Refined and merged TASK-10 after finding one async lifecycle blocker in the initial SSE tail: idle client disconnects did not wake `run_room_tail`, stranding its task, AppState, and broadcast receiver. Pi's narrow `tx.closed()` select fix and two-state regression passed Fable's re-gate and independent Codex verification. Tail tests passed 7/7, endpoint tests 3/3, store tests 39/39, workspace check, denied-warning Clippy, fmt, docs-check, and diff-check passed. Fast-forwarded commits 822e7558 and b74b3ffc onto main; live daemon acceptance remains the close gate.
 _________________________________________________________________________________
+time:      [09:08am] [16-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [pi/daemon-phase2c-final-28-handoff-20260716]
+type:      [handoff]: document final daemon Phase 2C execution program
+area:      [docs]: behavior-neutral refactor continuity
+
+Added the active final-28% handoff for cold-start continuation from last published Phase 2C checkpoint `b21006b`, reconciled against current source baseline `4712fdb`. It sequences Longhouse topic/convene governance, security-sensitive title/escrow/recall/breach/board governance, call HTTP/webhook/token adaptation, call runtime/persistence, a fresh remaining-registry inventory, and agent-turn/SSE orchestration last. The handoff records exact program protocol, authority and lifecycle invariants, characterization priorities, stop rules, validation/publication gates, deferred security dispositions, frozen compatibility quirks, and the restart/completion checklist. Linked it from the mission and docs active-plan index. No runtime, deployment, or supervision change was performed.
+_________________________________________________________________________________
