@@ -41,3 +41,18 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 - `ocean-store` and `ocean-daemon` own their implementation surfaces; this
   crate owns the type definitions + exhaustive serde round-trip/enum/backward
   compat + required-field + forbidden-key tests.
+
+## Work Guidance
+
+- Prefer explicit fields and stable enums over implicit client-specific conventions.
+- Update downstream crates when shared types change.
+- Document any migration or compatibility risk in the root `events.md` entry for the work.
+
+## Verification
+
+- `cargo test -p ocean-core`
+- `cargo check --workspace`
+
+## Child devlog Index
+
+No child boundaries defined within `ocean-core/` at this time.

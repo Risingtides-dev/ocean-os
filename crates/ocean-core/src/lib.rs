@@ -1772,12 +1772,20 @@ mod tests {
             kind: RoomMessageKind::Message,
             body: "hello".into(),
             created_at: Utc::now(),
-            federated: Some(meta.clone()),
+            federated: Some(meta),
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
             json["federated"],
-            serde_json::to_value(&meta).unwrap(),
+            serde_json::json!({
+                "ledger_event_id": "evt_abc",
+                "global_sequence": 42,
+                "source_id": "room:warroom:member:m1:producer:p1",
+                "source_sequence": 7,
+                "client_event_id": "cli-1",
+                "origin_principal_id": "princ-x",
+                "origin_member_id": "mem-y"
+            }),
             "federated must match the full exact FederatedMessageMeta object"
         );
         let roundtrip: RoomMessage = serde_json::from_value(json).unwrap();
