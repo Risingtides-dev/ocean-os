@@ -34,3 +34,29 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 ## Child devlog Index
 
 No child boundaries defined within `ocean-core/` at this time.
+
+---
+
+## Gate-2 S2-P1 — Federation types (2026-07-16)
+
+This crate owns the v2.2 wire types added for the producer-contract freeze
+(`gate2-s2-p1-producer-freeze.md` v1.1 + `gate2-s2-wire-freeze.md` v2.2):
+
+- `FederatedMessageMeta` — confirmed-federation metadata on `RoomMessage`
+- `FederatedRoomMemberProjection` + `FederatedActorType` + `FederatedRoomRole`
+- `MemberPresence` — derived presence (`live`, `unavailable`; no `stale`)
+- `PublicAgentDescriptor` — safe agent projection (no credentials/paths)
+- `RoomOutboxItem` + `OutboxItemState` — pending/failed outgoing events
+- `RoomAccessProjection` + `RoomAccessState` — surface-facing snapshot
+- `CreateInviteRequest` (Serialize only), `InviteResponse`, `RedeemInviteRequest`
+
+`RoomMessage.federated: Option<FederatedMessageMeta>` is the sole additive
+field on a G1 type — `#[serde(default)]`, backward-compatible. Every new
+struct field is required unless individually `#[serde(default)]` or
+`skip_serializing_if`. No `Room`, `RoomParticipant`, `RoomMessageKind`, or
+`RoomTriggerPolicy` changes. Do not remove `Serialize`/`Deserialize` from
+types the daemon routes use.
+
+`ocean-store` and `ocean-daemon` own their implementation surfaces; this
+crate owns the type definitions + exhaustive serde round-trip/enum/backward
+compat tests (see `#[cfg(test)] mod tests`).

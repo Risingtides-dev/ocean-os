@@ -311,6 +311,7 @@ impl RoomRegistry {
             kind,
             body,
             created_at: now,
+            federated: None,
         };
         let record = self
             .rooms

@@ -557,6 +557,10 @@ pub struct RoomMessage {
     pub body: String,
     /// When the entry was appended.
     pub created_at: DateTime<Utc>,
+    /// Confirmed-federation metadata. `None` for local-only rooms and G1
+    /// messages. Present only after Bedrock confirms.
+    #[serde(default)]
+    pub federated: Option<FederatedMessageMeta>,
 }
 
 /// A room-level event that the [`RoomTriggerPolicy`] is evaluated against
@@ -649,6 +653,193 @@ pub fn evaluate_trigger_policy(
             reason: "policy does not match this event".into(),
         },
     }
+}
+
+// ── Gate-2 Federation Types (S2-P1) ────────────────────────────────────
+
+/// Confirmed-federation metadata. Absent (`None`) for local-only rooms and G1
+/// messages. Present only after Bedrock confirms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederatedMessageMeta {
+    /// Bedrock ledger event id (UUID). Dedup key on ingest.
+    pub ledger_event_id: String,
+    /// Bedrock global ledger sequence. The confirmed display order.
+    pub global_sequence: u64,
+    /// Producer stream id —
+    /// `room:<room_id>:member:<member_id>:producer:<instance>`.
+    pub source_id: String,
+    /// Monotonic counter within that producer stream.
+    pub source_sequence: u64,
+    /// Client-assigned idempotency key (set by the posting daemon).
+    pub client_event_id: String,
+    /// Bedrock principal id of the posting member's owning human.
+    /// Non-secret public attribution id.
+    pub origin_principal_id: String,
+    /// Opaque Bedrock member_id of the author.
+    pub origin_member_id: String,
+}
+
+/// Safe projection of one Bedrock room_members row. `member_id` is opaque.
+/// Carries no bearer material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederatedRoomMemberProjection {
+    /// Opaque Bedrock member_id — mentions target this, not a display name.
+    pub member_id: String,
+    /// For an agent row: the owning human member_id. `None` for humans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_member_id: Option<String>,
+    /// `user` | `agent`
+    pub actor_type: FederatedActorType,
+    /// `owner` | `member`
+    pub role_in_room: FederatedRoomRole,
+    /// Human-readable name from Bedrock.
+    pub display_name: String,
+    /// Non-secret agent descriptor. `None` for Human rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_agent_descriptor: Option<PublicAgentDescriptor>,
+    /// ISO-8601 join timestamp.
+    pub joined_at: String,
+    /// Derived presence. `None` = federation projection absent entirely.
+    /// `Some(Unavailable)` = federated, no lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_presence: Option<MemberPresence>,
+    /// Agent-only. `None` for Human rows (absence IS the signal that binding
+    /// is N/A). `Some(true)` = local daemon holds a private binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_binding_available: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FederatedActorType {
+    User,
+    Agent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FederatedRoomRole {
+    Owner,
+    Member,
+}
+
+/// Derived presence. `Live` = lease within heartbeat window, `Unavailable` =
+/// no active lease. No grace/`Stale` state exists in the S1C contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberPresence {
+    Live,
+    Unavailable,
+}
+
+/// Non-secret agent descriptor for federation. Explicitly transforms live
+/// `GET /v1/agents` fields — NOT a claim of reuse. Local paths, provider
+/// credentials, tool config, permission posture, and execution capability are
+/// NEVER included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicAgentDescriptor {
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_alias: Option<String>,
+    #[serde(default)]
+    pub skills_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagent_names: Vec<String>,
+}
+
+/// One locally-authored federated event awaiting Bedrock confirmation.
+/// Rendered in a SEPARATE pending area; never inserted into the confirmed
+/// transcript before Bedrock assigns a global sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomOutboxItem {
+    pub client_event_id: String,
+    pub source_id: String,
+    pub source_sequence: u64,
+    pub author_member_id: String,
+    /// `event_type` string per the ledger append contract (e.g. `"message"`).
+    pub event_type: String,
+    /// The event payload (message body, join/leave data, etc.).
+    pub payload: serde_json::Value,
+    /// Canonical mention target `member_id`s (empty if no @mentions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mention_member_ids: Vec<String>,
+    /// `pending` | `failed` (confirmation removes the item).
+    pub state: OutboxItemState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxItemState {
+    Pending,
+    Failed,
+}
+
+/// The surface's single federated-state snapshot, updated via local SSE.
+/// No direct Bedrock call — the daemon projects this from bridge state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomAccessProjection {
+    /// `local` | `connecting` | `live` | `recovering` | `revoked`
+    pub state: RoomAccessState,
+    /// Highest Bedrock global sequence confirmed on this daemon.
+    /// `None` = no confirmed events yet. Distinguishable from `Some(0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_confirmed_global_sequence: Option<u64>,
+    /// Federated members (daemon-projected, including remote peers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<FederatedRoomMemberProjection>,
+    /// Pending outbox items not yet confirmed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbox: Vec<RoomOutboxItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomAccessState {
+    /// G1 local room (no federation).
+    Local,
+    /// Bridge connecting to Bedrock.
+    Connecting,
+    /// Live subscription, confirmed events flowing.
+    Live,
+    /// Resync in progress (queue overflow, re-paging from ledger).
+    Recovering,
+    /// Membership revoked or token invalidated.
+    Revoked,
+}
+
+// ── Invite intent types (P1 — types + serialization; routes deferred) ──
+
+/// `POST /v1/rooms/persistent/{key}/invites` — request body (Surface
+/// `Serialize` only). The daemon owns its own `Deserialize` twin with
+/// `ttl_minutes` defaulting to 1440.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateInviteRequest {
+    /// Optional human-readable recipient hint (not enforced).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient_name: Option<String>,
+    /// TTL in minutes. Surface sends explicit; daemon Deserialize twin defaults
+    /// to 1440 and validates 1..10080.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_minutes: Option<u32>,
+}
+
+/// Response from `POST .../invites` — the invite code the owner shares
+/// out-of-band.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteResponse {
+    pub code: String,
+    pub expires_at: String,
+    pub room_key: String,
+    pub room_name: String,
+}
+
+/// `POST /v1/rooms/persistent/invites/redeem` — request body.
+/// Code in BODY only.
+#[derive(Debug, Clone, Serialize)]
+pub struct RedeemInviteRequest {
+    pub code: String,
 }
 
 /// Response payload for `POST /v1/requests`.
@@ -1444,6 +1635,7 @@ mod tests {
             kind: RoomMessageKind::Message,
             body: "@ocean fix the markers".into(),
             created_at: Utc::now(),
+            federated: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["seq"], 3);
@@ -1526,5 +1718,310 @@ mod tests {
             let roundtrip: OceanEvent = serde_json::from_value(json).unwrap();
             assert_eq!(roundtrip, event);
         }
+    }
+
+    // ── Gate-2 S2-P1 federation type serde tests ───────────────────────
+
+    #[test]
+    fn room_message_federated_default_none_roundtrip() {
+        let msg = RoomMessage {
+            seq: 3,
+            author_id: "john".into(),
+            author_kind: RoomParticipantKind::Human,
+            kind: RoomMessageKind::Message,
+            body: "hello".into(),
+            created_at: Utc::now(),
+            federated: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["federated"], serde_json::Value::Null);
+        let roundtrip: RoomMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, msg);
+    }
+
+    #[test]
+    fn old_local_room_message_without_federated_deserializes_none() {
+        let old_json = serde_json::json!({
+            "seq": 3,
+            "author_id": "john",
+            "author_kind": "human",
+            "kind": "message",
+            "body": "hello",
+            "created_at": "2026-07-16T18:00:00Z"
+        });
+        let msg: RoomMessage = serde_json::from_value(old_json).unwrap();
+        assert_eq!(msg.federated, None);
+        assert_eq!(msg.seq, 3);
+    }
+
+    #[test]
+    fn federated_room_message_roundtrips() {
+        let meta = FederatedMessageMeta {
+            ledger_event_id: "evt_abc".into(),
+            global_sequence: 42,
+            source_id: "room:warroom:member:m1:producer:p1".into(),
+            source_sequence: 7,
+            client_event_id: "cli-1".into(),
+            origin_principal_id: "princ-x".into(),
+            origin_member_id: "mem-y".into(),
+        };
+        let msg = RoomMessage {
+            seq: 3,
+            author_id: "john".into(),
+            author_kind: RoomParticipantKind::Human,
+            kind: RoomMessageKind::Message,
+            body: "hello".into(),
+            created_at: Utc::now(),
+            federated: Some(meta),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["federated"]["global_sequence"], 42);
+        assert_eq!(json["federated"]["source_sequence"], 7);
+        let roundtrip: RoomMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, msg);
+    }
+
+    #[test]
+    fn room_access_local_projection_skips_empty_vecs() {
+        let proj = RoomAccessProjection {
+            state: RoomAccessState::Local,
+            last_confirmed_global_sequence: None,
+            members: vec![],
+            outbox: vec![],
+        };
+        let json = serde_json::to_value(&proj).unwrap();
+        assert_eq!(json["state"], "local");
+        assert!(json.get("me_mbers").is_none(), "empty members omitted");
+        assert!(json.get("outbox").is_none(), "empty outbox omitted");
+        assert!(json.get("last_confirmed_global_sequence").is_none());
+        let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, proj);
+    }
+
+    #[test]
+    fn room_access_live_with_members_roundtrips() {
+        let member = FederatedRoomMemberProjection {
+            member_id: "mem-1".into(),
+            owner_member_id: None,
+            actor_type: FederatedActorType::User,
+            role_in_room: FederatedRoomRole::Owner,
+            display_name: "Alice".into(),
+            public_agent_descriptor: None,
+            joined_at: "2026-07-16T18:00:00Z".into(),
+            derived_presence: Some(MemberPresence::Live),
+            local_binding_available: None,
+        };
+        let proj = RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(5),
+            members: vec![member],
+            outbox: vec![],
+        };
+        let json = serde_json::to_value(&proj).unwrap();
+        assert_eq!(json["state"], "live");
+        assert_eq!(json["last_confirmed_global_sequence"], 5);
+        assert_eq!(json["members"][0]["member_id"], "mem-1");
+        assert_eq!(json["members"][0]["actor_type"], "user");
+        assert_eq!(json["members"][0]["role_in_room"], "owner");
+        assert_eq!(json["members"][0]["derived_presence"], "live");
+        assert!(json["members"][0].get("local_binding_available").is_none());
+        assert!(json.get("outbox").is_none());
+        let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, proj);
+    }
+
+    #[test]
+    fn room_access_live_with_agent_member_roundtrips() {
+        let pda = PublicAgentDescriptor {
+            display_name: "Codex".into(),
+            description: Some("fast coder".into()),
+            model_alias: Some("sonnet".into()),
+            skills_count: 7,
+            subagent_names: vec!["flux".into()],
+        };
+        let member = FederatedRoomMemberProjection {
+            member_id: "agent-1".into(),
+            owner_member_id: Some("mem-1".into()),
+            actor_type: FederatedActorType::Agent,
+            role_in_room: FederatedRoomRole::Member,
+            display_name: "Codex".into(),
+            public_agent_descriptor: Some(pda),
+            joined_at: "2026-07-16T18:00:00Z".into(),
+            derived_presence: Some(MemberPresence::Live),
+            local_binding_available: Some(true),
+        };
+        let proj = RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(5),
+            members: vec![member],
+            outbox: vec![],
+        };
+        let json = serde_json::to_value(&proj).unwrap();
+        assert_eq!(json["members"][0]["actor_type"], "agent");
+        assert_eq!(json["members"][0]["local_binding_available"], true);
+        assert_eq!(
+            json["members"][0]["public_agent_descriptor"]["skills_count"],
+            7
+        );
+        assert_eq!(
+            json["members"][0]["public_agent_descriptor"]["subagent_names"][0],
+            "flux"
+        );
+        let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, proj);
+    }
+
+    #[test]
+    fn public_agent_descriptor_omits_empty_collections() {
+        let pda = PublicAgentDescriptor {
+            display_name: "Min".into(),
+            description: None,
+            model_alias: None,
+            skills_count: 0,
+            subagent_names: vec![],
+        };
+        let json = serde_json::to_value(&pda).unwrap();
+        assert_eq!(json["display_name"], "Min");
+        assert!(json.get("description").is_none());
+        assert!(json.get("model_alias").is_none());
+        assert!(json.get("subagent_names").is_none());
+        assert_eq!(json["skills_count"], 0);
+        let roundtrip: PublicAgentDescriptor = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, pda);
+    }
+
+    #[test]
+    fn outbox_item_roundtrips() {
+        let item = RoomOutboxItem {
+            client_event_id: "cli-1".into(),
+            source_id: "room:warroom:member:m1:producer:p1".into(),
+            source_sequence: 3,
+            author_member_id: "mem-1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"text": "hi"}),
+            mention_member_ids: vec!["mem-2".into()],
+            state: OutboxItemState::Pending,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["state"], "pending");
+        assert_eq!(json["source_sequence"], 3);
+        let roundtrip: RoomOutboxItem = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, item);
+    }
+
+    #[test]
+    fn outbox_item_empty_mentions_omitted() {
+        let item = RoomOutboxItem {
+            client_event_id: "cli-2".into(),
+            source_id: "room:warroom:member:m1:producer:p1".into(),
+            source_sequence: 4,
+            author_member_id: "mem-1".into(),
+            event_type: "message".into(),
+            payload: serde_json::json!({"text": "hi"}),
+            mention_member_ids: vec![],
+            state: OutboxItemState::Failed,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["state"], "failed");
+        assert!(json.get("mention_member_ids").is_none());
+        let roundtrip: RoomOutboxItem = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, item);
+    }
+
+    #[test]
+    fn all_access_state_enums_snake_case() {
+        for (state, expected) in [
+            (RoomAccessState::Local, "local"),
+            (RoomAccessState::Connecting, "connecting"),
+            (RoomAccessState::Live, "live"),
+            (RoomAccessState::Recovering, "recovering"),
+            (RoomAccessState::Revoked, "revoked"),
+        ] {
+            let json = serde_json::to_value(state).unwrap();
+            assert_eq!(json.as_str().unwrap(), expected);
+            let back: RoomAccessState = serde_json::from_value(json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn all_federated_actor_type_enums_snake_case() {
+        for (kind, expected) in [
+            (FederatedActorType::User, "user"),
+            (FederatedActorType::Agent, "agent"),
+        ] {
+            let json = serde_json::to_value(kind).unwrap();
+            assert_eq!(json.as_str().unwrap(), expected);
+            let back: FederatedActorType = serde_json::from_value(json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn all_federated_room_role_enums_snake_case() {
+        for (role, expected) in [
+            (FederatedRoomRole::Owner, "owner"),
+            (FederatedRoomRole::Member, "member"),
+        ] {
+            let json = serde_json::to_value(role).unwrap();
+            assert_eq!(json.as_str().unwrap(), expected);
+            let back: FederatedRoomRole = serde_json::from_value(json).unwrap();
+            assert_eq!(back, role);
+        }
+    }
+
+    #[test]
+    fn all_presence_enums_snake_case() {
+        for (presence, expected) in [
+            (MemberPresence::Live, "live"),
+            (MemberPresence::Unavailable, "unavailable"),
+        ] {
+            let json = serde_json::to_value(presence).unwrap();
+            assert_eq!(json.as_str().unwrap(), expected);
+            let back: MemberPresence = serde_json::from_value(json).unwrap();
+            assert_eq!(back, presence);
+        }
+    }
+
+    #[test]
+    fn invite_request_serialization() {
+        let req = CreateInviteRequest {
+            recipient_name: Some("Bob".into()),
+            ttl_minutes: Some(60),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["recipient_name"], "Bob");
+        assert_eq!(json["ttl_minutes"], 60);
+
+        let min = CreateInviteRequest {
+            recipient_name: None,
+            ttl_minutes: None,
+        };
+        let min_json = serde_json::to_value(&min).unwrap();
+        assert!(min_json.get("recipient_name").is_none());
+        assert!(min_json.get("ttl_minutes").is_none());
+    }
+
+    #[test]
+    fn invite_response_roundtrips() {
+        let resp = InviteResponse {
+            code: "abc123".into(),
+            expires_at: "2026-07-17T18:00:00Z".into(),
+            room_key: "warroom".into(),
+            room_name: "War Room".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["code"], "abc123");
+        let roundtrip: InviteResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, resp);
+    }
+
+    #[test]
+    fn redeem_invite_request_serialization() {
+        let req = RedeemInviteRequest {
+            code: "abc123".into(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["code"], "abc123");
     }
 }
