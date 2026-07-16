@@ -3554,3 +3554,103 @@ area:      [backend]: ocean-daemon Phase 2C advisory turn seam
 
 PR #299 merged the reviewed Longhouse turn-preparation extraction as `9095d5a` after hosted run `29475103379` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, corrected the final rustfmt-expanded module size from the pre-format 239-line estimate to the actual 246 lines, and advanced the next bounded wave to separately manifested Longhouse governance. Delegated loader path logs, unsanitized advisory text, uncancelled timed-out work/cache-lock amplification, and the librarian symlink-retarget finding remain separate; live daemon deployment/supervision remains outside this workstream.
 _________________________________________________________________________________
+time:      [05:38am 15-07-26]
+agent:     [api worker], [gpt-5]
+worktree:  main
+type:      [feature-request]: Add daemon-owned fuzzy transcript history search
+area:      [backend]: Agent session history and daemon HTTP API
+
+Added bounded deterministic search over persisted display transcript text for user and assistant entries, with exact/lexical/fuzzy ranking, stable hit identities, recency tie-breaking, Unicode-safe match-centered excerpts, and malformed-file tolerance. Mounted GET /v1/agent/history/search with default/clamped limits and stable success/error JSON, plus focused agent and daemon handler coverage and route/operator documentation.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [07:54am] [15-07-26]
+agent:     [ocean-tui], [gpt-5.4]
+worktree:  [main]
+type:      [feature-request]: add btop-inspired dithering to the context meter
+area:      [design]: terminal color, pixel-density texture, and context occupancy
+
+Researched btop's current source, screenshots, default/TTY theme machinery, and OneDark/Tokyo Night/Nord themes. Adapted its useful meter grammar—not its product chrome—into the session context bar: a subdued empty-capacity bed, per-cell truecolor deep-aqua→cyan→amber→coral ramp, and a `░`/`▒`/`▓` sub-cell frontier with terminal-safe ASCII fallback. Preserved daemon-reported occupancy truthfulness and separate 75%/90% semantic readout thresholds. Updated the owning TUI contract.
+
+Verification:
+- focused context dithering/gradient/threshold test passed
+- `cargo check -p ocean-tui` passed with the existing Markdown dead-code warning
+- `cargo xtask docs-check` passed (26 packages, 112 active Markdown files, 118 local links)
+- `git diff --check` passed for the owning source and contract
+
+Release rebuild/install intentionally deferred until the current TUI tranche is complete.
+_________________________________________________________________________________
+
+## 2026-07-15 — Collapsed tool bursts and concise todo titles
+
+- Added collapsed parent summaries for consecutive TUI tool-call bursts, with truthful running/done/failed counts and nested access to the existing independently expandable per-call drawers.
+- Added optional agent-supplied todo `title` labels bounded to 36 terminal cells while preserving authoritative full `text`; the Files tray prefers the concise title and legacy callers remain compatible.
+- Verification: `cargo test -p ocean-runtime --no-fail-fast` passed; focused and full tool-group/todo-title TUI coverage passed. Full `cargo test -p ocean-tui --no-fail-fast` reached 340 passed / 4 ignored with one unrelated concurrent selection failure at `shell::app::tests::drag_past_a_pane_edge_clamps_the_head_into_the_rect`.
+- worktree: `/Users/smathdaddy-macbook/ocean-os`
+
+## 2026-07-15 — Clamp chat selection to stable transcript rows
+
+- Fixed pane-edge chat drags so positions over composer/chrome saturate to the nearest rendered transcript row instead of mixing stable transcript and screen-relative row coordinates.
+- Updated the pane-edge regression to assert the stable-row contract while preserving pane-bounded columns and sibling-lane isolation.
+- Verification: focused selection regressions passed; full `cargo test -p ocean-tui --no-fail-fast` passed with 341 passed / 4 ignored / 0 failed; `cargo check --workspace`, `cargo xtask docs-check`, and `git diff --check` passed.
+- worktree: `/Users/smathdaddy-macbook/ocean-os`
+
+_________________________________________________________________________________
+time:      [07:10pm] [15-07-26]
+agent:     [ocean-tui], [gpt-5.4]
+worktree:  [main]
+type:      [feature-request]: remove redundant workspace pane titles
+area:      [frontend]: ocean-tui panel chrome
+
+Removed the visible SESSIONS, FILES, SESSION COMPONENT, and TERMINAL labels while retaining the shared panel title row, hairline, inset, footer, focus behavior, selection bounds, and content geometry. Added explicit render coverage that those four labels stay absent, refreshed stale panel/rail contract wording, and preserved editor/graph contextual titles. Verification: all 347 TUI tests completed with 343 passed and 4 ignored, all-target TUI Clippy passed with denied warnings, workspace check passed, docs-check passed, formatting and diff checks passed, and the release TUI build completed. The shared dirty worktree remained unstaged and uncommitted.
+
+_________________________________________________________________________________
+time:      [07:20pm] [15-07-26]
+agent:     [ocean-tui], [gpt-5.4]
+worktree:  [main]
+type:      [bug report]: preserve explicit Files close during Terminal repaint
+area:      [frontend]: ocean-tui session tray visibility
+
+Fixed the Files rail reopening immediately while the Terminal dock was active. Root cause: every PTY repaint dispatched `Action::Render`, and the dispatch tail unconditionally forced Files visible whenever a context/todo tray was already mounted. Auto-reveal now occurs only on the tray's hidden-to-visible transition; the first truthful tray content still reveals Files, while later terminal renders and unrelated actions respect an explicit operator close. Added an exact regression covering a mounted todo tray, active Terminal, Files-button close, and subsequent Render action, while retaining the original initial-auto-reveal test. Verification: all 348 TUI tests completed with 344 passed and 4 ignored; all-target denied-warning Clippy, workspace check, formatting, diff check, and release TUI build passed. Worktree remains unstaged and uncommitted.
+
+_________________________________________________________________________________
+time:      [07:39pm] [15-07-26]
+agent:     [pi], [gpt-5.4]
+worktree:  [main]
+type:      [feature-request]: add hold-Space dictation with live composer meter
+area:      [frontend/backend]: ocean-tui native audio and daemon voice STT
+
+Added generation-safe, macOS-native composer dictation over the existing daemon-owned xAI batch STT seam. Kitty-protocol terminals preserve quick Space taps and activate capture only after a deliberate hold; F2 provides a toggle fallback where release events are unavailable. A bounded 30-second mono capture feeds real RMS levels into a btop-style deep-aqua→cyan→amber→coral prompt-box wave/meter, then sends 16 kHz WAV to `/v1/voice/stt`. The final batch transcript paints into the existing UTF-8 composer cursor word by word without submitting or replacing the draft. Esc/quit/drop, release-before-device-open, stale generation results, and insertion interleave are guarded. The daemon now labels allowlisted WAV requests accurately while preserving Surface WebM compatibility.
+
+Verification at this checkpoint: focused dictation and daemon voice tests passed; the full TUI suite passed with 353 passed / 4 ignored; formatting passed. The shared pre-existing dirty worktree remains unstaged and uncommitted.
+
+_________________________________________________________________________________
+time:      [11:58pm] [15-07-26]
+agent:     [repo-reconciliation], [gpt-5.4]
+worktree:  [integrate/dirty-main-20260715-234403]
+type:      [maintenance]: reconcile mixed dirty checkout onto current upstream
+area:      [repository]: agent, runtime, daemon, TUI, and operator documentation
+
+Preserved the 35-path shared dirty checkout losslessly at recovery commit 5d86ab8, replayed it onto current origin/main c21f45a in an isolated integration worktree, and retained both sides of the sole additive conflict in ocean-daemon main composition (upstream Longhouse preparation extraction plus local bounded history search). Reviewed the combined mounted route/banner/operator-guide contract and advanced its explicit baseline from 75 to 76 for the two independently added routes. Because history, runtime tools, selection, render components, Files visibility, and dictation changes were interleaved inside shared App/chat/daemon/doc files, preserved a compiling semantic checkpoint instead of manufacturing path-split commits. Verification before commit: ocean-agent 160 passed; ocean-runtime 182 passed across targets; ocean-daemon 350 passed; ocean-tui 354 passed and 4 ignored; denied-warning TUI Clippy, format, docs-check, and diff checks passed. Recovery ref remains clean and untouched pending final workspace gate and promotion.
+
+_________________________________________________________________________________
+time:      [02:15am] [16-07-26]
+agent:     [pi], [orchestrator]
+worktree:  [fix/reconciliation-review-20260716]
+type:      [maintenance]: close reconciliation review findings
+area:      [repository]: history search, TUI lifecycle, and active contracts
+
+Closed the fresh review findings on the reconciled runtime/TUI checkpoint before publication. Hold-Space dictation now activates only after the Kitty keyboard protocol push succeeds. Final-round context occupancy clears on a normal turn start, an SSE continuity gap, or adoption of a turn whose start was missed. Persisted history search preflights a 64 MiB cumulative raw-session budget and enforces the same bound during reads so concurrent replacement or growth cannot bypass it; capacity failures return an explicit 503 response. Reconciled active route-count, Tauri prompt-versus-harness, launch-chooser, workspace-binding, and devlog-date documentation.
+
+Verification: focused history, capacity-response, terminal-protocol, context-lifecycle, and router tests passed; `cargo check --workspace`, `cargo build -p ocean-tui --release`, `cargo xtask docs-check`, `cargo xtask ci --compatibility`, the pinned Rust 1.88 MSRV lane, and the final canonical `cargo xtask ci` rerun passed. Two fresh reviewers found no remaining logic or documentation issue after the fixes.
+
+_________________________________________________________________________________
+time:      [02:34am] [16-07-26]
+agent:     [pi], [orchestrator]
+worktree:  [fix/reconciliation-review-20260716]
+type:      [fix]: keep macOS dictation warning-free on Linux
+area:      [frontend]: ocean-tui cross-platform compilation
+
+Hosted PR #301's Ubuntu denied-warning Clippy lane exposed macOS-only dictation producers and audio helpers as dead code on Linux. Kept the portable synthetic meter/WAV tests, marked only the two macOS-produced lifecycle variants as intentionally unconstructed on non-macOS production builds, and target-gated capture-only constants plus helper compilation. Runtime behavior and the macOS capture path are unchanged.
+
+Verification: all 356 TUI tests passed with 4 ignored; denied-warning all-target TUI Clippy, formatting, diff check, docs-check, and the release TUI build passed locally. Hosted PR run `29477165601` then passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny.

@@ -468,6 +468,42 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// `POST /v1/voice/stt` — daemon-owned xAI batch transcription. The TUI
+    /// sends a bounded WAV and never handles provider credentials itself.
+    pub async fn transcribe_voice(&self, wav: Vec<u8>) -> Result<String, String> {
+        let response = self
+            .http
+            .post(format!("{}/v1/voice/stt", self.base))
+            .header(reqwest::header::CONTENT_TYPE, "audio/wav")
+            .body(wav)
+            .send()
+            .await
+            .map_err(|error| format!("dictation could not reach the daemon: {error}"))?;
+        let status = response.status();
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| format!("dictation response was not valid JSON: {error}"))?;
+        if !status.is_success() {
+            return Err(payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("dictation transcription failed")
+                .to_string());
+        }
+        let text = payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            Err("no speech heard — try again".into())
+        } else {
+            Ok(text)
+        }
+    }
+
     /// `GET /v1/lsp?cwd=<workspace>` — language servers relevant to the
     /// workspace + their install/ready state, for the `/lsp` panel.
     pub async fn lsp(&self, cwd: &str) -> Result<LspResponse, String> {

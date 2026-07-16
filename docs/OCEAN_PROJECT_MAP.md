@@ -156,15 +156,15 @@ shared-storage or federation authority into browser state.
 Deployment URLs and process identifiers are operational state and belong in
 the owning repository's current runbook, not this architecture map.
 
-## Known current mismatch
+## Current Tauri boundary
 
-`ocean-surface` emits `client_type = "surface-tauri"` inside its Tauri host, but
-`ocean-agent::surface_flag` does not currently map that string. Those turns use
-the generic fallback prompt instead of a dedicated or GUI profile, while the
-daemon harness seam preserves its existing CLI-compatible hashline/artifact
-bundle. Choosing a first-class Tauri classification is a code-level integration
-decision tracked in [`../ROADMAP.md`](../ROADMAP.md), not a documentation
-convention to paper over.
+`ocean-surface` emits `client_type = "surface-tauri"` inside its Tauri host.
+`ocean-agent::surface_flag` maps that string to `TAURI` and supplies the
+native-shell Leptos/component prompt guidance. The daemon's separate effective
+harness seam still classifies the external tag through its CLI-compatible
+hashline/artifact fallback. Choosing a distinct Tauri harness capability bundle
+remains a code-level cross-repository policy decision tracked in
+[`../ROADMAP.md`](../ROADMAP.md), not a documentation convention.
 
 ## Source anchors
 

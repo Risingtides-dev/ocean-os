@@ -152,7 +152,7 @@ impl Reporter {
                 "--seq".into(),
                 self.seq.to_string(),
             ],
-            Duration::from_millis(300),
+            herdr_release_timeout(),
         );
     }
 
@@ -232,6 +232,19 @@ fn launch(program: OsString, args: Vec<String>) {
                 .stderr(Stdio::null())
                 .status();
         });
+}
+
+#[cfg(not(test))]
+fn herdr_release_timeout() -> Duration {
+    Duration::from_millis(300)
+}
+
+#[cfg(test)]
+fn herdr_release_timeout() -> Duration {
+    // Workspace tests can heavily contend for CPU/process slots. Preserve the
+    // production shutdown cap while giving the fixture enough time to prove
+    // that release waits for its command to finish.
+    Duration::from_secs(3)
 }
 
 /// Deliver lifecycle release before the TUI process exits, but cap the shutdown

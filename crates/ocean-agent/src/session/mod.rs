@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Write;
+use std::io::{Read, Write};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -507,6 +507,330 @@ pub fn detail(config_dir: &Path, id: SessionId) -> anyhow::Result<SessionDetail>
     Ok(session_detail(session))
 }
 
+fn history_search_capacity_error(observed_bytes: u64, max_bytes: u64) -> anyhow::Error {
+    HistorySearchCapacityError {
+        observed_bytes,
+        max_bytes,
+    }
+    .into()
+}
+
+fn enforce_history_search_store_budget(paths: &[PathBuf], max_bytes: u64) -> anyhow::Result<()> {
+    let mut observed_bytes = 0u64;
+    for path in paths {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        observed_bytes = observed_bytes.saturating_add(metadata.len());
+        if observed_bytes > max_bytes {
+            return Err(history_search_capacity_error(observed_bytes, max_bytes));
+        }
+    }
+    Ok(())
+}
+
+fn read_history_file_bounded(
+    path: &Path,
+    observed_bytes: &mut u64,
+    max_bytes: u64,
+) -> anyhow::Result<Option<String>> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let remaining = max_bytes.saturating_sub(*observed_bytes);
+    let mut bytes = Vec::new();
+    if file
+        .take(remaining.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let next_observed = observed_bytes.saturating_add(bytes.len() as u64);
+    if next_observed > max_bytes {
+        return Err(history_search_capacity_error(next_observed, max_bytes));
+    }
+    *observed_bytes = next_observed;
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// Search persisted display transcript text for user and assistant entries only.
+/// Tool results and non-display content blocks are never considered. The store's
+/// cumulative file size is bounded before any raw session is deserialized.
+pub fn search_history(
+    config_dir: &Path,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<HistorySearchHit>> {
+    let root = sessions_dir(config_dir);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(&root)
+        .with_context(|| format!("read {}", root.display()))?
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(children) = std::fs::read_dir(&path) {
+                paths.extend(children.flatten().map(|child| child.path()));
+            }
+        } else {
+            paths.push(path);
+        }
+    }
+    paths.retain(|path| path.extension().and_then(|value| value.to_str()) == Some("json"));
+    paths.sort();
+    enforce_history_search_store_budget(&paths, MAX_HISTORY_SEARCH_STORE_BYTES)?;
+
+    // Preserve the one-id-one-session invariant even if a stale duplicate is
+    // present on disk. Selection mirrors the resumable loader, without mutating
+    // files on this read-only path.
+    let mut sessions: HashMap<SessionId, (PathBuf, Session)> = HashMap::new();
+    let mut observed_bytes = 0u64;
+    for path in paths {
+        let Some(text) =
+            read_history_file_bounded(&path, &mut observed_bytes, MAX_HISTORY_SEARCH_STORE_BYTES)?
+        else {
+            continue;
+        };
+        let Ok(candidate) = serde_json::from_str::<Session>(&text) else {
+            continue;
+        };
+        let replace = sessions
+            .get(&candidate.id)
+            .is_none_or(|(winner_path, winner)| {
+                candidate.updated_ms > winner.updated_ms
+                    || (candidate.updated_ms == winner.updated_ms
+                        && (candidate.messages.len() > winner.messages.len()
+                            || (candidate.messages.len() == winner.messages.len()
+                                && path > *winner_path)))
+            });
+        if replace {
+            sessions.insert(candidate.id, (path, candidate));
+        }
+    }
+
+    let mut hits = Vec::new();
+    for (_, session) in sessions.into_values() {
+        let title = first_user_text(&session.messages);
+        for (message_index, message) in session.messages.iter().enumerate() {
+            let entry = transcript_entry(message);
+            if !matches!(entry.role.as_str(), "user" | "assistant") || entry.text.trim().is_empty()
+            {
+                continue;
+            }
+            let squashed = entry.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let Some((match_kind, score, match_span)) = score_match(query, &squashed) else {
+                continue;
+            };
+            hits.push(HistorySearchHit {
+                hit_id: format!("{}:{message_index}", session.id),
+                session_id: session.id,
+                session_title: title.clone(),
+                role: entry.role,
+                excerpt: bounded_excerpt(&squashed, match_span),
+                timestamp_ms: entry.timestamp_ms,
+                workspace_root: session.workspace_root.clone(),
+                score,
+                match_kind,
+            });
+            // Keep memory proportional to the requested result bound rather
+            // than the number of matching turns in the complete session store.
+            let prune_at = limit.saturating_mul(4).max(limit.saturating_add(1));
+            if hits.len() >= prune_at {
+                hits.sort_by(compare_history_hits);
+                hits.truncate(limit.saturating_mul(2).max(limit));
+            }
+        }
+    }
+
+    hits.sort_by(compare_history_hits);
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn compare_history_hits(a: &HistorySearchHit, b: &HistorySearchHit) -> std::cmp::Ordering {
+    match_rank(b.match_kind)
+        .cmp(&match_rank(a.match_kind))
+        .then_with(|| b.score.total_cmp(&a.score))
+        .then_with(|| {
+            b.timestamp_ms
+                .unwrap_or(0)
+                .cmp(&a.timestamp_ms.unwrap_or(0))
+        })
+        .then_with(|| a.hit_id.cmp(&b.hit_id))
+}
+
+fn match_rank(kind: HistoryMatchKind) -> u8 {
+    match kind {
+        HistoryMatchKind::Exact => 3,
+        HistoryMatchKind::Lexical => 2,
+        HistoryMatchKind::Fuzzy => 1,
+    }
+}
+
+fn normalized_phrase(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchSpan {
+    start: usize,
+    end: usize,
+}
+
+fn lexical_tokens(value: &str) -> Vec<(String, MatchSpan)> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut start = 0usize;
+    let mut end = 0usize;
+    for (index, character) in value.chars().enumerate() {
+        if character.is_alphanumeric() {
+            if token.is_empty() {
+                start = index;
+            }
+            token.extend(character.to_lowercase());
+            end = index + 1;
+        } else if !token.is_empty() {
+            tokens.push((std::mem::take(&mut token), MatchSpan { start, end }));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push((token, MatchSpan { start, end }));
+    }
+    tokens
+}
+
+fn folded_chars(value: &str, alphanumeric_only: bool) -> (Vec<char>, Vec<usize>) {
+    let mut folded = Vec::new();
+    let mut source_positions = Vec::new();
+    for (source_index, character) in value.chars().enumerate() {
+        if alphanumeric_only && !character.is_alphanumeric() {
+            continue;
+        }
+        for lowercase in character.to_lowercase() {
+            folded.push(lowercase);
+            source_positions.push(source_index);
+        }
+    }
+    (folded, source_positions)
+}
+
+fn score_match(query: &str, text: &str) -> Option<(HistoryMatchKind, f64, MatchSpan)> {
+    let normalized_query = normalized_phrase(query);
+    let (needle_phrase, _) = folded_chars(&normalized_query, false);
+    let (haystack_phrase, phrase_positions) = folded_chars(text, false);
+    if !needle_phrase.is_empty() {
+        if let Some(start) = haystack_phrase
+            .windows(needle_phrase.len())
+            .position(|window| window == needle_phrase)
+        {
+            let end = start + needle_phrase.len() - 1;
+            let ratio = needle_phrase.len() as f64 / haystack_phrase.len().max(1) as f64;
+            return Some((
+                HistoryMatchKind::Exact,
+                3.0 + ratio.min(1.0) * 0.5,
+                MatchSpan {
+                    start: phrase_positions[start],
+                    end: phrase_positions[end] + 1,
+                },
+            ));
+        }
+    }
+
+    let query_tokens = lexical_tokens(query);
+    let text_tokens = lexical_tokens(text);
+    let lexical_spans = query_tokens
+        .iter()
+        .map(|(query_token, _)| {
+            text_tokens
+                .iter()
+                .find(|(text_token, _)| text_token == query_token)
+                .map(|(_, span)| *span)
+        })
+        .collect::<Option<Vec<_>>>();
+    if !query_tokens.is_empty() {
+        if let Some(lexical_spans) = lexical_spans {
+            let ratio = query_tokens.len() as f64 / text_tokens.len().max(1) as f64;
+            return Some((
+                HistoryMatchKind::Lexical,
+                2.0 + ratio.min(1.0) * 0.5,
+                MatchSpan {
+                    start: lexical_spans.iter().map(|span| span.start).min().unwrap(),
+                    end: lexical_spans.iter().map(|span| span.end).max().unwrap(),
+                },
+            ));
+        }
+    }
+
+    let (needle, _) = folded_chars(query, true);
+    let (haystack, positions) = folded_chars(text, true);
+    if needle.is_empty() || haystack.is_empty() {
+        return None;
+    }
+    let mut matched = 0usize;
+    let mut start = 0usize;
+    for (index, character) in haystack.iter().enumerate() {
+        if *character == needle[matched] {
+            if matched == 0 {
+                start = index;
+            }
+            matched += 1;
+            if matched == needle.len() {
+                let span = index - start + 1;
+                let compactness = needle.len() as f64 / span as f64;
+                let coverage = needle.len() as f64 / haystack.len() as f64;
+                return Some((
+                    HistoryMatchKind::Fuzzy,
+                    1.0 + compactness * 0.75 + coverage.min(1.0) * 0.24,
+                    MatchSpan {
+                        start: positions[start],
+                        end: positions[index] + 1,
+                    },
+                ));
+            }
+        }
+    }
+    None
+}
+
+const HISTORY_EXCERPT_CHARS: usize = 240;
+
+fn bounded_excerpt(text: &str, match_span: MatchSpan) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= HISTORY_EXCERPT_CHARS {
+        return text.to_string();
+    }
+
+    // Reserve room for both ellipses, then center the window on the match span.
+    // This stays Unicode-safe because every boundary is a character index.
+    let content_chars = HISTORY_EXCERPT_CHARS - 2;
+    let center = match_span.start + (match_span.end.saturating_sub(match_span.start) / 2);
+    let start = center
+        .saturating_sub(content_chars / 2)
+        .min(chars.len() - content_chars);
+    let end = start + content_chars;
+    let mut excerpt = String::new();
+    if start > 0 {
+        excerpt.push('…');
+    }
+    excerpt.extend(chars[start..end].iter());
+    if end < chars.len() {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
 /// List sessions, optionally scoped to a single workspace root.
 /// `workspace_root = None` returns every session across every bucket.
 pub fn list(
@@ -727,5 +1051,156 @@ fn truncate_title(text: &str) -> String {
         squashed
     } else {
         format!("{}…", squashed.chars().take(70).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod history_search_tests {
+    use super::*;
+
+    fn stored_session(messages: Vec<Message>) -> Session {
+        Session {
+            id: SessionId::new_v4(),
+            created_ms: 10,
+            updated_ms: 100,
+            model: "fake".into(),
+            provider: "fake".into(),
+            messages,
+            workspace_root: Some("/tmp/history-workspace".into()),
+            cwd: Some("/tmp/history-workspace".into()),
+            git_branch: None,
+            git_commit: None,
+            client_type: None,
+        }
+    }
+
+    fn assistant_text(text: &str, timestamp: i64) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![Content::text(text)],
+            api: "messages".into(),
+            provider: "fake".into(),
+            model: "fake".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp,
+        })
+    }
+
+    #[test]
+    fn history_search_store_budget_rejects_before_deserialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.json");
+        let second = tmp.path().join("second.json");
+        std::fs::write(&first, "123456").unwrap();
+        std::fs::write(&second, "abcdef").unwrap();
+
+        let error = enforce_history_search_store_budget(&[first, second], 10).unwrap_err();
+        let capacity = error
+            .downcast_ref::<HistorySearchCapacityError>()
+            .expect("typed capacity error");
+        assert_eq!(capacity.observed_bytes, 12);
+        assert_eq!(capacity.max_bytes, 10);
+    }
+
+    #[test]
+    fn history_search_bounded_read_catches_growth_after_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.json");
+        let second = tmp.path().join("second.json");
+        std::fs::write(&first, "1234").unwrap();
+        std::fs::write(&second, "abcd").unwrap();
+        let paths = vec![first, second.clone()];
+        enforce_history_search_store_budget(&paths, 10).unwrap();
+
+        // Simulate an atomic replacement or growth between metadata preflight
+        // and the later open/read pass.
+        std::fs::write(&second, "abcdefgh").unwrap();
+        let mut observed = 0;
+        assert!(read_history_file_bounded(&paths[0], &mut observed, 10)
+            .unwrap()
+            .is_some());
+        let error = read_history_file_bounded(&paths[1], &mut observed, 10).unwrap_err();
+        let capacity = error
+            .downcast_ref::<HistorySearchCapacityError>()
+            .expect("typed capacity error");
+        assert_eq!(capacity.observed_bytes, 11);
+        assert_eq!(capacity.max_bytes, 10);
+    }
+
+    #[test]
+    fn history_search_ranks_display_text_and_excludes_tool_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lexical = Message::user_text("Ocean is calm today; the blue horizon is clear.");
+        if let Message::User { timestamp, .. } = &mut lexical {
+            *timestamp = 150;
+        }
+        let session = stored_session(vec![
+            lexical,
+            assistant_text("The blue ocean deployment is ready.", 200),
+            Message::ToolResult(ocean_protocol::ToolResultMessage {
+                tool_call_id: "secret-call".into(),
+                tool_name: "provider_payload".into(),
+                content: vec![Content::text("blue ocean must never be searched")],
+                is_error: false,
+                timestamp: 300,
+            }),
+        ]);
+        save(tmp.path(), &session).unwrap();
+
+        let hits = search_history(tmp.path(), "blue ocean", 20).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].match_kind, HistoryMatchKind::Exact);
+        assert_eq!(hits[0].role, "assistant");
+        assert_eq!(hits[1].match_kind, HistoryMatchKind::Lexical);
+        assert!(hits
+            .iter()
+            .all(|hit| !hit.excerpt.contains("never be searched")));
+        assert!(hits
+            .iter()
+            .all(|hit| hit.hit_id.starts_with(&session.id.to_string())));
+    }
+
+    #[test]
+    fn history_hit_serializes_null_workspace_for_legacy_sessions() {
+        let hit = HistorySearchHit {
+            hit_id: "session:0".into(),
+            session_id: SessionId::new_v4(),
+            session_title: "Legacy".into(),
+            role: "user".into(),
+            excerpt: "remember this".into(),
+            timestamp_ms: None,
+            workspace_root: None,
+            score: 3.0,
+            match_kind: HistoryMatchKind::Exact,
+        };
+        let value = serde_json::to_value(hit).unwrap();
+        assert!(value.get("workspace_root").is_some());
+        assert!(value["workspace_root"].is_null());
+    }
+
+    #[test]
+    fn history_search_fuzzy_is_deterministic_limited_and_unicode_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long_text = format!(
+            "{} blazing nightly cargo hold {}",
+            "🌊".repeat(300),
+            "🌊".repeat(300)
+        );
+        let session = stored_session(vec![Message::user_text(long_text)]);
+        save(tmp.path(), &session).unwrap();
+        let legacy = sessions_dir(tmp.path()).join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("malformed.json"), "not json").unwrap();
+
+        let first = search_history(tmp.path(), "blnch", 1).unwrap();
+        let second = search_history(tmp.path(), "blnch", 1).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].match_kind, HistoryMatchKind::Fuzzy);
+        assert!(first[0].excerpt.chars().count() <= HISTORY_EXCERPT_CHARS);
+        assert!(first[0].excerpt.contains("blazing nightly cargo h"));
+        assert!(first[0].excerpt.starts_with('…'));
+        assert!(first[0].excerpt.ends_with('…'));
     }
 }

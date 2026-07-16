@@ -1,11 +1,11 @@
-//! App — the workbench frame, mirroring CTRL's `ui()` layout exactly:
+//! App — the terminal workbench frame:
 //!
 //! ```text
 //! ┌ title row ──────────────────────────────────────────────┐
-//! │ SESSIONS │▏│ breadcrumb                       │▏│ FILES │
+//! │ sessions │▏│ breadcrumb                       │▏│ files │
 //! │ (left)   │ │ CENTER: chat / editor / graph    │ │(right)│
 //! │          │ │ ──────────────────────────────── │ │       │
-//! │          │ │ TERMINAL (docked bottom, live)   │ │       │
+//! │          │ │ terminal (docked bottom, live)   │ │       │
 //! └ status row ──────────────────────────────────────────────┘
 //! ```
 //!
@@ -18,13 +18,13 @@
 //! ⌃⌥6 terminal · Tab cycles focus · Esc → back to chat (double-Esc leaves the
 //! terminal dock) · ⌃Q quits (⌃C passes to the PTY).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+    Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnRequest, ThinkingLevel};
 use ocean_core::{PermissionId, PermissionMode, PermissionSettingsResponse, RequestId};
@@ -50,7 +50,7 @@ use super::{
         session_rail::SessionRailComponent,
         session_tray::SessionComponentTray,
     },
-    daemon_boot, errfmt,
+    daemon_boot, dictation, errfmt,
     event::{Event, EventHandler},
     git,
     herdr::Reporter as HerdrReporter,
@@ -69,6 +69,8 @@ const TERM_H: u16 = 14;
 /// How long an ephemeral notice occupies the bottom status row before the
 /// tick path clears it — the idle row returns to its minimal, model-only set.
 const STATUS_TTL: Duration = Duration::from_secs(8);
+/// A quick Space tap remains typing; only a deliberate hold opens the mic.
+const DICTATION_HOLD: Duration = Duration::from_millis(180);
 /// Floor for the dock and the main surface so neither can be squeezed to nothing.
 const MIN_TERM_H: u16 = 3;
 const MIN_CENTER_H: u16 = 5;
@@ -154,6 +156,13 @@ enum Focus {
     Tree,
     Center,
     Term,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SelectionSpace {
+    Screen,
+    Chat,
+    Editor,
 }
 
 /// One row in the `/providers` auth popup: a static descriptor (label, auth-file
@@ -309,6 +318,12 @@ fn unix_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+struct SpaceHold {
+    id: u64,
+    pressed_at: Instant,
+    started: bool,
+}
+
 pub struct App {
     client: DaemonClient,
     workspace_root: String,
@@ -350,6 +365,13 @@ pub struct App {
     should_quit: bool,
     actions_tx: mpsc::UnboundedSender<Action>,
     actions_rx: mpsc::UnboundedReceiver<Action>,
+    /// Hold-Space is enabled only when the terminal reports real key releases.
+    hold_to_dictate: bool,
+    space_hold: Option<SpaceHold>,
+    next_dictation_id: u64,
+    active_dictation_id: Option<u64>,
+    dictation_capture: Option<(u64, dictation::CaptureHandle)>,
+    dictation_task: Option<tokio::task::JoinHandle<()>>,
     /// OCEAN-185: the token minted for the in-flight submit, claimed by the
     /// turn's first permission request (keyed by its request_id).
     pending_submit_token: Option<String>,
@@ -424,20 +446,30 @@ pub struct App {
     image_view: Option<PathBuf>,
     image_body: Rect,
     image_placed: bool,
-    /// Mouse text selection. `sel_press` arms on any left-down that lands in a
-    /// content pane; the first drag promotes it into `selection` — a linear
-    /// (terminal-style) sweep in screen cells, anchor → head, but BOUND to the
-    /// pane (`sel_rect`) where the drag began so a sweep never crosses into a
-    /// sibling lane. Releasing the button auto-copies the swept text.
-    sel_press: Option<(u16, u16)>,
+    /// Mouse text selection. Chat and editor selections use stable content rows;
+    /// other panes use terminal screen rows. `sel_rect` keeps the sweep bounded
+    /// to the pane where it began. Releasing auto-copies the swept text.
+    sel_press: Option<(u16, usize)>,
     sel_rect: Option<Rect>,
-    selection: Option<((u16, u16), (u16, u16))>,
+    selection: Option<((u16, usize), (u16, usize))>,
+    /// Stable content rows encountered while a chat/editor selection is live.
+    selection_rows: BTreeMap<usize, Vec<String>>,
+    selection_space: SelectionSpace,
     /// Cell symbols of the last drawn frame (row-major), captured only while a
     /// selection is live, so release-time copy reads exactly what was shown.
     frame_cells: Vec<Vec<String>>,
+    /// Images captured from the system clipboard and queued for the next turn.
+    pending_images: Vec<ocean_agent_sdk::TurnImage>,
+    /// Submitted images retained only until the daemon accepts or definitely
+    /// rejects the turn, so definitely-unsent failures can restore attachments.
+    in_flight_images: Vec<ocean_agent_sdk::TurnImage>,
     /// Panel visibility (CTRL's collapsible rails + terminal dock).
     show_sessions: bool,
     show_tree: bool,
+    /// Set by an explicit operator close. Session-component lifecycle updates
+    /// may auto-reveal Files only while this latch is clear; explicit reopen
+    /// paths clear it again.
+    tree_auto_reveal_suppressed: bool,
     show_term: bool,
     /// Title-bar buttons: (hit rect, button), rebuilt on every title draw —
     /// mouse-first navigation, restored per operator request.
@@ -526,6 +558,12 @@ impl App {
             should_quit: false,
             actions_tx,
             actions_rx,
+            hold_to_dictate: false,
+            space_hold: None,
+            next_dictation_id: 0,
+            active_dictation_id: None,
+            dictation_capture: None,
+            dictation_task: None,
             pending_submit_token: None,
             decision_tokens: HashMap::new(),
             perm_request: HashMap::new(),
@@ -573,9 +611,14 @@ impl App {
             sel_press: None,
             sel_rect: None,
             selection: None,
+            selection_rows: BTreeMap::new(),
+            selection_space: SelectionSpace::Screen,
             frame_cells: Vec::new(),
+            pending_images: Vec::new(),
+            in_flight_images: Vec::new(),
             show_sessions: false,
             show_tree: false,
+            tree_auto_reveal_suppressed: false,
             show_term: false,
             buttons: Vec::new(),
             esc_armed: false,
@@ -617,6 +660,10 @@ impl App {
         // Inject visual-harness components when OCEAN_TUI_COMPONENT_DEMO is set.
         app.chat.maybe_inject_demo();
         app
+    }
+
+    pub fn set_hold_to_dictate(&mut self, supported: bool) {
+        self.hold_to_dictate = supported;
     }
 
     /// Apply an explicit `--session` selection after normal construction. The
@@ -750,6 +797,15 @@ impl App {
             match event {
                 Event::Render => {}
                 Event::Tick => {
+                    if let Some(id) = self
+                        .space_hold
+                        .as_ref()
+                        .filter(|hold| !hold.started && hold.pressed_at.elapsed() >= DICTATION_HOLD)
+                        .map(|hold| hold.id)
+                    {
+                        self.dispatch(Action::DictationHoldActivated { id });
+                        dirty = true;
+                    }
                     if let Some(a) = self.pty.tick() {
                         self.dispatch(a);
                         dirty = true;
@@ -780,7 +836,10 @@ impl App {
                     // — the SSE task is a self-healing reconnect loop that never
                     // finishes, and gating on it forced 60Hz full redraws (and
                     // ~20% CPU) forever once a session was bound.
-                    if self.chat.is_busy() || self.pty.is_active() {
+                    if self.chat.is_busy()
+                        || self.chat.dictation_is_active()
+                        || self.pty.is_active()
+                    {
                         dirty = true;
                     }
                 }
@@ -832,6 +891,41 @@ impl App {
     }
 
     fn on_crossterm(&mut self, evt: CrosstermEvent) {
+        // REPORT_EVENT_TYPES makes every enhanced-terminal key arrive again on
+        // release. Space release owns the hold gesture; all other releases are
+        // discarded before modal/global handlers can accidentally fire twice.
+        if let CrosstermEvent::Key(key) = &evt {
+            if key.kind == KeyEventKind::Release {
+                if key.code == KeyCode::Char(' ') && self.space_hold.is_some() {
+                    self.dispatch(Action::DictationHoldReleased);
+                }
+                return;
+            }
+        }
+
+        // While the prompt box is a live meter/transcription state, ordinary
+        // input stays locked. Esc cancels; F2 is the explicit toggle fallback.
+        if self.chat.dictation_blocks_input() {
+            if let CrosstermEvent::Key(key) = &evt {
+                if key.kind == KeyEventKind::Press
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('q')
+                {
+                    if let Some(id) = self.active_dictation_id {
+                        self.dispatch(Action::DictationCancel { id });
+                    }
+                    self.should_quit = true;
+                } else if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                    if let Some(id) = self.active_dictation_id {
+                        self.dispatch(Action::DictationCancel { id });
+                    }
+                } else if key.kind == KeyEventKind::Press && key.code == KeyCode::F(2) {
+                    self.dispatch(Action::DictationToggle);
+                }
+            }
+            return;
+        }
+
         // The `/image` viewer is a full-screen takeover: esc/q/enter or a click
         // closes it; other keys are swallowed (no accidental composer input).
         if self.image_view.is_some() {
@@ -1074,12 +1168,17 @@ impl App {
                     self.selection = None;
                     match self.pane_rect_at(pos) {
                         Some(rect) => {
-                            self.sel_press = Some(pos);
+                            self.selection_space = self.selection_space(rect);
+                            self.selection_rows.clear();
+                            self.sel_press =
+                                Some(self.selection_point(pos, rect, self.selection_space));
                             self.sel_rect = Some(rect);
                         }
                         None => {
                             self.sel_press = None;
                             self.sel_rect = None;
+                            self.selection_rows.clear();
+                            self.selection_space = SelectionSpace::Screen;
                         }
                     }
                 }
@@ -1088,7 +1187,10 @@ impl App {
                         if let Some(rect) = self.sel_rect {
                             // Clamp the head INTO the pane so sweeping past a
                             // border saturates at the lane edge.
-                            self.selection = Some((anchor, clamp_pos(pos, rect)));
+                            self.selection = Some((
+                                anchor,
+                                self.selection_point(pos, rect, self.selection_space),
+                            ));
                         }
                         return; // selection owns the drag; panes don't see it
                     }
@@ -1099,7 +1201,19 @@ impl App {
                     self.sel_press = None;
                     self.sel_rect = None;
                     if let (Some((a, b)), Some(rect)) = (sel, rect) {
-                        let text = selection_text(&self.frame_cells, a, b, rect);
+                        let text = if self.selection_space != SelectionSpace::Screen {
+                            let (left, right) = self.selection_columns(rect);
+                            stable_selection_text(&self.selection_rows, a, b, left, right)
+                        } else {
+                            selection_text(
+                                &self.frame_cells,
+                                (a.0, a.1 as u16),
+                                (b.0, b.1 as u16),
+                                rect,
+                            )
+                        };
+                        self.selection_rows.clear();
+                        self.selection_space = SelectionSpace::Screen;
                         // A selection of pure padding copies nothing (and must
                         // not clobber the clipboard). Success is silent.
                         if !text.is_empty() {
@@ -1144,8 +1258,38 @@ impl App {
             return;
         }
         if let CrosstermEvent::Key(k) = evt {
+            let chat_focused = self.focus == Focus::Center && self.center == Center::Chat;
+            if chat_focused
+                && k.kind == KeyEventKind::Press
+                && k.code == KeyCode::F(2)
+                && k.modifiers.is_empty()
+            {
+                self.dispatch(Action::DictationToggle);
+                return;
+            }
+            if self.hold_to_dictate
+                && chat_focused
+                && k.code == KeyCode::Char(' ')
+                && k.modifiers.is_empty()
+            {
+                if self.space_hold.is_some() {
+                    return; // ignore enhanced-protocol repeat while armed/hot
+                }
+                if k.kind == KeyEventKind::Press && self.chat.can_start_dictation() {
+                    self.dispatch(Action::DictationHoldPressed);
+                    return;
+                }
+            }
             if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('q') {
                 self.should_quit = true;
+                return;
+            }
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.code == KeyCode::Char('v')
+                && self.focus == Focus::Center
+                && self.center == Center::Chat
+            {
+                self.capture_clipboard_image();
                 return;
             }
             // Tab cycles focus across the VISIBLE panes (never hides anything).
@@ -1234,6 +1378,17 @@ impl App {
                 self.esc_armed = false;
             }
         }
+        // Finder and terminal drag/drop paste local files as newline-separated
+        // paths. Recognize the payload only when every nonblank line is a
+        // supported existing image; ordinary path-like prose remains composer text.
+        if self.focus == Focus::Center && self.center == Center::Chat {
+            if let CrosstermEvent::Paste(text) = &evt {
+                if let Some(paths) = pasted_image_paths(text) {
+                    self.load_image_paths(paths);
+                    return;
+                }
+            }
+        }
         let action = match self.focus {
             Focus::Sessions => self.rail.handle_event(&evt),
             Focus::Tree => self.tree.handle_event(&evt),
@@ -1305,6 +1460,14 @@ impl App {
         }
     }
 
+    fn set_tree_visible_by_operator(&mut self, visible: bool) {
+        self.show_tree = visible;
+        self.tree_auto_reveal_suppressed = !visible;
+        if !visible && self.focus == Focus::Tree {
+            self.focus_to(Focus::Center);
+        }
+    }
+
     /// A title-bar button press: rails and the terminal TOGGLE visibility;
     /// chat/editor/graph select the center surface. Toggle semantics are the
     /// buttons' contract — `Action::Navigate` (keys, `/` commands) always
@@ -1317,12 +1480,7 @@ impl App {
                     self.focus_to(Focus::Center);
                 }
             }
-            Btn::Tree => {
-                self.show_tree = !self.show_tree;
-                if !self.show_tree && self.focus == Focus::Tree {
-                    self.focus_to(Focus::Center);
-                }
-            }
+            Btn::Tree => self.set_tree_visible_by_operator(!self.show_tree),
             Btn::Term => {
                 if !self.pty.is_active() {
                     self.pty.open(&PathBuf::from(&self.workspace_root), "");
@@ -1360,7 +1518,25 @@ impl App {
         }
     }
 
+    fn load_image_paths(&mut self, paths: Vec<PathBuf>) {
+        let tx = self.actions_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(Action::ClipboardImages(read_image_paths(&paths)));
+        });
+    }
+
+    fn capture_clipboard_image(&mut self) {
+        let tx = self.actions_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(Action::ClipboardImages(
+                read_clipboard_image().map(|image| vec![image]),
+            ));
+        });
+    }
+
     fn dispatch(&mut self, action: Action) {
+        let tray_was_visible = self.tray.is_visible();
+        let mut follow_up = None;
         match &action {
             Action::Quit => {
                 self.herdr.release();
@@ -1378,8 +1554,16 @@ impl App {
             Action::HealthRecovered(source) => self.health.recover(*source),
             // Chat unwinds busy + restores the prompt (see its update arm);
             // the status line carries the humanized error.
-            Action::TurnSendFailed { err, .. } => self.set_notice(errfmt::humanize(err)),
-            Action::TurnOutcomeUnknown { err } => self.set_notice(errfmt::humanize(err)),
+            Action::TurnSendFailed { err, .. } => {
+                self.pending_images.append(&mut self.in_flight_images);
+                self.set_notice(errfmt::humanize(err));
+            }
+            Action::TurnOutcomeUnknown { err } => {
+                // The daemon may have accepted the image turn; never replay an
+                // attachment when the outcome is unknown.
+                self.in_flight_images.clear();
+                self.set_notice(errfmt::humanize(err));
+            }
             Action::SessionBound(id) => self.bind_session(*id),
             // Session hygiene: only fold in agent events for the BOUND session.
             // A superseded stream's last envelopes (or an unscoped daemon echo)
@@ -1389,6 +1573,16 @@ impl App {
                     if bound != evt_sid {
                         return;
                     }
+                }
+                // `/advisor off` is immediate from the operator's perspective.
+                // A review spawned by an earlier turn can finish later; suppress
+                // that stale card before child components paint it.
+                if matches!(
+                    evt.as_ref(),
+                    AgentTurnEvent::Extension { extension, .. } if extension == "advisor"
+                ) && matches!(&self.advisor_ctl, Some(control) if !control.enabled)
+                {
+                    return;
                 }
                 // Failover honesty (OCEAN-275): the daemon announces a reroute
                 // on the stream; paint it in the status line too (the chat
@@ -1403,6 +1597,180 @@ impl App {
                         "{requested} unavailable - running on {effective}"
                     ));
                     self.set_notice(msg);
+                }
+                if matches!(evt.as_ref(), AgentTurnEvent::TurnStarted { .. }) {
+                    self.in_flight_images.clear();
+                }
+            }
+            Action::ClipboardImages(result) => match result {
+                Ok(images) => {
+                    self.pending_images.extend(images.iter().cloned());
+                    self.set_notice(format!(
+                        "image attached · {} queued for next turn",
+                        self.pending_images.len()
+                    ));
+                }
+                Err(error) => self.set_notice(error.clone()),
+            },
+            Action::DictationHoldPressed => {
+                if self.space_hold.is_none()
+                    && self.active_dictation_id.is_none()
+                    && self.chat.can_start_dictation()
+                {
+                    self.next_dictation_id = self.next_dictation_id.wrapping_add(1).max(1);
+                    self.space_hold = Some(SpaceHold {
+                        id: self.next_dictation_id,
+                        pressed_at: Instant::now(),
+                        started: false,
+                    });
+                }
+            }
+            Action::DictationHoldActivated { id } => {
+                if let Some(hold) = self.space_hold.as_mut().filter(|hold| hold.id == *id) {
+                    if !hold.started {
+                        hold.started = true;
+                        follow_up = Some(Action::DictationStart {
+                            id: *id,
+                            toggle: false,
+                        });
+                    }
+                }
+            }
+            Action::DictationHoldReleased => {
+                if let Some(hold) = self.space_hold.take() {
+                    follow_up = Some(if hold.started {
+                        Action::DictationStop { id: hold.id }
+                    } else {
+                        Action::ComposerInsert(" ".into())
+                    });
+                }
+            }
+            Action::DictationToggle => {
+                if let Some(id) = self.active_dictation_id {
+                    follow_up = Some(
+                        if self
+                            .dictation_capture
+                            .as_ref()
+                            .is_some_and(|(capture_id, _)| *capture_id == id)
+                        {
+                            Action::DictationStop { id }
+                        } else {
+                            Action::DictationCancel { id }
+                        },
+                    );
+                } else if self.chat.can_start_dictation() {
+                    self.next_dictation_id = self.next_dictation_id.wrapping_add(1).max(1);
+                    follow_up = Some(Action::DictationStart {
+                        id: self.next_dictation_id,
+                        toggle: true,
+                    });
+                }
+            }
+            Action::DictationStart { id, .. } => {
+                if self.active_dictation_id.is_none() {
+                    self.active_dictation_id = Some(*id);
+                    if let Some(task) = self.dictation_task.take() {
+                        task.abort();
+                    }
+                    match dictation::start(*id, self.actions_tx.clone()) {
+                        Ok(capture) => self.dictation_capture = Some((*id, capture)),
+                        Err(error) => {
+                            follow_up = Some(Action::DictationCaptured {
+                                id: *id,
+                                audio: Err(error),
+                            });
+                        }
+                    }
+                }
+            }
+            Action::DictationStop { id } => {
+                if self.active_dictation_id == Some(*id) {
+                    if let Some((capture_id, capture)) = self.dictation_capture.as_mut() {
+                        if *capture_id == *id {
+                            capture.finish();
+                        }
+                    }
+                }
+            }
+            Action::DictationCaptured { id, audio } => {
+                if self.active_dictation_id == Some(*id) {
+                    if self
+                        .dictation_capture
+                        .as_ref()
+                        .is_some_and(|(capture_id, _)| capture_id == id)
+                    {
+                        self.dictation_capture.take();
+                    }
+                    match audio {
+                        Ok(wav) => {
+                            let client = self.client.clone();
+                            let tx = self.actions_tx.clone();
+                            let wav = wav.clone();
+                            let id = *id;
+                            self.dictation_task = Some(tokio::spawn(async move {
+                                let transcript = client.transcribe_voice(wav).await;
+                                let _ = tx.send(Action::DictationTranscribed { id, transcript });
+                            }));
+                        }
+                        Err(error) => {
+                            self.active_dictation_id = None;
+                            self.set_notice(errfmt::humanize(error));
+                        }
+                    }
+                }
+            }
+            Action::DictationTranscribed { id, transcript } => {
+                if self.active_dictation_id == Some(*id) {
+                    self.dictation_task.take();
+                    match transcript {
+                        Ok(text) => {
+                            let chunks = dictation_text_chunks(text);
+                            if chunks.is_empty() {
+                                self.active_dictation_id = None;
+                                self.set_notice("no speech heard — try again".into());
+                                follow_up = Some(Action::DictationCancel { id: *id });
+                            } else {
+                                let tx = self.actions_tx.clone();
+                                let id = *id;
+                                self.dictation_task = Some(tokio::spawn(async move {
+                                    let last_index = chunks.len() - 1;
+                                    for (index, text) in chunks.into_iter().enumerate() {
+                                        if index > 0 {
+                                            tokio::time::sleep(Duration::from_millis(38)).await;
+                                        }
+                                        let _ = tx.send(Action::DictationTextChunk {
+                                            id,
+                                            text,
+                                            first: index == 0,
+                                            last: index == last_index,
+                                        });
+                                    }
+                                }));
+                            }
+                        }
+                        Err(error) => {
+                            self.active_dictation_id = None;
+                            self.set_notice(errfmt::humanize(error));
+                        }
+                    }
+                }
+            }
+            Action::DictationTextChunk { id, last, .. } => {
+                if self.active_dictation_id == Some(*id) && *last {
+                    self.active_dictation_id = None;
+                    self.dictation_task.take();
+                }
+            }
+            Action::DictationCancel { id } => {
+                if self.active_dictation_id == Some(*id) {
+                    if let Some((_, mut capture)) = self.dictation_capture.take() {
+                        capture.cancel();
+                    }
+                    if let Some(task) = self.dictation_task.take() {
+                        task.abort();
+                    }
+                    self.space_hold = None;
+                    self.active_dictation_id = None;
                 }
             }
             Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
@@ -1457,7 +1825,7 @@ impl App {
                     self.focus_to(Focus::Sessions);
                 }
                 Nav::Files => {
-                    self.show_tree = true;
+                    self.set_tree_visible_by_operator(true);
                     self.focus_to(Focus::Tree);
                 }
                 Nav::Graph => {
@@ -1882,6 +2250,15 @@ impl App {
         if let Some(next) = self.tray.update(&action) {
             self.dispatch(next);
         }
+        // Auto-reveal only on the hidden -> visible transition, and never after
+        // an explicit operator close. Graph/context/todo lifecycle updates can
+        // remount this tray but cannot override that dismissal latch.
+        if !self.tree_auto_reveal_suppressed && !tray_was_visible && self.tray.is_visible() {
+            self.show_tree = true;
+        }
+        if let Some(next) = follow_up {
+            self.dispatch(next);
+        }
     }
 
     fn focus_to(&mut self, focus: Focus) {
@@ -1992,6 +2369,7 @@ impl App {
             }
             2 => {
                 self.launch_open = false;
+                self.set_tree_visible_by_operator(true);
                 self.show_tree = true;
                 self.center = Center::Editor;
                 self.focus_to(Focus::Center);
@@ -2163,7 +2541,7 @@ impl App {
             KeyCode::Right if self.settings_sel == 3 => self.resize_term(2),
             KeyCode::Enter | KeyCode::Char(' ') => match self.settings_sel {
                 0 => self.show_sessions = !self.show_sessions,
-                1 => self.show_tree = !self.show_tree,
+                1 => self.set_tree_visible_by_operator(!self.show_tree),
                 2 => self.show_term = !self.show_term,
                 3 => {} // height adjusts with ←/→
                 4 => self.chat.toggle_tools_expanded(),
@@ -3543,6 +3921,48 @@ impl App {
         .find(|&rect| rect_has(rect, pos))
     }
 
+    fn selection_space(&self, rect: Rect) -> SelectionSpace {
+        if rect != self.r_center {
+            SelectionSpace::Screen
+        } else {
+            match self.center {
+                Center::Chat => SelectionSpace::Chat,
+                Center::Editor if self.editor.has_tabs() => SelectionSpace::Editor,
+                Center::Editor | Center::Graph => SelectionSpace::Screen,
+            }
+        }
+    }
+
+    fn selection_columns(&self, rect: Rect) -> (u16, u16) {
+        if self.selection_space == SelectionSpace::Editor {
+            self.editor
+                .selection_columns()
+                .unwrap_or((rect.x, rect.right().saturating_sub(1)))
+        } else {
+            (rect.x, rect.right().saturating_sub(1))
+        }
+    }
+
+    fn selection_point(&self, pos: (u16, u16), rect: Rect, space: SelectionSpace) -> (u16, usize) {
+        let pos = clamp_pos(pos, rect);
+        let stable_row = match space {
+            SelectionSpace::Chat => self.chat.nearest_transcript_row(pos.1),
+            SelectionSpace::Editor => self.editor.nearest_selection_row(pos.1),
+            SelectionSpace::Screen => None,
+        };
+        let (left, right) = if space == SelectionSpace::Editor {
+            self.editor
+                .selection_columns()
+                .unwrap_or((rect.x, rect.right().saturating_sub(1)))
+        } else {
+            (rect.x, rect.right().saturating_sub(1))
+        };
+        (
+            pos.0.clamp(left, right),
+            stable_row.unwrap_or_else(|| usize::from(pos.1)),
+        )
+    }
+
     fn apply_focus(&mut self) {
         self.rail.focused = self.focus == Focus::Sessions;
         self.tree.focused = self.focus == Focus::Tree;
@@ -3557,6 +3977,8 @@ impl App {
         let client = self.client.clone();
         let tx = self.actions_tx.clone();
         let workspace = self.workspace_root.clone();
+        let images = (!self.pending_images.is_empty()).then(|| self.pending_images.clone());
+        self.pending_images.clear();
         let existing = self.session_id;
         let model_id = self.model_override.clone();
         let thinking = self.thinking_override;
@@ -3617,7 +4039,7 @@ impl App {
                 role: None,
                 thinking_level: thinking,
                 model_id,
-                images: None,
+                images,
                 decision_token: Some(decision_token),
                 client_context: None,
                 advisor,
@@ -3658,6 +4080,8 @@ impl App {
         self.sel_press = None;
         self.sel_rect = None;
         self.selection = None;
+        self.selection_rows.clear();
+        self.selection_space = SelectionSpace::Screen;
         self.dragging_sessions = false;
         self.dragging_tree = false;
         self.dragging_term = false;
@@ -3793,10 +4217,11 @@ impl App {
         self.draw_status(frame, status_row);
 
         // Mouse-selection overlay: reverse-video the swept cells and snapshot
-        // the frame's cell text so releasing the button copies exactly what's
-        // on screen. Drawn over everything — a selection is a selection.
+        // the frame's cell text. Chat/editor rows are additionally retained under
+        // stable content-row ids so scrolling does not discard prior text.
         if let Some((a, b)) = self.selection {
             if let Some(rect) = self.sel_rect {
+                let (stable_left, stable_right) = self.selection_columns(rect);
                 let buf = frame.buffer_mut();
                 let area = buf.area;
                 self.frame_cells = (area.top()..area.bottom())
@@ -3810,17 +4235,52 @@ impl App {
                             .collect()
                     })
                     .collect();
-                // Highlight is bounded to the pane's columns/rows: middle rows
-                // span the rect width (never the whole frame), endpoints clamp
-                // to the rect edges — identical span to `selection_text`.
-                if let Some(sp) = bounded_span(a, b, rect) {
+                if self.selection_space != SelectionSpace::Screen {
+                    for screen_y in rect.y..rect.bottom() {
+                        let stable_y = match self.selection_space {
+                            SelectionSpace::Chat => self.chat.transcript_row_for_screen(screen_y),
+                            SelectionSpace::Editor => {
+                                self.editor.selection_row_for_screen(screen_y)
+                            }
+                            SelectionSpace::Screen => None,
+                        };
+                        if let Some(stable_y) = stable_y {
+                            if let Some(row) = self.frame_cells.get(screen_y as usize) {
+                                self.selection_rows.insert(stable_y, row.clone());
+                            }
+                            if stable_y >= a.1.min(b.1) && stable_y <= a.1.max(b.1) {
+                                let (start, end) = if (a.1, a.0) <= (b.1, b.0) {
+                                    (a, b)
+                                } else {
+                                    (b, a)
+                                };
+                                let x0 = if stable_y == start.1 {
+                                    start.0.max(stable_left)
+                                } else {
+                                    stable_left
+                                };
+                                let x1 = if stable_y == end.1 {
+                                    end.0.min(stable_right)
+                                } else {
+                                    stable_right
+                                };
+                                for x in x0..=x1 {
+                                    if let Some(cell) = buf.cell_mut((x, screen_y)) {
+                                        cell.set_style(
+                                            cell.style().add_modifier(Modifier::REVERSED),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(sp) = bounded_span((a.0, a.1 as u16), (b.0, b.1 as u16), rect) {
                     for y in sp.y0..=sp.y1 {
                         let x0 = if y == sp.y0 { sp.first_x0 } else { sp.left };
                         let x1 = if y == sp.y1 { sp.last_x1 } else { sp.right };
                         for x in x0..=x1 {
                             if let Some(cell) = buf.cell_mut((x, y)) {
-                                let style = cell.style().add_modifier(Modifier::REVERSED);
-                                cell.set_style(style);
+                                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
                             }
                         }
                     }
@@ -4245,6 +4705,194 @@ fn selection_text(cells: &[Vec<String>], a: (u16, u16), b: (u16, u16), rect: Rec
     }
 }
 
+/// Stable-row equivalent of [`selection_text`] for a chat transcript selection
+/// that crossed viewport scrolls. Rows are populated incrementally from frames
+/// the operator actually saw; missing rows are skipped rather than fabricated.
+fn stable_selection_text(
+    rows: &BTreeMap<usize, Vec<String>>,
+    a: (u16, usize),
+    b: (u16, usize),
+    left: u16,
+    right: u16,
+) -> String {
+    let (s, e) = if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut out = Vec::new();
+    for row_index in s.1..=e.1 {
+        let Some(row) = rows.get(&row_index) else {
+            continue;
+        };
+        let x0 = if row_index == s.1 {
+            s.0.max(left)
+        } else {
+            left
+        } as usize;
+        let x_end = if row_index == e.1 {
+            e.0.min(right)
+        } else {
+            right
+        } as usize;
+        if row.is_empty() || x0 >= row.len() || x0 > x_end {
+            out.push(String::new());
+            continue;
+        }
+        let x1 = x_end.min(row.len().saturating_sub(1));
+        out.push(row[x0..=x1].concat().trim_end().to_string());
+    }
+    let text = out.join("\n");
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        text
+    }
+}
+
+fn dictation_text_chunks(text: &str) -> Vec<String> {
+    // STT is provider-controlled text. Preserve whitespace controls only as
+    // word boundaries and drop every other control byte before it can reach a
+    // raw composer Span (ESC/BEL would desynchronize the terminal).
+    let clean: String = text
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_control() {
+                ch.is_whitespace().then_some(' ')
+            } else {
+                Some(ch)
+            }
+        })
+        .collect();
+    let words: Vec<&str> = clean.split_whitespace().collect();
+    let last = words.len().saturating_sub(1);
+    words
+        .into_iter()
+        .enumerate()
+        .map(|(index, word)| {
+            if index == last {
+                word.to_string()
+            } else {
+                format!("{word} ")
+            }
+        })
+        .collect()
+}
+
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGES_PER_PASTE: usize = 8;
+
+fn image_mime(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Parse a Finder/terminal file paste only when the complete nonblank payload is
+/// a bounded list of existing supported image files. This all-or-nothing rule
+/// prevents ordinary prose containing one path from disappearing into attachments.
+fn pasted_image_paths(text: &str) -> Option<Vec<PathBuf>> {
+    let paths: Vec<PathBuf> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let unquoted = line
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .or_else(|| line.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+                .unwrap_or(line);
+            PathBuf::from(unquoted)
+        })
+        .collect();
+    (!paths.is_empty() && paths.len() <= MAX_IMAGES_PER_PASTE)
+        .then_some(paths)
+        .filter(|paths| {
+            paths
+                .iter()
+                .all(|path| path.is_file() && image_mime(path).is_some())
+        })
+}
+
+fn read_image_paths(paths: &[PathBuf]) -> Result<Vec<ocean_agent_sdk::TurnImage>, String> {
+    use base64::Engine;
+
+    paths
+        .iter()
+        .map(|path| {
+            let mime_type =
+                image_mime(path).ok_or_else(|| format!("unsupported image: {}", path.display()))?;
+            let metadata =
+                std::fs::metadata(path).map_err(|e| format!("image {}: {e}", path.display()))?;
+            if metadata.len() == 0 || metadata.len() > MAX_CLIPBOARD_IMAGE_BYTES as u64 {
+                return Err(format!(
+                    "image {} is empty or exceeds 20 MiB",
+                    path.display()
+                ));
+            }
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("image {}: {e}", path.display()))?;
+            Ok(ocean_agent_sdk::TurnImage {
+                mime_type: mime_type.into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            })
+        })
+        .collect()
+}
+
+/// Read an image from the macOS pasteboard without blocking the UI thread.
+/// `osascript` supplies TIFF/PNG bytes; `sips` normalizes TIFF to PNG because all
+/// Ocean vision providers and kitty's viewer understand PNG consistently.
+fn read_clipboard_image() -> Result<ocean_agent_sdk::TurnImage, String> {
+    use base64::Engine;
+    use std::process::Command;
+
+    let dir = std::env::temp_dir().join(format!("ocean-clipboard-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("clipboard image: {e}"))?;
+    let tiff = dir.join("clipboard.tiff");
+    let png = dir.join("clipboard.png");
+    let script = format!(
+        "set imageData to the clipboard as TIFF picture\nset outFile to open for access POSIX file {} with write permission\nset eof outFile to 0\nwrite imageData to outFile\nclose access outFile",
+        applescript_string(&tiff.to_string_lossy())
+    );
+    let capture = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("clipboard image unavailable: {e}"))?;
+    if !capture.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("clipboard does not contain an image".into());
+    }
+    let convert = Command::new("sips")
+        .args(["-s", "format", "png"])
+        .arg(&tiff)
+        .args(["--out"])
+        .arg(&png)
+        .output()
+        .map_err(|e| format!("clipboard image conversion failed: {e}"))?;
+    if !convert.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("clipboard image conversion failed".into());
+    }
+    let bytes = std::fs::read(&png).map_err(|e| format!("clipboard image: {e}"))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err("clipboard image is empty or exceeds 20 MiB".into());
+    }
+    Ok(ocean_agent_sdk::TurnImage {
+        mime_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Put `text` on the system clipboard via `pbcopy` (the workbench is macOS-first
 /// today; Linux would add xclip/wl-copy here). Runs off the UI thread.
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
@@ -4273,6 +4921,165 @@ mod tests {
         rows.iter()
             .map(|r| r.chars().map(|c| c.to_string()).collect())
             .collect()
+    }
+
+    fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> CrosstermEvent {
+        CrosstermEvent::Key(crossterm::event::KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind,
+            state: crossterm::event::KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn dictation_chunks_normalize_controls_and_keep_word_cadence() {
+        assert_eq!(
+            dictation_text_chunks("  hello\nworld\tfrom\u{1b}[2JOcean\u{7}  "),
+            ["hello ", "world ", "from[2JOcean"]
+        );
+        assert!(dictation_text_chunks(" \n\t\u{1b}\u{7} ").is_empty());
+        assert!(dictation_text_chunks("safe\u{1b}[31mtext")
+            .iter()
+            .flat_map(|chunk| chunk.chars())
+            .all(|ch| !ch.is_control()));
+    }
+
+    #[test]
+    fn enhanced_space_tap_inserts_one_space_without_opening_microphone() {
+        let mut app = offline_app();
+        app.set_hold_to_dictate(true);
+        app.on_crossterm(key_with_kind(KeyCode::Char(' '), KeyEventKind::Press));
+        assert!(app.space_hold.is_some());
+        assert_eq!(app.chat.composer_text(), "");
+
+        app.on_crossterm(key_with_kind(KeyCode::Char(' '), KeyEventKind::Release));
+        assert!(app.space_hold.is_none());
+        assert_eq!(app.chat.composer_text(), " ");
+        assert!(app.active_dictation_id.is_none());
+    }
+
+    #[test]
+    fn legacy_terminal_space_stays_immediate_text_input() {
+        let mut app = offline_app();
+        app.set_hold_to_dictate(false);
+        app.on_crossterm(key_with_kind(KeyCode::Char(' '), KeyEventKind::Press));
+        app.on_crossterm(key_with_kind(KeyCode::Char(' '), KeyEventKind::Release));
+        assert_eq!(app.chat.composer_text(), " ");
+        assert!(app.space_hold.is_none());
+    }
+
+    #[test]
+    fn pasted_image_paths_accepts_multiple_existing_images_only() {
+        let dir = std::env::temp_dir().join(format!("ocean-paste-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.jpg");
+        let second = dir.join("second.png");
+        std::fs::write(&first, b"jpeg fixture").unwrap();
+        std::fs::write(&second, b"png fixture").unwrap();
+        let paste = format!("{}\n{}", first.display(), second.display());
+        assert_eq!(pasted_image_paths(&paste), Some(vec![first, second]));
+        assert!(pasted_image_paths("this is ordinary text").is_none());
+        assert!(pasted_image_paths("/missing/image.jpg").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn advisor_off_suppresses_late_in_flight_advisor_event() {
+        let mut app = offline_app();
+        app.advisor_ctl = Some(ocean_agent_sdk::AdvisorControl {
+            enabled: false,
+            model: None,
+        });
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::Extension {
+            extension: "advisor".into(),
+            payload: serde_json::json!({
+                "note": "stale advisor card must not paint",
+                "severity": "warning",
+                "model": "test-advisor"
+            }),
+            scope: None,
+        })));
+        let rendered = render_app_to_string(&mut app, 100, 28);
+        assert!(!rendered.contains("stale advisor card must not paint"));
+    }
+
+    #[test]
+    fn stable_chat_selection_keeps_rows_seen_before_and_after_scroll() {
+        let mut rows = BTreeMap::new();
+        rows.insert(8, grid(&["eight row"])[0].clone());
+        rows.insert(9, grid(&["nine row"])[0].clone());
+        rows.insert(10, grid(&["ten row"])[0].clone());
+        assert_eq!(
+            stable_selection_text(&rows, (2, 8), (5, 10), 0, 8),
+            "ght row\nnine row\nten ro"
+        );
+        assert_eq!(
+            stable_selection_text(&rows, (5, 10), (2, 8), 0, 8),
+            "ght row\nnine row\nten ro",
+            "reverse drag copies the same retained rows"
+        );
+    }
+
+    #[test]
+    fn editor_selection_retains_rows_across_scroll_and_reverses_cleanly() {
+        let mut app = offline_app();
+        let path = PathBuf::from(&app.workspace_root).join("selection.rs");
+        let contents = (0..40)
+            .map(|row| format!("row-{row:02} payload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, contents).expect("write editor selection fixture");
+        app.editor.open(path.clone());
+        app.center = Center::Editor;
+        app.focus_to(Focus::Center);
+        render_app_to_string(&mut app, 80, 20);
+
+        let center = app.r_center;
+        let (left, right) = app
+            .editor
+            .selection_columns()
+            .expect("editor text viewport rendered");
+        let top = center.y + 2;
+        let bottom = center.bottom() - 2;
+        app.on_crossterm(mouse(MouseEventKind::Down(MouseButton::Left), left, top));
+        app.on_crossterm(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            right,
+            bottom,
+        ));
+        render_app_to_string(&mut app, 80, 20);
+
+        // Wheel while the button remains armed. Each painted viewport contributes
+        // its stable document rows, so copy is not limited to the final frame.
+        for _ in 0..4 {
+            app.on_crossterm(mouse(MouseEventKind::ScrollDown, left, bottom));
+            render_app_to_string(&mut app, 80, 20);
+        }
+        app.on_crossterm(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            left + 5,
+            bottom,
+        ));
+        render_app_to_string(&mut app, 80, 20);
+
+        let (anchor, head) = app.selection.expect("editor drag remains live");
+        assert!(app.selection_space == SelectionSpace::Editor);
+        assert!(head.1 > anchor.1, "scroll advances the stable document row");
+        let copied = stable_selection_text(&app.selection_rows, anchor, head, left, right);
+        let reversed = stable_selection_text(&app.selection_rows, head, anchor, left, right);
+        assert_eq!(copied, reversed, "reverse drag copies the same editor span");
+        let lines: Vec<_> = copied.lines().collect();
+        assert_eq!(lines.first(), Some(&"row-00 payload"));
+        let expected_last = format!("row-{:02}", head.1);
+        assert_eq!(lines.last(), Some(&expected_last.as_str()));
+        assert_eq!(lines.len(), head.1 - anchor.1 + 1);
+        assert!(
+            lines.iter().all(|line| !line.starts_with(' ')),
+            "painted line-number gutter is excluded from editor copy"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -4380,11 +5187,25 @@ mod tests {
         let (a, h) = app
             .selection
             .expect("drag promoted the arm to a live selection");
-        assert_eq!(a, anchor, "anchor preserved across the drag");
+        assert_eq!(a.0, anchor.0, "anchor column preserved across the drag");
         assert_eq!(
-            h,
-            (center.right() - 1, center.bottom() - 1),
-            "head saturates at the pane edges, never crossing into a sibling lane"
+            a.1,
+            app.chat
+                .nearest_transcript_row(anchor.1)
+                .expect("rendered chat has transcript rows"),
+            "anchor uses the nearest stable transcript row"
+        );
+        assert_eq!(
+            h.0,
+            center.right() - 1,
+            "head column saturates at pane edge"
+        );
+        assert_eq!(
+            h.1,
+            app.chat
+                .nearest_transcript_row(center.bottom() - 1)
+                .expect("rendered chat has transcript rows"),
+            "head row saturates at the transcript edge, never crossing into a sibling lane"
         );
     }
 
@@ -4530,7 +5351,7 @@ mod tests {
         )));
 
         let screen = render_app_to_string(&mut app, 100, 28);
-        assert!(screen.contains("SESSION COMPONENT"));
+        assert!(!screen.contains("SESSION COMPONENT"));
         assert!(screen.contains("tray task"));
         assert!(app.r_tree.bottom() < app.r_tray.y);
 
@@ -4547,7 +5368,11 @@ mod tests {
             app.r_tree.y,
         ));
         let (_, head) = app.selection.expect("tray drag selects inside tray");
-        assert_eq!(head.1, app.r_tray.y, "selection cannot enter file tree");
+        assert_eq!(
+            head.1,
+            usize::from(app.r_tray.y),
+            "selection cannot enter file tree"
+        );
 
         app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
             session_id: sid,
@@ -4558,6 +5383,106 @@ mod tests {
         assert!(next_screen.contains("tray task"));
         assert_ne!(app.r_tray, Rect::default());
         assert_ne!(app.r_split_tray, Rect::default());
+    }
+
+    #[tokio::test]
+    async fn files_close_survives_terminal_and_graph_tray_updates() {
+        let mut app = offline_app();
+        let sid = AgentSessionId(uuid::Uuid::from_u128(11));
+        let tid = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(12));
+        let cid = ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(13));
+        app.dispatch(Action::SessionBound(sid));
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            session_id: sid,
+            turn_id: tid,
+            model: None,
+        })));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallStarted {
+                session_id: sid,
+                turn_id: tid,
+                call: ocean_agent_sdk::ToolCall {
+                    id: cid.clone(),
+                    name: "todo".into(),
+                    args_json: serde_json::json!({"action": "add", "text": "keep hidden"}),
+                },
+            },
+        )));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallFinished {
+                session_id: sid,
+                turn_id: tid,
+                call_id: cid,
+                result: ocean_agent_sdk::ToolResult {
+                    ok: true,
+                    output: "1 [ ] keep hidden\n".into(),
+                    metadata_json: None,
+                },
+            },
+        )));
+        assert!(app.show_tree, "new tray content initially reveals Files");
+
+        app.dispatch(Action::Navigate(Nav::Terminal));
+        app.press(Btn::Tree);
+        assert!(!app.show_tree, "Files button closes the visible rail");
+        app.dispatch(Action::Render);
+        assert!(
+            !app.show_tree,
+            "terminal repaint must not reopen an explicitly hidden Files rail"
+        );
+
+        app.dispatch(Action::Navigate(Nav::Graph));
+        let clear_id = ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(14));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallStarted {
+                session_id: sid,
+                turn_id: tid,
+                call: ocean_agent_sdk::ToolCall {
+                    id: clear_id.clone(),
+                    name: "todo".into(),
+                    args_json: serde_json::json!({"action": "clear"}),
+                },
+            },
+        )));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallFinished {
+                session_id: sid,
+                turn_id: tid,
+                call_id: clear_id,
+                result: ocean_agent_sdk::ToolResult {
+                    ok: true,
+                    output: "Todo list cleared.".into(),
+                    metadata_json: None,
+                },
+            },
+        )));
+        assert!(!app.tray.is_visible(), "clear unmounts the tray");
+
+        let remount_id = ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(15));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallStarted {
+                session_id: sid,
+                turn_id: tid,
+                call: ocean_agent_sdk::ToolCall {
+                    id: remount_id,
+                    name: "todo".into(),
+                    args_json: serde_json::json!({"action": "add", "text": "graph update"}),
+                },
+            },
+        )));
+        assert!(app.tray.is_visible(), "fresh update remounts the tray");
+        assert!(app.center == Center::Graph);
+        assert!(
+            !app.show_tree,
+            "Graph tray updates must respect the explicit Files dismissal"
+        );
+
+        app.dispatch(Action::Navigate(Nav::Files));
+        assert!(app.show_tree, "explicit Files navigation reopens the rail");
+        assert!(
+            !app.tree_auto_reveal_suppressed,
+            "explicit reopen resets the dismissal latch"
+        );
     }
 
     #[tokio::test]
@@ -5327,6 +6252,21 @@ mod tests {
         app.dispatch(Action::Navigate(Nav::Terminal));
         assert!(app.show_term, "navigate must unhide the dock");
         assert!(app.focus == Focus::Term, "focus lands in the terminal");
+    }
+
+    #[test]
+    fn redundant_workspace_pane_titles_are_not_rendered() {
+        let mut app = offline_app();
+        app.show_sessions = true;
+        app.show_tree = true;
+        app.dispatch(Action::Navigate(Nav::Terminal));
+        let screen = render_app_to_string(&mut app, 120, 32);
+        for title in ["SESSIONS", "FILES", "SESSION COMPONENT", "TERMINAL"] {
+            assert!(
+                !screen.contains(title),
+                "obsolete pane title rendered: {title}"
+            );
+        }
     }
 
     #[test]

@@ -130,9 +130,10 @@ Named folder-as-agent turns use the agent folder selected by
 tool and permission enforcement remains in Ocean OS regardless of profile
 source.
 
-Known mismatch: Ocean Surface's Tauri host currently emits `surface-tauri`,
-which is not mapped by `ocean-agent::surface_flag`; see the project map and
-roadmap.
+Ocean Surface's Tauri host emits `surface-tauri`. `ocean-agent::surface_flag`
+maps that identity to `TAURI` and supplies the native-shell component guidance;
+the daemon's narrower effective harness seam still preserves CLI-compatible
+hashline/artifact gates until a separate cross-repository policy decision.
 
 ## Other daemon domains
 
@@ -145,7 +146,7 @@ The daemon also exposes current route families for:
 - optional call placement/webhooks/demo and daemon-owned voice endpoints;
 - health, readiness, metrics, cancellation, and permission decisions.
 
-The canonical `app_router` currently registers 72 explicit method/path pairs. Executable parity tests keep router registration, discovery output, and the operator-guide quick reference synchronized while preserving Axum fallback behavior and tracing/CORS middleware order. CORS policy and turn metrics are private daemon leaves; composition remains in `main.rs`. The extended route reference is [`OCEAN_RUNTIME_OPERATOR_GUIDE.md`](OCEAN_RUNTIME_OPERATOR_GUIDE.md), and ongoing extraction boundaries live in [`DAEMON_REFACTOR_MISSION.md`](DAEMON_REFACTOR_MISSION.md).
+The canonical `app_router` currently registers 76 explicit method/path pairs. Executable parity tests keep router registration, discovery output, and the operator-guide quick reference synchronized while preserving Axum fallback behavior and tracing/CORS middleware order. CORS policy and turn metrics are private daemon leaves; composition remains in `main.rs`. The extended route reference is [`OCEAN_RUNTIME_OPERATOR_GUIDE.md`](OCEAN_RUNTIME_OPERATOR_GUIDE.md), and ongoing extraction boundaries live in [`DAEMON_REFACTOR_MISSION.md`](DAEMON_REFACTOR_MISSION.md).
 
 ## Clients
 
@@ -173,5 +174,5 @@ Ocean OS does not currently claim:
 - bounded live per-turn MPSC memory;
 - runtime composition of Ocean Agents `_shared`/`_base` profile sources;
 - wired production execution of configured lifecycle hooks;
-- `surface-tauri` profile mapping;
+- a distinct `surface-tauri` effective harness profile beyond its current CLI-compatible gates;
 - shared cloud storage authority (Ocean Bedrock owns that plane).

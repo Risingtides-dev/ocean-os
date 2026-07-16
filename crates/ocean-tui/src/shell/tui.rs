@@ -2,7 +2,7 @@
 //! hook that restores the terminal so a crash never leaves a wedged shell.
 
 use std::{
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     ops::{Deref, DerefMut},
 };
 
@@ -25,19 +25,30 @@ pub type Tui = Terminal<Backend>;
 /// RAII owner for terminal mode. Every return path after `init`—including a
 /// splash/render error—restores raw mode, paste/mouse flags, keyboard protocol,
 /// and the alternate screen.
-pub struct Guard(Tui);
+pub struct Guard {
+    terminal: Tui,
+    key_releases: bool,
+}
+
+impl Guard {
+    /// True when the terminal accepted the Kitty keyboard protocol used to
+    /// report distinct press/repeat/release events.
+    pub fn supports_key_releases(&self) -> bool {
+        self.key_releases
+    }
+}
 
 impl Deref for Guard {
     type Target = Tui;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.terminal
     }
 }
 
 impl DerefMut for Guard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.terminal
     }
 }
 
@@ -45,6 +56,20 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let _ = restore();
     }
+}
+
+fn try_enable_key_releases(writer: &mut impl Write, supported: io::Result<bool>) -> bool {
+    if !matches!(supported, Ok(true)) {
+        return false;
+    }
+    execute!(
+        writer,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )
+    .is_ok()
 }
 
 pub fn init() -> io::Result<Guard> {
@@ -64,16 +89,18 @@ pub fn init() -> io::Result<Guard> {
         return Err(error);
     }
     // Kitty keyboard protocol where supported (iTerm2, Ghostty, kitty, WezTerm):
-    // without it, modifier combos like Ctrl+Opt+1 are ambiguous or dropped.
-    if matches!(supports_keyboard_enhancement(), Ok(true)) {
-        let _ = execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-    }
+    // disambiguation preserves modifier combos; event types make press-and-hold
+    // gestures honest by reporting release separately from key repeat.
+    // Capability detection is not enough: only intercept Space for hold-to-
+    // dictate after the protocol push itself succeeds. A failed push means the
+    // terminal will never send the release event needed to finish the gesture.
+    let key_releases = try_enable_key_releases(&mut stdout, supports_keyboard_enhancement());
     install_panic_hook();
     match Terminal::new(CrosstermBackend::new(stdout)) {
-        Ok(terminal) => Ok(Guard(terminal)),
+        Ok(terminal) => Ok(Guard {
+            terminal,
+            key_releases,
+        }),
         Err(error) => {
             let _ = restore();
             Err(error)
@@ -102,4 +129,35 @@ fn install_panic_hook() {
         let _ = restore();
         hook(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "push failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn key_releases_require_a_successful_protocol_push() {
+        let mut failed = FailingWriter;
+        assert!(!try_enable_key_releases(&mut failed, Ok(true)));
+
+        let mut unsupported = Vec::new();
+        assert!(!try_enable_key_releases(&mut unsupported, Ok(false)));
+        assert!(unsupported.is_empty());
+
+        let mut accepted = Vec::new();
+        assert!(try_enable_key_releases(&mut accepted, Ok(true)));
+        assert!(!accepted.is_empty());
+    }
 }

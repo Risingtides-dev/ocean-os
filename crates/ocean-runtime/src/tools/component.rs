@@ -32,6 +32,7 @@ const VALID_KINDS: &[&str] = &[
     "markdown",
     "dashboard",
     "chart",
+    "interactive_plot",
     "timeline",
     "stat",
     "file_tree",
@@ -72,6 +73,7 @@ impl AgentTool for ComponentRenderTool {
          • Task/status board → 'kanban'. Collecting input → 'form' (then component_wait).\n\
          • A running task → 'progress'. A multi-step plan → 'timeline'.\n\
          • KPIs / metrics (views, plays, saves) → 'stat'. Numeric series to visualize → 'chart'.\n\
+         • A graph users should explore by changing numeric parameters → 'interactive_plot'.\n\
          • Project structure / file list → 'file_tree'. Showing code edits → 'diff'.\n\
          • A code snippet to copy → 'code'. An important note/warning → 'callout'.\n\
          • Images / screenshots / generated art → 'gallery'. A yes/no before something \
@@ -90,6 +92,7 @@ impl AgentTool for ComponentRenderTool {
          • markdown — { content: \"## md\" }. Rich prose; supports tables, bold, lists.\n\
          • dashboard — { children: [{ id, width, kind?, props? }] }. Grid; width is fr units; inline kind+props renders that component in the cell.\n\
          • chart — { title?, type: \"bar\"|\"line\", series: [{label, value}] }. value is numeric. Display only.\n\
+         • interactive_plot — { title?, description?, parameters: [{id,label?,min,max,step?,value,unit?}], plot: {x:{id?,label?,min,max,samples?}, y_label?, series:[{label,expression}]}, metrics?:[{label,expression,unit?,precision?}] }. Parameter/x ids are lowercase ASCII. Bounded to 12 parameters, 6 series, 12 metrics, 512 samples, and 512 expression characters; controls recompute locally and emit parameters_changed on commit.\n\
          • timeline — { steps: [{label, status: \"done\"|\"active\"|\"pending\"|\"error\", detail?}] }. Re-render with replace:true to advance.\n\
          • stat — { stats: [{label, value, delta?, trend: \"up\"|\"down\"|\"flat\"}] }. value is string or number.\n\
          • file_tree — { root?, entries: [{name, type: \"file\"|\"dir\", path?, children?}] }. Dirs nest via children. Files emit file_clicked { path }.\n\
@@ -121,7 +124,7 @@ impl AgentTool for ComponentRenderTool {
                     "type": "string",
                     "enum": [
                         "kanban", "form", "table", "progress", "markdown", "dashboard",
-                        "chart", "timeline", "stat", "file_tree", "diff", "code",
+                        "chart", "interactive_plot", "timeline", "stat", "file_tree", "diff", "code",
                         "callout", "gallery", "confirm", "map", "video"
                     ],
                     "description": "Component type. Defines the shape of `props`."
@@ -134,6 +137,7 @@ impl AgentTool for ComponentRenderTool {
                         progress: {label, value, max, indeterminate?}. markdown: {content}. \
                         dashboard: {children:[{id,width,kind?,props?}]}. \
                         chart: {title?, type:'bar'|'line', series:[{label,value}]}. \
+                        interactive_plot: {title?,description?,parameters:[{id,label?,min,max,step?,value,unit?}],plot:{x:{id?,label?,min,max,samples?},y_label?,series:[{label,expression}]},metrics?:[{label,expression,unit?,precision?}]}; ids lowercase ASCII; max 12 parameters/6 series/12 metrics/512 samples/512 expression chars. \
                         timeline: {steps:[{label,status,detail?}]}. stat: {stats:[{label,value,delta?,trend?}]}. \
                         file_tree: {root?, entries:[{name,type,path?,children?}]}. \
                         diff: {filename?, lines:[{kind,text}]} or {filename?, unified:str}. \

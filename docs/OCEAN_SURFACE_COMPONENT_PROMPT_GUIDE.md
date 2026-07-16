@@ -1,8 +1,8 @@
 # Ocean Surface Component Prompt Guide
 
-This is the short, agent-facing guidance that Ocean should inject when the current client is `surface-web`.
+This is the short, agent-facing guidance that Ocean should inject when the current client is `surface-web` or `surface-tauri`.
 
-Ocean Surface renders live Leptos components from agent-emitted `component_render` events. Use these components as real UI, not decoration.
+Ocean Surface renders live Leptos components from agent-emitted `component_render` events. The browser PWA and Tauri desktop shell host the same canonical Leptos/WASM bundle, so both support these components as real UI, not decoration.
 
 Do not inject this guide for `surface-gpui`, `surface-native`, `tui`, `cli`, or voice clients. Those surfaces do not render Leptos components inside chat; they need native/terminal/plain-language responses unless they explicitly advertise matching component capabilities.
 
@@ -58,6 +58,43 @@ Use for visible plans or staged workflows.
 ```
 
 Statuses: `done`, `active`, `pending`, `error`.
+
+### `interactive_plot` — locally explorable numeric relationships
+
+Use when users should change bounded numeric parameters and immediately see the
+resulting curve or derived metrics. Use `chart` instead for display-only data.
+The Surface evaluates the declared math locally; do not use this component to
+execute tools or external actions.
+
+```json
+{
+  "id": "decay-lab",
+  "kind": "interactive_plot",
+  "props": {
+    "title": "Exponential decay",
+    "parameters": [
+      { "id": "rate", "label": "Decay rate", "min": 0.1, "max": 3,
+        "step": 0.1, "value": 1, "unit": "s⁻¹" }
+    ],
+    "plot": {
+      "x": { "id": "t", "label": "Time", "min": 0, "max": 10, "samples": 160 },
+      "y_label": "Amplitude",
+      "series": [{ "label": "x(t)", "expression": "exp(-rate*t)" }]
+    },
+    "metrics": [
+      { "label": "Half-life", "expression": "ln(2)/rate", "unit": " s", "precision": 2 }
+    ]
+  }
+}
+```
+
+Expressions may use numeric literals, lowercase ASCII parameter/x identifiers,
+`pi`, `e`, `+ - * / ^`, parentheses, and `sin`, `cos`, `tan`, `exp`,
+`ln`/`log`, `sqrt`, `abs`, `min`, and `max`. Limits: 12 parameters, 6 series,
+12 metrics, 512 samples, and 512 characters per expression. A committed control change emits
+`parameters_changed` with the complete parameter map and the changed id/value.
+Use `component_wait` only when the running turn truly needs that committed
+choice; local preview does not require an agent round trip.
 
 ### `table` — structured data
 
@@ -248,7 +285,7 @@ callout(context) → confirm → component_wait → act on result
 ### Data-heavy answer
 
 ```text
-table/stat/chart/map first → concise text interpretation second
+table/stat/chart/interactive_plot/map first → concise text interpretation second
 ```
 
 ## Do not

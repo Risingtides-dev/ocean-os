@@ -19,7 +19,7 @@ use crate::shell::{
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent, AgentTurnId, ContextUsage, ToolCallId};
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
     Frame,
@@ -30,13 +30,20 @@ const MAX_PANEL_H: u16 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TodoItem {
+    title: Option<String>,
     text: String,
     done: bool,
 }
 
+impl TodoItem {
+    fn display_text(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TodoCommand {
-    Add(String),
+    Add { title: Option<String>, text: String },
     Complete(usize),
     List,
     Clear,
@@ -45,7 +52,15 @@ enum TodoCommand {
 impl TodoCommand {
     fn from_args(args: &serde_json::Value) -> Option<Self> {
         match args.get("action")?.as_str()? {
-            "add" => Some(Self::Add(args.get("text")?.as_str()?.to_string())),
+            "add" => Some(Self::Add {
+                title: args
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_string),
+                text: args.get("text")?.as_str()?.to_string(),
+            }),
             "complete" => Some(Self::Complete(
                 usize::try_from(args.get("index")?.as_u64()?).ok()?,
             )),
@@ -89,7 +104,11 @@ impl TodoProjection {
             return true;
         }
         match command {
-            TodoCommand::Add(text) => self.items.push(TodoItem { text, done: false }),
+            TodoCommand::Add { title, text } => self.items.push(TodoItem {
+                title,
+                text,
+                done: false,
+            }),
             TodoCommand::Complete(index) => {
                 let Some(item) = index.checked_sub(1).and_then(|i| self.items.get_mut(i)) else {
                     self.uncertain = true;
@@ -171,10 +190,10 @@ impl SessionComponentTray {
         self.todo.uncertain = false;
         self.observed_calls.clear();
         self.continuity_uncertain = false;
-        // Keep the last completed measurement visible while the next turn runs.
-        // It is timestamped and explicitly final-round provenance, so it cannot be
-        // mistaken for a live estimate; replacing it only on a finished event also
-        // avoids a distracting panel collapse/reopen cycle.
+        // Context occupancy belongs only to the last finished turn. Once a new
+        // turn starts, the previous final-round measurement is stale until the
+        // daemon reports the new turn's final request.
+        self.context_usage = None;
     }
 
     fn apply_event(&mut self, event: &AgentTurnEvent) {
@@ -200,6 +219,7 @@ impl SessionComponentTray {
                     self.todo.uncertain = true;
                     self.observed_calls.clear();
                     self.continuity_uncertain = true;
+                    self.context_usage = None;
                 }
                 if self.continuity_uncertain {
                     self.todo.uncertain = true;
@@ -224,6 +244,7 @@ impl SessionComponentTray {
                     self.observed_calls.clear();
                     self.continuity_uncertain = true;
                     self.todo.uncertain = true;
+                    self.context_usage = None;
                 } else {
                     match self.observed_calls.remove(&call_id.0) {
                         Some(true) => {
@@ -273,6 +294,7 @@ impl Component for SessionComponentTray {
                 self.continuity_uncertain = true;
                 self.observed_calls.clear();
                 self.todo.invalidate();
+                self.context_usage = None;
             }
             Action::AgentEvent(event) => self.apply_event(event),
             _ => {}
@@ -281,7 +303,7 @@ impl Component for SessionComponentTray {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let body = panel::draw(frame, area, "SESSION COMPONENT", None, false);
+        let body = panel::draw(frame, area, "", None, false);
         if body.width == 0 || body.height == 0 {
             return;
         }
@@ -303,18 +325,18 @@ impl Component for SessionComponentTray {
                     .fg(theme::BLUE)
                     .add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::from(Span::styled(
-                fit_cells(
-                    &format!(
-                        " {}  {}/{}",
-                        context_bar(pct, 10),
-                        compact_tokens(usage.used_tokens),
-                        compact_tokens(usage.context_window)
-                    ),
-                    body.width as usize,
+            let meter_width = context_meter_width(body.width as usize);
+            let mut meter = vec![Span::raw(" ")];
+            meter.extend(context_meter(pct, meter_width));
+            meter.push(Span::styled(
+                format!(
+                    "  {}/{}",
+                    compact_tokens(usage.used_tokens),
+                    compact_tokens(usage.context_window)
                 ),
                 Style::default().fg(context_color(pct)),
-            )));
+            ));
+            lines.push(Line::from(meter));
             lines.push(Line::from(Span::styled(
                 fit_cells(&format!(" {pct}% · provider measured"), body.width as usize),
                 Style::default().fg(theme::COMMENT),
@@ -345,7 +367,7 @@ impl Component for SessionComponentTray {
         }
         for item in self.todo.items.iter().take(item_rows) {
             let mark = if item.done { g("✓", "x") } else { "·" };
-            let text = format!(" {mark} {}", item.text);
+            let text = format!(" {mark} {}", item.display_text());
             let fg = if item.done { theme::COMMENT } else { theme::FG };
             lines.push(Line::from(Span::styled(
                 fit_cells(&text, body.width as usize),
@@ -373,12 +395,73 @@ impl Component for SessionComponentTray {
     }
 }
 
-fn context_bar(pct: u64, width: usize) -> String {
-    let filled = ((pct.min(100) as usize) * width).div_ceil(100);
-    format!(
-        "{}{}",
-        "█".repeat(filled),
-        "░".repeat(width.saturating_sub(filled))
+const CONTEXT_METER_MAX_W: usize = 10;
+const CONTEXT_METER_MIN_W: usize = 3;
+const CONTEXT_METER_BG: Color = Color::Rgb(0x34, 0x3a, 0x42);
+
+fn context_meter_width(body_width: usize) -> usize {
+    // Keep room for the leading cell and a compact `  128k/200k` readout.
+    body_width
+        .saturating_sub(13)
+        .clamp(CONTEXT_METER_MIN_W, CONTEXT_METER_MAX_W)
+}
+
+/// Btop-inspired cell meter: each occupied column gets its own position-derived
+/// truecolor, while the frontier uses density glyphs as sub-cell dithering.
+/// Empty capacity remains a quiet, separately colored `░` bed.
+fn context_meter(pct: u64, width: usize) -> Vec<Span<'static>> {
+    let pct = pct.min(100);
+    let scaled = pct as usize * width;
+    let whole = scaled / 100;
+    let remainder = scaled % 100;
+
+    (0..width)
+        .map(|column| {
+            if column < whole {
+                Span::styled(
+                    g("█", "#"),
+                    Style::default().fg(context_gradient(column, width)),
+                )
+            } else if column == whole && remainder > 0 && column < width {
+                let glyph = if remainder < 34 {
+                    g("░", ".")
+                } else if remainder < 67 {
+                    g("▒", ":")
+                } else {
+                    g("▓", "=")
+                };
+                Span::styled(glyph, Style::default().fg(context_gradient(column, width)))
+            } else {
+                Span::styled(g("░", "."), Style::default().fg(CONTEXT_METER_BG))
+            }
+        })
+        .collect()
+}
+
+fn context_gradient(column: usize, width: usize) -> Color {
+    let pct = if width <= 1 {
+        100.0
+    } else {
+        column as f32 * 100.0 / (width - 1) as f32
+    };
+    // Ocean's capacity ramp, following btop's three-stop meter grammar without
+    // importing its theme: deep aqua → cyan for headroom, then restrained amber
+    // and coral only at the right-hand pressure edge.
+    if pct <= 70.0 {
+        mix_rgb((0x00, 0x5f, 0xaf), (0x00, 0xd7, 0xd7), pct / 70.0)
+    } else if pct <= 86.0 {
+        mix_rgb((0x00, 0xd7, 0xd7), (0xff, 0xb2, 0x24), (pct - 70.0) / 16.0)
+    } else {
+        mix_rgb((0xff, 0xb2, 0x24), (0xff, 0x4d, 0x67), (pct - 86.0) / 14.0)
+    }
+}
+
+fn mix_rgb(start: (u8, u8, u8), end: (u8, u8, u8), t: f32) -> Color {
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color::Rgb(
+        mix(start.0, end.0),
+        mix(start.1, end.1),
+        mix(start.2, end.2),
     )
 }
 
@@ -530,6 +613,10 @@ mod tests {
         assert!(screen.contains("75% · provider measured"));
 
         tray.update(&begin(sid, turn(3)));
+        assert!(
+            !tray.is_visible(),
+            "a new turn clears the previous final-round measurement"
+        );
         tray.update(&turn_finished(
             sid,
             turn(3),
@@ -543,9 +630,23 @@ mod tests {
     }
 
     #[test]
-    fn context_helpers_clamp_and_use_semantic_thresholds() {
-        assert_eq!(context_bar(0, 5), "░░░░░");
-        assert_eq!(context_bar(101, 5), "█████");
+    fn context_helpers_dither_clamp_and_use_semantic_thresholds() {
+        let empty = context_meter(0, 5);
+        assert_eq!(Line::from(empty.clone()).to_string(), "░░░░░");
+        assert!(empty
+            .iter()
+            .all(|span| span.style.fg == Some(CONTEXT_METER_BG)));
+
+        let partial = context_meter(51, 5);
+        assert_eq!(Line::from(partial).to_string(), "██▒░░");
+        let full = context_meter(101, 5);
+        assert_eq!(Line::from(full.clone()).to_string(), "█████");
+        assert_eq!(full.first().unwrap().style.fg, Some(theme::DEEPBLUE));
+        assert_eq!(full.last().unwrap().style.fg, Some(theme::RED));
+        assert_eq!(context_gradient(7, 11), theme::CYAN);
+
+        assert_eq!(context_meter_width(12), 3);
+        assert_eq!(context_meter_width(80), 10);
         assert_eq!(compact_tokens(999), "999");
         assert_eq!(compact_tokens(128_000), "128k");
         assert_eq!(context_color(74), theme::CYAN);
@@ -574,10 +675,44 @@ mod tests {
         assert_eq!(
             tray.todo.items,
             vec![TodoItem {
+                title: None,
                 text: "ship it".into(),
                 done: false,
             }]
         );
+    }
+
+    #[test]
+    fn todo_title_is_display_only_and_full_text_remains_projected() {
+        let mut tray = SessionComponentTray::new();
+        let sid = session(1);
+        let tid = turn(2);
+        let cid = call(3);
+        tray.update(&Action::SessionBound(sid));
+        tray.update(&begin(sid, tid));
+        tray.update(&started(
+            sid,
+            tid,
+            cid.clone(),
+            json!({
+                "action": "add",
+                "title": "Group tool drawers",
+                "text": "Group consecutive chat tool drawers under one collapsed parent"
+            }),
+        ));
+        tray.update(&finished(sid, tid, cid, true));
+
+        assert_eq!(
+            tray.todo.items,
+            vec![TodoItem {
+                title: Some("Group tool drawers".into()),
+                text: "Group consecutive chat tool drawers under one collapsed parent".into(),
+                done: false,
+            }]
+        );
+        let screen = render(&mut tray);
+        assert!(screen.contains("Group tool drawers"), "{screen}");
+        assert!(!screen.contains("Group consecutive chat"), "{screen}");
     }
 
     #[test]
@@ -618,6 +753,7 @@ mod tests {
         assert_eq!(
             tray.todo.items,
             vec![TodoItem {
+                title: None,
                 text: "old".into(),
                 done: false,
             }],
@@ -707,12 +843,67 @@ mod tests {
             json!({"action": "add", "text": "stale"}),
         ));
         tray.update(&finished(sid, tid, call(3), true));
+        tray.update(&turn_finished(
+            sid,
+            tid,
+            Some(ContextUsage {
+                used_tokens: 10,
+                context_window: 100,
+                source: "provider_reported_final_round".into(),
+                measured_at_ms: 123,
+            }),
+            AgentTurnStatus::Completed,
+        ));
+        assert!(tray.context_usage.is_some());
+
         tray.update(&Action::AgentStreamGap(sid));
         assert!(tray.todo.items.is_empty());
         assert!(tray.todo.uncertain);
+        assert!(
+            tray.context_usage.is_none(),
+            "a continuity gap invalidates final-round context provenance"
+        );
 
         tray.update(&begin(sid, turn(4)));
         assert!(!tray.is_visible());
+    }
+
+    #[test]
+    fn adopting_a_turn_after_a_missing_start_clears_prior_context() {
+        let mut tray = SessionComponentTray::new();
+        let sid = session(1);
+        let first = turn(2);
+        tray.update(&Action::SessionBound(sid));
+        tray.update(&begin(sid, first));
+        tray.update(&turn_finished(
+            sid,
+            first,
+            Some(ContextUsage {
+                used_tokens: 10,
+                context_window: 100,
+                source: "provider_reported_final_round".into(),
+                measured_at_ms: 123,
+            }),
+            AgentTurnStatus::Completed,
+        ));
+        assert!(tray.context_usage.is_some());
+
+        tray.update(&started(
+            sid,
+            turn(3),
+            call(4),
+            json!({"action": "add", "text": "partial"}),
+        ));
+        assert!(tray.context_usage.is_none());
+
+        tray.context_usage = Some(ContextUsage {
+            used_tokens: 20,
+            context_window: 100,
+            source: "provider_reported_final_round".into(),
+            measured_at_ms: 456,
+        });
+        tray.update(&finished(sid, turn(5), call(6), true));
+        assert!(tray.context_usage.is_none());
     }
 
     #[test]
@@ -772,6 +963,7 @@ mod tests {
         let mut tray = SessionComponentTray::new();
         tray.todo.items = (0..12)
             .map(|i| TodoItem {
+                title: None,
                 text: format!("item {i}"),
                 done: false,
             })

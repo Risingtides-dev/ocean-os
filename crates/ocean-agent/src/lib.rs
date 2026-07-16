@@ -68,6 +68,60 @@ pub const DEFAULT_LIST_LIMIT: usize = 100;
 /// load + serialize. Mirrors `ocean_store::MAX_LIST_LIMIT`.
 pub const MAX_LIST_LIMIT: usize = 1000;
 
+/// Default and maximum result counts for transcript history search.
+pub const DEFAULT_HISTORY_SEARCH_LIMIT: usize = 20;
+pub const MAX_HISTORY_SEARCH_LIMIT: usize = 50;
+/// Bound request work before any transcript files are opened.
+pub const MAX_HISTORY_SEARCH_QUERY_CHARS: usize = 512;
+/// Maximum cumulative size of persisted session files searched by one request.
+pub const MAX_HISTORY_SEARCH_STORE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Search-capacity error returned before raw session files are deserialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistorySearchCapacityError {
+    pub observed_bytes: u64,
+    pub max_bytes: u64,
+}
+
+impl std::fmt::Display for HistorySearchCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transcript history store is {} bytes; search budget is {} bytes",
+            self.observed_bytes, self.max_bytes
+        )
+    }
+}
+
+impl std::error::Error for HistorySearchCapacityError {}
+
+/// Classification of a deterministic transcript-text match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryMatchKind {
+    Exact,
+    Lexical,
+    Fuzzy,
+}
+
+/// One display-transcript match returned by daemon-owned history search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistorySearchHit {
+    pub hit_id: String,
+    pub session_id: SessionId,
+    pub session_title: String,
+    pub role: String,
+    pub excerpt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    /// Always serialized (`null` for unbound legacy sessions) so Recall clients
+    /// receive one stable hit shape.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    pub score: f64,
+    pub match_kind: HistoryMatchKind,
+}
+
 /// Clamp a caller-supplied collection-list limit into the allowed range. `None`
 /// ⇒ [`DEFAULT_LIST_LIMIT`]; any value is capped at [`MAX_LIST_LIMIT`] and
 /// floored at 1 so `0` can never request an empty-yet-`has_more` page.
@@ -998,6 +1052,27 @@ impl AgentRuntime {
         workspace_root: Option<&str>,
     ) -> anyhow::Result<Vec<SessionSummary>> {
         session::list(&self.config_dir, workspace_root)
+    }
+
+    /// Search persisted display transcript text without provider or embedding calls.
+    pub fn search_history(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<HistorySearchHit>> {
+        let query = query.trim();
+        anyhow::ensure!(!query.is_empty(), "history search query cannot be empty");
+        anyhow::ensure!(
+            query.chars().count() <= MAX_HISTORY_SEARCH_QUERY_CHARS,
+            "history search query exceeds {MAX_HISTORY_SEARCH_QUERY_CHARS} characters",
+        );
+        session::search_history(
+            &self.config_dir,
+            query,
+            limit
+                .unwrap_or(DEFAULT_HISTORY_SEARCH_LIMIT)
+                .clamp(1, MAX_HISTORY_SEARCH_LIMIT),
+        )
     }
 
     /// One bounded page of sessions (OCEAN-250), optionally scoped to a workspace.
