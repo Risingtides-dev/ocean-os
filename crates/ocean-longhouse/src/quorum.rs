@@ -33,8 +33,8 @@ use ocean_agent_sdk::{AbortReason, ProposalTally};
 use uuid::Uuid;
 
 use crate::evidence::{
-    evaluate_field, ConvergenceBasis, EvidenceContribution, EvidenceSnapshot, ReviewerCredential,
-    SequentialEvidenceConfig,
+    evaluate_field, evaluate_field_full, ConvergenceBasis, EvidenceContribution, EvidenceSnapshot,
+    FieldEvaluation, GroupHeadroom, GroupId, ReviewerCredential, SequentialEvidenceConfig,
 };
 
 /// How the engine decides a proposal has crossed quorum.
@@ -84,7 +84,7 @@ impl Default for QuorumConfig {
 
 /// A single endorse/inhibit signal toward a proposal, as the engine stores it.
 /// Proposals themselves don't decay (ttl 0 in the design); only stances do.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Stance {
     /// +1.0 base for endorse, -1.0 base for inhibit, scaled by the mark weight.
     signed_weight: f32,
@@ -100,6 +100,40 @@ impl Stance {
         let dt = (now_ms - self.at_ms).max(0) as f32;
         let decay = 2f32.powf(-dt / ttl_ms as f32);
         self.signed_weight * decay
+    }
+}
+
+/// One verbatim engine stance captured into an immutable decay trajectory.
+///
+/// Keeping the original [`Stance`] is load-bearing: projections must call the
+/// same `f32` [`Stance::effective`] function as the live engine and only then
+/// perform the existing per-contribution `as f64` cast.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecayStance {
+    proposal: Uuid,
+    author: Uuid,
+    stance: Stance,
+}
+
+impl DecayStance {
+    /// Proposal this captured stance targets.
+    pub fn proposal(&self) -> Uuid {
+        self.proposal
+    }
+
+    /// Credential that owns the captured stance.
+    pub fn author(&self) -> Uuid {
+        self.author
+    }
+
+    /// Original, undecayed signed weight stored by the engine.
+    pub fn signed_weight(&self) -> f32 {
+        self.stance.signed_weight
+    }
+
+    /// Original engine timestamp for the captured stance.
+    pub fn at_ms(&self) -> i64 {
+        self.stance.at_ms
     }
 }
 
@@ -143,6 +177,176 @@ pub enum QuorumOutcome {
         /// The auditable stopping condition that latched this decision.
         basis: ConvergenceBasis,
     },
+}
+
+/// The continuous-time instant when one saturated correlation group falls back
+/// to its configured evidence cap under the shared stance TTL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupCapTransition {
+    /// Owned correlation identity whose raw evidence mass crosses the cap.
+    pub group: GroupId,
+    /// Absolute timestamp in milliseconds. This is `f64` because the exact
+    /// closed-form transition can fall between the engine's integer instants.
+    pub at_ms: f64,
+}
+
+/// Immutable, cap-aware projection of the engine's current decaying field.
+///
+/// The trajectory stores stances verbatim and re-evaluates them through the one
+/// canonical evidence evaluator at every requested instant. It never translates
+/// a current posterior, estimates a slope, or reimplements decay in another
+/// precision. Consequently [`snapshot_at`](Self::snapshot_at) at the capture
+/// instant is structurally identical to the live engine snapshot.
+#[derive(Debug, Clone)]
+pub struct DecayTrajectory {
+    captured_at_ms: i64,
+    mark_ttl_ms: i64,
+    config: SequentialEvidenceConfig,
+    proposals: Vec<(Uuid, u64)>,
+    stances: Vec<DecayStance>,
+    reviewers: HashMap<Uuid, ReviewerCredential>,
+}
+
+impl DecayTrajectory {
+    /// Instant at which the immutable trajectory was captured.
+    pub fn captured_at_ms(&self) -> i64 {
+        self.captured_at_ms
+    }
+
+    /// Verbatim stance identities available to a pure review planner.
+    /// Projection still remains private to this type so callers cannot bypass
+    /// the canonical `Stance::effective` -> `as f64` evaluator seam.
+    ///
+    /// This is the CURRENT latest-wins effective stance set only — replaced
+    /// stances are not retained — so exposing it does not violate the contract
+    /// rule that the planner never sees raw stance history.
+    pub fn stances(&self) -> &[DecayStance] {
+        &self.stances
+    }
+
+    /// Canonical field snapshot at `at_ms`.
+    ///
+    /// Each stored stance calls the exact live `f32` decay function before its
+    /// signed weight is cast to `f64` and passed to [`evaluate_field_full`].
+    pub fn snapshot_at(&self, at_ms: i64) -> EvidenceSnapshot {
+        let contributions = self.contributions_at(at_ms);
+        evaluate_field(
+            self.config,
+            &self.proposals,
+            &contributions,
+            &self.reviewers,
+        )
+    }
+
+    /// Leader-minus-runner-up log-evidence gap at `at_ms`.
+    ///
+    /// Returns `None` until at least two proposals exist. A tie is `Some(0.0)`.
+    pub fn leader_gap_at(&self, at_ms: i64) -> Option<f64> {
+        let evaluation = self.evaluate_at(at_ms);
+        let ranked = evaluation.snapshot.ranked();
+        (ranked.len() >= 2).then(|| ranked[0].log_evidence - ranked[1].log_evidence)
+    }
+
+    /// Exact continuous-time cap exits for groups saturated at capture time.
+    ///
+    /// All stances share one half-life, so raw group mass follows
+    /// `M_g(t) = C_g * 2^(-Δt / ttl)`. Every over-cap group is monotone and
+    /// exits its cap at most once, at `ttl * log2(C_g / cap)` after capture. No
+    /// time sampling is involved. Groups at/below cap and non-decaying fields
+    /// have no future transition.
+    ///
+    /// The closed form is exact for MIXED-AGE groups too: with a shared TTL,
+    /// `Σ Cᵢ·2^(-(t-aᵢ)/ttl) = [Σ Cᵢ·2^(aᵢ/ttl)]·2^(-t/ttl)` — stance ages only
+    /// rescale the constant, so group mass is a single exponential regardless
+    /// of when each stance landed. That factorization is why no sampling is
+    /// needed.
+    ///
+    /// These times are ADVISORY scheduling hints in the f64 mass model; the
+    /// actual mass at any instant is evaluated through the `f32` decay path,
+    /// which can differ by ulps near a boundary. [`snapshot_at`](Self::snapshot_at)
+    /// is the authority on boundary behavior — a planner must re-verify via a
+    /// fresh assessment's headroom before acting on a transition.
+    pub fn cap_transition_times(&self) -> Vec<GroupCapTransition> {
+        if self.mark_ttl_ms <= 0 {
+            return Vec::new();
+        }
+        let mut transitions: Vec<GroupCapTransition> = self
+            .evaluate_at(self.captured_at_ms)
+            .headroom
+            .into_iter()
+            .filter_map(|headroom| {
+                (headroom.used > headroom.cap).then(|| GroupCapTransition {
+                    at_ms: self.captured_at_ms as f64
+                        + self.mark_ttl_ms as f64 * (headroom.used / headroom.cap).log2(),
+                    group: headroom.group,
+                })
+            })
+            .collect();
+        transitions.sort_by(|a, b| a.at_ms.total_cmp(&b.at_ms).then(a.group.cmp(&b.group)));
+        transitions
+    }
+
+    fn evaluate_at(&self, at_ms: i64) -> FieldEvaluation {
+        let contributions = self.contributions_at(at_ms);
+        evaluate_field_full(
+            self.config,
+            &self.proposals,
+            &contributions,
+            &self.reviewers,
+        )
+    }
+
+    fn contributions_at(&self, at_ms: i64) -> Vec<EvidenceContribution> {
+        self.stances
+            .iter()
+            .filter_map(|captured| {
+                let signed_weight = captured.stance.effective(at_ms, self.mark_ttl_ms) as f64;
+                signed_weight.is_finite().then_some(EvidenceContribution {
+                    proposal: captured.proposal,
+                    author: captured.author,
+                    signed_weight,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Read-only sequential state used by orchestration and review planning.
+///
+/// This wraps the canonical [`EvidenceSnapshot`] rather than duplicating its
+/// fields, adds the exact correlation budget state from that same evaluation,
+/// and carries an immutable decay trajectory. Callers must request a new
+/// assessment after every accepted stance mutation; no assessment may be
+/// cached across reviews in one orchestration tick.
+#[derive(Debug, Clone)]
+pub struct QuorumAssessment {
+    snapshot: EvidenceSnapshot,
+    correlation_headroom: Vec<GroupHeadroom>,
+    unused_groups: Vec<GroupId>,
+    trajectory: DecayTrajectory,
+}
+
+impl QuorumAssessment {
+    /// Canonical point-in-time evidence state used by the commitment gate.
+    pub fn snapshot(&self) -> &EvidenceSnapshot {
+        &self.snapshot
+    }
+
+    /// Raw used mass and cap for every live or registered correlation group.
+    pub fn correlation_headroom(&self) -> &[GroupHeadroom] {
+        &self.correlation_headroom
+    }
+
+    /// Registered correlation groups with no effective mass at this instant.
+    /// Eligibility remains a planner/roster decision, not an engine decision.
+    pub fn unused_groups(&self) -> &[GroupId] {
+        &self.unused_groups
+    }
+
+    /// Immutable exact projection captured with this assessment.
+    pub fn trajectory(&self) -> &DecayTrajectory {
+        &self.trajectory
+    }
 }
 
 /// The pure quorum engine for a single topic's blackboard.
@@ -337,35 +541,67 @@ impl QuorumEngine {
     ///
     /// Returns `None` in legacy [`QuorumRule::NetWeight`] mode.
     pub fn evidence_snapshot(&self, now_ms: i64) -> Option<EvidenceSnapshot> {
-        let config = self.config.rule.evidence_config()?;
-        Some(self.build_evidence_snapshot(config, now_ms))
+        self.assessment(now_ms)
+            .map(|assessment| assessment.snapshot)
     }
 
-    fn build_evidence_snapshot(
+    /// Full pending-state assessment for sequential orchestration.
+    ///
+    /// Returns `None` in legacy [`QuorumRule::NetWeight`] mode. The assessment
+    /// is rebuilt from the current engine state on every call; callers must not
+    /// cache it across endorse/inhibit/reviewer/proposal mutations.
+    pub fn assessment(&self, now_ms: i64) -> Option<QuorumAssessment> {
+        let config = self.config.rule.evidence_config()?;
+        let trajectory = self.build_decay_trajectory(config, now_ms);
+        let FieldEvaluation { snapshot, headroom } = trajectory.evaluate_at(now_ms);
+        let unused_groups = headroom
+            .iter()
+            .filter(|group| group.used == 0.0)
+            .filter_map(|group| match &group.group {
+                GroupId::Registered(_) => Some(group.group.clone()),
+                GroupId::Independent(_) => None,
+            })
+            .collect();
+        Some(QuorumAssessment {
+            snapshot,
+            correlation_headroom: headroom,
+            unused_groups,
+            trajectory,
+        })
+    }
+
+    fn build_decay_trajectory(
         &self,
         config: SequentialEvidenceConfig,
         now_ms: i64,
-    ) -> EvidenceSnapshot {
+    ) -> DecayTrajectory {
         let proposals: Vec<(Uuid, u64)> = self
             .proposals
             .iter()
             .map(|(proposal, state)| (*proposal, state.seq))
             .collect();
-        let contributions: Vec<EvidenceContribution> = self
+        let stances: Vec<DecayStance> = self
             .proposals
             .iter()
             .flat_map(|(proposal, state)| {
-                state.stances.iter().filter_map(move |(author, stance)| {
-                    let signed_weight = stance.effective(now_ms, self.config.mark_ttl_ms) as f64;
-                    signed_weight.is_finite().then_some(EvidenceContribution {
+                state
+                    .stances
+                    .iter()
+                    .map(move |(author, stance)| DecayStance {
                         proposal: *proposal,
                         author: *author,
-                        signed_weight,
+                        stance: *stance,
                     })
-                })
             })
             .collect();
-        evaluate_field(config, &proposals, &contributions, &self.reviewers)
+        DecayTrajectory {
+            captured_at_ms: now_ms,
+            mark_ttl_ms: self.config.mark_ttl_ms,
+            config,
+            proposals,
+            stances,
+            reviewers: self.reviewers.clone(),
+        }
     }
 
     /// Evaluate the current field. Returns `Converged` once (and stays
@@ -416,8 +652,11 @@ impl QuorumEngine {
                     tallies,
                 }
             }
-            QuorumRule::SequentialEvidence(config) => {
-                let snapshot = self.build_evidence_snapshot(config, now_ms);
+            QuorumRule::SequentialEvidence(_) => {
+                let snapshot = self
+                    .assessment(now_ms)
+                    .expect("sequential rule always produces an assessment")
+                    .snapshot;
                 let leader = snapshot.unique_leader().map(|item| item.proposal);
                 if let (Some(decision), Some(basis)) = (leader, snapshot.convergence_basis()) {
                     self.converged = Some((decision, basis));
@@ -675,6 +914,19 @@ mod tests {
         let mut b = [0u8; 16];
         b[15] = n;
         Uuid::from_bytes(b)
+    }
+
+    fn assert_assessment_round_trip(engine: &QuorumEngine, now_ms: i64) {
+        let assessment = engine
+            .assessment(now_ms)
+            .expect("sequential engine has an assessment");
+        let projected = assessment.trajectory.evaluate_at(now_ms);
+        assert_eq!(assessment.snapshot, projected.snapshot);
+        assert_eq!(assessment.correlation_headroom, projected.headroom);
+        assert_eq!(
+            assessment.trajectory.snapshot_at(now_ms),
+            engine.evidence_snapshot(now_ms).unwrap()
+        );
     }
 
     // A proposal that accrues endorsements climbs to convergence.
@@ -1104,6 +1356,208 @@ mod tests {
             Err(AbortReason::Timeout)
         );
         assert!(!eng.is_converged());
+    }
+
+    #[test]
+    fn assessment_round_trips_after_every_stance_mutation() {
+        let config = SequentialEvidenceConfig::default();
+        let mut eng = QuorumEngine::with_defaults();
+        let (pa, pb) = (uid(1), uid(2));
+        let (a, b, c, d) = (uid(10), uid(20), uid(30), uid(40));
+        for (reviewer, group) in [
+            (a, "model-a"),
+            (b, "model-b"),
+            (c, "model-c"),
+            (d, "model-d"),
+        ] {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(reviewer, group, config).unwrap(),
+            );
+        }
+
+        let empty = eng.assessment(0).unwrap();
+        assert_eq!(empty.unused_groups.len(), 4);
+        assert_assessment_round_trip(&eng, 0);
+
+        eng.propose(pa, a, 10);
+        assert_assessment_round_trip(&eng, 10);
+        eng.propose(pb, b, 11);
+        assert_assessment_round_trip(&eng, 11);
+        eng.endorse(pa, c, None, 12);
+        assert_assessment_round_trip(&eng, 12);
+        eng.inhibit(pa, d, Some(0.5), 13);
+        assert_assessment_round_trip(&eng, 13);
+        // Latest-wins target/sign flip: the rebuilt assessment must use only
+        // d's replacement stance, never a cached pre-review field.
+        eng.endorse(pb, d, None, 14);
+        assert_assessment_round_trip(&eng, 14);
+    }
+
+    #[test]
+    fn cap_transition_is_closed_form_and_round_trips_at_boundary() {
+        let config = SequentialEvidenceConfig::default();
+        let mut eng = QuorumEngine::new(QuorumConfig {
+            rule: QuorumRule::SequentialEvidence(config),
+            mark_ttl_ms: 1_000,
+            tie_break_seed: 7,
+        });
+        let (pa, pb) = (uid(1), uid(2));
+        let (a1, a2, b) = (uid(10), uid(11), uid(20));
+        for reviewer in [a1, a2] {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(reviewer, "same-model", config).unwrap(),
+            );
+        }
+        eng.register_reviewer(
+            ReviewerCredential::with_default_prior(b, "other-model", config).unwrap(),
+        );
+        eng.propose(pa, a1, 0);
+        eng.propose(pb, b, 0);
+        eng.endorse(pa, a2, None, 0);
+
+        let assessment = eng.assessment(0).unwrap();
+        let transitions = assessment.trajectory.cap_transition_times();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].group,
+            GroupId::Registered("same-model".into())
+        );
+        assert!((transitions[0].at_ms - 1_000.0).abs() < 1e-9);
+
+        // The continuous transition is exactly at 1000ms; projections at the
+        // adjacent integer instants and the boundary itself remain identical to
+        // fresh live-engine evaluations because both call the same evaluator.
+        for at_ms in [999, 1_000, 1_001] {
+            assert_eq!(
+                assessment.trajectory.snapshot_at(at_ms),
+                eng.evidence_snapshot(at_ms).unwrap()
+            );
+        }
+        let at_boundary = assessment.trajectory.evaluate_at(1_000);
+        let group = at_boundary
+            .headroom
+            .iter()
+            .find(|entry| entry.group == GroupId::Registered("same-model".into()))
+            .unwrap();
+        assert!((group.used - group.cap).abs() < 1e-12);
+    }
+
+    #[test]
+    fn near_tie_assessment_stays_open() {
+        let config = SequentialEvidenceConfig::default();
+        let mut eng = QuorumEngine::with_defaults();
+        let (pa, pb) = (uid(1), uid(2));
+        let (a, b, edge) = (uid(10), uid(20), uid(30));
+        for (reviewer, group) in [(a, "a"), (b, "b"), (edge, "edge")] {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(reviewer, group, config).unwrap(),
+            );
+        }
+        eng.propose(pa, a, 0);
+        eng.propose(pb, b, 0);
+        eng.endorse(pa, edge, Some(1e-7), 0);
+
+        let assessment = eng.assessment(0).unwrap();
+        assert!(assessment.snapshot().unique_leader().is_some());
+        assert_eq!(assessment.snapshot().convergence_basis(), None);
+        assert!(assessment.trajectory().leader_gap_at(0).unwrap() > 0.0);
+        assert!(matches!(eng.evaluate(0), QuorumOutcome::Pending { .. }));
+    }
+
+    // This is the CostBound-tie case the `unique_leader` gate exists for.
+    // EvidenceBound can never be blocked by the tie gate (posterior error at or
+    // below a sub-0.5 target forces the leader's posterior above 0.5, which is
+    // strictly unique), so the gate does load-bearing work ONLY here: with an
+    // expensive query (query_cost >= 0.5 * decision_loss), an exactly tied
+    // field satisfies the CostBound economics (evpi = 0.5 * loss <= cost) and
+    // only the tie gate stops the engine from committing a coin flip.
+    #[test]
+    fn exact_tie_never_commits_cost_bound() {
+        let config = SequentialEvidenceConfig::new(0.20, 0.75, 1.10, 0.60, 1.0).unwrap();
+        let mut eng = QuorumEngine::new(QuorumConfig {
+            rule: QuorumRule::SequentialEvidence(config),
+            mark_ttl_ms: 60_000,
+            tie_break_seed: 3,
+        });
+        let (pa, pb) = (uid(1), uid(2));
+        let (a, b) = (uid(10), uid(20));
+        for (reviewer, group) in [(a, "a"), (b, "b")] {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(reviewer, group, config).unwrap(),
+            );
+        }
+        // Exactly equal opposing evidence: one default endorsement each.
+        eng.propose(pa, a, 0);
+        eng.propose(pb, b, 0);
+
+        let assessment = eng.assessment(0).unwrap();
+        let snapshot = assessment.snapshot();
+        // The stopping economics ARE satisfied by the tie...
+        assert!(snapshot.evpi_upper_bound() <= config.query_cost());
+        // ...but there is no unique leader, so no basis may latch.
+        assert!(snapshot.unique_leader().is_none());
+        assert_eq!(assessment.trajectory().leader_gap_at(0), Some(0.0));
+        assert_eq!(snapshot.convergence_basis(), None);
+        assert!(matches!(eng.evaluate(0), QuorumOutcome::Pending { .. }));
+        assert!(!eng.is_converged());
+    }
+
+    #[test]
+    fn latched_cost_basis_never_relabels_after_more_evidence() {
+        let config = SequentialEvidenceConfig::new(0.01, 0.75, 10.0, 0.30, 1.0).unwrap();
+        let mut eng = QuorumEngine::new(QuorumConfig {
+            rule: QuorumRule::SequentialEvidence(config),
+            mark_ttl_ms: 60_000,
+            tie_break_seed: 9,
+        });
+        let (pa, pb) = (uid(1), uid(2));
+        let reviewers = [
+            uid(10),
+            uid(11),
+            uid(12),
+            uid(13),
+            uid(14),
+            uid(15),
+            uid(20),
+        ];
+        for (index, reviewer) in reviewers.into_iter().enumerate() {
+            eng.register_reviewer(
+                ReviewerCredential::with_default_prior(
+                    reviewer,
+                    format!("independent-{index}"),
+                    config,
+                )
+                .unwrap(),
+            );
+        }
+        eng.propose(pa, uid(10), 0);
+        eng.propose(pb, uid(20), 0);
+        eng.endorse(pa, uid(11), None, 0);
+        assert!(matches!(
+            eng.evaluate(0),
+            QuorumOutcome::Converged {
+                decision,
+                basis: ConvergenceBasis::CostBound,
+                ..
+            } if decision == pa
+        ));
+
+        for reviewer in [uid(12), uid(13), uid(14), uid(15)] {
+            eng.endorse(pa, reviewer, None, 1);
+        }
+        assert_eq!(
+            eng.assessment(1).unwrap().snapshot().convergence_basis(),
+            Some(ConvergenceBasis::EvidenceBound),
+            "the unlatchable live field now clears the stricter evidence bound"
+        );
+        assert_eq!(eng.convergence_basis(), Some(ConvergenceBasis::CostBound));
+        assert!(matches!(
+            eng.evaluate(1),
+            QuorumOutcome::Converged {
+                basis: ConvergenceBasis::CostBound,
+                ..
+            }
+        ));
     }
 
     // ---- RecallVote (OCEAN-302): quorum-of-recall, unforgeable --------------
