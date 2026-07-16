@@ -22,6 +22,7 @@
 //! ocean-longhouse
 //!   ├── evidence.rs  sequential evidence + stopping — PURE Rust
 //!   ├── quorum.rs    stance field + decision latch — PURE Rust
+//!   ├── planner.rs   uncertainty-driven review allocation — PURE Rust
 //!   ├── agent.rs     ModelHandle — one cheap-model turn via stream_simple
 //!   └── convene.rs   convene() — orchestrates rounds, feeds the engine, emits events
 //!       ▲
@@ -39,6 +40,7 @@ pub mod convene;
 pub mod escrow;
 pub mod evidence;
 pub mod longhouse_provider;
+pub mod planner;
 pub mod prepare;
 pub mod quorum;
 pub mod registry;
@@ -61,6 +63,7 @@ pub use evidence::{
     SequentialEvidenceConfig,
 };
 pub use longhouse_provider::{LonghouseProvider, LonghouseRegistryHandle};
+pub use planner::{EscalationReason, PlanOutcome, ReviewAction, ReviewPlanner};
 pub use prepare::{
     cached_index, cached_index_for, cached_workflows_for, clear_index_cache, clear_workflow_cache,
     ExplainedSkillMatch, ExplainedWorkflowMatch, SkillBrief, SkillIndex, SkillRoots, SkillSource,
