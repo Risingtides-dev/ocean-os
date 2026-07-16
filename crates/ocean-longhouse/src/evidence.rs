@@ -17,6 +17,23 @@
 //! bound on what one more real reviewer call can provide. If even that upper
 //! bound is not worth its cost, continuing cannot be economically justified by
 //! the configured loss model.
+//!
+//! # Canonical evaluator seam
+//!
+//! [`evaluate_field_full`] is the ONE evaluator for the sequential field. Every
+//! surface that needs the field at a time `t` — the live engine, the decay
+//! trajectory, replay — must reach it through the same path: decay each stance
+//! with `Stance::effective` (an `f32` function), apply the existing `as f64`
+//! cast per contribution, and hand the result here. Do not reimplement the
+//! decay exponential in either precision; the trajectory/engine round-trip
+//! invariant requires bit-identical evaluation, not merely equivalent math.
+//!
+//! Inputs are canonicalized internally (proposals by sequence, contributions by
+//! `(proposal_seq, proposal, author)`) so identical evidence produces an
+//! identical snapshot regardless of caller iteration order. Floating-point
+//! accumulation is order-sensitive, and callers feed us `HashMap` iteration
+//! order; without this, event-sourced replay could rank a near-tied field
+//! differently across process restarts.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -295,32 +312,116 @@ enum GroupKey<'a> {
     Independent(Uuid),
 }
 
+impl GroupKey<'_> {
+    fn to_group_id(self) -> GroupId {
+        match self {
+            Self::Registered(group) => GroupId::Registered(group.to_owned()),
+            Self::Independent(author) => GroupId::Independent(author),
+        }
+    }
+}
+
+/// Owned, public identity of one correlation budget. The internal borrowed
+/// [`GroupKey`] never crosses the module boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GroupId {
+    /// A registered correlation group (provider/model family).
+    Registered(String),
+    /// A synthetic per-author group for contributions without a credential
+    /// (backward compatibility with old recordings).
+    Independent(Uuid),
+}
+
+/// One correlation group's evidence budget at the evaluated instant.
+///
+/// `used` is the RAW decayed LLR mass the group has contributed — deliberately
+/// not clamped to `cap`, so a planner can see saturation depth. `used >= cap`
+/// means the group's total evidence budget is saturated; additional correlated
+/// mass is rescaled within that fixed budget, and exact replicas cannot
+/// increase total group influence. A new or flipped stance from a saturated
+/// group can still REDISTRIBUTE that budget among proposals and move the
+/// field. Because every stance decays, `used` is time-dependent: a group over
+/// its cap now can fall back under it later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupHeadroom {
+    pub group: GroupId,
+    pub used: f64,
+    pub cap: f64,
+}
+
+/// The full result of one field evaluation: the auditable stopping snapshot
+/// plus the per-group budget state the snapshot was computed from. Headroom is
+/// the same `group_mass` the cap scaling used — computed once, never re-derived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldEvaluation {
+    pub snapshot: EvidenceSnapshot,
+    /// Every correlation group, sorted by [`GroupId`]: groups with live mass
+    /// plus registered-but-silent groups synthesized at `used = 0.0` so an
+    /// unused-group inventory is derivable without consulting the engine.
+    pub headroom: Vec<GroupHeadroom>,
+}
+
 /// Evaluate one field under a validated evidence policy.
+///
+/// Thin compatibility wrapper over [`evaluate_field_full`] for callers that
+/// only need the stopping snapshot.
 pub(crate) fn evaluate_field(
     config: SequentialEvidenceConfig,
     proposals: &[(Uuid, u64)],
     contributions: &[EvidenceContribution],
     reviewers: &HashMap<Uuid, ReviewerCredential>,
 ) -> EvidenceSnapshot {
+    evaluate_field_full(config, proposals, contributions, reviewers).snapshot
+}
+
+/// Evaluate one field and report per-group budget state alongside the
+/// snapshot. This is the canonical evaluator (see the module docs): inputs are
+/// canonicalized so identical evidence yields a bit-identical result
+/// regardless of caller iteration order.
+pub(crate) fn evaluate_field_full(
+    config: SequentialEvidenceConfig,
+    proposals: &[(Uuid, u64)],
+    contributions: &[EvidenceContribution],
+    reviewers: &HashMap<Uuid, ReviewerCredential>,
+) -> FieldEvaluation {
     if proposals.is_empty() {
-        return EvidenceSnapshot {
-            ranked: Vec::new(),
-            convergence_basis: None,
-            posterior_error: 1.0,
-            evpi_upper_bound: config.decision_loss,
-            progress: 0.0,
+        return FieldEvaluation {
+            snapshot: EvidenceSnapshot {
+                ranked: Vec::new(),
+                convergence_basis: None,
+                posterior_error: 1.0,
+                evpi_upper_bound: config.decision_loss,
+                progress: 0.0,
+            },
+            headroom: silent_headroom(config, reviewers, &HashMap::new()),
         };
     }
 
+    // Canonical order: proposals by sequence, contributions by
+    // (proposal_seq, proposal, author). Float accumulation below follows this
+    // order, which is what makes the evaluation reproducible across HashMap
+    // layouts and process restarts.
+    let seq_of: HashMap<Uuid, u64> = proposals.iter().copied().collect();
+    let mut proposals: Vec<(Uuid, u64)> = proposals.to_vec();
+    proposals.sort_by_key(|(id, seq)| (*seq, *id));
+    let mut contributions: Vec<EvidenceContribution> = contributions.to_vec();
+    contributions.sort_by_key(|c| {
+        (
+            seq_of.get(&c.proposal).copied().unwrap_or(u64::MAX),
+            c.proposal,
+            c.author,
+        )
+    });
+
     let mut group_mass: HashMap<GroupKey<'_>, f64> = HashMap::new();
-    for contribution in contributions {
+    for contribution in &contributions {
         let (group, reliability) = reviewer_profile(config, reviewers, contribution.author);
         let raw = contribution.signed_weight * log_odds(reliability);
         *group_mass.entry(group).or_default() += raw.abs();
     }
 
     let mut scores: HashMap<Uuid, f64> = proposals.iter().map(|(id, _)| (*id, 0.0)).collect();
-    for contribution in contributions {
+    for contribution in &contributions {
         let (group, reliability) = reviewer_profile(config, reviewers, contribution.author);
         let raw = contribution.signed_weight * log_odds(reliability);
         let total = group_mass.get(&group).copied().unwrap_or_default();
@@ -333,9 +434,11 @@ pub(crate) fn evaluate_field(
     }
 
     let max_score = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
-    let normalizer: f64 = scores
-        .values()
-        .map(|score| (*score - max_score).exp())
+    // Sum in canonical proposal order, not HashMap order: the normalizer is a
+    // float accumulation too.
+    let normalizer: f64 = proposals
+        .iter()
+        .map(|(id, _)| (scores.get(id).copied().unwrap_or_default() - max_score).exp())
         .sum();
 
     let mut ranked: Vec<(u64, ProposalEvidence)> = proposals
@@ -383,13 +486,50 @@ pub(crate) fn evaluate_field(
         0.0
     };
 
-    EvidenceSnapshot {
-        ranked,
-        convergence_basis,
-        posterior_error,
-        evpi_upper_bound,
-        progress,
+    let mut headroom: Vec<GroupHeadroom> = group_mass
+        .iter()
+        .map(|(key, used)| GroupHeadroom {
+            group: key.to_group_id(),
+            used: *used,
+            cap: config.correlation_cap,
+        })
+        .collect();
+    headroom.extend(silent_headroom(config, reviewers, &group_mass));
+    headroom.sort_by(|a, b| a.group.cmp(&b.group));
+
+    FieldEvaluation {
+        snapshot: EvidenceSnapshot {
+            ranked,
+            convergence_basis,
+            posterior_error,
+            evpi_upper_bound,
+            progress,
+        },
+        headroom,
     }
+}
+
+/// Headroom entries for registered correlation groups with no live mass.
+/// `group_mass` only contains groups that contributed, so the unused-group
+/// inventory must be synthesized from the reviewer registry.
+fn silent_headroom(
+    config: SequentialEvidenceConfig,
+    reviewers: &HashMap<Uuid, ReviewerCredential>,
+    group_mass: &HashMap<GroupKey<'_>, f64>,
+) -> Vec<GroupHeadroom> {
+    let silent: std::collections::BTreeSet<&str> = reviewers
+        .values()
+        .map(|credential| credential.correlation_group())
+        .filter(|group| !group_mass.contains_key(&GroupKey::Registered(group)))
+        .collect();
+    silent
+        .into_iter()
+        .map(|group| GroupHeadroom {
+            group: GroupId::Registered(group.to_owned()),
+            used: 0.0,
+            cap: config.correlation_cap,
+        })
+        .collect()
 }
 
 fn reviewer_profile<'a>(
@@ -600,5 +740,131 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Engine-hardening proof: identical evidence must produce a bit-identical
+    /// snapshot regardless of input iteration order. Callers feed HashMap
+    /// order, float accumulation is order-sensitive, and event-sourced replay
+    /// depends on identical evidence reproducing identical rankings.
+    #[test]
+    fn shuffled_inputs_produce_identical_snapshot() {
+        let config = SequentialEvidenceConfig::default();
+        let mut reviewers = HashMap::new();
+        for author in [10, 11, 12, 20, 21] {
+            reviewers.insert(
+                uid(author),
+                ReviewerCredential::with_default_prior(
+                    uid(author),
+                    format!("group-{}", author / 10),
+                    config,
+                )
+                .unwrap(),
+            );
+        }
+        let proposals = vec![(uid(1), 0), (uid(2), 1), (uid(3), 2)];
+        let contributions = vec![
+            contribution(1, 10),
+            contribution(1, 11),
+            contribution(2, 12),
+            contribution(2, 20),
+            contribution(3, 21),
+        ];
+
+        let baseline = evaluate_field_full(config, &proposals, &contributions, &reviewers);
+
+        // Deterministic permutations standing in for arbitrary HashMap orders.
+        let mut proposals_rev = proposals.clone();
+        proposals_rev.reverse();
+        let mut contributions_rev = contributions.clone();
+        contributions_rev.reverse();
+        let mut contributions_rot = contributions.clone();
+        contributions_rot.rotate_left(2);
+
+        for (props, contribs) in [
+            (&proposals_rev, &contributions_rev),
+            (&proposals, &contributions_rot),
+            (&proposals_rev, &contributions),
+        ] {
+            let shuffled = evaluate_field_full(config, props, contribs, &reviewers);
+            assert_eq!(baseline, shuffled);
+        }
+    }
+
+    #[test]
+    fn capped_group_reports_raw_used_above_cap() {
+        let config = SequentialEvidenceConfig::default();
+        let mut reviewers = HashMap::new();
+        for author in [10, 11] {
+            reviewers.insert(
+                uid(author),
+                ReviewerCredential::with_default_prior(uid(author), "same-model", config).unwrap(),
+            );
+        }
+        let evaluation = evaluate_field_full(
+            config,
+            &proposals(),
+            &[contribution(1, 10), contribution(1, 11)],
+            &reviewers,
+        );
+
+        let saturated = evaluation
+            .headroom
+            .iter()
+            .find(|h| h.group == GroupId::Registered("same-model".into()))
+            .expect("contributing group must appear in headroom");
+        // Two default-prior stances contribute 2*ln(3) raw mass against a
+        // ln(3) cap: `used` reports the raw decayed mass, not the clamp.
+        assert!(saturated.used > saturated.cap);
+        assert!((saturated.used - 2.0 * DEFAULT_REVIEWER_LLR).abs() < 1e-12);
+        assert_eq!(saturated.cap, config.correlation_cap());
+    }
+
+    #[test]
+    fn silent_registered_group_is_synthesized_with_zero_used() {
+        let config = SequentialEvidenceConfig::default();
+        let mut reviewers = HashMap::new();
+        reviewers.insert(
+            uid(10),
+            ReviewerCredential::with_default_prior(uid(10), "vocal", config).unwrap(),
+        );
+        reviewers.insert(
+            uid(30),
+            ReviewerCredential::with_default_prior(uid(30), "quiet", config).unwrap(),
+        );
+        // uid(99) is deliberately NOT registered: it must form a synthetic
+        // per-author independent group rather than borrow anyone's budget.
+        let evaluation = evaluate_field_full(
+            config,
+            &proposals(),
+            &[contribution(1, 10), contribution(2, 99)],
+            &reviewers,
+        );
+
+        let silent = evaluation
+            .headroom
+            .iter()
+            .find(|h| h.group == GroupId::Registered("quiet".into()))
+            .expect("registered-but-silent group must be synthesized");
+        assert_eq!(silent.used, 0.0);
+        assert_eq!(silent.cap, config.correlation_cap());
+        // The credentialed contributor's registered group carries live mass.
+        let vocal = evaluation
+            .headroom
+            .iter()
+            .find(|h| h.group == GroupId::Registered("vocal".into()))
+            .expect("contributing group present");
+        assert!(vocal.used > 0.0);
+        // The uncredentialed author appears as its own independent group with
+        // live mass — never merged into a registered group.
+        let independent = evaluation
+            .headroom
+            .iter()
+            .find(|h| h.group == GroupId::Independent(uid(99)))
+            .expect("uncredentialed author forms a synthetic independent group");
+        assert!(independent.used > 0.0);
+        // Headroom is sorted by GroupId for deterministic output.
+        let mut sorted = evaluation.headroom.clone();
+        sorted.sort_by(|a, b| a.group.cmp(&b.group));
+        assert_eq!(evaluation.headroom, sorted);
     }
 }

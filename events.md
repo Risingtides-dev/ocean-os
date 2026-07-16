@@ -3690,3 +3690,11 @@ area:      [ocean-protocol]: Anthropic history serialization and prompt caching
 Fixed Fable 5 and other Anthropic/Claude Code high-thinking turns failing after a cross-provider model switch with `thinking.signature: Field required`. Anthropic wire encoding now preserves only non-empty signed thinking blocks, drops unsigned or empty-signature reasoning without exposing it as visible text, omits messages emptied by that filtering, and places rolling cache breakpoints against the converted provider-valid history. The shared persisted history schema remains compatible.
 
 Verification: all 132 ocean-protocol tests passed; `cargo check --workspace`, formatting, and diff checks passed. Focused regression coverage exercises unsigned and empty signatures, thinking-only messages, signed replay, chain-of-thought non-leakage, and converted-history cache indexing. A fresh final reviewer approved the change with no findings.
+time:      [02:05] [07-16-26]
+agent:     [claude] [fable-5]
+worktree:  main
+type:      feature-request
+area:      backend
+
+Longhouse Task 1 (contract step 1) landed in crates/ocean-longhouse/src/evidence.rs on top of codex's uncommitted WIP baseline: canonical evaluator (evaluate_field_full) with internally canonicalized input order (proposals by seq, contributions by proposal_seq/proposal/author, normalizer summed in canonical order) fixing a live replay determinism hazard; owned GroupId{Registered,Independent} + GroupHeadroom{group,used,cap} with raw uncapped used mass; silent registered groups synthesized from the reviewer registry; evaluate_field kept as thin wrapper; module docs now carry the canonical-evaluator seam rule (Stance::effective f32 + as-f64 cast, decay never reimplemented). Three new tests (shuffled-input identity, capped-group raw mass, silent-group synthesis); cargo test -p ocean-longhouse fully green: 127 passed, 0 failed, 1 ignored. Diff artifact (vs reconstructed baseline — evidence.rs is untracked, so no git baseline exists): ocean-surface/.stitchpad/artifacts/task1-evidence-rs.diff. Note for landing: evidence.rs has NEVER been committed; codex must commit its verified WIP baseline or the first commit will conflate baseline + step 1.
+_________________________________________________________________________________
