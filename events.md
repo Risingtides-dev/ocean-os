@@ -3512,3 +3512,37 @@ Verification:
 - denied-warning all-target crate Clippy passed
 - `cargo check --workspace --tests` and `cargo xtask ci --compatibility` passed
 - metadata/index parity, format, docs-check, diff-check, and `cargo deny check` passed
+_________________________________________________________________________________
+time:      [11:48pm] [15-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [docs]: manifest Longhouse turn preparation extraction
+area:      [backend]: ocean-daemon Phase 2C advisory turn seam
+
+Proposed the second narrow Longhouse boundary: move only the fresh default-on opt-out gate, deterministic model-facing advisory renderer/application, fixed 250 ms deadline, and cached read-only blocking preparation helper into private `src/longhouse_turn_preparation.rs`. All three production call sites remain in composition with exact raw-prompt versus guided-prompt inputs, caller cwd, permit/ack timing, browser-layer precedence, event/runtime order, and fail-open behavior requiring pre-move characterization. HTTP preparation adapters, librarian query/fetch/spec and its deferred symlink-retarget disposition, governance, calls, and broader turn/SSE orchestration remain excluded. Security review also recorded existing delegated loader path logs and the uncancelled timed-out blocking-task/cache-lock resource-amplification risk; neither is changed in this behavior-neutral move. Baseline `c21f45a` includes the non-overlapping standalone minimizer PR #298; live daemon deployment/supervision remains with the concurrent operator workstream.
+_________________________________________________________________________________
+time:      [12:56am] [16-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [test]: characterize Longhouse turn preparation boundary
+area:      [backend]: ocean-daemon Phase 2C advisory turn seam
+
+Added exact rendering/application, extraction-aware source/authority, and three-call-site ordering characterization at `f6e8efe`. The tests freeze advisory bytes and real-file body/path non-disclosure, skill/SOP/workflow order, byte-identical no-op prompts, the fresh environment truth table, whitespace early return, exact-empty versus non-empty cwd roots, `TurnBrief.cwd`, cache and ranking inside one blocking closure, the 250 ms timeout and all fail-open outcomes, exact helper-owned warnings, wired-module ownership, prompt assignment, async permit/ack placement, raw-versus-guided prompt inputs, browser precedence, and request/event/runtime prerequisites. Corrected only the stale “detached and harmless” comment: timed-out work is read-only but uncancelled and can amplify queued blocking work behind the global cache lock. Focused groups and all 351 daemon tests passed serialized in dedicated target `/tmp/ocean-target-longhouse-turn-prep-char`. Independent review drove five hardening rounds and ended clean. Extraction is authorized from rollback point `f6e8efe`; delegated loader path logs and detached-task/cache-lock availability remain separate retained risks, and deployment remains operator-owned.
+_________________________________________________________________________________
+time:      [01:52am] [16-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-next]
+type:      [refactor]: extract Longhouse turn preparation
+area:      [backend]: ocean-daemon Phase 2C advisory turn seam
+
+Moved the exact characterized 228-line gate/render/apply/deadline/preparation boundary into the 239-line private `src/longhouse_turn_preparation.rs` owner at `4eea76b`. `main.rs` retains all three call sites and exact caller-cwd, prompt assignment, permit/ack, event/runtime, raw-versus-guided input, browser-layer, and request-registration order; the sibling HTTP adapter changes only its private gate import. Mechanical comparison against rollback `f6e8efe` found token-identical definitions apart from required `pub(super)` visibility and rustfmt wrapping. No HTTP, runtime, permission, event, persistence, governance, call, librarian, or broader turn authority moved.
+
+Verification:
+- focused turn-preparation, rendering/application, gate, async preparation/deadline, HTTP-adapter, and router groups passed
+- all 351 daemon tests passed serialized; 118 Longhouse tests and one doc test passed with one host-dependent ignore
+- workspace test compilation and `livekit-tap`/`deepgram-stt` checks passed
+- compatibility, pinned Rust 1.88 MSRV, canonical local CI, formatting, docs, and diff checks passed
+- independent Codex correctness and Claude security/architecture reviews passed
+- delegated loader path logs, unsanitized advisory text, detached-task/cache-lock availability, and librarian symlink-retarget findings remain separate; deployment remains operator-owned
+- hosted CI and merge remain pending
+_________________________________________________________________________________

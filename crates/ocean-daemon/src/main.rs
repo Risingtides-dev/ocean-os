@@ -97,6 +97,8 @@ mod event_adapter;
 mod filesystem;
 /// State-free Longhouse prepare, inspect, and workflow HTTP adapters.
 mod longhouse_preparation;
+/// Per-turn Longhouse advisory preparation and model-facing presentation.
+mod longhouse_turn_preparation;
 /// In-process turn counters, Prometheus rendering, and in-flight RAII guard.
 mod metrics;
 /// Model catalog, current-selection, and persisted-selection HTTP adapters.
@@ -133,6 +135,7 @@ use cors::{cors_layer, parse_allowed_origins};
 use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
 use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prepare};
+use longhouse_turn_preparation::{apply_longhouse_prep, longhouse_prep_for_turn};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
@@ -168,6 +171,10 @@ use axum::http::Method;
 use filesystem::{expand_tilde, path_is_under, FsDirsQuery, FsFileQuery, FS_FILE_CAP};
 #[cfg(test)]
 use longhouse_preparation::LonghousePrepareRequest;
+#[cfg(test)]
+use longhouse_turn_preparation::{
+    longhouse_prepare_enabled, render_longhouse_prep, LONGHOUSE_PREP_DEADLINE,
+};
 #[cfg(test)]
 use metrics::{labelled_value, metric_value};
 #[cfg(test)]
@@ -543,47 +550,6 @@ fn parse_last_event_id(headers: &HeaderMap) -> Option<Uuid> {
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|raw| Uuid::parse_str(raw.trim()).ok())
-}
-
-/// Whether the **Longhouse pre-turn consult** is enabled. **Default ON**
-/// (OCEAN-283): now that the skill index is cached and the ranking is relevant,
-/// the consult-before-acting loop runs for every turn unless an operator opts
-/// OUT — the value of consulting the hive before acting only lands if it ships on
-/// by default.
-///
-/// Gated by `OCEAN_LONGHOUSE_PREPARE`:
-/// * **unset** → ON (the new default),
-/// * an explicit OFF spelling (`0` / `false` / `no` / `off`) → disabled: the turn
-///   behaves exactly as before, no skill index loaded, no brief injected, the
-///   prompt the model sees byte-for-byte unchanged,
-/// * any other / ON spelling (`1` / `true` / `yes` / `on`) → ON.
-///
-/// History: OCEAN-245 (#168) shipped this hook **default-OFF** behind the same
-/// env var, so the prep-loop shipped zero behavior unless opted in. OCEAN-281
-/// (#191) made selection cheap + relevant (the skill-librarian `SkillIndex`), and
-/// OCEAN-283 caches that index + improves the ranking, so the cost/benefit now
-/// favors default-on. The flip is **safe** because the consult stays:
-///   * **advisory-only** — the brief is injected into prompt context, never
-///     bypasses a permission gate or executes anything (see [`apply_longhouse_prep`]);
-///   * **fail-open** — any error / empty / slow path collapses to "no brief" and
-///     the turn proceeds with the unmodified prompt, never blocked;
-///   * **off the hot path + time-bounded** — the disk scan is cached (no per-turn
-///     walk) and the whole prep is wrapped in a deadline (see
-///     [`longhouse_prep_for_turn`]), so a slow/missing library can't tax a turn.
-///
-/// Read fresh per turn (not cached), like the YOLO env resolver, so an operator can
-/// flip it by restarting with a different env and tests can scope it.
-fn longhouse_prepare_enabled() -> bool {
-    match env::var("OCEAN_LONGHOUSE_PREPARE") {
-        // Explicit opt-OUT only. Everything else (including unset, handled by the
-        // Err arm, and any unrecognized value) leaves the default-on consult ON.
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        // Unset → ON (the OCEAN-283 default).
-        Err(_) => true,
-    }
 }
 
 /// Assemble the complete daemon router before binding [`AppState`].
@@ -6434,107 +6400,6 @@ fn apply_turn_guidance(guidance: Option<&[String]>, prompt: &str) -> String {
     }
 }
 
-// ---- Longhouse pre-turn consult (default-on, OCEAN-283) -----------------------
-//
-// PR #159 shipped `POST /v1/longhouse/prepare`; OCEAN-245 (#168) wired it into the
-// turn path behind `OCEAN_LONGHOUSE_PREPARE` **default-OFF**, so the
-// consult-before-acting loop shipped zero behavior unless opted in. OCEAN-283
-// promotes it to **default-ON**: before the LLM call, UNLESS an operator opts out,
-// the daemon ranks the turn's prompt against the (cached) local skill libraries
-// and injects the resulting compact briefs into prompt context — exactly like
-// room/operator guidance (OCEAN-143), prepended so it precedes the task without
-// mutating it.
-//
-// Default-on raises the bar: every turn now consults, so the safety + perf
-// invariants below become load-bearing rather than nice-to-haves.
-//
-// Invariants, straight from `docs/LONGHOUSE.md` (esp. line 115):
-//   * **Advisory only.** The brief is a RECOMMENDATION the model reads. It does
-//     NOT touch a permission gate, does NOT execute anything, does NOT alter tool
-//     routing — `apply_longhouse_prep` only prepends text to the prompt string.
-//   * **Fail-open.** A missing/garbled library, an empty index, an irrelevant
-//     prompt, a panicked scan, OR a prep that blows its deadline all collapse to
-//     "no brief" → the turn proceeds with the unmodified prompt. The prep step can
-//     never block a turn.
-//   * **Off the hot path + time-bounded.** The skill index is CACHED (no per-turn
-//     disk walk — OCEAN-283); any cold/stale reload runs on `spawn_blocking` and
-//     under a hard deadline (`LONGHOUSE_PREP_DEADLINE`), so a slow/missing library
-//     can never add latency to a turn even though every turn now consults.
-//
-// The opt-OUT: `OCEAN_LONGHOUSE_PREPARE=0|false|no|off` makes
-// `longhouse_prepare_enabled()` false, so none of this runs and the prompt is
-// byte-for-byte unchanged — the exact pre-OCEAN-283 behavior, on demand.
-
-/// Render a [`ocean_longhouse::TurnPrep`] into a compact, model-facing context
-/// block — or `None` when there is nothing to inject (the fail-open / no-op case).
-///
-/// Each surfaced skill becomes one bullet: `name — one-line when-to-use`. The
-/// header frames it as an **advisory** recommendation, not an instruction or a
-/// granted capability, so the model treats it as "here are skills that might be
-/// relevant; you still route every action through the normal gates." SOPs and
-/// workflows are included on the same footing for forward-compat (always empty in
-/// phase 1, so they contribute nothing today).
-///
-/// Pure + deterministic (no env, no disk): this is the unit-testable core of the
-/// injection. The empty-prep case returns `None`, mirroring `render_turn_guidance`.
-fn render_longhouse_prep(prep: &ocean_longhouse::TurnPrep) -> Option<String> {
-    if prep.is_empty() {
-        return None;
-    }
-    let mut block = String::from(
-        "Longhouse consult (advisory — relevant skills/SOPs for this turn; \
-         recommendations only, not granted capabilities; you still route every \
-         action through the normal permission gates):",
-    );
-    for skill in &prep.skills {
-        block.push_str("\n- ");
-        block.push_str(&skill.name);
-        let desc = skill.description.trim();
-        if !desc.is_empty() {
-            block.push_str(" — ");
-            block.push_str(desc);
-        }
-    }
-    for sop in &prep.sops {
-        block.push_str("\n- ");
-        block.push_str(&sop.name);
-        let desc = sop.description.trim();
-        if !desc.is_empty() {
-            block.push_str(" — ");
-            block.push_str(desc);
-        }
-    }
-    for wf in &prep.workflows {
-        block.push_str("\n- ");
-        block.push_str(&wf.name);
-        let desc = wf.description.trim();
-        if !desc.is_empty() {
-            block.push_str(" — ");
-            block.push_str(desc);
-        }
-    }
-    Some(block)
-}
-
-/// Layer a Longhouse consult brief on top of an already-composed turn prompt.
-///
-/// `prep` is `None` (consult disabled / errored) or an empty [`ocean_longhouse::TurnPrep`]
-/// → the prompt is returned **unchanged**, byte-for-byte. A non-empty prep is
-/// rendered by [`render_longhouse_prep`] and **prepended** (advisory block, blank
-/// line, then the prompt), exactly how room/operator guidance is layered
-/// (`apply_turn_guidance`) — steering context precedes the task, the task text is
-/// never mutated.
-///
-/// This is the pure seam the turn-hook test drives: feed it a known prep and
-/// assert the brief reaches the prompt; feed it `None` and assert the prompt is
-/// untouched. No env, no disk, no async.
-fn apply_longhouse_prep(prompt: &str, prep: Option<&ocean_longhouse::TurnPrep>) -> String {
-    match prep.and_then(render_longhouse_prep) {
-        Some(block) => format!("{block}\n\n{prompt}"),
-        None => prompt.to_string(),
-    }
-}
-
 /// OCEAN-40 (Phase 2): fold the client-supplied browser context into the turn
 /// prompt as a compact, additive `## Browser context` block, the same purely
 /// prompt-layering seam room/operator/longhouse guidance uses — it touches no
@@ -6680,93 +6545,6 @@ fn sanitize_browser_field(raw: &str) -> String {
     // long blank run) and trim the edges.
     let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.trim().to_string()
-}
-
-/// Hard deadline for the whole pre-turn consult. Default-on means EVERY turn
-/// runs this, so a pathologically slow skill library (a huge tree, a stalled
-/// network mount under `~/.spawner`) must never add unbounded latency to a turn.
-/// The cache makes the steady state a couple of string scans, but the *first*
-/// load after a cold start / TTL expiry still walks disk; this caps even that.
-/// On timeout we fail open — inject nothing, let the turn proceed immediately.
-const LONGHOUSE_PREP_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// The async, env-gated, off-hot-path side of the consult: when the consult is
-/// enabled ([`longhouse_prepare_enabled`], **default on** — OCEAN-283), get the
-/// **cached** local skill index and rank it against `prompt`, returning the
-/// compact [`ocean_longhouse::TurnPrep`] to inject. Returns `None` (inject
-/// nothing) when the consult is opted out, the prompt is empty, the result is
-/// empty, the scan task fails, or the prep exceeds [`LONGHOUSE_PREP_DEADLINE`] —
-/// every one of which is a **fail-open** no-op that leaves the turn exactly as it
-/// was without the hook. A consult can never block or slow a turn.
-///
-/// Two load-bearing perf guarantees, both now that default-on means every turn
-/// consults:
-/// * **No per-turn disk walk.** The index comes from
-///   [`ocean_longhouse::cached_index_for`] — a process-wide TTL cache — so the
-///   skill-library walk (`~/.spawner/skills`, `~/.codex/skills`, plus the turn's
-///   repo-local `./skills` when `cwd` is set) happens at most once per TTL window
-///   per root-set, not once per turn. The steady-state cost is ranking an
-///   already-loaded `Vec<SkillBrief>`.
-/// * **Time-bounded.** The whole consult (the cache check + any cold/stale
-///   reload + the rank) runs on `spawn_blocking` (filesystem I/O must never
-///   run on the async scheduler) AND under a [`LONGHOUSE_PREP_DEADLINE`] — if
-///   it overruns, we abandon it and inject nothing. So even a first cold load
-///   against a degraded disk caps the latency it can add to a turn.
-///
-/// This performs no side effects and touches no permission gate: it reads the
-/// cached index and ranks it, nothing more.
-async fn longhouse_prep_for_turn(prompt: String, cwd: String) -> Option<ocean_longhouse::TurnPrep> {
-    if !longhouse_prepare_enabled() {
-        return None;
-    }
-    // Empty prompt can never rank anything; skip the work entirely.
-    if prompt.trim().is_empty() {
-        return None;
-    }
-
-    let scan = tokio::task::spawn_blocking(move || {
-        let roots = if cwd.is_empty() {
-            ocean_longhouse::SkillRoots::default()
-        } else {
-            ocean_longhouse::SkillRoots::for_cwd(&cwd)
-        };
-        // Cached: at most one disk walk per TTL window per root-set, NOT per turn.
-        let index = ocean_longhouse::cached_index_for(&roots);
-        let brief = ocean_longhouse::TurnBrief {
-            prompt,
-            cwd: Some(cwd),
-            ..Default::default()
-        };
-        index.prepare(&brief)
-    });
-
-    // Time-bound the whole consult so default-on can never tax a turn: if the
-    // (rare) cold/stale reload is slow, we abandon it and inject nothing.
-    let prep = match tokio::time::timeout(LONGHOUSE_PREP_DEADLINE, scan).await {
-        Ok(joined) => joined,
-        Err(_elapsed) => {
-            tracing::warn!(
-                deadline_ms = LONGHOUSE_PREP_DEADLINE.as_millis() as u64,
-                "longhouse pre-turn consult exceeded its deadline; injecting no brief"
-            );
-            // The spawn_blocking task is detached and harmless — it only reads
-            // files + ranks; its (now-ignored) result simply warms the cache for
-            // a later turn. The current turn proceeds with no brief.
-            return None;
-        }
-    };
-
-    match prep {
-        // Empty prep → inject nothing (no library on disk, or nothing matched).
-        Ok(prep) if !prep.is_empty() => Some(prep),
-        Ok(_) => None,
-        Err(err) => {
-            // spawn_blocking only errors on a panic; the loader/ranker don't
-            // panic, but stay fail-open regardless — a turn never fails on prep.
-            tracing::warn!(error = %err, "longhouse pre-turn consult task failed; injecting no brief");
-            None
-        }
-    }
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -17636,6 +17414,67 @@ mod tests {
     }
 
     #[test]
+    fn longhouse_turn_preparation_rendering_and_application_are_exact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_path = tmp.path().join("skill-body.md");
+        let sop_path = tmp.path().join("sop-body.md");
+        let workflow_path = tmp.path().join("workflow-body.md");
+        std::fs::write(&skill_path, "SKILL_BODY_PRIVATE_SENTINEL").unwrap();
+        std::fs::write(&sop_path, "SOP_BODY_PRIVATE_SENTINEL").unwrap();
+        std::fs::write(&workflow_path, "WORKFLOW_BODY_PRIVATE_SENTINEL").unwrap();
+        let prep = ocean_longhouse::TurnPrep {
+            skills: vec![ocean_longhouse::SkillBrief {
+                name: "Skill Ω".to_string(),
+                description: "  Use first\nline two  ".to_string(),
+                source_path: skill_path.clone(),
+                source: ocean_longhouse::SkillSource::Repo,
+            }],
+            sops: vec![
+                ocean_longhouse::SopBrief {
+                    name: "Deploy SOP".to_string(),
+                    description: "  Follow the checklist  ".to_string(),
+                    source_path: sop_path.clone(),
+                },
+                ocean_longhouse::SopBrief {
+                    name: "Blank SOP".to_string(),
+                    description: "  \t ".to_string(),
+                    source_path: sop_path.clone(),
+                },
+            ],
+            workflows: vec![ocean_longhouse::WorkflowBrief {
+                name: "Nightly workflow".to_string(),
+                description: "  Run nightly  ".to_string(),
+                source_path: workflow_path.clone(),
+            }],
+        };
+        let expected = "Longhouse consult (advisory — relevant skills/SOPs for this turn; recommendations only, not granted capabilities; you still route every action through the normal permission gates):\n- Skill Ω — Use first\nline two\n- Deploy SOP — Follow the checklist\n- Blank SOP\n- Nightly workflow — Run nightly";
+        let rendered = render_longhouse_prep(&prep).expect("mixed prep renders");
+        assert_eq!(rendered, expected);
+        for private in [
+            skill_path.to_string_lossy().into_owned(),
+            sop_path.to_string_lossy().into_owned(),
+            workflow_path.to_string_lossy().into_owned(),
+            "SKILL_BODY_PRIVATE_SENTINEL".to_string(),
+            "SOP_BODY_PRIVATE_SENTINEL".to_string(),
+            "WORKFLOW_BODY_PRIVATE_SENTINEL".to_string(),
+        ] {
+            assert!(!rendered.contains(&private), "render leaked {private}");
+        }
+
+        for prompt in ["", " \n\t ", "\n  preserve this task byte-for-byte  \n\n"] {
+            assert_eq!(
+                apply_longhouse_prep(prompt, Some(&prep)),
+                format!("{expected}\n\n{prompt}")
+            );
+            assert_eq!(apply_longhouse_prep(prompt, None), prompt);
+            assert_eq!(
+                apply_longhouse_prep(prompt, Some(&ocean_longhouse::TurnPrep::default())),
+                prompt
+            );
+        }
+    }
+
+    #[test]
     fn apply_browser_context_none_leaves_prompt_byte_for_byte() {
         // OCEAN-40 fail-open: no browser context → prompt returned unchanged.
         let prompt = "summarize this page";
@@ -17866,7 +17705,7 @@ mod tests {
         );
 
         // Explicit opt-OUT spellings turn it off.
-        for off in ["0", "false", "FALSE", "no", "off", "Off"] {
+        for off in ["0", "false", "FALSE", "no", "off", "Off", " \tOFF\n"] {
             env::set_var("OCEAN_LONGHOUSE_PREPARE", off);
             assert!(
                 !longhouse_prepare_enabled(),
@@ -17876,7 +17715,16 @@ mod tests {
 
         // ON spellings (and, deliberately, anything unrecognized) keep it on — the
         // default-on bias means only an explicit off disables it.
-        for on in ["1", "true", "TRUE", "Yes", "on", "", "nonsense"] {
+        for on in [
+            "1",
+            "true",
+            "TRUE",
+            "Yes",
+            "on",
+            "",
+            "nonsense",
+            " off-ish ",
+        ] {
             env::set_var("OCEAN_LONGHOUSE_PREPARE", on);
             assert!(
                 longhouse_prepare_enabled(),
@@ -18016,13 +17864,16 @@ mod tests {
             "an unmatched prompt must inject nothing (fail-open), got {none:?}"
         );
 
-        // (c) Fail-open on an empty prompt: skip the scan entirely → None.
-        assert!(
-            longhouse_prep_for_turn(String::new(), cwd.to_string_lossy().into_owned())
-                .await
-                .is_none(),
-            "an empty prompt can rank nothing and must inject nothing"
-        );
+        // (c) Fail-open on an empty or whitespace-only prompt: skip the scan
+        // entirely → None.
+        for empty in [String::new(), " \n\t ".to_string()] {
+            assert!(
+                longhouse_prep_for_turn(empty, cwd.to_string_lossy().into_owned())
+                    .await
+                    .is_none(),
+                "an empty prompt can rank nothing and must inject nothing"
+            );
+        }
 
         match prior {
             Some(v) => env::set_var("OCEAN_LONGHOUSE_PREPARE", v),
@@ -18061,6 +17912,292 @@ mod tests {
             bounded.is_err(),
             "a prep that exceeds its deadline must time out (→ fail-open None), not block the turn"
         );
+    }
+
+    #[test]
+    fn longhouse_turn_preparation_source_preserves_blocking_fail_open_boundary() {
+        fn function_item<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source.find(signature).expect("function signature");
+            let relative_end = source[start..]
+                .find("\n}\n")
+                .expect("top-level function end");
+            &source[start..start + relative_end + 3]
+        }
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main_path = src_dir.join("main.rs");
+        let main_source = std::fs::read_to_string(&main_path).expect("daemon composition source");
+        let production_main = main_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production main prefix");
+        let extracted = src_dir.join("longhouse_turn_preparation.rs");
+        let is_extracted = extracted.exists();
+        let source = if is_extracted {
+            assert!(production_main.contains("mod longhouse_turn_preparation;"));
+            assert!(production_main.contains("use longhouse_turn_preparation::{"));
+            for signature in [
+                ["fn longhouse_prepare_", "enabled() -> bool"].concat(),
+                ["fn render_longhouse_", "prep("].concat(),
+                ["fn apply_longhouse_", "prep("].concat(),
+                ["async fn longhouse_", "prep_for_turn("].concat(),
+            ] {
+                assert!(
+                    !production_main.contains(&signature),
+                    "production definition remained in main.rs: {signature}"
+                );
+            }
+            std::fs::read_to_string(&extracted).expect("extracted turn-preparation source")
+        } else {
+            main_source
+        };
+        let gate = function_item(&source, "fn longhouse_prepare_enabled() -> bool");
+        let render = function_item(&source, "fn render_longhouse_prep(");
+        let apply = function_item(&source, "fn apply_longhouse_prep(");
+        let prepare = function_item(&source, "async fn longhouse_prep_for_turn(");
+
+        assert!(gate.contains("env::var(\"OCEAN_LONGHOUSE_PREPARE\")"));
+        assert!(gate.contains("v.trim().to_ascii_lowercase().as_str()"));
+        assert!(gate.contains("\"0\" | \"false\" | \"no\" | \"off\""));
+        assert!(gate.contains("Err(_) => true"));
+
+        let skill = render.find("for skill in &prep.skills").unwrap();
+        let sop = render.find("for sop in &prep.sops").unwrap();
+        let workflow = render.find("for wf in &prep.workflows").unwrap();
+        assert!(skill < sop && sop < workflow);
+        assert!(render.contains("let desc = skill.description.trim();"));
+        assert!(render.contains("let desc = sop.description.trim();"));
+        assert!(render.contains("let desc = wf.description.trim();"));
+        assert!(apply.contains("Some(block) => format!(\"{block}\\n\\n{prompt}\")"));
+        assert!(apply.contains("None => prompt.to_string()"));
+        let deadline_prefix = ["const LONGHOUSE_PREP_", "DEADLINE:"].concat();
+        let deadline_start = source.find(&deadline_prefix).expect("deadline constant");
+        let deadline_end = source[deadline_start..].find(';').unwrap() + deadline_start + 1;
+        let normalize_source = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected_deadline = [
+            "const LONGHOUSE_PREP_",
+            "DEADLINE: std::time::Duration = std::time::Duration::from_millis(",
+            "250",
+            ");",
+        ]
+        .concat();
+        assert_eq!(
+            normalize_source(&source[deadline_start..deadline_end]),
+            expected_deadline
+        );
+
+        let gate_check = prepare.find("if !longhouse_prepare_enabled()").unwrap();
+        let empty_check = prepare.find("if prompt.trim().is_empty()").unwrap();
+        let spawn = prepare
+            .find("tokio::task::spawn_blocking(move || {")
+            .unwrap();
+        let empty_cwd = prepare.find("if cwd.is_empty()").unwrap();
+        let default_roots = prepare
+            .find("ocean_longhouse::SkillRoots::default()")
+            .unwrap();
+        let cwd_roots = prepare
+            .find("ocean_longhouse::SkillRoots::for_cwd(&cwd)")
+            .unwrap();
+        let cache = prepare
+            .find("ocean_longhouse::cached_index_for(&roots)")
+            .unwrap();
+        let brief = prepare.find("ocean_longhouse::TurnBrief {").unwrap();
+        let brief_cwd = prepare.find("cwd: Some(cwd),").unwrap();
+        let rank = prepare.find("index.prepare(&brief)").unwrap();
+        let closure_end = prepare.find("\n    });").unwrap();
+        let timeout = prepare
+            .find("tokio::time::timeout(LONGHOUSE_PREP_DEADLINE, scan).await")
+            .unwrap();
+        let timeout_match_end = prepare
+            .find("\n    };\n\n    match prep {")
+            .expect("timeout match end");
+        let outcome = prepare.find("match prep {").unwrap();
+        assert!(
+            gate_check < empty_check
+                && empty_check < spawn
+                && spawn < empty_cwd
+                && empty_cwd < default_roots
+                && default_roots < cwd_roots
+                && cwd_roots < cache
+                && cache < brief
+                && brief < brief_cwd
+                && brief_cwd < rank
+                && rank < closure_end
+                && closure_end < timeout
+                && timeout < timeout_match_end
+                && timeout_match_end < outcome
+        );
+        let timeout_branch = &prepare[timeout..timeout_match_end];
+        assert!(timeout_branch.contains("Err(_elapsed) => {"));
+        assert!(timeout_branch.contains("return None;"));
+        let outcomes = &prepare[outcome..];
+        assert!(outcomes.contains("Ok(prep) if !prep.is_empty() => Some(prep)"));
+        assert!(outcomes.contains("Ok(_) => None"));
+        assert!(outcomes.contains("Err(err) => {"));
+        assert!(outcomes.contains("\n            None\n"));
+        assert!(!prepare.contains("current_dir"));
+        assert!(prepare.contains("Dropping the join handle does not cancel this read-only task."));
+        assert!(prepare.contains("process-wide cache lock"));
+        assert_eq!(prepare.matches("tracing::warn!(").count(), 2);
+        let timeout_warning_start = prepare.find("tracing::warn!(").unwrap();
+        let timeout_warning_end = prepare[timeout_warning_start..]
+            .find("\n            );")
+            .unwrap()
+            + timeout_warning_start
+            + "\n            );".len();
+        let join_warning_start = prepare[timeout_warning_end..]
+            .find("tracing::warn!(")
+            .unwrap()
+            + timeout_warning_end;
+        let join_warning_end = prepare[join_warning_start..]
+            .find(";\n            None")
+            .unwrap()
+            + join_warning_start
+            + 1;
+        let normalize = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            normalize(&prepare[timeout_warning_start..timeout_warning_end]),
+            normalize(
+                "tracing::warn!( deadline_ms = LONGHOUSE_PREP_DEADLINE.as_millis() as u64, \"longhouse pre-turn consult exceeded its deadline; injecting no brief\" );"
+            )
+        );
+        assert_eq!(
+            normalize(&prepare[join_warning_start..join_warning_end]),
+            normalize(
+                "tracing::warn!(error = %err, \"longhouse pre-turn consult task failed; injecting no brief\");"
+            )
+        );
+
+        let boundary = format!("{gate}\n{render}\n{apply}\n{prepare}");
+        let authority_boundary = if is_extracted {
+            source.as_str()
+        } else {
+            boundary.as_str()
+        };
+        for forbidden in [
+            "State<AppState>",
+            ".emit(",
+            "tokio::spawn(",
+            "AgentRuntime",
+            "PermissionPolicy",
+            "runtime.prompt",
+            "skills_fetch",
+            "subagent_spec",
+            "room_livekit_token",
+        ] {
+            assert!(
+                !authority_boundary.contains(forbidden),
+                "turn-preparation boundary gained authority marker {forbidden:?}"
+            );
+        }
+        if is_extracted {
+            let definitions = source
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| {
+                    line.starts_with("fn ")
+                        || line.starts_with("async fn ")
+                        || line.starts_with("pub(super) fn ")
+                        || line.starts_with("pub(super) async fn ")
+                })
+                .count();
+            assert_eq!(definitions, 4, "private owner gained an extra function");
+            assert_eq!(source.matches(&deadline_prefix).count(), 1);
+            assert!(!source.contains("\nstruct "));
+            assert!(!source.contains("\nenum "));
+        }
+    }
+
+    #[test]
+    fn longhouse_turn_preparation_call_sites_and_order_are_exact() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let from = source.find(start).expect("section start");
+            let to = source[from..].find(end).expect("section end") + from;
+            &source[from..to]
+        }
+
+        let source = include_str!("main.rs");
+        let prep_call = ["let consult = longhouse_", "prep_for_turn("].concat();
+        let apply_call = ["= apply_longhouse_", "prep("].concat();
+        assert_eq!(source.matches(&prep_call).count(), 3);
+
+        let prompt = section(source, "async fn prompt(", "async fn create_request(");
+        assert_eq!(prompt.matches(&apply_call).count(), 1);
+        let prompt_cwd = prompt.find("state.runtime.resolve_cwd_for_turn(").unwrap();
+        let prompt_registration = prompt.find("register_running_request(").unwrap();
+        let prompt_user_event = prompt.find("emit_user_message(&state.events").unwrap();
+        let prompt_prep = prompt.find(&prep_call).unwrap();
+        let prompt_apply = prompt.find(&apply_call).unwrap();
+        let prompt_control = prompt.find("let control = build_prompt_control(").unwrap();
+        let prompt_runtime = prompt
+            .find("state.runtime.prompt(req, control).await")
+            .unwrap();
+        assert!(
+            prompt_cwd < prompt_registration
+                && prompt_registration < prompt_user_event
+                && prompt_user_event < prompt_prep
+                && prompt_prep < prompt_apply
+                && prompt_apply < prompt_control
+                && prompt_control < prompt_runtime
+        );
+        assert!(prompt.contains("req.prompt.clone(), req.cwd.clone()"));
+        assert!(
+            prompt.contains("req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());")
+        );
+
+        let create = section(
+            source,
+            "async fn create_request(",
+            "async fn cancel_request(",
+        );
+        assert_eq!(create.matches(&apply_call).count(), 1);
+        let create_user_event = create.find("emit_user_message(&state.events").unwrap();
+        let spawn = create
+            .find("let handle = tokio::spawn(async move {")
+            .unwrap();
+        let permit = create.find("let _turn_permit = permit;").unwrap();
+        let create_prep = create.find(&prep_call).unwrap();
+        let create_apply = create.find(&apply_call).unwrap();
+        let create_runtime = create
+            .find("task_state.runtime.prompt(req, control).await")
+            .unwrap();
+        let spawned_end = create.find("\n    });\n    attach_request_handle").unwrap();
+        let response = create.rfind("Json(RequestCreateResponse {").unwrap();
+        assert!(
+            create_user_event < spawn
+                && spawn < permit
+                && permit < create_prep
+                && create_prep < create_apply
+                && create_apply < create_runtime
+                && create_runtime < spawned_end
+                && spawned_end < response
+        );
+        assert!(create.contains("req.prompt.clone(), req.cwd.clone()"));
+        assert!(
+            create.contains("req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());")
+        );
+
+        let agent = section(source, "async fn agent_turn(", "fn render_turn_guidance(");
+        assert_eq!(agent.matches(&apply_call).count(), 1);
+        let agent_cwd = agent.find("state.runtime.resolve_cwd_for_turn(").unwrap();
+        let turn_started = agent.find("AgentTurnEvent::TurnStarted {").unwrap();
+        let named_agent_end = agent
+            .find("None => (guided_prompt, None, None, None),\n    };")
+            .unwrap();
+        let agent_prep = agent.find(&prep_call).unwrap();
+        let agent_apply = agent.find(&apply_call).unwrap();
+        let browser = agent.find("apply_browser_context(").unwrap();
+        let registration = agent.find("register_running_request(").unwrap();
+        assert!(
+            agent_cwd < turn_started
+                && turn_started < named_agent_end
+                && named_agent_end < agent_prep
+                && agent_prep < agent_apply
+                && agent_apply < browser
+                && browser < registration
+        );
+        assert!(agent.contains("prompt.clone(), cwd.clone()"));
+        assert!(agent.contains("apply_longhouse_prep(&guided_prompt, consult.as_ref())"));
     }
 
     // ---- OCEAN-231: handler-level tests for the livekit-token + call_place ----
