@@ -21,8 +21,9 @@ pub use providers::{
 };
 pub use stream::AssistantMessageEventStream;
 pub use types::{
-    now_ms, AssistantMessage, AssistantMessageEvent, AuthMethod, Content, Context, Message, Model,
-    StopReason, StreamOptions, ThinkingLevel, Tool, ToolResultMessage, Usage,
+    now_ms, AssistantMessage, AssistantMessageEvent, AuthMethod, Content, Context,
+    DynamicToolDeclaration, Message, Model, StopReason, StreamOptions, ThinkingLevel, Tool,
+    ToolChoice, ToolResultMessage, Usage,
 };
 
 /// Entry point that mirrors `streamSimple()` in ocean-protocol TS: pick the provider
@@ -48,6 +49,12 @@ pub async fn stream_simple(
     context: &Context,
     options: &StreamOptions,
 ) -> Result<AssistantMessageEventStream> {
+    if !context.dynamic_tool_declarations.is_empty() && !model.supports_dynamic_tools() {
+        return Err(Error::UnsupportedProvider(format!(
+            "dynamic tool declarations require exact kimi-k3 route, got {}/{}",
+            model.provider, model.id
+        )));
+    }
     match model.api.as_str() {
         "anthropic-messages" => {
             AnthropicProvider::new()

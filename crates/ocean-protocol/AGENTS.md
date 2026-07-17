@@ -26,6 +26,15 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Codex OAuth turns with a bound Ocean session must use that stable session id
   for both `prompt_cache_key` and the HTTP `session_id`; a fresh UUID is only
   valid for ad-hoc provider calls with no session.
+- Dynamic tool declarations are ordered request-only Kimi K3 epochs. Only the
+  exact `openai-completions`/`kimi`/`kimi-k3` route on Moonshot's official endpoint
+  may encode nonempty groups, as content-less `role: system` messages at validated
+  transcript indices; unsupported routes, duplicate tools, unsorted groups, and
+  the 16-tool/512-KiB overflow fail closed. Historical epochs remain separate.
+  Final synthesis retains them for history validity while emitting
+  `tool_choice: "none"`. K3 omits fixed temperature, uses
+  `max_completion_tokens`, maps enabled reasoning to `max`, and replays
+  `reasoning_content` only from same-provider `kimi-k3` assistant history.
 - `OCEAN_PROMPT_CAPTURE_DIR` is an opt-in local diagnostics path: capture the
   complete serialized JSON body only (never request headers or endpoint URLs),
   warn-and-continue on capture failures, and retain owner-only permissions

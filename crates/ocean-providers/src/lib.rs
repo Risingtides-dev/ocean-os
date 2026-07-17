@@ -39,6 +39,11 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 // (see `minimax_base_url`) to point back at the mainland platform.
 const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
+// Kimi K3's published context window is 1M tokens. Moonshot permits up to 1M
+// completion tokens, but Ocean intentionally keeps its conservative 8K output
+// reservation so one turn cannot consume the entire shared context by default.
+const KIMI_K3_CONTEXT_WINDOW: u32 = 1_000_000;
+const KIMI_MAX_OUTPUT_TOKENS: u32 = 8_192;
 // Google Generative AI (Gemini). Routed through ocean-protocol's
 // `google-generative-ai` provider, which targets the v1beta surface under
 // this base — not an OpenAI-compatible endpoint.
@@ -63,7 +68,7 @@ pub enum ProviderId {
     ClaudeCode,
     /// MiniMax (OpenAI-compatible chat-completions; M2 family).
     MiniMax,
-    /// Moonshot AI / Kimi (OpenAI-compatible chat-completions; K2 family).
+    /// Moonshot AI / Kimi (OpenAI-compatible chat-completions; K2/K3 family).
     Kimi,
     /// Z.AI / Zhipu GLM (OpenAI-compatible chat-completions; GLM-4/5 family).
     Glm,
@@ -701,6 +706,7 @@ pub fn known_models() -> Vec<KnownModel> {
         // resolver lowercases the lookup key, so these still route correctly.
         m("MiniMax-M2.7", "minimax", "MiniMax M2.7"),
         m("MiniMax-M2", "minimax", "MiniMax M2"),
+        m("kimi-k3", "kimi", "Kimi K3"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
         m("glm-5.2", "glm", "GLM 5.2"),
@@ -985,14 +991,22 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             200_000,
             8_192,
         )),
-        // Moonshot AI / Kimi K2 family. Official OpenAI-compatible base; model
-        // ids are lowercase so casing survives normalization as-is.
+        // Moonshot AI / Kimi family. Official OpenAI-compatible base; model ids
+        // are lowercase so casing survives normalization as-is. Keep the bare
+        // `kimi` alias on K2.6 for backward compatibility; K3 is opt-in.
+        "kimi-k3" => Ok(model_selection(
+            ProviderId::Kimi,
+            "kimi-k3",
+            MOONSHOT_BASE_URL,
+            KIMI_K3_CONTEXT_WINDOW,
+            KIMI_MAX_OUTPUT_TOKENS,
+        )),
         "kimi" | "kimi-k2.6" | "kimi-k2-6" => Ok(model_selection(
             ProviderId::Kimi,
             "kimi-k2.6",
             MOONSHOT_BASE_URL,
             256_000,
-            8_192,
+            KIMI_MAX_OUTPUT_TOKENS,
         )),
         "kimi-k2" | "moonshot-v1" => Ok(model_selection(
             ProviderId::Kimi,
@@ -1197,13 +1211,20 @@ fn model_for_explicit_provider(
             200_000,
             8_192,
         )),
-        "kimi" | "moonshot" => Ok(model_selection(
-            ProviderId::Kimi,
-            model,
-            MOONSHOT_BASE_URL,
-            256_000,
-            8_192,
-        )),
+        "kimi" | "moonshot" => {
+            let context_window = if model == "kimi-k3" {
+                KIMI_K3_CONTEXT_WINDOW
+            } else {
+                256_000
+            };
+            Ok(model_selection(
+                ProviderId::Kimi,
+                model,
+                MOONSHOT_BASE_URL,
+                context_window,
+                KIMI_MAX_OUTPUT_TOKENS,
+            ))
+        }
         "glm" | "zhipu" | "zhipuai" => Ok(model_selection(
             ProviderId::Glm,
             model,
@@ -1513,6 +1534,23 @@ mod tests {
             resolve_model_selection(&env(&[("OCEAN_MODEL", "DeepSeek V4 Pro")])).unwrap();
         assert_eq!(selection.provider, ProviderId::DeepSeek);
         assert_eq!(selection.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn maps_kimi_k3_to_moonshot_with_published_context_and_conservative_output() {
+        let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", "kimi-k3")])).unwrap();
+        assert_eq!(selection.provider, ProviderId::Kimi);
+        assert_eq!(selection.model, "kimi-k3");
+        assert_eq!(selection.base_url, MOONSHOT_BASE_URL);
+        assert_eq!(selection.context_window, 1_000_000);
+        assert_eq!(selection.max_output_tokens, 8_192);
+
+        let legacy = resolve_model_selection(&env(&[("OCEAN_MODEL", "kimi")])).unwrap();
+        assert_eq!(
+            legacy.model, "kimi-k2.6",
+            "bare alias remains backward compatible"
+        );
+        assert_eq!(legacy.context_window, 256_000);
     }
 
     #[test]
@@ -1881,6 +1919,7 @@ mod tests {
             // current.model, and known_models() advertises the same string.
             "MiniMax-M2",
             "MiniMax-M2.7",
+            "kimi-k3",
             "kimi-k2.6",
             "kimi-k2",
             "glm-5.2",

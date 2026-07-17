@@ -29,6 +29,19 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - A tool-call batch runs through the concurrency scheduler (`agent_loop.rs`): consecutive `Concurrency::Shared` (read-only) tools run in one concurrent segment; a `Concurrency::Exclusive` tool (the default) is a full barrier. A new tool defaults to `Exclusive` — only override `concurrency()` to `Shared` when the tool is genuinely side-effect-free. Live `ToolExecutionEnd` + side-effect events must emit in completion order as each segment member finishes; persisted `ToolResult`s must remain in original batch order for provider pairing.
 - Blocking await boundaries in the agent loop (provider stream read, tool execution, retry backoff) must race the cancel token pre-yield via a biased `tokio::select!` on `cancelled(config)`. At a tool cancellation boundary, checkpoint the entire assistant tool-call batch with ordered real or conservative results, including not-yet-started barrier calls; completed side effects must never disappear into replayable history.
 - Every provider round in a bound agent session must copy `AgentConfig::session_id` into `StreamOptions::session_id`; providers use that stable identity for cross-round prompt caching and request correlation.
+- Exact `kimi`/`kimi-k3` turns use bounded dynamic tool discovery: expose only
+  the synthetic permission-free `search_tools` globally and return at most eight
+  deterministic matches per search. Durable search results persist names only;
+  every run reconstructs up to sixteen loaded definitions / 512 KiB from session
+  transcript truth, retaining each search epoch as a separate declaration after
+  its result and before later calls. If compaction removed the result, anchor the
+  recovered tool immediately before its first surviving call (or at transcript
+  end when none survives). `search_tools` is reserved and collisions fail closed.
+  A real call must have been offered in that exact provider round before ordinary
+  permission, cancellation, and execution handling may dispatch it; same-batch
+  search results never grant execution authority. Final synthesis retains all
+  historical declarations, sets `tool_choice` to `none`, and offers no executable
+  tool.
 - The reproducible history-cost kernel is `examples/history_cost_bench.rs`: run it in release mode from a clean revision with the fixed 10/100/1,000-message × 1/5/20-round matrix. Treat it as trim/serialization/clone scaling evidence, not end-to-end turn latency.
 - Hashline-enabled sessions expose both `edit` and `hashline_edit`; every profile retains `write`. Artifact spill is enabled by the daemon for TUI/ACP/CLI/web and disabled for voice; direct callers default off. These are the only effective profile gates currently copied into `SessionContext`. Controlled GPT-5.6 Terra benchmarks showed that hiding `edit` changed model exploration behavior and doubled wall time even when the model still selected `hashline_edit`.
 - `TodoTool` state is session-scoped in memory for bound sessions so the

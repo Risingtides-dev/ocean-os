@@ -26,6 +26,10 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 - Persisted history search reads only display-projected user/assistant transcript text; it must never inspect tool payloads/raw provider messages or invoke providers/embeddings. Preflight cumulative raw session-file size against the 64 MiB request budget, then enforce the same cumulative bound while reading so concurrent replacement/growth cannot bypass it.
 - `PromptControl::without_tools()` is the fail-closed no-capabilities boundary. Empty or unmatched folder-agent allowlists intentionally remain fail-open and must never represent a no-tools posture.
 - `PromptControl` receives exactly two effective harness-profile booleans from the daemon: `hashline_edits` and `artifact_spill`. Direct/legacy callers default both off; do not add declarative profile fields here until production runtime composition actually consumes them.
+- History shaping preserves stored thinking only when the selected route is exact
+  `kimi`/`kimi-k3`, because Moonshot requires same-model `reasoning_content`
+  replay. Kimi K2.x and other OpenAI-compatible routes retain the existing
+  thinking-strip boundary; provider encoders still drop cross-provider thinking.
 
 ## Work Guidance
 

@@ -542,6 +542,8 @@ impl AgentRuntime {
             system_prompt: Some(system_prompt.to_string()),
             messages: vec![Message::user_text(user_text)],
             tools: Vec::new(),
+            dynamic_tool_declarations: Vec::new(),
+            tool_choice: ocean_protocol::ToolChoice::Auto,
         };
 
         let mut options = ocean_protocol::StreamOptions {
@@ -1503,19 +1505,15 @@ impl AgentRuntime {
                 "compacted session history: elided old tool results past the token trigger"
             );
         }
-        // OpenAI-compatible providers (DeepSeek, OpenAI o-series, xAI, etc.)
-        // do not accept assistant `thinking` blocks as input on the next turn —
-        // reasoning is output-only. Strip them on replay. Anthropic stores
-        // thinking with a signature and is happy to receive it back.
-        if matches!(
-            snapshot.provider_config.selection.provider,
-            ProviderId::DeepSeek
-                | ProviderId::OpenAi
-                | ProviderId::OpenAiCodex
-                | ProviderId::OpenAiCompatible
-                | ProviderId::MiniMax
-                | ProviderId::Kimi
-        ) {
+        // Most OpenAI-compatible providers do not accept Ocean's assistant
+        // `thinking` blocks on replay, so strip them before the runtime turn.
+        // Anthropic replays signed thinking; exact Kimi K3 separately requires
+        // its prior `reasoning_content`, which the OpenAI adapter reconstructs.
+        let selection = &snapshot.provider_config.selection;
+        if should_strip_assistant_thinking(&selection.provider, &selection.model) {
+            // Kimi K3 is the sole Chat Completions exception: Moonshot requires
+            // same-model reasoning_content replay across tool rounds. K2.x and
+            // every other backend above retain the cross-provider privacy drop.
             strip_assistant_thinking_content(&mut history);
         }
         // Per-turn surface flag (Fix 2): every user turn is prefixed with a
@@ -2853,6 +2851,17 @@ pub fn lsp_servers(cwd: &std::path::Path) -> Vec<LspServerView> {
         .collect()
 }
 
+fn should_strip_assistant_thinking(provider: &ProviderId, model: &str) -> bool {
+    matches!(
+        provider,
+        ProviderId::DeepSeek
+            | ProviderId::OpenAi
+            | ProviderId::OpenAiCodex
+            | ProviderId::OpenAiCompatible
+            | ProviderId::MiniMax
+    ) || (*provider == ProviderId::Kimi && model != "kimi-k3")
+}
+
 fn strip_assistant_thinking_content(messages: &mut [Message]) {
     for message in messages {
         if let Message::Assistant(assistant) = message {
@@ -4131,6 +4140,26 @@ done
             panic!("expected assistant message");
         };
         assert_eq!(assistant.content, vec![Content::text("visible answer")]);
+    }
+
+    #[test]
+    fn history_shaping_preserves_thinking_only_for_exact_kimi_k3_route() {
+        assert!(!should_strip_assistant_thinking(
+            &ProviderId::Kimi,
+            "kimi-k3"
+        ));
+        assert!(should_strip_assistant_thinking(
+            &ProviderId::Kimi,
+            "kimi-k2.6"
+        ));
+        assert!(should_strip_assistant_thinking(
+            &ProviderId::OpenAi,
+            "kimi-k3"
+        ));
+        assert!(should_strip_assistant_thinking(
+            &ProviderId::OpenAiCompatible,
+            "kimi-k3"
+        ));
     }
 
     #[tokio::test]
