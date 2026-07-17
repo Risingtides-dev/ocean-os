@@ -86,6 +86,15 @@ impl Session {
         self.messages = messages;
         self.updated_ms = ocean_protocol::now_ms();
     }
+
+    /// Pin this session to a model + provider (session-config RPC v1). The pair
+    /// always moves together — `provider` is derived from the model catalog by
+    /// the caller, never trusted independently.
+    pub fn set_model(&mut self, model: String, provider: String) {
+        self.model = model;
+        self.provider = provider;
+        self.updated_ms = ocean_protocol::now_ms();
+    }
 }
 
 /// Resolve the workspace root for `cwd`. Tries `git rev-parse --show-toplevel`
@@ -906,7 +915,7 @@ fn first_user_text(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
-fn session_detail(session: Session) -> SessionDetail {
+pub(crate) fn session_detail(session: Session) -> SessionDetail {
     let title = first_user_text(&session.messages);
     let transcript = session
         .messages

@@ -1295,6 +1295,29 @@ impl AgentRuntime {
         Ok(true)
     }
 
+    /// Pin a persisted session to a model + provider (session-config RPC v1,
+    /// `PATCH /v1/agent/sessions/{id}/config`). Load-mutate-persist under the
+    /// same per-session lock as the run path, so a concurrent turn's
+    /// load→run→save can never clobber the pin (or vice versa). Returns
+    /// `Ok(None)` when no such session exists — the caller maps that to 404.
+    /// The caller resolves `provider` from the model catalog; this method
+    /// stores the pair as given.
+    pub async fn set_session_model(
+        &self,
+        id: SessionId,
+        model: String,
+        provider: String,
+    ) -> anyhow::Result<Option<SessionDetail>> {
+        let lock = self.session_lock(id);
+        let _guard = lock.lock().await;
+        let Some(mut session) = session::load_resumable(&self.config_dir, id)? else {
+            return Ok(None);
+        };
+        session.set_model(model, provider);
+        session::save(&self.config_dir, &session)?;
+        Ok(Some(session::session_detail(session)))
+    }
+
     /// Explicitly mint a session container *before* any turn is run, per the
     /// ecosystem contract. Mirrors the implicit create-on-turn path's session
     /// setup (mint id → `bind_workspace(cwd)` → persist) but runs no agent loop

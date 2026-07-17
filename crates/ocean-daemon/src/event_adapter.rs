@@ -45,6 +45,10 @@ pub(super) fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> 
             title: _,
             cwd: _,
         } => Some(OceanEvent::SessionCreated),
+        // Session-config RPC v1: config pins are agent-rail-only state; no
+        // legacy OceanEvent consumer renders them, so they skip the mirror
+        // like the other unmapped variants.
+        AgentTurnEvent::SessionConfigChanged { .. } => None,
         AgentTurnEvent::Extension { .. } => None,
         AgentTurnEvent::ComponentRender { .. } => None,
         AgentTurnEvent::ComponentUnmount { .. } => None,
@@ -65,6 +69,7 @@ pub(super) fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
         AgentTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
         AgentTurnEvent::TurnFinished { .. } => "turn_finished",
         AgentTurnEvent::SessionCreated { .. } => "session_created",
+        AgentTurnEvent::SessionConfigChanged { .. } => "session_config_changed",
         AgentTurnEvent::Extension { .. } => "extension",
         AgentTurnEvent::ComponentRender { .. } => "component_render",
         AgentTurnEvent::ComponentUnmount { .. } => "component_unmount",
@@ -178,6 +183,14 @@ mod tests {
                     cwd: "/tmp".into(),
                 },
                 "session_created",
+            ),
+            (
+                AgentTurnEvent::SessionConfigChanged {
+                    session_id,
+                    model: "deepseek-v4-pro".into(),
+                    provider: "deepseek".into(),
+                },
+                "session_config_changed",
             ),
             (
                 AgentTurnEvent::Extension {

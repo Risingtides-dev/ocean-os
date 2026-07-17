@@ -628,6 +628,16 @@ pub enum AgentTurnEvent {
         title: String,
         cwd: String,
     },
+    /// A session's persisted config changed outside a turn (session-config
+    /// RPC v1): `PATCH /v1/agent/sessions/{id}/config` re-pinned the session's
+    /// model. Surfaces attached to this session should refresh any model
+    /// readout; the session's next turn submitted without an explicit
+    /// `model_id` (or `role`) runs on this model.
+    SessionConfigChanged {
+        session_id: AgentSessionId,
+        model: String,
+        provider: String,
+    },
     /// The agent wants the client to mount or update an interactive component.
     /// Clients maintain a component registry per session and render these
     /// as live UI elements (kanban, forms, tables, etc.).
@@ -741,6 +751,7 @@ impl AgentTurnEvent {
             | AgentTurnEvent::ToolCallFinished { session_id, .. }
             | AgentTurnEvent::TurnFinished { session_id, .. }
             | AgentTurnEvent::SessionCreated { session_id, .. }
+            | AgentTurnEvent::SessionConfigChanged { session_id, .. }
             | AgentTurnEvent::ComponentRender { session_id, .. }
             | AgentTurnEvent::ComponentUnmount { session_id, .. }
             | AgentTurnEvent::BrowserActivity { session_id, .. }
@@ -1281,6 +1292,13 @@ mod tests {
                     crate::slack_canvas::SlackCanvasId::new("F0123ABCD"),
                 ),
             },
+            // Session-config RPC v1: a config pin announced on the session's
+            // stream — scoped like every other session-bearing event.
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: sid,
+                model: "deepseek-v4-pro".into(),
+                provider: "deepseek".into(),
+            },
             // Session-scoped Extension: behaves like any session-bearing event.
             AgentTurnEvent::Extension {
                 extension: "longhouse".into(),
@@ -1303,6 +1321,7 @@ mod tests {
                 | AgentTurnEvent::ToolCallFinished { .. }
                 | AgentTurnEvent::TurnFinished { .. }
                 | AgentTurnEvent::SessionCreated { .. }
+                | AgentTurnEvent::SessionConfigChanged { .. }
                 | AgentTurnEvent::ComponentRender { .. }
                 | AgentTurnEvent::ComponentUnmount { .. }
                 | AgentTurnEvent::BrowserActivity { .. }

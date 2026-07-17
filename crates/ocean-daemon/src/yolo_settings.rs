@@ -47,7 +47,7 @@ pub(super) fn effective_permission_mode() -> PermissionMode {
     }
 }
 
-fn permission_env_override() -> Option<PermissionMode> {
+pub(super) fn permission_env_override() -> Option<PermissionMode> {
     let persisted = persisted_permission_mode().unwrap_or_default();
     match yolo_env_pref() {
         Some(true) if persisted != PermissionMode::SkipAll => Some(PermissionMode::SkipAll),

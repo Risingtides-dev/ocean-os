@@ -169,8 +169,8 @@ use slack_canvas_fulfillment::{
 };
 use workspace_policy::{resolve_bound_cwd, session_detail_scope_check};
 use yolo_settings::{
-    effective_permission_mode, effective_yolo, permission_settings_get, permission_settings_set,
-    resolve_request_permission_mode, yolo_setting_get, yolo_setting_set,
+    effective_permission_mode, effective_yolo, permission_env_override, permission_settings_get,
+    permission_settings_set, resolve_request_permission_mode, yolo_setting_get, yolo_setting_set,
 };
 
 #[cfg(test)]
@@ -601,6 +601,12 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
             get(agent_sessions).post(agent_sessions_create),
         )
         .route("/v1/agent/sessions/{id}", get(agent_session))
+        // Session-config RPC v1: read + repin a session's model over daemon
+        // RPC (phone-driven control instead of injected keystrokes).
+        .route(
+            "/v1/agent/sessions/{id}/config",
+            get(agent_session_config_get).patch(agent_session_config_patch),
+        )
         .route("/v1/agent/history/search", get(history_search))
         // Voice phases 2/3: ephemeral Realtime client-secret mint (the
         // browser talks WebRTC directly to OpenAI with the returned secret;
@@ -1203,6 +1209,8 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/agent/sessions",
         "GET /v1/agent/sessions",
         "GET /v1/agent/sessions/{id}",
+        "GET /v1/agent/sessions/{id}/config",
+        "PATCH /v1/agent/sessions/{id}/config",
         "GET /v1/agent/history/search",
         "POST /v1/agent/sessions/{id}/messages",
         "POST /v1/voice/realtime/client-secret",
@@ -5776,7 +5784,32 @@ async fn agent_turn(
     // override (OCEAN-36) wins over the global model for this readout, so the
     // client sees the model that actually drives the turn.
     let (_provider, global_model) = state.runtime.current_model();
-    let turn_model = model_id.clone().unwrap_or(global_model);
+    // Session-config RPC v1: a resumed session whose persisted model differs
+    // from the global selection pins that model as the turn's default. A pin
+    // equal to the global model is treated as unpinned so pre-RPC sessions
+    // (which all recorded the global model at creation) keep following the
+    // global selection exactly as before.
+    let session_model: Option<String> = if is_new_session {
+        None
+    } else {
+        state
+            .runtime
+            .session_detail(core_sid(session_id))
+            .ok()
+            .map(|detail| detail.model)
+            .filter(|m| !m.trim().is_empty() && *m != global_model)
+    };
+    // The readout mirrors the resolution below: an explicit `model_id` wins;
+    // the session pin fills in only when the request names neither a role nor
+    // an agent (either of which may still redirect the turn's model).
+    let turn_model = model_id
+        .clone()
+        .or_else(|| {
+            (role.is_none() && agent.is_none())
+                .then(|| session_model.clone())
+                .flatten()
+        })
+        .unwrap_or(global_model);
     emit_agent(
         &state.events,
         &state.agent_events,
@@ -6216,6 +6249,18 @@ async fn agent_turn(
     } else if let (None, Some(r)) = (&model_id, &role) {
         tracing::debug!(role = %r, "resolved model role → alias");
     }
+
+    // Session-config RPC v1: the session's pinned model becomes the turn's
+    // default only when nothing per-turn chose one — an explicit `model_id`,
+    // a resolved `role`, or a named agent's declared model all outrank the
+    // session pin. (An unresolvable role falls through to the pin rather than
+    // straight to the global model; the warning above still fires.)
+    let effective_model_id = effective_model_id.or_else(|| {
+        agent_model
+            .is_none()
+            .then(|| session_model.clone())
+            .flatten()
+    });
 
     let control = build_prompt_control(
         &state,
@@ -7101,6 +7146,147 @@ async fn agent_session(
                 error: Some("session not found".into()),
             }),
         ),
+    }
+}
+
+/// Session-config RPC v1: the shared GET/PATCH projection for
+/// `/v1/agent/sessions/{id}/config`. `model`/`provider` come from the
+/// persisted session; the permission block mirrors
+/// [`ocean_core::PermissionSettingsResponse`] through the same resolvers the
+/// daemon's `/v1/settings/permissions` endpoint uses (global state today,
+/// reported per-session for forward-compat — read-only in v1). `model_source`
+/// says whether a turn without an explicit `model_id`/`role` would run on the
+/// session's pinned model (`"session"`) or the daemon's global selection
+/// (`"global"`).
+fn session_config_json(
+    state: &AppState,
+    session_id: AgentSessionId,
+    model: &str,
+    provider: &str,
+    client_type: Option<&str>,
+) -> serde_json::Value {
+    let (_global_provider, global_model) = state.runtime.current_model();
+    let model_source = if !model.trim().is_empty() && model != global_model {
+        "session"
+    } else {
+        "global"
+    };
+    let config_dir = ocean_agent::config_dir_from_env();
+    json!({
+        "session_id": session_id,
+        "model": model,
+        "provider": provider,
+        "client_type": client_type,
+        "permission_mode": {
+            "persisted": ocean_agent::load_permission_mode(&config_dir),
+            "effective": effective_permission_mode(),
+            "env_override": permission_env_override(),
+        },
+        "model_source": model_source,
+    })
+}
+
+/// `GET /v1/agent/sessions/{id}/config` — session-config RPC v1 (read).
+/// 404s on an unknown session id, same as `GET /v1/agent/sessions/{id}`.
+async fn agent_session_config_get(
+    State(state): State<AppState>,
+    Path(session_id): Path<AgentSessionId>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.runtime.session_detail(core_sid(session_id)) {
+        Ok(detail) => (
+            StatusCode::OK,
+            Json(session_config_json(
+                &state,
+                session_id,
+                &detail.model,
+                &detail.provider,
+                detail.client_type.as_deref(),
+            )),
+        ),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "session not found" })),
+        ),
+    }
+}
+
+/// Body for `PATCH /v1/agent/sessions/{id}/config`. v1 accepts ONLY `model`;
+/// permission_mode / skills / mcp are daemon-global state today and their
+/// per-session versions are v2 scope.
+#[derive(Debug, serde::Deserialize)]
+struct AgentSessionConfigPatchRequest {
+    model: String,
+}
+
+/// `PATCH /v1/agent/sessions/{id}/config` — session-config RPC v1 (write).
+/// Resolves `model` against the model catalog (unknown → 400 listing the
+/// valid ids), pins it (with its catalog provider) on the persisted session,
+/// announces the change on the session's event stream, and returns the same
+/// projection as the GET.
+async fn agent_session_config_patch(
+    State(state): State<AppState>,
+    Path(session_id): Path<AgentSessionId>,
+    Json(req): Json<AgentSessionConfigPatchRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let requested = req.model.trim();
+    let Some(known) = ocean_agent::known_models()
+        .into_iter()
+        .find(|m| m.id == requested)
+    else {
+        let valid: Vec<String> = ocean_agent::known_models()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!(
+                    "unknown model id `{requested}`; valid ids: {}",
+                    valid.join(", ")
+                ),
+                "valid_models": valid,
+            })),
+        );
+    };
+    match state
+        .runtime
+        .set_session_model(core_sid(session_id), known.id.clone(), known.provider.clone())
+        .await
+    {
+        Ok(Some(detail)) => {
+            emit_agent(
+                &state.events,
+                &state.agent_events,
+                session_id,
+                AgentTurnEvent::SessionConfigChanged {
+                    session_id,
+                    model: known.id.clone(),
+                    provider: known.provider.clone(),
+                },
+            );
+            (
+                StatusCode::OK,
+                Json(session_config_json(
+                    &state,
+                    session_id,
+                    &detail.model,
+                    &detail.provider,
+                    detail.client_type.as_deref(),
+                )),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "session not found" })),
+        ),
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "agent_session_config_patch: persist failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": error.to_string() })),
+            )
+        }
     }
 }
 
@@ -19596,7 +19782,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            80,
+            82,
             "route baseline changed; review the manifest"
         );
 

@@ -491,6 +491,8 @@ GET    /v1/agent/canvas/fulfill           query a stored canvas fulfillment ?ses
 POST   /v1/agent/sessions                 create a session before the first turn
 GET    /v1/agent/sessions                 list agent sessions
 GET    /v1/agent/sessions/{id}            agent session detail
+GET    /v1/agent/sessions/{id}/config     session config: model/provider, permission projection, model_source
+PATCH  /v1/agent/sessions/{id}/config     repin the session's model { model } (catalog-validated; emits session_config_changed)
 GET    /v1/agent/history/search            bounded persisted display-transcript search (?q=<query>&limit=<1..50>, default 20)
 POST   /v1/agent/sessions/{id}/messages   append an out-of-turn user message to an existing session
 
