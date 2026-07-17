@@ -1,479 +1,734 @@
-//! Scoped observer principals with cryptographic token verification (HMAC-SHA256).
+//! Scoped observer principals and HMAC-SHA256 observer tokens.
 
-use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use subtle::ConstantTimeEq;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use sha2::Sha256;
 use thiserror::Error;
 
-/// Type alias for HMAC-SHA256.
+const SECRET_FILE: &str = "observatory-secret";
+const OBSERVER_CONFIG_FILE: &str = "config";
+const OBSERVER_TOKEN_ENV: &str = "OCEAN_OBSERVER_TOKEN";
+const SECRET_LEN: usize = 32;
+const SECRET_MODE: u32 = 0o600;
+const NONCE_BYTES: usize = 16;
+/// Default observer-token lifetime (30 minutes).
+pub const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 30 * 60;
+const MIN_TOKEN_LIFETIME_SECS: u64 = 15 * 60;
+const MAX_TOKEN_LIFETIME_SECS: u64 = 60 * 60;
+
 type HmacSha256 = Hmac<Sha256>;
 
-/// Cryptographic scope defining observer permissions within the Observatory.
-///
-/// Scopes determine what data an observer can read:
-/// - **Metadata**: Only metadata-level redacted event fields (no content/secrets)
-/// - **Content**: Full event content including non-secret fields
-/// - **ExtensionProducer**: Content plus extension-producer-scoped data
-///
-/// No scope implies control/mutation capabilities — all observers are read-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Read-only visibility granted to an observer.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObserverScope {
-    #[serde(rename = "summary")]
+    /// Metadata-safe whole-daemon summary visibility.
     Summary,
+    /// Reserved future content visibility; not implemented by V1 routes.
     Content,
-    ExtensionProducer,
+    /// Reserved future visibility isolated to one extension producer.
+    ExtensionProducer(String),
+}
+
+impl ObserverScope {
+    fn wire_value(&self) -> String {
+        match self {
+            Self::Summary => "observatory:summary".to_owned(),
+            Self::Content => "observatory:content".to_owned(),
+            Self::ExtensionProducer(producer_id) => format!("extension:{producer_id}"),
+        }
+    }
 }
 
 impl fmt::Display for ObserverScope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ObserverScope::Summary => write!(f, "summary"),
-            ObserverScope::Content => write!(f, "content"),
-            ObserverScope::ExtensionProducer => write!(f, "extension_producer"),
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.wire_value())
+    }
+}
+
+impl Serialize for ObserverScope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.wire_value())
+    }
+}
+
+impl<'de> Deserialize<'de> for ObserverScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "observatory:summary" => Ok(Self::Summary),
+            "observatory:content" => Ok(Self::Content),
+            _ => value
+                .strip_prefix("extension:")
+                .filter(|producer_id| !producer_id.is_empty())
+                .map(|producer_id| Self::ExtensionProducer(producer_id.to_owned()))
+                .ok_or_else(|| de::Error::custom("unknown observer scope")),
         }
     }
 }
 
-/// An observer principal with cryptographic identity and scope constraints.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Authenticated observer identity extracted from token claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObserverPrincipal {
-    /// Unique identifier for this principal (e.g., service name, user ID).
+    /// Exact token principal. V1 accepts only `observer`.
     pub principal_id: String,
-    /// The scope/permission level this principal can access.
+    /// Read-only visibility granted by the token.
     pub scope: ObserverScope,
-    /// Optional constraints or metadata about this principal.
-    pub constraints: Option<String>,
 }
 
-impl ObserverPrincipal {
-    /// Create a new observer principal.
-    pub fn new(principal_id: impl Into<String>, scope: ObserverScope) -> Self {
-        Self {
-            principal_id: principal_id.into(),
-            scope,
-            constraints: None,
-        }
-    }
-
-    /// Add constraints to this principal.
-    pub fn with_constraints(mut self, constraints: impl Into<String>) -> Self {
-        self.constraints = Some(constraints.into());
-        self
-    }
-}
-
-/// An observer authentication token with scope and daemon instance binding.
-///
-/// Tokens are HMAC-SHA256 signed and include:
-/// - Scope information
-/// - Daemon instance ID (prevents token replay across daemon instances)
-/// - Issue and expiration timestamps
-/// - Principal ID (extracted during verification)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Exact JSON claims signed into an observer token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObserverToken {
-    /// Principal ID this token represents.
-    pub principal_id: String,
-    /// The scope this token grants.
+    /// V1 observer principal (`observer`).
+    pub principal: String,
+    /// Namespaced read-only observer scope.
     pub scope: ObserverScope,
-    /// Daemon instance ID this token is bound to (prevents cross-instance replay).
+    /// Daemon boot instance to which this token is bound.
     pub daemon_instance_id: String,
-    /// When the token was issued (RFC 3339).
-    pub issued_at: String,
-    /// When the token expires (RFC 3339).
-    pub expires_at: String,
+    /// Unix-second issuance time.
+    pub issued_at: u64,
+    /// Unix-second expiry time.
+    pub expires_at: u64,
+    /// Random 128-bit nonce encoded as 32 lowercase hexadecimal characters.
+    pub nonce: String,
 }
 
 impl ObserverToken {
-    /// Check if this token is expired (as of now).
-    pub fn is_expired(&self) -> bool {
-        if let Ok(expires) = DateTime::parse_from_rfc3339(&self.expires_at) {
-            expires < Utc::now()
-        } else {
-            // Unparseable expiration → treat as expired (fail closed)
-            true
+    /// Issue V1 observer claims using the current Unix time and a random nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the system clock is before the Unix epoch or the
+    /// expiry calculation overflows.
+    pub fn issue(
+        scope: ObserverScope,
+        daemon_instance_id: impl Into<String>,
+        lifetime_secs: u64,
+    ) -> Result<Self, AuthError> {
+        if matches!(&scope, ObserverScope::ExtensionProducer(producer_id) if producer_id.is_empty())
+            || !(MIN_TOKEN_LIFETIME_SECS..=MAX_TOKEN_LIFETIME_SECS).contains(&lifetime_secs)
+        {
+            return Err(AuthError::InvalidClaims);
         }
-    }
+        let issued_at = unix_time_now()?;
+        let expires_at = issued_at
+            .checked_add(lifetime_secs)
+            .ok_or(AuthError::InvalidClaims)?;
+        let mut nonce_bytes = [0_u8; NONCE_BYTES];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
 
-    /// Check if this token is valid for a specific daemon instance.
-    pub fn is_valid_for_daemon(&self, daemon_instance_id: &str) -> bool {
-        self.daemon_instance_id == daemon_instance_id
+        Ok(Self {
+            principal: "observer".to_owned(),
+            scope,
+            daemon_instance_id: daemon_instance_id.into(),
+            issued_at,
+            expires_at,
+            nonce: encode_hex(&nonce_bytes),
+        })
     }
 }
 
-/// Daemon-local secret key for signing and verifying observer tokens.
-///
-/// On first boot, generates a random 32-byte key and persists it to `.ocean/observatory-secret`
-/// with mode 0600. Subsequent boots load the same key for consistent verification.
-/// This prevents token replay across daemon restarts.
+/// A validated, exactly 32-byte daemon-local signing secret.
 #[derive(Clone)]
-pub struct ObserverSecret {
-    key: Vec<u8>,
-}
+pub struct ObserverSecret([u8; SECRET_LEN]);
 
 impl ObserverSecret {
-    /// Minimum key size in bytes (32 bytes = 256 bits for SHA256).
-    pub const MIN_KEY_SIZE: usize = 32;
+    /// Required secret size in bytes.
+    pub const LEN: usize = SECRET_LEN;
 
-    /// Create a secret from a raw key (test helper).
+    /// Construct a secret from an exact-size key.
     #[doc(hidden)]
-    pub fn from_raw_key(key: Vec<u8>) -> Self {
-        Self { key }
+    pub const fn from_raw_key(key: [u8; SECRET_LEN]) -> Self {
+        Self(key)
     }
 
-    /// Load or generate the daemon secret from `.ocean/observatory-secret`.
+    /// Load or securely create `<ocean_dir>/observatory-secret`.
     ///
-    /// If the file does not exist, generates a new random 32-byte key and saves it.
-    /// If the file exists, loads and validates it.
+    /// Creation writes a mode-0600 temporary inode completely, syncs it, and
+    /// atomically links it to the final path without replacing an existing file.
+    /// Concurrent creators therefore converge on the one winning file. Existing
+    /// files are opened with `O_NOFOLLOW` and must be regular, exactly 32 bytes,
+    /// and mode 0600.
     ///
-    /// File permissions are set to 0600 (read/write by owner only).
-    pub fn load_or_generate(ocean_dir: &PathBuf) -> Result<Self, AuthError> {
-        let secret_path = ocean_dir.join("observatory-secret");
+    /// # Errors
+    ///
+    /// Fails closed for I/O errors, symlinks, non-regular files, wrong mode, or
+    /// any size other than exactly 32 bytes.
+    pub fn load_or_generate(ocean_dir: &Path) -> Result<Self, AuthError> {
+        fs::create_dir_all(ocean_dir).map_err(AuthError::secret_io)?;
+        let dir_metadata = fs::symlink_metadata(ocean_dir).map_err(AuthError::secret_io)?;
+        if dir_metadata.file_type().is_symlink() || !dir_metadata.is_dir() {
+            return Err(AuthError::SecretValidation(
+                "observatory directory must be a real directory".to_owned(),
+            ));
+        }
 
-        // Try to load existing secret.
-        if secret_path.exists() {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .open(&secret_path)
-                .map_err(|e| {
-                    AuthError::SecretIo(format!("Failed to open observatory-secret: {}", e))
-                })?;
+        let secret_path = ocean_dir.join(SECRET_FILE);
+        match Self::load(&secret_path) {
+            Ok(secret) => return Ok(secret),
+            Err(AuthError::SecretIo(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
 
-            let mut key = Vec::new();
-            file.read_to_end(&mut key)
-                .map_err(|e| AuthError::SecretIo(format!("Failed to read observatory-secret: {}", e)))?;
+        let mut key = [0_u8; SECRET_LEN];
+        rand::thread_rng().fill_bytes(&mut key);
+        let temp_path = ocean_dir.join(format!(".{SECRET_FILE}.{}.tmp", random_suffix()));
+        let creation = (|| -> Result<(), AuthError> {
+            let mut temp = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(SECRET_MODE)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temp_path)
+                .map_err(AuthError::secret_io)?;
+            temp.write_all(&key).map_err(AuthError::secret_io)?;
+            temp.sync_all().map_err(AuthError::secret_io)?;
+            fs::hard_link(&temp_path, &secret_path).map_err(AuthError::secret_io)?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(&temp_path);
 
-            if key.len() < Self::MIN_KEY_SIZE {
-                return Err(AuthError::SecretValidation(
-                    format!("Secret key too small: {} bytes (min {})", key.len(), Self::MIN_KEY_SIZE)
-                ));
+        match creation {
+            Ok(()) => Self::load(&secret_path),
+            Err(AuthError::SecretIo(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                Self::load(&secret_path)
             }
+            Err(error) => Err(error),
+        }
+    }
 
-            return Ok(Self { key });
+    /// Borrow the exact signing key.
+    pub const fn key(&self) -> &[u8; SECRET_LEN] {
+        &self.0
+    }
+
+    fn load(path: &Path) -> Result<Self, AuthError> {
+        let link_metadata = fs::symlink_metadata(path).map_err(AuthError::secret_io)?;
+        if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+            return Err(AuthError::SecretValidation(
+                "observatory secret must be a regular file".to_owned(),
+            ));
         }
 
-        // Generate a new random secret if it doesn't exist.
-        let key = Self::generate_key()?;
-        let key_clone = key.clone();
-
-        // Create the .ocean directory if it doesn't exist.
-        fs::create_dir_all(ocean_dir).map_err(|e| {
-            AuthError::SecretIo(format!("Failed to create .ocean directory: {}", e))
-        })?;
-
-        // Write the secret to file with 0600 permissions.
         let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&secret_path)
-            .map_err(|e| {
-                AuthError::SecretIo(format!("Failed to create observatory-secret: {}", e))
-            })?;
-
-        file.write_all(&key_clone)
-            .map_err(|e| AuthError::SecretIo(format!("Failed to write observatory-secret: {}", e)))?;
-
-        // Set permissions to 0600 (owner read/write only).
-        #[cfg(unix)]
-        {
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&secret_path, perms).map_err(|e| {
-                AuthError::SecretIo(format!("Failed to set observatory-secret permissions: {}", e))
-            })?;
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(AuthError::secret_io)?;
+        let metadata = file.metadata().map_err(AuthError::secret_io)?;
+        if !metadata.is_file() {
+            return Err(AuthError::SecretValidation(
+                "observatory secret must be a regular file".to_owned(),
+            ));
+        }
+        if metadata.mode() & 0o777 != SECRET_MODE {
+            return Err(AuthError::SecretValidation(
+                "observatory secret mode must be 0600".to_owned(),
+            ));
+        }
+        if metadata.len() != SECRET_LEN as u64 {
+            return Err(AuthError::SecretValidation(
+                "observatory secret must be exactly 32 bytes".to_owned(),
+            ));
         }
 
-        Ok(Self { key })
-    }
-
-    /// Generate a new random 32-byte key.
-    fn generate_key() -> Result<Vec<u8>, AuthError> {
-        use rand::RngCore;
-
-        let mut key = vec![0u8; Self::MIN_KEY_SIZE];
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut key);
-        Ok(key)
-    }
-
-    /// Get a reference to the underlying key.
-    pub fn key(&self) -> &[u8] {
-        &self.key
+        let mut key = [0_u8; SECRET_LEN];
+        file.read_exact(&mut key).map_err(AuthError::secret_io)?;
+        Ok(Self(key))
     }
 }
 
-/// Errors related to observer authentication and secret management.
+/// Observer authentication and secret-storage failures.
 #[derive(Debug, Error)]
 pub enum AuthError {
-    #[error("Invalid token signature")]
+    /// The supplied HMAC did not authenticate the payload.
+    #[error("invalid token signature")]
     InvalidSignature,
-
-    #[error("Token has expired")]
+    /// The token is past its Unix-second expiry.
+    #[error("token has expired")]
     TokenExpired,
-
-    #[error("Token is not valid for this daemon instance")]
-    TokenInstanceMismatch,
-
-    #[error("Malformed token: {0}")]
-    MalformedToken(String),
-
-    #[error("Secret IO error: {0}")]
-    SecretIo(String),
-
-    #[error("Secret validation error: {0}")]
+    /// The token belongs to another daemon boot instance.
+    #[error("token is not valid for this daemon instance")]
+    WrongInstance,
+    /// The token framing, base64, JSON, or claims are malformed.
+    #[error("malformed token")]
+    MalformedToken,
+    /// The claims violate the V1 observer contract.
+    #[error("invalid token claims")]
+    InvalidClaims,
+    /// Secret storage failed at the filesystem boundary.
+    #[error("observer secret I/O failed: {0}")]
+    SecretIo(#[source] std::io::Error),
+    /// An existing secret path failed closed validation.
+    #[error("observer secret validation failed: {0}")]
     SecretValidation(String),
+    /// A persisted child observer credential failed closed validation.
+    #[error("observer credential config validation failed: {0}")]
+    CredentialConfig(String),
 }
 
-/// Sign an observer token with the daemon secret.
-///
-/// Encodes the token as JSON, computes an HMAC-SHA256 signature using the secret,
-/// and returns the signature as a base64-encoded string appended to the JSON payload.
-///
-/// Format: `<base64(json)>.<base64(hmac_sha256_signature)>`
-pub fn sign_token(token: &ObserverToken, secret: &ObserverSecret) -> String {
-    use base64::Engine;
-    let engine = base64::engine::general_purpose::STANDARD;
-
-    let payload = serde_json::to_string(token).expect("token serialization failed");
-    let payload_b64 = engine.encode(&payload);
-
-    let mut mac = HmacSha256::new_from_slice(secret.key()).expect("key size valid");
-    mac.update(payload_b64.as_bytes());
-    let signature = mac.finalize();
-    let signature_b64 = engine.encode(signature.into_bytes());
-
-    format!("{}.{}", payload_b64, signature_b64)
+impl AuthError {
+    fn secret_io(error: std::io::Error) -> Self {
+        Self::SecretIo(error)
+    }
 }
 
-/// Verify and extract an observer principal from a signed token.
+/// Load the child-process observer credential from the environment or
+/// `<ocean_dir>/config`, in that precedence order.
 ///
-/// Validates:
-/// 1. Token format (must be `<payload>.<signature>`)
-/// 2. HMAC-SHA256 signature (constant-time comparison)
-/// 3. Expiration timestamp
-/// 4. Daemon instance ID (must match provided instance ID)
+/// The config file's complete trimmed contents are the token. When present it
+/// must be a non-symlink regular file with mode 0600. This helper does not log
+/// or validate the token against a daemon instance; the receiving daemon owns
+/// cryptographic validation.
 ///
-/// Returns the extracted `ObserverPrincipal` on success, or an `AuthError` otherwise.
-pub fn verify_token(
-    token_string: &str,
-    secret: &ObserverSecret,
-    daemon_instance_id: &str,
-) -> Result<ObserverPrincipal, AuthError> {
-    use base64::Engine;
-    let engine = base64::engine::general_purpose::STANDARD;
+/// # Errors
+///
+/// Fails closed for a non-Unicode/empty environment value or for a config path
+/// with an unsafe type, mode, or unreadable/empty content.
+pub fn observer_token_for_child(ocean_dir: &Path) -> Result<Option<String>, AuthError> {
+    if let Some(value) = std::env::var_os(OBSERVER_TOKEN_ENV) {
+        let token = value.into_string().map_err(|_| AuthError::InvalidClaims)?;
+        if token.is_empty() {
+            return Err(AuthError::InvalidClaims);
+        }
+        return Ok(Some(token));
+    }
 
-    // Parse token format: `<payload>.<signature>`
-    let parts: Vec<&str> = token_string.split('.').collect();
-    if parts.len() != 2 {
-        return Err(AuthError::MalformedToken(
-            "Token must contain exactly one dot separator".to_string(),
+    let path = ocean_dir.join(OBSERVER_CONFIG_FILE);
+    let link_metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AuthError::secret_io(error)),
+    };
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        return Err(AuthError::CredentialConfig(
+            "observer config must be a regular file".to_owned(),
         ));
     }
 
-    let payload_b64 = parts[0];
-    let signature_b64_provided = parts[1];
-
-    // Decode payload from base64.
-    let payload_bytes = engine.decode(payload_b64)
-        .map_err(|e| AuthError::MalformedToken(format!("Invalid base64 payload: {}", e)))?;
-
-    let payload_str =
-        String::from_utf8(payload_bytes).map_err(|e| {
-            AuthError::MalformedToken(format!("Invalid UTF-8 in payload: {}", e))
-        })?;
-
-    // Deserialize token.
-    let token: ObserverToken = serde_json::from_str(&payload_str)
-        .map_err(|e| AuthError::MalformedToken(format!("Invalid token JSON: {}", e)))?;
-
-    // Verify HMAC signature (constant-time comparison).
-    let mut mac = HmacSha256::new_from_slice(secret.key()).expect("key size valid");
-    mac.update(payload_b64.as_bytes());
-    let signature_computed = mac.finalize();
-    let signature_computed_b64 = engine.encode(signature_computed.into_bytes());
-
-    // Use constant-time comparison to prevent timing attacks.
-    if signature_computed_b64.as_bytes().ct_eq(signature_b64_provided.as_bytes()).into() {
-        // Signature is valid, proceed with other checks.
-    } else {
-        return Err(AuthError::InvalidSignature);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(AuthError::secret_io)?;
+    let metadata = file.metadata().map_err(AuthError::secret_io)?;
+    if !metadata.is_file() || metadata.mode() & 0o777 != SECRET_MODE {
+        return Err(AuthError::CredentialConfig(
+            "observer config must be a regular mode-0600 file".to_owned(),
+        ));
     }
+    let mut token = String::new();
+    file.read_to_string(&mut token)
+        .map_err(AuthError::secret_io)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(AuthError::CredentialConfig(
+            "observer config token must not be empty".to_owned(),
+        ));
+    }
+    Ok(Some(token.to_owned()))
+}
 
-    // Check expiration.
-    if token.is_expired() {
+/// Sign claims as `signature_base64.payload_base64`.
+///
+/// HMAC-SHA256 covers the raw JSON payload bytes, not its base64 text.
+#[must_use]
+pub fn sign_token(token: &ObserverToken, secret: &ObserverSecret) -> String {
+    let payload = serde_json::to_vec(token).expect("ObserverToken serialization is infallible");
+    let mut mac = HmacSha256::new_from_slice(secret.key()).expect("32-byte HMAC key is valid");
+    mac.update(&payload);
+    let signature = mac.finalize().into_bytes();
+    format!("{}.{}", BASE64.encode(signature), BASE64.encode(payload))
+}
+
+/// Verify a signed token and extract its typed observer principal.
+///
+/// Signature verification occurs over the decoded raw JSON bytes before claims
+/// are parsed. All malformed credential material fails closed.
+///
+/// # Errors
+///
+/// Returns a typed authentication failure for malformed, tampered, expired,
+/// wrong-instance, or otherwise invalid claims.
+pub fn verify_token(
+    token: &str,
+    secret: &ObserverSecret,
+    daemon_instance_id: &str,
+) -> Result<ObserverPrincipal, AuthError> {
+    let (signature_b64, payload_b64) = token
+        .split_once('.')
+        .filter(|(_, payload)| !payload.contains('.'))
+        .ok_or(AuthError::MalformedToken)?;
+    let signature = BASE64
+        .decode(signature_b64)
+        .map_err(|_| AuthError::MalformedToken)?;
+    let payload = BASE64
+        .decode(payload_b64)
+        .map_err(|_| AuthError::MalformedToken)?;
+
+    let mut mac = HmacSha256::new_from_slice(secret.key()).expect("32-byte HMAC key is valid");
+    mac.update(&payload);
+    mac.verify_slice(&signature)
+        .map_err(|_| AuthError::InvalidSignature)?;
+
+    let claims: ObserverToken =
+        serde_json::from_slice(&payload).map_err(|_| AuthError::MalformedToken)?;
+    validate_claims(&claims, daemon_instance_id, unix_time_now()?)?;
+
+    Ok(ObserverPrincipal {
+        principal_id: claims.principal,
+        scope: claims.scope,
+    })
+}
+
+fn validate_claims(
+    claims: &ObserverToken,
+    daemon_instance_id: &str,
+    now: u64,
+) -> Result<(), AuthError> {
+    if claims.principal != "observer"
+        || claims.nonce.len() != NONCE_BYTES * 2
+        || !claims.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || claims.expires_at < claims.issued_at
+    {
+        return Err(AuthError::InvalidClaims);
+    }
+    if now > claims.expires_at {
         return Err(AuthError::TokenExpired);
     }
-
-    // Check daemon instance ID.
-    if !token.is_valid_for_daemon(daemon_instance_id) {
-        return Err(AuthError::TokenInstanceMismatch);
+    if claims.daemon_instance_id != daemon_instance_id {
+        return Err(AuthError::WrongInstance);
     }
+    Ok(())
+}
 
-    // Extract and return principal.
-    Ok(ObserverPrincipal::new(token.principal_id, token.scope))
+fn unix_time_now() -> Result<u64, AuthError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| AuthError::InvalidClaims)
+}
+
+fn random_suffix() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    encode_hex(&bytes)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
     use super::*;
-    use chrono::Duration;
 
-    fn create_test_secret() -> ObserverSecret {
-        ObserverSecret {
-            key: vec![0x42; ObserverSecret::MIN_KEY_SIZE],
-        }
+    const DAEMON_ID: &str = "a9f38dc1-fb42-46c4-9c64-0bf09aff3037";
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn secret() -> ObserverSecret {
+        ObserverSecret::from_raw_key([0x42; SECRET_LEN])
     }
 
-    fn create_test_token(principal_id: &str, scope: ObserverScope) -> ObserverToken {
-        let now = Utc::now();
+    fn valid_claims(scope: ObserverScope) -> ObserverToken {
+        let now = unix_time_now().expect("clock");
         ObserverToken {
-            principal_id: principal_id.to_string(),
+            principal: "observer".to_owned(),
             scope,
-            daemon_instance_id: "test-daemon-1".to_string(),
-            issued_at: now.to_rfc3339(),
-            expires_at: (now + Duration::hours(1)).to_rfc3339(),
+            daemon_instance_id: DAEMON_ID.to_owned(),
+            issued_at: now,
+            expires_at: now + 3_600,
+            nonce: "3a2f456b9cfe4e3fa10c2d3567e8c92b".to_owned(),
         }
     }
 
     #[test]
-    fn test_sign_and_verify_token() {
-        let secret = create_test_secret();
-        let token = create_test_token("observer-1", ObserverScope::Summary);
-
-        let signed = sign_token(&token, &secret);
-        assert!(signed.contains('.'), "Signed token should contain a dot separator");
-
-        let principal = verify_token(&signed, &secret, "test-daemon-1")
-            .expect("Token verification should succeed");
-
-        assert_eq!(principal.principal_id, "observer-1");
-        assert_eq!(principal.scope, ObserverScope::Summary);
-    }
-
-    #[test]
-    fn test_verify_expired_token() {
-        let secret = create_test_secret();
-        let now = Utc::now();
-        let expired_token = ObserverToken {
-            principal_id: "observer-1".to_string(),
-            scope: ObserverScope::Content,
-            daemon_instance_id: "test-daemon-1".to_string(),
-            issued_at: (now - Duration::hours(2)).to_rfc3339(),
-            expires_at: (now - Duration::hours(1)).to_rfc3339(),
+    fn known_vector_signs_signature_first_over_raw_json() {
+        let claims = ObserverToken {
+            principal: "observer".to_owned(),
+            scope: ObserverScope::Summary,
+            daemon_instance_id: DAEMON_ID.to_owned(),
+            issued_at: 1_721_233_351,
+            expires_at: 1_721_233_951,
+            nonce: "3a2f456b9cfe4e3fa10c2d3567e8c92b".to_owned(),
         };
+        let key = std::array::from_fn(|index| u8::try_from(index).expect("index fits"));
+        let signed = sign_token(&claims, &ObserverSecret::from_raw_key(key));
 
-        let signed = sign_token(&expired_token, &secret);
-        let result = verify_token(&signed, &secret, "test-daemon-1");
-
-        assert!(
-            matches!(result, Err(AuthError::TokenExpired)),
-            "Expired token should be rejected"
+        assert_eq!(
+            signed,
+            "IAzbB6f+LsWs2OjtyscPFeHfQzXuvJIAC9xIOoBDaVw=.eyJwcmluY2lwYWwiOiJvYnNlcnZlciIsInNjb3BlIjoib2JzZXJ2YXRvcnk6c3VtbWFyeSIsImRhZW1vbl9pbnN0YW5jZV9pZCI6ImE5ZjM4ZGMxLWZiNDItNDZjNC05YzY0LTBiZjA5YWZmMzAzNyIsImlzc3VlZF9hdCI6MTcyMTIzMzM1MSwiZXhwaXJlc19hdCI6MTcyMTIzMzk1MSwibm9uY2UiOiIzYTJmNDU2YjljZmU0ZTNmYTEwYzJkMzU2N2U4YzkyYiJ9"
         );
     }
 
     #[test]
-    fn test_verify_malformed_token() {
-        let secret = create_test_secret();
+    fn issue_uses_unix_seconds_random_nonce_and_requested_expiry() {
+        let first = ObserverToken::issue(
+            ObserverScope::Summary,
+            DAEMON_ID,
+            DEFAULT_TOKEN_LIFETIME_SECS,
+        )
+        .expect("issue");
+        let second = ObserverToken::issue(
+            ObserverScope::Summary,
+            DAEMON_ID,
+            DEFAULT_TOKEN_LIFETIME_SECS,
+        )
+        .expect("issue");
 
-        let result = verify_token("invalid-token-no-dot", &secret, "test-daemon-1");
-        assert!(
-            matches!(result, Err(AuthError::MalformedToken(_))),
-            "Malformed token should be rejected"
+        assert_eq!(
+            first.expires_at - first.issued_at,
+            DEFAULT_TOKEN_LIFETIME_SECS
         );
-
-        let result = verify_token("not.valid.base64.", &secret, "test-daemon-1");
-        assert!(
-            matches!(result, Err(AuthError::MalformedToken(_))),
-            "Invalid base64 should be rejected"
-        );
+        assert_eq!(first.nonce.len(), 32);
+        assert!(first.nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first.nonce, second.nonce);
+        assert!(matches!(
+            ObserverToken::issue(ObserverScope::Summary, DAEMON_ID, 899),
+            Err(AuthError::InvalidClaims)
+        ));
+        assert!(matches!(
+            ObserverToken::issue(ObserverScope::Summary, DAEMON_ID, 3_601),
+            Err(AuthError::InvalidClaims)
+        ));
     }
 
     #[test]
-    fn test_scope_extraction() {
-        let secret = create_test_secret();
-
-        for (scope, expected_scope) in &[
-            (ObserverScope::Summary, ObserverScope::Summary),
-            (ObserverScope::Content, ObserverScope::Content),
-            (ObserverScope::ExtensionProducer, ObserverScope::ExtensionProducer),
-        ] {
-            let token = create_test_token("observer-1", *scope);
-            let signed = sign_token(&token, &secret);
-            let principal = verify_token(&signed, &secret, "test-daemon-1")
-                .expect("Token verification should succeed");
-            assert_eq!(principal.scope, *expected_scope);
-        }
-    }
-
-    #[test]
-    fn test_cross_principal_isolation() {
-        let secret = create_test_secret();
-
-        let token1 = create_test_token("principal-1", ObserverScope::Summary);
-        let token2 = create_test_token("principal-2", ObserverScope::Content);
-
-        let signed1 = sign_token(&token1, &secret);
-        let signed2 = sign_token(&token2, &secret);
-
-        let principal1 = verify_token(&signed1, &secret, "test-daemon-1")
-            .expect("Token 1 should verify");
-        let principal2 = verify_token(&signed2, &secret, "test-daemon-1")
-            .expect("Token 2 should verify");
-
-        assert_ne!(principal1.principal_id, principal2.principal_id);
-        assert_ne!(principal1.scope, principal2.scope);
-    }
-
-    #[test]
-    fn test_instance_mismatch() {
-        let secret = create_test_secret();
-        let token = create_test_token("observer-1", ObserverScope::Summary);
-        let signed = sign_token(&token, &secret);
-
-        let result = verify_token(&signed, &secret, "different-daemon-id");
-        assert!(
-            matches!(result, Err(AuthError::TokenInstanceMismatch)),
-            "Token for different daemon instance should be rejected"
-        );
-    }
-
-    #[test]
-    fn test_observer_principal_with_constraints() {
-        let principal = ObserverPrincipal::new("observer-1", ObserverScope::Content)
-            .with_constraints("read-only");
-
-        assert_eq!(principal.principal_id, "observer-1");
-        assert_eq!(principal.scope, ObserverScope::Content);
-        assert_eq!(principal.constraints, Some("read-only".to_string()));
-    }
-
-    #[test]
-    fn test_no_control_scope_assertion() {
-        // Observers have no mutation/control scope — they are always read-only.
-        // This test documents that no scope variant implies control capabilities.
-        // The three scopes are read-only variants representing different visibility levels.
-        let secret = create_test_secret();
-
-        for scope in &[
+    fn round_trip_preserves_all_namespaced_scopes() {
+        for scope in [
             ObserverScope::Summary,
             ObserverScope::Content,
-            ObserverScope::ExtensionProducer,
+            ObserverScope::ExtensionProducer("producer-a".to_owned()),
         ] {
-            let token = create_test_token("observer-1", *scope);
-            let principal = verify_token(&sign_token(&token, &secret), &secret, "test-daemon-1")
-                .expect("Token should verify");
-
-            // All observers are read-only — the scope is only about visibility/data-access level.
-            // Enforcement of read-only behavior happens at the API level, not in the token.
-            // This test just documents the invariant by checking that principals are created.
-            assert_eq!(principal.principal_id, "observer-1");
+            let claims = valid_claims(scope.clone());
+            let principal = verify_token(&sign_token(&claims, &secret()), &secret(), DAEMON_ID)
+                .expect("valid token");
+            assert_eq!(principal.scope, scope);
         }
+    }
+
+    #[test]
+    fn tampered_payload_and_signature_are_rejected() {
+        let signed = sign_token(&valid_claims(ObserverScope::Summary), &secret());
+        let (signature, payload) = signed.split_once('.').expect("two parts");
+        let mut payload_bytes = BASE64.decode(payload).expect("payload base64");
+        payload_bytes[0] ^= 1;
+        let tampered_payload = format!("{signature}.{}", BASE64.encode(payload_bytes));
+        assert!(matches!(
+            verify_token(&tampered_payload, &secret(), DAEMON_ID),
+            Err(AuthError::InvalidSignature)
+        ));
+
+        let mut signature_bytes = BASE64.decode(signature).expect("signature base64");
+        signature_bytes[0] ^= 1;
+        let tampered_signature = format!("{}.{payload}", BASE64.encode(signature_bytes));
+        assert!(matches!(
+            verify_token(&tampered_signature, &secret(), DAEMON_ID),
+            Err(AuthError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn expired_and_wrong_instance_tokens_are_rejected() {
+        let now = unix_time_now().expect("clock");
+        let mut claims = valid_claims(ObserverScope::Summary);
+        claims.issued_at = now - 20;
+        claims.expires_at = now - 1;
+        assert!(matches!(
+            verify_token(&sign_token(&claims, &secret()), &secret(), DAEMON_ID),
+            Err(AuthError::TokenExpired)
+        ));
+
+        let claims = valid_claims(ObserverScope::Summary);
+        assert!(matches!(
+            verify_token(&sign_token(&claims, &secret()), &secret(), "other-daemon"),
+            Err(AuthError::WrongInstance)
+        ));
+    }
+
+    #[test]
+    fn malformed_framing_base64_json_and_scope_are_rejected() {
+        for malformed in ["", "one-part", "a.b.c", "%%%.%%%", "YQ==.e30="] {
+            assert!(verify_token(malformed, &secret(), DAEMON_ID).is_err());
+        }
+
+        let payload = br#"{"principal":"observer","scope":"observatory:control","daemon_instance_id":"a9f38dc1-fb42-46c4-9c64-0bf09aff3037","issued_at":1,"expires_at":9999999999,"nonce":"3a2f456b9cfe4e3fa10c2d3567e8c92b"}"#;
+        let mut mac = HmacSha256::new_from_slice(secret().key()).expect("HMAC key");
+        mac.update(payload);
+        let token = format!(
+            "{}.{}",
+            BASE64.encode(mac.finalize().into_bytes()),
+            BASE64.encode(payload)
+        );
+        assert!(matches!(
+            verify_token(&token, &secret(), DAEMON_ID),
+            Err(AuthError::MalformedToken)
+        ));
+    }
+
+    #[test]
+    fn secret_first_creation_is_exact_and_mode_0600() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let loaded = ObserverSecret::load_or_generate(directory.path()).expect("create secret");
+        let path = directory.path().join(SECRET_FILE);
+        let metadata = fs::metadata(path).expect("metadata");
+
+        assert_eq!(loaded.key().len(), SECRET_LEN);
+        assert_eq!(metadata.len(), SECRET_LEN as u64);
+        assert_eq!(metadata.permissions().mode() & 0o777, SECRET_MODE);
+    }
+
+    #[test]
+    fn secret_load_rejects_wrong_size_mode_type_and_symlink() {
+        let wrong_size = tempfile::tempdir().expect("tempdir");
+        fs::write(wrong_size.path().join(SECRET_FILE), [0_u8; 31]).expect("write");
+        fs::set_permissions(
+            wrong_size.path().join(SECRET_FILE),
+            fs::Permissions::from_mode(SECRET_MODE),
+        )
+        .expect("chmod");
+        assert!(matches!(
+            ObserverSecret::load_or_generate(wrong_size.path()),
+            Err(AuthError::SecretValidation(_))
+        ));
+
+        let wrong_mode = tempfile::tempdir().expect("tempdir");
+        fs::write(wrong_mode.path().join(SECRET_FILE), [0_u8; SECRET_LEN]).expect("write");
+        fs::set_permissions(
+            wrong_mode.path().join(SECRET_FILE),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod");
+        assert!(matches!(
+            ObserverSecret::load_or_generate(wrong_mode.path()),
+            Err(AuthError::SecretValidation(_))
+        ));
+
+        let wrong_type = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(wrong_type.path().join(SECRET_FILE)).expect("mkdir");
+        assert!(matches!(
+            ObserverSecret::load_or_generate(wrong_type.path()),
+            Err(AuthError::SecretValidation(_))
+        ));
+
+        let symlink_dir = tempfile::tempdir().expect("tempdir");
+        let target = symlink_dir.path().join("target");
+        fs::write(&target, [0_u8; SECRET_LEN]).expect("write target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(SECRET_MODE)).expect("chmod");
+        symlink(&target, symlink_dir.path().join(SECRET_FILE)).expect("symlink");
+        assert!(matches!(
+            ObserverSecret::load_or_generate(symlink_dir.path()),
+            Err(AuthError::SecretValidation(_))
+        ));
+    }
+
+    #[test]
+    fn child_token_environment_precedes_secure_config_file() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let prior = std::env::var_os(OBSERVER_TOKEN_ENV);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = directory.path().join(OBSERVER_CONFIG_FILE);
+        fs::write(&config, "config-token\n").expect("write config");
+        fs::set_permissions(&config, fs::Permissions::from_mode(SECRET_MODE)).expect("chmod");
+
+        std::env::remove_var(OBSERVER_TOKEN_ENV);
+        assert_eq!(
+            observer_token_for_child(directory.path()).expect("config token"),
+            Some("config-token".to_owned())
+        );
+
+        std::env::set_var(OBSERVER_TOKEN_ENV, "environment-token");
+        assert_eq!(
+            observer_token_for_child(directory.path()).expect("environment token"),
+            Some("environment-token".to_owned())
+        );
+
+        match prior {
+            Some(value) => std::env::set_var(OBSERVER_TOKEN_ENV, value),
+            None => std::env::remove_var(OBSERVER_TOKEN_ENV),
+        }
+    }
+
+    #[test]
+    fn child_token_config_rejects_unsafe_mode_and_symlink() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let prior = std::env::var_os(OBSERVER_TOKEN_ENV);
+        std::env::remove_var(OBSERVER_TOKEN_ENV);
+
+        let wrong_mode = tempfile::tempdir().expect("tempdir");
+        let config = wrong_mode.path().join(OBSERVER_CONFIG_FILE);
+        fs::write(&config, "token").expect("write config");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(matches!(
+            observer_token_for_child(wrong_mode.path()),
+            Err(AuthError::CredentialConfig(_))
+        ));
+
+        let symlink_dir = tempfile::tempdir().expect("tempdir");
+        let target = symlink_dir.path().join("target");
+        fs::write(&target, "token").expect("write target");
+        symlink(&target, symlink_dir.path().join(OBSERVER_CONFIG_FILE)).expect("symlink");
+        assert!(matches!(
+            observer_token_for_child(symlink_dir.path()),
+            Err(AuthError::CredentialConfig(_))
+        ));
+
+        match prior {
+            Some(value) => std::env::set_var(OBSERVER_TOKEN_ENV, value),
+            None => std::env::remove_var(OBSERVER_TOKEN_ENV),
+        }
+    }
+
+    #[test]
+    fn concurrent_load_or_create_converges_on_one_secret() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = Arc::new(directory.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    *ObserverSecret::load_or_generate(path.as_path())
+                        .expect("load or create")
+                        .key()
+                })
+            })
+            .collect();
+        let keys: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("thread"))
+            .collect();
+
+        assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }

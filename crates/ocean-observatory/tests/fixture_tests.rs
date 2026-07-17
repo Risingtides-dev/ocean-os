@@ -97,8 +97,16 @@ mod fixtures {
         ];
         for name in &names {
             let fixture = load_fixture(name);
-            assert!(!fixture.description.is_empty(), "fixture {} has no description", name);
-            assert_eq!(fixture.schema_version, 1, "fixture {} has wrong schema_version", name);
+            assert!(
+                !fixture.description.is_empty(),
+                "fixture {} has no description",
+                name
+            );
+            assert_eq!(
+                fixture.schema_version, 1,
+                "fixture {} has wrong schema_version",
+                name
+            );
             assert!(!fixture.events.is_empty(), "fixture {} has no events", name);
         }
     }
@@ -111,7 +119,8 @@ mod fixtures {
     fn test_events_have_required_fields() {
         let fixture = load_fixture("daemon_lifecycle.json");
         for (i, event) in fixture.events.iter().enumerate() {
-            let obj = event.as_object()
+            let obj = event
+                .as_object()
                 .unwrap_or_else(|| panic!("event {} is not an object", i));
 
             assert!(obj.contains_key("cursor"), "event {} missing cursor", i);
@@ -120,8 +129,16 @@ mod fixtures {
             assert!(obj.contains_key("producer"), "event {} missing producer", i);
             assert!(obj.contains_key("topology"), "event {} missing topology", i);
             assert!(obj.contains_key("payload"), "event {} missing payload", i);
-            assert!(obj.contains_key("occurred_at"), "event {} missing occurred_at", i);
-            assert!(obj.contains_key("recorded_at"), "event {} missing recorded_at", i);
+            assert!(
+                obj.contains_key("occurred_at"),
+                "event {} missing occurred_at",
+                i
+            );
+            assert!(
+                obj.contains_key("recorded_at"),
+                "event {} missing recorded_at",
+                i
+            );
         }
     }
 
@@ -155,14 +172,19 @@ mod fixtures {
             let fixture = load_fixture(name);
             let mut prev_cursor: u64 = 0;
             for (i, event) in fixture.events.iter().enumerate() {
-                let cursor_str = event["cursor"].as_str()
+                let cursor_str = event["cursor"]
+                    .as_str()
                     .unwrap_or_else(|| panic!("{} event {} has non-string cursor", name, i));
-                let cursor: u64 = cursor_str.parse()
+                let cursor: u64 = cursor_str
+                    .parse()
                     .unwrap_or_else(|_| panic!("{} event {} cursor not a u64", name, i));
                 assert!(
                     cursor > prev_cursor,
                     "{} event {} cursor {} is not > previous {}",
-                    name, i, cursor, prev_cursor
+                    name,
+                    i,
+                    cursor,
+                    prev_cursor
                 );
                 prev_cursor = cursor;
             }
@@ -176,42 +198,66 @@ mod fixtures {
     #[test]
     fn test_daemon_lifecycle_has_daemon_events() {
         let fixture = load_fixture("daemon_lifecycle.json");
-        let kinds: Vec<&str> = fixture.events.iter()
+        let kinds: Vec<&str> = fixture
+            .events
+            .iter()
             .map(|e| e["kind"].as_str().unwrap())
             .collect();
 
         assert!(kinds.contains(&"daemon.started"), "missing daemon.started");
-        assert!(kinds.contains(&"execution.admitted"), "missing execution.admitted");
-        assert!(kinds.contains(&"execution.finished"), "missing execution.finished");
+        assert!(
+            kinds.contains(&"execution.admitted"),
+            "missing execution.admitted"
+        );
+        assert!(
+            kinds.contains(&"execution.finished"),
+            "missing execution.finished"
+        );
     }
 
     #[test]
     fn test_topology_tree_has_extension_attested() {
         let fixture = load_fixture("topology_tree.json");
-        let attested: Vec<&str> = fixture.events.iter()
+        let attested: Vec<&str> = fixture
+            .events
+            .iter()
             .filter(|e| e["truth"].as_str() == Some("extension_attested"))
             .map(|e| e["event_id"].as_str().unwrap())
             .collect();
 
-        assert_eq!(attested.len(), 4, "expected 4 extension-attested events (2 admissions + phase change + finish)");
+        assert_eq!(
+            attested.len(),
+            4,
+            "expected 4 extension-attested events (2 admissions + phase change + finish)"
+        );
     }
 
     #[test]
     fn test_restart_has_interrupted_semantics() {
         let fixture = load_fixture("restart_interruption.json");
-        let kinds: Vec<&str> = fixture.events.iter()
+        let kinds: Vec<&str> = fixture
+            .events
+            .iter()
             .map(|e| e["kind"].as_str().unwrap())
             .collect();
 
-        assert!(kinds.contains(&"daemon.stopping"), "missing daemon.stopping");
+        assert!(
+            kinds.contains(&"daemon.stopping"),
+            "missing daemon.stopping"
+        );
         assert!(kinds.contains(&"stream.reset"), "missing stream.reset");
-        assert!(kinds.contains(&"daemon.started"), "missing second daemon.started");
+        assert!(
+            kinds.contains(&"daemon.started"),
+            "missing second daemon.started"
+        );
     }
 
     #[test]
     fn test_gap_has_gap_event() {
         let fixture = load_fixture("gap_and_resume.json");
-        let kinds: Vec<&str> = fixture.events.iter()
+        let kinds: Vec<&str> = fixture
+            .events
+            .iter()
             .map(|e| e["kind"].as_str().unwrap())
             .collect();
 
@@ -226,13 +272,37 @@ mod fixtures {
     // -----------------------------------------------------------------------
 
     const FORBIDDEN_FIELDS: &[&str] = &[
-        "prompt", "prompts", "system_prompt", "user_input", "instructions",
-        "thinking", "thinking_text", "reasoning", "scratchpad",
-        "tool_args", "tool_arguments", "args", "tool_output", "result", "stdout",
-        "error_message", "stack_trace", "traceback",
-        "env_vars", "PATH", "HOME", "OPENAI_API_KEY", "API_KEY", "api_key",
-        "secret", "password", "token", "Bearer",
-        "cwd", "file_path", "absolute_path",
+        "prompt",
+        "prompts",
+        "system_prompt",
+        "user_input",
+        "instructions",
+        "thinking",
+        "thinking_text",
+        "reasoning",
+        "scratchpad",
+        "tool_args",
+        "tool_arguments",
+        "args",
+        "tool_output",
+        "result",
+        "stdout",
+        "error_message",
+        "stack_trace",
+        "traceback",
+        "env_vars",
+        "PATH",
+        "HOME",
+        "OPENAI_API_KEY",
+        "API_KEY",
+        "api_key",
+        "secret",
+        "password",
+        "token",
+        "Bearer",
+        "cwd",
+        "file_path",
+        "absolute_path",
     ];
 
     #[test]

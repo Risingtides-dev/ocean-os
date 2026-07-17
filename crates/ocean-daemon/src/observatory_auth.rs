@@ -1,38 +1,47 @@
-//! Axum extractor for verifying scoped observer authentication tokens.
+//! Deferred Axum extraction seam for scoped Observatory authentication.
 //!
-//! This module provides the `ObservatoryAuth` extractor which reads the `Authorization: Bearer`
-//! header (or optionally a secure cookie) and validates the token using HMAC-SHA256.
-//!
-//! The extractor is crate-private to ocean-daemon — it is NOT exported for external use.
+//! Task 4 constructs and mounts the typed auth state at daemon startup. Task 5
+//! will consume this extractor from read-only Observatory data routes; no data
+//! route or credential-issuance endpoint is introduced here.
 
-use std::future::Future;
-use std::pin::Pin;
 use axum::extract::FromRequestParts;
-use axum::http::{request::Parts, StatusCode};
-use ocean_observatory::{verify_token, AuthError, ObserverPrincipal, ObserverSecret};
+use axum::http::{header, request::Parts, StatusCode};
+use ocean_observatory::{verify_token, ObserverPrincipal, ObserverSecret};
+use std::path::Path;
 
-/// Extractor that verifies an Observer authentication token and extracts the principal.
-///
-/// Reads the `Authorization: Bearer <token>` header and validates it using the daemon secret.
-/// Returns `ObserverPrincipal` on success (200), or `401 Unauthorized` on failure.
-///
-/// Security:
-/// - Uses constant-time HMAC comparison to prevent timing attacks
-/// - Validates token expiration
-/// - Verifies daemon instance ID to prevent cross-daemon token replay
-/// - No support for query-string tokens (header-only)
-///
-/// # Example
-///
-/// ```rust,ignore
-/// async fn protected_endpoint(
-///     ObservatoryAuth(principal): ObservatoryAuth,
-/// ) -> impl IntoResponse {
-///     format!("Welcome, {}. Scope: {:?}", principal.principal_id, principal.scope)
-/// }
-/// ```
+const OBSERVER_COOKIE_NAME: &str = "Authorization-Observer";
+
+/// Dedicated request-extension state for Observatory authentication.
+#[derive(Clone)]
+pub(super) struct ObservatoryAuthState {
+    secret: ObserverSecret,
+    daemon_instance_id: String,
+}
+
+impl ObservatoryAuthState {
+    /// Construct real startup auth state without adding Task 5 data routes.
+    pub(super) fn load(
+        ocean_dir: &Path,
+        daemon_instance_id: impl Into<String>,
+    ) -> Result<Self, ocean_observatory::AuthError> {
+        Ok(Self {
+            secret: ObserverSecret::load_or_generate(ocean_dir)?,
+            daemon_instance_id: daemon_instance_id.into(),
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(secret: ObserverSecret, daemon_instance_id: impl Into<String>) -> Self {
+        Self {
+            secret,
+            daemon_instance_id: daemon_instance_id.into(),
+        }
+    }
+}
+
+/// Verified, typed observer identity for future read-only Observatory routes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservatoryAuth(pub ObserverPrincipal);
+pub(super) struct ObservatoryAuth(pub ObserverPrincipal);
 
 impl<S> FromRequestParts<S> for ObservatoryAuth
 where
@@ -40,156 +49,161 @@ where
 {
     type Rejection = StatusCode;
 
-    fn from_request_parts<'a>(
-        parts: &'a mut Parts,
-        _state: &S,
-    ) -> Pin<Box<dyn Future<Output = Result<Self, Self::Rejection>> + Send + 'a>> {
-        Box::pin(async {
-        // Extract Authorization header (Bearer token).
-        let auth_header = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-
-        // Parse "Bearer <token>".
-        let token_string = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-
-        // Get daemon secret and instance ID from extension state.
-        // These are expected to be inserted via `.layer()` during router setup.
-        let secret = parts
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let auth_state = parts
             .extensions
-            .get::<ObserverSecret>()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            .get::<ObservatoryAuthState>()
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let token = request_token(parts).ok_or(StatusCode::UNAUTHORIZED)?;
 
-        let daemon_instance_id = parts
-            .extensions
-            .get::<String>()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        // Verify token and extract principal.
-        match verify_token(token_string, secret, daemon_instance_id) {
-            Ok(principal) => Ok(ObservatoryAuth(principal)),
-            Err(AuthError::TokenExpired) => Err(StatusCode::UNAUTHORIZED),
-            Err(AuthError::InvalidSignature) => Err(StatusCode::UNAUTHORIZED),
-            Err(AuthError::TokenInstanceMismatch) => Err(StatusCode::UNAUTHORIZED),
-            Err(AuthError::MalformedToken(_)) => Err(StatusCode::BAD_REQUEST),
-            Err(AuthError::SecretIo(_) | AuthError::SecretValidation(_)) => {
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
-            }
-        }
-        })
+        verify_token(token, &auth_state.secret, &auth_state.daemon_instance_id)
+            .map(Self)
+            .map_err(|_| StatusCode::UNAUTHORIZED)
     }
+}
+
+fn request_token(parts: &Parts) -> Option<&str> {
+    if let Some(authorization) = parts.headers.get(header::AUTHORIZATION) {
+        return authorization
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.is_empty());
+    }
+
+    parts
+        .headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|cookie| {
+            let (name, value) = cookie.split_once('=')?;
+            (name == OBSERVER_COOKIE_NAME && !value.is_empty()).then_some(value)
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use axum::{
-        extract::FromRequestParts,
-        http::{Request, StatusCode},
-    };
-    use chrono::Utc;
+    use axum::http::Request;
     use ocean_observatory::{sign_token, ObserverScope, ObserverToken};
 
-    fn create_test_secret() -> ObserverSecret {
-        // Create a test secret using a fixed key
-        let secret_key = vec![0x42; ObserverSecret::MIN_KEY_SIZE];
-        ObserverSecret::from_raw_key(secret_key)
+    use super::*;
+
+    const DAEMON_ID: &str = "test-daemon-1";
+
+    fn auth_state() -> ObservatoryAuthState {
+        ObservatoryAuthState::for_test(ObserverSecret::from_raw_key([0x42; 32]), DAEMON_ID)
     }
 
-    fn create_test_token(principal_id: &str, scope: ObserverScope, daemon_id: &str) -> String {
-        let now = Utc::now();
-        let token = ObserverToken {
-            principal_id: principal_id.to_string(),
-            scope,
-            daemon_instance_id: daemon_id.to_string(),
-            issued_at: now.to_rfc3339(),
-            expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
-        };
-        sign_token(&token, &create_test_secret())
+    fn token(scope: ObserverScope) -> String {
+        let claims = ObserverToken::issue(scope, DAEMON_ID, 3_600).expect("issue token");
+        sign_token(&claims, &ObserverSecret::from_raw_key([0x42; 32]))
+    }
+
+    async fn extract(request: Request<axum::body::Body>) -> Result<ObservatoryAuth, StatusCode> {
+        let (mut parts, _) = request.into_parts();
+        parts.extensions.insert(auth_state());
+        ObservatoryAuth::from_request_parts(&mut parts, &()).await
     }
 
     #[tokio::test]
-    async fn test_observatory_auth_valid_token() {
-        let secret = create_test_secret();
-        let daemon_id = "test-daemon-1";
-        let token = create_test_token("observer-1", ObserverScope::Summary, daemon_id);
+    async fn observatory_auth_extracts_bearer_header_for_all_scopes() {
+        for scope in [
+            ObserverScope::Summary,
+            ObserverScope::Content,
+            ObserverScope::ExtensionProducer("producer-a".to_owned()),
+        ] {
+            let request = Request::builder()
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token(scope.clone())),
+                )
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let auth = extract(request).await.expect("authenticated");
+            assert_eq!(auth.0.scope, scope);
+        }
+    }
 
-        let mut parts = Request::builder()
-            .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", token))
+    #[tokio::test]
+    async fn observatory_auth_extracts_authorization_observer_cookie() {
+        let expected = token(ObserverScope::Summary);
+        let request = Request::builder()
+            .header(
+                header::COOKIE,
+                format!("other=value; {OBSERVER_COOKIE_NAME}={expected}"),
+            )
             .body(axum::body::Body::empty())
-            .unwrap()
-            .into_parts()
-            .0;
+            .expect("request");
 
-        // Insert extensions (normally done by router middleware).
-        parts.extensions.insert(secret);
-        parts.extensions.insert(daemon_id.to_string());
-
-        let result = ObservatoryAuth::from_request_parts(&mut parts, &()).await;
-        assert!(result.is_ok(), "Valid token should extract principal");
-
-        let auth = result.unwrap();
-        assert_eq!(auth.0.principal_id, "observer-1");
+        let auth = extract(request).await.expect("authenticated cookie");
         assert_eq!(auth.0.scope, ObserverScope::Summary);
     }
 
     #[tokio::test]
-    async fn test_observatory_auth_missing_header() {
-        let secret = create_test_secret();
-        let daemon_id = "test-daemon-1";
-
-        let mut parts = Request::builder()
+    async fn observatory_auth_rejects_every_credential_failure_as_401() {
+        let malformed_cookie = Request::builder()
+            .header(
+                header::COOKIE,
+                format!("{OBSERVER_COOKIE_NAME}=not-a-token"),
+            )
             .body(axum::body::Body::empty())
-            .unwrap()
-            .into_parts()
-            .0;
+            .expect("request");
+        assert_eq!(
+            extract(malformed_cookie).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
 
-        parts.extensions.insert(secret);
-        parts.extensions.insert(daemon_id.to_string());
+        let malformed_header = Request::builder()
+            .header(header::AUTHORIZATION, "Basic nope")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(
+            extract(malformed_header).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
 
-        let result = ObservatoryAuth::from_request_parts(&mut parts, &()).await;
-        assert_eq!(result, Err(StatusCode::UNAUTHORIZED), "Missing header should return 401");
+        let missing = Request::builder()
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(extract(missing).await, Err(StatusCode::UNAUTHORIZED));
+
+        let wrong_instance_claims =
+            ObserverToken::issue(ObserverScope::Summary, "other-daemon", 3_600)
+                .expect("issue token");
+        let wrong_instance = sign_token(
+            &wrong_instance_claims,
+            &ObserverSecret::from_raw_key([0x42; 32]),
+        );
+        let request = Request::builder()
+            .header(header::AUTHORIZATION, format!("Bearer {wrong_instance}"))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(extract(request).await, Err(StatusCode::UNAUTHORIZED));
     }
 
     #[tokio::test]
-    async fn test_observatory_auth_invalid_bearer_format() {
-        let secret = create_test_secret();
-        let daemon_id = "test-daemon-1";
-
-        let mut parts = Request::builder()
-            .header(axum::http::header::AUTHORIZATION, "InvalidFormat")
+    async fn observatory_auth_never_reads_query_string_credentials() {
+        let request = Request::builder()
+            .uri(format!(
+                "/v1/observatory/events?token={}",
+                token(ObserverScope::Summary)
+            ))
             .body(axum::body::Body::empty())
-            .unwrap()
-            .into_parts()
-            .0;
-
-        parts.extensions.insert(secret);
-        parts.extensions.insert(daemon_id.to_string());
-
-        let result = ObservatoryAuth::from_request_parts(&mut parts, &()).await;
-        assert_eq!(result, Err(StatusCode::UNAUTHORIZED), "Invalid Bearer format should return 401");
+            .expect("request");
+        assert_eq!(extract(request).await, Err(StatusCode::UNAUTHORIZED));
     }
 
-    #[tokio::test]
-    async fn test_observatory_auth_daemon_mismatch() {
-        let secret = create_test_secret();
-        let token = create_test_token("observer-1", ObserverScope::Summary, "daemon-1");
+    #[test]
+    fn observatory_auth_state_loads_persistent_secret_at_startup() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first = ObservatoryAuthState::load(directory.path(), "daemon-one").expect("first");
+        let second = ObservatoryAuthState::load(directory.path(), "daemon-two").expect("second");
 
-        let mut parts = Request::builder()
-            .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", token))
-            .body(axum::body::Body::empty())
-            .unwrap()
-            .into_parts()
-            .0;
-
-        parts.extensions.insert(secret);
-        parts.extensions.insert("daemon-2".to_string()); // Different daemon ID
-
-        let result = ObservatoryAuth::from_request_parts(&mut parts, &()).await;
-        assert_eq!(result, Err(StatusCode::UNAUTHORIZED), "Token for different daemon should return 401");
+        assert_eq!(first.secret.key(), second.secret.key());
+        assert_eq!(first.daemon_instance_id, "daemon-one");
+        assert_eq!(second.daemon_instance_id, "daemon-two");
     }
 }

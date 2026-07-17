@@ -60,6 +60,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - The explicit method/path set in `app_router`, `banner_routes()`, and the operator-guide HTTP quick reference must remain identical. Preserve Axum's default 404/405 fallback and the global layer order: HTTP tracing outside CORS outside route dispatch.
 - `POST /v1/longhouse/inspect` is a read-only projection of the exact ordinary preparation ranking: preserve the shared request/cwd roots/cache/cap/exact-token scorer/tie-break path, path-redacted compact response, raw-prompt/session/cwd/body non-echo (only contributing prompt terms and the additive `exact_name_phrase` flag are returned), and separation from turn execution, capabilities, models, and automatic prompt injection.
 - `harness_profile.rs` owns only the effective per-turn profile gates currently applied to `PromptControl`: hashline edits and artifact spill. LSP/memory remain globally registered, and stream rules, rich context, and minimization remain unavailable rather than logged-only profile claims. Preserve the unknown/missing → CLI fallback; `acp-zed` resolves explicitly with the same effective gates as its former fallback. New external surface classifications require a separate cross-repository policy decision.
+- `observatory_auth.rs` owns the typed Axum auth-state/extractor seam only: accept `Authorization: Bearer` or the `Authorization-Observer` cookie, never query credentials, and map every credential failure to 401. Startup loads the secure secret and mounts typed extension state; Task 5 alone may add read-only Observatory data routes, and no public token-creation route exists.
 
 ## Work Guidance
 
@@ -96,8 +97,8 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon longhouse_turn_preparation_ -- --nocapture --test-threads=1`
 - `cargo test -p ocean-daemon harness_profile -- --nocapture`
 - `cargo test -p ocean-daemon router_contract -- --nocapture`
+- `cargo test -p ocean-daemon observatory_auth -- --nocapture`
 - `cargo test -p ocean-daemon persistent_rooms -- --test-threads=1`
-- `cargo test -p ocean-daemon room_federation::tests -- --nocapture`
 - `cargo test -p ocean-daemon`
 - `cargo check --workspace`
 - Manual daemon health check when route/startup behavior changes: `curl http://127.0.0.1:4780/health`
