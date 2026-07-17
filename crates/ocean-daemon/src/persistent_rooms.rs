@@ -68,6 +68,11 @@ impl RoomWakeBus {
         self.tx.subscribe()
     }
 
+    #[cfg(test)]
+    pub(super) fn test_subscribe(&self) -> broadcast::Receiver<RoomWakeHint> {
+        self.subscribe()
+    }
+
     fn publish(&self, room: &RoomKey, message: &RoomMessage) {
         let _ = self.tx.send(RoomWakeHint {
             room: room.clone(),
@@ -84,8 +89,15 @@ impl RoomWakeBus {
 /// Publish only after the store adapter has returned, which means the allocating
 /// SQLite transaction has committed. A missing subscriber is harmless: hints
 /// are advisory and reconnect/recovery always pages the durable log.
-fn publish_room_wake(state: &AppState, room: &RoomKey, message: &RoomMessage) {
-    state.room_wakes.publish(room, message);
+pub(super) fn publish_room_wake(state: &AppState, room: &RoomKey, message: &RoomMessage) {
+    publish_room_wake_on(&state.room_wakes, room, message);
+}
+
+/// Post-commit transcript wake seam for sibling background producers.
+/// SQLite remains authoritative; callers invoke this only after the store
+/// transaction has returned successfully.
+pub(super) fn publish_room_wake_on(wakes: &RoomWakeBus, room: &RoomKey, message: &RoomMessage) {
+    wakes.publish(room, message);
 }
 
 // ── RoomAccessWakeBus: separate bounded channel for access projection hints ──
@@ -122,6 +134,11 @@ impl RoomAccessWakeBus {
     }
 
     #[cfg(test)]
+    pub(super) fn test_subscribe(&self) -> broadcast::Receiver<RoomAccessWakeHint> {
+        self.subscribe()
+    }
+
+    #[cfg(test)]
     fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
     }
@@ -133,8 +150,14 @@ impl RoomAccessWakeBus {
 
 /// Publish an access-projection wake hint only after the store adapter has
 /// returned (the allocating SQLite transaction has committed).
-fn publish_room_access_wake(state: &AppState, room: &RoomKey) {
-    state.room_access_wakes.publish(room);
+pub(super) fn publish_room_access_wake(state: &AppState, room: &RoomKey) {
+    publish_room_access_wake_on(&state.room_access_wakes, room);
+}
+
+/// Post-commit access-projection wake seam for sibling background producers.
+/// The hint carries no payload; subscribers reread SQLite.
+pub(super) fn publish_room_access_wake_on(wakes: &RoomAccessWakeBus, room: &RoomKey) {
+    wakes.publish(room);
 }
 
 /// Append one durable transcript row and issue its post-commit wake hint.

@@ -53,6 +53,9 @@ serde_json.workspace = true
 # and the STT endpoint uses multipart for xAI speech-to-text. Workspace-pinned;
 # already a transitive dep via ocean-protocol.
 reqwest = { workspace = true, features = ["multipart"] }
+# S2 P2-B: parse Bedrock's durable room SSE stream. Already locked through
+# ocean-protocol/ocean-mcp; direct here because the daemon owns the supervisor.
+eventsource-stream = "0.2"
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true

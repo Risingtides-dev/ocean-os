@@ -4009,3 +4009,39 @@ area:      [design]
 
 Recorded Smaths's explicit Ocean Observatory Gate 1 acceptance after the operator replied “ready” to the manifest gate and coordination lead WildDragon confirmed authorization. Marked the implementation manifest accepted on 2026-07-17, completed its sign-off, corrected the stale Gate 0 reference filename, and updated root/docs contracts, the documentation index, and ROADMAP. Tasks 2–9 are authorized only under the manifest's strict dependency order and stop conditions; the authenticated metadata-safe snapshot/replay/live contract still precedes production Ocean Floor renderer work.
 _________________________________________________________________________________
+
+time:      [04:54] [17-07-26]
+agent:     [pi] [kimi-k2.5] [thoth]
+worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
+type:      [feature-request]
+area:      [backend]
+
+S2 P2-B outbound Bedrock room client/supervisor per approved gate2-s2-p2b-freeze-v2 + v2.1 + v2.2, base f51d9dd3. Added AppState-owned FederationSupervisor with idempotent start/wake/stop/shutdown+join, one serialized task epoch per credentialed room, header-bearer eventsource-stream SSE reconnect from durable cursor, roster-first lease-derived presence, canonical-u64 exact row validation, atomic confirmed ingest through ocean-store, and post-commit transcript/access wake matrix. Sender selects Notify + jittered bounded periodic durable scan + cancellation, validates exact durable message payload, builds the B2 wire body, accepts exact 201 only, suppresses immediate repost while awaiting SSE, and applies the frozen row-fail/recover/revoke status matrix. Revoke closes local admission, joins sender, fails Pending rows, persists Revoked last, publishes one access wake; presence downgrade shares the state commit/wake. Strict origin-only OCEAN_FEDERATION_URL boundary (HTTPS except loopback HTTP, no path/userinfo/query/fragment, redirects off, bounded requests/error bodies, no total SSE deadline); missing/invalid config downgrades credentialed rooms from stale Live to Recovering. P2-B adds no routes and deliberately leaves pending-redemption/redeem and trigger dispatch to P2-C. Fake-Bedrock tests pin header/path/body/no-query, Last-Event-ID 0, POST-cannot-create-transcript, periodic lost-notify healing, exact 201 suppression, two producer sequence-1 streams, SSE-only confirmation/removal, duplicate no-wake, non-message cursor-only ingest, inherited control ids, >2^53 sequence, roster refresh/author mapping, lease presence transitions, revoke ordering/wake count, and start/stop epoch serialization. Narrow gates green: federation 13 tests, persistent_rooms 39, ocean-store 88, denied-warning daemon Clippy, fmt, workspace check, docs-check, diff-check. Full daemon has one unrelated baseline failure: longhouse_inspect_is_advisory_bounded_and_does_not_echo_sensitive_text observes 6 matches vs expected 2 and reproduces on clean f51d9dd3 with the entire P2-B diff stashed; gate rerun excludes exactly that baseline test. Uncommitted, holding for codex pre-commit review; no push.
+_________________________________________________________________________________
+
+time:      [05:14] [17-07-26]
+agent:     [pi] [kimi-k2.5] [thoth]
+worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
+type:      [review]
+area:      [testing]
+
+P2-B pre-commit hardening complete under freeze v2.2. Added synchronized revoke admission so post-gate responses cannot mutate local state, globally bounded concurrent supervisor shutdown joins, strict roster uniqueness and exact control/envelope parsing, 64 KiB SSE JSON cap, no redundant Live-to-Live state commit, cursor>H no-regression helper, and fail-closed revoke cleanup when Pending enumeration fails. Fake Bedrock coverage expanded to 17 focused tests: sender and members GET status matrices (400/409/mismatch-403 row-fail; auth 401/403 revoke; 429/5xx/unexpected 2xx recover), held in-flight POST released after revoke with no local mutation/new request, jittered periodic lost-Notify healing, stop/join/start epoch serialization, two producer sequence-1 streams plus byte-identical restart replay, durable >2^53 cursor reconnect, duplicate no-wake, non-message cursor-only, inherited control ids, heartbeat both-direction mismatch, resync divergence, unknown frame, room-event id mismatch, unknown-author refresh, lease-derived presence/downgrade, and invalid-config stale-Live repair. Final gates: federation 17/17, persistent_rooms 39/39, ocean-store 88/88, daemon 408/408 with one exact baseline Longhouse inspect test excluded (clean f51d9dd3 independently reproduces 6 vs expected 2), daemon all-target Clippy with denied warnings, workspace check, fmt, docs-check, diff-check, compatibility lane, and Rust 1.88 daemon check all green. Exact ten-file scope, uncommitted, no push, awaiting codex gate.
+_________________________________________________________________________________
+
+time:      [05:35] [17-07-26]
+agent:     [pi] [kimi-k2.5] [thoth]
+worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
+type:      [review]
+area:      [backend]
+
+P2-B codex corrective round closed (5 contract gaps). Startup with a valid client now atomically commits Connecting + all-Unavailable before subscribe, pinned against a valid fake origin whose first response hangs. Durable-cursor errors no longer fall back to Last-Event-ID 0, and failed Recovering-to-Live promotion ends the epoch; pure authority tests pin both. Revoke admission is linearized: one AdmissionGate owns close, first-poll request initiation, and post-response local mutation; close-before-admit fake barrier proves zero POSTs, while the existing held in-flight response test still proves no post-gate mutation. RawSseEventBound counts bytes across chunks and rejects an incomplete event above 64 KiB before eventsource-stream accumulation; fake oversized streaming response forces Recovering at the cap. Unknown-author roster refresh is fetched but deferred: Duplicate commits/wakes nothing; Ingested optionally commits roster after atomic message ingest and publishes exactly one message + one access wake. Focused gates green: federation 21/21, persistent_rooms 39/39, ocean-store 88/88, daemon 412/412 with the same one clean-base Longhouse test excluded, daemon denied-warning Clippy, workspace check, Rust 1.88 daemon check, fmt, docs-check, diff-check. Exact ten-file scope remains uncommitted/no push, TASK-18 in_review.
+_________________________________________________________________________________
+
+time:      [05:42] [17-07-26]
+agent:     [pi] [kimi-k2.5] [thoth]
+worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
+type:      [review]
+area:      [backend]
+
+P2-B final store-authority corrective: lease-loss persistence now returns Result and reads the full RoomAccessProjection fail-closed; any decode/read error performs no update, no wake, and no empty-roster substitution. Startup converts room_access failure to BridgeError, skips that room, and never starts its task. Valid-client startup starts only after the atomic Connecting + Unavailable transition succeeds. Reconnect continuation stops if Recovering/lease-loss commit fails; heartbeat ends the epoch on durable-state read error; revoke Pending-enumeration fallback cannot overwrite a corrupt projection. Helper injection pin proves a projection Err invokes neither startup eligibility nor the commit/wake closure and preserves a valid one-member roster when successful. Focused re-gate: federation 22/22, denied-warning daemon Clippy, fmt, diff-check green. Exact ten-file scope remains uncommitted/no push, TASK-18 in_review.
+_________________________________________________________________________________

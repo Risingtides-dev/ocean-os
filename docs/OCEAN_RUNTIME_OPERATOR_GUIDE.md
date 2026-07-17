@@ -195,6 +195,36 @@ Two additional SQLite databases live alongside sessions and the config dir:
 - `rooms.db` — persistent room store (`SqliteRoomStore`). Survives daemon restarts; override the full path with `OCEAN_DB_PATH`.
 - `titles.db` — Longhouse title/escrow registry (firekeeper titles, recall tallies). Survives daemon restarts; override the full path with `OCEAN_TITLES_DB_PATH`.
 
+### Federated-room Bedrock bridge
+
+Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
+`https://bedrock.example.com` or trusted-loopback diagnostics such as
+`http://127.0.0.1:8787`). The daemon rejects userinfo, paths, query strings,
+fragments, non-HTTPS remote origins, and redirects. Each room bearer remains
+in owner-only `rooms.db`; requests use the Authorization header and never a
+query token. Missing or invalid configuration moves every credentialed,
+non-revoked room to `recovering` instead of leaving stale `live` chrome.
+
+At startup, the AppState-owned federation supervisor enumerates durable room
+credentials and starts one cancellable task tree per room. The receiver
+reconnects the Bedrock room SSE from the persisted cursor, commits the roster
+before the first event, and treats ordered SSE as the **only** confirmation
+rail: a ledger POST `201` does not append a transcript row or remove outbox
+state. The sender scans durable Pending rows periodically (Notify only reduces
+latency), posts one row at a time, and suppresses immediate reposts while the
+same connection awaits SSE confirmation. Restart safely retries the exact
+producer tuple.
+
+Operator-visible access states are `connecting`, `recovering`, `live`, and
+`revoked` for credentialed rooms (`local` for unfederated rooms). Presence
+follows the authenticated SSE lease: during healthy catch-up, the local human
+and locally-bound owned agents remain Live even while the state label is
+`recovering`; disconnect/resync/auth failure downgrades all projected members
+to Unavailable in the same access commit/wake. A room-level revoke closes new
+sender admission, fails local Pending rows, persists `revoked` last, emits one
+access wake, and stops retries. P2-B adds no HTTP routes; invite redemption,
+new-room startup, local outbox enqueue, and trigger dispatch remain P2-C.
+
 ## Common commands
 
 ### CLI help

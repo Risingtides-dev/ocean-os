@@ -115,6 +115,8 @@ mod project_registry;
 mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
 mod request_control;
+/// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
+mod room_federation;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
 mod slack_canvas_fulfillment;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
@@ -159,6 +161,7 @@ use request_control::{
     register_running_request, requests_snapshot, update_request_finished,
     update_request_permission_result, PermissionRegistry, PermissionWaiter, RequestRegistry,
 };
+use room_federation::FederationSupervisor;
 use slack_canvas_fulfillment::{
     canvas_fulfillment_get, canvas_fulfillment_post, gc_canvas_fulfillments, CanvasFulfillmentStore,
 };
@@ -234,6 +237,9 @@ struct AppState {
     /// Separate from `room_wakes` so a heavy transcript tail does not
     /// back-pressure access-projection subscribers.
     room_access_wakes: RoomAccessWakeBus,
+    /// AppState-owned cloneable outbound Bedrock supervisor. P2-C reuses its
+    /// idempotent start/wake/stop seam after redeem and local outbox enqueue.
+    room_federation: FederationSupervisor,
     /// The **persisted Longhouse title registry** (OCEAN-246/272). Holds firekeeper
     /// and validator titles durably across turns, storing only a salt+SHA-256
     /// *verifier* per title (never the raw token). Convene mints into it; the
@@ -785,6 +791,17 @@ async fn main() -> anyhow::Result<()> {
 
     let roles = load_model_roles(&ocean_agent::config_dir_from_env());
 
+    let rooms = Arc::new(Mutex::new(room_store));
+    let room_wakes = RoomWakeBus::default();
+    let room_access_wakes = RoomAccessWakeBus::default();
+    let shutdown = CancellationToken::new();
+    let room_federation = FederationSupervisor::from_env(
+        rooms.clone(),
+        room_wakes.clone(),
+        room_access_wakes.clone(),
+        shutdown.clone(),
+    );
+
     let state = AppState {
         runtime,
         roles: Arc::new(roles),
@@ -793,9 +810,10 @@ async fn main() -> anyhow::Result<()> {
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
-        rooms: Arc::new(Mutex::new(room_store)),
-        room_wakes: RoomWakeBus::default(),
-        room_access_wakes: RoomAccessWakeBus::default(),
+        rooms,
+        room_wakes,
+        room_access_wakes,
+        room_federation,
         titles: Arc::new(Mutex::new(title_registry)),
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
         recalls: new_recall_registry(),
@@ -810,7 +828,7 @@ async fn main() -> anyhow::Result<()> {
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         // OCEAN-300: a single daemon-wide shutdown token, cloned into the SSE
         // handlers and fired by the signal handler so live streams terminate.
-        shutdown: CancellationToken::new(),
+        shutdown,
         // OCEAN-303: daemon-wide turn metrics behind `GET /metrics`.
         metrics: Arc::new(TurnMetrics::default()),
         // OCEAN-304: concurrent-turn ceiling. One permit per running turn;
@@ -818,6 +836,11 @@ async fn main() -> anyhow::Result<()> {
         turn_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_turns())),
         advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
     };
+
+    // Start restart-safe room federation only after AppState owns the handle.
+    // Missing/invalid client config cannot leave credentialed rooms stale Live:
+    // startup downgrades them to Recovering and spawns no network tasks.
+    state.room_federation.startup().await;
 
     // Background GC: the request/permission/canvas-fulfillment registries are
     // otherwise unbounded and accrete one entry per turn/permission/fulfilled
@@ -890,6 +913,7 @@ async fn main() -> anyhow::Result<()> {
     // terminates the live SSE streams (`/v1/events`, `/v1/agent/events`) and lets
     // `with_graceful_shutdown` actually complete instead of hanging forever.
     let shutdown_token = state.shutdown.clone();
+    let federation_shutdown = state.room_federation.clone();
     let app = app.with_state(state);
 
     let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
@@ -948,6 +972,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
         }
     }
+
+    // All room task trees share the daemon shutdown token, but retain and join
+    // their handles explicitly so no sender/receiver is runtime-aborted mid-
+    // bookkeeping when main returns.
+    federation_shutdown.shutdown().await;
 
     // OCEAN-301: the drain is now supervised. A wedged, non-cancellable turn
     // handle must never hang the process past a hard ceiling, and a SECOND
@@ -11804,6 +11833,16 @@ mod tests {
         std::env::set_var("OCEAN_MODEL", "fake-ok");
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         AppState {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
@@ -11812,9 +11851,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -11825,7 +11865,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
@@ -13193,6 +13233,16 @@ mod tests {
         std::env::set_var("OCEAN_YOLO", "1");
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         AppState {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
@@ -13201,9 +13251,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13214,7 +13265,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
@@ -13234,6 +13285,16 @@ mod tests {
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let db_path = tmp.path().join("rooms.db");
         let store = ocean_store::SqliteRoomStore::open(&db_path).expect("file-backed store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         let state = AppState {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
@@ -13242,9 +13303,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13255,7 +13317,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
             advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
@@ -13990,6 +14052,16 @@ mod tests {
         std::env::set_var("OCEAN_MODEL", "fake-ok");
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         let titles = ocean_longhouse::SqliteTitleRegistry::open(dir.join("titles.db"))
             .expect("on-disk titles");
         AppState {
@@ -14000,9 +14072,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(titles)),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             recalls: new_recall_registry(),
@@ -14011,7 +14084,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
