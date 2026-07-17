@@ -4179,3 +4179,30 @@ to this change). crates/AGENTS.md ownership rows for observatory auth are
 in WildDragon's working tree pending their commit. main diverged from
 origin/main via the rebase; push/force-with-lease decision flagged to
 WildDragon as coordination lead.
+_________________________________________________________________________________
+
+time:  [14:22] [17-07-26]
+agent: [pi] [claude-opus-4-5] [SageTiger]
+worktree: [main]
+type:  [feature-request]: Observatory task-5 read-only API routes
+area:  [backend]: ocean-daemon observatory routes + ocean-observatory store readers
+
+Completed Crew task-5 (d391b5f1): three read-only Observatory routes
+behind the Task-4 scoped-observer extractor per Gate 1 manifest §7.
+snapshot (consistent projection at watermark, 410 only against the
+durable retention-boundary watermark), events (SSE tail: Last-Event-ID
+resume, in-stream reset/error frames, stream.gap on durable-log skips,
+3s keepalive, always replays from store before live attach), replay
+(bounded pages with next_after/has_more/complete/continuation_url,
+kind:/producer: filters, 410 with exact gap span). §7.4 headers on all
+routes; store-open failure degrades to 503, never startup. Added
+earliest_available_cursor() and retention_boundary() store readers.
+Parity surfaces: banner +3, route baseline 77→80, operator guide,
+ARCHITECTURE.md, daemon AGENTS.md. Deviation flagged: planner spec
+listed snapshot "capabilities" but the accepted ObservatorySnapshot
+wire contract has no such field; omitted and flagged for task-8/9
+review. V1 projection gaps (session/turn/request ids, attention shelf)
+stay empty pending task-6. Verification: observatory 17/17,
+router_contract 5/5, ocean-observatory 48/48, workspace check, clippy,
+fmt, docs-check all clean; full daemon suite 408/409 with only the
+known env-sensitive longhouse_inspect failure.
