@@ -109,6 +109,8 @@ mod model_catalog;
 mod model_roles;
 /// Read-only Observatory data routes (snapshot, SSE events, replay).
 mod observatory;
+/// Redacting bridge from the runtime `AgentTurnEvent` stream to Observatory facts.
+mod observatory_adapter;
 /// Axum extractor for scoped observer authentication tokens (HMAC-SHA256).
 mod observatory_auth;
 /// Durable persistent-room HTTP lifecycle, paging, and auto-convene adapter.
@@ -823,6 +825,56 @@ async fn main() -> anyhow::Result<()> {
             .context("initializing Observatory authentication")?;
     let observatory_services =
         observatory::ObservatoryServices::load(&config_dir, observatory_boot_id);
+    // The agent event bus is hoisted above AppState so the Observatory pump
+    // can subscribe before any turn runs (no fact can slip the seam).
+    let agent_event_bus = AgentEventBus::new(1024);
+
+    // Task 6: bridge runtime facts into the Observatory. The restart sweep
+    // closes out executions a previous boot left nonterminal, then the pump
+    // appends every adapted agent event to the durable store. When the store
+    // failed to open the pump is skipped and routes answer 503.
+    let observatory_adapter = std::sync::Arc::new(observatory_adapter::ObservatoryAdapter::new(
+        observatory_services.observatory_id().to_owned(),
+        observatory_services.daemon_instance_id().to_owned(),
+    ));
+    let observatory_store = observatory_services.store_handle();
+    if let Some(observatory_store) = observatory_store.as_ref() {
+        let interrupted = observatory_adapter.mark_interrupted(observatory_store);
+        if interrupted > 0 {
+            tracing::info!(
+                interrupted,
+                "observatory restart sweep closed stale executions"
+            );
+        }
+        if let Err(error) = observatory_store
+            .append_event(observatory_adapter.daemon_started(env!("CARGO_PKG_VERSION")))
+        {
+            tracing::error!(%error, "observatory daemon-started append failed");
+        }
+        let (_replay, mut observatory_rx) = agent_event_bus.subscribe_with_full_replay();
+        let pump_store = std::sync::Arc::clone(observatory_store);
+        let pump_adapter = std::sync::Arc::clone(&observatory_adapter);
+        tokio::spawn(async move {
+            loop {
+                match observatory_rx.recv().await {
+                    Ok(envelope) => {
+                        if let Some(fact) = pump_adapter.adapt(&envelope.event) {
+                            if let Err(error) = pump_store.append_event(fact) {
+                                tracing::error!(%error, "observatory fact append failed");
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // The pump is the durability path: lag means facts were
+                        // dropped, so make it loud (unlike the SSE routes,
+                        // which can always re-read the store).
+                        tracing::warn!(skipped, "observatory pump lagged; facts were lost");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 
     let rooms = Arc::new(Mutex::new(room_store));
     let room_wakes = RoomWakeBus::default();
@@ -842,7 +894,7 @@ async fn main() -> anyhow::Result<()> {
         runtime,
         roles: Arc::new(roles),
         events: EventBus::new(1024),
-        agent_events: AgentEventBus::new(1024),
+        agent_events: agent_event_bus,
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
@@ -1028,6 +1080,16 @@ async fn main() -> anyhow::Result<()> {
             outcome = "federated_dispatch_join_failed",
             "federated trigger dispatcher ended unexpectedly"
         );
+    }
+
+    // Task 6: record the graceful stop in the durable Observatory log before
+    // the process exits. Best-effort: a failed append must not block shutdown.
+    if let Some(store) = observatory_store.as_ref() {
+        if let Err(error) = store
+            .append_event(observatory_adapter.daemon_stopping(Some("graceful_shutdown".to_owned())))
+        {
+            tracing::error!(%error, "observatory daemon-stopping append failed");
+        }
     }
 
     // OCEAN-301: the drain is now supervised. A wedged, non-cancellable turn

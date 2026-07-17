@@ -104,6 +104,20 @@ impl ObservatoryStore {
         )?;
         Ok(Cursor::new(earliest))
     }
+    /// Nonterminal executions (phase `admitted`/`running`) with their current
+    /// phase string. Used by the daemon restart sweep to close out executions
+    /// a previous boot left hanging.
+    pub fn nonterminal_executions(&self) -> Result<Vec<(String, String)>> {
+        let db = self.db.lock();
+        let mut stmt = db.prepare(
+            "SELECT execution_id, phase FROM execution_nodes WHERE phase IN ('admitted','running')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Last pruned retention boundary, when any pruning has occurred.
     ///
     /// Cursors at or below this watermark are gone for good. Unlike

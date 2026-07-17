@@ -89,8 +89,22 @@ impl ObservatoryServices {
         }
     }
 
+    /// Shared store handle for the runtime-fact adapter (Task 6). `None`
+    /// means the store failed to open and the routes answer 503.
+    pub(crate) fn store_handle(&self) -> Option<Arc<ObservatoryStore>> {
+        self.store.clone()
+    }
+
+    pub(crate) fn observatory_id(&self) -> &str {
+        &self.observatory_id
+    }
+
+    pub(crate) fn daemon_instance_id(&self) -> &str {
+        &self.daemon_instance_id
+    }
+
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         store: Arc<ObservatoryStore>,
         observatory_id: &str,
         daemon_instance_id: &str,
@@ -173,7 +187,7 @@ fn parse_cursor(raw: &str) -> Option<Cursor> {
 /// Map the store's projected phase string back to the wire enum. The V1
 /// projection writes `format!("{phase:?}").to_lowercase()`, which collapses
 /// `TimedOut` to `timedout`; both spellings are accepted here.
-fn phase_from_projection(raw: &str) -> ocean_observatory::ExecutionPhase {
+pub(crate) fn phase_from_projection(raw: &str) -> ocean_observatory::ExecutionPhase {
     use ocean_observatory::ExecutionPhase;
     match raw {
         "admitted" => ExecutionPhase::Admitted,
