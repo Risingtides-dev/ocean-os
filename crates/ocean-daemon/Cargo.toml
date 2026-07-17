@@ -46,6 +46,7 @@ ocean-browser.workspace = true
 ocean-call.workspace = true
 ocean-core.workspace = true
 ocean-longhouse.workspace = true
+ocean-observatory.workspace = true
 ocean-protocol.workspace = true
 # Voice phases 2/3: resolve the OpenAI credential for the Realtime mint.
 ocean-providers.workspace = true

@@ -5,11 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-utils = []
+
 [dependencies]
+base64 = "0.22"
 chrono.workspace = true
+hmac = "0.12"
+rand = "0.8"
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle = "2"
 thiserror = "2"
 uuid.workspace = true
 sha2.workspace = true

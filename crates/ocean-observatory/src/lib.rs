@@ -1,9 +1,11 @@
 //! Durable, metadata-only Observatory event schema and SQLite/WAL store.
+pub mod auth;
 pub mod cursor;
 pub mod redaction;
 pub mod retention;
 pub mod schema;
 pub mod store;
+pub use auth::*;
 pub use cursor::*;
 pub use redaction::*;
 pub use retention::*;

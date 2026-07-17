@@ -117,6 +117,7 @@ ocean-hooks = { path = "crates/ocean-hooks" }
 regex = "1"
 ocean-context = { path = "crates/ocean-context" }
 ocean-memory = { path = "crates/ocean-memory" }
+ocean-observatory = { path = "crates/ocean-observatory" }
 # B1 tree-sitter resolver (OCEAN-307). Pinned: grammar ABI and node-kind names
 # must not drift under us — sig-hashes are persisted in handoffs.
 tree-sitter = "=0.26.9"

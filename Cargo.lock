@@ -3385,6 +3385,7 @@ dependencies = [
  "ocean-call",
  "ocean-core",
  "ocean-longhouse",
+ "ocean-observatory",
  "ocean-protocol",
  "ocean-providers",
  "ocean-runtime",
@@ -3546,12 +3547,16 @@ dependencies = [
 name = "ocean-observatory"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "hmac",
  "parking_lot",
+ "rand 0.8.6",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "uuid",

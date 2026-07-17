@@ -107,6 +107,8 @@ mod metrics;
 mod model_catalog;
 /// Immutable startup model-role loading and pure turn/advisor role resolution.
 mod model_roles;
+/// Axum extractor for scoped observer authentication tokens (HMAC-SHA256).
+mod observatory_auth;
 /// Durable persistent-room HTTP lifecycle, paging, and auto-convene adapter.
 mod persistent_rooms;
 /// Project registry CRUD, pagination, git enrichment, and session association adapters.
