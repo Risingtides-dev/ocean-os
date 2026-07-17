@@ -1,7 +1,7 @@
 # Ocean Daemon Longhouse Topic Projection Extraction Manifest
 
 **Date:** 2026-07-16
-**Status:** Ready for publication; characterization, extraction, dedicated-target validation, compatibility/MSRV/local CI, and independent review passed; hosted CI and merge pending
+**Status:** Published; characterization, extraction, dedicated-target validation, compatibility/MSRV/local CI, independent review, hosted CI, and PR #305 merge `9676b18` passed
 **Owner:** Ocean OS
 **Source baseline:** fetched and rebased `origin/main` `9177598`
 **Rollback point:** characterization commit `c443df9` (rebased from reviewed `c1be830`)
@@ -223,7 +223,7 @@ Focused characterization/convene/router/SSE/preparation groups passed. Before th
 
 Fresh independent correctness/mechanical and security/architecture/lifecycle reviews both reported PASS with no unresolved medium-or-higher issue. They confirmed exact three-item ownership and visibility, one unchanged detached 17-event task, lock-end-before-publication/await, poison asymmetry, exact HTTP responses, one composition-owned registry shared with runtime extensions and `AppState`, and no title token, model, permission, persistence, route, SSE, runtime, call, registry-construction, or broader governance authority in the new owner. The prior non-blocking source-inventory parser limitation did not affect review because complete definitions and whole-owner contents were compared directly.
 
-Live daemon deployment/supervision remains owned by the concurrent operator workstream and was not performed. Hosted default-parallel macOS/Ubuntu CI, pinned Rust 1.88, cargo-deny, and merge remain pending.
+Live daemon deployment/supervision remained owned by the concurrent operator workstream and was not performed. Hosted CI run `29615843464` passed the default-parallel macOS and Ubuntu repository/feature/release gates, pinned Rust 1.88 MSRV, and cargo-deny. PR #305 merged the exact reviewed head `ba1a599` over base `9177598` as merge commit `9676b18`.
 
 ## Validation matrix
 
@@ -258,7 +258,7 @@ cargo xtask docs-check
 git diff --check
 ```
 
-Default-parallel hosted macOS/Ubuntu repository gates, pinned Rust 1.88 MSRV, and cargo-deny remain required before merge.
+Default-parallel hosted macOS/Ubuntu repository gates, pinned Rust 1.88 MSRV, and cargo-deny passed in CI run `29615843464` before PR #305 merged as `9676b18`.
 
 ## Review requirements
 

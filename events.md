@@ -4299,3 +4299,11 @@ Verification:
 - after the latest rebase onto `9177598`, mechanical comparison, focused groups, all 491 daemon tests, daemon Clippy, formatting, docs, and diff checks passed again
 - fresh independent correctness/mechanical and security/architecture/lifecycle reviews passed with no unresolved medium-or-higher issue
 - existing adjacent Longhouse risks remain separately documented; deployment/supervision was not performed; hosted CI and merge remain pending
+_________________________________________________________________________________
+time:      [05:54pm] [17-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-governance]
+type:      [merge]: publish Longhouse topic projection extraction
+area:      [backend]: ocean-daemon Phase 2C governance observability
+
+PR #305 passed hosted default-parallel macOS and Ubuntu repository/feature/release gates, pinned Rust 1.88 MSRV, and cargo-deny in CI run `29615843464`, then merged the exact reviewed head `ba1a599` over `9177598` as `9676b18`. The private `src/longhouse_topics.rs` boundary is published with only the scripted demo and topic list/detail adapters; real convene/title/control remains the next separate security-sensitive manifest. No daemon restart, deployment, process kill, LaunchAgent change, or binary installation was performed from the refactor worktree.
