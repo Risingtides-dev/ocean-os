@@ -222,6 +222,7 @@ pub struct AgentTurn {
 /// the manual field-by-field conversion in the daemon's `agent_turn` handler.
 /// `ocean-core` is the dep-free leaf crate — `sdk → core` is a legal arrow.
 pub use ocean_core::PromptImage as TurnImage;
+pub use ocean_core::SessionRunState;
 
 /// A single tab as the **client** sees it (OCEAN-40, Phase 2). This is the wire
 /// DTO a surface ships with its turn, deliberately decoupled from
@@ -465,6 +466,12 @@ pub struct AgentSessionSummary {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn: Option<AgentTurnId>,
+    /// Client-facing run state of the active turn, derived atomically
+    /// with active_turn from the same RequestStatus snapshot.
+    /// None when active_turn is None.
+    /// Additive, backward-compatible: old clients ignore unknown keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_state: Option<SessionRunState>,
     pub turn_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
