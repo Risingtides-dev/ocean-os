@@ -25,8 +25,7 @@ use ocean_agent_sdk::{
     AgentOwningProject, AgentRole, AgentSessionCreateRequest, AgentSessionCreateResponse,
     AgentSessionId, AgentSessionResponse, AgentSessionSummary, AgentSessionsResponse, AgentTurn,
     AgentTurnEvent, AgentTurnId, AgentTurnRequest, AgentTurnResponse, AgentTurnStatus,
-    ContextUsage, ConveneTrigger, Federation, LonghouseEvent, LonghouseMember, Mark, MarkKind,
-    ProposalTally, ToolCall, ToolCallId, ToolResult,
+    ContextUsage, Federation, LonghouseEvent, Mark, MarkKind, ToolCall, ToolCallId, ToolResult,
 };
 use ocean_core::{
     EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
@@ -99,6 +98,8 @@ mod filesystem;
 mod history_search;
 /// State-free Longhouse prepare, inspect, and workflow HTTP adapters.
 mod longhouse_preparation;
+/// Scripted Longhouse topic producer plus read-only topic projection adapters.
+mod longhouse_topics;
 /// Per-turn Longhouse advisory preparation and model-facing presentation.
 mod longhouse_turn_preparation;
 /// In-process turn counters, Prometheus rendering, and in-flight RAII guard.
@@ -146,6 +147,7 @@ use event_adapter::{agent_event_type_name, agent_to_ocean_event};
 use filesystem::{fs_dirs, fs_file};
 use history_search::history_search;
 use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prepare};
+use longhouse_topics::{longhouse_demo, longhouse_topic, longhouse_topics};
 use longhouse_turn_preparation::{apply_longhouse_prep, longhouse_prep_for_turn};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
@@ -195,6 +197,8 @@ use longhouse_turn_preparation::{
 use metrics::{labelled_value, metric_value};
 #[cfg(test)]
 use model_catalog::ModelSetRequest;
+#[cfg(test)]
+use ocean_agent_sdk::{ConveneTrigger, LonghouseMember, ProposalTally};
 #[cfg(test)]
 use ocean_core::{
     evaluate_trigger_policy, Project, ProjectConfig, RoomParticipant, RoomTriggerEvent,
@@ -2459,211 +2463,6 @@ fn longhouse_routes() -> Router<AppState> {
         .route("/v1/workflows/prepare", post(workflows_prepare))
 }
 
-/// Emit a scripted-but-real Longhouse deliberation onto the agent event bus so
-/// the Living Deck (the underwater-building UI) can render an actual council
-/// flow before the full convening engine exists. Returns immediately; the flow
-/// streams over `/v1/agent/events` as `Extension { extension: "longhouse" }`
-/// events. This is a development harness, not the production convening path.
-async fn longhouse_demo(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let bus = state.agent_events.clone();
-    let registry = state.longhouse.clone();
-    let topic_id = Uuid::new_v4();
-    let board_id = Uuid::new_v4();
-
-    tokio::spawn(async move {
-        use tokio::time::{sleep, Duration};
-        // Tee every demo event into the read-side registry before publishing to
-        // the bus — identical to the `longhouse_convene` path (OCEAN-58 / Codex).
-        // Without this, a demo council's TopicConvened/TopicClosed stream renders
-        // live but never lands in the topic store, so GET /v1/longhouse/topics
-        // stays empty and GET /v1/longhouse/topics/{id} 404s for the demo's id.
-        // The std Mutex guard is dropped before any await (the closure is fully
-        // synchronous), so it never blocks the scheduler.
-        let emit = |ev: LonghouseEvent| {
-            if let Ok(mut reg) = registry.lock() {
-                reg.ingest(&ev);
-            }
-            bus.emit(ev.into_turn_event());
-        };
-
-        // 1. A user asks the Sales room a question → the room lights up.
-        emit(LonghouseEvent::TopicConvened {
-            topic_id,
-            board_id,
-            federation: Federation::Sales,
-            trigger: ConveneTrigger::UserRequest,
-            title: "Which 5 creators should we pitch for the Warner Q3 push?".into(),
-            deadline_ms: 1_700_000_000_000,
-        });
-        sleep(Duration::from_millis(600)).await;
-
-        // 2. Four members swim in — mixed models, mostly couriers + a steward.
-        let opus = Uuid::new_v4();
-        let kimi = Uuid::new_v4();
-        let deepseek = Uuid::new_v4();
-        let steward = Uuid::new_v4();
-        let member = |id: Uuid, role: AgentRole, model: &str, label: &str| LonghouseMember {
-            agent_id: id,
-            federation: Federation::Sales,
-            role,
-            model: model.into(),
-            label: Some(label.into()),
-        };
-        emit(LonghouseEvent::Convened {
-            topic_id,
-            members: vec![
-                member(
-                    opus,
-                    AgentRole::Courier,
-                    "claude-opus-4-7",
-                    "Sales Courier · Opus",
-                ),
-                member(
-                    kimi,
-                    AgentRole::Courier,
-                    "kimi-k2.6",
-                    "Sales Courier · Kimi",
-                ),
-                member(
-                    deepseek,
-                    AgentRole::Courier,
-                    "deepseek-v4-pro",
-                    "Sales Courier · DeepSeek",
-                ),
-                member(
-                    steward,
-                    AgentRole::Steward,
-                    "claude-opus-4-7",
-                    "Sales Steward",
-                ),
-            ],
-        });
-        sleep(Duration::from_millis(700)).await;
-
-        // 3. Two proposals land on the blackboard.
-        let prop_a = Uuid::new_v4();
-        let prop_b = Uuid::new_v4();
-        emit(LonghouseEvent::MarkPosted {
-            topic_id,
-            mark: Mark {
-                mark_id: Uuid::new_v4(),
-                author: opus,
-                kind: MarkKind::Proposal,
-                target: None,
-                summary: "Plan A: 5 mid-tier dance creators w/ proven Warner sound lift".into(),
-            },
-        });
-        // give prop_a its identity by re-using mark_id as proposal id in tallies
-        sleep(Duration::from_millis(500)).await;
-        emit(LonghouseEvent::MarkPosted {
-            topic_id,
-            mark: Mark {
-                mark_id: Uuid::new_v4(),
-                author: kimi,
-                kind: MarkKind::Proposal,
-                target: None,
-                summary: "Plan B: 3 macro creators + 2 emerging, higher reach, higher risk".into(),
-            },
-        });
-        sleep(Duration::from_millis(600)).await;
-
-        // 4. Evidence + endorsements + an inhibit — the deliberation moves.
-        emit(LonghouseEvent::MarkPosted {
-            topic_id,
-            mark: Mark {
-                mark_id: Uuid::new_v4(),
-                author: deepseek,
-                kind: MarkKind::Evidence,
-                target: Some(prop_a),
-                summary: "Campaign Hub: Plan A creators avg 2.3x save-rate on prior Warner sounds"
-                    .into(),
-            },
-        });
-        sleep(Duration::from_millis(500)).await;
-        for (author, target) in [(opus, prop_a), (deepseek, prop_a), (steward, prop_a)] {
-            emit(LonghouseEvent::MarkPosted {
-                topic_id,
-                mark: Mark {
-                    mark_id: Uuid::new_v4(),
-                    author,
-                    kind: MarkKind::Endorse,
-                    target: Some(target),
-                    summary: "endorses Plan A".into(),
-                },
-            });
-            emit(LonghouseEvent::QuorumUpdated {
-                topic_id,
-                tallies: vec![
-                    ProposalTally {
-                        proposal: prop_a,
-                        net_weight: 1.0,
-                    },
-                    ProposalTally {
-                        proposal: prop_b,
-                        net_weight: 0.4,
-                    },
-                ],
-                leader: Some(prop_a),
-                distance_to_quorum: 0.5,
-            });
-            sleep(Duration::from_millis(450)).await;
-        }
-        emit(LonghouseEvent::MarkPosted {
-            topic_id,
-            mark: Mark {
-                mark_id: Uuid::new_v4(),
-                author: kimi,
-                kind: MarkKind::Inhibit,
-                target: Some(prop_a),
-                summary: "flags Plan A reach ceiling — but concedes save-rate".into(),
-            },
-        });
-        sleep(Duration::from_millis(500)).await;
-
-        // 5. A firekeeper title is granted; quorum crosses.
-        emit(LonghouseEvent::RoleGranted {
-            topic_id,
-            agent_id: steward,
-            role: AgentRole::Firekeeper,
-        });
-        emit(LonghouseEvent::QuorumUpdated {
-            topic_id,
-            tallies: vec![
-                ProposalTally {
-                    proposal: prop_a,
-                    net_weight: 2.6,
-                },
-                ProposalTally {
-                    proposal: prop_b,
-                    net_weight: 0.4,
-                },
-            ],
-            leader: Some(prop_a),
-            distance_to_quorum: 1.0,
-        });
-        sleep(Duration::from_millis(600)).await;
-
-        // 6. The firekeeper ratifies — the room floods with light.
-        emit(LonghouseEvent::Converged {
-            topic_id,
-            decision: prop_a,
-            by: steward,
-        });
-        sleep(Duration::from_millis(400)).await;
-        emit(LonghouseEvent::TopicClosed { topic_id });
-
-        // 7. A steward heartbeat about the Sales automations (deck shows health).
-        emit(LonghouseEvent::RunHealth {
-            federation: Federation::Sales,
-            runs_total: 7,
-            runs_healthy: 7,
-            note: Some("nightly outreach sync green".into()),
-        });
-    });
-
-    Json(json!({ "ok": true, "topic_id": topic_id, "streaming_on": "/v1/agent/events" }))
-}
-
 /// Request body for `POST /v1/longhouse/convene`.
 #[derive(Debug, serde::Deserialize)]
 struct LonghouseConveneRequest {
@@ -4579,56 +4378,6 @@ async fn room_livekit_token(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "ok": false, "error": e })),
-        ),
-    }
-}
-
-/// `GET /v1/longhouse/topics` — list every tracked longhouse topic with its full
-/// observable state (members, marks, tallies, leader, deadline, firekeeper,
-/// decision, state). Read-only mirror of the per-council quorum engine, folded
-/// from the event stream so the quorum observability deck survives a refresh
-/// (OCEAN-58).
-async fn longhouse_topics(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let topics = match state.longhouse.lock() {
-        Ok(reg) => reg.topics(),
-        Err(poisoned) => poisoned.into_inner().topics(),
-    };
-    Json(json!({ "ok": true, "topics": topics }))
-}
-
-/// `GET /v1/longhouse/topics/{topic_id}` — one topic's full observable state by
-/// id. 404 if the topic id is unknown, 400 if it isn't a valid UUID. Mirrors the
-/// client-facing API shape: a typed error body, never a panic.
-async fn longhouse_topic(
-    State(state): State<AppState>,
-    Path(topic_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let id = match Uuid::parse_str(topic_id.trim()) {
-        Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": format!("invalid topic id '{topic_id}'; expected a UUID"),
-                })),
-            );
-        }
-    };
-
-    let snapshot = match state.longhouse.lock() {
-        Ok(reg) => reg.topic(&id),
-        Err(poisoned) => poisoned.into_inner().topic(&id),
-    };
-
-    match snapshot {
-        Some(topic) => (StatusCode::OK, Json(json!({ "ok": true, "topic": topic }))),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "ok": false,
-                "error": format!("no longhouse topic with id '{id}'"),
-            })),
         ),
     }
 }
@@ -14796,6 +14545,977 @@ mod tests {
         std::env::remove_var("OCEAN_YOLO");
     }
 
+    // ---- Longhouse topic-projection extraction characterization ------------
+
+    async fn longhouse_topic_projection_request(
+        app: Router,
+        method: Method,
+        path: &str,
+        body: &'static str,
+    ) -> (StatusCode, Option<String>, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let allow = response
+            .headers()
+            .get(header::ALLOW)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, allow, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_topic_projection_http_envelopes_methods_and_order_are_exact() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let app = longhouse_routes().with_state(state.clone());
+
+        let (status, allow, body) = longhouse_topic_projection_request(
+            app.clone(),
+            Method::GET,
+            "/v1/longhouse/topics",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(allow, None);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({ "ok": true, "topics": [] })
+        );
+
+        let oldest = Uuid::from_u128(1);
+        let newest_a = Uuid::from_u128(2);
+        let newest_b = Uuid::from_u128(3);
+        let member = Uuid::from_u128(10);
+        let proposal = Uuid::from_u128(11);
+        let board = Uuid::from_u128(12);
+        {
+            let mut registry = state.longhouse.lock().unwrap();
+            for (topic_id, deadline_ms, title) in [
+                (oldest, 100, "oldest"),
+                (newest_b, 200, "newest-b"),
+                (newest_a, 200, "newest-a"),
+            ] {
+                registry.ingest(&LonghouseEvent::TopicConvened {
+                    topic_id,
+                    board_id: if topic_id == newest_a {
+                        board
+                    } else {
+                        Uuid::new_v4()
+                    },
+                    federation: Federation::Dev,
+                    trigger: ConveneTrigger::UserRequest,
+                    title: title.into(),
+                    deadline_ms,
+                });
+            }
+            registry.ingest(&LonghouseEvent::Convened {
+                topic_id: newest_a,
+                members: vec![LonghouseMember {
+                    agent_id: member,
+                    federation: Federation::Dev,
+                    role: AgentRole::Steward,
+                    model: "fake-topic-model".into(),
+                    label: Some("Topic Steward".into()),
+                }],
+            });
+            registry.ingest(&LonghouseEvent::MarkPosted {
+                topic_id: newest_a,
+                mark: Mark {
+                    mark_id: Uuid::from_u128(13),
+                    author: member,
+                    kind: MarkKind::Proposal,
+                    target: None,
+                    summary: "seed proposal".into(),
+                },
+            });
+            registry.ingest(&LonghouseEvent::QuorumUpdated {
+                topic_id: newest_a,
+                tallies: vec![ProposalTally {
+                    proposal,
+                    net_weight: 1.0,
+                }],
+                leader: Some(proposal),
+                distance_to_quorum: 1.0,
+            });
+            registry.ingest(&LonghouseEvent::RoleGranted {
+                topic_id: newest_a,
+                agent_id: member,
+                role: AgentRole::Firekeeper,
+            });
+            registry.ingest(&LonghouseEvent::Converged {
+                topic_id: newest_a,
+                decision: proposal,
+                by: member,
+            });
+        }
+
+        let (status, allow, body) = longhouse_topic_projection_request(
+            app.clone(),
+            Method::GET,
+            "/v1/longhouse/topics",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(allow, None);
+        let list: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(sorted_json_keys(&list), ["ok", "topics"]);
+        assert_eq!(list["ok"], json!(true));
+        let topics = list["topics"].as_array().unwrap();
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics[0]["topic_id"], json!(newest_a));
+        assert_eq!(topics[1]["topic_id"], json!(newest_b));
+        assert_eq!(topics[2]["topic_id"], json!(oldest));
+
+        let detail_path = format!("/v1/longhouse/topics/{newest_a}");
+        let (status, allow, body) =
+            longhouse_topic_projection_request(app.clone(), Method::GET, &detail_path, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(allow, None);
+        let detail: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(sorted_json_keys(&detail), ["ok", "topic"]);
+        assert_eq!(
+            detail,
+            json!({
+                "ok": true,
+                "topic": {
+                    "topic_id": newest_a,
+                    "board_id": board,
+                    "federation": "dev",
+                    "trigger": "user_request",
+                    "title": "newest-a",
+                    "deadline_ms": 200,
+                    "members": [{
+                        "agent_id": member,
+                        "federation": "dev",
+                        "role": "steward",
+                        "model": "fake-topic-model",
+                        "label": "Topic Steward",
+                    }],
+                    "marks": [{
+                        "mark_id": Uuid::from_u128(13),
+                        "author": member,
+                        "kind": "proposal",
+                        "summary": "seed proposal",
+                    }],
+                    "tallies": [{
+                        "proposal": proposal,
+                        "net_weight": 1.0,
+                    }],
+                    "leader": proposal,
+                    "distance_to_quorum": 1.0,
+                    "firekeeper": member,
+                    "decision": proposal,
+                    "state": "converged",
+                },
+            })
+        );
+
+        let padded_path = format!("/v1/longhouse/topics/%20{newest_a}%20");
+        let (status, _, body) =
+            longhouse_topic_projection_request(app.clone(), Method::GET, &padded_path, "").await;
+        assert_eq!(status, StatusCode::OK);
+        let padded: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(padded["topic"]["topic_id"], json!(newest_a));
+
+        let (status, _, body) = longhouse_topic_projection_request(
+            app.clone(),
+            Method::GET,
+            "/v1/longhouse/topics/not-a-uuid",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({
+                "ok": false,
+                "error": "invalid topic id 'not-a-uuid'; expected a UUID",
+            })
+        );
+        let (status, _, body) = longhouse_topic_projection_request(
+            app.clone(),
+            Method::GET,
+            "/v1/longhouse/topics/%20not-a-uuid%20",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({
+                "ok": false,
+                "error": "invalid topic id ' not-a-uuid '; expected a UUID",
+            })
+        );
+
+        let unknown = Uuid::from_u128(999);
+        let unknown_path = format!("/v1/longhouse/topics/{unknown}");
+        let (status, _, body) =
+            longhouse_topic_projection_request(app.clone(), Method::GET, &unknown_path, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({
+                "ok": false,
+                "error": format!("no longhouse topic with id '{unknown}'"),
+            })
+        );
+
+        for (method, path, expected_allow) in [
+            (Method::POST, "/v1/longhouse/topics", "GET,HEAD"),
+            (Method::POST, detail_path.as_str(), "GET,HEAD"),
+            (Method::GET, "/v1/longhouse/demo", "POST"),
+            (Method::PUT, "/v1/longhouse/demo", "POST"),
+        ] {
+            let (status, allow, body) =
+                longhouse_topic_projection_request(app.clone(), method, path, "").await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{path}");
+            assert_eq!(allow.as_deref(), Some(expected_allow), "{path}");
+            assert!(body.is_empty(), "Axum 405 body drifted for {path}");
+        }
+
+        let (status, _, body) = longhouse_topic_projection_request(
+            app.clone(),
+            Method::GET,
+            "/v1/longhouse/topics/not-a-uuid/extra",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
+
+        let (status, allow, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            longhouse_topic_projection_request(
+                app,
+                Method::POST,
+                "/v1/longhouse/demo",
+                "body ignored without content-type",
+            ),
+        )
+        .await
+        .expect("demo acknowledgement must not await its scripted task");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(allow, None);
+        let demo: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(sorted_json_keys(&demo), ["ok", "streaming_on", "topic_id"]);
+        assert_eq!(demo["ok"], json!(true));
+        assert_eq!(demo["streaming_on"], json!("/v1/agent/events"));
+        assert!(Uuid::parse_str(demo["topic_id"].as_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_topic_projection_demo_sequence_and_fold_before_publish_are_exact() {
+        fn assert_event_already_folded(registry: &LonghouseRegistryHandle, event: &LonghouseEvent) {
+            let topic_id = match event {
+                LonghouseEvent::TopicConvened { topic_id, .. }
+                | LonghouseEvent::Convened { topic_id, .. }
+                | LonghouseEvent::MarkPosted { topic_id, .. }
+                | LonghouseEvent::QuorumUpdated { topic_id, .. }
+                | LonghouseEvent::RoleGranted { topic_id, .. }
+                | LonghouseEvent::RoleRevoked { topic_id, .. }
+                | LonghouseEvent::Warned { topic_id, .. }
+                | LonghouseEvent::Converged { topic_id, .. }
+                | LonghouseEvent::Aborted { topic_id, .. }
+                | LonghouseEvent::TopicClosed { topic_id } => *topic_id,
+                LonghouseEvent::RunHealth { .. } => return,
+            };
+            let snapshot = registry
+                .lock()
+                .unwrap()
+                .topic(&topic_id)
+                .expect("published topic event must already be projected");
+            match event {
+                LonghouseEvent::TopicConvened {
+                    board_id,
+                    federation,
+                    trigger,
+                    title,
+                    deadline_ms,
+                    ..
+                } => {
+                    assert_eq!(snapshot.board_id, *board_id);
+                    assert_eq!(snapshot.federation, *federation);
+                    assert_eq!(snapshot.trigger, *trigger);
+                    assert_eq!(snapshot.title, *title);
+                    assert_eq!(snapshot.deadline_ms, *deadline_ms);
+                }
+                LonghouseEvent::Convened { members, .. } => {
+                    assert_eq!(&snapshot.members, members);
+                }
+                LonghouseEvent::MarkPosted { mark, .. } => {
+                    assert_eq!(snapshot.marks.last(), Some(mark));
+                }
+                LonghouseEvent::QuorumUpdated {
+                    tallies,
+                    leader,
+                    distance_to_quorum,
+                    ..
+                } => {
+                    assert_eq!(&snapshot.tallies, tallies);
+                    assert_eq!(snapshot.leader, *leader);
+                    assert_eq!(snapshot.distance_to_quorum, *distance_to_quorum);
+                }
+                LonghouseEvent::RoleGranted { agent_id, role, .. } => {
+                    if *role == AgentRole::Firekeeper {
+                        assert_eq!(snapshot.firekeeper, Some(*agent_id));
+                    }
+                }
+                LonghouseEvent::Converged { decision, by, .. } => {
+                    assert_eq!(snapshot.decision, Some(*decision));
+                    assert_eq!(snapshot.firekeeper, Some(*by));
+                    assert_eq!(snapshot.state, ocean_longhouse::TopicState::Converged);
+                }
+                LonghouseEvent::TopicClosed { .. } => {
+                    assert_eq!(snapshot.state, ocean_longhouse::TopicState::Converged);
+                }
+                LonghouseEvent::RoleRevoked { .. }
+                | LonghouseEvent::Warned { .. }
+                | LonghouseEvent::Aborted { .. } => {
+                    panic!("scripted demo emitted an unexpected event: {event:?}")
+                }
+                LonghouseEvent::RunHealth { .. } => unreachable!(),
+            }
+        }
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (_replay, mut rx) = state.agent_events.subscribe_with_replay(None);
+        let app = longhouse_routes().with_state(state.clone());
+
+        let (status, _, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            longhouse_topic_projection_request(app, Method::POST, "/v1/longhouse/demo", ""),
+        )
+        .await
+        .expect("demo acknowledgement must be immediate");
+        assert_eq!(status, StatusCode::OK);
+        let response: Value = serde_json::from_str(&body).unwrap();
+        let response_topic = Uuid::parse_str(response["topic_id"].as_str().unwrap()).unwrap();
+
+        let (events, published_wires) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut events = Vec::with_capacity(17);
+                let mut published_wires = Vec::with_capacity(17);
+                for _ in 0..17 {
+                    let envelope = rx.recv().await.expect("scripted demo event");
+                    match &envelope.event {
+                        AgentTurnEvent::Extension {
+                            extension,
+                            payload,
+                            scope,
+                        } => {
+                            assert_eq!(extension, LonghouseEvent::EXTENSION);
+                            assert_eq!(scope, &None);
+                            assert!(payload.get("lh_type").is_some());
+                        }
+                        other => panic!("demo published a non-extension event: {other:?}"),
+                    }
+                    let published_wire = serde_json::to_string(&envelope.event).unwrap();
+                    assert!(!published_wire.contains("\"token\""));
+                    assert!(!published_wire.contains("title_id"));
+                    published_wires.push(published_wire);
+                    let event = LonghouseEvent::from_turn_event(&envelope.event)
+                        .expect("demo publishes only Longhouse extension events");
+                    assert_event_already_folded(&state.longhouse, &event);
+                    events.push(event);
+                }
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                        .await
+                        .is_err(),
+                    "scripted demo emitted an unexpected eighteenth event"
+                );
+                (events, published_wires)
+            })
+            .await
+            .expect("scripted demo must finish within its characterized delay budget");
+
+        let kinds: Vec<String> = events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).unwrap()["lh_type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "topic_convened",
+                "convened",
+                "mark_posted",
+                "mark_posted",
+                "mark_posted",
+                "mark_posted",
+                "quorum_updated",
+                "mark_posted",
+                "quorum_updated",
+                "mark_posted",
+                "quorum_updated",
+                "mark_posted",
+                "role_granted",
+                "quorum_updated",
+                "converged",
+                "topic_closed",
+                "run_health",
+            ]
+        );
+        for event in events.iter().take(16) {
+            let event_topic = match event {
+                LonghouseEvent::TopicConvened { topic_id, .. }
+                | LonghouseEvent::Convened { topic_id, .. }
+                | LonghouseEvent::MarkPosted { topic_id, .. }
+                | LonghouseEvent::QuorumUpdated { topic_id, .. }
+                | LonghouseEvent::RoleGranted { topic_id, .. }
+                | LonghouseEvent::RoleRevoked { topic_id, .. }
+                | LonghouseEvent::Warned { topic_id, .. }
+                | LonghouseEvent::Converged { topic_id, .. }
+                | LonghouseEvent::Aborted { topic_id, .. }
+                | LonghouseEvent::TopicClosed { topic_id } => *topic_id,
+                LonghouseEvent::RunHealth { .. } => {
+                    panic!("run health appeared before the final event")
+                }
+            };
+            assert_eq!(event_topic, response_topic);
+        }
+
+        let LonghouseEvent::TopicConvened {
+            topic_id,
+            board_id,
+            federation,
+            trigger,
+            title,
+            deadline_ms,
+        } = &events[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*topic_id, response_topic);
+        assert_ne!(*board_id, Uuid::nil());
+        assert_eq!(*federation, Federation::Sales);
+        assert_eq!(*trigger, ConveneTrigger::UserRequest);
+        assert_eq!(
+            title,
+            "Which 5 creators should we pitch for the Warner Q3 push?"
+        );
+        assert_eq!(*deadline_ms, 1_700_000_000_000);
+
+        let LonghouseEvent::Convened { members, .. } = &events[1] else {
+            unreachable!()
+        };
+        assert_eq!(members.len(), 4);
+        let opus = members[0].agent_id;
+        let kimi = members[1].agent_id;
+        let deepseek = members[2].agent_id;
+        let steward = members[3].agent_id;
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| (
+                    member.role,
+                    member.model.as_str(),
+                    member.label.as_deref(),
+                    member.federation,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    AgentRole::Courier,
+                    "claude-opus-4-7",
+                    Some("Sales Courier · Opus"),
+                    Federation::Sales,
+                ),
+                (
+                    AgentRole::Courier,
+                    "kimi-k2.6",
+                    Some("Sales Courier · Kimi"),
+                    Federation::Sales,
+                ),
+                (
+                    AgentRole::Courier,
+                    "deepseek-v4-pro",
+                    Some("Sales Courier · DeepSeek"),
+                    Federation::Sales,
+                ),
+                (
+                    AgentRole::Steward,
+                    "claude-opus-4-7",
+                    Some("Sales Steward"),
+                    Federation::Sales,
+                ),
+            ]
+        );
+
+        let LonghouseEvent::MarkPosted { mark: plan_a, .. } = &events[2] else {
+            unreachable!()
+        };
+        assert_eq!(plan_a.author, opus);
+        assert_eq!(plan_a.kind, MarkKind::Proposal);
+        assert_eq!(plan_a.target, None);
+        assert_eq!(
+            plan_a.summary,
+            "Plan A: 5 mid-tier dance creators w/ proven Warner sound lift"
+        );
+        let LonghouseEvent::MarkPosted { mark: plan_b, .. } = &events[3] else {
+            unreachable!()
+        };
+        assert_eq!(plan_b.author, kimi);
+        assert_eq!(plan_b.kind, MarkKind::Proposal);
+        assert_eq!(plan_b.target, None);
+        assert_eq!(
+            plan_b.summary,
+            "Plan B: 3 macro creators + 2 emerging, higher reach, higher risk"
+        );
+
+        let LonghouseEvent::MarkPosted { mark: evidence, .. } = &events[4] else {
+            unreachable!()
+        };
+        assert_eq!(evidence.author, deepseek);
+        assert_eq!(evidence.kind, MarkKind::Evidence);
+        assert_eq!(
+            evidence.summary,
+            "Campaign Hub: Plan A creators avg 2.3x save-rate on prior Warner sounds"
+        );
+        let proposal_a = evidence.target.expect("evidence targets Plan A");
+
+        let mut proposal_b = None;
+        for (mark_index, tally_index, author) in
+            [(5usize, 6usize, opus), (7, 8, deepseek), (9, 10, steward)]
+        {
+            let LonghouseEvent::MarkPosted { mark, .. } = &events[mark_index] else {
+                unreachable!()
+            };
+            assert_eq!(mark.author, author);
+            assert_eq!(mark.kind, MarkKind::Endorse);
+            assert_eq!(mark.target, Some(proposal_a));
+            assert_eq!(mark.summary, "endorses Plan A");
+            let LonghouseEvent::QuorumUpdated {
+                tallies,
+                leader,
+                distance_to_quorum,
+                ..
+            } = &events[tally_index]
+            else {
+                unreachable!()
+            };
+            assert_eq!(tallies.len(), 2);
+            let current_b = tallies[1].proposal;
+            if let Some(expected_b) = proposal_b {
+                assert_eq!(current_b, expected_b);
+            } else {
+                proposal_b = Some(current_b);
+            }
+            assert_eq!(
+                tallies.as_slice(),
+                [
+                    ProposalTally {
+                        proposal: proposal_a,
+                        net_weight: 1.0,
+                    },
+                    ProposalTally {
+                        proposal: current_b,
+                        net_weight: 0.4,
+                    },
+                ]
+            );
+            assert_eq!(*leader, Some(proposal_a));
+            assert_eq!(*distance_to_quorum, 0.5);
+        }
+        let proposal_b = proposal_b.unwrap();
+
+        let LonghouseEvent::MarkPosted { mark: inhibit, .. } = &events[11] else {
+            unreachable!()
+        };
+        assert_eq!(inhibit.author, kimi);
+        assert_eq!(inhibit.kind, MarkKind::Inhibit);
+        assert_eq!(inhibit.target, Some(proposal_a));
+        assert_eq!(
+            inhibit.summary,
+            "flags Plan A reach ceiling — but concedes save-rate"
+        );
+        let LonghouseEvent::RoleGranted { agent_id, role, .. } = &events[12] else {
+            unreachable!()
+        };
+        assert_eq!(*agent_id, steward);
+        assert_eq!(*role, AgentRole::Firekeeper);
+        let LonghouseEvent::QuorumUpdated {
+            tallies,
+            leader,
+            distance_to_quorum,
+            ..
+        } = &events[13]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            tallies.as_slice(),
+            [
+                ProposalTally {
+                    proposal: proposal_a,
+                    net_weight: 2.6,
+                },
+                ProposalTally {
+                    proposal: proposal_b,
+                    net_weight: 0.4,
+                },
+            ]
+        );
+        assert_eq!(*leader, Some(proposal_a));
+        assert_eq!(*distance_to_quorum, 1.0);
+        let LonghouseEvent::Converged { decision, by, .. } = &events[14] else {
+            unreachable!()
+        };
+        assert_eq!(*decision, proposal_a);
+        assert_eq!(*by, steward);
+        assert!(matches!(
+            &events[15],
+            LonghouseEvent::TopicClosed { topic_id } if *topic_id == response_topic
+        ));
+        let LonghouseEvent::RunHealth {
+            federation,
+            runs_total,
+            runs_healthy,
+            note,
+        } = &events[16]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*federation, Federation::Sales);
+        assert_eq!(*runs_total, 7);
+        assert_eq!(*runs_healthy, 7);
+        assert_eq!(note.as_deref(), Some("nightly outreach sync green"));
+
+        let snapshot = state
+            .longhouse
+            .lock()
+            .unwrap()
+            .topic(&response_topic)
+            .unwrap();
+        assert_eq!(snapshot.members.len(), 4);
+        assert_eq!(snapshot.marks.len(), 7);
+        assert_eq!(snapshot.decision, Some(proposal_a));
+        assert_eq!(snapshot.firekeeper, Some(steward));
+        assert_eq!(snapshot.state, ocean_longhouse::TopicState::Converged);
+
+        let mark_ids: Vec<Uuid> = events
+            .iter()
+            .filter_map(|event| match event {
+                LonghouseEvent::MarkPosted { mark, .. } => Some(mark.mark_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mark_ids.len(), 7);
+        let mut generated_ids = vec![
+            response_topic,
+            *board_id,
+            opus,
+            kimi,
+            deepseek,
+            steward,
+            proposal_a,
+            proposal_b,
+        ];
+        generated_ids.extend(mark_ids);
+        assert!(generated_ids.iter().all(|id| *id != Uuid::nil()));
+        assert_eq!(
+            generated_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            generated_ids.len(),
+            "scripted members, marks, and proposal handles are independently generated"
+        );
+        let public_wire = published_wires.concat();
+        assert!(!public_wire.contains("\"token\""));
+        assert!(!public_wire.contains("title_id"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_topic_projection_poison_policy_is_exact() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let known = Uuid::from_u128(501);
+        state
+            .longhouse
+            .lock()
+            .unwrap()
+            .ingest(&LonghouseEvent::TopicConvened {
+                topic_id: known,
+                board_id: Uuid::from_u128(502),
+                federation: Federation::Commons,
+                trigger: ConveneTrigger::UserRequest,
+                title: "survives poison".into(),
+                deadline_ms: 42,
+            });
+
+        let to_poison = state.longhouse.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = to_poison.lock().unwrap();
+            panic!("characterization poison");
+        })
+        .join()
+        .is_err());
+
+        let Json(list) = longhouse_topics(State(state.clone())).await;
+        assert_eq!(list["ok"], json!(true));
+        assert_eq!(list["topics"][0]["topic_id"], json!(known));
+        let (status, Json(detail)) =
+            longhouse_topic(State(state.clone()), Path(format!(" {known} "))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["topic"]["topic_id"], json!(known));
+
+        let (_replay, mut rx) = state.agent_events.subscribe_with_replay(None);
+        let Json(response) = longhouse_demo(State(state.clone())).await;
+        let demo_topic = Uuid::parse_str(response["topic_id"].as_str().unwrap()).unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("poisoned projection must not block live publication")
+            .expect("demo opening event");
+        assert!(matches!(
+            LonghouseEvent::from_turn_event(&envelope.event),
+            Some(LonghouseEvent::TopicConvened { topic_id, .. }) if topic_id == demo_topic
+        ));
+        let registry = state
+            .longhouse
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(registry.topic(&known).is_some());
+        assert!(
+            registry.topic(&demo_topic).is_none(),
+            "demo must skip projection on poison while still publishing live"
+        );
+    }
+
+    #[test]
+    fn longhouse_topic_projection_source_preserves_shared_handle_and_authority_boundary() {
+        fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source.find(signature).expect("function signature");
+            let body_start = start + source[start..].find('{').expect("function opening brace");
+            let mut depth = 0usize;
+            for (offset, byte) in source.as_bytes()[body_start..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[start..body_start + offset + 1];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated function {signature}");
+        }
+
+        fn block_end(source: &str, marker: &str) -> usize {
+            let start = source.find(marker).expect("block marker");
+            let body_start = start + source[start..].find('{').expect("block opening brace");
+            let mut depth = 0usize;
+            for (offset, byte) in source.as_bytes()[body_start..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return body_start + offset + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated block {marker}");
+        }
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main_source = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let production_end = main_source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("parent test module boundary");
+        let production_main = &main_source[..production_end];
+        let extracted = src_dir.join("longhouse_topics.rs");
+        let owner_source = if extracted.exists() {
+            assert!(production_main.contains("mod longhouse_topics;"));
+            assert!(production_main.contains("use longhouse_topics::{"));
+            for signature in [
+                "async fn longhouse_demo(",
+                "async fn longhouse_topics(",
+                "async fn longhouse_topic(",
+            ] {
+                assert!(
+                    !production_main.contains(signature),
+                    "moved definition remained in main.rs: {signature}"
+                );
+            }
+            std::fs::read_to_string(&extracted).unwrap()
+        } else {
+            assert!(!production_main.contains("mod longhouse_topics;"));
+            production_main.to_string()
+        };
+
+        let demo = function_source(&owner_source, "async fn longhouse_demo(");
+        let topics = function_source(&owner_source, "async fn longhouse_topics(");
+        let topic = function_source(&owner_source, "async fn longhouse_topic(");
+        let boundary = format!("{demo}\n{topics}\n{topic}");
+        assert_eq!(boundary.matches("async fn longhouse_").count(), 3);
+        let spawn = demo.find("tokio::spawn(async move {").unwrap();
+        let lock_start = demo.find("if let Ok(mut reg) = registry.lock() {").unwrap();
+        let ingest = demo.find("reg.ingest(&ev);").unwrap();
+        let lock_end = block_end(demo, "if let Ok(mut reg) = registry.lock() {");
+        let publish = demo.find("bus.emit(ev.into_turn_event());").unwrap();
+        let first_await = demo.find(".await;").unwrap();
+        assert!(
+            spawn < lock_start
+                && lock_start < ingest
+                && ingest < lock_end
+                && lock_end < publish
+                && publish < first_await,
+            "registry guard must end before publication and every await"
+        );
+        let delays: Vec<&str> = demo
+            .lines()
+            .filter_map(|line| {
+                line.split_once("Duration::from_millis(")
+                    .and_then(|(_, rest)| rest.split_once(')'))
+                    .map(|(delay, _)| delay)
+            })
+            .collect();
+        assert_eq!(
+            delays,
+            ["600", "700", "500", "600", "500", "450", "500", "600", "400"]
+        );
+        assert!(topics.contains("Err(poisoned) => poisoned.into_inner().topics()"));
+        assert!(topic.contains("Err(poisoned) => poisoned.into_inner().topic(&id)"));
+        assert!(demo.contains("if let Ok(mut reg) = registry.lock()"));
+
+        let authority_scope = if extracted.exists() {
+            owner_source.as_str()
+        } else {
+            boundary.as_str()
+        };
+        for forbidden in [
+            "state.titles",
+            "TitleRegistryHandle",
+            "SqliteTitleRegistry",
+            "secret.token",
+            "\"title_id\"",
+            "known_models_with_readiness",
+            "ProviderEnv",
+            "ocean_longhouse::convene(",
+            "Revoker",
+            "RecallRegistry",
+            "longhouse_claim",
+            "longhouse_revoke",
+            "longhouse_recall",
+            "longhouse_breach",
+            "longhouse_board",
+            "PermissionPolicy",
+            "AgentRuntime",
+            "run_turn",
+            "with_rooms",
+            "ocean_call",
+            "LiveKit",
+            "Router",
+            ".route(",
+            "Sse<",
+            "spawn_blocking",
+            "subscribe_with_replay",
+            "CancellationToken",
+            "JoinHandle",
+            "LonghouseRegistry::new()",
+            "LonghouseRegistry::default()",
+            "Default::default()",
+            "Arc::new(",
+            "Mutex::new(",
+        ] {
+            assert!(
+                !authority_scope.contains(forbidden),
+                "topic projection owner gained authority marker {forbidden:?}"
+            );
+        }
+        assert_eq!(authority_scope.matches("tokio::spawn(").count(), 1);
+        if extracted.exists() {
+            let functions: Vec<&str> = owner_source
+                .lines()
+                .map(str::trim)
+                .filter(|line| {
+                    line.starts_with("fn ")
+                        || line.starts_with("async fn ")
+                        || line.starts_with("pub(super) fn ")
+                        || line.starts_with("pub(super) async fn ")
+                })
+                .collect();
+            assert_eq!(
+                functions.len(),
+                3,
+                "extracted owner gained a helper function"
+            );
+            for name in ["longhouse_demo", "longhouse_topics", "longhouse_topic"] {
+                assert!(functions.iter().any(|line| line.contains(name)));
+            }
+            for item_prefix in [
+                "struct ", "enum ", "trait ", "type ", "const ", "static ", "impl ",
+            ] {
+                assert!(
+                    !owner_source
+                        .lines()
+                        .map(str::trim)
+                        .any(|line| line.starts_with(item_prefix)),
+                    "extracted owner gained an unauthorized {item_prefix} item"
+                );
+            }
+        }
+
+        let startup = source_section(
+            production_main,
+            "// The Longhouse read-side topic registry.",
+            "// Persistent rooms (OCEAN-107):",
+        );
+        assert_eq!(startup.matches("LonghouseRegistry::new()").count(), 1);
+        assert!(startup.contains(".with_extensions(Some(longhouse.clone()))"));
+        let state_start = production_main.find("let state = AppState {").unwrap();
+        let state_assembly = &production_main[state_start..state_start + 2_000];
+        assert!(state_assembly.contains("\n        longhouse,"));
+
+        let routes = source_section(
+            production_main,
+            "fn longhouse_routes()",
+            "/// Request body for `POST /v1/longhouse/convene`.",
+        );
+        for mount in [
+            ".route(\"/v1/longhouse/demo\", post(longhouse_demo))",
+            ".route(\"/v1/longhouse/topics\", get(longhouse_topics))",
+            ".route(\"/v1/longhouse/topics/{topic_id}\", get(longhouse_topic))",
+        ] {
+            assert!(routes.contains(mount), "route mount drifted: {mount}");
+        }
+        assert!(production_main.contains("async fn longhouse_convene("));
+        assert!(production_main.contains("let titles = state.titles.clone();"));
+    }
+
     // ---- OCEAN-272: persisted escrow wired into the daemon ------------------
     //
     // These exercise the daemon-held title registry end to end through the REAL
@@ -20299,7 +21019,11 @@ mod tests {
         let sections = [
             app_router_source,
             source_section(source, "fn room_routes(", "fn longhouse_routes("),
-            source_section(source, "fn longhouse_routes(", "async fn longhouse_demo("),
+            source_section(
+                source,
+                "fn longhouse_routes(",
+                "/// Request body for `POST /v1/longhouse/convene`.",
+            ),
         ];
         let mut routes = std::collections::BTreeSet::new();
         for call in sections.into_iter().flat_map(route_calls) {

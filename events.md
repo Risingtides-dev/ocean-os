@@ -4266,3 +4266,36 @@ area:      [backend]
 
 Closed the six-item post-hoc audit for session-config RPC v1 on exact base 074f26a4. PATCH now rejects malformed/unknown-field bodies with sanitized `400 invalid_request` and remains model-only; GET/PATCH distinguish missing sessions from corrupt/internal storage and sanitize 500 responses; permission_mode.env_override is a boolean override-presence flag. Centralized turn selection pins explicit model > resolved role > named-agent model > session pin > global, makes an unresolved named role stop at global, and emits TurnStarted from the same pre-reroute selection passed to the runtime. Added raw-router acceptance for GET, persisted model/provider PATCH, session-scoped SessionConfigChanged, extra keys, unknown models, missing/corrupt sessions, and boolean permission projection, plus pure precedence and real fake-provider unresolved-role execution/event parity. Agent and daemon ownership contracts now record the boundary. Gates: config route 3/3, precedence/execution 2/2, ocean-agent 164/164, daemon 456/456 with only the independently known host-sensitive Longhouse inspect test excluded (still 6 vs expected 2), workspace tests green with that test and three inherited parallel Herdr env-race tests excluded; the Herdr group passes 8/8 serial and each excluded test passes alone. Workspace all-target check/build, denied-warning workspace Clippy, compatibility, Rust 1.88 MSRV, docs-check, fmt, cargo-deny, and diff-check pass. Exact six-file corrective remains uncommitted and unpushed for Codex gate.
 _________________________________________________________________________________
+time:      [01:43pm] [16-07-26]
+agent:     [pi], [unknown-model], [orchestrator]
+worktree:  [pi/daemon-longhouse-governance-20260716]
+type:      [plan]: narrow first Longhouse governance extraction
+area:      [docs]: ocean-daemon Phase 2C topic projection
+
+Fresh mapping at `origin/main` `5b9e23a` found that real `longhouse_convene` is inseparable from ready-model filtering, asynchronous council orchestration, durable title grant/bind, and raw-token response delivery without a forbidden new interface. Applied the final-28% handoff stop rule and manifested a narrower first checkpoint: move only the detached scripted demo plus topic list/detail HTTP adapters into private `src/longhouse_topics.rs` after characterization. The manifest freezes one registry shared by runtime extensions and `AppState`, the 17-event demo and immediate acknowledgement, projection-before-publication ordering, poison-policy asymmetry, exact topic envelopes/order, route composition, exclusions, rollback, dedicated-target validation, and two fresh review gates. Real convene and title/control governance remain a separate security-sensitive manifest. Fresh boundary/security review passed with no unresolved medium-or-higher issue; docs-check, diff-check, five router-contract tests, the council-wide SSE filter test, and candidate-body hash comparison passed. No runtime, route, deployment, or supervision change was performed.
+_________________________________________________________________________________
+time:      [02:24pm] [16-07-26]
+agent:     [pi], [unknown-model], [orchestrator]
+worktree:  [pi/daemon-longhouse-governance-20260716]
+type:      [plan]: authorize Longhouse topic-projection extraction
+area:      [testing]: ocean-daemon Phase 2C governance boundary
+
+Accepted final rebased characterization commit `c443df9` (originally reviewed as `c1be830`) as the rollback point and authorized only the three-function `longhouse_topics.rs` move. Four extraction-aware tests freeze empty/populated/complete HTTP responses, the exact 17-event public wire/content/ID/tally sequence and no eighteenth event, immediate detached acknowledgement, lock-end-before-publication, poison asymmetry, one startup registry shared with runtime extensions and `AppState`, parent route/SSE authority, and whole-owner exclusions. Initial reviews found five major coverage gaps; all were corrected. Final correctness and security/architecture/lifecycle re-reviews passed with no unresolved medium-or-higher issue. Dedicated-target verification passed all 372 daemon tests, 168 Longhouse tests plus one host-dependent ignore and one doc test, focused convene/router/SSE/preparation groups, daemon all-target Clippy, formatting, docs-check, and diff-check on the original baseline. Before extraction, the branch rebased cleanly over 24 upstream commits through `e8f3322`; before initial publication, it rebased cleanly over another 15 Observatory/session-config commits through `a517f6c`; after PR creation, it reconciled session-config RPC hardening through `ad391f3` and active-request session-summary work through `9177598`. Every reconciliation left all three candidate bodies byte-identical and retained parent route/shared-handle authority. Real convene/title/control remains outside this authorization.
+_________________________________________________________________________________
+time:      [05:21pm] [17-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [/tmp/ocean-daemon-phase2c-governance]
+type:      [refactor]: extract Longhouse topic projection
+area:      [backend]: ocean-daemon Phase 2C governance observability
+
+Moved the exact characterized 252-line `longhouse_demo` plus topic list/detail definition/comment boundary into the 273-line private `src/longhouse_topics.rs` owner at final rebased commit `0199d57`. `main.rs` retains `longhouse_routes()`, `AppState`, one startup registry shared with runtime extensions, HTTP/SSE composition, real convene/request/federation parsing/model readiness, and every title/escrow/revoker/recall/breach/board control path. Mechanical comparison against rollback `c443df9` found all three definitions and attached comments byte-identical apart from required `pub(super)` visibility. The owner adds no helper, registry, service seam, dependency, or broader authority.
+
+Verification:
+- focused topic projection, convene alias/model/response, global-opt-in SSE, router, preparation, and turn-preparation groups passed
+- before the publication rebases, all 456 daemon tests passed serialized; 168 Longhouse tests and one doc test passed with one host-dependent ignore
+- workspace test compilation, `livekit-tap`, `deepgram-stt`, denied-warning daemon all-target Clippy, compatibility, pinned Rust 1.88 MSRV, and canonical local CI passed
+- after rebasing onto `a517f6c`, focused groups, all 483 daemon tests, daemon Clippy, formatting, docs, and diff checks passed
+- after PR reconciliation onto `ad391f3`, mechanical comparison, focused groups, all 488 daemon tests, daemon Clippy, formatting, docs, and diff checks passed
+- after the latest rebase onto `9177598`, mechanical comparison, focused groups, all 491 daemon tests, daemon Clippy, formatting, docs, and diff checks passed again
+- fresh independent correctness/mechanical and security/architecture/lifecycle reviews passed with no unresolved medium-or-higher issue
+- existing adjacent Longhouse risks remain separately documented; deployment/supervision was not performed; hosted CI and merge remain pending
