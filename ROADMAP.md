@@ -22,8 +22,8 @@ approved design or permission to alter public contracts.
 ## Ocean Observatory
 
 - [x] Gate 0 decisions accepted — see [`docs/specs/2026-07-17-observatory-gate0-decisions.md`](docs/specs/2026-07-17-observatory-gate0-decisions.md), including the operator's 90s-game visual-parity ruling on truthful events with a durable event store.
-- [ ] Write and accept the Gate 1 implementation manifest (schema, auth token format, persistence contract, admission/binding contract, test requirements) before any Observatory code lands.
-- [ ] After the Gate 1 manifest, implement and independently review the daemon-owned metadata projection, durable ordered replay, authenticated snapshot/live API, and extension admission/binding contract before building the production animated Surface renderer.
+- [x] Gate 1 implementation manifest accepted on 2026-07-17 — schema, auth token format, persistence contract, admission/binding contract, strict task dependencies, and test requirements are fixed in [`docs/specs/2026-07-17-observatory-gate1-implementation-manifest.md`](docs/specs/2026-07-17-observatory-gate1-implementation-manifest.md).
+- [ ] Implement and independently review the daemon-owned metadata projection, durable ordered replay, authenticated snapshot/live API, and extension admission/binding contract before building the production animated Surface renderer.
 - [ ] Repair and contract-test end-to-end event resume through the Surface proxy (`Last-Event-ID` or an approved explicit cursor equivalent); do not use `/v1/agent/events?all=1` as the product feed.
 
 ## Harness evolution

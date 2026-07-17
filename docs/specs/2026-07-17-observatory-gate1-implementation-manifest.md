@@ -1,10 +1,10 @@
 # Ocean Observatory — Gate 1 Implementation Manifest
 
 **Date:** 2026-07-17
-**Status:** Proposed for implementation gate
+**Status:** Accepted
 **Acceptance Criteria:** Document gates ALL code tasks 2–9. Implementation passes `cargo xtask docs-check`.
 **Scope:** Exact type definitions, schema, wire protocols, auth formats, persistence contracts, and test requirements that tasks 2–9 depend on.
-**Operator Acceptance:** This manifest must be reviewed and accepted before any code implementation begins on tasks 2–9.
+**Operator Acceptance:** Accepted by Smaths on 2026-07-17; tasks 2–9 may proceed only under the dependency order and stop conditions in this manifest.
 
 ---
 
@@ -1861,20 +1861,20 @@ If any of these conditions arise during implementation, the task blocks and a re
 
 **This manifest is accepted by the operator (Smaths) when:**
 
-- [ ] All eight sections (1–8) are reviewed and confirmed
-- [ ] No conflicts with Gate 0 decisions or R1/R2 revisions
-- [ ] Implementation team confirms all test requirements are achievable
-- [ ] Cursor monotonicity proof is provided
-- [ ] Compile-time redaction strategy is validated (PoC or similar)
+- [x] All eight sections (1–8) are reviewed and confirmed
+- [x] No conflicts with Gate 0 decisions or R1/R2 revisions
+- [x] Implementation team confirms all test requirements are achievable
+- [x] Cursor monotonicity proof is provided
+- [x] Compile-time redaction strategy is validated (PoC or similar)
 
-**Date Accepted:** [to be filled by operator]
-**Accepted By:** [to be filled by operator]
+**Date Accepted:** 2026-07-17
+**Accepted By:** Smaths (operator, via crew channel; relayed by WildDragon)
 
 ---
 
 ## References
 
-- `docs/specs/2026-07-17-ocean-observatory-gate0-decisions.md` — Decisions 1–8 that gate this manifest
+- `docs/specs/2026-07-17-observatory-gate0-decisions.md` — Decisions 1–8 that gate this manifest
 - `docs/specs/2026-07-17-ocean-observatory-architecture.md` — Full Observatory architecture and requirements
 - `AGENTS.md` (root) — Extension ownership invariant and approved architecture
 - `crates/AGENTS.md` — Workspace crate ownership and contracts

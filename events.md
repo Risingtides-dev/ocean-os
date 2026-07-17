@@ -4001,3 +4001,11 @@ area:      [design]
 
 Gate 0 accepted for Ocean Observatory. Landed LoudDragon's proposal spec (66904694), then recorded operator (Smaths) acceptance of all eight Gate 0 decisions in docs/specs/2026-07-17-observatory-gate0-decisions.md, salvaged from the quarantined QuickPhoenix draft with two revisions: R1 operator visual-direction ruling (Ocean Floor ships full 90s-CPU-game pixel visual parity as the presentation layer, wired to real daemon events via the Observatory contract with a durable append-only event store; security invariants unchanged — metadata-only, scoped auth, redaction-before-append, read-only v1) and R2 token signature correction (HMAC or opaque daemon-validated tokens, not non-cryptographic). Updated root AGENTS.md, ROADMAP.md, docs/AGENTS.md, docs/README.md to reflect acceptance and the Gate 1 manifest-before-code requirement. Earlier this session: caught Crew auto-start violation (workers wrote crates/ocean-observatory + a local commit despite Gate 0 hold); LoudDragon reset and quarantined outputs at /tmp/ocean-observatory-crew-quarantine-20260717-034952; origin/main was never touched. Next: Gate 1 implementation manifest, then re-planned Crew execution.
 _________________________________________________________________________________
+time:      [04:21] [17-07-26]
+agent:     [pi] [thoth] [SwiftBear]
+worktree:  [main]
+type:      [plan]
+area:      [design]
+
+Recorded Smaths's explicit Ocean Observatory Gate 1 acceptance after the operator replied “ready” to the manifest gate and coordination lead WildDragon confirmed authorization. Marked the implementation manifest accepted on 2026-07-17, completed its sign-off, corrected the stale Gate 0 reference filename, and updated root/docs contracts, the documentation index, and ROADMAP. Tasks 2–9 are authorized only under the manifest's strict dependency order and stop conditions; the authenticated metadata-safe snapshot/replay/live contract still precedes production Ocean Floor renderer work.
+_________________________________________________________________________________
