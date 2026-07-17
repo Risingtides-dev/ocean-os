@@ -36,7 +36,7 @@ pub enum EventKind {
     StreamReset,
     StreamGap,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TruthProvenance {
     HostObserved,
@@ -48,12 +48,13 @@ pub struct Producer {
     pub kind: ProducerKind,
     pub id: String,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProducerKind {
     Daemon,
     Extension,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Topology {
     pub execution_id: String,

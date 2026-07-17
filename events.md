@@ -4127,3 +4127,21 @@ Verification:
 - opened Herdr PR https://github.com/ogulcancelik/herdr/pull/1542 for official restore planning
 _________________________________________________________________________________
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:  [13:38] [17-07-26]
+agent: [pi] [claude-opus-4-5] [DarkEagle]
+worktree: [main]
+type:  [feature-request]: Observatory task-3 admission/binding seam
+area:  [backend]: ocean-observatory extension admission and host binding
+
+Completed Crew task-3: extension admission and host binding contract in
+ocean-observatory. admission.rs adds AdmissionRequest/Result/Error,
+validate_admission with cycle detection, depth limit (32), cross-authority
+rejection, safe-metadata checks, and idempotency dedup with fresh tokens.
+binding.rs adds 256-bit single-use BindingToken (30s TTL, redacted Debug),
+BindingRegistry with TTL eviction, and strip_binding removing
+_observation_binding before provider serialization. Record-only topology;
+no core orchestration per root AGENTS.md invariant. Coordinated a mid-task
+write collision with NiceQuartz; reconciled tree passes cargo test -p
+ocean-observatory (45 tests) and cargo check --workspace.

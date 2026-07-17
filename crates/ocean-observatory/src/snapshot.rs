@@ -333,7 +333,10 @@ mod tests {
         assert_eq!(deserialized.watermark_cursor, Cursor::new(42));
         assert_eq!(deserialized.nodes.len(), 1);
         assert_eq!(deserialized.nodes[0].phase, ExecutionPhase::Running);
-        assert_eq!(deserialized.nodes[0].producer.kind, crate::ProducerKind::Daemon);
+        assert_eq!(
+            deserialized.nodes[0].producer.kind,
+            crate::ProducerKind::Daemon
+        );
     }
 
     #[test]
