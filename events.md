@@ -3923,3 +3923,11 @@ area:      [backend]
 
 P1-C docs/devlog closeout atop b5741033: documented merged SSE (payload-free dual-bus wake hints, no-id initial room_access projection, SQLite reread on relevant/lagged, ascending message gap recovery, full-projection access dedup), outbox (locally-authored federated events awaiting Bedrock confirmation; bridge delivery future; P1 retry no network; 404 includes unknown room/item, 500 sanitized store), and exact five access states (local/connecting/live/recovering/revoked) with rowless default local in ocean-daemon AGENTS, crates/ AGENTS, and OCEAN_ECOSYSTEM_CONTRACT. Fixed stale ocean-agent store ownership → ocean-store; clarified RoomStore lifecycle vs inherent access/outbox APIs. Added focused persistent_rooms module gate. 391/391 pass (base-only longhouse exclusion); workspace check, denied-warning Clippy, fmt, docs-check, diff-check green. events.md release entry from 21:27 preserved byte-for-byte.
 _________________________________________________________________________________
+time:      [21:29] [16-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/s2-p1-room-producer-contracts] /private/tmp/ocean-s2-p1-reconcile-20260716-212251
+type:      [workflow]
+area:      [review]
+
+Reconciled the six committed S2-P1 federation core/store commits from local base 4712fdbe onto GitHub main 5b9e23a8 in an isolated worktree while preserving the actively edited daemon producer-contract files in the primary checkout. The rebase was conflict-free; git range-diff and identical patch hashes proved semantic identity across all six commits. Pushed the reconciled branch to origin as feat/s2-p1-room-producer-contracts at 2cdc7163 (six ahead, zero behind main). Verification passed: ocean-core 48 tests, ocean-store 63 tests, ocean-agent 163 tests, cargo check --workspace, cargo fmt --check, docs-check, and diff-check. A backup branch and checksummed tracked-worktree patch were created before reconciliation; .wrangler remained untouched. The primary worktree branch ref and live daemon edits remain intentionally unchanged pending their active owner's checkpoint.
+_________________________________________________________________________________
