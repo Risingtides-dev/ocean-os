@@ -74,6 +74,10 @@ impl RoomWakeBus {
     }
 
     #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "subscribers live in room_federation.rs, which is not yet wired as a module"
+    )]
     pub(super) fn test_subscribe(&self) -> broadcast::Receiver<RoomWakeHint> {
         self.subscribe()
     }
@@ -139,6 +143,10 @@ impl RoomAccessWakeBus {
     }
 
     #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "subscribers live in room_federation.rs, which is not yet wired as a module"
+    )]
     pub(super) fn test_subscribe(&self) -> broadcast::Receiver<RoomAccessWakeHint> {
         self.subscribe()
     }
