@@ -19,6 +19,12 @@ approved design or permission to alter public contracts.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
       executable drift checks rather than prose-only synchronization.
 
+## Ocean Observatory
+
+- [ ] Accept the Gate 0 persistence, observer-credential, initial-scope, canonical-entity, content-retention, remote-child, retention-limit, and control decisions in [`docs/specs/2026-07-17-ocean-observatory-architecture.md`](docs/specs/2026-07-17-ocean-observatory-architecture.md).
+- [ ] After Gate 0 acceptance, implement and independently review the daemon-owned metadata projection, durable ordered replay, authenticated snapshot/live API, and extension admission/binding contract before building the production animated Surface renderer.
+- [ ] Repair and contract-test end-to-end event resume through the Surface proxy (`Last-Event-ID` or an approved explicit cursor equivalent); do not use `/v1/agent/events?all=1` as the product feed.
+
 ## Harness evolution
 
 The source-researched mechanism inventory and dated implementation matrix live in

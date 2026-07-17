@@ -3974,3 +3974,21 @@ area:      [backend]
 
 Shipped S2 P2-A to main: fast-forward 9c8cdbec..92399623 and pushed, local == origin. thoth's single-commit five-file slice (ocean-store federation core: 7 private tables incl. v1.2 pending_redemptions, 14 atomic APIs, 0600-before-DB-work, canonical-u64 fail-closed, full-meta ingest dedup; plus the ruled persistent_rooms.rs error arm) landed after codex's APPROVE + independent parity confirm (store 88/88, daemon 39/39, clippy -D, fmt, workspace, docs, diff-check green). P2-B/C daemon bridge lanes now unblocked.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [03:41] [17-07-26]
+agent:     [pi] [thoth]
+worktree:  [main]
+type:      [plan]
+area:      [design]
+
+Consolidated four independent subagent passes—runtime contract, Surface integration, product interaction, and adversarial security/performance—into the proposed Ocean Observatory architecture at docs/specs/2026-07-17-ocean-observatory-architecture.md. The proposal rejects the Claude Design pixel-office export and raw global agent firehose as implementation foundations; preserves extension ownership of subagent orchestration; defines daemon-owned provenance, topology identities, authenticated metadata-safe snapshot/live/replay contracts, explicit cursor gaps, and read-only v1 control boundaries; and defines the shared Leptos Ocean Floor mode, truthful state-to-motion grammar, accessibility, compact behavior, performance gates, and rejected shortcuts. Indexed the Gate 0 proposal from root/docs contracts and ROADMAP. No runtime implementation is approved until persistence, credential, scope, entity, privacy, remote-child, retention, and control decisions are accepted. Verification: cargo xtask docs-check and git diff --check pass.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [03:53] [17-07-26]
+agent:     [pi] [thoth]
+worktree:  [main]
+type:      [workflow]
+area:      [agent-building]
+
+Contained a pi-messenger Crew auto-start safety failure during Ocean Observatory planning. Although the requested plan was marked no-auto-work and all eight tasks were subsequently blocked, four Crew child processes continued writing an unapproved Gate 0 decision document, a new ocean-observatory crate, and workspace manifest entries; one child also committed the dirty shared tree locally as eca9db61. The commit never reached origin. Reset main to origin/main f51d9dd3, restored Cargo.toml/Cargo.lock, quarantined all worker artifacts under /tmp/ocean-observatory-crew-quarantine-20260717-034952, terminated only the four identified Crew child PIDs (30159, 39222, 41248, 44736), left the Crew mesh, and verified the crate path stayed absent with Cargo manifests clean. The intended in-flight proposal/index/devlog edits and pre-existing .wrangler remain; no implementation is accepted.
+_________________________________________________________________________________
