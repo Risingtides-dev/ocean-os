@@ -4206,3 +4206,26 @@ stay empty pending task-6. Verification: observatory 17/17,
 router_contract 5/5, ocean-observatory 48/48, workspace check, clippy,
 fmt, docs-check all clean; full daemon suite 408/409 with only the
 known env-sensitive longhouse_inspect failure.
+_________________________________________________________________________________
+
+time:  [14:41] [17-07-26]
+agent: [pi] [claude-opus-4-5] [SageTiger]
+worktree: [main]
+type:  [feature-request]: Observatory task-6 runtime fact bridge
+area:  [backend]: ocean-daemon observatory_adapter + event bus wiring
+
+Completed Crew task-6 (cfb7d5ce): AgentTurnEvent stream now feeds the
+Observatory. observatory_adapter.rs maps each runtime variant to one
+metadata-only envelope or skips it (content-bearing variants never
+cross); args/output bodies/titles/cwds/free-text errors stripped by
+construction, reasons classified to fixed codes. main.rs hoists the
+AgentEventBus so the pump subscribes pre-turn, runs the restart
+interruption sweep at boot (stale nonterminal executions close as
+canceled), appends DaemonStarted at startup and DaemonStopping on
+graceful shutdown; pump lag is warn-loud. Deviations recorded: real
+seam has no AgentStart/permission variants, so SessionCreated is the
+root admission and PermissionWaiting/Resolved stay reserved. 9 new
+tests including forbidden-content sentinel sweeps and end-to-end agent
+event → adapter → store → SSE subscriber. Verification: observatory
+suites 27/27 + 48/48, workspace check, clippy, fmt, docs-check clean;
+daemon suite 418/419 (known env-sensitive longhouse_inspect only).
