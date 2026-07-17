@@ -6,8 +6,10 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::{header, request::Parts, StatusCode};
-use ocean_observatory::{verify_token, ObserverPrincipal, ObserverSecret};
-use std::path::Path;
+use ocean_observatory::{
+    verify_token, write_summary_observer_token, ObserverPrincipal, ObserverSecret,
+};
+use std::path::{Path, PathBuf};
 
 const OBSERVER_COOKIE_NAME: &str = "Authorization-Observer";
 
@@ -16,6 +18,7 @@ const OBSERVER_COOKIE_NAME: &str = "Authorization-Observer";
 pub(super) struct ObservatoryAuthState {
     secret: ObserverSecret,
     daemon_instance_id: String,
+    ocean_dir: PathBuf,
 }
 
 impl ObservatoryAuthState {
@@ -24,10 +27,22 @@ impl ObservatoryAuthState {
         ocean_dir: &Path,
         daemon_instance_id: impl Into<String>,
     ) -> Result<Self, ocean_observatory::AuthError> {
+        let daemon_instance_id = daemon_instance_id.into();
+        let secret = ObserverSecret::load_or_generate(ocean_dir)?;
+        write_summary_observer_token(ocean_dir, &daemon_instance_id, &secret)?;
         Ok(Self {
-            secret: ObserverSecret::load_or_generate(ocean_dir)?,
-            daemon_instance_id: daemon_instance_id.into(),
+            secret,
+            daemon_instance_id,
+            ocean_dir: ocean_dir.to_path_buf(),
         })
+    }
+
+    /// Rotate the boot-bound summary credential consumed by first-party local
+    /// proxies. Previously issued tokens remain valid only until their normal
+    /// short expiry and never survive a daemon restart.
+    pub(super) fn refresh_summary_token(&self) -> Result<(), ocean_observatory::AuthError> {
+        write_summary_observer_token(&self.ocean_dir, &self.daemon_instance_id, &self.secret)
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -35,6 +50,7 @@ impl ObservatoryAuthState {
         Self {
             secret,
             daemon_instance_id: daemon_instance_id.into(),
+            ocean_dir: PathBuf::new(),
         }
     }
 }

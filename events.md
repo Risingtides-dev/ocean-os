@@ -4249,3 +4249,12 @@ performance acceptance targets with benchmark harness, and the binding
 renderer data contract (reducer state only). docs-check PASS. Task-9
 independent review is the sole remaining task; per review independence
 norms it should go to an agent other than the 4/5/6 implementer.
+_________________________________________________________________________________
+time:      [17:11] [17-07-26]
+agent:     [pi] [gpt-5.4] [WildDragon]
+worktree:  [main]
+type:      [handoff]
+area:      [backend]
+
+Consolidated the Ocean Observatory backend after ending the multi-writer Crew run. Rebased the 12-task implementation stack onto current origin/main, rebuilt ocean-daemon composition from the current P2-C/session-config main instead of preserving stale worker conflict resolutions, restored room federation alongside the Observatory, and mapped the new SessionConfigChanged event safely out of the metadata bridge. The daemon now opens the SQLite/WAL Observatory store, runs restart interruption recovery, appends daemon/runtime lifecycle facts, exposes authenticated snapshot/live/replay routes, and records graceful shutdown without blocking runtime authority. Closed the first-party credential gap: daemon startup now atomically mints a mode-0600, boot-bound `.ocean/observatory-token`, rotates it every ten minutes with thirty-minute overlap, and never distributes the HMAC signing secret or injects credentials into arbitrary subprocess environments. Hardened the environment-dependent Longhouse inspection test to preserve its two planted-candidate invariant without assuming empty operator home-skill roots. Verification: ocean-observatory 49/49 tests, ocean-daemon 479/479 tests, workspace check, daemon/observatory Clippy -D warnings, docs-check (28 packages / 157 active Markdown files / 133 links), format, and diff-check pass. Removed the worker's accidentally tracked `.wrangler/cache/wrangler-account.json` and ignored `.wrangler/` as local Cloudflare state. Next authority: implement Ocean Floor in ocean-surface against these real read-only routes; the Claude Design export is visual reference only.
+_________________________________________________________________________________

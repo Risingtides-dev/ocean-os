@@ -16,7 +16,7 @@ use sha2::Sha256;
 use thiserror::Error;
 
 const SECRET_FILE: &str = "observatory-secret";
-const OBSERVER_CONFIG_FILE: &str = "config";
+const OBSERVER_TOKEN_FILE: &str = "observatory-token";
 const OBSERVER_TOKEN_ENV: &str = "OCEAN_OBSERVER_TOKEN";
 const SECRET_LEN: usize = 32;
 const SECRET_MODE: u32 = 0o600;
@@ -291,10 +291,61 @@ impl AuthError {
     }
 }
 
-/// Load the child-process observer credential from the environment or
-/// `<ocean_dir>/config`, in that precedence order.
+/// Mint and atomically publish a boot-bound summary observer credential at
+/// `<ocean_dir>/observatory-token` with mode 0600.
 ///
-/// The config file's complete trimmed contents are the token. When present it
+/// The proxy and other first-party local clients read this file immediately
+/// before opening an Observatory request or stream. Replacing the file rotates
+/// credentials without exposing the daemon's signing secret.
+///
+/// # Errors
+///
+/// Fails closed for token issuance or any filesystem error.
+pub fn write_summary_observer_token(
+    ocean_dir: &Path,
+    daemon_instance_id: &str,
+    secret: &ObserverSecret,
+) -> Result<String, AuthError> {
+    fs::create_dir_all(ocean_dir).map_err(AuthError::secret_io)?;
+    let directory = fs::symlink_metadata(ocean_dir).map_err(AuthError::secret_io)?;
+    if directory.file_type().is_symlink() || !directory.is_dir() {
+        return Err(AuthError::CredentialConfig(
+            "observer token directory must be a real directory".to_owned(),
+        ));
+    }
+
+    let claims = ObserverToken::issue(
+        ObserverScope::Summary,
+        daemon_instance_id,
+        DEFAULT_TOKEN_LIFETIME_SECS,
+    )?;
+    let token = sign_token(&claims, secret);
+    let final_path = ocean_dir.join(OBSERVER_TOKEN_FILE);
+    let temporary = ocean_dir.join(format!(".{OBSERVER_TOKEN_FILE}.{}.tmp", random_suffix()));
+    let result = (|| -> Result<(), AuthError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)
+            .map_err(AuthError::secret_io)?;
+        file.write_all(token.as_bytes())
+            .map_err(AuthError::secret_io)?;
+        file.write_all(b"\n").map_err(AuthError::secret_io)?;
+        file.sync_all().map_err(AuthError::secret_io)?;
+        fs::rename(&temporary, &final_path).map_err(AuthError::secret_io)?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result?;
+    Ok(token)
+}
+
+/// Load the child-process observer credential from the environment or
+/// `<ocean_dir>/observatory-token`, in that precedence order.
+///
+/// The token file's complete trimmed contents are the token. When present it
 /// must be a non-symlink regular file with mode 0600. This helper does not log
 /// or validate the token against a daemon instance; the receiving daemon owns
 /// cryptographic validation.
@@ -312,7 +363,7 @@ pub fn observer_token_for_child(ocean_dir: &Path) -> Result<Option<String>, Auth
         return Ok(Some(token));
     }
 
-    let path = ocean_dir.join(OBSERVER_CONFIG_FILE);
+    let path = ocean_dir.join(OBSERVER_TOKEN_FILE);
     let link_metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -651,11 +702,39 @@ mod tests {
     }
 
     #[test]
-    fn child_token_environment_precedes_secure_config_file() {
+    fn summary_token_file_is_mode_0600_boot_bound_and_readable() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let prior = std::env::var_os(OBSERVER_TOKEN_ENV);
+        std::env::remove_var(OBSERVER_TOKEN_ENV);
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secret = ObserverSecret::from_raw_key([0x37; SECRET_LEN]);
+        let token = write_summary_observer_token(directory.path(), "daemon-boot", &secret)
+            .expect("mint token");
+        let path = directory.path().join(OBSERVER_TOKEN_FILE);
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").mode() & 0o777,
+            SECRET_MODE
+        );
+        assert_eq!(
+            observer_token_for_child(directory.path()).expect("read token"),
+            Some(token.clone())
+        );
+        let principal = verify_token(&token, &secret, "daemon-boot").expect("verify token");
+        assert_eq!(principal.scope, ObserverScope::Summary);
+
+        match prior {
+            Some(value) => std::env::set_var(OBSERVER_TOKEN_ENV, value),
+            None => std::env::remove_var(OBSERVER_TOKEN_ENV),
+        }
+    }
+
+    #[test]
+    fn child_token_environment_precedes_secure_token_file() {
         let _guard = ENV_LOCK.lock().expect("environment lock");
         let prior = std::env::var_os(OBSERVER_TOKEN_ENV);
         let directory = tempfile::tempdir().expect("tempdir");
-        let config = directory.path().join(OBSERVER_CONFIG_FILE);
+        let config = directory.path().join(OBSERVER_TOKEN_FILE);
         fs::write(&config, "config-token\n").expect("write config");
         fs::set_permissions(&config, fs::Permissions::from_mode(SECRET_MODE)).expect("chmod");
 
@@ -678,13 +757,13 @@ mod tests {
     }
 
     #[test]
-    fn child_token_config_rejects_unsafe_mode_and_symlink() {
+    fn child_token_file_rejects_unsafe_mode_and_symlink() {
         let _guard = ENV_LOCK.lock().expect("environment lock");
         let prior = std::env::var_os(OBSERVER_TOKEN_ENV);
         std::env::remove_var(OBSERVER_TOKEN_ENV);
 
         let wrong_mode = tempfile::tempdir().expect("tempdir");
-        let config = wrong_mode.path().join(OBSERVER_CONFIG_FILE);
+        let config = wrong_mode.path().join(OBSERVER_TOKEN_FILE);
         fs::write(&config, "token").expect("write config");
         fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("chmod");
         assert!(matches!(
@@ -695,7 +774,7 @@ mod tests {
         let symlink_dir = tempfile::tempdir().expect("tempdir");
         let target = symlink_dir.path().join("target");
         fs::write(&target, "token").expect("write target");
-        symlink(&target, symlink_dir.path().join(OBSERVER_CONFIG_FILE)).expect("symlink");
+        symlink(&target, symlink_dir.path().join(OBSERVER_TOKEN_FILE)).expect("symlink");
         assert!(matches!(
             observer_token_for_child(symlink_dir.path()),
             Err(AuthError::CredentialConfig(_))

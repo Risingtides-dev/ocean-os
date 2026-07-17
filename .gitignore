@@ -57,3 +57,6 @@ __pycache__/
 .superpowers/
 target-ci/
 /target3/
+
+# Cloudflare Wrangler local cache
+.wrangler/

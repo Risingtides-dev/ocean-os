@@ -566,21 +566,19 @@ b3F0Yd3F8nQ2mT5rW9sP7kL1xJ4vM9nB2cD5eF8gH1jK4mL7oP0rS3tU6vW9xY2z . eyJwcmluY2lwY
 
 ### 3.4 Token Distribution
 
-**Web/Tauri (Browser-based):**
-- Client connects to the Ocean Surface proxy at a configured origin.
-- Proxy authenticates the operator (Basic auth, session, etc., out of scope for Observatory).
-- Proxy obtains a scoped observer token from the daemon (`POST /v1/observatory/token/create` or similar internal route).
-- Proxy sends the token in an HTTP cookie: `Authorization-Observer: <token>`
-  - Attributes: `secure`, `httponly`, `samesite=strict`, `path=/v1/observatory`
-  - Lifetime: match token expiry
-- Client includes the cookie in subsequent Observatory requests.
-- Cookie is never written to localStorage, querystring, or URL.
+**First-party local web/Tauri path:**
+- At boot the daemon mints a boot-bound `observatory:summary` token and atomically writes `.ocean/observatory-token` with mode 0600.
+- The daemon replaces that file every ten minutes; tokens expire after thirty minutes, so existing streams survive rotation while new requests read the latest credential.
+- The Ocean Surface proxy reads the token file immediately before opening an Observatory request or SSE stream and injects `Authorization: Bearer <token>` on the daemon-side hop.
+- Browser JavaScript never receives the token, signing secret, or an issuance route. The proxy's existing operator authentication remains a separate outer boundary.
 
-**CLI/Extension (Command-line/Local):**
-- Token stored in `.ocean/config` (mode 0600), alongside other observer credentials.
-- Daemon reads the token at startup and makes it available to child processes via `OCEAN_OBSERVER_TOKEN` environment variable.
-- Child processes include the token in Observatory API requests via the `Authorization` HTTP header: `Authorization: Bearer <token>`
-- The environment variable is never logged or printed.
+**CLI/native extension hosts:**
+- A trusted local process reads `.ocean/observatory-token` immediately before its request and sends `Authorization: Bearer <token>`.
+- `OCEAN_OBSERVER_TOKEN` remains an explicit operator override for isolated child processes; the daemon never injects it globally into arbitrary tool or shell subprocesses.
+- The daemon signing secret remains only in `.ocean/observatory-secret` and is never distributed.
+
+**No credential-issuance route:**
+- V1 exposes no `/v1/observatory/token/*` route. The mode-0600 local token file is the only automatic first-party distribution seam.
 
 **No Query-String Credentials:**
 - Tokens are never embedded in URLs or query parameters.
@@ -1660,14 +1658,16 @@ X-Observatory-Instance: <daemon-instance-id>
 
 3. **Middleware tests**:
    - Extract token from Authorization header
-   - Extract token from OCEAN_OBSERVER_TOKEN env var
+   - Extract token from the compatibility `Authorization-Observer` cookie
    - Reject missing token (401)
    - Reject invalid token (401)
    - Scope validation (summary, content, extension)
 
 4. **Integration tests**:
-   - Cookie flow (secure, httponly, samesite)
-   - Env var flow (read from .ocean/config)
+   - Boot-bound summary token is atomically written to `.ocean/observatory-token` with mode 0600
+   - Token file rotates without distributing the signing secret
+   - Explicit `OCEAN_OBSERVER_TOKEN` override precedes the secure token file
+   - Unsafe mode and symlink token files fail closed
 
 **Coverage Target:** ≥90%
 

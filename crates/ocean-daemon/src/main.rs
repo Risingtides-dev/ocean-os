@@ -17,7 +17,7 @@ use axum::{
         IntoResponse,
     },
     routing::{get, post},
-    Extension, Json, Router,
+    Json, Router,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use ocean_agent::{AgentRuntime, PromptControl};
@@ -109,9 +109,9 @@ mod model_catalog;
 mod model_roles;
 /// Read-only Observatory data routes (snapshot, SSE events, replay).
 mod observatory;
-/// Redacting bridge from the runtime `AgentTurnEvent` stream to Observatory facts.
+/// Redacting bridge from runtime agent events into durable Observatory facts.
 mod observatory_adapter;
-/// Axum extractor for scoped observer authentication tokens (HMAC-SHA256).
+/// Scoped observer authentication extractor and startup state.
 mod observatory_auth;
 /// Durable persistent-room HTTP lifecycle, paging, and auto-convene adapter.
 mod persistent_rooms;
@@ -121,6 +121,8 @@ mod project_registry;
 mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
 mod request_control;
+/// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
+mod room_federation;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
 mod slack_canvas_fulfillment;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
@@ -167,6 +169,7 @@ use request_control::{
     register_running_request, requests_snapshot, update_request_finished,
     update_request_permission_result, PermissionRegistry, PermissionWaiter, RequestRegistry,
 };
+use room_federation::FederationSupervisor;
 use slack_canvas_fulfillment::{
     canvas_fulfillment_get, canvas_fulfillment_post, gc_canvas_fulfillments, CanvasFulfillmentStore,
 };
@@ -242,6 +245,9 @@ struct AppState {
     /// Separate from `room_wakes` so a heavy transcript tail does not
     /// back-pressure access-projection subscribers.
     room_access_wakes: RoomAccessWakeBus,
+    /// AppState-owned cloneable outbound Bedrock supervisor. P2-C reuses its
+    /// idempotent start/wake/stop seam after redeem and local outbox enqueue.
+    room_federation: FederationSupervisor,
     /// The **persisted Longhouse title registry** (OCEAN-246/272). Holds firekeeper
     /// and validator titles durably across turns, storing only a salt+SHA-256
     /// *verifier* per title (never the raw token). Convene mints into it; the
@@ -587,6 +593,9 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/agent/turns", post(agent_turn))
         .route("/v1/agent/voice", post(agent_voice))
         .route("/v1/agent/events", get(agent_events))
+        .route("/v1/observatory/snapshot", get(observatory::snapshot))
+        .route("/v1/observatory/events", get(observatory::events))
+        .route("/v1/observatory/replay", get(observatory::replay))
         // OCEAN-262: the Slack canvas bridge (`ocean-agents`) POSTs a fulfilled
         // awareness result here after round-tripping a `read`/`list`/`create` to
         // the live Slack Canvas API; a `GET` queries the stored fulfillment per
@@ -626,11 +635,6 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         )
         .route("/v1/events", get(events))
         .route("/v1/prompt", post(prompt))
-        // Read-only Observatory data routes (Gate 1 manifest §7) behind the
-        // Task 4 scoped-observer extractor; no public token-creation route.
-        .route("/v1/observatory/snapshot", get(observatory::snapshot))
-        .route("/v1/observatory/events", get(observatory::events))
-        .route("/v1/observatory/replay", get(observatory::replay))
         .route("/v1/requests", get(requests).post(create_request))
         .route("/v1/requests/{id}/cancel", post(cancel_request))
         .route("/v1/permissions", get(permissions))
@@ -763,19 +767,6 @@ async fn main() -> anyhow::Result<()> {
     let longhouse: LonghouseRegistryHandle =
         Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new()));
 
-    // Resolve the Task 4 CLI/extension credential flow before runtime child
-    // processes can be created. An explicit environment value wins; otherwise
-    // a secure mode-0600 `<config-dir>/config` token is inherited via the
-    // manifest's OCEAN_OBSERVER_TOKEN channel. The credential is never logged.
-    let config_dir = ocean_agent::config_dir_from_env();
-    if env::var_os("OCEAN_OBSERVER_TOKEN").is_none() {
-        if let Some(token) = ocean_observatory::observer_token_for_child(&config_dir)
-            .context("loading child Observatory credential")?
-        {
-            env::set_var("OCEAN_OBSERVER_TOKEN", token);
-        }
-    }
-
     // Built-ins first, then connect any configured MCP servers (non-fatally)
     // and fold their tools into the capability registry before sharing it.
     let runtime = Arc::new(
@@ -815,45 +806,41 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening titles DB at {}", titles_db_path.display()))?;
     tracing::info!(path = %titles_db_path.display(), "persisted longhouse title registry ready");
 
+    let config_dir = ocean_agent::config_dir_from_env();
     let roles = load_model_roles(&config_dir);
-    // Task 4 makes secret loading and typed auth-state construction real at
-    // startup; Task 5 mounts the read-only data routes that consume the
-    // extractor. One boot id is shared by token verification and responses.
+
+    // Hoist the event bus so the Observatory durability pump subscribes before
+    // any turn can emit a fact. One boot id scopes auth and all read models.
+    let agent_event_bus = AgentEventBus::new(1024);
     let observatory_boot_id = Uuid::new_v4().to_string();
     let observatory_auth =
         observatory_auth::ObservatoryAuthState::load(&config_dir, observatory_boot_id.clone())
             .context("initializing Observatory authentication")?;
     let observatory_services =
         observatory::ObservatoryServices::load(&config_dir, observatory_boot_id);
-    // The agent event bus is hoisted above AppState so the Observatory pump
-    // can subscribe before any turn runs (no fact can slip the seam).
-    let agent_event_bus = AgentEventBus::new(1024);
-
-    // Task 6: bridge runtime facts into the Observatory. The restart sweep
-    // closes out executions a previous boot left nonterminal, then the pump
-    // appends every adapted agent event to the durable store. When the store
-    // failed to open the pump is skipped and routes answer 503.
-    let observatory_adapter = std::sync::Arc::new(observatory_adapter::ObservatoryAdapter::new(
+    let observatory_adapter = Arc::new(observatory_adapter::ObservatoryAdapter::new(
         observatory_services.observatory_id().to_owned(),
         observatory_services.daemon_instance_id().to_owned(),
     ));
     let observatory_store = observatory_services.store_handle();
-    if let Some(observatory_store) = observatory_store.as_ref() {
-        let interrupted = observatory_adapter.mark_interrupted(observatory_store);
+
+    if let Some(store) = observatory_store.as_ref() {
+        let interrupted = observatory_adapter.mark_interrupted(store.as_ref());
         if interrupted > 0 {
             tracing::info!(
                 interrupted,
                 "observatory restart sweep closed stale executions"
             );
         }
-        if let Err(error) = observatory_store
-            .append_event(observatory_adapter.daemon_started(env!("CARGO_PKG_VERSION")))
+        if let Err(error) =
+            store.append_event(observatory_adapter.daemon_started(env!("CARGO_PKG_VERSION")))
         {
             tracing::error!(%error, "observatory daemon-started append failed");
         }
+
         let (_replay, mut observatory_rx) = agent_event_bus.subscribe_with_full_replay();
-        let pump_store = std::sync::Arc::clone(observatory_store);
-        let pump_adapter = std::sync::Arc::clone(&observatory_adapter);
+        let pump_store = Arc::clone(store);
+        let pump_adapter = Arc::clone(&observatory_adapter);
         tokio::spawn(async move {
             loop {
                 match observatory_rx.recv().await {
@@ -865,9 +852,6 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        // The pump is the durability path: lag means facts were
-                        // dropped, so make it loud (unlike the SSE routes,
-                        // which can always re-read the store).
                         tracing::warn!(skipped, "observatory pump lagged; facts were lost");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -880,6 +864,28 @@ async fn main() -> anyhow::Result<()> {
     let room_wakes = RoomWakeBus::default();
     let room_access_wakes = RoomAccessWakeBus::default();
     let shutdown = CancellationToken::new();
+
+    // Keep the local proxy credential fresh without ever distributing the
+    // daemon signing secret. The file is replaced atomically every ten minutes;
+    // HMAC tokens remain valid for thirty minutes, so in-flight streams survive
+    // a rotation while new clients always read the current credential.
+    let observer_token_refresh = observatory_auth.clone();
+    let observer_token_cancel = shutdown.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = observer_token_cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = observer_token_refresh.refresh_summary_token() {
+                        tracing::error!(%error, "observatory summary token rotation failed");
+                    }
+                }
+            }
+        }
+    });
+
     let (federated_trigger_tx, federated_trigger_rx) = tokio::sync::mpsc::unbounded_channel();
     let federated_dispatch_cancel = CancellationToken::new();
     let room_federation = FederationSupervisor::from_env(
@@ -894,13 +900,14 @@ async fn main() -> anyhow::Result<()> {
         runtime,
         roles: Arc::new(roles),
         events: EventBus::new(1024),
-        agent_events: agent_event_bus,
+        agent_events: agent_event_bus.clone(),
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
-        rooms: Arc::new(Mutex::new(room_store)),
-        room_wakes: RoomWakeBus::default(),
-        room_access_wakes: RoomAccessWakeBus::default(),
+        rooms,
+        room_wakes,
+        room_access_wakes,
+        room_federation,
         titles: Arc::new(Mutex::new(title_registry)),
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
         recalls: new_recall_registry(),
@@ -915,7 +922,7 @@ async fn main() -> anyhow::Result<()> {
         canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
         // OCEAN-300: a single daemon-wide shutdown token, cloned into the SSE
         // handlers and fired by the signal handler so live streams terminate.
-        shutdown: CancellationToken::new(),
+        shutdown,
         // OCEAN-303: daemon-wide turn metrics behind `GET /metrics`.
         metrics: Arc::new(TurnMetrics::default()),
         // OCEAN-304: concurrent-turn ceiling. One permit per running turn;
@@ -994,9 +1001,7 @@ async fn main() -> anyhow::Result<()> {
     if !extra_origins.is_empty() {
         tracing::info!(origins = ?extra_origins, "OCEAN_ALLOWED_ORIGINS: extra CORS origins");
     }
-    let app = app_router(cors_layer(extra_origins))
-        .layer(Extension(observatory_auth))
-        .layer(Extension(observatory_services));
+    let app = app_router(cors_layer(extra_origins));
 
     // Drain the registry of in-flight turn tasks AFTER axum finishes draining
     // open connections (OCEAN-184). `with_graceful_shutdown` only waits for live
@@ -1011,7 +1016,11 @@ async fn main() -> anyhow::Result<()> {
     // terminates the live SSE streams (`/v1/events`, `/v1/agent/events`) and lets
     // `with_graceful_shutdown` actually complete instead of hanging forever.
     let shutdown_token = state.shutdown.clone();
-    let app = app.with_state(state);
+    let federation_shutdown = state.room_federation.clone();
+    let app = app
+        .with_state(state)
+        .layer(axum::Extension(observatory_auth))
+        .layer(axum::Extension(observatory_services));
 
     let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
     tracing::info!(%addr, "ocean-daemon listening");
@@ -1082,8 +1091,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Task 6: record the graceful stop in the durable Observatory log before
-    // the process exits. Best-effort: a failed append must not block shutdown.
+    // Best-effort: Observatory failure must never block daemon shutdown.
     if let Some(store) = observatory_store.as_ref() {
         if let Err(error) = store
             .append_event(observatory_adapter.daemon_stopping(Some("graceful_shutdown".to_owned())))
@@ -1291,6 +1299,9 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/agent/turns",
         "POST /v1/agent/voice",
         "GET /v1/agent/events",
+        "GET /v1/observatory/snapshot",
+        "GET /v1/observatory/events",
+        "GET /v1/observatory/replay",
         "POST /v1/agent/canvas/fulfill",
         "GET /v1/agent/canvas/fulfill",
         "POST /v1/agent/sessions",
@@ -1305,9 +1316,6 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/voice/tts",
         "GET /v1/events",
         "POST /v1/prompt",
-        "GET /v1/observatory/snapshot",
-        "GET /v1/observatory/events",
-        "GET /v1/observatory/replay",
         "GET /v1/requests",
         "POST /v1/requests",
         "POST /v1/requests/{id}/cancel",
@@ -7341,7 +7349,11 @@ async fn agent_session_config_patch(
     };
     match state
         .runtime
-        .set_session_model(core_sid(session_id), known.id.clone(), known.provider.clone())
+        .set_session_model(
+            core_sid(session_id),
+            known.id.clone(),
+            known.provider.clone(),
+        )
         .await
     {
         Ok(Some(detail)) => {
@@ -12145,6 +12157,16 @@ mod tests {
         std::env::set_var("OCEAN_MODEL", "fake-ok");
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         AppState {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
@@ -12153,9 +12175,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -12166,7 +12189,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
@@ -13534,6 +13557,16 @@ mod tests {
         std::env::set_var("OCEAN_YOLO", "1");
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         AppState {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
@@ -13542,9 +13575,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13555,7 +13589,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
@@ -13575,6 +13609,16 @@ mod tests {
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let db_path = tmp.path().join("rooms.db");
         let store = ocean_store::SqliteRoomStore::open(&db_path).expect("file-backed store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         let state = AppState {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
@@ -13583,9 +13627,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13596,7 +13641,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
             advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
@@ -14331,6 +14376,16 @@ mod tests {
         std::env::set_var("OCEAN_MODEL", "fake-ok");
         let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
+        let rooms = Arc::new(Mutex::new(store));
+        let room_wakes = RoomWakeBus::default();
+        let room_access_wakes = RoomAccessWakeBus::default();
+        let shutdown = CancellationToken::new();
+        let room_federation = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            room_wakes.clone(),
+            room_access_wakes.clone(),
+            shutdown.clone(),
+        );
         let titles = ocean_longhouse::SqliteTitleRegistry::open(dir.join("titles.db"))
             .expect("on-disk titles");
         AppState {
@@ -14341,9 +14396,10 @@ mod tests {
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
-            rooms: Arc::new(Mutex::new(store)),
-            room_wakes: RoomWakeBus::default(),
-            room_access_wakes: RoomAccessWakeBus::default(),
+            rooms,
+            room_wakes,
+            room_access_wakes,
+            room_federation,
             titles: Arc::new(Mutex::new(titles)),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             recalls: new_recall_registry(),
@@ -14352,7 +14408,7 @@ mod tests {
             sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             metrics: Arc::new(TurnMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
@@ -17031,7 +17087,10 @@ mod tests {
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["advisory"], json!(true));
         assert!(body["consult_enabled"].is_boolean());
-        assert_eq!(body["skill_candidates"], json!(2));
+        assert!(
+            body["skill_candidates"].as_u64().unwrap_or_default() >= 2,
+            "the two planted repo skills must be candidates even when operator home-skill roots add matches"
+        );
         assert_eq!(body["workflow_candidates"], json!(1));
         assert_eq!(body["selected_skills"].as_array().unwrap().len(), 1);
         assert_eq!(body["selected_workflows"].as_array().unwrap().len(), 1);
@@ -19828,7 +19887,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            82,
+            85,
             "route baseline changed; review the manifest"
         );
 
