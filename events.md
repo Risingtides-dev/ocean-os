@@ -3907,3 +3907,19 @@ type:      [bug report]: Restore operator-specified Realtime 2.1 model
 area:      [backend]: OpenAI Realtime voice model
 
 Corrected Ocean's Realtime default to the exact operator-provided model ID `gpt-realtime-2.1`. The prior change to `gpt-realtime` was an erroneous override based on a mismatched docs catalog page despite the operator supplying the current Agents SDK example. The owning daemon contract and upstream mint-body regression now pin `gpt-realtime-2.1`; explicit surface overrides remain supported. Verification: all 11 voice_realtime tests, workspace check, denied-warning daemon Clippy, docs-check, and diff-check pass.
+time:      [21:27] [16-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached @ origin/main (5b9e23a8)]
+type:      [release]
+area:      [infra]
+
+Redeployed ocean-daemon onto current origin/main. Running daemon was rev 4712fdbe-dirty, 5 commits behind — missing the voice realtime GA-id fixes (5b9e23a8, 04c683fb) and voice credential isolation (ca4fe32c). Built clean in a detached worktree so the S2-P1 feature checkout and its uncommitted daemon edits stayed untouched, swapped target/release/ocean-daemon (the deployed binary via the ~/.local/bin symlink), and restarted in a verified idle window (0 turns in flight); the ocean parent respawned it in seconds. /health confirms rev 5b9e23a8a99a clean, pid 66499. Footgun logged to stitchpad: any cargo build of ocean-daemon in the main checkout silently stages that code for the next daemon restart because the deploy symlink points into target/release.
+_________________________________________________________________________________
+time:      [21:47] [16-07-26]
+agent:     [ocean]
+worktree:  [feat/s2-p1-room-producer-contracts]
+type:      [feature]
+area:      [backend]
+
+P1-C docs/devlog closeout atop b5741033: documented merged SSE (payload-free dual-bus wake hints, no-id initial room_access projection, SQLite reread on relevant/lagged, ascending message gap recovery, full-projection access dedup), outbox (locally-authored federated events awaiting Bedrock confirmation; bridge delivery future; P1 retry no network; 404 includes unknown room/item, 500 sanitized store), and exact five access states (local/connecting/live/recovering/revoked) with rowless default local in ocean-daemon AGENTS, crates/ AGENTS, and OCEAN_ECOSYSTEM_CONTRACT. Fixed stale ocean-agent store ownership → ocean-store; clarified RoomStore lifecycle vs inherent access/outbox APIs. Added focused persistent_rooms module gate. 391/391 pass (base-only longhouse exclusion); workspace check, denied-warning Clippy, fmt, docs-check, diff-check green. events.md release entry from 21:27 preserved byte-for-byte.
+_________________________________________________________________________________

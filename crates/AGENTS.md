@@ -40,7 +40,7 @@ The workspace currently contains 27 Rust packages.
 | `ocean-cli` | Thin daemon command/prompt/session client | Agent loop and session persistence | `ocean-cli/src/main.rs` | — | `cargo test -p ocean-cli` |
 | `ocean-context` | Evidence-bearing handoff claims, extraction, replay, reverification | Agent sessions; hashline edits; general AST summaries | `ocean-context/src/lib.rs`, `extract.rs` | — | `cargo test -p ocean-context` |
 | `ocean-core` | Low-level daemon request/response/event/session protocol types | Product-facing agent SDK behavior | `ocean-core/src/lib.rs` | `ocean-core/AGENTS.md` | `cargo test -p ocean-core` |
-| `ocean-daemon` | HTTP/SSE service, per-turn harness-profile composition, execution authority | Provider implementation; client-owned state | `ocean-daemon/src/main.rs`, `harness_profile.rs` | `ocean-daemon/AGENTS.md` | `cargo test -p ocean-daemon` |
+| `ocean-daemon` | HTTP/SSE service, per-turn harness-profile composition, execution authority, room access/outbox HTTP projection and retry adapter | Provider implementation; client-owned state; room access/outbox durability (owned by ocean-store) | `ocean-daemon/src/main.rs`, `harness_profile.rs` | `ocean-daemon/AGENTS.md` | `cargo test -p ocean-daemon` |
 | `ocean-extension` | Schema-v1 extension package parsing, SemVer compatibility, and confined resource validation | Install/trust/enable state; routes; execution | `ocean-extension/src/lib.rs` | `ocean-extension/AGENTS.md` | `cargo test -p ocean-extension` |
 | `ocean-hashline` | File-hash-anchored surgical edits and stale recovery | General AST summarization or session persistence | `ocean-hashline/src/lib.rs`, `patcher.rs` | — | `cargo test -p ocean-hashline` |
 | `ocean-heartbeat` | Scheduled/routine CLI that calls the daemon | In-daemon scheduling authority | `ocean-heartbeat/src/main.rs` | — | `cargo test -p ocean-heartbeat` |
@@ -55,7 +55,7 @@ The workspace currently contains 27 Rust packages.
 | `ocean-protocol` | Anthropic/OpenAI/Gemini/Codex wire encoding, streaming, retry | Model catalog, credentials, readiness | `ocean-protocol/src/lib.rs`, `providers/` | `ocean-protocol/AGENTS.md` | `cargo test -p ocean-protocol` |
 | `ocean-providers` | Model catalog/routing, credentials, aliases, readiness | Provider request/stream encoding | `ocean-providers/src/lib.rs` | — | `cargo test -p ocean-providers` |
 | `ocean-runtime` | Agent loop, permission gates, cancellation, capability/tool execution, runtime events | Session persistence; model credential routing | `ocean-runtime/src/lib.rs`, `agent_loop.rs` | `ocean-runtime/AGENTS.md` | `cargo test -p ocean-runtime` |
-| `ocean-store` | SQLite durable rooms/rosters/transcripts behind `RoomStore` | Agent sessions, memory, Longhouse titles | `ocean-store/src/lib.rs` | — | `cargo test -p ocean-store` |
+| `ocean-store` | SQLite durable rooms, rosters, transcripts behind `RoomStore`; inherent access-projection and outbox APIs | Agent sessions, memory, Longhouse titles | `ocean-store/src/lib.rs` | — | `cargo test -p ocean-store` |
 | `ocean-tui` | Ratatui steering cockpit and client interaction | Agent/session/runtime authority | `ocean-tui/src/main.rs`, `shell/` | `ocean-tui/AGENTS.md` | `cargo test -p ocean-tui && cargo build -p ocean-tui --release` |
 | `xtask` | Repository docs/index checks, canonical repository/compatibility/MSRV gate manifests, WebRTC-cache recovery | Production runtime behavior | `../xtask/src/main.rs` | `../xtask/README.md` | `cargo test -p xtask && cargo xtask docs-check && cargo xtask ci --compatibility` |
 

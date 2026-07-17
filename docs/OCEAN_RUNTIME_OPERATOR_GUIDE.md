@@ -483,7 +483,7 @@ POST   /v1/rooms/persistent/{key}/messages                post message { author_
 GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N&limit=M)
 GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+has_more (?after_seq=N&limit=M)
 GET    /v1/rooms/persistent/{key}/events                  SSE: initial full room_access projection (no id) + id-bearing room_message frames via ?after_seq=N / Last-Event-ID replay, then post-commit access-update + message tail; open non-call rooms only
-POST   /v1/rooms/persistent/{key}/outbox/retry            retry a failed outbox item { client_event_id }; 202 on success, 403 revoked, 404 unknown, 409 pending/local, 400 for malformed body
+POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-authored federated event awaiting Bedrock confirmation { client_event_id }; 202 on success, 403 revoked, 404 unknown room/item, 409 pending/local, 400 malformed body, 500 sanitized store error
 
 # Room media — retained independently from the retired projection API
 POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join token for web in-room voice/video

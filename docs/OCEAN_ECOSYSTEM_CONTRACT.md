@@ -146,21 +146,21 @@ timestamps, an append-only transcript, and an optional trigger policy. Its
 lifecycle is namespaced under `/v1/rooms/persistent`. Source of truth:
 `crates/ocean-core/src/lib.rs` (`Room`, `RoomKey`, `RoomParticipant`,
 `RoomMessage`, `RoomTriggerPolicy`, `RoomTriggerEvent`, `evaluate_trigger_policy`)
-and `crates/ocean-agent` (`RoomRegistry` store, `RoomStoreError`).
+and `crates/ocean-store` (`RoomStore` trait for lifecycle, inherent access-projection and outbox APIs, `RoomStoreError`).
 
-Routes (all in `crates/ocean-daemon/src/main.rs`, typed `{ ok, error }` bodies,
-400 on a bad key, 404 on an unknown room):
+Routes (all in `crates/ocean-daemon/src/main.rs`; JSON routes use typed `{ ok, error }` bodies with 400 on a bad key and 404 on an unknown room; SSE is streaming; retry returns strict status codes):
 
 ```text
 POST /v1/rooms/persistent                                  # create a room
 GET  /v1/rooms/persistent                                  # list rooms
-GET  /v1/rooms/persistent/{key}                            # fetch one room
+GET  /v1/rooms/persistent/{key}                            # fetch one room (includes access projection)
 POST /v1/rooms/persistent/{key}/participants               # join (add participant)
 DEL  /v1/rooms/persistent/{key}/participants/{participant_id}  # leave
 POST /v1/rooms/persistent/{key}/messages                   # append a transcript entry
 GET  /v1/rooms/persistent/{key}/transcript                 # read transcript (after_seq tail)
-GET  /v1/rooms/persistent/{key}/snapshot                   # hydrate durable room state
-GET  /v1/rooms/persistent/{key}/events                     # tail durable room events
+GET  /v1/rooms/persistent/{key}/snapshot                   # hydrate durable room state (includes access)
+GET  /v1/rooms/persistent/{key}/events                     # merged SSE tail (access + messages)
+POST /v1/rooms/persistent/{key}/outbox/retry               # retry a failed outbox item
 POST /v1/rooms/{room_id}/livekit-token                     # mint voice/video join token
 ```
 
@@ -178,6 +178,12 @@ absent policy (`None`) never convenes. A positive `TriggerDecision`
 (`should_convene: true`, optional `target_participant`, human-readable `reason`)
 is the seed for auto-convene; the daemon evaluates it at the transcript/
 component-event wiring point.
+
+**Access projection** is a typed, store-owned `RoomAccessProjection` (a struct, not a tagged variant) returned on room detail (`GET /v1/rooms/persistent/{key}`) and snapshot (`GET /v1/rooms/persistent/{key}/snapshot`). Access states are exact `local`, `connecting`, `live`, `recovering`, and `revoked`. `members` and `outbox` are skip-when-empty struct fields, not variant-confined fields. Outbox stays separate and never enters the confirmed transcript before Bedrock confirmation. Rooms without an access row (including the frozen soft-closed fixture) default exact `local`.
+
+**Pending outbox** is durable per-room storage of locally-authored federated events awaiting Bedrock confirmation. `POST /v1/rooms/persistent/{key}/outbox/retry` accepts `{ "client_event_id": "<id>" }` and returns 202 on successful durable requeue, 403 revoked, 404 for an unknown room or item, 409 pending/local, 400 for malformed/non-object body, or sanitized store 500 on internal error. Outbox durability lives in `ocean-store`; the daemon owns only the HTTP validation, store lookup, and wake-publication adapter. Bridge delivery is future; P1 retry performs no network or provider calls.
+
+**Merged SSE** (`GET /v1/rooms/persistent/{key}/events`) delivers both `room_access` and `room_message` frames on a single stream. The initial frame is a full `room_access` projection (no `event.id`) reflecting the committed access state; `room_message` replay follows via `Last-Event-ID` (numeric or 400, wins over `after_seq`). Post-commit, the tail sends access-update frames on a dedicated `RoomAccessWakeBus` and unchanged id-bearing message frames on `RoomWakeBus` — separate buses so heavy transcript traffic never back-pressures access subscribers. Both bus wake hints are payload-free; relevant and lagged hints reread from SQLite. Message gap recovery pages ascending; access dedup compares the full projection. Unknown/closed rooms return 404; `call:` rooms return the typed unsupported rejection.
 
 ## Implementation Anchors
 
