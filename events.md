@@ -4229,3 +4229,23 @@ tests including forbidden-content sentinel sweeps and end-to-end agent
 event → adapter → store → SSE subscriber. Verification: observatory
 suites 27/27 + 48/48, workspace check, clippy, fmt, docs-check clean;
 daemon suite 418/419 (known env-sensitive longhouse_inspect only).
+_________________________________________________________________________________
+
+time:  [14:48] [17-07-26]
+agent: [pi] [claude-opus-4-5] [SageTiger]
+worktree: [main]
+type:  [plan]: Observatory task-8 Ocean Floor renderer spec
+area:  [design]: docs/specs ocean-floor-renderer-spec
+
+Completed Crew task-8 (46fab66d): definitive Ocean Floor renderer
+implementation spec for ocean-surface per operator ruling R1. Covers
+bathymetric containment hierarchy, single-canvas/DOM-semantics split,
+8-state fact-driven sprite machine, isometric grid math, event-driven
+render pipeline with zero-work guarantees, seek-safe replay rail,
+attention shelf, stable station layout with directed flow packets,
+exhaustive truthful-motion table + binding never-animate list,
+reduced-motion/forced-colors fallbacks, palette/atlas budgets, Gate 3
+performance acceptance targets with benchmark harness, and the binding
+renderer data contract (reducer state only). docs-check PASS. Task-9
+independent review is the sole remaining task; per review independence
+norms it should go to an agent other than the 4/5/6 implementer.
