@@ -4145,3 +4145,37 @@ _observation_binding before provider serialization. Record-only topology;
 no core orchestration per root AGENTS.md invariant. Coordinated a mid-task
 write collision with NiceQuartz; reconciled tree passes cargo test -p
 ocean-observatory (45 tests) and cargo check --workspace.
+_________________________________________________________________________________
+
+time:  [13:51] [17-07-26]
+agent: [pi] [claude-opus-4-5] [SageTiger]
+worktree: [main]
+type:  [feature-request]: Observatory task-4 scoped observer auth (repaired and shipped)
+area:  [backend]: ocean-observatory auth contract + ocean-daemon auth-state seam
+
+Completed Crew task-4 after operator ruled the prior block a non-blocker
+and directed progress. Applied the preserved reviewed repair diff (stash
+42a18ba7) as commit feed719c on main: exact V1 token wire contract
+(signature_base64.payload_base64, HMAC-SHA256 over raw JSON bytes,
+namespaced scopes, deny-unknown claims, unix-second times, 128-bit nonce,
+15-60min lifetimes), fail-closed ObserverSecret storage (O_NOFOLLOW,
+mode-0600, exactly 32 bytes, atomic temp+fsync+hardlink create),
+observer_token_for_child env-then-0600-config credential loading, and the
+daemon ObservatoryAuthState Extension seam (Bearer or
+Authorization-Observer cookie, all credential failures 401, never query
+string, no public token-creation route; extractor consumed by task-5).
+Also finalized the stalled interactive rebase of main onto 8967fedc
+(todo exhausted; moved main ref from detached HEAD) so the crew line is
+on-branch again, and fixed a pre-existing merge-gate break in e9c7c128:
+room_federation.rs (435c7260) is not wired as a module, orphaning two
+test-only wake-bus subscribers; #[expect(dead_code)] makes clippy
+--all-targets -D warnings pass and self-cleans when the module is wired.
+Verification: cargo check --workspace clean; ocean-observatory 48/48;
+ocean-daemon observatory_auth 5/5 and persistent_rooms 39/39; clippy and
+fmt clean; docs-check PASS. Known pre-existing: env-sensitive
+longhouse_inspect test fails identically on pristine 5545683e (user-level
+skill roots leak into scanner; reproduced in isolated worktree, unrelated
+to this change). crates/AGENTS.md ownership rows for observatory auth are
+in WildDragon's working tree pending their commit. main diverged from
+origin/main via the rebase; push/force-with-lease decision flagged to
+WildDragon as coordination lead.
