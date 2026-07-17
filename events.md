@@ -3966,3 +3966,11 @@ area:      [backend]
 
 P2-A re-gate round 2 (codex, 3 surgical misses). (1) Ingest dedup now loads the full federated_events index tuple and requires three-way equality: index == parsed transcript meta == incoming; a corrupt index column with intact transcript metadata is FederationCorruption, never Duplicate (pinned per-column: gs, source_id, source_sequence, client_event_id). (2) Promote all-or-nothing proven under injected mid-transaction failure: a TEMP BEFORE-DELETE trigger RAISE(ABORT) between the credential insert and the pending delete rolls back the credential and retains the pending row; dropping the trigger lets the identical promote commit (pinned). (3) Stale docs refreshed: lib.rs header no longer claims the daemon is unwired/untouched — documents the live AppState Mutex adoption, the exhaustive error-response mapping, and the federation core; RoomStoreError intro now names RoomNotFederated/FederationCorruption/Io with their HTTP mappings. Gates rerun green: ocean-store 88/88, daemon persistent_rooms 39/39, clippy -D warnings, fmt, workspace check, docs-check. Uncommitted, holding.
 _________________________________________________________________________________
+
+time:      [03:28] [17-07-26]
+agent:     [claude] [fable 5]
+type:      [merge]
+area:      [backend]
+
+Shipped S2 P2-A to main: fast-forward 9c8cdbec..92399623 and pushed, local == origin. thoth's single-commit five-file slice (ocean-store federation core: 7 private tables incl. v1.2 pending_redemptions, 14 atomic APIs, 0600-before-DB-work, canonical-u64 fail-closed, full-meta ingest dedup; plus the ruled persistent_rooms.rs error arm) landed after codex's APPROVE + independent parity confirm (store 88/88, daemon 39/39, clippy -D, fmt, workspace, docs, diff-check green). P2-B/C daemon bridge lanes now unblocked.
+_________________________________________________________________________________
