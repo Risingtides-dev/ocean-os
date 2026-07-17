@@ -1,0 +1,172 @@
+{
+  "description": "Simple daemon lifecycle: daemon starts, a single root execution runs a tool and finishes successfully. Tests basic event processing and deterministic terminal state.",
+  "schema_version": 1,
+  "events": [
+    {
+      "cursor": "1",
+      "event_id": "daemon-started-001",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:00:00.000Z",
+      "recorded_at": "2026-07-17T18:00:00.002Z",
+      "kind": "daemon.started",
+      "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null,
+        "edge_id": null,
+        "session_id": "",
+        "turn_id": "",
+        "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "daemon.started", "data": { "version": "0.1.0" } }
+    },
+    {
+      "cursor": "2",
+      "event_id": "exec-admitted-001",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:00.000Z",
+      "recorded_at": "2026-07-17T18:01:00.003Z",
+      "kind": "execution.admitted",
+      "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-root-001",
+        "root_execution_id": "exec-root-001",
+        "parent_execution_id": null,
+        "edge_id": null,
+        "session_id": "session-001",
+        "turn_id": "turn-001",
+        "request_id": "request-001"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.admitted",
+        "data": { "phase": "running", "labels": ["root_agent"] }
+      }
+    },
+    {
+      "cursor": "3",
+      "event_id": "tool-started-001",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:05.000Z",
+      "recorded_at": "2026-07-17T18:01:05.002Z",
+      "kind": "tool.started",
+      "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-root-001",
+        "root_execution_id": "exec-root-001",
+        "parent_execution_id": null,
+        "edge_id": null,
+        "session_id": "session-001",
+        "turn_id": "turn-001",
+        "request_id": "request-001"
+      },
+      "correlation": { "tool_call_id": "tool-call-001", "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "tool.started",
+        "data": { "tool_name": "search", "model_alias": "claude-sonnet-4" }
+      }
+    },
+    {
+      "cursor": "4",
+      "event_id": "tool-finished-001",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:08.000Z",
+      "recorded_at": "2026-07-17T18:01:08.001Z",
+      "kind": "tool.finished",
+      "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-root-001",
+        "root_execution_id": "exec-root-001",
+        "parent_execution_id": null,
+        "edge_id": null,
+        "session_id": "session-001",
+        "turn_id": "turn-001",
+        "request_id": "request-001"
+      },
+      "correlation": { "tool_call_id": "tool-call-001", "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "tool.finished",
+        "data": {
+          "tool_name": "search",
+          "duration_millis": 3000,
+          "outcome": "success",
+          "byte_count": 2048
+        }
+      }
+    },
+    {
+      "cursor": "5",
+      "event_id": "exec-finished-001",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:10.000Z",
+      "recorded_at": "2026-07-17T18:01:10.002Z",
+      "kind": "execution.finished",
+      "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-root-001",
+        "root_execution_id": "exec-root-001",
+        "parent_execution_id": null,
+        "edge_id": null,
+        "session_id": "session-001",
+        "turn_id": "turn-001",
+        "request_id": "request-001"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.finished",
+        "data": {
+          "phase": "finished",
+          "duration_millis": 10000,
+          "error_classification": null
+        }
+      }
+    }
+  ],
+  "expected_state_at_cursor": {
+    "1": {
+      "description": "After daemon start event. No executions, no edges, no attention.",
+      "daemon_running": true,
+      "execution_count": 0,
+      "edge_count": 0,
+      "attention_count": 0
+    },
+    "2": {
+      "description": "After execution admitted. One execution in Running phase.",
+      "daemon_running": true,
+      "execution_count": 1,
+      "running_count": 1,
+      "edge_count": 0,
+      "attention_count": 0
+    },
+    "3": {
+      "description": "Tool started. Execution still running, one in-flight tool.",
+      "daemon_running": true,
+      "execution_count": 1,
+      "running_count": 1,
+      "in_flight_tools": 1,
+      "edge_count": 0,
+      "attention_count": 0
+    },
+    "5": {
+      "description": "After execution finished. One terminal execution, one edge, no attention (normal completion is low priority).",
+      "daemon_running": true,
+      "execution_count": 1,
+      "finished_count": 1,
+      "edge_count": 0,
+      "in_flight_tools": 0,
+      "attention_count": 0
+    }
+  }
+}

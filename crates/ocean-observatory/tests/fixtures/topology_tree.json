@@ -1,0 +1,142 @@
+{
+  "description": "Topology tree: a root execution spawns a child via extension admission+binding, which spawns a grandchild. Tests parent/child edge tracking, tree depth, and extension-attested provenance.",
+  "schema_version": 1,
+  "events": [
+    {
+      "cursor": "1", "event_id": "daemon-start-003",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:00:00.000Z",
+      "recorded_at": "2026-07-17T18:00:00.001Z",
+      "kind": "daemon.started", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "daemon.started", "data": { "version": "0.1.0" } }
+    },
+    {
+      "cursor": "2", "event_id": "root-admitted",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:00.000Z",
+      "recorded_at": "2026-07-17T18:01:00.002Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "root-001", "root_execution_id": "root-001",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-010", "turn_id": "turn-010", "request_id": "req-010"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["root_agent"] } }
+    },
+    {
+      "cursor": "3", "event_id": "child1-admitted",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:02:00.000Z",
+      "recorded_at": "2026-07-17T18:02:00.003Z",
+      "kind": "execution.admitted", "truth": "extension_attested",
+      "producer": { "kind": "extension", "id": "orchestrator-ext" },
+      "topology": {
+        "execution_id": "child-001", "root_execution_id": "root-001",
+        "parent_execution_id": "root-001", "edge_id": "edge-root-child1",
+        "session_id": "session-010", "turn_id": "turn-011", "request_id": "req-011"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["child_worker", "batch_1"] } }
+    },
+    {
+      "cursor": "4", "event_id": "child2-admitted",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:03:00.000Z",
+      "recorded_at": "2026-07-17T18:03:00.001Z",
+      "kind": "execution.admitted", "truth": "extension_attested",
+      "producer": { "kind": "extension", "id": "orchestrator-ext" },
+      "topology": {
+        "execution_id": "child-002", "root_execution_id": "root-001",
+        "parent_execution_id": "child-001", "edge_id": "edge-child1-child2",
+        "session_id": "session-010", "turn_id": "turn-012", "request_id": "req-012"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["grandchild_worker"] } }
+    },
+    {
+      "cursor": "5", "event_id": "child1-finished",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:04:00.000Z",
+      "recorded_at": "2026-07-17T18:04:00.002Z",
+      "kind": "execution.phase_changed", "truth": "extension_attested",
+      "producer": { "kind": "extension", "id": "orchestrator-ext" },
+      "topology": {
+        "execution_id": "child-001", "root_execution_id": "root-001",
+        "parent_execution_id": "root-001", "edge_id": "edge-root-child1",
+        "session_id": "session-010", "turn_id": "turn-011", "request_id": "req-011"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.phase_changed",
+        "data": { "from_phase": "running", "to_phase": "finished" }
+      }
+    },
+    {
+      "cursor": "6", "event_id": "child1-done",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:04:00.000Z",
+      "recorded_at": "2026-07-17T18:04:00.003Z",
+      "kind": "execution.finished", "truth": "extension_attested",
+      "producer": { "kind": "extension", "id": "orchestrator-ext" },
+      "topology": {
+        "execution_id": "child-001", "root_execution_id": "root-001",
+        "parent_execution_id": "root-001", "edge_id": "edge-root-child1",
+        "session_id": "session-010", "turn_id": "turn-011", "request_id": "req-011"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.finished",
+        "data": { "phase": "finished", "duration_millis": 120000, "error_classification": null }
+      }
+    }
+  ],
+  "expected_state_at_cursor": {
+    "2": {
+      "description": "Root execution admitted. No children.",
+      "daemon_running": true,
+      "execution_count": 1,
+      "running_count": 1,
+      "edge_count": 0
+    },
+    "3": {
+      "description": "Child-001 admitted via extension attestation. One edge (root→child1). Two execution nodes, one edge.",
+      "daemon_running": true,
+      "execution_count": 2,
+      "running_count": 2,
+      "edge_count": 1
+    },
+    "4": {
+      "description": "Grandchild-002 admitted. Two edges (root→child1, child1→child2). Three nodes, depth 3.",
+      "daemon_running": true,
+      "execution_count": 3,
+      "running_count": 3,
+      "edge_count": 2,
+      "max_tree_depth": 3
+    },
+    "6": {
+      "description": "Child-001 finished. Root still running (waiting for grandchild). Grandchild still running.",
+      "daemon_running": true,
+      "execution_count": 3,
+      "running_count": 2,
+      "finished_count": 1,
+      "edge_count": 2,
+      "max_tree_depth": 3
+    }
+  }
+}

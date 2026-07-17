@@ -1,0 +1,180 @@
+{
+  "description": "Multiple execution lifecycle: three root executions with different outcomes. One finishes successfully, one errors out, one is still running. Tests phase tracking and heterogeneous execution states.",
+  "schema_version": 1,
+  "events": [
+    {
+      "cursor": "1", "event_id": "daemon-start-002",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:00:00.000Z",
+      "recorded_at": "2026-07-17T18:00:00.001Z",
+      "kind": "daemon.started", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "daemon.started", "data": { "version": "0.1.0" } }
+    },
+    {
+      "cursor": "2", "event_id": "exec-admitted-a",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:00.000Z",
+      "recorded_at": "2026-07-17T18:01:00.002Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-a", "root_execution_id": "exec-a",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-002", "turn_id": "turn-002", "request_id": "req-002"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_a"] } }
+    },
+    {
+      "cursor": "3", "event_id": "exec-admitted-b",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:30.000Z",
+      "recorded_at": "2026-07-17T18:01:30.002Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-b", "root_execution_id": "exec-b",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-003", "turn_id": "turn-003", "request_id": "req-003"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_b"] } }
+    },
+    {
+      "cursor": "4", "event_id": "exec-admitted-c",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:02:00.000Z",
+      "recorded_at": "2026-07-17T18:02:00.001Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-c", "root_execution_id": "exec-c",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-004", "turn_id": "turn-004", "request_id": "req-004"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_c"] } }
+    },
+    {
+      "cursor": "5", "event_id": "exec-a-phase-finish",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:10.000Z",
+      "recorded_at": "2026-07-17T18:01:10.002Z",
+      "kind": "execution.phase_changed", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-a", "root_execution_id": "exec-a",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-002", "turn_id": "turn-002", "request_id": "req-002"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.phase_changed",
+        "data": { "from_phase": "running", "to_phase": "finished" }
+      }
+    },
+    {
+      "cursor": "6", "event_id": "exec-a-finish",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:10.000Z",
+      "recorded_at": "2026-07-17T18:01:10.003Z",
+      "kind": "execution.finished", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-a", "root_execution_id": "exec-a",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-002", "turn_id": "turn-002", "request_id": "req-002"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.finished",
+        "data": { "phase": "finished", "duration_millis": 10000, "error_classification": null }
+      }
+    },
+    {
+      "cursor": "7", "event_id": "exec-c-phase-error",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:02:30.000Z",
+      "recorded_at": "2026-07-17T18:02:30.001Z",
+      "kind": "execution.phase_changed", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-c", "root_execution_id": "exec-c",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-004", "turn_id": "turn-004", "request_id": "req-004"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.phase_changed",
+        "data": { "from_phase": "running", "to_phase": "error" }
+      }
+    },
+    {
+      "cursor": "8", "event_id": "exec-c-finish",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:02:30.000Z",
+      "recorded_at": "2026-07-17T18:02:30.002Z",
+      "kind": "execution.finished", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-c", "root_execution_id": "exec-c",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-004", "turn_id": "turn-004", "request_id": "req-004"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.finished",
+        "data": { "phase": "error", "duration_millis": 30000, "error_classification": "execution_failed" }
+      }
+    }
+  ],
+  "expected_state_at_cursor": {
+    "1": {
+      "description": "Daemon started. No executions.",
+      "daemon_running": true,
+      "execution_count": 0,
+      "edge_count": 0
+    },
+    "4": {
+      "description": "Three root executions admitted. All running, no edges.",
+      "daemon_running": true,
+      "execution_count": 3,
+      "running_count": 3,
+      "edge_count": 0
+    },
+    "6": {
+      "description": "Execution A finished (success). B and C still running.",
+      "daemon_running": true,
+      "execution_count": 3,
+      "running_count": 2,
+      "finished_count": 1,
+      "edge_count": 0
+    },
+    "8": {
+      "description": "Execution A finished (success), C errored, B still running.",
+      "daemon_running": true,
+      "execution_count": 3,
+      "running_count": 1,
+      "finished_count": 1,
+      "error_count": 1,
+      "edge_count": 0,
+      "attention_count_at_least": 1
+    }
+  }
+}

@@ -26,6 +26,7 @@ members = [
   "crates/ocean-memory",
   "crates/ocean-hashline",
   "crates/ocean-oauth",
+  "crates/ocean-observatory",
   "xtask",
 ]
 # ocean-ast and ocean-minimizer are standalone, unwired libraries; xtask is a
@@ -59,6 +60,7 @@ default-members = [
   "crates/ocean-memory",
   "crates/ocean-hashline",
   "crates/ocean-oauth",
+  "crates/ocean-observatory",
 ]
 resolver = "2"
 
@@ -108,7 +110,7 @@ ocean-longhouse = { path = "crates/ocean-longhouse" }
 ocean-store = { path = "crates/ocean-store" }
 # Bundled SQLite (no system libsqlite3 dependency). Sync, no async-runtime
 # coupling — matches the daemon's std::sync::Mutex room registry style.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid"] }
 ocean-extension = { path = "crates/ocean-extension" }
 ocean-plugin = { path = "crates/ocean-plugin" }
 ocean-hooks = { path = "crates/ocean-hooks" }

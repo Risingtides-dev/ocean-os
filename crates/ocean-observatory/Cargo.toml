@@ -1,0 +1,19 @@
+[package]
+name = "ocean-observatory"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+uuid.workspace = true
+sha2.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

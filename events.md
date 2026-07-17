@@ -4053,6 +4053,22 @@ type:      [merge]
 area:      [backend]
 
 Shipped S2 P2-B to main: pushed 435c7260 (c8bdd024..435c7260 ff) via ref from thoth's worktree — canonical checkout deliberately untouched, it carries the Observatory lane's unpushed commits + dirty tree. 435c7260 is thoth's approved c84e4f99 rebased onto the Observatory docs delta (9 blobs byte-identical, events.md append byte-identical, ledger separator restored), parity-approved by codex. Slice: outbound Bedrock room supervisor per gate2-s2-p2b-freeze-v2.2 — origin-only client, epoch-locked per-room receiver/sender, lease-derived presence, fail-closed store authority, admission-linearized revoke, raw SSE byte cap. Gates: federation 22/22, persistent_rooms 39/39, store 88/88, clippy -D, fmt, diff-check. Next: P2-C (intents/message split/trigger dispatch) closes the two-machine bridge; config-rpc + Observatory lanes rebase onto this main.
+time:      [04:26] [07-17-26]
+agent:     [claude] [fable 5]
+worktree:  feat/session-config-rpc
+type:      [feature-request]
+area:      [backend]
+
+Built session-config RPC v1 per .stitchpad/artifacts/config-rpc-v1-spec.md, held uncommitted in the feat/session-config-rpc worktree for the pre-commit review gate. GET/PATCH /v1/agent/sessions/{id}/config read and repin a session's model (catalog-validated, 400 with valid ids on unknown); PATCH persists via a new locked AgentRuntime::set_session_model + Session::set_model and emits a new AgentTurnEvent::SessionConfigChanged on the session stream (agent-rail-only, no legacy mirror). Turn wiring: a session pin that differs from the global model now fills in as the turn default below explicit model_id, role, and folder-agent model. Mechanical ripple: banner_routes + route-baseline count 77→79 + operator guide parity, event_adapter/acp match arms, sdk exhaustiveness fixtures. cargo check clean, clippy -D warnings clean on daemon/agent/sdk, full test suites green except the pre-existing env-dependent longhouse_inspect failure (fails identically on the pristine tree). Live smoke skipped: the running daemon on 4780 serves active agents.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [04:30] [17-07-26]
+agent:     [pi] [gpt-5.6-terra] [CalmIce] [SwiftBear]
+worktree:  [main]
+type:      [feature-request]
+area:      [backend]
+
+Completed the Ocean Observatory Gate 1 task-2 landing checkpoint. Added the ocean-observatory workspace crate with a closed metadata-only event schema, decimal-string monotonic cursors, structural redaction allow-list, SQLite/WAL event and topology persistence, replay/snapshot pagination, and terminal-only retention enforcement at the accepted 7-day/1-GiB bounds with durable boundary records. Redaction regressions cover prompts/reasoning, tool arguments/output, errors/paths/environment, credentials/permission rationale, and decimal cursor encoding; no raw runtime AgentEvent derives Serialize or maps implicitly. Recorded lead-approved Deviation D1: the V1 structural allow-list replaces the #[observer_safe] proc-macro gate, with macro hardening optional later. Updated the canonical workspace index and parent count to 28 packages. Verification passed: cargo test -p ocean-observatory (21/21 integration tests), cargo xtask docs-check (28 packages, 150 active Markdown files, 133 local links), and git diff --check.
 _________________________________________________________________________________
 
 time:      [10:10] [17-07-26]

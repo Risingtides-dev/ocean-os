@@ -1870,6 +1870,10 @@ If any of these conditions arise during implementation, the task blocks and a re
 **Date Accepted:** 2026-07-17
 **Accepted By:** Smaths (operator, via crew channel; relayed by WildDragon)
 
+### Approved implementation deviations
+
+- **D1 — Structural allow-list replaces `#[observer_safe]` for V1.** Closed, metadata-only Observatory payload types, explicit adapter construction, and exhaustive redaction/serialization regression fixtures form the V1 structural allow-list; no raw runtime `AgentEvent` type derives `Serialize` or maps implicitly. This supersedes the macro-specific acceptance and non-acceptance language in this manifest for V1 only. WildDragon approved D1 as coordination lead on 2026-07-17. A proc-macro may be added later as optional defense-in-depth hardening, but it is not a V1 landing gate.
+
 ---
 
 ## References

@@ -27,7 +27,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 ## Workspace Package Index
 
-The workspace currently contains 27 Rust packages.
+The workspace currently contains 28 Rust packages.
 
 | Package | Owns | Does not own | Primary entry | Local contract | Narrow validation |
 |---|---|---|---|---|---|
@@ -51,6 +51,7 @@ The workspace currently contains 27 Rust packages.
 | `ocean-memory` | Typed provenance-bearing SQLite memory and ingest | Session transcripts; shared Bedrock storage | `ocean-memory/src/lib.rs` | — | `cargo test -p ocean-memory` |
 | `ocean-minimizer` | Standalone conservative output minimization for already-tokenized cargo/git/gh/npm/npx/pytest invocations | Shell parsing/execution; TOML/config; artifacts; live runtime wiring | `ocean-minimizer/src/lib.rs::minimize` | `ocean-minimizer/AGENTS.md` | `cargo test -p ocean-minimizer && cargo clippy -p ocean-minimizer --all-targets -- -D warnings` |
 | `ocean-oauth` | Browser OAuth/PKCE login and Ocean auth-file writes | Model routing and provider wire calls | `ocean-oauth/src/lib.rs` | `ocean-oauth/AGENTS.md` | `cargo test -p ocean-oauth` |
+| `ocean-observatory` | Metadata-only event schema, structural redaction allow-list, cursor semantics, and SQLite/WAL persistence | Daemon event adapters, authenticated API routes, or Surface rendering | `ocean-observatory/src/lib.rs` | — | `cargo test -p ocean-observatory` |
 | `ocean-plugin` | Subprocess plugin manifests, lifecycle, JSON-RPC, capability adapter | External MCP transport | `ocean-plugin/src/lib.rs`, `plugin.rs` | — | `cargo test -p ocean-plugin` |
 | `ocean-protocol` | Anthropic/OpenAI/Gemini/Codex wire encoding, streaming, retry | Model catalog, credentials, readiness | `ocean-protocol/src/lib.rs`, `providers/` | `ocean-protocol/AGENTS.md` | `cargo test -p ocean-protocol` |
 | `ocean-providers` | Model catalog/routing, credentials, aliases, readiness | Provider request/stream encoding | `ocean-providers/src/lib.rs` | — | `cargo test -p ocean-providers` |

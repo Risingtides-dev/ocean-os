@@ -1,0 +1,191 @@
+{
+  "description": "Stream gap and resume: normal event flow is interrupted by a StreamGap event. Reducer must freeze state, mark in-flight activity as interrupted, request snapshot reconciliation, and resume after receiving the snapshot.",
+  "schema_version": 1,
+  "events": [
+    {
+      "cursor": "1", "event_id": "daemon-start-gap",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:00:00.000Z",
+      "recorded_at": "2026-07-17T18:00:00.001Z",
+      "kind": "daemon.started", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "daemon.started", "data": { "version": "0.1.0" } }
+    },
+    {
+      "cursor": "2", "event_id": "exec-p-admitted",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:01:00.000Z",
+      "recorded_at": "2026-07-17T18:01:00.002Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-p", "root_execution_id": "exec-p",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-p", "turn_id": "turn-p", "request_id": "req-p"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_p"] } }
+    },
+    {
+      "cursor": "3", "event_id": "exec-q-admitted",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:02:00.000Z",
+      "recorded_at": "2026-07-17T18:02:00.001Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-q", "root_execution_id": "exec-q",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-q", "turn_id": "turn-q", "request_id": "req-q"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_q"] } }
+    },
+    {
+      "cursor": "4", "event_id": "exec-p-perm-wait",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:02:30.000Z",
+      "recorded_at": "2026-07-17T18:02:30.002Z",
+      "kind": "permission.waiting", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-p", "root_execution_id": "exec-p",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-p", "turn_id": "turn-p", "request_id": "req-p"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": "perm-p-1" },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "permission.waiting",
+        "data": { "reason_code": "user_required" }
+      }
+    },
+    {
+      "cursor": "5", "event_id": "gap-event",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:03:00.000Z",
+      "recorded_at": "2026-07-17T18:03:00.001Z",
+      "kind": "stream.gap", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "stream.gap",
+        "data": {
+          "from_cursor": "5",
+          "to_cursor": "10",
+          "reason": "retention_boundary"
+        }
+      }
+    },
+    {
+      "cursor": "10", "event_id": "exec-p-resumed",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:04:00.000Z",
+      "recorded_at": "2026-07-17T18:04:00.002Z",
+      "kind": "execution.phase_changed", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-p", "root_execution_id": "exec-p",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-p", "turn_id": "turn-p", "request_id": "req-p"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.phase_changed",
+        "data": { "from_phase": "running", "to_phase": "finished" }
+      }
+    },
+    {
+      "cursor": "11", "event_id": "exec-p-finished",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:04:00.000Z",
+      "recorded_at": "2026-07-17T18:04:00.003Z",
+      "kind": "execution.finished", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-p", "root_execution_id": "exec-p",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-p", "turn_id": "turn-p", "request_id": "req-p"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "execution.finished",
+        "data": { "phase": "finished", "duration_millis": 180000, "error_classification": null }
+      }
+    },
+    {
+      "cursor": "12", "event_id": "exec-q-tool",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T18:05:00.000Z",
+      "recorded_at": "2026-07-17T18:05:00.001Z",
+      "kind": "tool.started", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-q", "root_execution_id": "exec-q",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-q", "turn_id": "turn-q", "request_id": "req-q"
+      },
+      "correlation": { "tool_call_id": "tool-q-1", "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "tool.started",
+        "data": { "tool_name": "search", "model_alias": "claude-sonnet-4" }
+      }
+    }
+  ],
+  "expected_state_at_cursor": {
+    "4": {
+      "description": "Before gap. Two executions running. Permission waiting on exec-p (high attention).",
+      "daemon_running": true,
+      "execution_count": 2,
+      "running_count": 2,
+      "edge_count": 0,
+      "attention_count_at_least": 1,
+      "pending_permissions": 1
+    },
+    "5": {
+      "description": "StreamGap event received. Reducer must freeze state at cursor 5, mark in-flight activity as interrupted. Transition to gap phase.",
+      "daemon_running": true,
+      "phase_gap": true,
+      "frozen_cursor": 5,
+      "gap_from": 5,
+      "gap_to": 10
+    },
+    "10": {
+      "description": "After snapshot reconciliation. Events resume at cursor 10 (post-gap). The reducer has received a fresh snapshot covering events 5-9. Exec-p transitions to finished at cursor 10.",
+      "daemon_running": true,
+      "execution_count": 2,
+      "running_count": 1,
+      "finished_count": 1,
+      "phase_normal": true
+    },
+    "12": {
+      "description": "Full recovery. Exec-p finished. Exec-q running with one in-flight tool. No gap phase. Normal operation.",
+      "daemon_running": true,
+      "execution_count": 2,
+      "running_count": 1,
+      "finished_count": 1,
+      "in_flight_tools": 1,
+      "phase_normal": true
+    }
+  }
+}

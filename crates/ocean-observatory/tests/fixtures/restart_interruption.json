@@ -1,0 +1,177 @@
+{
+  "description": "Daemon restart with interrupted executions: daemon starts, runs two executions, restarts without clean finish. Previous executions must be marked 'interrupted', attention items created. Tests daemon instance boundary and interrupted-phase semantics.",
+  "schema_version": 1,
+  "events": [
+    {
+      "cursor": "1", "event_id": "daemon-start-v1",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:00:00.000Z",
+      "recorded_at": "2026-07-17T17:00:00.001Z",
+      "kind": "daemon.started", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "daemon.started", "data": { "version": "0.1.0" } }
+    },
+    {
+      "cursor": "2", "event_id": "exec-x-admitted",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:05:00.000Z",
+      "recorded_at": "2026-07-17T17:05:00.002Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-x", "root_execution_id": "exec-x",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-x", "turn_id": "turn-x", "request_id": "req-x"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_x"] } }
+    },
+    {
+      "cursor": "3", "event_id": "exec-y-admitted",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:10:00.000Z",
+      "recorded_at": "2026-07-17T17:10:00.001Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-y", "root_execution_id": "exec-y",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-y", "turn_id": "turn-y", "request_id": "req-y"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_y"] } }
+    },
+    {
+      "cursor": "4", "event_id": "exec-y-tool",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:11:00.000Z",
+      "recorded_at": "2026-07-17T17:11:00.002Z",
+      "kind": "tool.started", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-y", "root_execution_id": "exec-y",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-y", "turn_id": "turn-y", "request_id": "req-y"
+      },
+      "correlation": { "tool_call_id": "tool-y-1", "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "tool.started",
+        "data": { "tool_name": "code_editor", "model_alias": "claude-sonnet-4" }
+      }
+    },
+    {
+      "cursor": "5", "event_id": "daemon-stopping",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:15:00.000Z",
+      "recorded_at": "2026-07-17T17:15:00.001Z",
+      "kind": "daemon.stopping", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "daemon.stopping", "data": { "reason": "operator_requested" } }
+    },
+    {
+      "cursor": "6", "event_id": "stream-reset",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:15:05.000Z",
+      "recorded_at": "2026-07-17T17:15:05.001Z",
+      "kind": "stream.reset", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": {
+        "kind": "stream.reset",
+        "data": { "reason": "server_restart" }
+      }
+    },
+    {
+      "cursor": "7", "event_id": "daemon-start-v2",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:16:00.000Z",
+      "recorded_at": "2026-07-17T17:16:00.001Z",
+      "kind": "daemon.started", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "00000000-0000-0000-0000-000000000000",
+        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "", "turn_id": "", "request_id": ""
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "daemon.started", "data": { "version": "0.1.0" } }
+    },
+    {
+      "cursor": "8", "event_id": "exec-z-admitted-v2",
+      "schema_version": 1,
+      "occurred_at": "2026-07-17T17:17:00.000Z",
+      "recorded_at": "2026-07-17T17:17:00.002Z",
+      "kind": "execution.admitted", "truth": "host_observed",
+      "producer": { "kind": "daemon", "id": "ocean-daemon" },
+      "topology": {
+        "execution_id": "exec-z", "root_execution_id": "exec-z",
+        "parent_execution_id": null, "edge_id": null,
+        "session_id": "session-z", "turn_id": "turn-z", "request_id": "req-z"
+      },
+      "correlation": { "tool_call_id": null, "permission_id": null },
+      "visibility": "metadata",
+      "payload": { "kind": "execution.admitted", "data": { "phase": "running", "labels": ["agent_z", "post_restart"] } }
+    }
+  ],
+  "expected_state_at_cursor": {
+    "5": {
+      "description": "After DaemonStopping. Two executions still running. One in-flight tool. Daemon is shutting down.",
+      "daemon_running": false,
+      "execution_count": 2,
+      "running_count": 2,
+      "in_flight_tools": 1,
+      "edge_count": 0,
+      "daemon_stopping": true
+    },
+    "6": {
+      "description": "StreamReset received. Reducer must enter stale phase and request fresh snapshot. Previous state frozen.",
+      "daemon_running": false,
+      "stream_reset": true,
+      "phase_stale": true
+    },
+    "7": {
+      "description": "New daemon instance started. Fresh daemon_instance_id. After snapshot reconciliation, previous executions (exec-x, exec-y) appear as 'interrupted'.",
+      "daemon_running": true,
+      "execution_count": 2,
+      "interrupted_count": 2,
+      "edge_count": 0,
+      "new_daemon_instance": true
+    },
+    "8": {
+      "description": "New execution 'exec-z' started in the new daemon instance. Two interrupted execs (x, y) + one running (z).",
+      "daemon_running": true,
+      "execution_count": 3,
+      "interrupted_count": 2,
+      "running_count": 1,
+      "edge_count": 0
+    }
+  }
+}
