@@ -1,10 +1,10 @@
 # Ocean Daemon Longhouse Topic Projection Extraction Manifest
 
 **Date:** 2026-07-16
-**Status:** Characterization complete and independently reviewed; extraction authorized
+**Status:** Ready for publication; characterization, extraction, dedicated-target validation, compatibility/MSRV/local CI, and independent review passed; hosted CI and merge pending
 **Owner:** Ocean OS
-**Source baseline:** fetched and rebased `origin/main` `e8f3322`
-**Rollback point:** characterization commit `3aedaf1` (rebased from reviewed `c1be830`)
+**Source baseline:** fetched and rebased `origin/main` `9177598`
+**Rollback point:** characterization commit `c443df9` (rebased from reviewed `c1be830`)
 
 ## Purpose
 
@@ -18,7 +18,7 @@ The result remains a private module of the `ocean-daemon` binary. It is not a da
 
 ## Current upstream and reconciliation rule
 
-This manifest originated from fetched `origin/main` `5b9e23a` and was rebased immediately before extraction onto fetched `origin/main` `e8f3322`. The last published Phase 2C extraction is Longhouse turn preparation at merge `9095d5a`, with publication follow-up `b21006b`.
+This manifest originated from fetched `origin/main` `5b9e23a`, was rebased immediately before extraction onto `e8f3322`, was rebased before initial publication onto `a517f6c`, and was reconciled after PR creation through `ad391f3` and then fetched `origin/main` `9177598`. The last published Phase 2C extraction is Longhouse turn preparation at merge `9095d5a`, with publication follow-up `b21006b`.
 
 The source advanced substantially after `b21006b`:
 
@@ -28,7 +28,7 @@ The source advanced substantially after `b21006b`:
 - `cdb7c17`, `822e755`, and `b74b3ff` changed persistent-room named-agent binding and durable room SSE lifecycle adjacent to, but outside, this boundary;
 - after the handoff's `4712fdb` baseline, `ca4fe32` changed only the Realtime voice credential seam in `main.rs`; `04c683f` and `5b9e23a` changed the separate voice model default contract.
 
-The three proposed functions are unchanged across `b21006b..5b9e23a`. Reconciliation of the 24 later commits through `e8f3322` found only room-federation/startup/test wiring adjacent to the mapped seams; all three candidate definitions remain byte-identical to reviewed rollback source, and the focused characterization, convene, router, SSE, preparation, and turn-preparation groups passed from rebased rollback `3aedaf1` in `/tmp/ocean-target-longhouse-topics-rebase`. The real convene body changed and its `ocean-longhouse` owner changed heavily before the original manifest, which is another reason not to hide it inside this first move. This extraction must not restore any earlier Longhouse algorithm or convergence path.
+The three proposed functions are unchanged across `b21006b..5b9e23a`. Reconciliation of the 24 later commits through `e8f3322` found only room-federation/startup/test wiring adjacent to the mapped seams. A second clean rebase over 15 Observatory/session-config commits through `a517f6c` changed adjacent `AppState`, event-bus, startup, and router composition but not the owner, route mounts, shared Longhouse handle, or any moved definition. Later clean rebases over session-config RPC hardening through `ad391f3` and active-request session-summary work through `9177598` again changed adjacent parent code without changing the extracted owner or definitions. All three definitions remain byte-identical to reviewed rollback source; the focused characterization, convene, router, and SSE groups, all 491 daemon tests, daemon Clippy, formatting, docs, and diff checks passed after the latest rebase. The real convene body changed and its `ocean-longhouse` owner changed heavily before the original manifest, which is another reason not to hide it inside this first move. This extraction must not restore any earlier Longhouse algorithm or convergence path.
 
 Before characterization, authorization, extraction, completion documentation, and publication commits:
 
@@ -194,7 +194,7 @@ Live daemon deployment, LaunchAgent supervision, process kills, restarts, and bi
 
 ## Characterization result
 
-Commit `3aedaf1` (rebased from independently reviewed `c1be830`) adds four extraction-aware daemon characterization tests without moving or changing a production handler:
+Commit `c443df9` (rebased from independently reviewed `c1be830`) adds four extraction-aware daemon characterization tests without moving or changing a production handler:
 
 - `longhouse_topic_projection_http_envelopes_methods_and_order_are_exact` freezes the empty and populated list responses, complete seeded detail JSON, newest-deadline/UUID tie-break order, trimmed known UUID, original-text malformed UUID errors, canonical unknown UUID errors, exact 404/405/`Allow` behavior, and the body/content-type-free immediate demo acknowledgement;
 - `longhouse_topic_projection_demo_sequence_and_fold_before_publish_are_exact` drives the real router and bus through all 17 events under the existing delay budget, freezes every event kind/content/topic relationship, generated member/mark/proposal handle independence, exact two-entry interim/final tallies, final projection, actual public `AgentTurnEvent` scope/wire non-disclosure, and absence of an eighteenth event;
@@ -205,9 +205,25 @@ The existing route-source parity parser now ends the `longhouse_routes()` sectio
 
 Focused tests, all 372 daemon tests serialized, 168 Longhouse tests plus one host-dependent ignore and one doc test, denied-warning daemon all-target Clippy, formatting, docs, and diff checks passed in dedicated target `/tmp/ocean-target-longhouse-topics-char`. Existing convene alias/model/response, global-opt-in SSE, router-contract, preparation, and turn-preparation groups also passed.
 
-Two independent review rounds first found and then verified fixes for missing empty/full HTTP snapshots, incomplete dynamic-ID/tally coverage, lock-scope proof, whole-owner authority scanning, and lossy token/extra-event checks. Final correctness and security/architecture/lifecycle re-reviews both reported PASS with no unresolved medium-or-higher issue. One non-blocking minor notes that exotic visibility-qualified future item forms are not exhaustively parsed; the authorized move adds no such item, and extraction review must still compare the complete three-function owner mechanically against `3aedaf1`.
+Two independent review rounds first found and then verified fixes for missing empty/full HTTP snapshots, incomplete dynamic-ID/tally coverage, lock-scope proof, whole-owner authority scanning, and lossy token/extra-event checks. Final correctness and security/architecture/lifecycle re-reviews both reported PASS with no unresolved medium-or-higher issue. One non-blocking minor notes that exotic visibility-qualified future item forms are not exhaustively parsed; the authorized move adds no such item, and extraction review must still compare the complete three-function owner mechanically against `c443df9`.
 
-Extraction is authorized only from rebased rollback point `3aedaf1` and only for the three manifested definitions.
+Extraction is authorized only from rebased rollback point `c443df9` and only for the three manifested definitions.
+
+## Extraction result
+
+Commit `0199d57` moves the exact characterized 252-line definition/comment boundary into the 273-line private `crates/ocean-daemon/src/longhouse_topics.rs` owner. `main.rs` changes only the private module/import wiring, moves demo-only SDK types behind `#[cfg(test)]` for unchanged parent characterization, and removes the three definitions. All three route mounts, `AppState`, startup/shared-handle assembly, HTTP/SSE composition, real convene/request/federation parsing/model readiness, and title/control handlers remain in `main.rs`.
+
+Brace-aware comparison against rollback `c443df9` found all three moved definitions and complete attached comments byte-identical after removing only the required `pub(super)` visibility:
+
+- `longhouse_demo`: SHA-256 `fab051ce140bf27465c827c4d08b1908f2dce1343cbff08b0c866e17ded5403a`;
+- `longhouse_topics`: SHA-256 `df63548821bf14d4df0d68f053560d217911a0a1ca19bfc0f133850a07029aa1`;
+- `longhouse_topic`: SHA-256 `89c70aca569c80f93e183077b4d19be23088761a17b2f665406046e47e9c7142`.
+
+Focused characterization/convene/router/SSE/preparation groups passed. Before the first publication rebase, all 456 daemon tests passed serialized; 168 Longhouse tests and one doc test passed with one host-dependent ignore. Workspace test compilation, `livekit-tap` and `deepgram-stt` checks, denied-warning daemon all-target Clippy, compatibility, pinned Rust 1.88 MSRV, canonical local CI, formatting, docs, and diff checks passed in the dedicated extraction targets. After rebasing onto `a517f6c`, the focused characterization/convene/router/SSE groups, all 483 daemon tests serialized, denied-warning daemon all-target Clippy, formatting, docs, and diff checks passed. After reconciling the opened PR onto `ad391f3`, mechanical comparison, the focused groups, all 488 daemon tests, Clippy, formatting, docs, and diff checks passed. After the latest rebase onto `9177598`, mechanical comparison, the focused groups, all 491 daemon tests serialized, denied-warning daemon all-target Clippy, formatting, docs, and diff checks passed again.
+
+Fresh independent correctness/mechanical and security/architecture/lifecycle reviews both reported PASS with no unresolved medium-or-higher issue. They confirmed exact three-item ownership and visibility, one unchanged detached 17-event task, lock-end-before-publication/await, poison asymmetry, exact HTTP responses, one composition-owned registry shared with runtime extensions and `AppState`, and no title token, model, permission, persistence, route, SSE, runtime, call, registry-construction, or broader governance authority in the new owner. The prior non-blocking source-inventory parser limitation did not affect review because complete definitions and whole-owner contents were compared directly.
+
+Live daemon deployment/supervision remains owned by the concurrent operator workstream and was not performed. Hosted default-parallel macOS/Ubuntu CI, pinned Rust 1.88, cargo-deny, and merge remain pending.
 
 ## Validation matrix
 
@@ -268,7 +284,7 @@ Before extraction acceptance, separate fresh reviewers must:
 
 A fresh read-only boundary/security review against `5b9e23a` reported PASS with no blocker, major, minor, or unresolved medium-or-higher issue. It independently confirmed the three-function scope, title-coupled convene exclusion, exact 17-event/sleep sequence, fold-before-publication and poison asymmetry, single shared registry, parent-owned HTTP/SSE composition, characterization matrix, rollback, and moving-baseline rule. It also verified the three candidate bodies are byte-identical from `b21006b` through `5b9e23a`.
 
-Review validation passed `cargo xtask docs-check`, `git diff --check`, all five `router_contract` tests, and `council_wide_extension_event_is_global_opt_in_only` in a dedicated target. This initial review authorized characterization only; accepted characterization and extraction authorization are recorded above at rebased rollback `3aedaf1` (originally reviewed as `c1be830`).
+Review validation passed `cargo xtask docs-check`, `git diff --check`, all five `router_contract` tests, and `council_wide_extension_event_is_global_opt_in_only` in a dedicated target. This initial review authorized characterization only; accepted characterization and extraction authorization are recorded above at final rebased rollback `c443df9` (originally reviewed as `c1be830`).
 
 ## Stop rules
 
@@ -284,4 +300,4 @@ Do not expand this manifest to real convene merely to keep the tentative handoff
 
 ## Rollback
 
-Rollback is one revert of the mechanical extraction commit after `3aedaf1`: restore the three definitions and comments to `main.rs`, remove the private module/imports, and leave the characterization tests in place. No schema, wire version, persistence, title, event format, or external API migration is part of this checkpoint.
+Rollback is one revert of the mechanical extraction commit after `c443df9`: restore the three definitions and comments to `main.rs`, remove the private module/imports, and leave the characterization tests in place. No schema, wire version, persistence, title, event format, or external API migration is part of this checkpoint.
