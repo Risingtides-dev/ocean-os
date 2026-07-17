@@ -107,14 +107,9 @@ mod metrics;
 mod model_catalog;
 /// Immutable startup model-role loading and pure turn/advisor role resolution.
 mod model_roles;
+/// Read-only Observatory data routes (snapshot, SSE events, replay).
+mod observatory;
 /// Axum extractor for scoped observer authentication tokens (HMAC-SHA256).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 4 builds auth state; Task 5 will consume the deferred extractor seam"
-    )
-)]
 mod observatory_auth;
 /// Durable persistent-room HTTP lifecycle, paging, and auto-convene adapter.
 mod persistent_rooms;
@@ -629,6 +624,11 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         )
         .route("/v1/events", get(events))
         .route("/v1/prompt", post(prompt))
+        // Read-only Observatory data routes (Gate 1 manifest §7) behind the
+        // Task 4 scoped-observer extractor; no public token-creation route.
+        .route("/v1/observatory/snapshot", get(observatory::snapshot))
+        .route("/v1/observatory/events", get(observatory::events))
+        .route("/v1/observatory/replay", get(observatory::replay))
         .route("/v1/requests", get(requests).post(create_request))
         .route("/v1/requests/{id}/cancel", post(cancel_request))
         .route("/v1/permissions", get(permissions))
@@ -815,10 +815,14 @@ async fn main() -> anyhow::Result<()> {
 
     let roles = load_model_roles(&config_dir);
     // Task 4 makes secret loading and typed auth-state construction real at
-    // startup. Task 5 will consume the extractor from read-only data routes.
+    // startup; Task 5 mounts the read-only data routes that consume the
+    // extractor. One boot id is shared by token verification and responses.
+    let observatory_boot_id = Uuid::new_v4().to_string();
     let observatory_auth =
-        observatory_auth::ObservatoryAuthState::load(&config_dir, Uuid::new_v4().to_string())
+        observatory_auth::ObservatoryAuthState::load(&config_dir, observatory_boot_id.clone())
             .context("initializing Observatory authentication")?;
+    let observatory_services =
+        observatory::ObservatoryServices::load(&config_dir, observatory_boot_id);
 
     let rooms = Arc::new(Mutex::new(room_store));
     let room_wakes = RoomWakeBus::default();
@@ -938,7 +942,9 @@ async fn main() -> anyhow::Result<()> {
     if !extra_origins.is_empty() {
         tracing::info!(origins = ?extra_origins, "OCEAN_ALLOWED_ORIGINS: extra CORS origins");
     }
-    let app = app_router(cors_layer(extra_origins)).layer(Extension(observatory_auth));
+    let app = app_router(cors_layer(extra_origins))
+        .layer(Extension(observatory_auth))
+        .layer(Extension(observatory_services));
 
     // Drain the registry of in-flight turn tasks AFTER axum finishes draining
     // open connections (OCEAN-184). `with_graceful_shutdown` only waits for live
@@ -1237,6 +1243,9 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/voice/tts",
         "GET /v1/events",
         "POST /v1/prompt",
+        "GET /v1/observatory/snapshot",
+        "GET /v1/observatory/events",
+        "GET /v1/observatory/replay",
         "GET /v1/requests",
         "POST /v1/requests",
         "POST /v1/requests/{id}/cancel",

@@ -91,6 +91,34 @@ impl ObservatoryStore {
     pub fn latest_cursor(&self) -> Cursor {
         *self.current_cursor.lock()
     }
+    /// Earliest cursor still present in the durable log (0 when empty).
+    ///
+    /// Cursors at or below a pruned retention boundary are gone; readers use
+    /// this to answer 410/reset instead of silently skipping missing history.
+    pub fn earliest_available_cursor(&self) -> Result<Cursor> {
+        let db = self.db.lock();
+        let earliest = db.query_row(
+            "SELECT COALESCE(MIN(cursor),0) FROM observatory_events",
+            [],
+            |r| r.get::<_, u64>(0),
+        )?;
+        Ok(Cursor::new(earliest))
+    }
+    /// Last pruned retention boundary, when any pruning has occurred.
+    ///
+    /// Cursors at or below this watermark are gone for good. Unlike
+    /// `earliest_available_cursor` (which is 1 on a fresh, unpruned log),
+    /// this distinguishes "history was destroyed" from "history starts at 1".
+    pub fn retention_boundary(&self) -> Result<Option<Cursor>> {
+        let db = self.db.lock();
+        let mut stmt =
+            db.prepare("SELECT cursor FROM watermarks WHERE key = 'retention_boundary'")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Cursor::new(row.get::<_, u64>(0)?))),
+            None => Ok(None),
+        }
+    }
     pub fn events_after(&self, after: Cursor, limit: Option<usize>) -> Result<Vec<EventEnvelope>> {
         self.events_page(after, None, limit.unwrap_or(1000))
             .map(|p| p.events)

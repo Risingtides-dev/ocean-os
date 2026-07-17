@@ -521,6 +521,11 @@ filesystem change.
 # Legacy / debug prompt + request API
 GET    /v1/events                         global SSE stream (debug/legacy)
 POST   /v1/prompt                         synchronous one-shot prompt
+
+# Observatory (read-only, scoped observer token required)
+GET    /v1/observatory/snapshot           consistent projection at a watermark cursor (nodes, edges, attention, instance ids)
+GET    /v1/observatory/events             SSE live tail with durable resume (Last-Event-ID or ?after=), reset/gap frames, 3s keepalive
+GET    /v1/observatory/replay             ascending bounded JSON event pages (?after=<cursor>&through=&limit=&filter=), 410 on retention-crossed ranges
 GET    /v1/requests                       list async requests
 POST   /v1/requests                       enqueue an async request
 POST   /v1/requests/{id}/cancel           cancel an in-flight request

@@ -31,7 +31,7 @@ impl ObservatoryAuthState {
     }
 
     #[cfg(test)]
-    fn for_test(secret: ObserverSecret, daemon_instance_id: impl Into<String>) -> Self {
+    pub(super) fn for_test(secret: ObserverSecret, daemon_instance_id: impl Into<String>) -> Self {
         Self {
             secret,
             daemon_instance_id: daemon_instance_id.into(),
