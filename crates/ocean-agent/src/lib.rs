@@ -1274,6 +1274,15 @@ impl AgentRuntime {
         session::detail(&self.config_dir, id)
     }
 
+    /// Read a persisted session while preserving the distinction between a
+    /// missing id and an unreadable/corrupt session file. Config-style HTTP
+    /// adapters need this three-way result so only a genuinely absent session
+    /// becomes 404; storage and decode failures remain internal errors.
+    pub fn session_detail_optional(&self, id: SessionId) -> anyhow::Result<Option<SessionDetail>> {
+        session::load_resumable(&self.config_dir, id)
+            .map(|session| session.map(session::session_detail))
+    }
+
     /// Append a client-authored message to a persisted session outside the
     /// turn loop (the realtime voice agent's handoff notes, voice phases
     /// 2/3). Returns `Ok(false)` when no such session exists — the caller

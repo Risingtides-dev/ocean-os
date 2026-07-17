@@ -13,6 +13,10 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 ## Local Contracts
 
 - Preserve session compatibility unless a migration is documented.
+- Session-config model pins update model/provider together under the same
+  per-session lock as turn persistence. Optional config reads must distinguish
+  an absent session from unreadable/corrupt storage so daemon adapters map only
+  genuine absence to 404.
 - Permission-mode persistence atomically writes the authoritative three-state
   file and reports write failures. Load old booleans as automatic/skip-all; the
   legacy `yolo_pref` is a best-effort downgrade mirror, while current boolean

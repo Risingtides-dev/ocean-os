@@ -38,6 +38,17 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   advertise only `propose_handoff`, and mutate only through the existing
   session/message/turn routes after an explicit Surface click.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
+- Session-config RPC v1 is `GET/PATCH /v1/agent/sessions/{id}/config`;
+  PATCH accepts strict model-only JSON (malformed or extra-key bodies return
+  exact `400 {"ok":false,"error":"invalid_request"}`), persists the catalog
+  model/provider pair, and emits one session-scoped `SessionConfigChanged`.
+  Permission state is read-only and `permission_mode.env_override` is a boolean
+  presence flag. Only
+  absent sessions map to 404; corrupt/internal reads and writes return sanitized
+  500s. Turn selection is explicit model > resolved role > named-agent model >
+  session pin > global; an explicitly named unresolved role stops at global,
+  and `TurnStarted` announces the model passed to execution before any separately
+  announced provider reroute.
 - `GET /v1/agent/history/search` is a bounded adapter over ocean-agent's persisted display-transcript search (default 20, clamp 1..50); it performs no provider or embedding calls, allows at most two concurrent scans, and returns a capacity response before deserialization when raw session files exceed the 64 MiB request budget.
 - Subagent roles, dispatch, lifecycle, and orchestration are extension-owned. Do not add daemon-native `task`/`spawn_worker`/fleet machinery. The daemon may expose generic permission-gated turn, cancellation, capability-provider, and extension event/tool seams; current `/v1/subagents/spec` and folder-agent subagent metadata remain compatibility surfaces until a separately approved extension migration.
 - Slack Socket Mode, API/credential access, reconnects, replies, files, and real Canvas delivery are `ocean-slack` extension concerns. Private `slack_canvas_fulfillment.rs` is only the temporary typed host ingress/readback, runtime lookup, scoped-event, and lifecycle-enforcement compatibility seam; do not grow it into a second Slack transport authority.
@@ -83,6 +94,8 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon model_catalog_ -- --nocapture`
 - `cargo test -p ocean-daemon model_roles_ -- --nocapture`
 - `cargo test -p ocean-daemon role_resolution_ -- --nocapture`
+- `cargo test -p ocean-daemon session_config_ -- --nocapture`
+- `cargo test -p ocean-daemon unresolved_role_executes_global_and_turn_started_matches_it_despite_session_pin -- --nocapture`
 - `cargo test -p ocean-daemon project -- --nocapture`
 - `cargo test -p ocean-daemon recall_registry -- --nocapture`
 - `cargo test -p ocean-daemon recall_route -- --nocapture`

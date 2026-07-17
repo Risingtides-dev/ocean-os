@@ -149,7 +149,9 @@ use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prep
 use longhouse_turn_preparation::{apply_longhouse_prep, longhouse_prep_for_turn};
 use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
-use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
+#[cfg(test)]
+use model_roles::resolve_effective_model_id;
+use model_roles::{load_model_roles, resolve_advisor_alias, resolve_turn_model};
 use persistent_rooms::{
     resolve_named_agent, room_create, room_create_invite, room_db_path, room_events, room_get,
     room_join, room_leave, room_post_message, room_redeem_invite, room_register_agents,
@@ -5877,10 +5879,9 @@ async fn agent_turn(
         );
     }
 
-    // Emit turn_started, tagged with the model driving this turn so clients
-    // can show it live and reflect a mid-session swap. A per-turn `model_id`
-    // override (OCEAN-36) wins over the global model for this readout, so the
-    // client sees the model that actually drives the turn.
+    // Capture the global and persisted-session candidates now; the final
+    // selection and truthful `TurnStarted` announcement happen after the named
+    // agent has resolved, when every precedence input is available.
     let (_provider, global_model) = state.runtime.current_model();
     // Session-config RPC v1: a resumed session whose persisted model differs
     // from the global selection pins that model as the turn's default. A pin
@@ -5897,27 +5898,6 @@ async fn agent_turn(
             .map(|detail| detail.model)
             .filter(|m| !m.trim().is_empty() && *m != global_model)
     };
-    // The readout mirrors the resolution below: an explicit `model_id` wins;
-    // the session pin fills in only when the request names neither a role nor
-    // an agent (either of which may still redirect the turn's model).
-    let turn_model = model_id
-        .clone()
-        .or_else(|| {
-            (role.is_none() && agent.is_none())
-                .then(|| session_model.clone())
-                .flatten()
-        })
-        .unwrap_or(global_model);
-    emit_agent(
-        &state.events,
-        &state.agent_events,
-        session_id,
-        AgentTurnEvent::TurnStarted {
-            turn_id,
-            session_id,
-            model: Some(turn_model),
-        },
-    );
 
     // Approval policy is daemon-owned and captured at turn start. The default
     // is automatic (safe tools run; permission-requiring tools pause), while
@@ -5975,6 +5955,38 @@ async fn agent_turn(
             (guided_prompt, None, None, None)
         }
     };
+
+    // Resolve the complete model precedence only after folder-as-agent lookup,
+    // then announce the same requested model the runtime will receive. A named
+    // but unknown role is a terminal fallback to the global model: it must not
+    // silently fall through to a lower-priority session pin (the prior bug
+    // logged and announced global while executing the pin).
+    let model_resolution = resolve_turn_model(
+        model_id.as_deref(),
+        role.as_deref(),
+        &state.roles,
+        agent_model.as_deref(),
+        session_model.as_deref(),
+        &global_model,
+    );
+    if model_resolution.role_unresolved {
+        tracing::warn!(
+            role = role.as_deref().unwrap_or(""),
+            "unknown model role (not in ocean.toml [roles]); using global model"
+        );
+    } else if let (None, Some(r)) = (&model_id, &role) {
+        tracing::debug!(role = %r, "resolved model role → alias");
+    }
+    emit_agent(
+        &state.events,
+        &state.agent_events,
+        session_id,
+        AgentTurnEvent::TurnStarted {
+            turn_id,
+            session_id,
+            model: Some(model_resolution.announced_model.clone()),
+        },
+    );
 
     // Longhouse pre-turn consult (OCEAN-283, default-ON). Unless the operator
     // opted out (`OCEAN_LONGHOUSE_PREPARE=0|false|no|off`), rank this turn's
@@ -6329,37 +6341,6 @@ async fn agent_turn(
         }
     });
 
-    // Model-role indirection (oh-my-pi-style): a turn may carry a symbolic
-    // `role` (e.g. "fast", "deep") that the daemon resolves to a concrete model
-    // alias through the `[roles]` table loaded at startup. An explicit
-    // `model_id` ALWAYS wins over `role`; role resolution only fills in when no
-    // explicit model was pinned. An unknown / unconfigured role falls back to
-    // the runtime's global model (a logged warning, never a hard fail), so a
-    // typo can't break a turn. With no `[roles]` configured this is a no-op and
-    // `effective_model_id == model_id`.
-    let (effective_model_id, role_unresolved) =
-        resolve_effective_model_id(model_id.as_deref(), role.as_deref(), &state.roles);
-    if role_unresolved {
-        tracing::warn!(
-            role = role.as_deref().unwrap_or(""),
-            "unknown model role (not in ocean.toml [roles]); using global model"
-        );
-    } else if let (None, Some(r)) = (&model_id, &role) {
-        tracing::debug!(role = %r, "resolved model role → alias");
-    }
-
-    // Session-config RPC v1: the session's pinned model becomes the turn's
-    // default only when nothing per-turn chose one — an explicit `model_id`,
-    // a resolved `role`, or a named agent's declared model all outrank the
-    // session pin. (An unresolvable role falls through to the pin rather than
-    // straight to the global model; the warning above still fires.)
-    let effective_model_id = effective_model_id.or_else(|| {
-        agent_model
-            .is_none()
-            .then(|| session_model.clone())
-            .flatten()
-    });
-
     let control = build_prompt_control(
         &state,
         request_id,
@@ -6382,7 +6363,7 @@ async fn agent_turn(
     // Per-turn model override (OCEAN-36): threads the optional request
     // `model_id` into this turn's config only, leaving the runtime's
     // global model selection untouched.
-    .with_model_id(effective_model_id.clone());
+    .with_model_id(model_resolution.model_id.clone());
     // Folder-as-agent: a named agent's declared tool allowlist narrows this
     // turn's toolset (fail-safe to the full set if it matches nothing), and its
     // declared model drives the turn (fail-soft to the global model if the model
@@ -6392,7 +6373,7 @@ async fn agent_turn(
         Some(tools) => control.with_tool_allowlist(tools),
         None => control,
     };
-    let control = control.with_agent_model(agent_model);
+    let control = control.with_agent_model(model_resolution.agent_model);
     // A2 — bind the named agent's tier-1 subprocess capabilities for this turn
     // (no-op for every non-agent turn and every data-only agent).
     let control = match agent_capabilities {
@@ -7249,10 +7230,10 @@ async fn agent_session(
 
 /// Session-config RPC v1: the shared GET/PATCH projection for
 /// `/v1/agent/sessions/{id}/config`. `model`/`provider` come from the
-/// persisted session; the permission block mirrors
-/// [`ocean_core::PermissionSettingsResponse`] through the same resolvers the
-/// daemon's `/v1/settings/permissions` endpoint uses (global state today,
-/// reported per-session for forward-compat — read-only in v1). `model_source`
+/// persisted session; the permission block uses the same resolvers as the
+/// daemon's `/v1/settings/permissions` endpoint while exposing `env_override`
+/// as a boolean presence flag (global state today, reported per-session for
+/// forward-compat — read-only in v1). `model_source`
 /// says whether a turn without an explicit `model_id`/`role` would run on the
 /// session's pinned model (`"session"`) or the daemon's global selection
 /// (`"global"`).
@@ -7278,7 +7259,7 @@ fn session_config_json(
         "permission_mode": {
             "persisted": ocean_agent::load_permission_mode(&config_dir),
             "effective": effective_permission_mode(),
-            "env_override": permission_env_override(),
+            "env_override": permission_env_override().is_some(),
         },
         "model_source": model_source,
     })
@@ -7290,8 +7271,8 @@ async fn agent_session_config_get(
     State(state): State<AppState>,
     Path(session_id): Path<AgentSessionId>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.runtime.session_detail(core_sid(session_id)) {
-        Ok(detail) => (
+    match state.runtime.session_detail_optional(core_sid(session_id)) {
+        Ok(Some(detail)) => (
             StatusCode::OK,
             Json(session_config_json(
                 &state,
@@ -7301,10 +7282,17 @@ async fn agent_session_config_get(
                 detail.client_type.as_deref(),
             )),
         ),
-        Err(_) => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": "session not found" })),
         ),
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "agent_session_config_get: read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": "internal server error" })),
+            )
+        }
     }
 }
 
@@ -7312,20 +7300,28 @@ async fn agent_session_config_get(
 /// permission_mode / skills / mcp are daemon-global state today and their
 /// per-session versions are v2 scope.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentSessionConfigPatchRequest {
     model: String,
 }
 
 /// `PATCH /v1/agent/sessions/{id}/config` — session-config RPC v1 (write).
-/// Resolves `model` against the model catalog (unknown → 400 listing the
-/// valid ids), pins it (with its catalog provider) on the persisted session,
+/// Rejects malformed or extra-key JSON as sanitized `400 invalid_request`,
+/// resolves `model` against the model catalog (unknown → 400 listing the valid
+/// ids), pins it (with its catalog provider) on the persisted session,
 /// announces the change on the session's event stream, and returns the same
 /// projection as the GET.
 async fn agent_session_config_patch(
     State(state): State<AppState>,
     Path(session_id): Path<AgentSessionId>,
-    Json(req): Json<AgentSessionConfigPatchRequest>,
+    body: Result<Json<AgentSessionConfigPatchRequest>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let Ok(Json(req)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_request" })),
+        );
+    };
     let requested = req.model.trim();
     let Some(known) = ocean_agent::known_models()
         .into_iter()
@@ -7386,7 +7382,7 @@ async fn agent_session_config_patch(
             tracing::warn!(%session_id, %error, "agent_session_config_patch: persist failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "ok": false, "error": error.to_string() })),
+                Json(json!({ "ok": false, "error": "internal server error" })),
             )
         }
     }
@@ -8292,6 +8288,98 @@ mod tests {
             resolve_effective_model_id(None, None, &roles),
             (None, false)
         );
+    }
+
+    #[test]
+    fn session_turn_model_precedence_and_announcements_are_exact() {
+        let roles = HashMap::from([
+            ("fast".to_string(), "role-model".to_string()),
+            ("blank".to_string(), String::new()),
+        ]);
+
+        let explicit = resolve_turn_model(
+            Some("explicit-model"),
+            Some("fast"),
+            &roles,
+            Some("agent-model"),
+            Some("session-model"),
+            "global-model",
+        );
+        assert_eq!(explicit.model_id.as_deref(), Some("explicit-model"));
+        assert_eq!(explicit.announced_model, "explicit-model");
+        assert!(!explicit.role_unresolved);
+
+        let role = resolve_turn_model(
+            None,
+            Some("fast"),
+            &roles,
+            Some("agent-model"),
+            Some("session-model"),
+            "global-model",
+        );
+        assert_eq!(role.model_id.as_deref(), Some("role-model"));
+        assert_eq!(role.announced_model, "role-model");
+        assert!(!role.role_unresolved);
+
+        let agent = resolve_turn_model(
+            None,
+            None,
+            &roles,
+            Some("agent-model"),
+            Some("session-model"),
+            "global-model",
+        );
+        assert_eq!(agent.model_id, None);
+        assert_eq!(agent.agent_model.as_deref(), Some("agent-model"));
+        assert_eq!(agent.announced_model, "agent-model");
+        assert!(!agent.role_unresolved);
+
+        let session = resolve_turn_model(
+            None,
+            None,
+            &roles,
+            None,
+            Some("session-model"),
+            "global-model",
+        );
+        assert_eq!(session.model_id.as_deref(), Some("session-model"));
+        assert_eq!(session.announced_model, "session-model");
+        assert!(!session.role_unresolved);
+
+        let global = resolve_turn_model(None, None, &roles, None, None, "global-model");
+        assert_eq!(global.model_id, None);
+        assert_eq!(global.announced_model, "global-model");
+        assert!(!global.role_unresolved);
+
+        // Blank aliases are preserved by role loading but filtered by the
+        // runtime's model override. Announce and execute the resulting global
+        // fallback rather than emitting an empty model or taking the session.
+        let blank = resolve_turn_model(
+            None,
+            Some("blank"),
+            &roles,
+            None,
+            Some("session-model"),
+            "global-model",
+        );
+        assert_eq!(blank.model_id, None);
+        assert_eq!(blank.announced_model, "global-model");
+        assert!(!blank.role_unresolved);
+
+        // A named-but-unresolved role must stop at global. It cannot fall
+        // through to the folder agent or the persisted session pin.
+        let unresolved = resolve_turn_model(
+            None,
+            Some("missing"),
+            &roles,
+            Some("agent-model"),
+            Some("session-model"),
+            "global-model",
+        );
+        assert_eq!(unresolved.model_id, None);
+        assert_eq!(unresolved.agent_model, None);
+        assert_eq!(unresolved.announced_model, "global-model");
+        assert!(unresolved.role_unresolved);
     }
 
     /// Serializes every test that mutates the process-global env this module
@@ -13599,6 +13687,335 @@ mod tests {
         }
     }
 
+    async fn session_config_http_request(
+        app: Router,
+        method: Method,
+        uri: String,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, String) {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut builder = Request::builder().method(method).uri(uri);
+        let raw = match body {
+            Some(body) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                body.to_string()
+            }
+            None => String::new(),
+        };
+        let response = app
+            .oneshot(builder.body(Body::from(raw)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn session_config_response_json(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).unwrap_or_else(|error| {
+            panic!("session-config response is not JSON ({error}): {raw:?}")
+        })
+    }
+
+    #[tokio::test]
+    async fn session_config_http_get_patch_persists_provider_and_emits_scoped_change() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_LONGHOUSE_PREPARE",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(
+                tmp.path().to_str().unwrap(),
+                Some("surface-web".to_string()),
+            )
+            .unwrap();
+        let sdk_session_id = sdk_sid(session_id);
+        let uri = format!("/v1/agent/sessions/{sdk_session_id}/config");
+        let app = app_router(cors_layer(Vec::new())).with_state(state.clone());
+
+        let (status, raw) =
+            session_config_http_request(app.clone(), Method::GET, uri.clone(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let initial = session_config_response_json(&raw);
+        assert_eq!(initial["session_id"], json!(sdk_session_id));
+        assert_eq!(initial["model"], "fake-ok");
+        assert_eq!(initial["provider"], "fake");
+        assert_eq!(initial["client_type"], "surface-web");
+        assert_eq!(initial["model_source"], "global");
+        assert_eq!(initial["permission_mode"]["env_override"], true);
+        assert!(initial["permission_mode"]["env_override"].is_boolean());
+
+        // The wire field reports override presence, not null or a mode string.
+        std::env::remove_var("OCEAN_YOLO");
+        let (status, raw) =
+            session_config_http_request(app.clone(), Method::GET, uri.clone(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let without_override = session_config_response_json(&raw);
+        assert_eq!(without_override["permission_mode"]["env_override"], false);
+        assert!(without_override["permission_mode"]["env_override"].is_boolean());
+
+        let known = ocean_agent::known_models()
+            .into_iter()
+            .next()
+            .expect("public model catalog must not be empty");
+        let (status, raw) = session_config_http_request(
+            app.clone(),
+            Method::PATCH,
+            uri.clone(),
+            Some(json!({ "model": known.id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let patched = session_config_response_json(&raw);
+        assert_eq!(patched["model"], known.id);
+        assert_eq!(patched["provider"], known.provider);
+        assert_eq!(patched["model_source"], "session");
+
+        let persisted = state.runtime.session_detail(session_id).unwrap();
+        assert_eq!(persisted.model, known.id);
+        assert_eq!(persisted.provider, known.provider);
+
+        let (status, raw) = session_config_http_request(app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let reread = session_config_response_json(&raw);
+        assert_eq!(reread["model"], known.id);
+        assert_eq!(reread["provider"], known.provider);
+
+        let history = state.agent_events.history.lock().unwrap();
+        let changes: Vec<_> = history
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                AgentTurnEvent::SessionConfigChanged {
+                    session_id,
+                    model,
+                    provider,
+                } => Some((*session_id, model.as_str(), provider.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            vec![(sdk_session_id, known.id.as_str(), known.provider.as_str())],
+            "PATCH must emit exactly one change scoped to the patched session"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_config_http_rejects_extra_keys_and_unknown_models_without_mutation() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_LONGHOUSE_PREPARE",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        let uri = format!("/v1/agent/sessions/{}/config", sdk_sid(session_id));
+        let app = app_router(cors_layer(Vec::new())).with_state(state.clone());
+        let known = ocean_agent::known_models()
+            .into_iter()
+            .next()
+            .expect("public model catalog must not be empty");
+
+        let (status, raw) = session_config_http_request(
+            app.clone(),
+            Method::PATCH,
+            uri.clone(),
+            Some(json!({
+                "model": known.id,
+                "permission_mode": "skip_all"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            session_config_response_json(&raw),
+            json!({ "ok": false, "error": "invalid_request" })
+        );
+
+        let (status, raw) = session_config_http_request(
+            app,
+            Method::PATCH,
+            uri,
+            Some(json!({ "model": "not-a-real-model" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let rejected = session_config_response_json(&raw);
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected["valid_models"].is_array());
+
+        let unchanged = state.runtime.session_detail(session_id).unwrap();
+        assert_eq!(unchanged.model, "fake-ok");
+        assert_eq!(unchanged.provider, "fake");
+        let history = state.agent_events.history.lock().unwrap();
+        assert!(history.iter().all(|envelope| !matches!(
+            &envelope.event,
+            AgentTurnEvent::SessionConfigChanged { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn session_config_http_maps_only_missing_to_404_and_sanitizes_internal_errors() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_LONGHOUSE_PREPARE",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let app = app_router(cors_layer(Vec::new())).with_state(state);
+        let known = ocean_agent::known_models()
+            .into_iter()
+            .next()
+            .expect("public model catalog must not be empty");
+
+        let missing = AgentSessionId::new_v4();
+        let missing_uri = format!("/v1/agent/sessions/{missing}/config");
+        let (status, raw) =
+            session_config_http_request(app.clone(), Method::GET, missing_uri.clone(), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            session_config_response_json(&raw),
+            json!({ "ok": false, "error": "session not found" })
+        );
+        let (status, raw) = session_config_http_request(
+            app.clone(),
+            Method::PATCH,
+            missing_uri,
+            Some(json!({ "model": known.id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            session_config_response_json(&raw),
+            json!({ "ok": false, "error": "session not found" })
+        );
+
+        let corrupt = AgentSessionId::new_v4();
+        let bucket = tmp.path().join("sessions").join("legacy");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(
+            bucket.join(format!("{}.json", corrupt.inner())),
+            b"{ not valid json",
+        )
+        .unwrap();
+        let corrupt_uri = format!("/v1/agent/sessions/{corrupt}/config");
+
+        for (method, body) in [
+            (Method::GET, None),
+            (Method::PATCH, Some(json!({ "model": known.id }))),
+        ] {
+            let (status, raw) =
+                session_config_http_request(app.clone(), method, corrupt_uri.clone(), body).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                session_config_response_json(&raw),
+                json!({ "ok": false, "error": "internal server error" })
+            );
+            assert!(!raw.contains("parse"));
+            assert!(!raw.contains("not valid json"));
+            assert!(!raw.contains(tmp.path().to_string_lossy().as_ref()));
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_role_executes_global_and_turn_started_matches_it_despite_session_pin() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_LONGHOUSE_PREPARE",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        std::env::set_var("OCEAN_LONGHOUSE_PREPARE", "0");
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), Some("test".into()))
+            .unwrap();
+        let pinned = ocean_agent::known_models()
+            .into_iter()
+            .next()
+            .expect("public model catalog must not be empty");
+        state
+            .runtime
+            .set_session_model(session_id, pinned.id, pinned.provider)
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        let mut turn = sample_agent_turn();
+        turn.session_id = Some(sdk_sid(session_id));
+        turn.cwd = tmp.path().to_string_lossy().into_owned();
+        turn.role = Some("missing-role".into());
+        let (status, ack) = agent_turn(State(state.clone()), Json(turn)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(ack.ok);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let complete =
+                    state
+                        .runtime
+                        .session_detail(session_id)
+                        .ok()
+                        .is_some_and(|detail| {
+                            detail
+                                .messages
+                                .iter()
+                                .any(|message| message["role"] == "assistant")
+                        });
+                if complete {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("fake turn must complete");
+
+        let detail = state.runtime.session_detail(session_id).unwrap();
+        let assistant = detail
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message persisted");
+        assert_eq!(assistant["model"], "fake-ok");
+        assert_eq!(assistant["provider"], "fake");
+
+        let history = state.agent_events.history.lock().unwrap();
+        let announced = history.iter().find_map(|envelope| match &envelope.event {
+            AgentTurnEvent::TurnStarted {
+                turn_id,
+                session_id: event_session,
+                model,
+            } if *turn_id == ack.turn_id && *event_session == sdk_sid(session_id) => {
+                model.as_deref()
+            }
+            _ => None,
+        });
+        assert_eq!(announced, Some("fake-ok"));
+    }
+
     /// Build a file-backed `AppState` so tests can induce real rusqlite errors.
     pub(super) fn fake_convene_file_state(
         tmp: &tempfile::TempDir,
@@ -18635,9 +19052,9 @@ mod tests {
         let browser = agent.find("apply_browser_context(").unwrap();
         let registration = agent.find("register_running_request(").unwrap();
         assert!(
-            agent_cwd < turn_started
-                && turn_started < named_agent_end
-                && named_agent_end < agent_prep
+            agent_cwd < named_agent_end
+                && named_agent_end < turn_started
+                && turn_started < agent_prep
                 && agent_prep < agent_apply
                 && agent_apply < browser
                 && browser < registration

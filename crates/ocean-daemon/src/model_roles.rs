@@ -76,3 +76,90 @@ pub(super) fn resolve_effective_model_id(
         (None, None) => (None, false),
     }
 }
+
+/// Complete daemon-side model selection for an ordinary agent turn.
+///
+/// Precedence is explicit model > resolved role > named-agent model > session
+/// pin > global. A role that was actually named but did not resolve is a
+/// deliberate global fallback: lower-priority agent/session values must not
+/// silently replace it. `model_id` is the hard per-turn override passed to the
+/// runtime; `agent_model` retains the runtime's fail-soft folder-agent path.
+/// `announced_model` is the exact value for `TurnStarted` before any later
+/// provider-readiness reroute (which has its own `ModelRerouted` event).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TurnModelResolution {
+    pub(super) model_id: Option<String>,
+    pub(super) agent_model: Option<String>,
+    pub(super) announced_model: String,
+    pub(super) role_unresolved: bool,
+}
+
+pub(super) fn resolve_turn_model(
+    model_id: Option<&str>,
+    role: Option<&str>,
+    roles: &HashMap<String, String>,
+    agent_model: Option<&str>,
+    session_model: Option<&str>,
+    global_model: &str,
+) -> TurnModelResolution {
+    let (request_model, role_unresolved) = resolve_effective_model_id(model_id, role, roles);
+
+    if role_unresolved {
+        return TurnModelResolution {
+            model_id: None,
+            agent_model: None,
+            announced_model: global_model.to_string(),
+            role_unresolved: true,
+        };
+    }
+
+    if let Some(model) = request_model {
+        if model.trim().is_empty() {
+            return TurnModelResolution {
+                model_id: None,
+                agent_model: None,
+                announced_model: global_model.to_string(),
+                role_unresolved: false,
+            };
+        }
+        return TurnModelResolution {
+            announced_model: model.clone(),
+            model_id: Some(model),
+            agent_model: None,
+            role_unresolved: false,
+        };
+    }
+
+    if let Some(model) = agent_model {
+        if model.trim().is_empty() {
+            return TurnModelResolution {
+                model_id: None,
+                agent_model: None,
+                announced_model: global_model.to_string(),
+                role_unresolved: false,
+            };
+        }
+        return TurnModelResolution {
+            model_id: None,
+            agent_model: Some(model.to_string()),
+            announced_model: model.to_string(),
+            role_unresolved: false,
+        };
+    }
+
+    if let Some(model) = session_model {
+        return TurnModelResolution {
+            announced_model: model.to_string(),
+            model_id: Some(model.to_string()),
+            agent_model: None,
+            role_unresolved: false,
+        };
+    }
+
+    TurnModelResolution {
+        model_id: None,
+        agent_model: None,
+        announced_model: global_model.to_string(),
+        role_unresolved: false,
+    }
+}
