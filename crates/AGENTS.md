@@ -55,7 +55,7 @@ The workspace currently contains 27 Rust packages.
 | `ocean-protocol` | Anthropic/OpenAI/Gemini/Codex wire encoding, streaming, retry | Model catalog, credentials, readiness | `ocean-protocol/src/lib.rs`, `providers/` | `ocean-protocol/AGENTS.md` | `cargo test -p ocean-protocol` |
 | `ocean-providers` | Model catalog/routing, credentials, aliases, readiness | Provider request/stream encoding | `ocean-providers/src/lib.rs` | — | `cargo test -p ocean-providers` |
 | `ocean-runtime` | Agent loop, permission gates, cancellation, capability/tool execution, runtime events | Session persistence; model credential routing | `ocean-runtime/src/lib.rs`, `agent_loop.rs` | `ocean-runtime/AGENTS.md` | `cargo test -p ocean-runtime` |
-| `ocean-store` | SQLite durable rooms, rosters, transcripts behind `RoomStore`; inherent access-projection and outbox APIs | Agent sessions, memory, Longhouse titles | `ocean-store/src/lib.rs` | — | `cargo test -p ocean-store` |
+| `ocean-store` | SQLite durable rooms, rosters, transcripts behind `RoomStore`; inherent access-projection and outbox APIs; restart-safe federation core (credentials, bindings, producer counters, confirmed ingest, trigger-claim journal) | Agent sessions, memory, Longhouse titles; federation network client | `ocean-store/src/lib.rs` | `ocean-store/AGENTS.md` | `cargo test -p ocean-store` |
 | `ocean-tui` | Ratatui steering cockpit and client interaction | Agent/session/runtime authority | `ocean-tui/src/main.rs`, `shell/` | `ocean-tui/AGENTS.md` | `cargo test -p ocean-tui && cargo build -p ocean-tui --release` |
 | `xtask` | Repository docs/index checks, canonical repository/compatibility/MSRV gate manifests, WebRTC-cache recovery | Production runtime behavior | `../xtask/src/main.rs` | `../xtask/README.md` | `cargo test -p xtask && cargo xtask docs-check && cargo xtask ci --compatibility` |
 
@@ -104,4 +104,5 @@ The workspace currently contains 27 Rust packages.
 - `ocean-oauth/` — browser OAuth + PKCE provider login → `ocean-oauth/AGENTS.md`
 - `ocean-protocol/` — multi-provider LLM wire protocol → `ocean-protocol/AGENTS.md`
 - `ocean-runtime/` — agent loop and permission-gated tool execution → `ocean-runtime/AGENTS.md`
+- `ocean-store/` — SQLite durable rooms and federation store → `ocean-store/AGENTS.md`
 - `ocean-tui/` — terminal steering cockpit → `ocean-tui/AGENTS.md`

@@ -3939,3 +3939,30 @@ area:      [backend]
 
 Coordination gate cleared by smaths: rebased feat/s2-p1-room-producer-contracts (P1 producer contracts, 8 commits) conflict-free onto the moved main, re-ran gates green (cargo fmt --check, 39/39 persistent_rooms with --test-threads=1, denied-warning workspace clippy), cherry-picked pi's S2-P1 reconciliation checkpoint entry across the rebase so the append-only ledger lost nothing, and pushed main 5b9e23a8 -> ee6b698f. The pre-rebase remote checkpoint branch was left in place rather than force-pushed.
 _________________________________________________________________________________
+
+time:      [02:58] [17-07-26]
+agent:     [pi] [kimi-k2.5] [thoth]
+worktree:  [feat/s2-p2a-store-core] ~/.worktrees/ocean-os-p2a-store-20260717
+type:      [feature-request]
+area:      [backend]
+
+P2-A restart-safe federation core in ocean-store per gate2-s2-bridge-freeze-v1, base 9c8cdbec. Added six private tables (federation_instance, room_federation, room_member_bindings, producer_counters, federated_events, processed_room_triggers) and atomic APIs: instance id create-once, credential install/read/revoke/list with redacting Debug and no Serialize, update_room_access_safe (outbox-preserving, cursor monotonic), agent bindings (name unique per room, registration_key private), allocate_outbox_pending (transactional counter + outbox insert, source_id room:<r>:member:<m>:producer:<instance>, u64::MAX fail-closed), pending/fail outbox transitions, and ingest_confirmed_event (one IMMEDIATE tx: dedup, strict monotonic global_sequence via local_seq ordering, transcript append, dedup index, full-producer-tuple outbox removal, cursor advance, at-most-once locally-bound trigger claims, agent-authored rows claim nothing). open() enforces 0600 on rooms.db + sidecars every open (unix). Three new RoomStoreError variants forced one mechanical arm in daemon room_store_error_response (scope extension ruled by fable, mapping approved by codex: RoomNotFederated→409, FederationCorruption|Io→500). Two initial test failures were fixture bugs, not implementation: credential test used two separate in-memory stores (independent DBs), fail_outbox test lacked an access row so the Local projection legitimately hides outbox. Gates: ocean-store 78/78, daemon persistent_rooms 39/39 (--test-threads=1), workspace check, clippy -D warnings, fmt, docs-check all green. New crates/ocean-store/AGENTS.md; crates/AGENTS.md row + child index updated. Uncommitted, holding for codex pre-commit gate; no push.
+_________________________________________________________________________________
+
+time:      [03:16] [17-07-26]
+agent:     [pi] [kimi-k2.5] [thoth]
+worktree:  [feat/s2-p2a-store-core] ~/.worktrees/ocean-os-p2a-store-20260717
+type:      [review]
+area:      [backend]
+
+P2-A gate corrections (codex review, 5 items) plus freeze v1.2 amendment applied atop the uncommitted tree. (1) Table 7 pending_redemptions per v1.2: invite_code UNIQUE, atomic get-or-insert by code returning the stored triple (a code never forks), exact-input promote (redemption_id, room, bearer, member) all-or-nothing with idempotent response-loss replay and fail-closed corruption matrix, list for startup recovery, remove without credential contact; PendingRedemption redacts bearer AND invite code. Binding semantics per v1.1 §1b: identical-tuple re-registration is a no-op, divergent (room, member) fails closed; key derivation deferred to P2-C per v1.2 §3, column stored opaquely. (2) Ingest dedup now compares the parsed persisted transcript FederatedMessageMeta — all fields; divergent origin metadata or a missing/unreadable indexed transcript row is corruption. (3) Ordering baseline is max(last indexed gs, persisted room_access cursor); bootstrap cursor ahead of an empty index rejects stale sequences; cursor regression impossible. (4) 0600 enforcement moved BEFORE any DB work (and re-run after create); metadata errors fail closed except NotFound; loosened sidecars repaired. (5) New pins: federated index u64::MAX reopen, corrupt index/cursor text fail closed, sidecar repair, full-meta dedup matrix, cursor-baseline upgrade case. Gates: ocean-store 86/86, daemon persistent_rooms 39/39, clippy -D warnings, fmt, workspace check, docs-check green. Still uncommitted, holding for codex gate; no push.
+_________________________________________________________________________________
+
+time:      [03:23] [17-07-26]
+agent:     [pi] [kimi-k2.5] [thoth]
+worktree:  [feat/s2-p2a-store-core] ~/.worktrees/ocean-os-p2a-store-20260717
+type:      [review]
+area:      [backend]
+
+P2-A re-gate round 2 (codex, 3 surgical misses). (1) Ingest dedup now loads the full federated_events index tuple and requires three-way equality: index == parsed transcript meta == incoming; a corrupt index column with intact transcript metadata is FederationCorruption, never Duplicate (pinned per-column: gs, source_id, source_sequence, client_event_id). (2) Promote all-or-nothing proven under injected mid-transaction failure: a TEMP BEFORE-DELETE trigger RAISE(ABORT) between the credential insert and the pending delete rolls back the credential and retains the pending row; dropping the trigger lets the identical promote commit (pinned). (3) Stale docs refreshed: lib.rs header no longer claims the daemon is unwired/untouched — documents the live AppState Mutex adoption, the exhaustive error-response mapping, and the federation core; RoomStoreError intro now names RoomNotFederated/FederationCorruption/Io with their HTTP mappings. Gates rerun green: ocean-store 88/88, daemon persistent_rooms 39/39, clippy -D warnings, fmt, workspace check, docs-check. Uncommitted, holding.
+_________________________________________________________________________________

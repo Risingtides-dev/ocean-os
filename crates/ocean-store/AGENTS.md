@@ -1,0 +1,110 @@
+# ocean-store — Durable Rooms + Federation Store
+
+## Purpose
+
+SQLite-backed durability for persistent rooms: rosters, transcripts, room
+access projections, the outbox, and the restart-safe federation core
+(S2 P2-A). One database file (`rooms.db`), one owning crate.
+
+## Ownership
+
+- **Scope:** `crates/ocean-store/`
+- **Parent contract:** `../AGENTS.md` — read it first
+- **Owns:** room/roster/transcript persistence, `room_access` + `outbox`
+  durability, federation credential custody, producer counters, confirmed
+  ingest, trigger-claim journal
+- **Does not own:** HTTP projection (daemon), federation network client,
+  agent sessions/memory, Longhouse titles
+
+## Local Contracts
+
+### Schema (private; consumers use APIs, never SQL)
+
+- `rooms`, `room_participants`, `room_messages` — pre-federation durable rooms.
+- `room_access` — per-room access projection (`state`, `confirmed_sequence`
+  as canonical decimal u64 TEXT, `member_projection` JSON).
+- `outbox` — locally-authored unconfirmed events with full producer tuple
+  (`client_event_id`, `source_id`, `source_sequence`) and stable `position`.
+- P2-A federation tables: `federation_instance` (singleton instance id),
+  `room_federation` (bearer credential — PRIVATE), `room_member_bindings`
+  (member→agent binding, `registration_key` PRIVATE, agent name unique per
+  room), `producer_counters` (next source_sequence per room+member),
+  `federated_events` (dedup + monotonic order index),
+  `processed_room_triggers` (at-most-once trigger-claim journal), and
+  `pending_redemptions` (v1.2 amendment table 7: pre-room `{redemption_id,
+  bearer, invite_code}` custody, `invite_code` UNIQUE — bearer AND invite
+  code are PRIVATE).
+
+### Load-bearing invariants
+
+- **u64 as canonical decimal TEXT.** Counters, cursors, and sequences are
+  stored via `write_u64_text` and re-read only through
+  `parse_canonical_u64_text`; noncanonical text fails closed. Never compare
+  or `MAX()` these columns in SQL — lexicographic order is not numeric order.
+- **Atomicity.** Every multi-row federation mutation runs in one IMMEDIATE
+  transaction: `allocate_outbox_pending` (counter advance + outbox insert)
+  and `ingest_confirmed_event` (dedup check, monotonic check, transcript
+  append, dedup-index insert, full-tuple outbox removal, cursor advance,
+  trigger claims) commit all-or-nothing.
+- **Outbox removal requires the full producer tuple.** A confirmed event
+  deletes an outbox row only when `client_event_id`, `source_id`, and
+  `source_sequence` all match — never `client_event_id` alone.
+- **Confirmed ingest is fail-closed.** Dedup cross-checks BOTH persisted
+  copies: the `federated_events` index tuple must equal the parsed transcript
+  `FederatedMessageMeta`, and that meta must equal the incoming event — every
+  field, never raw JSON bytes or a column subset. Full three-way equality ⇒
+  `IngestOutcome::Duplicate` no-op; any divergence (including index vs
+  transcript), a missing/unreadable indexed transcript row, a
+  `global_sequence` at or below the ordering baseline, or a missing access
+  row ⇒ error and full rollback. The ordering baseline is
+  max(last indexed sequence, persisted `room_access` cursor), so a
+  bootstrap/recovery cursor set ahead of the local index rejects stale
+  sequences and the cursor can never regress. Sequence gaps are accepted.
+- **Trigger claims are at-most-once per (room, ledger event, target).**
+  Claims commit inside the ingest transaction, only for locally-bound
+  targets, and never for agent-authored rows.
+- **Producer counters never reuse a sequence.** Allocation is transactional
+  across connections; exhaustion at `u64::MAX` fails closed.
+- **Credential custody.** `bearer_token`, `registration_key`, and pending
+  redemption secrets (bearer + invite code) are never serialized into
+  projections, transcripts, logs, or error messages. `RoomCredential` and
+  `PendingRedemption` have redacting `Debug` and no `Serialize`. `open()`
+  enforces owner-only (0600) mode on the DB and its sidecar files BEFORE any
+  DB work and again after create/migration (Unix); filesystem errors fail
+  closed except `NotFound`.
+- **Pending redemptions never fork.** `get_or_insert_pending_redemption` is
+  an atomic get-or-insert keyed by `invite_code`: an existing code returns
+  the STORED triple and discards caller-supplied values. Promote takes exact
+  inputs `(redemption_id, room, bearer, local_human_member_id)` and is
+  all-or-nothing: install credential + delete pending in one transaction;
+  exact replay after response loss is an idempotent no-op; every other state
+  is corruption with no partial write.
+- **Bindings are write-once per member.** A retried registration with the
+  identical `(room, member, agent, key)` tuple is an idempotent no-op; the
+  same member with a different agent or key fails closed — rebinding
+  requires an explicit unbind. Registration-key derivation is frozen for
+  P2-C (freeze v1.2 §3); this crate stores the column opaquely.
+- **`update_room_access_safe` is the runtime refresh path**: it never touches
+  the outbox and its cursor only advances. `replace_room_access` is
+  destructive test seeding only.
+
+## Work Guidance
+
+- Add new durable state to this crate; do not let the daemon or a network
+  client own SQL against `rooms.db`.
+- New u64-valued columns must use the canonical-decimal TEXT helpers and get
+  reopen + fail-closed tests.
+- Keep new error variants coordinated with
+  `ocean-daemon/src/persistent_rooms.rs::room_store_error_response`
+  (exhaustive match).
+
+## Verification
+
+- `cargo test -p ocean-store`
+- `cargo clippy -p ocean-store --all-targets -- -D warnings`
+- Workspace impact: `cargo check --workspace` (daemon matches
+  `RoomStoreError` exhaustively).
+
+## Child devlog Index
+
+- (none)

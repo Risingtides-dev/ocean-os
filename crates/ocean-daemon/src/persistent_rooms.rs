@@ -216,10 +216,14 @@ pub(super) fn room_store_error_response(
         BadKey(_) => StatusCode::BAD_REQUEST,
         UnknownRoom(_) | UnknownParticipant { .. } => StatusCode::NOT_FOUND,
         AlreadyExists(_) => StatusCode::CONFLICT,
+        // The room exists but is not federated: a client-side misuse of a
+        // federation-only operation, not a server fault.
+        RoomNotFederated(_) => StatusCode::CONFLICT,
         // A durable backend can fail on I/O or (de)serialization, which the
         // in-memory registry never could. Surface those as 500s, not as a
-        // misleading 4xx.
-        Db(_) | Encode(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // misleading 4xx. Federation corruption is a fail-closed integrity
+        // stop and never carries secrets in its message.
+        Db(_) | Encode(_) | FederationCorruption(_) | Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
         status,
