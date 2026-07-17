@@ -4045,3 +4045,12 @@ area:      [backend]
 
 P2-B final store-authority corrective: lease-loss persistence now returns Result and reads the full RoomAccessProjection fail-closed; any decode/read error performs no update, no wake, and no empty-roster substitution. Startup converts room_access failure to BridgeError, skips that room, and never starts its task. Valid-client startup starts only after the atomic Connecting + Unavailable transition succeeds. Reconnect continuation stops if Recovering/lease-loss commit fails; heartbeat ends the epoch on durable-state read error; revoke Pending-enumeration fallback cannot overwrite a corrupt projection. Helper injection pin proves a projection Err invokes neither startup eligibility nor the commit/wake closure and preserves a valid one-member roster when successful. Focused re-gate: federation 22/22, denied-warning daemon Clippy, fmt, diff-check green. Exact ten-file scope remains uncommitted/no push, TASK-18 in_review.
 _________________________________________________________________________________
+
+time:      [05:50] [17-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/s2-p2b-federation-client ~/.worktrees/ocean-os-p2b-fed-20260717 (ref-push; canonical checkout occupied by Observatory lane)
+type:      [merge]
+area:      [backend]
+
+Shipped S2 P2-B to main: pushed 435c7260 (c8bdd024..435c7260 ff) via ref from thoth's worktree — canonical checkout deliberately untouched, it carries the Observatory lane's unpushed commits + dirty tree. 435c7260 is thoth's approved c84e4f99 rebased onto the Observatory docs delta (9 blobs byte-identical, events.md append byte-identical, ledger separator restored), parity-approved by codex. Slice: outbound Bedrock room supervisor per gate2-s2-p2b-freeze-v2.2 — origin-only client, epoch-locked per-room receiver/sender, lease-derived presence, fail-closed store authority, admission-linearized revoke, raw SSE byte cap. Gates: federation 22/22, persistent_rooms 39/39, store 88/88, clippy -D, fmt, diff-check. Next: P2-C (intents/message split/trigger dispatch) closes the two-machine bridge; config-rpc + Observatory lanes rebase onto this main.
+_________________________________________________________________________________
