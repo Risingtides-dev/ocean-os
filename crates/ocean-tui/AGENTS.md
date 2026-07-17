@@ -198,9 +198,12 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `idle`/`working`/`blocked` from already-accepted Elm actions, ignores
   permission traffic for other sessions, and emits no prompt/tool/token
   content. State reports never block the event loop; shutdown release waits at
-  most 300 ms before relinquishing its custom `ocean:tui` authority. The
-  distributable launcher manifest lives under
-  `../../integrations/herdr/`.
+  most 300 ms before relinquishing its official `herdr:ocean` authority. Bound
+  session ids are reported via `pane report-agent-session` so a Herdr server
+  restart can resume with `ocean --session <id>` once Herdr accepts `ocean` as
+  an official agent source. The distributable launcher is owned by the standalone
+  [`Risingtides-dev/ocean-herdr`](https://github.com/Risingtides-dev/ocean-herdr)
+  repository.
 
 ## Verification
 

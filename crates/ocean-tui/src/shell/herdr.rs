@@ -2,8 +2,10 @@
 //!
 //! Herdr injects `HERDR_ENV`, `HERDR_PANE_ID`, and `HERDR_BIN_PATH` into
 //! managed panes. When present, Ocean projects its existing authoritative TUI
-//! lifecycle onto Herdr's socket-backed CLI. Reporting is deliberately
-//! fail-soft and runs off-thread so Herdr can never block the Elm loop.
+//! lifecycle and bound session identity onto Herdr's socket-backed CLI so a
+//! Herdr server restart can resume with `ocean --session <id>`. Reporting is
+//! deliberately fail-soft and runs off-thread so Herdr can never block the Elm
+//! loop.
 
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
@@ -15,7 +17,9 @@ use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 
 use super::action::Action;
 
-const SOURCE: &str = "ocean:tui";
+/// Official Herdr source label. Must match a planner entry in Herdr's
+/// `agent_resume` table (`herdr:ocean` / `ocean`) for native restore.
+const SOURCE: &str = "herdr:ocean";
 const AGENT: &str = "ocean";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +54,11 @@ pub struct Reporter {
     state: Option<State>,
     turn_active: bool,
     pending_permissions: usize,
+    /// Last session id successfully projected to Herdr.
+    reported_session: Option<String>,
+    /// True after any session has been bound in this process. Distinguishes the
+    /// first mint (`startup`) from later `/new` mints (`new`).
+    ever_bound: bool,
     seq: u64,
 }
 
@@ -75,11 +84,9 @@ impl Reporter {
                     pane_id,
                 })
             });
-            let mut reporter = Self {
-                config,
-                seq: initial_seq(),
-                ..Self::default()
-            };
+            let mut reporter = Self::default();
+            reporter.config = config;
+            reporter.seq = initial_seq();
             reporter.set_state(State::Idle);
             reporter
         }
@@ -88,6 +95,14 @@ impl Reporter {
     /// Observe an action only after [`super::app::App::dispatch`] has rejected
     /// stale-session agent events and applied its authoritative state changes.
     pub fn observe(&mut self, action: &Action, bound_session: Option<AgentSessionId>) {
+        let session_start_source = match action {
+            Action::ResumeSession { .. } => Some("resume"),
+            Action::SessionBound(_) => Some(if self.ever_bound { "new" } else { "startup" }),
+            Action::NewSession | Action::NewSessionInProject { .. } => None,
+            _ => None,
+        };
+        self.sync_session(bound_session, session_start_source);
+
         match action {
             Action::SubmitPrompt(_) => {
                 self.turn_active = true;
@@ -138,6 +153,7 @@ impl Reporter {
         let Some(config) = self.config.take() else {
             return;
         };
+        self.reported_session = None;
         self.seq = self.seq.saturating_add(1);
         run_bounded(
             config.herdr_bin,
@@ -156,6 +172,51 @@ impl Reporter {
         );
     }
 
+    fn sync_session(
+        &mut self,
+        bound_session: Option<AgentSessionId>,
+        session_start_source: Option<&'static str>,
+    ) {
+        let next = bound_session.map(|id| id.0.to_string());
+        if self.reported_session == next {
+            return;
+        }
+        self.reported_session = next.clone();
+        if next.is_some() {
+            self.ever_bound = true;
+        }
+
+        let Some(config) = self.config.clone() else {
+            return;
+        };
+        let Some(session_id) = next else {
+            // Unbound `/new` leaves no durable Ocean session. Herdr has no
+            // clear-without-replacement API, so the previous official reference
+            // remains until the next bind or pane release.
+            return;
+        };
+
+        self.seq = self.seq.saturating_add(1);
+        let mut args = vec![
+            "pane".into(),
+            "report-agent-session".into(),
+            config.pane_id,
+            "--source".into(),
+            SOURCE.into(),
+            "--agent".into(),
+            AGENT.into(),
+            "--agent-session-id".into(),
+            session_id,
+            "--seq".into(),
+            self.seq.to_string(),
+        ];
+        if let Some(source) = session_start_source {
+            args.push("--session-start-source".into());
+            args.push(source.into());
+        }
+        launch(config.herdr_bin, args);
+    }
+
     fn finish_turn(&mut self) {
         self.turn_active = false;
         self.pending_permissions = 0;
@@ -171,22 +232,24 @@ impl Reporter {
             return;
         };
         self.seq = self.seq.saturating_add(1);
-        launch(
-            config.herdr_bin,
-            vec![
-                "pane".into(),
-                "report-agent".into(),
-                config.pane_id,
-                "--source".into(),
-                SOURCE.into(),
-                "--agent".into(),
-                AGENT.into(),
-                "--state".into(),
-                state.as_str().into(),
-                "--seq".into(),
-                self.seq.to_string(),
-            ],
-        );
+        let mut args = vec![
+            "pane".into(),
+            "report-agent".into(),
+            config.pane_id,
+            "--source".into(),
+            SOURCE.into(),
+            "--agent".into(),
+            AGENT.into(),
+            "--state".into(),
+            state.as_str().into(),
+            "--seq".into(),
+            self.seq.to_string(),
+        ];
+        if let Some(session_id) = self.reported_session.clone() {
+            args.push("--agent-session-id".into());
+            args.push(session_id);
+        }
+        launch(config.herdr_bin, args);
     }
 }
 
@@ -419,6 +482,25 @@ mod tests {
         assert!(!reporter.turn_active);
     }
 
+    #[test]
+    fn tracks_bound_session_identity() {
+        let sid = session(7);
+        let mut reporter = Reporter::default();
+
+        reporter.observe(&Action::SessionBound(sid), Some(sid));
+        assert_eq!(
+            reporter.reported_session.as_deref(),
+            Some(sid.0.to_string().as_str())
+        );
+        assert!(reporter.ever_bound);
+
+        reporter.observe(&Action::NewSession, None);
+        // Locally we drop the bound id; Herdr keeps the last official ref until
+        // the next bind/release because it has no clear-without-replacement API.
+        assert_eq!(reporter.reported_session, None);
+        assert!(reporter.ever_bound);
+    }
+
     #[cfg(unix)]
     #[test]
     fn release_waits_for_the_report_command() {
@@ -443,13 +525,12 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&script, permissions).expect("make script executable");
 
-        let mut reporter = Reporter {
-            config: Some(Config {
-                herdr_bin: script.into_os_string(),
-                pane_id: "w1:p9".into(),
-            }),
-            ..Reporter::default()
-        };
+        let mut reporter = Reporter::default();
+        reporter.config = Some(Config {
+            herdr_bin: script.into_os_string(),
+            pane_id: "w1:p9".into(),
+        });
+        reporter.reported_session = Some("sess".into());
         reporter.release();
 
         let args = fs::read_to_string(&marker).expect("release command completed");
@@ -458,5 +539,60 @@ mod tests {
         assert!(args.contains(SOURCE));
         assert!(args.contains(AGENT));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_bind_reports_agent_session_id() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ocean-herdr-session-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let script = dir.join("fake-herdr.sh");
+        let marker = dir.join("args.txt");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write fake herdr");
+        let mut permissions = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).expect("make script executable");
+
+        let sid = session(42);
+        let mut reporter = Reporter::default();
+        reporter.config = Some(Config {
+            herdr_bin: script.into_os_string(),
+            pane_id: "w1:p3".into(),
+        });
+        reporter.observe(&Action::SessionBound(sid), Some(sid));
+        // Give the detached reporter thread a moment to finish.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let args = wait_for_marker(&marker);
+        assert!(args.contains("report-agent-session"));
+        assert!(args.contains("--agent-session-id"));
+        assert!(args.contains(&sid.0.to_string()));
+        assert!(args.contains("startup") || args.contains("new"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    fn wait_for_marker(path: &std::path::Path) -> String {
+        for _ in 0..50 {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if !contents.trim().is_empty() {
+                    return contents;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(path).expect("marker written")
     }
 }
