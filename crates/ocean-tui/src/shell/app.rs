@@ -724,8 +724,15 @@ impl App {
         self.bind_session_with(id, false);
         // This initialization path intentionally skips dispatch (replay_first
         // differs from a fresh mint), so explicitly deliver the same bind
-        // action to session-scoped components.
-        let _ = self.tray.update(&Action::SessionBound(id));
+        // action to session-scoped components. Use ResumeSession so the
+        // `--session` startup path reports the correct `resume` source to Herdr.
+        let resume = Action::ResumeSession {
+            id,
+            path: session.path.clone(),
+            cwd: session.cwd.clone(),
+        };
+        let _ = self.tray.update(&resume);
+        self.herdr.observe(&resume, self.session_id);
         self.rail.live_id = Some(session.id);
         self.launch_open = false;
         Ok(())
@@ -5839,6 +5846,24 @@ mod tests {
             },
         )));
         assert!(app.tray.is_visible(), "explicit session binds the tray");
+    }
+
+    #[tokio::test]
+    async fn resume_initial_session_reports_resume_action_to_herdr() {
+        let mut app = launch_app();
+        let session = resumable_session(42, "herdr-resume-test");
+        let want_str = session.id.clone();
+
+        app.resume_initial_session(session)
+            .expect("explicit resume");
+
+        // The `--session` path must report `resume` (not `startup/new`)
+        // so Herdr can distinguish a CLI restart from a new mint.
+        assert_eq!(
+            app.herdr.reported_session().map(|s| s.to_string()),
+            Some(want_str),
+        );
+        assert!(app.herdr.is_ever_bound());
     }
 
     #[test]

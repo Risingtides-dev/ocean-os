@@ -259,6 +259,16 @@ impl Drop for Reporter {
     }
 }
 
+#[cfg(test)]
+impl Reporter {
+    pub fn reported_session(&self) -> Option<&str> {
+        self.reported_session.as_deref()
+    }
+    pub fn is_ever_bound(&self) -> bool {
+        self.ever_bound
+    }
+}
+
 fn envelope_matches_session(
     envelope: &ocean_core::EventEnvelope,
     bound_session: Option<AgentSessionId>,
@@ -580,6 +590,58 @@ mod tests {
         assert!(args.contains("--agent-session-id"));
         assert!(args.contains(&sid.0.to_string()));
         assert!(args.contains("startup") || args.contains("new"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_session_reports_agent_session_id_with_resume_source() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ocean-herdr-resume-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let script = dir.join("fake-herdr.sh");
+        let marker = dir.join("args.txt");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write fake herdr");
+        let mut permissions = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).expect("make script executable");
+
+        let sid = session(77);
+        let mut reporter = Reporter::default();
+        reporter.config = Some(Config {
+            herdr_bin: script.into_os_string(),
+            pane_id: "w1:p4".into(),
+        });
+        reporter.observe(
+            &Action::ResumeSession {
+                id: sid,
+                path: std::path::PathBuf::from("/tmp/fake"),
+                cwd: std::path::PathBuf::from("/tmp/fake"),
+            },
+            Some(sid),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+
+        let args = wait_for_marker(&marker);
+        assert!(args.contains("report-agent-session"));
+        assert!(args.contains("--agent-session-id"));
+        assert!(args.contains(&sid.0.to_string()));
+        assert!(
+            args.contains("--session-start-source"),
+            "ResumeSession must carry --session-start-source resume"
+        );
+        assert!(args.contains("resume"));
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -4090,7 +4090,7 @@ area:      [backend]
 Closed the Kimi K3 dynamic-tool lifecycle review blockers. Request context now carries ordered, nonempty declaration epochs at validated transcript indices instead of one aggregate declaration. Every runtime invocation reconstructs loaded names and epoch membership from durable, K3-attributed search_tools ToolResults; resumed turns restore declarations on their first request, descriptions remain absent from persistence, multiple search epochs remain separate and position-stable, and compacted search evidence falls back immediately before the first surviving same-provider K3 call. The 16-tool/512-KiB bounds remain enforced. Final synthesis retains historical declarations for provider-valid replay, emits tool_choice:none, exposes no globally callable tool, and rejects a disobedient real-tool call before permission or execution. Added protocol validation/serialization and runtime resume, multi-epoch, compacted-anchor, final-synthesis, schema-budget, and no-description regressions. Focused provider/protocol/runtime/agent tests, workspace test compilation, strict touched-crate Clippy, formatting, docs-check, and diff-check pass. `cargo xtask ci` reaches the pre-existing host-sensitive daemon Longhouse inspect assertion (expected 2, observed 6); the exact focused test reproduces unchanged on clean `origin/main@5b9e23a8`, proving it is not caused by this feature.
 _________________________________________________________________________________
 
-02:10pm 17-07-26
+time:      [14:10] [17-07-26]
 agent:     [pi], [gpt-5.4]
 worktree:  [main]
 type:      [feature]: report Ocean session ids to Herdr for native restore
