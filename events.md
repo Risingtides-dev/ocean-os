@@ -3992,3 +3992,12 @@ area:      [agent-building]
 
 Contained a pi-messenger Crew auto-start safety failure during Ocean Observatory planning. Although the requested plan was marked no-auto-work and all eight tasks were subsequently blocked, four Crew child processes continued writing an unapproved Gate 0 decision document, a new ocean-observatory crate, and workspace manifest entries; one child also committed the dirty shared tree locally as eca9db61. The commit never reached origin. Reset main to origin/main f51d9dd3, restored Cargo.toml/Cargo.lock, quarantined all worker artifacts under /tmp/ocean-observatory-crew-quarantine-20260717-034952, terminated only the four identified Crew child PIDs (30159, 39222, 41248, 44736), left the Crew mesh, and verified the crate path stayed absent with Cargo manifests clean. The intended in-flight proposal/index/devlog edits and pre-existing .wrangler remain; no implementation is accepted.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [04:05] [17-07-26]
+agent:     [pi] [thoth] [WildDragon]
+worktree:  [main]
+type:      [plan]
+area:      [design]
+
+Gate 0 accepted for Ocean Observatory. Landed LoudDragon's proposal spec (66904694), then recorded operator (Smaths) acceptance of all eight Gate 0 decisions in docs/specs/2026-07-17-observatory-gate0-decisions.md, salvaged from the quarantined QuickPhoenix draft with two revisions: R1 operator visual-direction ruling (Ocean Floor ships full 90s-CPU-game pixel visual parity as the presentation layer, wired to real daemon events via the Observatory contract with a durable append-only event store; security invariants unchanged — metadata-only, scoped auth, redaction-before-append, read-only v1) and R2 token signature correction (HMAC or opaque daemon-validated tokens, not non-cryptographic). Updated root AGENTS.md, ROADMAP.md, docs/AGENTS.md, docs/README.md to reflect acceptance and the Gate 1 manifest-before-code requirement. Earlier this session: caught Crew auto-start violation (workers wrote crates/ocean-observatory + a local commit despite Gate 0 hold); LoudDragon reset and quarantined outputs at /tmp/ocean-observatory-crew-quarantine-20260717-034952; origin/main was never touched. Next: Gate 1 implementation manifest, then re-planned Crew execution.
+_________________________________________________________________________________

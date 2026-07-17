@@ -54,7 +54,7 @@ the document and verify source before using one as a work order.
 Active plans:
 
 - [`specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md) — approved extension architecture, ownership boundaries, accepted Phase 0 evidence, and staged migration gates; the Phase 1 schema/tool-lane checkpoint is implemented but not accepted, while state separation and inspect/doctor remain pending.
-- [`specs/2026-07-17-ocean-observatory-architecture.md`](specs/2026-07-17-ocean-observatory-architecture.md) — proposed cross-repository architecture for authenticated, metadata-safe root/subagent topology, replay, and the Ocean Floor product mode. It is awaiting Gate 0 decisions and is not yet an implementation work order.
+- [`specs/2026-07-17-ocean-observatory-architecture.md`](specs/2026-07-17-ocean-observatory-architecture.md) — cross-repository architecture for authenticated, metadata-safe root/subagent topology, replay, and the Ocean Floor product mode. Gate 0 is accepted in [`specs/2026-07-17-observatory-gate0-decisions.md`](specs/2026-07-17-observatory-gate0-decisions.md); a Gate 1 implementation manifest must be accepted before code.
 - [`specs/2026-07-16-ocean-daemon-phase2c-final-28-percent-handoff.md`](specs/2026-07-16-ocean-daemon-phase2c-final-28-percent-handoff.md) — cold-start execution order, invariants, characterization priorities, stop rules, and validation guidance for the complexity-weighted final 28% of daemon Phase 2C.
 
 Active implementation reference:
